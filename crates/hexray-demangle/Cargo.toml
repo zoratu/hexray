@@ -1,0 +1,14 @@
+[package]
+name = "hexray-demangle"
+description = "Symbol demangling (C++, Rust) for hexray"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "hexray"
+description = "A multi-architecture disassembler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hexray"
+path = "src/main.rs"
+
+[dependencies]
+hexray-core.workspace = true
+hexray-formats.workspace = true
+hexray-disasm = { workspace = true, features = ["all-archs"] }
+hexray-analysis.workspace = true
+hexray-demangle.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

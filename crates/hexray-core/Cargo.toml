@@ -1,0 +1,17 @@
+[package]
+name = "hexray-core"
+description = "Core abstractions for the hexray disassembler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true, optional = true }
+indexmap.workspace = true
+
+[features]
+default = []
+serde = ["dep:serde", "indexmap/serde"]

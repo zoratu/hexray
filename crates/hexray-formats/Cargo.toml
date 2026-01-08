@@ -1,0 +1,15 @@
+[package]
+name = "hexray-formats"
+description = "Binary format parsers (ELF, Mach-O) for hexray"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hexray-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

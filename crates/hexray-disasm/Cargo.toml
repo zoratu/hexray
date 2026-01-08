@@ -1,0 +1,22 @@
+[package]
+name = "hexray-disasm"
+description = "Architecture-specific instruction decoders for hexray"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hexray-core.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["x86_64"]
+x86_64 = []
+arm64 = []
+riscv = []
+all-archs = ["x86_64", "arm64", "riscv"]
+
+[dev-dependencies]
+pretty_assertions.workspace = true

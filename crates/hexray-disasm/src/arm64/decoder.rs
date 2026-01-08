@@ -1,0 +1,1551 @@
+//! ARM64 instruction decoder implementation.
+
+use crate::{DecodeError, DecodedInstruction, Disassembler};
+use hexray_core::{
+    Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand, Operation,
+    Register, RegisterClass,
+    register::arm64,
+};
+
+/// ARM64 disassembler.
+pub struct Arm64Disassembler;
+
+impl Arm64Disassembler {
+    /// Creates a new ARM64 disassembler.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Creates an ARM64 general-purpose register.
+    fn gpr(id: u16, is_64bit: bool) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            if id == arm64::SP {
+                RegisterClass::StackPointer
+            } else {
+                RegisterClass::General
+            },
+            id,
+            if is_64bit { 64 } else { 32 },
+        )
+    }
+
+    /// Creates an X register (64-bit).
+    fn xreg(id: u16) -> Register {
+        Self::gpr(id, true)
+    }
+
+    /// Creates a W register (32-bit).
+    fn wreg(id: u16) -> Register {
+        Self::gpr(id, false)
+    }
+
+    /// Decode the instruction at the given address.
+    fn decode(&self, bytes: &[u8], address: u64) -> Result<DecodedInstruction, DecodeError> {
+        if bytes.len() < 4 {
+            return Err(DecodeError::truncated(address, 4, bytes.len()));
+        }
+
+        // ARM64 instructions are little-endian 32-bit
+        let insn = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let raw_bytes = bytes[0..4].to_vec();
+
+        // Extract op0 (bits 25-28) for major classification
+        let op0 = (insn >> 25) & 0xF;
+
+        match op0 {
+            // Data processing - immediate
+            0b1000 | 0b1001 => self.decode_dp_imm(insn, address, raw_bytes),
+
+            // Branches, exception generating, system instructions
+            0b1010 | 0b1011 => self.decode_branch_system(insn, address, raw_bytes),
+
+            // Loads and stores
+            0b0100 | 0b0110 | 0b1100 | 0b1110 => self.decode_load_store(insn, address, raw_bytes),
+
+            // Data processing - register
+            0b0101 | 0b1101 => self.decode_dp_reg(insn, address, raw_bytes),
+
+            // Data processing - SIMD and floating-point
+            0b0111 | 0b1111 => self.decode_simd_fp(insn, address, raw_bytes),
+
+            _ => self.decode_unknown(insn, address, raw_bytes),
+        }
+    }
+
+    /// Decode data processing - immediate instructions.
+    fn decode_dp_imm(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let op0 = (insn >> 23) & 0x7;
+        let sf = (insn >> 31) & 1; // 64-bit if set
+        let is_64bit = sf == 1;
+
+        match op0 {
+            // PC-relative addressing (ADR, ADRP)
+            0b000 | 0b001 => {
+                let rd = (insn & 0x1F) as u16;
+                let immlo = (insn >> 29) & 0x3;
+                let immhi = (insn >> 5) & 0x7FFFF;
+                let is_adrp = (insn >> 31) & 1 == 1;
+
+                let imm = if is_adrp {
+                    // ADRP: page address (4KB aligned)
+                    let imm21 = ((immhi << 2) | immlo) as i64;
+                    let imm = sign_extend(imm21 as u64, 21) << 12;
+                    (address & !0xFFF) as i64 + imm
+                } else {
+                    // ADR: byte address
+                    let imm21 = ((immhi << 2) | immlo) as i64;
+                    let imm = sign_extend(imm21 as u64, 21);
+                    address as i64 + imm
+                };
+
+                let mnemonic = if is_adrp { "adrp" } else { "adr" };
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(Operation::LoadEffectiveAddress)
+                    .with_operands(vec![
+                        Operand::reg(Self::xreg(rd)),
+                        Operand::pc_rel(imm - address as i64, imm as u64),
+                    ]);
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Add/subtract immediate
+            0b010 | 0b011 => {
+                let rd = (insn & 0x1F) as u16;
+                let rn = ((insn >> 5) & 0x1F) as u16;
+                let imm12 = ((insn >> 10) & 0xFFF) as u64;
+                let shift = ((insn >> 22) & 0x3) as u8;
+                let is_sub = (insn >> 30) & 1 == 1;
+                let set_flags = (insn >> 29) & 1 == 1;
+
+                let imm = if shift == 1 { imm12 << 12 } else { imm12 };
+
+                // Special cases for aliases
+                let (mnemonic, operands, operation) = if set_flags && rd == 31 {
+                    // CMP/CMN (comparing with zero register)
+                    let mnemonic = if is_sub { "cmp" } else { "cmn" };
+                    let reg = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    (mnemonic, vec![Operand::reg(reg), Operand::imm_unsigned(imm, 64)], Operation::Compare)
+                } else if !set_flags && is_sub && rn == 31 {
+                    // MOV (from SP) - sub from SP with 0
+                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                    let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    if imm == 0 {
+                        ("mov", vec![Operand::reg(dst), Operand::reg(src)], Operation::Move)
+                    } else {
+                        let mnemonic = if is_sub { "sub" } else { "add" };
+                        (mnemonic, vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(imm, 64)], if is_sub { Operation::Sub } else { Operation::Add })
+                    }
+                } else {
+                    let mnemonic = match (is_sub, set_flags) {
+                        (false, false) => "add",
+                        (false, true) => "adds",
+                        (true, false) => "sub",
+                        (true, true) => "subs",
+                    };
+                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                    let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    (mnemonic, vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(imm, 64)], if is_sub { Operation::Sub } else { Operation::Add })
+                };
+
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(operation)
+                    .with_operands(operands);
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Logical immediate
+            0b100 => {
+                let rd = (insn & 0x1F) as u16;
+                let rn = ((insn >> 5) & 0x1F) as u16;
+                let opc = (insn >> 29) & 0x3;
+
+                // Decode bitmask immediate (complex encoding)
+                let n = ((insn >> 22) & 1) as u8;
+                let immr = ((insn >> 16) & 0x3F) as u8;
+                let imms = ((insn >> 10) & 0x3F) as u8;
+                let imm = decode_bitmask_imm(n, imms, immr, is_64bit);
+
+                let (mnemonic, operation, set_flags) = match opc {
+                    0b00 => ("and", Operation::And, false),
+                    0b01 => ("orr", Operation::Or, false),
+                    0b10 => ("eor", Operation::Xor, false),
+                    0b11 => ("ands", Operation::And, true),
+                    _ => unreachable!(),
+                };
+
+                let operands = if set_flags && rd == 31 {
+                    // TST alias
+                    let reg = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    vec![Operand::reg(reg), Operand::imm_unsigned(imm, 64)]
+                } else if opc == 0b01 && rn == 31 {
+                    // MOV (bitmask immediate) alias
+                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                    vec![Operand::reg(dst), Operand::imm_unsigned(imm, 64)]
+                } else {
+                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                    let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(imm, 64)]
+                };
+
+                let final_mnemonic = if set_flags && rd == 31 {
+                    "tst"
+                } else if opc == 0b01 && rn == 31 {
+                    "mov"
+                } else {
+                    mnemonic
+                };
+
+                let inst = Instruction::new(address, 4, bytes, final_mnemonic)
+                    .with_operation(if final_mnemonic == "tst" { Operation::Test } else if final_mnemonic == "mov" { Operation::Move } else { operation })
+                    .with_operands(operands);
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Move wide immediate (MOVN, MOVZ, MOVK)
+            0b101 => {
+                let rd = (insn & 0x1F) as u16;
+                let imm16 = ((insn >> 5) & 0xFFFF) as u64;
+                let hw = ((insn >> 21) & 0x3) as u8;
+                let opc = (insn >> 29) & 0x3;
+                let shift = hw * 16;
+
+                let (mnemonic, operation) = match opc {
+                    0b00 => ("movn", Operation::Move),
+                    0b10 => ("movz", Operation::Move),
+                    0b11 => ("movk", Operation::Move),
+                    _ => return self.decode_unknown(insn, address, bytes),
+                };
+
+                // Check for MOV alias (MOVZ with no shift, or MOVN producing simple value)
+                let is_mov_alias = opc == 0b10 && hw == 0;
+
+                let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                let shifted_imm = imm16 << shift;
+
+                let (final_mnemonic, operands) = if is_mov_alias {
+                    ("mov", vec![Operand::reg(dst), Operand::imm_unsigned(imm16, 64)])
+                } else if shift > 0 {
+                    (mnemonic, vec![Operand::reg(dst), Operand::imm_unsigned(imm16, 16), Operand::imm_unsigned(shift as u64, 8)])
+                } else {
+                    (mnemonic, vec![Operand::reg(dst), Operand::imm_unsigned(shifted_imm, 64)])
+                };
+
+                let inst = Instruction::new(address, 4, bytes, final_mnemonic)
+                    .with_operation(operation)
+                    .with_operands(operands);
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Bitfield (BFM, SBFM, UBFM)
+            0b110 => {
+                let rd = (insn & 0x1F) as u16;
+                let rn = ((insn >> 5) & 0x1F) as u16;
+                let imms = ((insn >> 10) & 0x3F) as u8;
+                let immr = ((insn >> 16) & 0x3F) as u8;
+                let opc = (insn >> 29) & 0x3;
+
+                let reg_size = if is_64bit { 64 } else { 32 };
+                let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+
+                // Check for common aliases
+                let (mnemonic, operands) = match opc {
+                    0b00 => {
+                        // SBFM aliases
+                        if imms == reg_size - 1 {
+                            // ASR
+                            ("asr", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8)])
+                        } else if immr == 0 && imms == 7 {
+                            ("sxtb", vec![Operand::reg(dst), Operand::reg(src)])
+                        } else if immr == 0 && imms == 15 {
+                            ("sxth", vec![Operand::reg(dst), Operand::reg(src)])
+                        } else if immr == 0 && imms == 31 {
+                            ("sxtw", vec![Operand::reg(dst), Operand::reg(src)])
+                        } else {
+                            ("sbfm", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8), Operand::imm_unsigned(imms as u64, 8)])
+                        }
+                    }
+                    0b01 => {
+                        // BFM - bit field move
+                        ("bfm", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8), Operand::imm_unsigned(imms as u64, 8)])
+                    }
+                    0b10 => {
+                        // UBFM aliases
+                        if imms + 1 == immr {
+                            // LSL
+                            let shift = (reg_size - immr) & (reg_size - 1);
+                            ("lsl", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(shift as u64, 8)])
+                        } else if imms == reg_size - 1 {
+                            // LSR
+                            ("lsr", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8)])
+                        } else if immr == 0 && imms == 7 {
+                            ("uxtb", vec![Operand::reg(dst), Operand::reg(src)])
+                        } else if immr == 0 && imms == 15 {
+                            ("uxth", vec![Operand::reg(dst), Operand::reg(src)])
+                        } else {
+                            ("ubfm", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8), Operand::imm_unsigned(imms as u64, 8)])
+                        }
+                    }
+                    _ => return self.decode_unknown(insn, address, bytes),
+                };
+
+                let operation = match mnemonic {
+                    "asr" => Operation::Sar,
+                    "lsl" => Operation::Shl,
+                    "lsr" => Operation::Shr,
+                    _ => Operation::Other(0),
+                };
+
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(operation)
+                    .with_operands(operands);
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Extract
+            0b111 => {
+                let rd = (insn & 0x1F) as u16;
+                let rn = ((insn >> 5) & 0x1F) as u16;
+                let rm = ((insn >> 16) & 0x1F) as u16;
+                let imms = ((insn >> 10) & 0x3F) as u8;
+
+                let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                let src1 = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                let src2 = if is_64bit { Self::xreg(rm) } else { Self::wreg(rm) };
+
+                let (mnemonic, operands) = if rn == rm {
+                    // ROR alias
+                    ("ror", vec![Operand::reg(dst), Operand::reg(src1), Operand::imm_unsigned(imms as u64, 8)])
+                } else {
+                    ("extr", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::imm_unsigned(imms as u64, 8)])
+                };
+
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(if mnemonic == "ror" { Operation::Ror } else { Operation::Other(0) })
+                    .with_operands(operands);
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            _ => self.decode_unknown(insn, address, bytes),
+        }
+    }
+
+    /// Decode branch and system instructions.
+    fn decode_branch_system(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let op0 = (insn >> 29) & 0x7;
+        let op1 = (insn >> 22) & 0xF;
+
+        match op0 {
+            // Unconditional branch immediate
+            0b000 | 0b100 => {
+                let is_bl = (insn >> 31) & 1 == 1;
+                let imm26 = (insn & 0x3FFFFFF) as i64;
+                let offset = sign_extend((imm26 << 2) as u64, 28);
+                let target = (address as i64 + offset) as u64;
+
+                let mnemonic = if is_bl { "bl" } else { "b" };
+                let cf = if is_bl {
+                    ControlFlow::Call { target, return_addr: address + 4 }
+                } else {
+                    ControlFlow::UnconditionalBranch { target }
+                };
+
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(if is_bl { Operation::Call } else { Operation::Jump })
+                    .with_operand(Operand::pc_rel(offset, target))
+                    .with_control_flow(cf);
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Compare and branch
+            0b001 | 0b101 => {
+                let is_cbnz = (insn >> 24) & 1 == 1;
+                let sf = (insn >> 31) & 1 == 1;
+                let rt = (insn & 0x1F) as u16;
+                let imm19 = ((insn >> 5) & 0x7FFFF) as i64;
+                let offset = sign_extend((imm19 << 2) as u64, 21);
+                let target = (address as i64 + offset) as u64;
+
+                let mnemonic = if is_cbnz { "cbnz" } else { "cbz" };
+                let reg = if sf { Self::xreg(rt) } else { Self::wreg(rt) };
+                let condition = if is_cbnz { Condition::NotEqual } else { Condition::Equal };
+
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(Operation::ConditionalJump)
+                    .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)])
+                    .with_control_flow(ControlFlow::ConditionalBranch {
+                        target,
+                        condition,
+                        fallthrough: address + 4,
+                    });
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Test and branch
+            0b011 | 0b111 => {
+                let is_tbnz = (insn >> 24) & 1 == 1;
+                let b5 = (insn >> 31) & 1;
+                let b40 = (insn >> 19) & 0x1F;
+                let bit_pos = (b5 << 5) | b40;
+                let rt = (insn & 0x1F) as u16;
+                let imm14 = ((insn >> 5) & 0x3FFF) as i64;
+                let offset = sign_extend((imm14 << 2) as u64, 16);
+                let target = (address as i64 + offset) as u64;
+
+                let mnemonic = if is_tbnz { "tbnz" } else { "tbz" };
+                let is_64bit = b5 == 1;
+                let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+                let condition = if is_tbnz { Condition::NotEqual } else { Condition::Equal };
+
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(Operation::ConditionalJump)
+                    .with_operands(vec![
+                        Operand::reg(reg),
+                        Operand::imm_unsigned(bit_pos as u64, 8),
+                        Operand::pc_rel(offset, target),
+                    ])
+                    .with_control_flow(ControlFlow::ConditionalBranch {
+                        target,
+                        condition,
+                        fallthrough: address + 4,
+                    });
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Conditional branch
+            0b010 => {
+                let cond = (insn & 0xF) as u8;
+                let imm19 = ((insn >> 5) & 0x7FFFF) as i64;
+                let offset = sign_extend((imm19 << 2) as u64, 21);
+                let target = (address as i64 + offset) as u64;
+
+                let (cond_suffix, condition) = decode_condition(cond);
+                let mnemonic = format!("b.{}", cond_suffix);
+
+                let inst = Instruction::new(address, 4, bytes, mnemonic)
+                    .with_operation(Operation::ConditionalJump)
+                    .with_operand(Operand::pc_rel(offset, target))
+                    .with_control_flow(ControlFlow::ConditionalBranch {
+                        target,
+                        condition,
+                        fallthrough: address + 4,
+                    });
+
+                Ok(DecodedInstruction { instruction: inst, size: 4 })
+            }
+
+            // Misc branches / system instructions
+            0b110 => {
+                // Classify based on bits 25:21 and other fields
+                // bits 24:21 help further distinguish system instructions:
+                // - 0011: Hints (NOP, YIELD, WFE, WFI, SEV, SEVL)
+                // - 0100: Barriers (DSB, DMB, ISB, CLREX)
+                // - Unconditional branch (register): bit 25=1
+                // - Exception generating: bit 25=0, bit 24=0
+
+                let op1_24_21 = (insn >> 21) & 0xF; // bits 24:21
+                let bit25 = (insn >> 25) & 1;
+                let bit24 = (insn >> 24) & 1;
+
+                if bit25 == 1 && bit24 == 0 {
+                    // Unconditional branch (register): BR, BLR, RET
+                    let opc = (insn >> 21) & 0x7;
+                    let rn = ((insn >> 5) & 0x1F) as u16;
+
+                    let (mnemonic, operation, cf) = match opc {
+                        0b000 => ("br", Operation::Jump, ControlFlow::IndirectBranch { possible_targets: vec![] }),
+                        0b001 => ("blr", Operation::Call, ControlFlow::IndirectCall { return_addr: address + 4 }),
+                        0b010 => ("ret", Operation::Return, ControlFlow::Return),
+                        _ => return self.decode_unknown(insn, address, bytes),
+                    };
+
+                    let operands = if opc == 0b010 && rn == 30 {
+                        // RET with x30 (default) - no operand needed
+                        vec![]
+                    } else {
+                        vec![Operand::reg(Self::xreg(rn))]
+                    };
+
+                    let inst = Instruction::new(address, 4, bytes, mnemonic)
+                        .with_operation(operation)
+                        .with_operands(operands)
+                        .with_control_flow(cf);
+
+                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                } else if bit25 == 0 && bit24 == 0 {
+                    // Exception generating: SVC, HVC, SMC, BRK, HLT (0xD4xxxxxx)
+                    let opc = (insn >> 21) & 0x7;
+                    let imm16 = ((insn >> 5) & 0xFFFF) as u64;
+
+                    let (mnemonic, cf) = match opc {
+                        0b000 => ("svc", ControlFlow::Syscall),
+                        0b001 => ("hvc", ControlFlow::Halt),
+                        0b010 => ("smc", ControlFlow::Halt),
+                        0b011 => ("brk", ControlFlow::Halt),
+                        0b100 => ("hlt", ControlFlow::Halt),
+                        _ => return self.decode_unknown(insn, address, bytes),
+                    };
+
+                    let inst = Instruction::new(address, 4, bytes, mnemonic)
+                        .with_operation(if opc == 0 { Operation::Syscall } else { Operation::Halt })
+                        .with_operand(Operand::imm_unsigned(imm16, 16))
+                        .with_control_flow(cf);
+
+                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                } else if bit25 == 0 && bit24 == 1 && op1_24_21 == 0b0011 {
+                    // Hints: NOP, YIELD, WFE, WFI, SEV, SEVL (0xD503xxxx)
+                    let crm = (insn >> 8) & 0xF;
+                    let op2 = (insn >> 5) & 0x7;
+
+                    let mnemonic = if crm == 0 {
+                        match op2 {
+                            0b000 => "nop",
+                            0b001 => "yield",
+                            0b010 => "wfe",
+                            0b011 => "wfi",
+                            0b100 => "sev",
+                            0b101 => "sevl",
+                            _ => "hint",
+                        }
+                    } else {
+                        "hint"
+                    };
+
+                    let inst = Instruction::new(address, 4, bytes, mnemonic)
+                        .with_operation(Operation::Nop);
+
+                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                } else if bit25 == 0 && bit24 == 1 && op1_24_21 == 0b0100 {
+                    // Barriers: DSB, DMB, ISB, CLREX (0xD503xxxx)
+                    let op2 = (insn >> 5) & 0x7;
+
+                    let mnemonic = match op2 {
+                        0b001 => "clrex",
+                        0b100 => "dsb",
+                        0b101 => "dmb",
+                        0b110 => "isb",
+                        _ => "barrier",
+                    };
+
+                    let inst = Instruction::new(address, 4, bytes, mnemonic)
+                        .with_operation(Operation::Other(0));
+
+                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                } else {
+                    // Other system instructions: MSR, MRS, SYS, SYSL
+                    self.decode_system_insn(insn, address, bytes)
+                }
+            }
+
+            _ => self.decode_unknown(insn, address, bytes),
+        }
+    }
+
+    /// Decode system instructions (NOP, hints, MSR, MRS).
+    fn decode_system_insn(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let l = (insn >> 21) & 1;
+        let op0 = (insn >> 19) & 0x3;
+        let op1 = (insn >> 16) & 0x7;
+        let crn = (insn >> 12) & 0xF;
+        let crm = (insn >> 8) & 0xF;
+        let op2 = (insn >> 5) & 0x7;
+
+        // Check for NOP and hints
+        if l == 0 && op0 == 0 && op1 == 3 && crn == 2 && crm == 0 {
+            let mnemonic = match op2 {
+                0b000 => "nop",
+                0b001 => "yield",
+                0b010 => "wfe",
+                0b011 => "wfi",
+                0b100 => "sev",
+                0b101 => "sevl",
+                _ => return self.decode_unknown(insn, address, bytes),
+            };
+
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(Operation::Nop);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+        }
+
+        // MRS (read system register)
+        if l == 1 {
+            let rt = (insn & 0x1F) as u16;
+            let inst = Instruction::new(address, 4, bytes, "mrs")
+                .with_operation(Operation::Move)
+                .with_operand(Operand::reg(Self::xreg(rt)));
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+        }
+
+        // MSR (write system register)
+        let rt = (insn & 0x1F) as u16;
+        let inst = Instruction::new(address, 4, bytes, "msr")
+            .with_operation(Operation::Move)
+            .with_operand(Operand::reg(Self::xreg(rt)));
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode load/store instructions.
+    fn decode_load_store(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        // ARM64 load/store encoding (bits 29-27 determine major class)
+        let op_29_27 = (insn >> 27) & 0x7;
+        let v = (insn >> 26) & 1;  // SIMD/FP if set
+        let op_25_23 = (insn >> 23) & 0x7;
+        let op_21 = (insn >> 21) & 1;
+        let op_11_10 = (insn >> 10) & 0x3;
+
+        // Load/store pair (bits 29-27 = 101)
+        if op_29_27 == 0b101 {
+            return self.decode_ldst_pair(insn, address, bytes);
+        }
+
+        // Load/store register variants (bits 29-27 = 111)
+        if op_29_27 == 0b111 {
+            // Unsigned offset: bits 25-24 = 01
+            if (op_25_23 >> 1) == 0b01 {
+                return self.decode_ldst_unsigned_imm(insn, address, bytes);
+            }
+            // Unscaled immediate, pre/post-indexed: bits 25-24 = 00
+            if (op_25_23 >> 1) == 0b00 {
+                // bits 11-10 determine type: 00=unscaled, 01=post-index, 11=pre-index, 10=register
+                if op_11_10 == 0b10 {
+                    return self.decode_ldst_reg_offset(insn, address, bytes);
+                } else if op_11_10 == 0b01 || op_11_10 == 0b11 {
+                    return self.decode_ldst_imm_indexed(insn, address, bytes);
+                } else {
+                    // Unscaled immediate (LDUR/STUR)
+                    return self.decode_ldst_unscaled(insn, address, bytes);
+                }
+            }
+        }
+
+        // Load literal (bits 29-27 = 011)
+        if op_29_27 == 0b011 && v == 0 {
+            return self.decode_ldr_literal(insn, address, bytes);
+        }
+
+        // Load/store exclusive, etc. - fall through to unknown for now
+        self.decode_unknown(insn, address, bytes)
+    }
+
+    /// Decode LDUR/STUR (unscaled immediate).
+    fn decode_ldst_unscaled(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let size = (insn >> 30) & 0x3;
+        let v = (insn >> 26) & 1;
+        let opc = (insn >> 22) & 0x3;
+        let imm9 = ((insn >> 12) & 0x1FF) as i64;
+        let imm9 = if imm9 & 0x100 != 0 { imm9 | !0x1FF } else { imm9 }; // Sign extend
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rt = (insn & 0x1F) as u16;
+
+        let (mnemonic, is_load, data_size) = if v == 0 {
+            match (size, opc) {
+                (0, 0) => ("sturb", false, 1),
+                (0, 1) => ("ldurb", true, 1),
+                (1, 0) => ("sturh", false, 2),
+                (1, 1) => ("ldurh", true, 2),
+                (2, 0) => ("stur", false, 4),
+                (2, 1) => ("ldur", true, 4),
+                (3, 0) => ("stur", false, 8),
+                (3, 1) => ("ldur", true, 8),
+                _ => return self.decode_unknown(insn, address, bytes),
+            }
+        } else {
+            // SIMD/FP
+            match (size, opc) {
+                (0, 0) => ("stur", false, 1),  // B register
+                (0, 1) => ("ldur", true, 1),
+                (1, 0) => ("stur", false, 2),  // H register
+                (1, 1) => ("ldur", true, 2),
+                (2, 0) => ("stur", false, 4),  // S register
+                (2, 1) => ("ldur", true, 4),
+                (3, 0) => ("stur", false, 8),  // D register
+                (3, 1) => ("ldur", true, 8),
+                _ => return self.decode_unknown(insn, address, bytes),
+            }
+        };
+
+        let (reg_rt, reg_base) = if v == 0 {
+            if data_size == 8 {
+                (Self::xreg(rt), Self::xreg(rn))
+            } else {
+                (Self::wreg(rt), Self::xreg(rn))
+            }
+        } else {
+            // SIMD register naming (simplified)
+            (Self::xreg(rt), Self::xreg(rn))
+        };
+
+        let mem = MemoryRef::base_disp(reg_base.clone(), imm9, data_size as u8);
+        let operands = if is_load {
+            vec![Operand::reg(reg_rt), Operand::Memory(mem)]
+        } else {
+            vec![Operand::Memory(mem), Operand::reg(reg_rt)]
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode LDR/STR with unsigned immediate offset.
+    fn decode_ldst_unsigned_imm(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let size = (insn >> 30) & 0x3;
+        let v = (insn >> 26) & 1;
+        let opc = (insn >> 22) & 0x3;
+        let imm12 = ((insn >> 10) & 0xFFF) as u64;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rt = (insn & 0x1F) as u16;
+
+        if v == 1 {
+            // SIMD/FP load/store - simplified
+            return self.decode_unknown(insn, address, bytes);
+        }
+
+        let scale = size;
+        let offset = imm12 << scale;
+        let is_load = opc & 1 == 1;
+        let is_signed = opc & 0b10 != 0;
+
+        let access_size = 1u8 << size;
+        let is_64bit = size == 3 || (is_signed && size != 2);
+
+        let (mnemonic, operation) = match (is_load, is_signed, size) {
+            (true, false, 0) => ("ldrb", Operation::Load),
+            (true, false, 1) => ("ldrh", Operation::Load),
+            (true, false, 2) => ("ldr", Operation::Load),  // 32-bit
+            (true, false, 3) => ("ldr", Operation::Load),  // 64-bit
+            (true, true, 0) => ("ldrsb", Operation::Load),
+            (true, true, 1) => ("ldrsh", Operation::Load),
+            (true, true, 2) => ("ldrsw", Operation::Load),
+            (false, _, 0) => ("strb", Operation::Store),
+            (false, _, 1) => ("strh", Operation::Store),
+            (false, _, 2) => ("str", Operation::Store),
+            (false, _, 3) => ("str", Operation::Store),
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let reg = if is_64bit || size == 3 { Self::xreg(rt) } else { Self::wreg(rt) };
+        let base = Self::xreg(rn);
+        let mem = if offset == 0 {
+            MemoryRef::base(base, access_size)
+        } else {
+            MemoryRef::base_disp(base, offset as i64, access_size)
+        };
+
+        let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode load/store register pair (LDP, STP).
+    fn decode_ldst_pair(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let opc = (insn >> 30) & 0x3;
+        let v = (insn >> 26) & 1;
+        let l = (insn >> 22) & 1;
+        let imm7 = ((insn >> 15) & 0x7F) as i64;
+        let rt2 = ((insn >> 10) & 0x1F) as u16;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rt = (insn & 0x1F) as u16;
+
+        if v == 1 {
+            // SIMD/FP pair - simplified
+            return self.decode_unknown(insn, address, bytes);
+        }
+
+        let is_load = l == 1;
+        let is_64bit = opc & 0b10 != 0;
+        let scale = if is_64bit { 3 } else { 2 };
+        let offset = sign_extend((imm7 << scale) as u64, 7 + scale);
+
+        let mnemonic = if is_load { "ldp" } else { "stp" };
+        let reg1 = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let reg2 = if is_64bit { Self::xreg(rt2) } else { Self::wreg(rt2) };
+        let base = Self::xreg(rn);
+
+        let mem = if offset == 0 {
+            MemoryRef::base(base, if is_64bit { 16 } else { 8 })
+        } else {
+            MemoryRef::base_disp(base, offset, if is_64bit { 16 } else { 8 })
+        };
+
+        let operands = vec![Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)];
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode load/store with register offset.
+    fn decode_ldst_reg_offset(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let size = (insn >> 30) & 0x3;
+        let opc = (insn >> 22) & 0x3;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let option = (insn >> 13) & 0x7;
+        let s = (insn >> 12) & 1;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rt = (insn & 0x1F) as u16;
+
+        let is_load = opc & 1 == 1;
+        let access_size = 1u8 << size;
+        let is_64bit = size == 3;
+
+        let mnemonic = if is_load {
+            match size {
+                0 => "ldrb",
+                1 => "ldrh",
+                2 | 3 => "ldr",
+                _ => unreachable!(),
+            }
+        } else {
+            match size {
+                0 => "strb",
+                1 => "strh",
+                2 | 3 => "str",
+                _ => unreachable!(),
+            }
+        };
+
+        let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let base = Self::xreg(rn);
+        let index = if option & 0b011 == 0b011 {
+            Self::xreg(rm)
+        } else {
+            Self::wreg(rm)
+        };
+
+        let scale = if s == 1 { size as u8 } else { 0 };
+        let mem = MemoryRef::sib(Some(base), Some(index), 1 << scale, 0, access_size);
+
+        let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode load/store with immediate pre/post-indexed.
+    fn decode_ldst_imm_indexed(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let size = (insn >> 30) & 0x3;
+        let opc = (insn >> 22) & 0x3;
+        let imm9 = ((insn >> 12) & 0x1FF) as i64;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rt = (insn & 0x1F) as u16;
+        let is_pre = (insn >> 11) & 1 == 1;
+
+        let is_load = opc & 1 == 1;
+        let offset = sign_extend(imm9 as u64, 9);
+        let access_size = 1u8 << size;
+        let is_64bit = size == 3;
+
+        let base_mnemonic = if is_load {
+            match size {
+                0 => "ldrb",
+                1 => "ldrh",
+                2 | 3 => "ldr",
+                _ => unreachable!(),
+            }
+        } else {
+            match size {
+                0 => "strb",
+                1 => "strh",
+                2 | 3 => "str",
+                _ => unreachable!(),
+            }
+        };
+
+        // For display, we'd normally add ! for pre-indexed, but we'll just use the mnemonic
+        let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let base = Self::xreg(rn);
+        let mem = MemoryRef::base_disp(base, offset, access_size);
+
+        let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
+
+        let inst = Instruction::new(address, 4, bytes, base_mnemonic)
+            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode LDR (literal) - PC-relative load.
+    fn decode_ldr_literal(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let opc = (insn >> 30) & 0x3;
+        let v = (insn >> 26) & 1;
+        let imm19 = ((insn >> 5) & 0x7FFFF) as i64;
+        let rt = (insn & 0x1F) as u16;
+
+        let offset = sign_extend((imm19 << 2) as u64, 21);
+        let target = (address as i64 + offset) as u64;
+
+        if v == 1 {
+            // SIMD/FP literal load
+            return self.decode_unknown(insn, address, bytes);
+        }
+
+        let (mnemonic, is_64bit) = match opc {
+            0b00 => ("ldr", false),
+            0b01 => ("ldr", true),
+            0b10 => ("ldrsw", true),
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Load)
+            .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode data processing - register instructions.
+    fn decode_dp_reg(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let op0 = (insn >> 30) & 1;
+        let op1 = (insn >> 28) & 1;
+        let op2 = (insn >> 21) & 0xF;
+
+        // Logical (shifted register)
+        if op1 == 0 && (op2 & 0b1000) == 0 {
+            return self.decode_logical_shifted_reg(insn, address, bytes);
+        }
+
+        // Add/subtract (shifted register)
+        if op1 == 0 && (op2 & 0b1001) == 0b1000 {
+            return self.decode_add_sub_shifted_reg(insn, address, bytes);
+        }
+
+        // Add/subtract (extended register)
+        if op1 == 0 && (op2 & 0b1001) == 0b1001 {
+            return self.decode_add_sub_extended_reg(insn, address, bytes);
+        }
+
+        // Data processing (2 source)
+        if op1 == 1 && op2 == 0b0110 {
+            return self.decode_dp_2source(insn, address, bytes);
+        }
+
+        // Data processing (1 source)
+        if op1 == 1 && op2 == 0b0000 {
+            return self.decode_dp_1source(insn, address, bytes);
+        }
+
+        // Conditional select
+        if op1 == 1 && (op2 & 0b1110) == 0b0100 {
+            return self.decode_cond_select(insn, address, bytes);
+        }
+
+        // Data processing (3 source) - MUL, MADD, MSUB, etc.
+        if op1 == 1 && (op2 & 0b1000) == 0b1000 {
+            return self.decode_dp_3source(insn, address, bytes);
+        }
+
+        self.decode_unknown(insn, address, bytes)
+    }
+
+    /// Decode logical (shifted register).
+    fn decode_logical_shifted_reg(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let opc = (insn >> 29) & 0x3;
+        let shift = (insn >> 22) & 0x3;
+        let n = (insn >> 21) & 1;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let imm6 = ((insn >> 10) & 0x3F) as u8;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let (base_mnemonic, operation, set_flags) = match (opc, n) {
+            (0b00, 0) => ("and", Operation::And, false),
+            (0b00, 1) => ("bic", Operation::And, false),  // AND NOT
+            (0b01, 0) => ("orr", Operation::Or, false),
+            (0b01, 1) => ("orn", Operation::Or, false),   // OR NOT
+            (0b10, 0) => ("eor", Operation::Xor, false),
+            (0b10, 1) => ("eon", Operation::Xor, false),  // XOR NOT
+            (0b11, 0) => ("ands", Operation::And, true),
+            (0b11, 1) => ("bics", Operation::And, true),
+            _ => unreachable!(),
+        };
+
+        let dst = if sf { Self::xreg(rd) } else { Self::wreg(rd) };
+        let src1 = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+        let src2 = if sf { Self::xreg(rm) } else { Self::wreg(rm) };
+
+        // Check for MOV alias (ORR with zero register)
+        let (mnemonic, operands) = if opc == 0b01 && n == 0 && rn == 31 && imm6 == 0 {
+            ("mov", vec![Operand::reg(dst), Operand::reg(src2)])
+        } else if opc == 0b01 && n == 1 && rn == 31 && imm6 == 0 {
+            ("mvn", vec![Operand::reg(dst), Operand::reg(src2)])
+        } else if set_flags && rd == 31 {
+            // TST alias
+            ("tst", vec![Operand::reg(src1), Operand::reg(src2)])
+        } else if imm6 == 0 {
+            (base_mnemonic, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+        } else {
+            let shift_type = match shift {
+                0 => "lsl",
+                1 => "lsr",
+                2 => "asr",
+                3 => "ror",
+                _ => unreachable!(),
+            };
+            // Include shift in mnemonic for now
+            (base_mnemonic, vec![
+                Operand::reg(dst),
+                Operand::reg(src1),
+                Operand::reg(src2),
+                Operand::imm_unsigned(imm6 as u64, 8),
+            ])
+        };
+
+        let final_operation = if mnemonic == "mov" || mnemonic == "mvn" {
+            Operation::Move
+        } else if mnemonic == "tst" {
+            Operation::Test
+        } else {
+            operation
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(final_operation)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode add/subtract (shifted register).
+    fn decode_add_sub_shifted_reg(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let op = (insn >> 30) & 1;
+        let s = (insn >> 29) & 1;
+        let shift = (insn >> 22) & 0x3;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let imm6 = ((insn >> 10) & 0x3F) as u8;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let is_sub = op == 1;
+        let set_flags = s == 1;
+
+        let dst = if sf { Self::xreg(rd) } else { Self::wreg(rd) };
+        let src1 = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+        let src2 = if sf { Self::xreg(rm) } else { Self::wreg(rm) };
+
+        // Check for CMP/CMN aliases
+        let (mnemonic, operands, operation) = if set_flags && rd == 31 {
+            let mnem = if is_sub { "cmp" } else { "cmn" };
+            if imm6 == 0 {
+                (mnem, vec![Operand::reg(src1), Operand::reg(src2)], Operation::Compare)
+            } else {
+                (mnem, vec![Operand::reg(src1), Operand::reg(src2), Operand::imm_unsigned(imm6 as u64, 8)], Operation::Compare)
+            }
+        } else if !set_flags && is_sub && rn == 31 {
+            // NEG alias
+            ("neg", vec![Operand::reg(dst), Operand::reg(src2)], Operation::Neg)
+        } else {
+            let mnem = match (is_sub, set_flags) {
+                (false, false) => "add",
+                (false, true) => "adds",
+                (true, false) => "sub",
+                (true, true) => "subs",
+            };
+            let op = if is_sub { Operation::Sub } else { Operation::Add };
+            if imm6 == 0 {
+                (mnem, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)], op)
+            } else {
+                (mnem, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::imm_unsigned(imm6 as u64, 8)], op)
+            }
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode add/subtract (extended register).
+    fn decode_add_sub_extended_reg(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let op = (insn >> 30) & 1;
+        let s = (insn >> 29) & 1;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let option = (insn >> 13) & 0x7;
+        let imm3 = ((insn >> 10) & 0x7) as u8;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let is_sub = op == 1;
+        let set_flags = s == 1;
+
+        let dst = if sf { Self::xreg(rd) } else { Self::wreg(rd) };
+        let src1 = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+        let src2 = if option & 0b011 == 0b011 && sf {
+            Self::xreg(rm)
+        } else {
+            Self::wreg(rm)
+        };
+
+        let mnemonic = match (is_sub, set_flags) {
+            (false, false) => "add",
+            (false, true) => "adds",
+            (true, false) => "sub",
+            (true, true) => "subs",
+        };
+
+        let operands = vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)];
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(if is_sub { Operation::Sub } else { Operation::Add })
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode data processing (2 source) - UDIV, SDIV, LSLV, etc.
+    fn decode_dp_2source(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let opcode = (insn >> 10) & 0x3F;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let (mnemonic, operation) = match opcode {
+            0b000010 => ("udiv", Operation::Div),
+            0b000011 => ("sdiv", Operation::Div),
+            0b001000 => ("lslv", Operation::Shl),
+            0b001001 => ("lsrv", Operation::Shr),
+            0b001010 => ("asrv", Operation::Sar),
+            0b001011 => ("rorv", Operation::Ror),
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let dst = if sf { Self::xreg(rd) } else { Self::wreg(rd) };
+        let src1 = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+        let src2 = if sf { Self::xreg(rm) } else { Self::wreg(rm) };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_operands(vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode data processing (1 source) - REV, CLZ, etc.
+    fn decode_dp_1source(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let opcode = (insn >> 10) & 0x3F;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let mnemonic = match opcode {
+            0b000000 => "rbit",
+            0b000001 => "rev16",
+            0b000010 => if sf { "rev32" } else { "rev" },
+            0b000011 => "rev",
+            0b000100 => "clz",
+            0b000101 => "cls",
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let dst = if sf { Self::xreg(rd) } else { Self::wreg(rd) };
+        let src = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Other(0))
+            .with_operands(vec![Operand::reg(dst), Operand::reg(src)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode conditional select (CSEL, CSINC, CSINV, CSNEG).
+    fn decode_cond_select(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let op = (insn >> 30) & 1;
+        let op2 = (insn >> 10) & 0x3;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let cond = ((insn >> 12) & 0xF) as u8;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let mnemonic = match (op, op2) {
+            (0, 0b00) => "csel",
+            (0, 0b01) => "csinc",
+            (1, 0b00) => "csinv",
+            (1, 0b01) => "csneg",
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let dst = if sf { Self::xreg(rd) } else { Self::wreg(rd) };
+        let src1 = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+        let src2 = if sf { Self::xreg(rm) } else { Self::wreg(rm) };
+        let (cond_str, _) = decode_condition(cond);
+
+        // Check for aliases
+        let (final_mnemonic, operands) = if op == 0 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE {
+            // CINC alias
+            if rn == 31 {
+                // CSET
+                ("cset", vec![Operand::reg(dst)])
+            } else {
+                ("cinc", vec![Operand::reg(dst), Operand::reg(src1)])
+            }
+        } else if op == 1 && op2 == 0b00 && rn == rm && cond & 0xE != 0xE {
+            // CINV alias
+            if rn == 31 {
+                ("csetm", vec![Operand::reg(dst)])
+            } else {
+                ("cinv", vec![Operand::reg(dst), Operand::reg(src1)])
+            }
+        } else if op == 1 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE {
+            // CNEG alias
+            ("cneg", vec![Operand::reg(dst), Operand::reg(src1)])
+        } else {
+            (mnemonic, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+        };
+
+        let inst = Instruction::new(address, 4, bytes, final_mnemonic)
+            .with_operation(Operation::Move)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode data processing (3 source) - MADD, MSUB, MUL, etc.
+    fn decode_dp_3source(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let op54 = (insn >> 29) & 0x3;
+        let op31 = (insn >> 21) & 0x7;
+        let o0 = (insn >> 15) & 1;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let ra = ((insn >> 10) & 0x1F) as u16;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let dst = if sf { Self::xreg(rd) } else { Self::wreg(rd) };
+        let src1 = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+        let src2 = if sf { Self::xreg(rm) } else { Self::wreg(rm) };
+        let addend = if sf { Self::xreg(ra) } else { Self::wreg(ra) };
+
+        let (mnemonic, operands) = match (op54, op31, o0) {
+            (0b00, 0b000, 0) => {
+                if ra == 31 {
+                    ("mul", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                } else {
+                    ("madd", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::reg(addend)])
+                }
+            }
+            (0b00, 0b000, 1) => {
+                if ra == 31 {
+                    ("mneg", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                } else {
+                    ("msub", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::reg(addend)])
+                }
+            }
+            (0b00, 0b001, 0) if sf => ("smaddl", vec![Operand::reg(dst), Operand::reg(Self::wreg(rn)), Operand::reg(Self::wreg(rm)), Operand::reg(addend)]),
+            (0b00, 0b010, 0) if sf => {
+                if ra == 31 {
+                    ("smulh", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                } else {
+                    return self.decode_unknown(insn, address, bytes);
+                }
+            }
+            (0b00, 0b101, 0) if sf => ("umaddl", vec![Operand::reg(dst), Operand::reg(Self::wreg(rn)), Operand::reg(Self::wreg(rm)), Operand::reg(addend)]),
+            (0b00, 0b110, 0) if sf => {
+                if ra == 31 {
+                    ("umulh", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                } else {
+                    return self.decode_unknown(insn, address, bytes);
+                }
+            }
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Mul)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode SIMD/FP instructions (placeholder).
+    fn decode_simd_fp(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        // For now, just output the raw encoding
+        let inst = Instruction::new(address, 4, bytes, "simd/fp")
+            .with_operation(Operation::Other(0));
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode unknown instruction.
+    fn decode_unknown(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        Err(DecodeError::unknown_opcode(address, &bytes))
+    }
+}
+
+impl Default for Arm64Disassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Disassembler for Arm64Disassembler {
+    fn decode_instruction(&self, bytes: &[u8], address: u64) -> Result<DecodedInstruction, DecodeError> {
+        self.decode(bytes, address)
+    }
+
+    fn min_instruction_size(&self) -> usize {
+        4
+    }
+
+    fn max_instruction_size(&self) -> usize {
+        4
+    }
+
+    fn is_fixed_width(&self) -> bool {
+        true
+    }
+
+    fn architecture(&self) -> Architecture {
+        Architecture::Arm64
+    }
+}
+
+/// Sign-extend a value from a given bit width.
+fn sign_extend(value: u64, bits: u8) -> i64 {
+    let shift = 64 - bits;
+    ((value as i64) << shift) >> shift
+}
+
+/// Decode ARM64 condition code.
+fn decode_condition(cond: u8) -> (&'static str, Condition) {
+    match cond {
+        0b0000 => ("eq", Condition::Equal),
+        0b0001 => ("ne", Condition::NotEqual),
+        0b0010 => ("cs", Condition::AboveOrEqual), // HS (unsigned >=)
+        0b0011 => ("cc", Condition::Below),        // LO (unsigned <)
+        0b0100 => ("mi", Condition::Sign),         // Negative
+        0b0101 => ("pl", Condition::NotSign),      // Positive or zero
+        0b0110 => ("vs", Condition::Overflow),     // Overflow
+        0b0111 => ("vc", Condition::NotOverflow),  // No overflow
+        0b1000 => ("hi", Condition::Above),        // Unsigned >
+        0b1001 => ("ls", Condition::BelowOrEqual), // Unsigned <=
+        0b1010 => ("ge", Condition::GreaterOrEqual), // Signed >=
+        0b1011 => ("lt", Condition::Less),         // Signed <
+        0b1100 => ("gt", Condition::Greater),      // Signed >
+        0b1101 => ("le", Condition::LessOrEqual),  // Signed <=
+        0b1110 => ("al", Condition::Equal),        // Always (placeholder)
+        0b1111 => ("nv", Condition::Equal),        // Never (placeholder)
+        _ => ("??", Condition::Equal),
+    }
+}
+
+/// Decode bitmask immediate (complex ARM64 encoding).
+/// This is a simplified version - full implementation is complex.
+fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
+    let len = if n == 1 {
+        6
+    } else {
+        // Find highest set bit in ~imms
+        let mut len = 5u8;
+        while len > 0 && (imms & (1 << len)) != 0 {
+            len -= 1;
+        }
+        len
+    };
+
+    if len == 0 {
+        return 0; // Invalid encoding
+    }
+
+    let size = 1u64 << (len + 1);
+    let s = (imms & ((1 << (len + 1)) - 1)) as u64;
+    let r = (immr & ((1 << (len + 1)) - 1)) as u64;
+
+    // Create base pattern
+    let ones = (1u64 << (s + 1)) - 1;
+    // Rotate right by r
+    let rotated = if r == 0 {
+        ones
+    } else {
+        (ones >> r) | (ones << (size - r))
+    };
+    let pattern = rotated & ((1u64 << size) - 1);
+
+    // Replicate pattern
+    let mut result = 0u64;
+    let mut pos = 0;
+    let reg_size = if is_64bit { 64 } else { 32 };
+    while pos < reg_size {
+        result |= pattern << pos;
+        pos += size;
+    }
+
+    if !is_64bit {
+        result &= 0xFFFFFFFF;
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nop() {
+        let disasm = Arm64Disassembler::new();
+        // NOP: 0xD503201F
+        let bytes = [0x1F, 0x20, 0x03, 0xD5];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "nop");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ret() {
+        let disasm = Arm64Disassembler::new();
+        // RET: 0xD65F03C0
+        let bytes = [0xC0, 0x03, 0x5F, 0xD6];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ret");
+        assert!(result.instruction.is_return());
+    }
+
+    #[test]
+    fn test_mov_immediate() {
+        let disasm = Arm64Disassembler::new();
+        // MOV X0, #0x1234 (MOVZ): 0xD2824680
+        let bytes = [0x80, 0x46, 0x82, 0xD2];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "mov");
+    }
+
+    #[test]
+    fn test_bl() {
+        let disasm = Arm64Disassembler::new();
+        // BL +0x100: 0x94000040
+        let bytes = [0x40, 0x00, 0x00, 0x94];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "bl");
+        assert!(result.instruction.is_call());
+    }
+}
