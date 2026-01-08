@@ -334,11 +334,56 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool) {
     }
 }
 
+/// Find a symbol by name, preferring exact matches over partial matches.
+/// For function decompilation, we want the most specific match.
+fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
+    // Collect symbols into owned values
+    let symbols: Vec<hexray_core::Symbol> = fmt.symbols().cloned().collect();
+
+    // 1. Try exact match first (highest priority)
+    if let Some(sym) = symbols.iter().find(|s| s.name == name) {
+        return Some(sym.clone());
+    }
+
+    // 2. Try exact match on demangled name
+    if let Some(sym) = symbols.iter().find(|s| demangle_or_original(&s.name) == name) {
+        return Some(sym.clone());
+    }
+
+    // 3. Try prefix match (e.g., "nfsd_open" matches "nfsd_open.cold")
+    //    Prefer function symbols and shorter names
+    let mut prefix_matches: Vec<hexray_core::Symbol> = symbols.iter()
+        .filter(|s| s.name.starts_with(name) || demangle_or_original(&s.name).starts_with(name))
+        .cloned()
+        .collect();
+    prefix_matches.sort_by(|a, b| {
+        // Prefer functions over non-functions
+        let a_is_func = a.is_function() as u8;
+        let b_is_func = b.is_function() as u8;
+        b_is_func.cmp(&a_is_func)
+            .then_with(|| a.name.len().cmp(&b.name.len())) // Shorter names preferred
+    });
+    if !prefix_matches.is_empty() {
+        return Some(prefix_matches.remove(0));
+    }
+
+    // 4. Try contains match as last resort (lowest priority)
+    //    Only match function symbols, and prefer shorter names
+    let mut contains_matches: Vec<hexray_core::Symbol> = symbols.iter()
+        .filter(|s| s.is_function() && (s.name.contains(name) || demangle_or_original(&s.name).contains(name)))
+        .cloned()
+        .collect();
+    contains_matches.sort_by(|a, b| a.name.len().cmp(&b.name.len()));
+    if !contains_matches.is_empty() {
+        return Some(contains_matches.remove(0));
+    }
+
+    None
+}
+
 fn disassemble_symbol(fmt: &dyn BinaryFormat, name: &str, max_count: usize) -> Result<()> {
-    // Find the symbol
-    let symbol = fmt
-        .symbols()
-        .find(|s| s.name == name || s.name.contains(name) || demangle_or_original(&s.name).contains(name))
+    // Find the symbol - prefer exact matches, then prefix matches, then contains
+    let symbol = find_symbol(fmt, name)
         .with_context(|| format!("Symbol '{}' not found", name))?;
 
     println!("Disassembling {} at {:#x} (size: {} bytes)\n",
@@ -440,10 +485,8 @@ fn disassemble_cfg(fmt: &dyn BinaryFormat, target: &str) -> Result<()> {
     let (start_addr, name) = if let Some(addr) = address {
         (addr, format!("sub_{:x}", addr))
     } else {
-        // Find symbol
-        let symbol = fmt
-            .symbols()
-            .find(|s| s.name == target || s.name.contains(target) || demangle_or_original(&s.name).contains(target))
+        // Find symbol using improved search
+        let symbol = find_symbol(fmt, target)
             .with_context(|| format!("Symbol '{}' not found", target))?;
         (symbol.address, demangle_or_original(&symbol.name))
     };
@@ -546,10 +589,8 @@ fn decompile_function(fmt: &dyn BinaryFormat, target: &str, show_addresses: bool
     let (start_addr, name) = if let Some(addr) = address {
         (addr, format!("sub_{:x}", addr))
     } else {
-        // Find symbol
-        let symbol = fmt
-            .symbols()
-            .find(|s| s.name == target || s.name.contains(target) || demangle_or_original(&s.name).contains(target))
+        // Find symbol using improved search
+        let symbol = find_symbol(fmt, target)
             .with_context(|| format!("Symbol '{}' not found", target))?;
         (symbol.address, demangle_or_original(&symbol.name))
     };
