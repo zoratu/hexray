@@ -177,6 +177,42 @@ fn print_info(binary: &Binary) {
             }
             println!("\nSections:      {}", elf.sections.len());
             println!("Segments:      {}", elf.segments.len());
+
+            // Display kernel module info if present
+            if let Some(modinfo) = &elf.modinfo {
+                println!("\nKernel Module Information");
+                println!("-------------------------");
+                if let Some(name) = &modinfo.name {
+                    println!("Name:          {}", name);
+                }
+                if let Some(version) = &modinfo.version {
+                    println!("Version:       {}", version);
+                }
+                if let Some(author) = &modinfo.author {
+                    println!("Author:        {}", author);
+                }
+                if let Some(description) = &modinfo.description {
+                    println!("Description:   {}", description);
+                }
+                if let Some(license) = &modinfo.license {
+                    println!("License:       {}", license);
+                }
+                if let Some(srcversion) = &modinfo.srcversion {
+                    println!("Srcversion:    {}", srcversion);
+                }
+                if let Some(vermagic) = &modinfo.vermagic {
+                    println!("Vermagic:      {}", vermagic);
+                }
+                if !modinfo.depends.is_empty() {
+                    println!("Dependencies:  {}", modinfo.depends.join(", "));
+                }
+                if modinfo.retpoline {
+                    println!("Retpoline:     Yes");
+                }
+
+                // Print relocation count
+                println!("\nRelocations:   {}", elf.relocations.len());
+            }
         }
         Binary::MachO(macho) => {
             println!("Type:          {:?}", macho.header.filetype);

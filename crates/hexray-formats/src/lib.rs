@@ -13,7 +13,7 @@ pub mod macho;
 pub mod pe;
 pub mod traits;
 
-pub use elf::Elf;
+pub use elf::{Elf, ElfType, KernelModuleInfo, Relocation, RelocationType};
 pub use error::ParseError;
 pub use macho::MachO;
 pub use pe::Pe;

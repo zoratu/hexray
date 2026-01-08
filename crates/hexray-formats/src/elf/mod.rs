@@ -2,16 +2,24 @@
 //!
 //! This module provides a complete ELF parser built from scratch,
 //! supporting both 32-bit and 64-bit formats.
+//!
+//! Supports:
+//! - Executables (ET_EXEC)
+//! - Shared objects (ET_DYN)
+//! - Relocatable objects (ET_REL) - including Linux kernel modules (.ko)
 
 mod header;
+mod relocation;
 mod section;
 mod segment;
 mod symbol;
 
 pub use header::{ElfHeader, ElfClass, ElfType, Machine};
+pub use relocation::{Relocation, RelocationType};
 pub use section::SectionHeader;
 pub use segment::ProgramHeader;
 pub use symbol::SymbolEntry;
+// KernelModuleInfo is defined in this module and is public
 
 use crate::{BinaryFormat, ParseError, Section};
 use hexray_core::{Architecture, Bitness, Endianness, Symbol};
@@ -31,6 +39,35 @@ pub struct Elf<'a> {
     symbols: Vec<Symbol>,
     /// Section name string table.
     section_names: StringTable<'a>,
+    /// Relocations (for ET_REL files).
+    pub relocations: Vec<Relocation>,
+    /// Kernel module info (if this is a .ko file).
+    pub modinfo: Option<KernelModuleInfo>,
+}
+
+/// Kernel module information parsed from .modinfo section.
+#[derive(Debug, Clone, Default)]
+pub struct KernelModuleInfo {
+    /// Module name.
+    pub name: Option<String>,
+    /// Module version.
+    pub version: Option<String>,
+    /// Module author.
+    pub author: Option<String>,
+    /// Module description.
+    pub description: Option<String>,
+    /// Module license.
+    pub license: Option<String>,
+    /// Source version (srcversion).
+    pub srcversion: Option<String>,
+    /// Module dependencies.
+    pub depends: Vec<String>,
+    /// Retpoline flag.
+    pub retpoline: bool,
+    /// Module vermagic string.
+    pub vermagic: Option<String>,
+    /// All key-value pairs from modinfo.
+    pub all_info: Vec<(String, String)>,
 }
 
 impl<'a> Elf<'a> {
@@ -61,8 +98,18 @@ impl<'a> Elf<'a> {
             StringTable::empty()
         };
 
-        // Parse symbols
+        // Parse symbols (with section base address adjustment for ET_REL)
         let symbols = Self::parse_symbols(data, &sections, &header)?;
+
+        // Parse relocations for relocatable files
+        let relocations = if header.file_type == ElfType::Relocatable {
+            Self::parse_relocations(data, &sections, &header)?
+        } else {
+            Vec::new()
+        };
+
+        // Parse kernel module info if present
+        let modinfo = Self::parse_modinfo(data, &sections, &section_names);
 
         Ok(Self {
             data,
@@ -71,6 +118,8 @@ impl<'a> Elf<'a> {
             segments,
             symbols,
             section_names,
+            relocations,
+            modinfo,
         })
     }
 
@@ -134,9 +183,10 @@ impl<'a> Elf<'a> {
         header: &ElfHeader,
     ) -> Result<Vec<Symbol>, ParseError> {
         let mut symbols = Vec::new();
+        let is_relocatable = header.file_type == ElfType::Relocatable;
 
         // Find symbol table sections (.symtab and .dynsym)
-        for (idx, section) in sections.iter().enumerate() {
+        for (_idx, section) in sections.iter().enumerate() {
             if section.sh_type != section::SHT_SYMTAB
                 && section.sh_type != section::SHT_DYNSYM
             {
@@ -177,13 +227,193 @@ impl<'a> Elf<'a> {
                 )?;
 
                 let name = strtab.get(entry.st_name as usize).unwrap_or("");
-                symbols.push(entry.to_symbol(name.to_string()));
+                let mut sym = entry.to_symbol(name.to_string());
+
+                // For relocatable files, adjust symbol address to be globally unique
+                // by adding the section's file offset
+                if is_relocatable && entry.st_shndx > 0 && (entry.st_shndx as usize) < sections.len() {
+                    let sym_section = &sections[entry.st_shndx as usize];
+                    // Use section file offset + symbol value as the address
+                    sym.address = sym_section.sh_offset + entry.st_value;
+                }
+
+                symbols.push(sym);
 
                 offset += entry_size;
             }
         }
 
         Ok(symbols)
+    }
+
+    fn parse_relocations(
+        data: &[u8],
+        sections: &[SectionHeader],
+        header: &ElfHeader,
+    ) -> Result<Vec<Relocation>, ParseError> {
+        let mut relocations = Vec::new();
+        let is_x86_64 = matches!(header.machine, Machine::X86_64);
+
+        for (idx, section) in sections.iter().enumerate() {
+            // RELA sections have an explicit addend
+            if section.sh_type == section::SHT_RELA {
+                let start = section.sh_offset as usize;
+                let end = start + section.sh_size as usize;
+                if end <= data.len() {
+                    // sh_info tells us which section these relocations apply to
+                    let target_section = section.sh_info as usize;
+                    let relocs = Relocation::parse_rela(
+                        &data[start..end],
+                        section,
+                        target_section,
+                        header.class,
+                        header.endianness,
+                        is_x86_64,
+                    )?;
+                    relocations.extend(relocs);
+                }
+            }
+            // REL sections have implicit addend (stored in the target location)
+            else if section.sh_type == section::SHT_REL {
+                let start = section.sh_offset as usize;
+                let end = start + section.sh_size as usize;
+                if end <= data.len() {
+                    let target_section = section.sh_info as usize;
+                    let relocs = Relocation::parse_rel(
+                        &data[start..end],
+                        section,
+                        target_section,
+                        header.class,
+                        header.endianness,
+                        is_x86_64,
+                    )?;
+                    relocations.extend(relocs);
+                }
+            }
+        }
+
+        Ok(relocations)
+    }
+
+    fn parse_modinfo(
+        data: &[u8],
+        sections: &[SectionHeader],
+        section_names: &StringTable,
+    ) -> Option<KernelModuleInfo> {
+        // Find .modinfo section
+        let modinfo_section = sections.iter().find(|s| {
+            section_names
+                .get(s.sh_name as usize)
+                .map(|n| n == ".modinfo")
+                .unwrap_or(false)
+        })?;
+
+        let start = modinfo_section.sh_offset as usize;
+        let end = start + modinfo_section.sh_size as usize;
+        if end > data.len() {
+            return None;
+        }
+
+        let modinfo_data = &data[start..end];
+        let mut info = KernelModuleInfo::default();
+
+        // Parse null-terminated key=value pairs
+        let mut offset = 0;
+        while offset < modinfo_data.len() {
+            // Find the end of this entry
+            let entry_end = modinfo_data[offset..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| offset + p)
+                .unwrap_or(modinfo_data.len());
+
+            if entry_end > offset {
+                if let Ok(entry_str) = std::str::from_utf8(&modinfo_data[offset..entry_end]) {
+                    if let Some((key, value)) = entry_str.split_once('=') {
+                        let key = key.trim();
+                        let value = value.trim();
+
+                        info.all_info.push((key.to_string(), value.to_string()));
+
+                        match key {
+                            "name" => info.name = Some(value.to_string()),
+                            "version" => info.version = Some(value.to_string()),
+                            "author" => info.author = Some(value.to_string()),
+                            "description" => info.description = Some(value.to_string()),
+                            "license" => info.license = Some(value.to_string()),
+                            "srcversion" => info.srcversion = Some(value.to_string()),
+                            "vermagic" => info.vermagic = Some(value.to_string()),
+                            "depends" => {
+                                info.depends = value
+                                    .split(',')
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| s.trim().to_string())
+                                    .collect();
+                            }
+                            "retpoline" => info.retpoline = value == "Y",
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            offset = entry_end + 1;
+        }
+
+        // Only return if we found at least some module info
+        if info.all_info.is_empty() {
+            None
+        } else {
+            Some(info)
+        }
+    }
+
+    /// Returns true if this is a kernel module (.ko file).
+    pub fn is_kernel_module(&self) -> bool {
+        self.modinfo.is_some()
+    }
+
+    /// Returns true if this is a relocatable object file.
+    pub fn is_relocatable(&self) -> bool {
+        self.header.file_type == ElfType::Relocatable
+    }
+
+    /// Get bytes from a relocatable file using section-based addressing.
+    ///
+    /// For relocatable files, "addresses" are actually section offsets.
+    /// We use a virtual addressing scheme where each section's base address
+    /// is its file offset, allowing unique addresses across sections.
+    fn bytes_at_relocatable(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        // For relocatable files, we use section file offsets as virtual addresses
+        // This allows us to have unique addresses for all sections
+        for section in &self.sections {
+            // Skip sections without data
+            if section.sh_type == section::SHT_NOBITS || section.sh_size == 0 {
+                continue;
+            }
+
+            // Use section's file offset as its base address for relocatable files
+            let section_base = section.sh_offset;
+            let section_end = section_base + section.sh_size;
+
+            if addr >= section_base && addr < section_end {
+                let offset_in_section = (addr - section_base) as usize;
+                let file_offset = section.sh_offset as usize + offset_in_section;
+                let available = (section.sh_size as usize).saturating_sub(offset_in_section);
+                let to_read = len.min(available);
+
+                if file_offset + to_read <= self.data.len() {
+                    return Some(&self.data[file_offset..file_offset + to_read]);
+                }
+            }
+        }
+        None
+    }
+
+    /// For kernel modules, get the base address of a section by name.
+    /// In relocatable files, this returns the section's file offset.
+    pub fn section_base_address(&self, name: &str) -> Option<u64> {
+        self.section_by_name(name).map(|s| s.sh_offset)
     }
 
     /// Returns the section with the given name.
@@ -259,7 +489,12 @@ impl BinaryFormat for Elf<'_> {
     }
 
     fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
-        // Find the segment containing this address
+        // For relocatable files (including kernel modules), use section-based lookup
+        if self.header.file_type == ElfType::Relocatable {
+            return self.bytes_at_relocatable(addr, len);
+        }
+
+        // For executables/shared objects, use segment-based lookup
         for segment in &self.segments {
             if segment.p_type != segment::PT_LOAD {
                 continue;
