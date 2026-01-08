@@ -72,9 +72,12 @@ impl OpcodeEntry {
     }
 }
 
+/// Const None for array initialization (stable Rust compatibility)
+const NONE_ENTRY: Option<OpcodeEntry> = None;
+
 /// One-byte opcode table.
 pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
-    let mut table: [Option<OpcodeEntry>; 256] = [const { None }; 256];
+    let mut table: [Option<OpcodeEntry>; 256] = [NONE_ENTRY; 256];
 
     // ADD
     table[0x00] = Some(OpcodeEntry::new("add", Operation::Add, OperandEncoding::ModRmRm_Reg).with_size(8));
@@ -242,7 +245,7 @@ pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
 
 /// Two-byte opcode table (0x0F prefix).
 pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
-    let mut table: [Option<OpcodeEntry>; 256] = [const { None }; 256];
+    let mut table: [Option<OpcodeEntry>; 256] = [NONE_ENTRY; 256];
 
     // SYSCALL
     table[0x05] = Some(OpcodeEntry::new("syscall", Operation::Syscall, OperandEncoding::None));
