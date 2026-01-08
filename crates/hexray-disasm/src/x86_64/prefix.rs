@@ -1,5 +1,7 @@
 //! x86 prefix parsing.
 
+#![allow(dead_code)]
+
 /// Legacy prefixes that can appear before an instruction.
 #[derive(Debug, Clone, Default)]
 pub struct Prefixes {

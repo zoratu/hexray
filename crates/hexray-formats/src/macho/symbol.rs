@@ -1,5 +1,7 @@
 //! Mach-O symbol table parsing.
 
+#![allow(dead_code)]
+
 use crate::ParseError;
 use hexray_core::{Symbol, SymbolBinding, SymbolKind};
 

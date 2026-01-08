@@ -7,6 +7,8 @@
 //! - Meet: union (a definition reaches if it reaches along any path)
 //! - Transfer: gen ∪ (in - kill)
 
+#![allow(dead_code)]
+
 use super::{DataflowAnalysis, DataflowSolver, InstructionEffects, Location};
 use hexray_core::{BasicBlockId, ControlFlowGraph};
 use std::collections::{HashMap, HashSet};

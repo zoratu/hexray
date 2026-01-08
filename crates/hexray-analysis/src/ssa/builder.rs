@@ -7,7 +7,7 @@
 use super::types::*;
 use super::{collect_definitions, compute_dominance_frontiers, find_phi_placements};
 use crate::dataflow::{InstructionEffects, Location};
-use hexray_core::{BasicBlockId, ControlFlowGraph, Operand, Register};
+use hexray_core::{BasicBlockId, ControlFlowGraph, Operand};
 use std::collections::{HashMap, HashSet};
 
 /// Builds SSA form from a CFG.

@@ -20,7 +20,7 @@ pub mod builder;
 pub use types::{SsaValue, SsaInstruction, SsaBlock, SsaFunction, PhiNode, Version};
 pub use builder::SsaBuilder;
 
-use crate::dataflow::{LivenessAnalysis, Location};
+use crate::dataflow::Location;
 use hexray_core::{BasicBlockId, ControlFlowGraph};
 use std::collections::{HashMap, HashSet};
 
@@ -73,7 +73,7 @@ pub fn compute_dominance_frontiers(
 /// at the dominance frontier of each definition, and placing a phi is
 /// itself a new definition requiring its own frontier.
 pub fn find_phi_placements(
-    cfg: &ControlFlowGraph,
+    _cfg: &ControlFlowGraph,
     frontiers: &HashMap<BasicBlockId, HashSet<BasicBlockId>>,
     def_blocks: &HashSet<BasicBlockId>,
 ) -> HashSet<BasicBlockId> {

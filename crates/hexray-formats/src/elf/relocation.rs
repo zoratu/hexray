@@ -217,7 +217,7 @@ impl Relocation {
             return Err(ParseError::too_short(16, data.len()));
         }
 
-        let read_u32 = |offset: usize| -> u32 {
+        let _read_u32 = |offset: usize| -> u32 {
             let bytes = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
             match endianness {
                 Endianness::Little => u32::from_le_bytes(bytes),

@@ -61,7 +61,7 @@ pub struct Import {
 pub fn parse_imports(
     data: &[u8],
     import_dir_rva: u32,
-    import_dir_size: u32,
+    _import_dir_size: u32,
     sections: &[super::section::SectionHeader],
     is_64bit: bool,
 ) -> Vec<Import> {

@@ -21,7 +21,7 @@ pub use liveness::LivenessAnalysis;
 pub use reaching_defs::ReachingDefinitions;
 
 use hexray_core::{BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation, Register};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A location (register or memory) that can be defined or used.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

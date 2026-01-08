@@ -2,6 +2,8 @@
 //!
 //! Transforms a CFG into structured control flow (if/else, while, for, etc.).
 
+#![allow(dead_code)]
+
 use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, Operation, cfg::Loop};
 use std::collections::{HashMap, HashSet};
 
@@ -534,7 +536,7 @@ impl<'a> Structurer<'a> {
         region_end: Option<BasicBlockId>,
     ) -> Option<BasicBlockId> {
         // Use dominator information to find where paths converge
-        let dominators = self.cfg.compute_dominators();
+        let _dominators = self.cfg.compute_dominators();
 
         // Find blocks reachable from both branches
         let mut true_reachable = HashSet::new();

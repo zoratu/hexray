@@ -130,7 +130,7 @@ impl<'a> Elf<'a> {
         let mut sections = Vec::with_capacity(header.e_shnum as usize);
         let mut offset = header.e_shoff as usize;
 
-        for i in 0..header.e_shnum {
+        for _i in 0..header.e_shnum {
             if offset + header.e_shentsize as usize > data.len() {
                 return Err(ParseError::too_short(
                     offset + header.e_shentsize as usize,
@@ -254,7 +254,7 @@ impl<'a> Elf<'a> {
         let mut relocations = Vec::new();
         let is_x86_64 = matches!(header.machine, Machine::X86_64);
 
-        for (idx, section) in sections.iter().enumerate() {
+        for (_idx, section) in sections.iter().enumerate() {
             // RELA sections have an explicit addend
             if section.sh_type == section::SHT_RELA {
                 let start = section.sh_offset as usize;

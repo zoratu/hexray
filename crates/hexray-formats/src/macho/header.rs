@@ -1,5 +1,7 @@
 //! Mach-O header parsing.
 
+#![allow(dead_code)]
+
 use crate::ParseError;
 use hexray_core::Architecture;
 

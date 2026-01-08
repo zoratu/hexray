@@ -2,6 +2,8 @@
 //!
 //! Emits readable pseudo-code from structured control flow.
 
+#![allow(dead_code)]
+
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::expression::{Expr, ExprKind};
 use super::{StringTable, SymbolTable};

@@ -1,5 +1,7 @@
 //! ARM64 instruction decoder implementation.
 
+#![allow(unused_variables)]
+
 use crate::{DecodeError, DecodedInstruction, Disassembler};
 use hexray_core::{
     Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand, Operation,

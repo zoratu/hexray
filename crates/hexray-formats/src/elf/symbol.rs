@@ -1,5 +1,7 @@
 //! ELF symbol table parsing.
 
+#![allow(dead_code)]
+
 use super::header::ElfClass;
 use crate::ParseError;
 use hexray_core::{Endianness, Symbol, SymbolBinding, SymbolKind};

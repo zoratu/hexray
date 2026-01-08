@@ -7,6 +7,8 @@
 //! - Common load commands
 //! - Symbol tables
 
+#![allow(dead_code)]
+
 mod header;
 mod load_command;
 mod segment;
@@ -18,7 +20,7 @@ pub use segment::{Segment, Section as MachSection};
 pub use symbol::Nlist;
 
 use crate::{BinaryFormat, ParseError, Section};
-use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
+use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolKind};
 
 /// A parsed Mach-O binary.
 #[derive(Debug)]

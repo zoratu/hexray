@@ -1,5 +1,7 @@
 //! Mach-O load command parsing.
 
+#![allow(dead_code)]
+
 use super::segment::Segment;
 use crate::ParseError;
 

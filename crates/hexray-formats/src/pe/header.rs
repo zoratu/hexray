@@ -1,5 +1,7 @@
 //! PE header parsing.
 
+#![allow(dead_code)]
+
 use crate::ParseError;
 
 /// DOS header magic number ("MZ")
