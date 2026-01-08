@@ -121,6 +121,42 @@ impl SymbolTable {
     }
 }
 
+/// Relocation table for resolving call targets in relocatable files.
+///
+/// In kernel modules and other relocatable files, call instructions
+/// have unresolved targets (offset = 0) that need relocation info
+/// to determine the actual call target.
+#[derive(Debug, Clone, Default)]
+pub struct RelocationTable {
+    /// Maps call instruction addresses to target symbol names.
+    relocations: HashMap<u64, String>,
+}
+
+impl RelocationTable {
+    /// Creates a new empty relocation table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a relocation entry.
+    ///
+    /// `call_addr` is the address of the call instruction.
+    /// `target_symbol` is the name of the function being called.
+    pub fn insert(&mut self, call_addr: u64, target_symbol: String) {
+        self.relocations.insert(call_addr, target_symbol);
+    }
+
+    /// Looks up a call target by call instruction address.
+    pub fn get(&self, call_addr: u64) -> Option<&str> {
+        self.relocations.get(&call_addr).map(|s| s.as_str())
+    }
+
+    /// Returns true if the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.relocations.is_empty()
+    }
+}
+
 /// Main entry point for decompilation.
 ///
 /// Takes a CFG and produces pseudo-code output.
@@ -133,6 +169,8 @@ pub struct Decompiler {
     pub string_table: Option<StringTable>,
     /// Symbol table for resolving function addresses.
     pub symbol_table: Option<SymbolTable>,
+    /// Relocation table for resolving call targets in relocatable files.
+    pub relocation_table: Option<RelocationTable>,
 }
 
 impl Default for Decompiler {
@@ -142,6 +180,7 @@ impl Default for Decompiler {
             indent: "    ".to_string(),
             string_table: None,
             symbol_table: None,
+            relocation_table: None,
         }
     }
 }
@@ -176,6 +215,12 @@ impl Decompiler {
         self
     }
 
+    /// Sets the relocation table for resolving call targets.
+    pub fn with_relocation_table(mut self, table: RelocationTable) -> Self {
+        self.relocation_table = Some(table);
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 1: Structure the control flow
@@ -184,7 +229,8 @@ impl Decompiler {
         // Step 2: Emit pseudo-code
         let emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
-            .with_symbol_table(self.symbol_table.clone());
+            .with_symbol_table(self.symbol_table.clone())
+            .with_relocation_table(self.relocation_table.clone());
         emitter.emit(&structured, func_name)
     }
 

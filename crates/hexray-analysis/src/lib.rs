@@ -21,7 +21,7 @@ pub mod types;
 
 pub use cfg_builder::CfgBuilder;
 pub use dataflow::{DefUseChain, LivenessAnalysis, ReachingDefinitions, Location};
-pub use decompiler::{Decompiler, StringTable, SymbolTable};
+pub use decompiler::{Decompiler, StringTable, SymbolTable, RelocationTable};
 pub use function_finder::FunctionFinder;
 pub use ssa::{SsaBuilder, SsaFunction, SsaValue, PhiNode};
 pub use types::{Type, TypeInference, FunctionSignatures};

@@ -6,7 +6,7 @@
 
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::expression::{Expr, ExprKind};
-use super::{StringTable, SymbolTable};
+use super::{StringTable, SymbolTable, RelocationTable};
 use std::fmt::Write;
 
 /// Emits pseudo-code from structured control flow.
@@ -15,6 +15,7 @@ pub struct PseudoCodeEmitter {
     emit_addresses: bool,
     string_table: Option<StringTable>,
     symbol_table: Option<SymbolTable>,
+    relocation_table: Option<RelocationTable>,
 }
 
 impl PseudoCodeEmitter {
@@ -25,6 +26,7 @@ impl PseudoCodeEmitter {
             emit_addresses,
             string_table: None,
             symbol_table: None,
+            relocation_table: None,
         }
     }
 
@@ -37,6 +39,12 @@ impl PseudoCodeEmitter {
     /// Sets the symbol table for resolving function addresses.
     pub fn with_symbol_table(mut self, table: Option<SymbolTable>) -> Self {
         self.symbol_table = table;
+        self
+    }
+
+    /// Sets the relocation table for resolving call targets in relocatable files.
+    pub fn with_relocation_table(mut self, table: Option<RelocationTable>) -> Self {
+        self.relocation_table = table;
         self
     }
 
@@ -86,9 +94,24 @@ impl PseudoCodeEmitter {
             }
             ExprKind::Call { target, args } => {
                 let target_str = match target {
-                    super::expression::CallTarget::Direct(addr) => {
-                        // First check if this is a known function symbol
-                        if let Some(ref sym_table) = self.symbol_table {
+                    super::expression::CallTarget::Direct { target: addr, call_site } => {
+                        // First check relocation table (for kernel modules)
+                        // This uses the call instruction address to find the target symbol
+                        if let Some(ref reloc_table) = self.relocation_table {
+                            if let Some(name) = reloc_table.get(*call_site) {
+                                name.to_string()
+                            } else if let Some(ref sym_table) = self.symbol_table {
+                                // Fall back to symbol table by target address
+                                if let Some(name) = sym_table.get(*addr) {
+                                    name.to_string()
+                                } else {
+                                    format!("sub_{:x}", addr)
+                                }
+                            } else {
+                                format!("sub_{:x}", addr)
+                            }
+                        } else if let Some(ref sym_table) = self.symbol_table {
+                            // Check symbol table by target address
                             if let Some(name) = sym_table.get(*addr) {
                                 name.to_string()
                             } else if let Some(s) = table.get(*addr) {

@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use hexray_analysis::{CfgBuilder, Decompiler, StringTable, SymbolTable};
+use hexray_analysis::{CfgBuilder, Decompiler, StringTable, SymbolTable, RelocationTable};
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
 use hexray_disasm::{Disassembler, X86_64Disassembler, Arm64Disassembler, RiscVDisassembler};
@@ -138,7 +138,7 @@ fn main() -> Result<()> {
             disassemble_cfg(fmt, &target)?;
         }
         Some(Commands::Decompile { target, no_addresses }) => {
-            decompile_function(fmt, &target, !no_addresses)?;
+            decompile_function(&binary, &target, !no_addresses)?;
         }
         None => {
             // Default: disassemble
@@ -578,7 +578,9 @@ fn disassemble_for_cfg<D: Disassembler>(
     instructions
 }
 
-fn decompile_function(fmt: &dyn BinaryFormat, target: &str, show_addresses: bool) -> Result<()> {
+fn decompile_function(binary: &Binary, target: &str, show_addresses: bool) -> Result<()> {
+    let fmt = binary.as_format();
+
     // Try to parse as address first
     let address = if let Some(stripped) = target.strip_prefix("0x") {
         u64::from_str_radix(stripped, 16).ok()
@@ -634,11 +636,15 @@ fn decompile_function(fmt: &dyn BinaryFormat, target: &str, show_addresses: bool
     // Build symbol table for function names
     let symbol_table = build_symbol_table(fmt);
 
+    // Build relocation table for kernel modules
+    let relocation_table = build_relocation_table(binary);
+
     // Decompile
     let decompiler = Decompiler::new()
         .with_addresses(show_addresses)
         .with_string_table(string_table)
-        .with_symbol_table(symbol_table);
+        .with_symbol_table(symbol_table)
+        .with_relocation_table(relocation_table);
     let pseudocode = decompiler.decompile(&cfg, &name);
 
     println!("{}", pseudocode);
@@ -679,6 +685,64 @@ fn build_symbol_table(fmt: &dyn BinaryFormat) -> SymbolTable {
     for symbol in fmt.symbols() {
         if symbol.is_function() && symbol.address != 0 {
             table.insert(symbol.address, symbol.name.clone());
+        }
+    }
+
+    table
+}
+
+/// Builds a relocation table from ELF relocations.
+///
+/// For kernel modules and other relocatable files, call instructions have
+/// unresolved targets. This table maps call instruction addresses to the
+/// actual target symbol names based on relocation entries.
+fn build_relocation_table(binary: &Binary) -> RelocationTable {
+    use hexray_formats::RelocationType;
+
+    let mut table = RelocationTable::new();
+
+    // Only ELF files have relocations we need to process
+    let elf = match binary {
+        Binary::Elf(elf) => elf,
+        _ => return table,
+    };
+
+    // Collect symbols for lookup by index
+    let symbols: Vec<_> = elf.symbols().collect();
+
+    // Find the .text section to get its file offset
+    let text_section = elf.sections.iter().find(|s| {
+        if let Some(name) = elf.section_name(s) {
+            name == ".text"
+        } else {
+            false
+        }
+    });
+
+    let text_offset = text_section.map(|s| s.sh_offset).unwrap_or(0);
+
+    // Process relocations
+    for reloc in &elf.relocations {
+        // We're interested in PC-relative call relocations
+        match reloc.r_type {
+            RelocationType::Pc32 | RelocationType::Plt32 => {
+                // Get the symbol name
+                if let Some(symbol) = symbols.get(reloc.symbol_index as usize) {
+                    // The relocation offset points to the 4-byte displacement in the call instruction
+                    // For x86_64 call E8 xx xx xx xx, the call opcode is at offset-1
+                    // But for kernel modules, the relocation offset is relative to the section
+                    // We need to convert to the address used by the disassembler
+
+                    // The call instruction address is:
+                    // section_file_offset + relocation_offset - 1 (for E8 opcode)
+                    let call_addr = text_offset + reloc.offset - 1;
+
+                    if !symbol.name.is_empty() {
+                        table.insert(call_addr, symbol.name.clone());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 

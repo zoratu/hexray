@@ -191,7 +191,9 @@ impl UnaryOpKind {
 #[derive(Debug, Clone)]
 pub enum CallTarget {
     /// Direct call to address.
-    Direct(u64),
+    /// `target` is the computed call target address.
+    /// `call_site` is the address of the call instruction itself (for relocation lookup).
+    Direct { target: u64, call_site: u64 },
     /// Direct call to named function.
     Named(String),
     /// Indirect call through expression.
@@ -454,10 +456,11 @@ impl Expr {
                 }
             }
             Operation::Call => {
+                let call_site = inst.address;
                 let target = if !ops.is_empty() {
                     match &ops[0] {
-                        Operand::PcRelative { target, .. } => CallTarget::Direct(*target),
-                        Operand::Immediate(imm) => CallTarget::Direct(imm.as_u64()),
+                        Operand::PcRelative { target, .. } => CallTarget::Direct { target: *target, call_site },
+                        Operand::Immediate(imm) => CallTarget::Direct { target: imm.as_u64(), call_site },
                         _ => CallTarget::Indirect(Box::new(Self::from_operand(&ops[0]))),
                     }
                 } else {
@@ -559,7 +562,7 @@ impl fmt::Display for Expr {
             ExprKind::AddressOf(e) => write!(f, "&{}", e),
             ExprKind::Call { target, args } => {
                 match target {
-                    CallTarget::Direct(addr) => write!(f, "sub_{:x}", addr)?,
+                    CallTarget::Direct { target, .. } => write!(f, "sub_{:x}", target)?,
                     CallTarget::Named(name) => write!(f, "{}", name)?,
                     CallTarget::Indirect(e) => write!(f, "({})", e)?,
                 }
