@@ -1,7 +1,7 @@
 //! x86_64 instruction decoder.
 
 use super::modrm::{decode_gpr, decode_modrm_reg, decode_modrm_rm, ModRM};
-use super::opcodes::{OperandEncoding, OPCODE_TABLE, OPCODE_TABLE_0F, GROUP1_OPS};
+use super::opcodes::{OperandEncoding, OPCODE_TABLE, OPCODE_TABLE_0F, GROUP1_OPS, GROUP5_OPS};
 use super::prefix::Prefixes;
 use crate::error::DecodeError;
 use crate::traits::{DecodedInstruction, Disassembler};
@@ -89,6 +89,10 @@ impl Disassembler for X86_64Disassembler {
             // Handle group 2 (shift/rotate: 0xC0-0xC1, 0xD0-0xD3)
             if opcode == 0xC0 || opcode == 0xC1 || (opcode >= 0xD0 && opcode <= 0xD3) {
                 return self.decode_group2(bytes, address, &prefixes, offset, opcode);
+            }
+            // Handle group 5 (0xFF: INC/DEC/CALL/JMP/PUSH)
+            if opcode == 0xFF {
+                return self.decode_group5(bytes, address, &prefixes, offset);
             }
             OPCODE_TABLE[opcode as usize].as_ref()
         };
@@ -536,6 +540,78 @@ impl X86_64Disassembler {
             size: offset,
         })
     }
+
+    /// Decode group 5 instructions (0xFF: INC/DEC/CALL/JMP/PUSH r/m).
+    fn decode_group5(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        let modrm = ModRM::parse(remaining[0], prefixes.rex);
+        offset += 1;
+
+        // Determine operation from ModR/M reg field
+        let (mnemonic, operation) = GROUP5_OPS[(modrm.reg & 0x7) as usize];
+
+        // Reserved opcode extension
+        if mnemonic.is_empty() {
+            return Err(DecodeError::invalid_encoding(address, "reserved opcode extension in group 5"));
+        }
+
+        // Operand size: CALL/JMP are always 64-bit in 64-bit mode, others depend on prefix
+        let operand_size = match modrm.reg & 0x7 {
+            2 | 3 | 4 | 5 => 64, // CALL/JMP always 64-bit
+            6 => 64,             // PUSH always 64-bit in 64-bit mode
+            _ => prefixes.operand_size(false), // INC/DEC use normal size
+        };
+
+        // Decode r/m operand
+        let rm_bytes = &bytes[offset..];
+        let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+        offset += rm_consumed;
+
+        // Determine control flow
+        let control_flow = match modrm.reg & 0x7 {
+            2 | 3 => {
+                // CALL r/m64 (indirect call)
+                ControlFlow::IndirectCall {
+                    return_addr: address + offset as u64,
+                }
+            }
+            4 | 5 => {
+                // JMP r/m64 (indirect jump)
+                ControlFlow::IndirectBranch {
+                    possible_targets: vec![],
+                }
+            }
+            _ => ControlFlow::Sequential,
+        };
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands: vec![rm_operand],
+            control_flow,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -611,5 +687,32 @@ mod tests {
         let result = disasm.decode_instruction(&[0x0f, 0x05], 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "syscall");
         assert!(matches!(result.instruction.control_flow, ControlFlow::Syscall));
+    }
+
+    #[test]
+    fn test_endbr64() {
+        let disasm = X86_64Disassembler::new();
+        // F3 0F 1E FA = ENDBR64 (treated as NOP)
+        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0x1e, 0xfa], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "nop");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_indirect_call_rip() {
+        let disasm = X86_64Disassembler::new();
+        // FF 15 xx xx xx xx = CALL [rip+disp32]
+        let result = disasm.decode_instruction(&[0xff, 0x15, 0x10, 0x00, 0x00, 0x00], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "call");
+        assert!(matches!(result.instruction.control_flow, ControlFlow::IndirectCall { .. }));
+    }
+
+    #[test]
+    fn test_indirect_jmp_reg() {
+        let disasm = X86_64Disassembler::new();
+        // FF E0 = JMP rax
+        let result = disasm.decode_instruction(&[0xff, 0xe0], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "jmp");
+        assert!(matches!(result.instruction.control_flow, ControlFlow::IndirectBranch { .. }));
     }
 }

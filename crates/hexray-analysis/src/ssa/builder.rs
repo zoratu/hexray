@@ -249,7 +249,7 @@ impl<'a> SsaBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, BlockTerminator, Condition, Instruction, Operation, Immediate, RegisterClass, Architecture};
+    use hexray_core::{BasicBlock, BlockTerminator, Condition, Instruction, Operation, Immediate, RegisterClass, Architecture, Register};
 
     fn make_register(id: u16, _name: &str) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, 64)

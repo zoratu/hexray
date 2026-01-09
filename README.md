@@ -286,7 +286,7 @@ cargo doc --open
 
 ## License
 
-MIT License
+GNU GPLv3
 
 ## Acknowledgments
 

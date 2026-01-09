@@ -138,6 +138,8 @@ struct Structurer<'a> {
     loop_info: HashMap<BasicBlockId, LoopInfo>,
     visited: HashSet<BasicBlockId>,
     processed: HashSet<BasicBlockId>,
+    /// Blocks with multiple predecessors that should be emitted with labels.
+    multi_pred_blocks: HashSet<BasicBlockId>,
 }
 
 impl<'a> Structurer<'a> {
@@ -162,6 +164,34 @@ impl<'a> Structurer<'a> {
             });
         }
 
+        // Find blocks with multiple predecessors that are "cleanup targets"
+        // These are blocks that have jumps coming FROM addresses AFTER them
+        // (indicating error cleanup patterns where later code jumps back to earlier cleanup)
+        let mut multi_pred_blocks = HashSet::new();
+        for block_id in cfg.block_ids() {
+            let preds = cfg.predecessors(block_id);
+            if preds.len() < 2 || loop_headers.contains(&block_id) {
+                continue;
+            }
+
+            // Get this block's start address
+            let block_addr = cfg.block(block_id).map(|b| b.start).unwrap_or(0);
+
+            // Count how many predecessors have higher addresses (backward jumps to this block)
+            let backward_jumps = preds.iter()
+                .filter(|&&pred_id| {
+                    cfg.block(pred_id)
+                        .map(|b| b.start > block_addr)
+                        .unwrap_or(false)
+                })
+                .count();
+
+            // If multiple paths jump backward to this block, it's a cleanup target
+            if backward_jumps >= 2 {
+                multi_pred_blocks.insert(block_id);
+            }
+        }
+
         Self {
             cfg,
             loops,
@@ -169,6 +199,7 @@ impl<'a> Structurer<'a> {
             loop_info,
             visited: HashSet::new(),
             processed: HashSet::new(),
+            multi_pred_blocks,
         }
     }
 
@@ -213,7 +244,27 @@ impl<'a> Structurer<'a> {
     }
 
     fn structure(&mut self) -> Vec<StructuredNode> {
-        self.structure_region(self.cfg.entry, None)
+        let mut result = self.structure_region(self.cfg.entry, None);
+
+        // Emit any unprocessed multi-predecessor blocks as labeled sections
+        // Sort by address for consistent output
+        let mut unprocessed: Vec<_> = self.multi_pred_blocks
+            .iter()
+            .filter(|b| !self.processed.contains(b))
+            .copied()
+            .collect();
+        unprocessed.sort_by_key(|b| self.cfg.block(*b).map(|blk| blk.start).unwrap_or(0));
+
+        for block_id in unprocessed {
+            // Add label
+            result.push(StructuredNode::Label(block_id));
+
+            // Structure from this block
+            let block_nodes = self.structure_region(block_id, None);
+            result.extend(block_nodes);
+        }
+
+        result
     }
 
     fn structure_region(
@@ -227,6 +278,13 @@ impl<'a> Structurer<'a> {
         while let Some(block_id) = current {
             // Stop if we've reached the end of this region
             if end == Some(block_id) {
+                break;
+            }
+
+            // If this is a multi-predecessor block (shared target) and not the first block,
+            // emit a goto and let it be handled as a labeled block later
+            if self.multi_pred_blocks.contains(&block_id) && block_id != start {
+                result.push(StructuredNode::Goto(block_id));
                 break;
             }
 
@@ -654,6 +712,14 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
             // For CMP/TEST instructions, operands are [src1, src2]
             let left = Expr::from_operand(&inst.operands[0]);
             let right = Expr::from_operand(&inst.operands[1]);
+
+            // Special case: TEST reg, reg (same register) is a zero check
+            // test eax, eax; je → jump if eax == 0
+            // test eax, eax; jne → jump if eax != 0
+            if matches!(inst.operation, Operation::Test) && inst.operands[0] == inst.operands[1] {
+                return Expr::binop(op, left, Expr::int(0));
+            }
+
             return Expr::binop(op, left, right);
         } else if inst.operands.len() == 1 {
             // Compare against zero (common for test/cmp with single operand)

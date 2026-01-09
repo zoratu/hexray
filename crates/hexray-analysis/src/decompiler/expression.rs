@@ -163,6 +163,23 @@ impl BinOpKind {
             Self::Mul | Self::Div | Self::Mod => 10,
         }
     }
+
+    /// Returns the negated comparison operator, if this is a comparison.
+    pub fn negate(&self) -> Option<Self> {
+        match self {
+            Self::Eq => Some(Self::Ne),
+            Self::Ne => Some(Self::Eq),
+            Self::Lt => Some(Self::Ge),
+            Self::Le => Some(Self::Gt),
+            Self::Gt => Some(Self::Le),
+            Self::Ge => Some(Self::Lt),
+            Self::ULt => Some(Self::UGe),
+            Self::ULe => Some(Self::UGt),
+            Self::UGt => Some(Self::ULe),
+            Self::UGe => Some(Self::ULt),
+            _ => None,
+        }
+    }
 }
 
 /// Unary operation kinds.
@@ -321,6 +338,27 @@ impl Expr {
         Self { kind: ExprKind::Unknown(desc.into()) }
     }
 
+    /// Negates a boolean expression (for conditions).
+    /// For comparisons, inverts the operator (== becomes !=, < becomes >=, etc.)
+    /// For other expressions, wraps with logical not.
+    pub fn negate(self) -> Self {
+        match self.kind {
+            ExprKind::BinOp { op, left, right } => {
+                if let Some(negated_op) = op.negate() {
+                    Self::binop(negated_op, *left, *right)
+                } else {
+                    // Not a comparison, wrap with logical not
+                    Self::unary(UnaryOpKind::LogicalNot, Self { kind: ExprKind::BinOp { op, left, right } })
+                }
+            }
+            ExprKind::UnaryOp { op: UnaryOpKind::LogicalNot, operand } => {
+                // Double negation: !!x -> x
+                *operand
+            }
+            _ => Self::unary(UnaryOpKind::LogicalNot, self),
+        }
+    }
+
     /// Converts an operand to an expression.
     pub fn from_operand(op: &Operand) -> Self {
         match op {
@@ -404,12 +442,26 @@ impl Expr {
                 }
             }
             Operation::Add => Self::make_binop(ops, BinOpKind::Add, &inst.mnemonic),
-            Operation::Sub => Self::make_binop(ops, BinOpKind::Sub, &inst.mnemonic),
+            Operation::Sub => {
+                // Special case: sub reg, reg is a zeroing idiom
+                if ops.len() >= 2 && ops[0] == ops[1] {
+                    Self::assign(Self::from_operand(&ops[0]), Self::int(0))
+                } else {
+                    Self::make_binop(ops, BinOpKind::Sub, &inst.mnemonic)
+                }
+            }
             Operation::Mul => Self::make_binop(ops, BinOpKind::Mul, &inst.mnemonic),
             Operation::Div => Self::make_binop(ops, BinOpKind::Div, &inst.mnemonic),
             Operation::And => Self::make_binop(ops, BinOpKind::And, &inst.mnemonic),
             Operation::Or => Self::make_binop(ops, BinOpKind::Or, &inst.mnemonic),
-            Operation::Xor => Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic),
+            Operation::Xor => {
+                // Special case: xor reg, reg is a zeroing idiom
+                if ops.len() >= 2 && ops[0] == ops[1] {
+                    Self::assign(Self::from_operand(&ops[0]), Self::int(0))
+                } else {
+                    Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic)
+                }
+            }
             Operation::Shl => Self::make_binop(ops, BinOpKind::Shl, &inst.mnemonic),
             Operation::Shr => Self::make_binop(ops, BinOpKind::Shr, &inst.mnemonic),
             Operation::Sar => Self::make_binop(ops, BinOpKind::Sar, &inst.mnemonic),

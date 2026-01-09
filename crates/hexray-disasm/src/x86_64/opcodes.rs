@@ -282,8 +282,13 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
     // IMUL r, r/m
     table[0xAF] = Some(OpcodeEntry::new("imul", Operation::Mul, OperandEncoding::ModRmReg_Rm));
 
-    // NOP (multi-byte)
+    // NOP (multi-byte) - 0F 1F is the general multi-byte NOP
     table[0x1F] = Some(OpcodeEntry::new("nop", Operation::Nop, OperandEncoding::ModRmRmOnly));
+
+    // 0F 1E - ENDBR64/ENDBR32/NOP (CET hint instructions)
+    // With F3 prefix: ENDBR64 (FA) or ENDBR32 (FB)
+    // Without prefix: treated as NOP with ModR/M
+    table[0x1E] = Some(OpcodeEntry::new("nop", Operation::Nop, OperandEncoding::ModRmRmOnly));
 
     table
 };
@@ -310,4 +315,16 @@ pub static GROUP2_OPS: [(&str, Operation); 8] = [
     ("shr", Operation::Shr),      // Shift right logical
     ("shl", Operation::Shl),      // (undefined, but some assemblers use SAL)
     ("sar", Operation::Sar),      // Shift right arithmetic
+];
+
+/// Group 5 operations (for opcode 0xFF).
+pub static GROUP5_OPS: [(&str, Operation); 8] = [
+    ("inc", Operation::Add),      // /0 INC r/m
+    ("dec", Operation::Sub),      // /1 DEC r/m
+    ("call", Operation::Call),    // /2 CALL r/m64 (indirect call)
+    ("call", Operation::Call),    // /3 CALL m16:64 (far call, rare)
+    ("jmp", Operation::Jump),     // /4 JMP r/m64 (indirect jump)
+    ("jmp", Operation::Jump),     // /5 JMP m16:64 (far jmp, rare)
+    ("push", Operation::Push),    // /6 PUSH r/m64
+    ("", Operation::Other(255)),  // /7 (reserved)
 ];

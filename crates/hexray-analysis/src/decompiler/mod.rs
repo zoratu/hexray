@@ -121,15 +121,17 @@ impl SymbolTable {
     }
 }
 
-/// Relocation table for resolving call targets in relocatable files.
+/// Relocation table for resolving symbols in relocatable files.
 ///
 /// In kernel modules and other relocatable files, call instructions
-/// have unresolved targets (offset = 0) that need relocation info
-/// to determine the actual call target.
+/// and data references have unresolved targets (offset = 0) that need
+/// relocation info to determine the actual target.
 #[derive(Debug, Clone, Default)]
 pub struct RelocationTable {
-    /// Maps call instruction addresses to target symbol names.
-    relocations: HashMap<u64, String>,
+    /// Maps instruction addresses to target symbol names (for calls).
+    call_relocations: HashMap<u64, String>,
+    /// Maps instruction addresses to data symbol names (for mov/lea with immediates).
+    data_relocations: HashMap<u64, String>,
 }
 
 impl RelocationTable {
@@ -138,22 +140,40 @@ impl RelocationTable {
         Self::default()
     }
 
-    /// Adds a relocation entry.
-    ///
-    /// `call_addr` is the address of the call instruction.
-    /// `target_symbol` is the name of the function being called.
+    /// Adds a call relocation entry.
     pub fn insert(&mut self, call_addr: u64, target_symbol: String) {
-        self.relocations.insert(call_addr, target_symbol);
+        self.call_relocations.insert(call_addr, target_symbol);
+    }
+
+    /// Adds a data relocation entry.
+    pub fn insert_data(&mut self, inst_addr: u64, symbol: String) {
+        self.data_relocations.insert(inst_addr, symbol);
     }
 
     /// Looks up a call target by call instruction address.
     pub fn get(&self, call_addr: u64) -> Option<&str> {
-        self.relocations.get(&call_addr).map(|s| s.as_str())
+        self.call_relocations.get(&call_addr).map(|s| s.as_str())
+    }
+
+    /// Looks up a data symbol by instruction address.
+    pub fn get_data(&self, inst_addr: u64) -> Option<&str> {
+        self.data_relocations.get(&inst_addr).map(|s| s.as_str())
+    }
+
+    /// Gets all data relocations within an address range, sorted by address.
+    pub fn get_data_in_range(&self, start: u64, end: u64) -> Vec<(u64, &str)> {
+        let mut results: Vec<_> = self.data_relocations
+            .iter()
+            .filter(|(addr, _)| **addr >= start && **addr < end)
+            .map(|(addr, name)| (*addr, name.as_str()))
+            .collect();
+        results.sort_by_key(|(addr, _)| *addr);
+        results
     }
 
     /// Returns true if the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.relocations.is_empty()
+        self.call_relocations.is_empty() && self.data_relocations.is_empty()
     }
 }
 
@@ -243,7 +263,7 @@ impl Decompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, Condition, Instruction, Operation, Operand, ControlFlow};
+    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, Condition, Instruction, Operation, ControlFlow};
 
     fn make_simple_cfg() -> ControlFlowGraph {
         // Simple if/else:

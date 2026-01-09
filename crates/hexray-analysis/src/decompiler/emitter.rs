@@ -160,6 +160,29 @@ impl PseudoCodeEmitter {
     fn emit_nodes(&self, nodes: &[StructuredNode], output: &mut String, depth: usize) {
         for node in nodes {
             self.emit_node(node, output, depth);
+            // Stop emitting after control flow that exits the current scope
+            if self.is_control_exit(node) {
+                break;
+            }
+        }
+    }
+
+    /// Checks if a node is a control flow exit (goto, return, break, continue).
+    fn is_control_exit(&self, node: &StructuredNode) -> bool {
+        match node {
+            StructuredNode::Goto(_) |
+            StructuredNode::Return(_) |
+            StructuredNode::Break |
+            StructuredNode::Continue => true,
+            // Check if an if-else exits on both branches
+            StructuredNode::If { then_body, else_body, .. } => {
+                let then_exits = then_body.last().is_some_and(|n| self.is_control_exit(n));
+                let else_exits = else_body.as_ref()
+                    .and_then(|e| e.last())
+                    .is_some_and(|n| self.is_control_exit(n));
+                then_exits && else_exits
+            }
+            _ => false,
         }
     }
 
@@ -171,16 +194,43 @@ impl PseudoCodeEmitter {
                 if self.emit_addresses {
                     writeln!(output, "{}// {} [{:#x} - {:#x}]", indent, id, address_range.0, address_range.1).unwrap();
                 }
+                // Get data relocations for this block to resolve `reg = 0` assignments
+                let data_relocs = if let Some(ref reloc_table) = self.relocation_table {
+                    reloc_table.get_data_in_range(address_range.0, address_range.1)
+                } else {
+                    Vec::new()
+                };
+                let mut reloc_idx = 0;
+
                 for stmt in statements {
+                    // Check if this is an assignment of 0 and we have a data relocation
+                    if let ExprKind::Assign { rhs, .. } = &stmt.kind {
+                        if let ExprKind::IntLit(0) = rhs.kind {
+                            if reloc_idx < data_relocs.len() {
+                                // Replace with symbol reference
+                                let (_, symbol) = data_relocs[reloc_idx];
+                                reloc_idx += 1;
+                                self.emit_statement_with_data_symbol(stmt, symbol, output, depth);
+                                continue;
+                            }
+                        }
+                    }
                     self.emit_statement(stmt, output, depth);
                 }
             }
 
             StructuredNode::If { condition, then_body, else_body } => {
-                writeln!(output, "{}if ({}) {{", indent, self.format_expr(condition)).unwrap();
-                self.emit_nodes(then_body, output, depth + 1);
+                // If then_body is empty but else_body has content, invert the condition
+                let (actual_cond, actual_then, actual_else) = if then_body.is_empty() && else_body.is_some() {
+                    (condition.clone().negate(), else_body.as_ref().unwrap().clone(), None)
+                } else {
+                    (condition.clone(), then_body.clone(), else_body.clone())
+                };
 
-                if let Some(else_body) = else_body {
+                writeln!(output, "{}if ({}) {{", indent, self.format_expr(&actual_cond)).unwrap();
+                self.emit_nodes(&actual_then, output, depth + 1);
+
+                if let Some(else_body) = actual_else {
                     if else_body.len() == 1 {
                         if let StructuredNode::If { .. } = &else_body[0] {
                             // else if
@@ -190,7 +240,7 @@ impl PseudoCodeEmitter {
                         }
                     }
                     writeln!(output, "{}}} else {{", indent).unwrap();
-                    self.emit_nodes(else_body, output, depth + 1);
+                    self.emit_nodes(&else_body, output, depth + 1);
                 }
 
                 writeln!(output, "{}}}", indent).unwrap();
@@ -290,6 +340,20 @@ impl PseudoCodeEmitter {
 
         writeln!(output, "{}{};", indent, expr_str).unwrap();
     }
+
+    /// Emits a statement where the RHS 0 should be replaced with a symbol.
+    fn emit_statement_with_data_symbol(&self, expr: &Expr, symbol: &str, output: &mut String, depth: usize) {
+        let indent = self.indent.repeat(depth);
+
+        if let ExprKind::Assign { lhs, .. } = &expr.kind {
+            let lhs_str = self.format_expr(lhs);
+            // Format as address-of symbol (since we're loading an address)
+            writeln!(output, "{}{} = &{};", indent, lhs_str, symbol).unwrap();
+        } else {
+            // Fallback to regular emission
+            self.emit_statement(expr, output, depth);
+        }
+    }
 }
 
 /// Escapes a string for C output.
@@ -319,7 +383,7 @@ pub fn format_condition(cond: &Expr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::expression::{ExprKind, Variable, VarKind, BinOpKind};
+    use super::super::expression::BinOpKind;
 
     #[test]
     fn test_emit_if_else() {

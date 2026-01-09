@@ -712,28 +712,38 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
 
     // Process relocations - each relocation has a section_index telling us which section it applies to
     for reloc in &elf.relocations {
-        // We're interested in PC-relative call relocations
-        match reloc.r_type {
-            RelocationType::Pc32 | RelocationType::Plt32 => {
-                // Get the symbol name
-                if let Some(symbol) = symbols.get(reloc.symbol_index as usize) {
-                    // Get the section this relocation applies to
-                    if let Some(section) = elf.sections.get(reloc.section_index) {
-                        // The relocation offset is relative to the section start
+        if let Some(symbol) = symbols.get(reloc.symbol_index as usize) {
+            if symbol.name.is_empty() {
+                continue;
+            }
+
+            if let Some(section) = elf.sections.get(reloc.section_index) {
+                match reloc.r_type {
+                    // PC-relative relocations (for calls/jumps)
+                    RelocationType::Pc32 | RelocationType::Plt32 => {
                         // For x86_64 call E8 xx xx xx xx, the relocation points to the displacement
                         // The call opcode (E8) is at offset-1 from the relocation
-
-                        // Calculate the call instruction address (file offset):
-                        // section_file_offset + relocation_offset_in_section - 1
                         let call_addr = section.sh_offset + reloc.offset - 1;
-
-                        if !symbol.name.is_empty() {
-                            table.insert(call_addr, symbol.name.clone());
-                        }
+                        table.insert(call_addr, symbol.name.clone());
                     }
+                    // 32-bit signed immediate relocations (for mov reg, imm32)
+                    // mov rdi, 0x0 = 48 C7 C7 xx xx xx xx (7 bytes)
+                    // relocation points to offset+3 (the immediate)
+                    RelocationType::R32S => {
+                        // Instruction starts 3 bytes before the relocation offset
+                        // for "mov reg, imm32" with REX prefix
+                        let inst_addr = section.sh_offset + reloc.offset - 3;
+                        table.insert_data(inst_addr, symbol.name.clone());
+                    }
+                    // 64-bit absolute relocations
+                    RelocationType::R64 => {
+                        // For movabs, the relocation points to the immediate
+                        let inst_addr = section.sh_offset + reloc.offset - 2;
+                        table.insert_data(inst_addr, symbol.name.clone());
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
     }
 
