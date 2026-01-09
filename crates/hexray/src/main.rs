@@ -710,35 +710,26 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
     // Collect symbols for lookup by index
     let symbols: Vec<_> = elf.symbols().collect();
 
-    // Find the .text section to get its file offset
-    let text_section = elf.sections.iter().find(|s| {
-        if let Some(name) = elf.section_name(s) {
-            name == ".text"
-        } else {
-            false
-        }
-    });
-
-    let text_offset = text_section.map(|s| s.sh_offset).unwrap_or(0);
-
-    // Process relocations
+    // Process relocations - each relocation has a section_index telling us which section it applies to
     for reloc in &elf.relocations {
         // We're interested in PC-relative call relocations
         match reloc.r_type {
             RelocationType::Pc32 | RelocationType::Plt32 => {
                 // Get the symbol name
                 if let Some(symbol) = symbols.get(reloc.symbol_index as usize) {
-                    // The relocation offset points to the 4-byte displacement in the call instruction
-                    // For x86_64 call E8 xx xx xx xx, the call opcode is at offset-1
-                    // But for kernel modules, the relocation offset is relative to the section
-                    // We need to convert to the address used by the disassembler
+                    // Get the section this relocation applies to
+                    if let Some(section) = elf.sections.get(reloc.section_index) {
+                        // The relocation offset is relative to the section start
+                        // For x86_64 call E8 xx xx xx xx, the relocation points to the displacement
+                        // The call opcode (E8) is at offset-1 from the relocation
 
-                    // The call instruction address is:
-                    // section_file_offset + relocation_offset - 1 (for E8 opcode)
-                    let call_addr = text_offset + reloc.offset - 1;
+                        // Calculate the call instruction address (file offset):
+                        // section_file_offset + relocation_offset_in_section - 1
+                        let call_addr = section.sh_offset + reloc.offset - 1;
 
-                    if !symbol.name.is_empty() {
-                        table.insert(call_addr, symbol.name.clone());
+                        if !symbol.name.is_empty() {
+                            table.insert(call_addr, symbol.name.clone());
+                        }
                     }
                 }
             }
