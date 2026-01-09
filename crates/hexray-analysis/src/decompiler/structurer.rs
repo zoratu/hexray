@@ -118,6 +118,12 @@ impl StructuredCfg {
         let mut structurer = Structurer::new(cfg);
         let body = structurer.structure();
 
+        // Post-process to propagate arguments into function calls (before copy propagation)
+        let body = propagate_call_args(body);
+
+        // Post-process to merge return value captures across block boundaries
+        let body = merge_return_value_captures(body);
+
         // Post-process to eliminate temporary register patterns
         let body = simplify_statements(body);
 
@@ -969,6 +975,343 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
             Expr::deref(substitute_vars(addr, reg_values), *size)
         }
         _ => expr.clone(),
+    }
+}
+
+/// Recursively propagates function call arguments through structured nodes.
+fn propagate_call_args(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    nodes.into_iter().map(propagate_call_args_node).collect()
+}
+
+fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::Block { id, statements, address_range } => {
+            let statements = propagate_args_in_block(statements);
+            StructuredNode::Block { id, statements, address_range }
+        }
+        StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body: propagate_call_args(then_body),
+                else_body: else_body.map(propagate_call_args),
+            }
+        }
+        StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition,
+                body: propagate_call_args(body),
+            }
+        }
+        StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body: propagate_call_args(body),
+                condition,
+            }
+        }
+        StructuredNode::For { init, condition, update, body } => {
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: propagate_call_args(body),
+            }
+        }
+        StructuredNode::Loop { body } => {
+            StructuredNode::Loop {
+                body: propagate_call_args(body),
+            }
+        }
+        StructuredNode::Switch { value, cases, default } => {
+            StructuredNode::Switch {
+                value,
+                cases: cases.into_iter()
+                    .map(|(vals, body)| (vals, propagate_call_args(body)))
+                    .collect(),
+                default: default.map(propagate_call_args),
+            }
+        }
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(propagate_call_args(nodes))
+        }
+        other => other,
+    }
+}
+
+/// Propagates arguments into function calls within a block.
+/// Transforms patterns like:
+///   edi = 5;
+///   func();
+/// Into:
+///   func(5);
+fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
+    use super::expression::ExprKind;
+
+    // Track argument register values
+    let mut arg_values: HashMap<String, Expr> = HashMap::new();
+    let mut to_remove: HashSet<usize> = HashSet::new();
+    let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
+
+    for (i, stmt) in statements.into_iter().enumerate() {
+        // Check if this is an assignment to an argument register
+        if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let ExprKind::Var(v) = &lhs.kind {
+                if get_arg_register_index(&v.name).is_some() {
+                    // Track this argument value
+                    arg_values.insert(v.name.clone(), (**rhs).clone());
+                    to_remove.insert(i);
+                    result.push(stmt);
+                    continue;
+                }
+            }
+        }
+
+        // Check if this is a function call (not push/pop/syscall/etc.)
+        if let ExprKind::Call { target, args } = &stmt.kind {
+            if is_real_function_call(target) && args.is_empty() {
+                // Try to extract arguments from tracked registers
+                let new_args = extract_call_arguments(&arg_values);
+                if !new_args.is_empty() {
+                    // Create a new call with arguments
+                    let new_call = Expr::call(target.clone(), new_args);
+                    result.push(new_call);
+                    // Clear argument tracking after the call
+                    arg_values.clear();
+                    continue;
+                }
+            }
+        }
+
+        // Check if this is an assignment with a call on RHS (return value capture)
+        // Pattern: func(); var = eax; -> var = func();
+        if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let ExprKind::Var(v) = &rhs.kind {
+                if is_return_register(&v.name) {
+                    // Check if previous statement was a call
+                    if let Some(prev) = result.last() {
+                        if let ExprKind::Call { target, args } = &prev.kind {
+                            if is_real_function_call(target) {
+                                // Merge: replace the call with an assignment
+                                let call_expr = Expr::call(target.clone(), args.clone());
+                                let assign = Expr::assign((**lhs).clone(), call_expr);
+                                result.pop(); // Remove the bare call
+                                result.push(assign);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass through other statements
+        result.push(stmt);
+    }
+
+    // Filter out argument register assignments that were propagated
+    result.into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !to_remove.contains(idx))
+        .map(|(_, stmt)| stmt)
+        .collect()
+}
+
+/// Returns the argument index (0-based) for an argument register, or None if not an arg register.
+fn get_arg_register_index(name: &str) -> Option<usize> {
+    match name {
+        // x86-64 System V ABI
+        "edi" | "rdi" => Some(0),
+        "esi" | "rsi" => Some(1),
+        "edx" | "rdx" => Some(2),
+        "ecx" | "rcx" => Some(3),
+        "r8d" | "r8" => Some(4),
+        "r9d" | "r9" => Some(5),
+        // ARM64 AAPCS64
+        "x0" | "w0" => Some(0),
+        "x1" | "w1" => Some(1),
+        "x2" | "w2" => Some(2),
+        "x3" | "w3" => Some(3),
+        "x4" | "w4" => Some(4),
+        "x5" | "w5" => Some(5),
+        "x6" | "w6" => Some(6),
+        "x7" | "w7" => Some(7),
+        // RISC-V
+        "a0" => Some(0),
+        "a1" => Some(1),
+        "a2" => Some(2),
+        "a3" => Some(3),
+        "a4" => Some(4),
+        "a5" => Some(5),
+        "a6" => Some(6),
+        "a7" => Some(7),
+        _ => None,
+    }
+}
+
+/// Checks if a register is a return value register.
+fn is_return_register(name: &str) -> bool {
+    matches!(name, "eax" | "rax" | "x0" | "w0" | "a0")
+}
+
+/// Checks if a call target is a "real" function call (not push/pop/syscall etc.)
+fn is_real_function_call(target: &super::expression::CallTarget) -> bool {
+    use super::expression::CallTarget;
+    match target {
+        CallTarget::Named(name) => {
+            !matches!(name.as_str(), "push" | "pop" | "syscall" | "int" | "halt" | "swap" | "rol" | "ror")
+        }
+        CallTarget::Direct { .. } | CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => true,
+    }
+}
+
+/// Extracts function arguments from tracked argument registers.
+fn extract_call_arguments(arg_values: &HashMap<String, Expr>) -> Vec<Expr> {
+    let mut args: Vec<(usize, Expr)> = Vec::new();
+
+    for (reg_name, value) in arg_values {
+        if let Some(idx) = get_arg_register_index(reg_name) {
+            args.push((idx, value.clone()));
+        }
+    }
+
+    // Sort by argument index
+    args.sort_by_key(|(idx, _)| *idx);
+
+    // Only include contiguous arguments starting from 0
+    let mut result = Vec::new();
+    for (expected_idx, (actual_idx, value)) in args.into_iter().enumerate() {
+        if actual_idx == expected_idx {
+            result.push(value);
+        } else {
+            break;
+        }
+    }
+
+    result
+}
+
+/// Merges return value captures across basic block boundaries.
+/// Transforms patterns where:
+///   Block1: ...; func();
+///   Block2: var = eax; ...
+/// Into:
+///   Block1: ...
+///   Block2: var = func(); ...
+fn merge_return_value_captures(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    use super::expression::ExprKind;
+
+    let mut result: Vec<StructuredNode> = Vec::with_capacity(nodes.len());
+
+    for node in nodes {
+        // First, recursively process nested structures
+        let node = merge_return_value_captures_node(node);
+
+        // Check if we should merge with the previous block
+        if let StructuredNode::Block { id, mut statements, address_range } = node {
+            // Check if first statement is `var = eax` (return value capture)
+            if !statements.is_empty() {
+                let should_merge = if let ExprKind::Assign { lhs: _, rhs } = &statements[0].kind {
+                    if let ExprKind::Var(v) = &rhs.kind {
+                        if is_return_register(&v.name) {
+                            // Check if previous node is a block ending with a call
+                            if let Some(prev_node) = result.last() {
+                                if let StructuredNode::Block { statements: prev_stmts, .. } = prev_node {
+                                    if let Some(last_stmt) = prev_stmts.last() {
+                                        if let ExprKind::Call { target, .. } = &last_stmt.kind {
+                                            is_real_function_call(target)
+                                        } else { false }
+                                    } else { false }
+                                } else { false }
+                            } else { false }
+                        } else { false }
+                    } else { false }
+                } else { false };
+
+                if should_merge {
+                    // Pop the previous block
+                    if let Some(StructuredNode::Block { id: prev_id, statements: mut prev_stmts, address_range: prev_range }) = result.pop() {
+                        // Extract the call from the previous block
+                        if let Some(last_stmt) = prev_stmts.pop() {
+                            if let ExprKind::Call { target, args } = &last_stmt.kind {
+                                // Get the LHS from current block's first statement
+                                if let ExprKind::Assign { lhs, .. } = &statements[0].kind {
+                                    // Create the merged assignment
+                                    let call_expr = Expr::call(target.clone(), args.clone());
+                                    let assign = Expr::assign((**lhs).clone(), call_expr);
+
+                                    // Put the modified previous block back (if not empty)
+                                    if !prev_stmts.is_empty() {
+                                        result.push(StructuredNode::Block {
+                                            id: prev_id,
+                                            statements: prev_stmts,
+                                            address_range: prev_range,
+                                        });
+                                    }
+
+                                    // Replace first statement with the merged assignment
+                                    statements[0] = assign;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            result.push(StructuredNode::Block { id, statements, address_range });
+        } else {
+            result.push(node);
+        }
+    }
+
+    result
+}
+
+/// Recursively applies return value capture merging to nested structures.
+fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body: merge_return_value_captures(then_body),
+                else_body: else_body.map(merge_return_value_captures),
+            }
+        }
+        StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition,
+                body: merge_return_value_captures(body),
+            }
+        }
+        StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body: merge_return_value_captures(body),
+                condition,
+            }
+        }
+        StructuredNode::For { init, condition, update, body } => {
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: merge_return_value_captures(body),
+            }
+        }
+        StructuredNode::Loop { body } => {
+            StructuredNode::Loop {
+                body: merge_return_value_captures(body),
+            }
+        }
+        StructuredNode::Switch { value, cases, default } => {
+            StructuredNode::Switch {
+                value,
+                cases: cases.into_iter()
+                    .map(|(vals, body)| (vals, merge_return_value_captures(body)))
+                    .collect(),
+                default: default.map(merge_return_value_captures),
+            }
+        }
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(merge_return_value_captures(nodes))
+        }
+        other => other,
     }
 }
 
