@@ -39,6 +39,19 @@ pub enum ExprKind {
         size: u8,
     },
 
+    /// GOT/data reference: RIP-relative memory access with computed absolute address.
+    /// Used for resolving `mov reg, [rip + offset]` patterns to symbol names.
+    GotRef {
+        /// The computed absolute address (rip + inst_size + displacement).
+        address: u64,
+        /// Size of the dereference in bytes (0 for address-of/LEA).
+        size: u8,
+        /// The original expression for display if resolution fails.
+        display_expr: Box<Expr>,
+        /// True if this is a dereference (MOV), false if address-of (LEA).
+        is_deref: bool,
+    },
+
     /// Address-of: &expr.
     AddressOf(Box<Expr>),
 
@@ -215,6 +228,10 @@ pub enum CallTarget {
     Named(String),
     /// Indirect call through expression.
     Indirect(Box<Expr>),
+    /// Indirect call through GOT/PLT entry.
+    /// `got_address` is the computed address of the GOT entry being dereferenced.
+    /// `expr` is the expression for display if symbol resolution fails.
+    IndirectGot { got_address: u64, expr: Box<Expr> },
 }
 
 /// A variable (abstraction over registers, stack slots, globals).
@@ -326,6 +343,30 @@ impl Expr {
         }
     }
 
+    /// Creates a GOT/data reference with a computed absolute address (for MOV from memory).
+    pub fn got_ref(address: u64, size: u8, display_expr: Expr) -> Self {
+        Self {
+            kind: ExprKind::GotRef {
+                address,
+                size,
+                display_expr: Box::new(display_expr),
+                is_deref: true,
+            }
+        }
+    }
+
+    /// Creates a GOT/data address reference (for LEA - address-of, not dereference).
+    pub fn got_addr(address: u64, display_expr: Expr) -> Self {
+        Self {
+            kind: ExprKind::GotRef {
+                address,
+                size: 0,
+                display_expr: Box::new(display_expr),
+                is_deref: false,
+            }
+        }
+    }
+
     /// Creates a call expression.
     pub fn call(target: CallTarget, args: Vec<Expr>) -> Self {
         Self {
@@ -411,10 +452,20 @@ impl Expr {
         match inst.operation {
             Operation::Move => {
                 if ops.len() >= 2 {
-                    Self::assign(
-                        Self::from_operand(&ops[0]),
-                        Self::from_operand(&ops[1]),
-                    )
+                    // Check for RIP-relative memory load (e.g., mov rdi, [rip + offset])
+                    let rhs = if let Operand::Memory(mem) = &ops[1] {
+                        if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip" && mem.index.is_none() {
+                            // Compute absolute address: inst.address + inst.size + displacement
+                            let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+                            let display_expr = Self::from_memory_ref(mem);
+                            Self::got_ref(abs_addr, mem.size, display_expr)
+                        } else {
+                            Self::from_operand(&ops[1])
+                        }
+                    } else {
+                        Self::from_operand(&ops[1])
+                    };
+                    Self::assign(Self::from_operand(&ops[0]), rhs)
                 } else if ops.len() == 1 {
                     Self::from_operand(&ops[0])
                 } else {
@@ -465,6 +516,35 @@ impl Expr {
             Operation::Shl => Self::make_binop(ops, BinOpKind::Shl, &inst.mnemonic),
             Operation::Shr => Self::make_binop(ops, BinOpKind::Shr, &inst.mnemonic),
             Operation::Sar => Self::make_binop(ops, BinOpKind::Sar, &inst.mnemonic),
+            Operation::Rol | Operation::Ror => {
+                // Rotate operations - emit as function-style for now
+                // Could be expanded to proper rotate expressions later
+                if ops.len() >= 2 {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::call(
+                            CallTarget::Named(inst.mnemonic.clone()),
+                            vec![Self::from_operand(&ops[0]), Self::from_operand(&ops[1])],
+                        ),
+                    )
+                } else if ops.len() == 1 {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::call(
+                            CallTarget::Named(inst.mnemonic.clone()),
+                            vec![Self::from_operand(&ops[0]), Self::int(1)],
+                        ),
+                    )
+                } else {
+                    Self::unknown("/* nop */")
+                }
+            }
+            Operation::Compare | Operation::Test => {
+                // Compare and test set flags but don't produce a visible result.
+                // They're consumed by subsequent conditional branches.
+                // Emit as a no-op comment to avoid cluttering output.
+                Self::unknown("/* nop */")
+            }
             Operation::Neg => {
                 if !ops.is_empty() {
                     let operand = Self::from_operand(&ops[0]);
@@ -513,6 +593,21 @@ impl Expr {
                     match &ops[0] {
                         Operand::PcRelative { target, .. } => CallTarget::Direct { target: *target, call_site },
                         Operand::Immediate(imm) => CallTarget::Direct { target: imm.as_u64(), call_site },
+                        Operand::Memory(mem) => {
+                            // Check for RIP-relative addressing (GOT/PLT pattern)
+                            // e.g., call [rip + 0x1234] = call through GOT entry
+                            if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip" && mem.index.is_none() {
+                                // Compute GOT address: inst.address + inst.size + displacement
+                                // inst.size is stored in inst.size field
+                                let got_address = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+                                CallTarget::IndirectGot {
+                                    got_address,
+                                    expr: Box::new(Self::from_operand(&ops[0])),
+                                }
+                            } else {
+                                CallTarget::Indirect(Box::new(Self::from_operand(&ops[0])))
+                            }
+                        }
                         _ => CallTarget::Indirect(Box::new(Self::from_operand(&ops[0]))),
                     }
                 } else {
@@ -543,6 +638,40 @@ impl Expr {
             Operation::Return => Self::unknown("return"),
             Operation::Nop => Self::unknown("/* nop */"),
             Operation::Syscall => Self::call(CallTarget::Named("syscall".to_string()), vec![]),
+            Operation::Interrupt => {
+                if !ops.is_empty() {
+                    Self::call(CallTarget::Named("int".to_string()), vec![Self::from_operand(&ops[0])])
+                } else {
+                    Self::call(CallTarget::Named("int".to_string()), vec![])
+                }
+            }
+            Operation::Halt => Self::call(CallTarget::Named("halt".to_string()), vec![]),
+            Operation::Exchange => {
+                // XCHG swaps two operands - emit as a swap pseudo-function
+                if ops.len() >= 2 {
+                    Self::call(
+                        CallTarget::Named("swap".to_string()),
+                        vec![Self::from_operand(&ops[0]), Self::from_operand(&ops[1])],
+                    )
+                } else {
+                    Self::unknown("/* nop */")
+                }
+            }
+            Operation::Jump | Operation::ConditionalJump => {
+                // Jumps are handled by control flow structuring, not as expressions
+                Self::unknown("/* nop */")
+            }
+            Operation::Other(_) => {
+                // Unknown operation - emit the mnemonic as a function call if it has operands
+                if !ops.is_empty() {
+                    Self::call(
+                        CallTarget::Named(inst.mnemonic.clone()),
+                        ops.iter().map(Self::from_operand).collect(),
+                    )
+                } else {
+                    Self::unknown("/* nop */")
+                }
+            }
             Operation::LoadEffectiveAddress => {
                 // ADRP/ADR/LEA - load effective address
                 if ops.len() >= 2 {
@@ -550,7 +679,18 @@ impl Expr {
                     // operands[1] = PcRelative or Memory address
                     let addr_val = match &ops[1] {
                         Operand::PcRelative { target, .. } => Self::int(*target as i128),
-                        Operand::Memory(mem) => Self::from_memory_ref(mem),
+                        Operand::Memory(mem) => {
+                            // Check for RIP-relative addressing (e.g., lea rdi, [rip + offset])
+                            if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip" && mem.index.is_none() {
+                                // Compute absolute address: inst.address + inst.size + displacement
+                                let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+                                // Use GotAddr for LEA (address-of, not dereference)
+                                let display_expr = Self::int(abs_addr as i128);
+                                Self::got_addr(abs_addr, display_expr)
+                            } else {
+                                Self::from_memory_ref(mem)
+                            }
+                        }
                         Operand::Immediate(imm) => Self::int(imm.value),
                         _ => Self::from_operand(&ops[1]),
                     };
@@ -559,7 +699,6 @@ impl Expr {
                     Self::unknown(&inst.mnemonic)
                 }
             }
-            _ => Self::unknown(&inst.mnemonic),
         }
     }
 
@@ -611,12 +750,29 @@ impl fmt::Display for Expr {
                 };
                 write!(f, "{}({})", prefix, addr)
             }
+            ExprKind::GotRef { display_expr, size, is_deref, .. } => {
+                // Default display falls back to showing the original expression
+                if *is_deref {
+                    let prefix = match size {
+                        1 => "*(uint8_t*)",
+                        2 => "*(uint16_t*)",
+                        4 => "*(uint32_t*)",
+                        8 => "*(uint64_t*)",
+                        _ => "*",
+                    };
+                    write!(f, "{}({})", prefix, display_expr)
+                } else {
+                    // Address-of (LEA) - just show the address
+                    write!(f, "{}", display_expr)
+                }
+            }
             ExprKind::AddressOf(e) => write!(f, "&{}", e),
             ExprKind::Call { target, args } => {
                 match target {
                     CallTarget::Direct { target, .. } => write!(f, "sub_{:x}", target)?,
                     CallTarget::Named(name) => write!(f, "{}", name)?,
                     CallTarget::Indirect(e) => write!(f, "({})", e)?,
+                    CallTarget::IndirectGot { expr, .. } => write!(f, "({})", expr)?,
                 }
                 write!(f, "(")?;
                 for (i, arg) in args.iter().enumerate() {

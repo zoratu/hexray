@@ -101,12 +101,10 @@ impl<'a> Elf<'a> {
         // Parse symbols (with section base address adjustment for ET_REL)
         let symbols = Self::parse_symbols(data, &sections, &header)?;
 
-        // Parse relocations for relocatable files
-        let relocations = if header.file_type == ElfType::Relocatable {
-            Self::parse_relocations(data, &sections, &header)?
-        } else {
-            Vec::new()
-        };
+        // Parse relocations for relocatable files and dynamic binaries
+        // - Relocatable files: need relocations for symbol resolution in decompilation
+        // - Shared objects/executables: need GOT/PLT relocations for indirect call resolution
+        let relocations = Self::parse_relocations(data, &sections, &header)?;
 
         // Parse kernel module info if present
         let modinfo = Self::parse_modinfo(data, &sections, &section_names);

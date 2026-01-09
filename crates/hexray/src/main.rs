@@ -696,6 +696,9 @@ fn build_symbol_table(fmt: &dyn BinaryFormat) -> SymbolTable {
 /// For kernel modules and other relocatable files, call instructions have
 /// unresolved targets. This table maps call instruction addresses to the
 /// actual target symbol names based on relocation entries.
+///
+/// For dynamically linked binaries, this also populates GOT/PLT symbol mappings
+/// to resolve indirect calls through the GOT.
 fn build_relocation_table(binary: &Binary) -> RelocationTable {
     use hexray_formats::RelocationType;
 
@@ -717,32 +720,42 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                 continue;
             }
 
-            if let Some(section) = elf.sections.get(reloc.section_index) {
-                match reloc.r_type {
-                    // PC-relative relocations (for calls/jumps)
-                    RelocationType::Pc32 | RelocationType::Plt32 => {
+            match reloc.r_type {
+                // GOT entry relocations - map GOT address to symbol name
+                // These are used for indirect calls: call [rip + offset] -> call through GOT
+                RelocationType::GlobDat | RelocationType::JumpSlot => {
+                    // The relocation offset is the virtual address of the GOT entry
+                    table.insert_got(reloc.offset, symbol.name.clone());
+                }
+                // PC-relative relocations (for calls/jumps in relocatable objects)
+                RelocationType::Pc32 | RelocationType::Plt32 => {
+                    if let Some(section) = elf.sections.get(reloc.section_index) {
                         // For x86_64 call E8 xx xx xx xx, the relocation points to the displacement
                         // The call opcode (E8) is at offset-1 from the relocation
                         let call_addr = section.sh_offset + reloc.offset - 1;
                         table.insert(call_addr, symbol.name.clone());
                     }
-                    // 32-bit signed immediate relocations (for mov reg, imm32)
-                    // mov rdi, 0x0 = 48 C7 C7 xx xx xx xx (7 bytes)
-                    // relocation points to offset+3 (the immediate)
-                    RelocationType::R32S => {
+                }
+                // 32-bit signed immediate relocations (for mov reg, imm32)
+                // mov rdi, 0x0 = 48 C7 C7 xx xx xx xx (7 bytes)
+                // relocation points to offset+3 (the immediate)
+                RelocationType::R32S => {
+                    if let Some(section) = elf.sections.get(reloc.section_index) {
                         // Instruction starts 3 bytes before the relocation offset
                         // for "mov reg, imm32" with REX prefix
                         let inst_addr = section.sh_offset + reloc.offset - 3;
                         table.insert_data(inst_addr, symbol.name.clone());
                     }
-                    // 64-bit absolute relocations
-                    RelocationType::R64 => {
+                }
+                // 64-bit absolute relocations
+                RelocationType::R64 => {
+                    if let Some(section) = elf.sections.get(reloc.section_index) {
                         // For movabs, the relocation points to the immediate
                         let inst_addr = section.sh_offset + reloc.offset - 2;
                         table.insert_data(inst_addr, symbol.name.clone());
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }

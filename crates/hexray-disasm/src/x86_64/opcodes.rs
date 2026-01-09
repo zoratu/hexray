@@ -307,8 +307,8 @@ pub static GROUP1_OPS: [(&str, Operation); 8] = [
 
 /// Group 2 operations (shift/rotate, for opcodes 0xC0-0xC1, 0xD0-0xD3).
 pub static GROUP2_OPS: [(&str, Operation); 8] = [
-    ("rol", Operation::Other(0)), // Rotate left
-    ("ror", Operation::Other(1)), // Rotate right
+    ("rol", Operation::Rol),      // Rotate left
+    ("ror", Operation::Ror),      // Rotate right
     ("rcl", Operation::Other(2)), // Rotate through carry left
     ("rcr", Operation::Other(3)), // Rotate through carry right
     ("shl", Operation::Shl),      // Shift left (also SAL)
@@ -319,8 +319,8 @@ pub static GROUP2_OPS: [(&str, Operation); 8] = [
 
 /// Group 5 operations (for opcode 0xFF).
 pub static GROUP5_OPS: [(&str, Operation); 8] = [
-    ("inc", Operation::Add),      // /0 INC r/m
-    ("dec", Operation::Sub),      // /1 DEC r/m
+    ("inc", Operation::Inc),      // /0 INC r/m
+    ("dec", Operation::Dec),      // /1 DEC r/m
     ("call", Operation::Call),    // /2 CALL r/m64 (indirect call)
     ("call", Operation::Call),    // /3 CALL m16:64 (far call, rare)
     ("jmp", Operation::Jump),     // /4 JMP r/m64 (indirect jump)

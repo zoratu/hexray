@@ -92,6 +92,39 @@ impl PseudoCodeEmitter {
                     self.format_expr_with_strings(lhs, table),
                     self.format_expr_with_strings(rhs, table))
             }
+            ExprKind::GotRef { address, size, display_expr, is_deref } => {
+                // Try to resolve the GOT/data address to a symbol name
+                if let Some(ref reloc_table) = self.relocation_table {
+                    if let Some(name) = reloc_table.get_got(*address) {
+                        // Found symbol in GOT - return just the symbol name
+                        return name.to_string();
+                    }
+                }
+                // Try symbol table
+                if let Some(ref sym_table) = self.symbol_table {
+                    if let Some(name) = sym_table.get(*address) {
+                        return name.to_string();
+                    }
+                }
+                // Try string table
+                if let Some(s) = table.get(*address) {
+                    return format!("\"{}\"", escape_string(s));
+                }
+                // Fall back to default display
+                if *is_deref {
+                    let prefix = match size {
+                        1 => "*(uint8_t*)",
+                        2 => "*(uint16_t*)",
+                        4 => "*(uint32_t*)",
+                        8 => "*(uint64_t*)",
+                        _ => "*",
+                    };
+                    format!("{}({})", prefix, self.format_expr_with_strings(display_expr, table))
+                } else {
+                    // Address-of (LEA) - format as sub_XXXX if it looks like a code address
+                    format!("sub_{:x}", address)
+                }
+            }
             ExprKind::Call { target, args } => {
                 let target_str = match target {
                     super::expression::CallTarget::Direct { target: addr, call_site } => {
@@ -130,6 +163,26 @@ impl PseudoCodeEmitter {
                     super::expression::CallTarget::Named(name) => name.clone(),
                     super::expression::CallTarget::Indirect(e) => {
                         format!("({})", self.format_expr_with_strings(e, table))
+                    }
+                    super::expression::CallTarget::IndirectGot { got_address, expr } => {
+                        // Try to resolve the GOT entry to a symbol name
+                        if let Some(ref reloc_table) = self.relocation_table {
+                            if let Some(name) = reloc_table.get_got(*got_address) {
+                                name.to_string()
+                            } else {
+                                // Fall back to showing the expression
+                                format!("({})", self.format_expr_with_strings(expr, table))
+                            }
+                        } else if let Some(ref sym_table) = self.symbol_table {
+                            // Try symbol table by GOT address (rare, but possible)
+                            if let Some(name) = sym_table.get(*got_address) {
+                                name.to_string()
+                            } else {
+                                format!("({})", self.format_expr_with_strings(expr, table))
+                            }
+                        } else {
+                            format!("({})", self.format_expr_with_strings(expr, table))
+                        }
                     }
                 };
                 let args_str: Vec<_> = args.iter()

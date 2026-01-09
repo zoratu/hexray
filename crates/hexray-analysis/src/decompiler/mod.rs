@@ -132,6 +132,8 @@ pub struct RelocationTable {
     call_relocations: HashMap<u64, String>,
     /// Maps instruction addresses to data symbol names (for mov/lea with immediates).
     data_relocations: HashMap<u64, String>,
+    /// Maps GOT/PLT entry addresses to symbol names (for indirect calls).
+    got_symbols: HashMap<u64, String>,
 }
 
 impl RelocationTable {
@@ -173,7 +175,17 @@ impl RelocationTable {
 
     /// Returns true if the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.call_relocations.is_empty() && self.data_relocations.is_empty()
+        self.call_relocations.is_empty() && self.data_relocations.is_empty() && self.got_symbols.is_empty()
+    }
+
+    /// Adds a GOT entry mapping.
+    pub fn insert_got(&mut self, got_addr: u64, symbol: String) {
+        self.got_symbols.insert(got_addr, symbol);
+    }
+
+    /// Looks up a symbol by GOT entry address.
+    pub fn get_got(&self, got_addr: u64) -> Option<&str> {
+        self.got_symbols.get(&got_addr).map(|s| s.as_str())
     }
 }
 
