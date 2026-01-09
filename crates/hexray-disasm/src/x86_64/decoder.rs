@@ -1,7 +1,7 @@
 //! x86_64 instruction decoder.
 
 use super::modrm::{decode_gpr, decode_modrm_reg, decode_modrm_rm, ModRM};
-use super::opcodes::{OperandEncoding, OPCODE_TABLE, OPCODE_TABLE_0F, GROUP1_OPS, GROUP5_OPS};
+use super::opcodes::{OperandEncoding, OPCODE_TABLE, OPCODE_TABLE_0F, GROUP1_OPS, GROUP3_OPS, GROUP5_OPS};
 use super::prefix::Prefixes;
 use crate::error::DecodeError;
 use crate::traits::{DecodedInstruction, Disassembler};
@@ -89,6 +89,10 @@ impl Disassembler for X86_64Disassembler {
             // Handle group 2 (shift/rotate: 0xC0-0xC1, 0xD0-0xD3)
             if opcode == 0xC0 || opcode == 0xC1 || (opcode >= 0xD0 && opcode <= 0xD3) {
                 return self.decode_group2(bytes, address, &prefixes, offset, opcode);
+            }
+            // Handle group 3 (0xF6/0xF7: TEST/NOT/NEG/MUL/DIV)
+            if opcode == 0xF6 || opcode == 0xF7 {
+                return self.decode_group3(bytes, address, &prefixes, offset, opcode);
             }
             // Handle group 5 (0xFF: INC/DEC/CALL/JMP/PUSH)
             if opcode == 0xFF {
@@ -522,6 +526,82 @@ impl X86_64Disassembler {
             }
             _ => {}
         }
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands,
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    /// Decode group 3 instructions (0xF6/0xF7: TEST/NOT/NEG/MUL/DIV r/m).
+    fn decode_group3(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        opcode: u8,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        let modrm = ModRM::parse(remaining[0], prefixes.rex);
+        offset += 1;
+
+        // Determine operation from ModR/M reg field
+        let (mnemonic, operation) = GROUP3_OPS[(modrm.reg & 0x7) as usize];
+
+        // Operand size: F6 = 8-bit, F7 = 16/32/64-bit
+        let operand_size = if opcode == 0xF6 {
+            8
+        } else {
+            prefixes.operand_size(false)
+        };
+
+        // Decode r/m operand
+        let rm_bytes = &bytes[offset..];
+        let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+        offset += rm_consumed;
+
+        // For TEST (reg field 0 or 1), we need an immediate operand
+        let operands = if (modrm.reg & 0x7) <= 1 {
+            let imm_remaining = &bytes[offset..];
+            let imm_size = if opcode == 0xF6 { 1 } else { std::cmp::min(operand_size as usize, 4) };
+            if imm_remaining.len() < imm_size {
+                return Err(DecodeError::truncated(address, offset + imm_size, bytes.len()));
+            }
+            let imm = match imm_size {
+                1 => imm_remaining[0] as i8 as i128,
+                2 => i16::from_le_bytes([imm_remaining[0], imm_remaining[1]]) as i128,
+                4 => i32::from_le_bytes([
+                    imm_remaining[0],
+                    imm_remaining[1],
+                    imm_remaining[2],
+                    imm_remaining[3],
+                ]) as i128,
+                _ => unreachable!(),
+            };
+            offset += imm_size;
+            vec![rm_operand, Operand::imm(imm, (imm_size * 8) as u8)]
+        } else {
+            // NOT/NEG/MUL/IMUL/DIV/IDIV - just r/m operand
+            vec![rm_operand]
+        };
 
         let instruction = Instruction {
             address,

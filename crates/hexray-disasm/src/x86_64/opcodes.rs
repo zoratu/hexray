@@ -317,6 +317,18 @@ pub static GROUP2_OPS: [(&str, Operation); 8] = [
     ("sar", Operation::Sar),      // Shift right arithmetic
 ];
 
+/// Group 3 operations (for opcodes 0xF6/0xF7: unary ops with r/m).
+pub static GROUP3_OPS: [(&str, Operation); 8] = [
+    ("test", Operation::Test),    // /0 TEST r/m, imm
+    ("test", Operation::Test),    // /1 TEST r/m, imm (same as /0)
+    ("not", Operation::Not),      // /2 NOT r/m
+    ("neg", Operation::Neg),      // /3 NEG r/m
+    ("mul", Operation::Mul),      // /4 MUL r/m (unsigned)
+    ("imul", Operation::Mul),     // /5 IMUL r/m (signed)
+    ("div", Operation::Div),      // /6 DIV r/m (unsigned)
+    ("idiv", Operation::Div),     // /7 IDIV r/m (signed)
+];
+
 /// Group 5 operations (for opcode 0xFF).
 pub static GROUP5_OPS: [(&str, Operation); 8] = [
     ("inc", Operation::Inc),      // /0 INC r/m

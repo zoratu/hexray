@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use super::structurer::{StructuredCfg, StructuredNode};
-use super::expression::{Expr, ExprKind};
+use super::expression::{CallTarget, Expr, ExprKind};
 use super::{StringTable, SymbolTable, RelocationTable};
 use std::fmt::Write;
 
@@ -86,6 +86,21 @@ impl PseudoCodeEmitter {
             }
             ExprKind::UnaryOp { op, operand } => {
                 format!("{}{}", op.as_str(), self.format_expr_with_strings(operand, table))
+            }
+            ExprKind::Deref { addr, size } => {
+                // Check if this is a stack slot access (rbp + offset or rbp - offset)
+                if let Some(var_name) = self.try_format_stack_slot(addr, *size) {
+                    return var_name;
+                }
+                // Fall back to default deref formatting
+                let prefix = match size {
+                    1 => "*(uint8_t*)",
+                    2 => "*(uint16_t*)",
+                    4 => "*(uint32_t*)",
+                    8 => "*(uint64_t*)",
+                    _ => "*",
+                };
+                format!("{}({})", prefix, self.format_expr_with_strings(addr, table))
             }
             ExprKind::Assign { lhs, rhs } => {
                 format!("{} = {}",
@@ -377,6 +392,16 @@ impl PseudoCodeEmitter {
     }
 
     fn emit_statement(&self, expr: &Expr, output: &mut String, depth: usize) {
+        // Skip prologue/epilogue boilerplate
+        if self.is_prologue_epilogue(expr) {
+            return;
+        }
+
+        // Skip redundant no-op assignments
+        if self.is_noop_assignment(expr) {
+            return;
+        }
+
         let indent = self.indent.repeat(depth);
         let expr_str = self.format_expr(expr);
 
@@ -392,6 +417,125 @@ impl PseudoCodeEmitter {
         }
 
         writeln!(output, "{}{};", indent, expr_str).unwrap();
+    }
+
+    /// Checks if a statement is function prologue/epilogue boilerplate.
+    /// These patterns don't add semantic value and clutter the output.
+    fn is_prologue_epilogue(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // push(rbp) / pop(rbp) - prologue/epilogue
+            ExprKind::Call { target, args } => {
+                if let CallTarget::Named(name) = target {
+                    if name == "push" || name == "pop" {
+                        if let Some(arg) = args.first() {
+                            if let ExprKind::Var(v) = &arg.kind {
+                                if v.name == "rbp" {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            // rbp = rsp (prologue) or rsp = rsp +/- N (stack frame)
+            ExprKind::Assign { lhs, rhs } => {
+                if let ExprKind::Var(lhs_var) = &lhs.kind {
+                    // rbp = rsp (frame pointer setup)
+                    if lhs_var.name == "rbp" {
+                        if let ExprKind::Var(rhs_var) = &rhs.kind {
+                            if rhs_var.name == "rsp" {
+                                return true;
+                            }
+                        }
+                    }
+                    // rsp = rsp +/- N (stack allocation/deallocation)
+                    if lhs_var.name == "rsp" {
+                        if let ExprKind::BinOp { left, .. } = &rhs.kind {
+                            if let ExprKind::Var(inner_var) = &left.kind {
+                                if inner_var.name == "rsp" {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Checks if an assignment is a no-op (e.g., x = x, x = x + 0, x = x * 1).
+    fn is_noop_assignment(&self, expr: &Expr) -> bool {
+        use super::expression::BinOpKind;
+
+        if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+            // Check for exact self-assignment: x = x
+            if exprs_equal(lhs, rhs) {
+                return true;
+            }
+
+            // Check for identity operations: x = x + 0, x = x - 0, x = x * 1, x = x | 0, x = x ^ 0
+            if let ExprKind::BinOp { op, left, right } = &rhs.kind {
+                if exprs_equal(lhs, left) {
+                    // Check if the right operand is an identity value for this operation
+                    if let ExprKind::IntLit(n) = &right.kind {
+                        match op {
+                            BinOpKind::Add | BinOpKind::Sub | BinOpKind::Or | BinOpKind::Xor | BinOpKind::Shl | BinOpKind::Shr => {
+                                if *n == 0 {
+                                    return true;
+                                }
+                            }
+                            BinOpKind::Mul | BinOpKind::Div => {
+                                if *n == 1 {
+                                    return true;
+                                }
+                            }
+                            BinOpKind::And => {
+                                // x & -1 (all bits set) is identity
+                                if *n == -1 {
+                                    return true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Try to format a stack slot dereference as a local variable name.
+    /// Detects patterns like rbp + -0x8 and converts to var_8.
+    fn try_format_stack_slot(&self, addr: &Expr, _size: u8) -> Option<String> {
+        use super::expression::BinOpKind;
+
+        // Check for rbp + offset pattern
+        if let ExprKind::BinOp { op, left, right } = &addr.kind {
+            if let ExprKind::Var(base) = &left.kind {
+                if base.name == "rbp" {
+                    if let ExprKind::IntLit(offset) = &right.kind {
+                        // Compute the actual offset (handle rbp + -0x8 as offset -8)
+                        let actual_offset = match op {
+                            BinOpKind::Add => *offset,
+                            BinOpKind::Sub => -*offset,
+                            _ => return None,
+                        };
+
+                        if actual_offset < 0 {
+                            // Local variables are at negative offsets from rbp
+                            return Some(format!("var_{:x}", -actual_offset));
+                        } else if actual_offset > 0 {
+                            // Arguments/caller data are at positive offsets from rbp
+                            return Some(format!("arg_{:x}", actual_offset));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Emits a statement where the RHS 0 should be replaced with a symbol.
@@ -431,6 +575,27 @@ fn escape_string(s: &str) -> String {
 /// Helper to format a condition nicely.
 pub fn format_condition(cond: &Expr) -> String {
     cond.to_string()
+}
+
+/// Checks if two expressions are structurally equal.
+fn exprs_equal(a: &Expr, b: &Expr) -> bool {
+    match (&a.kind, &b.kind) {
+        (ExprKind::Var(va), ExprKind::Var(vb)) => va.name == vb.name,
+        (ExprKind::IntLit(na), ExprKind::IntLit(nb)) => na == nb,
+        (ExprKind::BinOp { op: opa, left: la, right: ra },
+         ExprKind::BinOp { op: opb, left: lb, right: rb }) => {
+            opa == opb && exprs_equal(la, lb) && exprs_equal(ra, rb)
+        }
+        (ExprKind::UnaryOp { op: opa, operand: oa },
+         ExprKind::UnaryOp { op: opb, operand: ob }) => {
+            opa == opb && exprs_equal(oa, ob)
+        }
+        (ExprKind::Deref { addr: aa, size: sa },
+         ExprKind::Deref { addr: ab, size: sb }) => {
+            sa == sb && exprs_equal(aa, ab)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
