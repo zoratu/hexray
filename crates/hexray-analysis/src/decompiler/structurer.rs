@@ -694,6 +694,7 @@ impl<'a> Structurer<'a> {
 }
 
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
+/// Also substitutes register names with their values from preceding MOV instructions.
 fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
     let op = match cond {
         Condition::Equal => BinOpKind::Eq,
@@ -709,6 +710,9 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
         _ => BinOpKind::Ne, // Default for flag-based conditions
     };
 
+    // Build a map of register values from MOV instructions before the compare
+    let reg_values = build_register_value_map(block);
+
     // Find the last compare instruction in the block
     let compare_inst = block.instructions.iter().rev().find(|inst| {
         matches!(inst.operation, Operation::Compare | Operation::Test | Operation::Sub)
@@ -718,13 +722,13 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
         // For SUB/SUBS instructions (ARM64), operands are [dst, src1, src2]
         // The comparison is between src1 and src2
         if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Sub) {
-            let left = Expr::from_operand(&inst.operands[1]);
-            let right = Expr::from_operand(&inst.operands[2]);
+            let left = substitute_register_in_expr(Expr::from_operand(&inst.operands[1]), &reg_values);
+            let right = substitute_register_in_expr(Expr::from_operand(&inst.operands[2]), &reg_values);
             return Expr::binop(op, left, right);
         } else if inst.operands.len() >= 2 {
             // For CMP/TEST instructions, operands are [src1, src2]
-            let left = Expr::from_operand(&inst.operands[0]);
-            let right = Expr::from_operand(&inst.operands[1]);
+            let left = substitute_register_in_expr(Expr::from_operand(&inst.operands[0]), &reg_values);
+            let right = substitute_register_in_expr(Expr::from_operand(&inst.operands[1]), &reg_values);
 
             // Special case: TEST reg, reg (same register) is a zero check
             // test eax, eax; je → jump if eax == 0
@@ -736,13 +740,69 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
             return Expr::binop(op, left, right);
         } else if inst.operands.len() == 1 {
             // Compare against zero (common for test/cmp with single operand)
-            let left = Expr::from_operand(&inst.operands[0]);
+            let left = substitute_register_in_expr(Expr::from_operand(&inst.operands[0]), &reg_values);
             return Expr::binop(op, left, Expr::int(0));
         }
     }
 
     // Fallback: use placeholder if no compare found
     Expr::binop(op, Expr::unknown("cmp_left"), Expr::unknown("cmp_right"))
+}
+
+/// Builds a map of register names to their values from MOV instructions in a block.
+/// This is used to substitute register names in conditions with meaningful variable names.
+fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
+    use hexray_core::Operand;
+
+    let mut reg_values: HashMap<String, Expr> = HashMap::new();
+
+    for inst in &block.instructions {
+        // Look for MOV instructions: mov reg, [mem] or mov reg, var
+        if matches!(inst.operation, Operation::Move) && inst.operands.len() >= 2 {
+            // First operand is destination (register), second is source
+            if let Operand::Register(reg) = &inst.operands[0] {
+                let reg_name = reg.name().to_lowercase();
+                // Only track if source is a memory operand (stack variable)
+                if let Operand::Memory { .. } = &inst.operands[1] {
+                    let value = Expr::from_operand(&inst.operands[1]);
+                    reg_values.insert(reg_name, value);
+                }
+            }
+        }
+    }
+
+    reg_values
+}
+
+/// Substitutes register references in an expression with their known values.
+fn substitute_register_in_expr(expr: Expr, reg_values: &HashMap<String, Expr>) -> Expr {
+    use super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(v) => {
+            // Check if this variable name is a register we have a value for
+            let lower_name = v.name.to_lowercase();
+            if let Some(value) = reg_values.get(&lower_name) {
+                value.clone()
+            } else {
+                expr
+            }
+        }
+        ExprKind::BinOp { op, left, right } => {
+            Expr::binop(
+                *op,
+                substitute_register_in_expr((**left).clone(), reg_values),
+                substitute_register_in_expr((**right).clone(), reg_values),
+            )
+        }
+        ExprKind::UnaryOp { op, operand } => {
+            Expr::unary(*op, substitute_register_in_expr((**operand).clone(), reg_values))
+        }
+        ExprKind::Deref { addr, size } => {
+            Expr::deref(substitute_register_in_expr((**addr).clone(), reg_values), *size)
+        }
+        _ => expr,
+    }
 }
 
 /// Simple condition conversion without block context (fallback).
