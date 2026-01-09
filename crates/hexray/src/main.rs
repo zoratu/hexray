@@ -60,9 +60,9 @@ enum Commands {
     Decompile {
         /// Symbol name or address
         target: String,
-        /// Don't show address comments
+        /// Show basic block address comments
         #[arg(long)]
-        no_addresses: bool,
+        show_addresses: bool,
     },
 }
 
@@ -137,8 +137,8 @@ fn main() -> Result<()> {
         Some(Commands::Cfg { target }) => {
             disassemble_cfg(fmt, &target)?;
         }
-        Some(Commands::Decompile { target, no_addresses }) => {
-            decompile_function(&binary, &target, !no_addresses)?;
+        Some(Commands::Decompile { target, show_addresses }) => {
+            decompile_function(&binary, &target, show_addresses)?;
         }
         None => {
             // Default: disassemble

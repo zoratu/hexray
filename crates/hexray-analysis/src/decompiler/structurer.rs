@@ -118,6 +118,9 @@ impl StructuredCfg {
         let mut structurer = Structurer::new(cfg);
         let body = structurer.structure();
 
+        // Post-process to eliminate temporary register patterns
+        let body = simplify_statements(body);
+
         Self {
             body,
             cfg_entry: cfg.entry,
@@ -324,14 +327,18 @@ impl<'a> Structurer<'a> {
             // Handle based on terminator
             match &block.terminator {
                 BlockTerminator::Return => {
-                    if !statements.is_empty() {
+                    // Check if last statement is an assignment to return register (eax/rax)
+                    // If so, extract it as the return value
+                    let (filtered_stmts, return_value) = extract_return_value(statements);
+
+                    if !filtered_stmts.is_empty() {
                         result.push(StructuredNode::Block {
                             id: block_id,
-                            statements,
+                            statements: filtered_stmts,
                             address_range,
                         });
                     }
-                    result.push(StructuredNode::Return(None));
+                    result.push(StructuredNode::Return(return_value));
                     break;
                 }
 
@@ -776,3 +783,192 @@ fn negate_condition(expr: Expr) -> Expr {
         _ => Expr::unary(super::expression::UnaryOpKind::LogicalNot, expr),
     }
 }
+
+/// Extracts the return value from a return register assignment near the end of the block.
+/// Returns the filtered statements (without the return value assignment) and the return value.
+/// Looks backwards through statements to find the last assignment to a return register,
+/// skipping over prologue/epilogue statements like pop(rbp).
+fn extract_return_value(mut statements: Vec<Expr>) -> (Vec<Expr>, Option<Expr>) {
+    // Search backwards for an assignment to a return register
+    for i in (0..statements.len()).rev() {
+        let stmt = &statements[i];
+        if let super::expression::ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let super::expression::ExprKind::Var(v) = &lhs.kind {
+                // Check if this is assigning to a return register (eax, rax, x0, a0)
+                let is_return_reg = matches!(v.name.as_str(), "eax" | "rax" | "x0" | "a0");
+                if is_return_reg {
+                    let return_value = (**rhs).clone();
+                    statements.remove(i);
+                    return (statements, Some(return_value));
+                }
+            }
+        }
+        // Skip prologue/epilogue-like statements (push/pop)
+        if let super::expression::ExprKind::Call { target, .. } = &stmt.kind {
+            if let super::expression::CallTarget::Named(name) = target {
+                if name == "push" || name == "pop" {
+                    continue;
+                }
+            }
+        }
+        // If we hit a non-prologue statement that's not a return reg assignment, stop
+        break;
+    }
+    (statements, None)
+}
+
+/// Simplifies statements by performing copy propagation on temporary registers.
+/// Transforms patterns like `eax = x; y = eax;` into `y = x;`.
+fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    nodes.into_iter().map(simplify_node).collect()
+}
+
+fn simplify_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::Block { id, statements, address_range } => {
+            let statements = propagate_copies(statements);
+            StructuredNode::Block { id, statements, address_range }
+        }
+        StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body: simplify_statements(then_body),
+                else_body: else_body.map(simplify_statements),
+            }
+        }
+        StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition,
+                body: simplify_statements(body),
+            }
+        }
+        StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body: simplify_statements(body),
+                condition,
+            }
+        }
+        StructuredNode::For { init, condition, update, body } => {
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: simplify_statements(body),
+            }
+        }
+        StructuredNode::Loop { body } => {
+            StructuredNode::Loop {
+                body: simplify_statements(body),
+            }
+        }
+        StructuredNode::Switch { value, cases, default } => {
+            StructuredNode::Switch {
+                value,
+                cases: cases.into_iter()
+                    .map(|(vals, body)| (vals, simplify_statements(body)))
+                    .collect(),
+                default: default.map(simplify_statements),
+            }
+        }
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(simplify_statements(nodes))
+        }
+        // Pass through other nodes unchanged
+        other => other,
+    }
+}
+
+/// Performs copy propagation on a list of statements.
+/// Transforms patterns like `eax = x; y = eax;` into `y = x;` and removes the temp assignment.
+fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
+    use super::expression::ExprKind;
+
+    // Track the last value assigned to each temp register
+    let mut reg_values: HashMap<String, Expr> = HashMap::new();
+    // Track which temp register assignments can be removed
+    let mut can_remove: HashSet<String> = HashSet::new();
+    let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
+
+    for stmt in statements.into_iter() {
+        if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            // Always substitute known register values in the RHS
+            let new_rhs = substitute_vars(rhs, &reg_values);
+
+            // Check if LHS is a temp register
+            if let ExprKind::Var(lhs_var) = &lhs.kind {
+                if is_temp_register(&lhs_var.name) {
+                    // Track this assignment for future substitution
+                    reg_values.insert(lhs_var.name.clone(), new_rhs.clone());
+                    can_remove.insert(lhs_var.name.clone());
+                    // Emit with substituted RHS
+                    result.push(Expr::assign((**lhs).clone(), new_rhs));
+                    continue;
+                }
+            }
+
+            // Non-temp LHS (memory location or non-temp register): emit with substitution
+            result.push(Expr::assign((**lhs).clone(), new_rhs));
+            continue;
+        }
+        // Non-assignment statement: pass through
+        result.push(stmt);
+    }
+
+    // Second pass: remove temp register assignments that were fully propagated
+    result.into_iter()
+        .filter(|stmt| {
+            if let ExprKind::Assign { lhs, .. } = &stmt.kind {
+                if let ExprKind::Var(v) = &lhs.kind {
+                    if is_temp_register(&v.name) && can_remove.contains(&v.name) {
+                        return false; // Remove this temp assignment
+                    }
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Check if a register name is a temporary (likely to be eliminated)
+fn is_temp_register(name: &str) -> bool {
+    matches!(name, "eax" | "rax" | "ebx" | "rbx" | "ecx" | "rcx" | "edx" | "rdx" |
+                   "esi" | "rsi" | "edi" | "rdi" | "r8" | "r8d" | "r9" | "r9d" |
+                   "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7" |
+                   "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7")
+}
+
+/// Substitute variable references with their known values
+fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
+    use super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(v) => {
+            if let Some(value) = reg_values.get(&v.name) {
+                value.clone()
+            } else {
+                expr.clone()
+            }
+        }
+        ExprKind::BinOp { op, left, right } => {
+            Expr::binop(
+                *op,
+                substitute_vars(left, reg_values),
+                substitute_vars(right, reg_values),
+            )
+        }
+        ExprKind::UnaryOp { op, operand } => {
+            Expr::unary(*op, substitute_vars(operand, reg_values))
+        }
+        ExprKind::Assign { lhs, rhs } => {
+            Expr::assign(
+                substitute_vars(lhs, reg_values),
+                substitute_vars(rhs, reg_values),
+            )
+        }
+        ExprKind::Deref { addr, size } => {
+            Expr::deref(substitute_vars(addr, reg_values), *size)
+        }
+        _ => expr.clone(),
+    }
+}
+
