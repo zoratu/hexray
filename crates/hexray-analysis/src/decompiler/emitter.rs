@@ -272,11 +272,91 @@ impl PseudoCodeEmitter {
         }
         writeln!(output, "{{").unwrap();
 
+        // Collect all local variables used in the function (excluding parameters)
+        let all_vars = self.collect_local_variables(&cfg.body, &func_info.parameters);
+
+        // Emit variable declarations at the top (C89 style)
+        if !all_vars.is_empty() {
+            let indent = &self.indent;
+            for var in &all_vars {
+                writeln!(output, "{}int {};", indent, var).unwrap();
+            }
+            writeln!(output).unwrap(); // Blank line after declarations
+        }
+
+        // Track declared variables (parameters + locals)
+        let mut declared_vars: HashSet<String> = func_info.parameters.iter().cloned().collect();
+        declared_vars.extend(all_vars);
+
         // Emit body, skipping parameter assignment statements
-        self.emit_nodes_with_skip(&cfg.body, &mut output, 1, &func_info.skip_statements);
+        self.emit_nodes_with_skip_and_decls(&cfg.body, &mut output, 1, &func_info.skip_statements, &mut declared_vars);
 
         writeln!(output, "}}").unwrap();
         output
+    }
+
+    /// Collects all local variables assigned to in the function body.
+    fn collect_local_variables(&self, nodes: &[StructuredNode], params: &[String]) -> Vec<String> {
+        let mut vars = HashSet::new();
+        self.collect_vars_from_nodes(nodes, &mut vars);
+
+        // Remove parameters
+        for p in params {
+            vars.remove(p);
+        }
+
+        // Sort for consistent output
+        let mut vars: Vec<_> = vars.into_iter().collect();
+        vars.sort();
+        vars
+    }
+
+    fn collect_vars_from_nodes(&self, nodes: &[StructuredNode], vars: &mut HashSet<String>) {
+        for node in nodes {
+            self.collect_vars_from_node(node, vars);
+        }
+    }
+
+    fn collect_vars_from_node(&self, node: &StructuredNode, vars: &mut HashSet<String>) {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    // Skip prologue/epilogue
+                    if self.is_prologue_epilogue(stmt) {
+                        continue;
+                    }
+                    if let ExprKind::Assign { lhs, .. } = &stmt.kind {
+                        if let Some(var_name) = get_stack_var_name(lhs) {
+                            vars.insert(var_name);
+                        }
+                    }
+                }
+            }
+            StructuredNode::If { then_body, else_body, .. } => {
+                self.collect_vars_from_nodes(then_body, vars);
+                if let Some(else_nodes) = else_body {
+                    self.collect_vars_from_nodes(else_nodes, vars);
+                }
+            }
+            StructuredNode::While { body, .. } |
+            StructuredNode::DoWhile { body, .. } |
+            StructuredNode::For { body, .. } |
+            StructuredNode::Loop { body } => {
+                self.collect_vars_from_nodes(body, vars);
+            }
+            StructuredNode::Switch { cases, default, .. } => {
+                for (_, case_body) in cases {
+                    self.collect_vars_from_nodes(case_body, vars);
+                }
+                if let Some(def) = default {
+                    self.collect_vars_from_nodes(def, vars);
+                }
+            }
+            StructuredNode::Sequence(nodes) => {
+                self.collect_vars_from_nodes(nodes, vars);
+            }
+            _ => {}
+        }
     }
 
     /// Analyzes a function body to detect parameters and return type.
@@ -389,29 +469,31 @@ impl PseudoCodeEmitter {
         false
     }
 
-    /// Emits nodes, skipping specified statements.
-    fn emit_nodes_with_skip(
+    /// Emits nodes, skipping specified statements and tracking variable declarations.
+    fn emit_nodes_with_skip_and_decls(
         &self,
         nodes: &[StructuredNode],
         output: &mut String,
         depth: usize,
-        skip: &std::collections::HashSet<(usize, usize)>,
+        skip: &HashSet<(usize, usize)>,
+        declared_vars: &mut HashSet<String>,
     ) {
         for (block_idx, node) in nodes.iter().enumerate() {
-            self.emit_node_with_skip(node, output, depth, block_idx, skip);
+            self.emit_node_with_skip_and_decls(node, output, depth, block_idx, skip, declared_vars);
             if self.is_control_exit(node) {
                 break;
             }
         }
     }
 
-    fn emit_node_with_skip(
+    fn emit_node_with_skip_and_decls(
         &self,
         node: &StructuredNode,
         output: &mut String,
         depth: usize,
         block_idx: usize,
         skip: &HashSet<(usize, usize)>,
+        declared_vars: &mut HashSet<String>,
     ) {
         match node {
             StructuredNode::Block { id, statements, address_range } => {
@@ -427,13 +509,148 @@ impl PseudoCodeEmitter {
                     writeln!(output, "{}// bb{} [{:#x}..{:#x}]", indent, id.0, address_range.0, address_range.1).unwrap();
                 }
                 for stmt in filtered {
-                    // Use emit_statement to get prologue/epilogue filtering
-                    self.emit_statement(stmt, output, depth);
+                    self.emit_statement_with_decl(stmt, output, depth, declared_vars);
                 }
+            }
+            // For control flow structures, recurse with the same declared_vars
+            StructuredNode::If { condition, then_body, else_body } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}if ({}) {{", indent, self.format_expr(condition)).unwrap();
+                self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
+                if let Some(else_nodes) = else_body {
+                    if else_nodes.len() == 1 {
+                        if let StructuredNode::If { .. } = &else_nodes[0] {
+                            write!(output, "{}}} else ", indent).unwrap();
+                            self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
+                            return;
+                        }
+                    }
+                    writeln!(output, "{}}} else {{", indent).unwrap();
+                    self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
+                }
+                writeln!(output, "{}}}", indent).unwrap();
+            }
+            StructuredNode::While { condition, body } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}while ({}) {{", indent, self.format_expr(condition)).unwrap();
+                self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
+                writeln!(output, "{}}}", indent).unwrap();
+            }
+            StructuredNode::DoWhile { body, condition } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}do {{", indent).unwrap();
+                self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
+                writeln!(output, "{}}} while ({});", indent, self.format_expr(condition)).unwrap();
+            }
+            StructuredNode::Loop { body } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}while (1) {{", indent).unwrap();
+                self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
+                writeln!(output, "{}}}", indent).unwrap();
             }
             // For other node types, delegate to the normal emit_node
             _ => self.emit_node(node, output, depth),
         }
+    }
+
+    /// Emits nodes tracking variable declarations.
+    fn emit_nodes_with_decls(
+        &self,
+        nodes: &[StructuredNode],
+        output: &mut String,
+        depth: usize,
+        declared_vars: &mut HashSet<String>,
+    ) {
+        for node in nodes {
+            self.emit_node_with_decls(node, output, depth, declared_vars);
+            if self.is_control_exit(node) {
+                break;
+            }
+        }
+    }
+
+    fn emit_node_with_decls(
+        &self,
+        node: &StructuredNode,
+        output: &mut String,
+        depth: usize,
+        declared_vars: &mut HashSet<String>,
+    ) {
+        match node {
+            StructuredNode::Block { id, statements, address_range } => {
+                if self.emit_addresses {
+                    let indent = self.indent.repeat(depth);
+                    writeln!(output, "{}// bb{} [{:#x}..{:#x}]", indent, id.0, address_range.0, address_range.1).unwrap();
+                }
+                for stmt in statements {
+                    self.emit_statement_with_decl(stmt, output, depth, declared_vars);
+                }
+            }
+            // For control flow structures, recurse
+            StructuredNode::If { condition, then_body, else_body } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}if ({}) {{", indent, self.format_expr(condition)).unwrap();
+                self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
+                if let Some(else_nodes) = else_body {
+                    if else_nodes.len() == 1 {
+                        if let StructuredNode::If { .. } = &else_nodes[0] {
+                            write!(output, "{}}} else ", indent).unwrap();
+                            self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
+                            return;
+                        }
+                    }
+                    writeln!(output, "{}}} else {{", indent).unwrap();
+                    self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
+                }
+                writeln!(output, "{}}}", indent).unwrap();
+            }
+            StructuredNode::While { condition, body } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}while ({}) {{", indent, self.format_expr(condition)).unwrap();
+                self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
+                writeln!(output, "{}}}", indent).unwrap();
+            }
+            StructuredNode::DoWhile { body, condition } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}do {{", indent).unwrap();
+                self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
+                writeln!(output, "{}}} while ({});", indent, self.format_expr(condition)).unwrap();
+            }
+            StructuredNode::Loop { body } => {
+                let indent = self.indent.repeat(depth);
+                writeln!(output, "{}while (1) {{", indent).unwrap();
+                self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
+                writeln!(output, "{}}}", indent).unwrap();
+            }
+            _ => self.emit_node(node, output, depth),
+        }
+    }
+
+    /// Emits a statement (variables are declared at function top, so no inline declarations).
+    fn emit_statement_with_decl(&self, expr: &Expr, output: &mut String, depth: usize, _declared_vars: &mut HashSet<String>) {
+        // Skip prologue/epilogue boilerplate
+        if self.is_prologue_epilogue(expr) {
+            return;
+        }
+
+        // Skip redundant no-op assignments
+        if self.is_noop_assignment(expr) {
+            return;
+        }
+
+        let indent = self.indent.repeat(depth);
+        let expr_str = self.format_expr(expr);
+
+        if expr_str.is_empty() || expr_str == "/* nop */" {
+            return;
+        }
+
+        if expr_str == "return" {
+            writeln!(output, "{}return;", indent).unwrap();
+            return;
+        }
+
+        writeln!(output, "{}{};", indent, expr_str).unwrap();
     }
 
     fn emit_nodes(&self, nodes: &[StructuredNode], output: &mut String, depth: usize) {
