@@ -160,6 +160,26 @@ impl BinOpKind {
         }
     }
 
+    /// Returns the operator string for compound assignment (e.g., "+=" for Add).
+    /// Returns None for comparison operators which don't support compound assignment.
+    pub fn compound_op_str(&self) -> Option<&'static str> {
+        match self {
+            Self::Add => Some("+"),
+            Self::Sub => Some("-"),
+            Self::Mul => Some("*"),
+            Self::Div => Some("/"),
+            Self::Mod => Some("%"),
+            Self::And => Some("&"),
+            Self::Or => Some("|"),
+            Self::Xor => Some("^"),
+            Self::Shl => Some("<<"),
+            Self::Shr => Some(">>"),
+            Self::Sar => Some(">>"),
+            // Comparison and logical operators don't have compound forms
+            _ => None,
+        }
+    }
+
     /// Returns precedence (higher = binds tighter).
     pub fn precedence(&self) -> u8 {
         match self {

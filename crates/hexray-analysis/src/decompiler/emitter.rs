@@ -146,6 +146,27 @@ impl PseudoCodeEmitter {
                 format!("{}({})", prefix, self.format_expr_with_strings(addr, table))
             }
             ExprKind::Assign { lhs, rhs } => {
+                // Check for compound assignment patterns: x = x op y → x op= y
+                if let ExprKind::BinOp { op, left, right } = &rhs.kind {
+                    if exprs_equal(lhs, left) {
+                        let lhs_str = self.format_expr_with_strings(lhs, table);
+                        let rhs_str = self.format_expr_with_strings(right, table);
+
+                        // Special case: x = x + 1 → x++ and x = x - 1 → x--
+                        if let ExprKind::IntLit(1) = right.kind {
+                            match op {
+                                super::expression::BinOpKind::Add => return format!("{}++", lhs_str),
+                                super::expression::BinOpKind::Sub => return format!("{}--", lhs_str),
+                                _ => {}
+                            }
+                        }
+
+                        // General compound assignment: x = x op y → x op= y
+                        if let Some(compound_op) = op.compound_op_str() {
+                            return format!("{} {}= {}", lhs_str, compound_op, rhs_str);
+                        }
+                    }
+                }
                 format!("{} = {}",
                     self.format_expr_with_strings(lhs, table),
                     self.format_expr_with_strings(rhs, table))
