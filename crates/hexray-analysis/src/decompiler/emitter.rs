@@ -965,13 +965,22 @@ impl PseudoCodeEmitter {
     fn try_format_stack_slot(&self, addr: &Expr, _size: u8) -> Option<String> {
         use super::expression::BinOpKind;
 
-        // Check for base + offset pattern (rbp for x86-64, sp/x29 for ARM64)
+        // Check for base-only pattern (offset 0): just "sp" or "x29"
+        if let ExprKind::Var(base) = &addr.kind {
+            if base.name == "sp" {
+                return Some("var_0".to_string());
+            }
+        }
+
+        // Check for base + offset pattern
         if let ExprKind::BinOp { op, left, right } = &addr.kind {
             if let ExprKind::Var(base) = &left.kind {
-                let is_x86_frame = base.name == "rbp";
-                let is_arm64_stack = base.name == "sp" || base.name == "x29";
+                // Frame pointers: rbp (x86-64), x29 (ARM64) - locals at negative offsets
+                let is_frame_pointer = base.name == "rbp" || base.name == "x29";
+                // Stack pointer: sp (ARM64) - locals at positive offsets
+                let is_stack_pointer = base.name == "sp";
 
-                if is_x86_frame || is_arm64_stack {
+                if is_frame_pointer || is_stack_pointer {
                     if let ExprKind::IntLit(offset) = &right.kind {
                         let actual_offset = match op {
                             BinOpKind::Add => *offset,
@@ -979,15 +988,15 @@ impl PseudoCodeEmitter {
                             _ => return None,
                         };
 
-                        if is_x86_frame {
-                            // x86-64: locals at negative offsets from rbp
+                        if is_frame_pointer {
+                            // Frame pointer: locals at negative offsets, args at positive
                             if actual_offset < 0 {
                                 return Some(format!("var_{:x}", -actual_offset));
                             } else if actual_offset > 0 {
                                 return Some(format!("arg_{:x}", actual_offset));
                             }
                         } else {
-                            // ARM64: locals at positive offsets from sp
+                            // Stack pointer: locals at positive offsets
                             if actual_offset >= 0 {
                                 return Some(format!("var_{:x}", actual_offset));
                             }
