@@ -18,28 +18,51 @@ impl Arm64Disassembler {
         Self
     }
 
-    /// Creates an ARM64 general-purpose register.
-    fn gpr(id: u16, is_64bit: bool) -> Register {
+    /// Creates an ARM64 general-purpose register with SP interpretation for register 31.
+    /// Use this for base address registers where register 31 means SP.
+    fn gpr_sp(id: u16, is_64bit: bool) -> Register {
         Register::new(
             Architecture::Arm64,
-            if id == arm64::SP {
+            if id == 31 {
                 RegisterClass::StackPointer
             } else {
                 RegisterClass::General
             },
-            id,
+            if id == 31 { arm64::SP } else { id },
             if is_64bit { 64 } else { 32 },
         )
     }
 
-    /// Creates an X register (64-bit).
-    fn xreg(id: u16) -> Register {
-        Self::gpr(id, true)
+    /// Creates an ARM64 general-purpose register with ZR interpretation for register 31.
+    /// Use this for data registers where register 31 means XZR/WZR (zero register).
+    fn gpr_zr(id: u16, is_64bit: bool) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::General,
+            if id == 31 { arm64::XZR } else { id },
+            if is_64bit { 64 } else { 32 },
+        )
     }
 
-    /// Creates a W register (32-bit).
+    /// Creates an X register (64-bit) with ZR interpretation for register 31.
+    fn xreg(id: u16) -> Register {
+        Self::gpr_zr(id, true)
+    }
+
+    /// Creates a W register (32-bit) with ZR interpretation for register 31.
     fn wreg(id: u16) -> Register {
-        Self::gpr(id, false)
+        Self::gpr_zr(id, false)
+    }
+
+    /// Creates an X register (64-bit) with SP interpretation for register 31.
+    fn xreg_sp(id: u16) -> Register {
+        Self::gpr_sp(id, true)
+    }
+
+    /// Creates a W register (32-bit) with SP interpretation for register 31.
+    #[allow(dead_code)]
+    fn wreg_sp(id: u16) -> Register {
+        Self::gpr_sp(id, false)
     }
 
     /// Decode the instruction at the given address.
@@ -131,13 +154,15 @@ impl Arm64Disassembler {
                 // Special cases for aliases
                 let (mnemonic, operands, operation) = if set_flags && rd == 31 {
                     // CMP/CMN (comparing with zero register)
+                    // Rn can be SP (register 31 = SP in CMP/CMN)
                     let mnemonic = if is_sub { "cmp" } else { "cmn" };
-                    let reg = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    let reg = if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) };
                     (mnemonic, vec![Operand::reg(reg), Operand::imm_unsigned(imm, 64)], Operation::Compare)
                 } else if !set_flags && is_sub && rn == 31 {
                     // MOV (from SP) - sub from SP with 0
-                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
-                    let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    // Without flags, register 31 = SP for both Rd and Rn
+                    let dst = if is_64bit { Self::xreg_sp(rd) } else { Self::wreg_sp(rd) };
+                    let src = if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) };
                     if imm == 0 {
                         ("mov", vec![Operand::reg(dst), Operand::reg(src)], Operation::Move)
                     } else {
@@ -151,8 +176,19 @@ impl Arm64Disassembler {
                         (true, false) => "sub",
                         (true, true) => "subs",
                     };
-                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
-                    let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    // Without flags (S=0): Rd and Rn use SP interpretation for reg 31
+                    // With flags (S=1): Rd uses ZR, Rn uses SP
+                    let (dst, src) = if set_flags {
+                        (
+                            if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) },
+                            if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) },
+                        )
+                    } else {
+                        (
+                            if is_64bit { Self::xreg_sp(rd) } else { Self::wreg_sp(rd) },
+                            if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) },
+                        )
+                    };
                     (mnemonic, vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(imm, 64)], if is_sub { Operation::Sub } else { Operation::Add })
                 };
 
@@ -704,21 +740,19 @@ impl Arm64Disassembler {
 
         let (reg_rt, reg_base) = if v == 0 {
             if data_size == 8 {
-                (Self::xreg(rt), Self::xreg(rn))
+                (Self::xreg(rt), Self::xreg_sp(rn))
             } else {
-                (Self::wreg(rt), Self::xreg(rn))
+                (Self::wreg(rt), Self::xreg_sp(rn))
             }
         } else {
             // SIMD register naming (simplified)
-            (Self::xreg(rt), Self::xreg(rn))
+            (Self::xreg(rt), Self::xreg_sp(rn))
         };
 
         let mem = MemoryRef::base_disp(reg_base.clone(), imm9, data_size as u8);
-        let operands = if is_load {
-            vec![Operand::reg(reg_rt), Operand::Memory(mem)]
-        } else {
-            vec![Operand::Memory(mem), Operand::reg(reg_rt)]
-        };
+        // Use consistent operand order: [Register, Memory] for both loads and stores
+        // This matches the STR/LDR unsigned immediate encoding
+        let operands = vec![Operand::reg(reg_rt), Operand::Memory(mem)];
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(if is_load { Operation::Load } else { Operation::Store })
@@ -770,7 +804,7 @@ impl Arm64Disassembler {
         };
 
         let reg = if is_64bit || size == 3 { Self::xreg(rt) } else { Self::wreg(rt) };
-        let base = Self::xreg(rn);
+        let base = Self::xreg_sp(rn);
         let mem = if offset == 0 {
             MemoryRef::base(base, access_size)
         } else {
@@ -814,7 +848,7 @@ impl Arm64Disassembler {
         let mnemonic = if is_load { "ldp" } else { "stp" };
         let reg1 = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
         let reg2 = if is_64bit { Self::xreg(rt2) } else { Self::wreg(rt2) };
-        let base = Self::xreg(rn);
+        let base = Self::xreg_sp(rn);
 
         let mem = if offset == 0 {
             MemoryRef::base(base, if is_64bit { 16 } else { 8 })
@@ -867,7 +901,7 @@ impl Arm64Disassembler {
         };
 
         let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
-        let base = Self::xreg(rn);
+        let base = Self::xreg_sp(rn);
         let index = if option & 0b011 == 0b011 {
             Self::xreg(rm)
         } else {
@@ -923,7 +957,7 @@ impl Arm64Disassembler {
 
         // For display, we'd normally add ! for pre-indexed, but we'll just use the mnemonic
         let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
-        let base = Self::xreg(rn);
+        let base = Self::xreg_sp(rn);
         let mem = MemoryRef::base_disp(base, offset, access_size);
 
         let operands = vec![Operand::reg(reg), Operand::Memory(mem)];

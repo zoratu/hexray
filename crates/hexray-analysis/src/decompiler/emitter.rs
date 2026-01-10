@@ -263,6 +263,16 @@ impl PseudoCodeEmitter {
                     .collect();
                 format!("{}({})", target_str, args_str.join(", "))
             }
+            // Handle variables - convert ARM64 zero register to literal 0
+            ExprKind::Var(var) => {
+                let name_lower = var.name.to_lowercase();
+                if name_lower == "wzr" || name_lower == "xzr" {
+                    // ARM64 zero register represents constant 0
+                    "0".to_string()
+                } else {
+                    var.name.clone()
+                }
+            }
             // For other cases, use default formatting
             _ => expr.to_string(),
         }
@@ -955,24 +965,32 @@ impl PseudoCodeEmitter {
     fn try_format_stack_slot(&self, addr: &Expr, _size: u8) -> Option<String> {
         use super::expression::BinOpKind;
 
-        // Check for rbp + offset pattern
+        // Check for base + offset pattern (rbp for x86-64, sp/x29 for ARM64)
         if let ExprKind::BinOp { op, left, right } = &addr.kind {
             if let ExprKind::Var(base) = &left.kind {
-                if base.name == "rbp" {
+                let is_x86_frame = base.name == "rbp";
+                let is_arm64_stack = base.name == "sp" || base.name == "x29";
+
+                if is_x86_frame || is_arm64_stack {
                     if let ExprKind::IntLit(offset) = &right.kind {
-                        // Compute the actual offset (handle rbp + -0x8 as offset -8)
                         let actual_offset = match op {
                             BinOpKind::Add => *offset,
                             BinOpKind::Sub => -*offset,
                             _ => return None,
                         };
 
-                        if actual_offset < 0 {
-                            // Local variables are at negative offsets from rbp
-                            return Some(format!("var_{:x}", -actual_offset));
-                        } else if actual_offset > 0 {
-                            // Arguments/caller data are at positive offsets from rbp
-                            return Some(format!("arg_{:x}", actual_offset));
+                        if is_x86_frame {
+                            // x86-64: locals at negative offsets from rbp
+                            if actual_offset < 0 {
+                                return Some(format!("var_{:x}", -actual_offset));
+                            } else if actual_offset > 0 {
+                                return Some(format!("arg_{:x}", actual_offset));
+                            }
+                        } else {
+                            // ARM64: locals at positive offsets from sp
+                            if actual_offset >= 0 {
+                                return Some(format!("var_{:x}", actual_offset));
+                            }
                         }
                     }
                 }
@@ -1067,10 +1085,13 @@ fn get_stack_var_name(expr: &Expr) -> Option<String> {
             }
         }
         ExprKind::Deref { addr, .. } => {
-            // Check for rbp + offset pattern
+            // Check for base + offset pattern (rbp for x86-64, sp/x29 for ARM64)
             if let ExprKind::BinOp { op, left, right } = &addr.kind {
                 if let ExprKind::Var(base) = &left.kind {
-                    if base.name == "rbp" {
+                    let is_x86_frame = base.name == "rbp";
+                    let is_arm64_stack = base.name == "sp" || base.name == "x29";
+
+                    if is_x86_frame || is_arm64_stack {
                         if let ExprKind::IntLit(offset) = &right.kind {
                             let actual_offset = match op {
                                 BinOpKind::Add => *offset,
@@ -1078,10 +1099,18 @@ fn get_stack_var_name(expr: &Expr) -> Option<String> {
                                 _ => return None,
                             };
 
-                            if actual_offset < 0 {
-                                return Some(format!("var_{:x}", -actual_offset));
-                            } else if actual_offset > 0 {
-                                return Some(format!("arg_{:x}", actual_offset));
+                            if is_x86_frame {
+                                // x86-64: locals at negative offsets from rbp
+                                if actual_offset < 0 {
+                                    return Some(format!("var_{:x}", -actual_offset));
+                                } else if actual_offset > 0 {
+                                    return Some(format!("arg_{:x}", actual_offset));
+                                }
+                            } else {
+                                // ARM64: locals at positive offsets from sp
+                                if actual_offset >= 0 {
+                                    return Some(format!("var_{:x}", actual_offset));
+                                }
                             }
                         }
                     }
@@ -1093,10 +1122,10 @@ fn get_stack_var_name(expr: &Expr) -> Option<String> {
     }
 }
 
-/// Checks if a statement is a prologue pattern (push rbp, rbp = rsp, etc.)
+/// Checks if a statement is a prologue pattern (push rbp, rbp = rsp, sp = sp - N, etc.)
 fn is_prologue_statement(expr: &Expr) -> bool {
     match &expr.kind {
-        // push(rbp) - prologue
+        // push(rbp) - x86-64 prologue
         ExprKind::Call { target, args } => {
             if let CallTarget::Named(name) = target {
                 if name == "push" {
@@ -1106,23 +1135,46 @@ fn is_prologue_statement(expr: &Expr) -> bool {
                         }
                     }
                 }
+                // ARM64: stp (store pair) for x29, x30
+                if name == "stp" {
+                    return true;
+                }
             }
             false
         }
-        // rbp = rsp (prologue) or rsp = rsp - N (stack frame allocation)
+        // Frame setup patterns for x86-64 and ARM64
         ExprKind::Assign { lhs, rhs } => {
             if let ExprKind::Var(lhs_var) = &lhs.kind {
-                // rbp = rsp (frame pointer setup)
+                // x86-64: rbp = rsp (frame pointer setup)
                 if lhs_var.name == "rbp" {
                     if let ExprKind::Var(rhs_var) = &rhs.kind {
                         return rhs_var.name == "rsp";
                     }
                 }
-                // rsp = rsp - N (stack allocation)
-                if lhs_var.name == "rsp" {
+                // x86-64: rsp = rsp - N (stack allocation)
+                // ARM64: sp = sp - N or sp = N (stack allocation)
+                if lhs_var.name == "rsp" || lhs_var.name == "sp" {
+                    // sp = 0 or sp = constant (ARM64 sub sp, sp, #N becomes sp = 0 after structuring)
+                    if let ExprKind::IntLit(_) = &rhs.kind {
+                        return true;
+                    }
                     if let ExprKind::BinOp { left, .. } = &rhs.kind {
                         if let ExprKind::Var(inner_var) = &left.kind {
-                            return inner_var.name == "rsp";
+                            if inner_var.name == "rsp" || inner_var.name == "sp" {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // ARM64: x29 = sp + N (frame pointer setup)
+                if lhs_var.name == "x29" {
+                    return true;
+                }
+                // ARM64: x30 = x29 (link register save pattern)
+                if lhs_var.name == "x30" {
+                    if let ExprKind::Var(rhs_var) = &rhs.kind {
+                        if rhs_var.name == "x29" {
+                            return true;
                         }
                     }
                 }
@@ -1133,10 +1185,11 @@ fn is_prologue_statement(expr: &Expr) -> bool {
     }
 }
 
-/// Checks if a statement is an epilogue pattern (pop rbp, rsp = rsp + N, etc.)
+/// Checks if a statement is an epilogue pattern (pop rbp, rsp = rsp + N, ldp, etc.)
 fn is_epilogue_statement(expr: &Expr) -> bool {
     match &expr.kind {
-        // pop(rbp) - epilogue
+        // pop(rbp) - x86-64 epilogue
+        // ldp - ARM64 epilogue (load pair, restores x29/x30)
         ExprKind::Call { target, args } => {
             if let CallTarget::Named(name) = target {
                 if name == "pop" {
@@ -1146,16 +1199,32 @@ fn is_epilogue_statement(expr: &Expr) -> bool {
                         }
                     }
                 }
+                // ARM64: ldp (load pair) for x29, x30
+                if name == "ldp" {
+                    return true;
+                }
             }
             false
         }
-        // rsp = rsp + N (stack deallocation)
+        // Stack deallocation patterns
         ExprKind::Assign { lhs, rhs } => {
             if let ExprKind::Var(lhs_var) = &lhs.kind {
-                if lhs_var.name == "rsp" {
+                // x86-64: rsp = rsp + N
+                // ARM64: sp = sp + N
+                if lhs_var.name == "rsp" || lhs_var.name == "sp" {
                     if let ExprKind::BinOp { left, .. } = &rhs.kind {
                         if let ExprKind::Var(inner_var) = &left.kind {
-                            return inner_var.name == "rsp";
+                            if inner_var.name == "rsp" || inner_var.name == "sp" {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // ARM64: x29 = x30 (restore frame pointer from link register)
+                if lhs_var.name == "x29" {
+                    if let ExprKind::Var(rhs_var) = &rhs.kind {
+                        if rhs_var.name == "x30" {
+                            return true;
                         }
                     }
                 }

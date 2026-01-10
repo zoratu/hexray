@@ -749,7 +749,7 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
     Expr::binop(op, Expr::unknown("cmp_left"), Expr::unknown("cmp_right"))
 }
 
-/// Builds a map of register names to their values from MOV instructions in a block.
+/// Builds a map of register names to their values from MOV/LDR instructions in a block.
 /// This is used to substitute register names in conditions with meaningful variable names.
 fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
     use hexray_core::Operand;
@@ -757,12 +757,25 @@ fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
 
     for inst in &block.instructions {
-        // Look for MOV instructions: mov reg, [mem] or mov reg, var
+        // Look for MOV instructions (x86-64): mov reg, [mem]
         if matches!(inst.operation, Operation::Move) && inst.operands.len() >= 2 {
             // First operand is destination (register), second is source
             if let Operand::Register(reg) = &inst.operands[0] {
                 let reg_name = reg.name().to_lowercase();
                 // Only track if source is a memory operand (stack variable)
+                if let Operand::Memory { .. } = &inst.operands[1] {
+                    let value = Expr::from_operand(&inst.operands[1]);
+                    reg_values.insert(reg_name, value);
+                }
+            }
+        }
+
+        // Look for LDR instructions (ARM64): ldr reg, [sp, #offset]
+        if matches!(inst.operation, Operation::Load) && inst.operands.len() >= 2 {
+            // First operand is destination (register), second is source (memory)
+            if let Operand::Register(reg) = &inst.operands[0] {
+                let reg_name = reg.name().to_lowercase();
+                // Track if source is a memory operand (stack variable)
                 if let Operand::Memory { .. } = &inst.operands[1] {
                     let value = Expr::from_operand(&inst.operands[1]);
                     reg_values.insert(reg_name, value);
@@ -997,10 +1010,19 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
 
 /// Check if a register name is a temporary (likely to be eliminated)
 fn is_temp_register(name: &str) -> bool {
-    matches!(name, "eax" | "rax" | "ebx" | "rbx" | "ecx" | "rcx" | "edx" | "rdx" |
-                   "esi" | "rsi" | "edi" | "rdi" | "r8" | "r8d" | "r9" | "r9d" |
-                   "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7" |
-                   "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7")
+    matches!(name,
+        // x86-64 registers
+        "eax" | "rax" | "ebx" | "rbx" | "ecx" | "rcx" | "edx" | "rdx" |
+        "esi" | "rsi" | "edi" | "rdi" | "r8" | "r8d" | "r9" | "r9d" |
+        // ARM64 registers (x0-x18 and w0-w18 are caller-saved/temp)
+        "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7" |
+        "x8" | "x9" | "x10" | "x11" | "x12" | "x13" | "x14" | "x15" |
+        "x16" | "x17" | "x18" |
+        "w0" | "w1" | "w2" | "w3" | "w4" | "w5" | "w6" | "w7" |
+        "w8" | "w9" | "w10" | "w11" | "w12" | "w13" | "w14" | "w15" |
+        "w16" | "w17" | "w18" |
+        // RISC-V registers
+        "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7")
 }
 
 /// Substitute variable references with their known values
