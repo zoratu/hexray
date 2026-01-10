@@ -873,8 +873,11 @@ fn extract_return_value(mut statements: Vec<Expr>) -> (Vec<Expr>, Option<Expr>) 
         let stmt = &statements[i];
         if let super::expression::ExprKind::Assign { lhs, rhs } = &stmt.kind {
             if let super::expression::ExprKind::Var(v) = &lhs.kind {
-                // Check if this is assigning to a return register (eax, rax, x0, a0)
-                let is_return_reg = matches!(v.name.as_str(), "eax" | "rax" | "x0" | "a0");
+                // Check if this is assigning to a return register
+                // x86: eax (32-bit), rax (64-bit)
+                // ARM64: w0 (32-bit), x0 (64-bit)
+                // RISC-V: a0
+                let is_return_reg = matches!(v.name.as_str(), "eax" | "rax" | "w0" | "x0" | "a0");
                 if is_return_reg {
                     let return_value = (**rhs).clone();
                     statements.remove(i);
@@ -882,11 +885,27 @@ fn extract_return_value(mut statements: Vec<Expr>) -> (Vec<Expr>, Option<Expr>) 
                 }
             }
         }
-        // Skip prologue/epilogue-like statements (push/pop)
+        // Skip prologue/epilogue-like statements
+        // x86: push/pop calls
         if let super::expression::ExprKind::Call { target, .. } = &stmt.kind {
             if let super::expression::CallTarget::Named(name) = target {
                 if name == "push" || name == "pop" {
                     continue;
+                }
+            }
+        }
+        // ARM64: stack pointer adjustments (sp = sp + X or sp = sp - X)
+        if let super::expression::ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let super::expression::ExprKind::Var(v) = &lhs.kind {
+                if v.name == "sp" {
+                    if let super::expression::ExprKind::BinOp { left, .. } = &rhs.kind {
+                        if let super::expression::ExprKind::Var(base) = &left.kind {
+                            if base.name == "sp" {
+                                // This is sp = sp +/- X, skip it
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
         }
