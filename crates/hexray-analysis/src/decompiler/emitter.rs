@@ -112,14 +112,8 @@ impl PseudoCodeEmitter {
                         return format!("\"{}\"", escape_string(s));
                     }
                 }
-                // Default integer formatting
-                if *n >= 0 && *n < 10 {
-                    format!("{}", n)
-                } else if *n < 0 {
-                    format!("-{:#x}", -n)
-                } else {
-                    format!("{:#x}", n)
-                }
+                // Format integers as decimal for readability
+                format_integer(*n)
             }
             ExprKind::BinOp { op, left, right } => {
                 format!("{} {} {}",
@@ -1000,6 +994,39 @@ impl PseudoCodeEmitter {
             self.emit_statement(expr, output, depth);
         }
     }
+}
+
+/// Formats an integer for C output.
+/// Uses decimal for "normal" values and hex for large addresses.
+fn format_integer(n: i128) -> String {
+    if n < 0 {
+        // Negative numbers in decimal
+        format!("{}", n)
+    } else if n <= 255 {
+        // Small values in decimal
+        format!("{}", n)
+    } else if n <= 0xFFFF && !looks_like_address(n) {
+        // Medium values in decimal if they don't look like addresses
+        format!("{}", n)
+    } else {
+        // Large values (likely addresses) in hex
+        format!("{:#x}", n)
+    }
+}
+
+/// Heuristic: does this value look like a memory address?
+fn looks_like_address(n: i128) -> bool {
+    // Common address ranges for x86-64
+    let n = n as u64;
+    // Stack addresses (high memory)
+    if n >= 0x7FFF_0000_0000 {
+        return true;
+    }
+    // Code/data addresses (typically 0x400000+ for ELF, 0x100000000+ for Mach-O)
+    if n >= 0x400000 && (n & 0xFFF) == 0 {
+        return true; // Page-aligned addresses
+    }
+    false
 }
 
 /// Escapes a string for C output.
