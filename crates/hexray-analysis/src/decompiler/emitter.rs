@@ -7,7 +7,50 @@
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::expression::{CallTarget, Expr, ExprKind};
 use super::{StringTable, SymbolTable, RelocationTable};
+use std::collections::HashSet;
 use std::fmt::Write;
+
+/// Information about a function's signature detected from analysis.
+struct FunctionInfo {
+    /// Detected parameter names (in order).
+    parameters: Vec<String>,
+    /// Whether the function has a return value.
+    has_return_value: bool,
+    /// Statements to skip (block_idx, stmt_idx) - these are parameter assignments.
+    skip_statements: HashSet<(usize, usize)>,
+}
+
+/// Returns the argument index (0-based) for an argument register, or None if not an arg register.
+fn get_arg_register_index(name: &str) -> Option<usize> {
+    match name {
+        // x86-64 System V ABI
+        "edi" | "rdi" => Some(0),
+        "esi" | "rsi" => Some(1),
+        "edx" | "rdx" => Some(2),
+        "ecx" | "rcx" => Some(3),
+        "r8d" | "r8" => Some(4),
+        "r9d" | "r9" => Some(5),
+        // ARM64 AAPCS64
+        "x0" | "w0" => Some(0),
+        "x1" | "w1" => Some(1),
+        "x2" | "w2" => Some(2),
+        "x3" | "w3" => Some(3),
+        "x4" | "w4" => Some(4),
+        "x5" | "w5" => Some(5),
+        "x6" | "w6" => Some(6),
+        "x7" | "w7" => Some(7),
+        // RISC-V
+        "a0" => Some(0),
+        "a1" => Some(1),
+        "a2" => Some(2),
+        "a3" => Some(3),
+        "a4" => Some(4),
+        "a5" => Some(5),
+        "a6" => Some(6),
+        "a7" => Some(7),
+        _ => None,
+    }
+}
 
 /// Emits pseudo-code from structured control flow.
 pub struct PseudoCodeEmitter {
@@ -214,15 +257,183 @@ impl PseudoCodeEmitter {
     pub fn emit(&self, cfg: &StructuredCfg, func_name: &str) -> String {
         let mut output = String::new();
 
-        // Function header
-        writeln!(output, "void {}()", func_name).unwrap();
+        // Analyze function to detect parameters and return type
+        let func_info = self.analyze_function(&cfg.body);
+
+        // Function header with detected signature
+        let return_type = if func_info.has_return_value { "int" } else { "void" };
+        if func_info.parameters.is_empty() {
+            writeln!(output, "{} {}()", return_type, func_name).unwrap();
+        } else {
+            let params: Vec<_> = func_info.parameters.iter()
+                .map(|p| format!("int {}", p))
+                .collect();
+            writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+        }
         writeln!(output, "{{").unwrap();
 
-        // Emit body
-        self.emit_nodes(&cfg.body, &mut output, 1);
+        // Emit body, skipping parameter assignment statements
+        self.emit_nodes_with_skip(&cfg.body, &mut output, 1, &func_info.skip_statements);
 
         writeln!(output, "}}").unwrap();
         output
+    }
+
+    /// Analyzes a function body to detect parameters and return type.
+    fn analyze_function(&self, body: &[StructuredNode]) -> FunctionInfo {
+        let mut info = FunctionInfo {
+            parameters: Vec::new(),
+            has_return_value: false,
+            skip_statements: HashSet::new(),
+        };
+
+        // Check first block for parameter patterns and prologue
+        if let Some(StructuredNode::Block { statements, .. }) = body.first() {
+            for (idx, stmt) in statements.iter().enumerate() {
+                // Skip prologue statements
+                if is_prologue_statement(stmt) {
+                    info.skip_statements.insert((0, idx));
+                    continue;
+                }
+
+                // Check for parameter assignments (var = arg_register)
+                if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+                    // Check if RHS is an argument register
+                    if let ExprKind::Var(rhs_var) = &rhs.kind {
+                        if let Some(arg_idx) = get_arg_register_index(&rhs_var.name) {
+                            // Check if LHS is a stack variable (either Var or Deref that formats to var_N)
+                            let lhs_name = get_stack_var_name(lhs);
+                            if let Some(var_name) = lhs_name {
+                                if var_name.starts_with("var_") {
+                                    // This is a parameter: use the stack var name as param name
+                                    // Ensure we have enough slots
+                                    while info.parameters.len() <= arg_idx {
+                                        info.parameters.push(String::new());
+                                    }
+                                    info.parameters[arg_idx] = var_name;
+                                    info.skip_statements.insert((0, idx));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check last block for epilogue
+        for (block_idx, node) in body.iter().enumerate() {
+            if let StructuredNode::Block { statements, .. } = node {
+                for (idx, stmt) in statements.iter().enumerate() {
+                    if is_epilogue_statement(stmt) {
+                        info.skip_statements.insert((block_idx, idx));
+                    }
+                }
+            }
+        }
+
+        // Remove empty parameter slots (non-contiguous parameters)
+        info.parameters = info.parameters.into_iter()
+            .take_while(|p| !p.is_empty())
+            .collect();
+
+        // Check for return values
+        info.has_return_value = self.has_return_value(body);
+
+        info
+    }
+
+    /// Checks if the function body has any return statements with values.
+    fn has_return_value(&self, nodes: &[StructuredNode]) -> bool {
+        for node in nodes {
+            match node {
+                StructuredNode::Return(Some(_)) => return true,
+                StructuredNode::If { then_body, else_body, .. } => {
+                    if self.has_return_value(then_body) {
+                        return true;
+                    }
+                    if let Some(else_nodes) = else_body {
+                        if self.has_return_value(else_nodes) {
+                            return true;
+                        }
+                    }
+                }
+                StructuredNode::While { body, .. } |
+                StructuredNode::DoWhile { body, .. } |
+                StructuredNode::For { body, .. } |
+                StructuredNode::Loop { body } => {
+                    if self.has_return_value(body) {
+                        return true;
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        if self.has_return_value(case_body) {
+                            return true;
+                        }
+                    }
+                    if let Some(def) = default {
+                        if self.has_return_value(def) {
+                            return true;
+                        }
+                    }
+                }
+                StructuredNode::Sequence(nodes) => {
+                    if self.has_return_value(nodes) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Emits nodes, skipping specified statements.
+    fn emit_nodes_with_skip(
+        &self,
+        nodes: &[StructuredNode],
+        output: &mut String,
+        depth: usize,
+        skip: &std::collections::HashSet<(usize, usize)>,
+    ) {
+        for (block_idx, node) in nodes.iter().enumerate() {
+            self.emit_node_with_skip(node, output, depth, block_idx, skip);
+            if self.is_control_exit(node) {
+                break;
+            }
+        }
+    }
+
+    fn emit_node_with_skip(
+        &self,
+        node: &StructuredNode,
+        output: &mut String,
+        depth: usize,
+        block_idx: usize,
+        skip: &HashSet<(usize, usize)>,
+    ) {
+        match node {
+            StructuredNode::Block { id, statements, address_range } => {
+                // Filter out skipped statements
+                let filtered: Vec<_> = statements.iter()
+                    .enumerate()
+                    .filter(|(stmt_idx, _)| !skip.contains(&(block_idx, *stmt_idx)))
+                    .map(|(_, stmt)| stmt)
+                    .collect();
+
+                if self.emit_addresses {
+                    let indent = self.indent.repeat(depth);
+                    writeln!(output, "{}// bb{} [{:#x}..{:#x}]", indent, id.0, address_range.0, address_range.1).unwrap();
+                }
+                for stmt in filtered {
+                    // Use emit_statement to get prologue/epilogue filtering
+                    self.emit_statement(stmt, output, depth);
+                }
+            }
+            // For other node types, delegate to the normal emit_node
+            _ => self.emit_node(node, output, depth),
+        }
     }
 
     fn emit_nodes(&self, nodes: &[StructuredNode], output: &mut String, depth: usize) {
@@ -575,6 +786,119 @@ fn escape_string(s: &str) -> String {
 /// Helper to format a condition nicely.
 pub fn format_condition(cond: &Expr) -> String {
     cond.to_string()
+}
+
+/// Extracts the stack variable name from an expression.
+/// Handles both Var("var_4") and Deref patterns like [rbp - 0x4] → "var_4".
+fn get_stack_var_name(expr: &Expr) -> Option<String> {
+    use super::expression::BinOpKind;
+
+    match &expr.kind {
+        ExprKind::Var(v) => {
+            if v.name.starts_with("var_") || v.name.starts_with("arg_") {
+                Some(v.name.clone())
+            } else {
+                None
+            }
+        }
+        ExprKind::Deref { addr, .. } => {
+            // Check for rbp + offset pattern
+            if let ExprKind::BinOp { op, left, right } = &addr.kind {
+                if let ExprKind::Var(base) = &left.kind {
+                    if base.name == "rbp" {
+                        if let ExprKind::IntLit(offset) = &right.kind {
+                            let actual_offset = match op {
+                                BinOpKind::Add => *offset,
+                                BinOpKind::Sub => -*offset,
+                                _ => return None,
+                            };
+
+                            if actual_offset < 0 {
+                                return Some(format!("var_{:x}", -actual_offset));
+                            } else if actual_offset > 0 {
+                                return Some(format!("arg_{:x}", actual_offset));
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Checks if a statement is a prologue pattern (push rbp, rbp = rsp, etc.)
+fn is_prologue_statement(expr: &Expr) -> bool {
+    match &expr.kind {
+        // push(rbp) - prologue
+        ExprKind::Call { target, args } => {
+            if let CallTarget::Named(name) = target {
+                if name == "push" {
+                    if let Some(arg) = args.first() {
+                        if let ExprKind::Var(v) = &arg.kind {
+                            return v.name == "rbp";
+                        }
+                    }
+                }
+            }
+            false
+        }
+        // rbp = rsp (prologue) or rsp = rsp - N (stack frame allocation)
+        ExprKind::Assign { lhs, rhs } => {
+            if let ExprKind::Var(lhs_var) = &lhs.kind {
+                // rbp = rsp (frame pointer setup)
+                if lhs_var.name == "rbp" {
+                    if let ExprKind::Var(rhs_var) = &rhs.kind {
+                        return rhs_var.name == "rsp";
+                    }
+                }
+                // rsp = rsp - N (stack allocation)
+                if lhs_var.name == "rsp" {
+                    if let ExprKind::BinOp { left, .. } = &rhs.kind {
+                        if let ExprKind::Var(inner_var) = &left.kind {
+                            return inner_var.name == "rsp";
+                        }
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Checks if a statement is an epilogue pattern (pop rbp, rsp = rsp + N, etc.)
+fn is_epilogue_statement(expr: &Expr) -> bool {
+    match &expr.kind {
+        // pop(rbp) - epilogue
+        ExprKind::Call { target, args } => {
+            if let CallTarget::Named(name) = target {
+                if name == "pop" {
+                    if let Some(arg) = args.first() {
+                        if let ExprKind::Var(v) = &arg.kind {
+                            return v.name == "rbp";
+                        }
+                    }
+                }
+            }
+            false
+        }
+        // rsp = rsp + N (stack deallocation)
+        ExprKind::Assign { lhs, rhs } => {
+            if let ExprKind::Var(lhs_var) = &lhs.kind {
+                if lhs_var.name == "rsp" {
+                    if let ExprKind::BinOp { left, .. } = &rhs.kind {
+                        if let ExprKind::Var(inner_var) = &left.kind {
+                            return inner_var.name == "rsp";
+                        }
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Checks if two expressions are structurally equal.
