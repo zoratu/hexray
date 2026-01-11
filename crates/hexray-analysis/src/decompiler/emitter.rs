@@ -893,6 +893,28 @@ impl PseudoCodeEmitter {
             }
             // rbp = rsp (prologue) or rsp = rsp +/- N (stack frame)
             ExprKind::Assign { lhs, rhs } => {
+                // ARM64: stur wzr, [x29 - N] - implicit return value initialization
+                if let ExprKind::Deref { addr, .. } = &lhs.kind {
+                    if let ExprKind::BinOp { op: super::expression::BinOpKind::Add, left, right } = &addr.kind {
+                        if let ExprKind::Var(base) = &left.kind {
+                            if base.name == "x29" || base.name == "rbp" {
+                                if let ExprKind::IntLit(offset) = &right.kind {
+                                    if *offset < 0 {
+                                        let is_zero = match &rhs.kind {
+                                            ExprKind::IntLit(0) => true,
+                                            ExprKind::Var(v) => v.name == "wzr" || v.name == "xzr",
+                                            _ => false,
+                                        };
+                                        if is_zero {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if let ExprKind::Var(lhs_var) = &lhs.kind {
                     // rbp = rsp (frame pointer setup)
                     if lhs_var.name == "rbp" {
@@ -1163,6 +1185,31 @@ fn is_prologue_statement(expr: &Expr) -> bool {
         }
         // Frame setup patterns for x86-64 and ARM64
         ExprKind::Assign { lhs, rhs } => {
+            // ARM64: stur wzr, [x29 - N] - implicit return value initialization
+            // This stores 0 (zero register) to a frame-relative location
+            if let ExprKind::Deref { addr, .. } = &lhs.kind {
+                if let ExprKind::BinOp { op: super::expression::BinOpKind::Add, left, right } = &addr.kind {
+                    if let ExprKind::Var(base) = &left.kind {
+                        if base.name == "x29" || base.name == "rbp" {
+                            if let ExprKind::IntLit(offset) = &right.kind {
+                                // Negative offset (frame-relative local) assigned 0 or zero register
+                                if *offset < 0 {
+                                    // Check for IntLit(0) or zero register (wzr/xzr)
+                                    let is_zero = match &rhs.kind {
+                                        ExprKind::IntLit(0) => true,
+                                        ExprKind::Var(v) => v.name == "wzr" || v.name == "xzr",
+                                        _ => false,
+                                    };
+                                    if is_zero {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 // x86-64: rbp = rsp (frame pointer setup)
                 if lhs_var.name == "rbp" {
