@@ -335,6 +335,7 @@ impl<'a> Structurer<'a> {
                 BlockTerminator::Return => {
                     // Check if last statement is an assignment to return register (eax/rax)
                     // If so, extract it as the return value
+                    // Note: extract_return_value applies copy propagation internally
                     let (filtered_stmts, return_value) = extract_return_value(statements);
 
                     if !filtered_stmts.is_empty() {
@@ -867,52 +868,98 @@ fn negate_condition(expr: Expr) -> Expr {
 /// Returns the filtered statements (without the return value assignment) and the return value.
 /// Looks backwards through statements to find the last assignment to a return register,
 /// skipping over prologue/epilogue statements like pop(rbp).
-fn extract_return_value(mut statements: Vec<Expr>) -> (Vec<Expr>, Option<Expr>) {
-    // Search backwards for an assignment to a return register
+fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<Expr>) {
+    use super::expression::ExprKind;
+
+    // First pass: build a map of temp register values for substitution
+    let mut reg_values: HashMap<String, Expr> = HashMap::new();
+    for stmt in &statements {
+        if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let ExprKind::Var(v) = &lhs.kind {
+                if is_temp_register(&v.name) {
+                    // Substitute known values in RHS before storing
+                    let substituted_rhs = substitute_vars(rhs, &reg_values);
+                    reg_values.insert(v.name.clone(), substituted_rhs);
+                }
+            }
+        }
+    }
+
+    let mut return_value = None;
+    let mut indices_to_remove = Vec::new();
+
+    // Search backwards for an assignment to a return register, collecting epilogue statements
     for i in (0..statements.len()).rev() {
         let stmt = &statements[i];
-        if let super::expression::ExprKind::Assign { lhs, rhs } = &stmt.kind {
-            if let super::expression::ExprKind::Var(v) = &lhs.kind {
+
+        // Check for return register assignment
+        if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let ExprKind::Var(v) = &lhs.kind {
                 // Check if this is assigning to a return register
                 // x86: eax (32-bit), rax (64-bit)
                 // ARM64: w0 (32-bit), x0 (64-bit)
                 // RISC-V: a0
                 let is_return_reg = matches!(v.name.as_str(), "eax" | "rax" | "w0" | "x0" | "a0");
                 if is_return_reg {
-                    let return_value = (**rhs).clone();
-                    statements.remove(i);
-                    return (statements, Some(return_value));
+                    // Use the fully substituted value from reg_values if available,
+                    // otherwise substitute the RHS directly
+                    return_value = Some(
+                        reg_values.get(&v.name)
+                            .cloned()
+                            .unwrap_or_else(|| substitute_vars(rhs, &reg_values))
+                    );
+                    indices_to_remove.push(i);
+                    break;
                 }
-            }
-        }
-        // Skip prologue/epilogue-like statements
-        // x86: push/pop calls
-        if let super::expression::ExprKind::Call { target, .. } = &stmt.kind {
-            if let super::expression::CallTarget::Named(name) = target {
-                if name == "push" || name == "pop" {
+
+                // ARM64 epilogue: frame pointer (x29) and link register (x30) restoration
+                if v.name == "x29" || v.name == "x30" {
+                    indices_to_remove.push(i);
                     continue;
                 }
-            }
-        }
-        // ARM64: stack pointer adjustments (sp = sp + X or sp = sp - X)
-        if let super::expression::ExprKind::Assign { lhs, rhs } = &stmt.kind {
-            if let super::expression::ExprKind::Var(v) = &lhs.kind {
-                if v.name == "sp" {
-                    if let super::expression::ExprKind::BinOp { left, .. } = &rhs.kind {
-                        if let super::expression::ExprKind::Var(base) = &left.kind {
-                            if base.name == "sp" {
-                                // This is sp = sp +/- X, skip it
+
+                // Stack pointer adjustments (sp/rsp = sp/rsp +/- X)
+                let is_stack_ptr = v.name == "sp" || v.name == "rsp";
+                if is_stack_ptr {
+                    if let ExprKind::BinOp { left, .. } = &rhs.kind {
+                        if let ExprKind::Var(base) = &left.kind {
+                            if base.name == "sp" || base.name == "rsp" {
+                                indices_to_remove.push(i);
                                 continue;
                             }
                         }
                     }
                 }
+
+                // Skip other temp register assignments (they'll be removed by propagate_copies later)
+                if is_temp_register(&v.name) {
+                    indices_to_remove.push(i);
+                    continue;
+                }
             }
         }
-        // If we hit a non-prologue statement that's not a return reg assignment, stop
+
+        // x86 epilogue: push/pop calls
+        if let ExprKind::Call { target, .. } = &stmt.kind {
+            if let super::expression::CallTarget::Named(name) = target {
+                if name == "push" || name == "pop" {
+                    indices_to_remove.push(i);
+                    continue;
+                }
+            }
+        }
+
+        // If we hit a non-epilogue statement that's not a return reg assignment, stop
         break;
     }
-    (statements, None)
+
+    // Remove collected statements (in reverse order to preserve indices)
+    let mut statements = statements;
+    for i in indices_to_remove {
+        statements.remove(i);
+    }
+
+    (statements, return_value)
 }
 
 /// Simplifies statements by performing copy propagation on temporary registers.

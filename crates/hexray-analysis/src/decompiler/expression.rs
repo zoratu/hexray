@@ -493,7 +493,15 @@ impl Expr {
                 }
             }
             Operation::Load => {
-                if ops.len() >= 2 {
+                if ops.len() == 3 {
+                    // ARM64 ldp: load pair [reg1, reg2, mem]
+                    // Just load into first register (second is typically x30/link register)
+                    // This is used in epilogue (ldp x29, x30, [sp + X])
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::from_operand(&ops[2]),
+                    )
+                } else if ops.len() >= 2 {
                     Self::assign(
                         Self::from_operand(&ops[0]),
                         Self::from_operand(&ops[1]),
