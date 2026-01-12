@@ -12,6 +12,9 @@ hexray-core.workspace = true
 hexray-formats.workspace = true
 hexray-disasm.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

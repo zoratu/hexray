@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use super::structurer::{StructuredCfg, StructuredNode};
-use super::expression::{CallTarget, Expr, ExprKind};
+use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
 use super::{StringTable, SymbolTable, RelocationTable};
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -93,7 +93,11 @@ impl PseudoCodeEmitter {
 
     /// Formats an expression, resolving strings from the string table.
     fn format_expr(&self, expr: &Expr) -> String {
-        if let Some(ref table) = self.string_table {
+        // Use format_expr_with_strings if we have a string table OR relocation table
+        // This ensures GOT/relocation lookups happen even without a string table
+        if self.string_table.is_some() || self.relocation_table.is_some() {
+            let empty = super::StringTable::new();
+            let table = self.string_table.as_ref().unwrap_or(&empty);
             self.format_expr_with_strings(expr, table)
         } else {
             expr.to_string()
@@ -128,6 +132,12 @@ impl PseudoCodeEmitter {
                 // Check if this is a stack slot access (rbp + offset or rbp - offset)
                 if let Some(var_name) = self.try_format_stack_slot(addr, *size) {
                     return var_name;
+                }
+                // Check if this is an array access pattern: base + index * size
+                if let Some((base, index)) = try_extract_array_access(addr, *size) {
+                    let base_str = self.format_expr_with_strings(&base, table);
+                    let index_str = self.format_expr_with_strings(&index, table);
+                    return format!("{}[{}]", base_str, index_str);
                 }
                 // Fall back to default deref formatting
                 let prefix = match size {
@@ -165,11 +175,15 @@ impl PseudoCodeEmitter {
                     self.format_expr_with_strings(lhs, table),
                     self.format_expr_with_strings(rhs, table))
             }
-            ExprKind::GotRef { address, size, display_expr, is_deref } => {
-                // Try to resolve the GOT/data address to a symbol name
+            ExprKind::GotRef { address, instruction_address, size, display_expr, is_deref } => {
+                // Try to resolve using instruction address first (for relocatable objects)
+                // This uses the relocation at the instruction to find the symbol
                 if let Some(ref reloc_table) = self.relocation_table {
+                    if let Some(name) = reloc_table.get_got(*instruction_address) {
+                        return name.to_string();
+                    }
+                    // Fall back to computed address (for linked binaries)
                     if let Some(name) = reloc_table.get_got(*address) {
-                        // Found symbol in GOT - return just the symbol name
                         return name.to_string();
                     }
                 }
@@ -263,14 +277,16 @@ impl PseudoCodeEmitter {
                     .collect();
                 format!("{}({})", target_str, args_str.join(", "))
             }
-            // Handle variables - convert ARM64 zero register to literal 0
+            // Handle variables - convert registers to meaningful names
             ExprKind::Var(var) => {
                 let name_lower = var.name.to_lowercase();
                 if name_lower == "wzr" || name_lower == "xzr" {
                     // ARM64 zero register represents constant 0
                     "0".to_string()
                 } else {
-                    var.name.clone()
+                    // Rename callee-saved registers to meaningful names
+                    // These are commonly used to hold return values/error codes
+                    rename_register(&var.name)
                 }
             }
             // For other cases, use default formatting
@@ -365,8 +381,18 @@ impl PseudoCodeEmitter {
             }
             StructuredNode::While { body, .. } |
             StructuredNode::DoWhile { body, .. } |
-            StructuredNode::For { body, .. } |
             StructuredNode::Loop { body } => {
+                self.collect_vars_from_nodes(body, vars);
+            }
+            StructuredNode::For { init, body, .. } => {
+                // Collect variable from init expression (e.g., for (i = 0; ...))
+                if let Some(init_expr) = init {
+                    if let ExprKind::Assign { lhs, .. } = &init_expr.kind {
+                        if let Some(var_name) = get_stack_var_name(lhs) {
+                            vars.insert(var_name);
+                        }
+                    }
+                }
                 self.collect_vars_from_nodes(body, vars);
             }
             StructuredNode::Switch { cases, default, .. } => {
@@ -533,25 +559,75 @@ impl PseudoCodeEmitter {
                     let indent = self.indent.repeat(depth);
                     writeln!(output, "{}// bb{} [{:#x}..{:#x}]", indent, id.0, address_range.0, address_range.1).unwrap();
                 }
+
+                // Get data relocations for this block to resolve `reg = 0` assignments
+                let data_relocs = if let Some(ref reloc_table) = self.relocation_table {
+                    reloc_table.get_data_in_range(address_range.0, address_range.1)
+                } else {
+                    Vec::new()
+                };
+                let mut reloc_idx = 0;
+
                 for stmt in filtered {
+                    // Check if this is a Call with IntLit(0) arguments and we have relocations
+                    if !data_relocs.is_empty() {
+                        if let ExprKind::Call { target, args } = &stmt.kind {
+                            let has_zero_arg = args.iter().any(|arg| matches!(arg.kind, ExprKind::IntLit(0)));
+                            if has_zero_arg {
+                                self.emit_call_with_relocations(target, args, &data_relocs, &mut reloc_idx, output, depth);
+                                continue;
+                            }
+                        }
+                    }
                     self.emit_statement_with_decl(stmt, output, depth, declared_vars);
                 }
             }
             // For control flow structures, recurse with the same declared_vars
             StructuredNode::If { condition, then_body, else_body } => {
-                let indent = self.indent.repeat(depth);
-                writeln!(output, "{}if ({}) {{", indent, self.format_expr(condition)).unwrap();
-                self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
+                // Skip stack canary check: if (check) { __stack_chk_fail(); }
+                // Check both then and else bodies since compiler may invert the condition
+                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                    return;
+                }
                 if let Some(else_nodes) = else_body {
-                    if else_nodes.len() == 1 {
-                        if let StructuredNode::If { .. } = &else_nodes[0] {
-                            write!(output, "{}}} else ", indent).unwrap();
-                            self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
-                            return;
-                        }
+                    if is_stack_canary_check_body(else_nodes, self.symbol_table.as_ref()) {
+                        return;
                     }
-                    writeln!(output, "{}}} else {{", indent).unwrap();
-                    self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
+                }
+
+                let then_empty = self.is_body_empty(then_body);
+                let else_empty = else_body.as_ref().map_or(true, |e| self.is_body_empty(e));
+
+                // Skip entirely if both bodies are empty
+                if then_empty && else_empty {
+                    return;
+                }
+
+                let indent = self.indent.repeat(depth);
+
+                // Determine actual condition and bodies
+                let (actual_cond, actual_then, actual_else) = if then_empty && !else_empty {
+                    (condition.clone().negate(), else_body.as_ref().unwrap(), None)
+                } else if !then_empty && else_empty {
+                    (condition.clone(), then_body, None)
+                } else {
+                    (condition.clone(), then_body, else_body.as_ref())
+                };
+
+                writeln!(output, "{}if ({}) {{", indent, self.format_expr(&actual_cond)).unwrap();
+                self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
+                if let Some(else_nodes) = actual_else {
+                    if !self.is_body_empty(else_nodes) {
+                        if else_nodes.len() == 1 {
+                            if let StructuredNode::If { .. } = &else_nodes[0] {
+                                write!(output, "{}}} else ", indent).unwrap();
+                                self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
+                                return;
+                            }
+                        }
+                        writeln!(output, "{}}} else {{", indent).unwrap();
+                        self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
+                    }
                 }
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -607,25 +683,75 @@ impl PseudoCodeEmitter {
                     let indent = self.indent.repeat(depth);
                     writeln!(output, "{}// bb{} [{:#x}..{:#x}]", indent, id.0, address_range.0, address_range.1).unwrap();
                 }
+
+                // Get data relocations for this block to resolve `reg = 0` assignments
+                let data_relocs = if let Some(ref reloc_table) = self.relocation_table {
+                    reloc_table.get_data_in_range(address_range.0, address_range.1)
+                } else {
+                    Vec::new()
+                };
+                let mut reloc_idx = 0;
+
                 for stmt in statements {
+                    // Check if this is a Call with IntLit(0) arguments and we have relocations
+                    if !data_relocs.is_empty() {
+                        if let ExprKind::Call { target, args } = &stmt.kind {
+                            let has_zero_arg = args.iter().any(|arg| matches!(arg.kind, ExprKind::IntLit(0)));
+                            if has_zero_arg {
+                                self.emit_call_with_relocations(target, args, &data_relocs, &mut reloc_idx, output, depth);
+                                continue;
+                            }
+                        }
+                    }
                     self.emit_statement_with_decl(stmt, output, depth, declared_vars);
                 }
             }
             // For control flow structures, recurse
             StructuredNode::If { condition, then_body, else_body } => {
-                let indent = self.indent.repeat(depth);
-                writeln!(output, "{}if ({}) {{", indent, self.format_expr(condition)).unwrap();
-                self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
+                // Skip stack canary check: if (check) { __stack_chk_fail(); }
+                // Check both then and else bodies since compiler may invert the condition
+                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                    return;
+                }
                 if let Some(else_nodes) = else_body {
-                    if else_nodes.len() == 1 {
-                        if let StructuredNode::If { .. } = &else_nodes[0] {
-                            write!(output, "{}}} else ", indent).unwrap();
-                            self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
-                            return;
-                        }
+                    if is_stack_canary_check_body(else_nodes, self.symbol_table.as_ref()) {
+                        return;
                     }
-                    writeln!(output, "{}}} else {{", indent).unwrap();
-                    self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
+                }
+
+                let then_empty = self.is_body_empty(then_body);
+                let else_empty = else_body.as_ref().map_or(true, |e| self.is_body_empty(e));
+
+                // Skip entirely if both bodies are empty
+                if then_empty && else_empty {
+                    return;
+                }
+
+                let indent = self.indent.repeat(depth);
+
+                // Determine actual condition and bodies
+                let (actual_cond, actual_then, actual_else) = if then_empty && !else_empty {
+                    (condition.clone().negate(), else_body.as_ref().unwrap(), None)
+                } else if !then_empty && else_empty {
+                    (condition.clone(), then_body, None)
+                } else {
+                    (condition.clone(), then_body, else_body.as_ref())
+                };
+
+                writeln!(output, "{}if ({}) {{", indent, self.format_expr(&actual_cond)).unwrap();
+                self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
+                if let Some(else_nodes) = actual_else {
+                    if !self.is_body_empty(else_nodes) {
+                        if else_nodes.len() == 1 {
+                            if let StructuredNode::If { .. } = &else_nodes[0] {
+                                write!(output, "{}}} else ", indent).unwrap();
+                                self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
+                                return;
+                            }
+                        }
+                        writeln!(output, "{}}} else {{", indent).unwrap();
+                        self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
+                    }
                 }
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -651,6 +777,72 @@ impl PseudoCodeEmitter {
         }
     }
 
+    /// Emits a Call expression with data relocations resolved for IntLit(0) arguments.
+    fn emit_call_with_relocations(
+        &self,
+        target: &super::expression::CallTarget,
+        args: &[Expr],
+        data_relocs: &[(u64, &str)],
+        reloc_idx: &mut usize,
+        output: &mut String,
+        depth: usize,
+    ) {
+        let indent = self.indent.repeat(depth);
+
+        // Format the call target
+        let target_str = match target {
+            super::expression::CallTarget::Direct { target: addr, call_site } => {
+                if let Some(ref reloc_table) = self.relocation_table {
+                    if let Some(name) = reloc_table.get(*call_site) {
+                        name.to_string()
+                    } else if let Some(ref sym_table) = self.symbol_table {
+                        sym_table.get(*addr).map(|s| s.to_string()).unwrap_or_else(|| format!("sub_{:x}", addr))
+                    } else {
+                        format!("sub_{:x}", addr)
+                    }
+                } else if let Some(ref sym_table) = self.symbol_table {
+                    sym_table.get(*addr).map(|s| s.to_string()).unwrap_or_else(|| format!("sub_{:x}", addr))
+                } else {
+                    format!("sub_{:x}", addr)
+                }
+            }
+            super::expression::CallTarget::Named(name) => name.clone(),
+            super::expression::CallTarget::Indirect(e) => format!("({})", self.format_expr(e)),
+            super::expression::CallTarget::IndirectGot { got_address, expr } => {
+                if let Some(ref reloc_table) = self.relocation_table {
+                    if let Some(name) = reloc_table.get_got(*got_address) {
+                        name.to_string()
+                    } else {
+                        format!("({})", self.format_expr(expr))
+                    }
+                } else {
+                    format!("({})", self.format_expr(expr))
+                }
+            }
+        };
+
+        // Format arguments, replacing IntLit(0) with relocation symbols
+        let mut formatted_args = Vec::new();
+        for arg in args {
+            if let ExprKind::IntLit(0) = arg.kind {
+                if *reloc_idx < data_relocs.len() {
+                    let (_, symbol) = data_relocs[*reloc_idx];
+                    *reloc_idx += 1;
+                    // String literals (starting with ") don't need & prefix
+                    if symbol.starts_with('"') {
+                        formatted_args.push(symbol.to_string());
+                    } else {
+                        formatted_args.push(format!("&{}", symbol));
+                    }
+                    continue;
+                }
+            }
+            formatted_args.push(self.format_expr(arg));
+        }
+
+        writeln!(output, "{}{}({});", indent, target_str, formatted_args.join(", ")).unwrap();
+    }
+
     /// Emits a statement (variables are declared at function top, so no inline declarations).
     fn emit_statement_with_decl(&self, expr: &Expr, output: &mut String, depth: usize, _declared_vars: &mut HashSet<String>) {
         // Skip prologue/epilogue boilerplate
@@ -660,6 +852,11 @@ impl PseudoCodeEmitter {
 
         // Skip redundant no-op assignments
         if self.is_noop_assignment(expr) {
+            return;
+        }
+
+        // Skip ARM64 argument setup noise and other skippable patterns
+        if self.is_skippable_statement(expr) {
             return;
         }
 
@@ -707,6 +904,70 @@ impl PseudoCodeEmitter {
         }
     }
 
+    /// Checks if a body (list of nodes) is empty or contains only empty/skippable blocks.
+    fn is_body_empty(&self, nodes: &[StructuredNode]) -> bool {
+        if nodes.is_empty() {
+            return true;
+        }
+        // Check if all nodes are empty blocks or blocks with only skippable statements
+        nodes.iter().all(|node| {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    statements.is_empty() || statements.iter().all(|s| self.is_skippable_statement(s))
+                }
+                StructuredNode::Sequence(inner) => self.is_body_empty(inner),
+                _ => false,
+            }
+        })
+    }
+
+    /// Checks if a statement would be skipped during emission (prologue/epilogue/etc).
+    fn is_skippable_statement(&self, expr: &Expr) -> bool {
+        use super::expression::ExprKind;
+
+        match &expr.kind {
+            // pop(reg) - epilogue
+            ExprKind::Call { target, .. } => {
+                if let super::expression::CallTarget::Named(name) = target {
+                    if name == "pop" || name == "push" {
+                        return true;
+                    }
+                }
+                false
+            }
+            // Return value setup: rax/eax = something
+            // Also skip ARM64 argument setup patterns
+            ExprKind::Assign { lhs, rhs } => {
+                if let ExprKind::Var(v) = &lhs.kind {
+                    // Return register assignments at end of block are skipped
+                    if matches!(v.name.as_str(), "eax" | "rax" | "x0" | "w0" | "a0") {
+                        return true;
+                    }
+                }
+                // ARM64 argument setup: *(uint64_t*)(x9) = x8 or similar
+                // Store through temporary registers (x8-x17) to stack
+                if let ExprKind::Deref { addr, .. } = &lhs.kind {
+                    if is_arm64_temp_register_expr(addr) {
+                        // Store through temp register (likely argument setup)
+                        return true;
+                    }
+                }
+                // ARM64: var = w9 or similar (sign extension artifact)
+                if let ExprKind::Var(rhs_var) = &rhs.kind {
+                    if is_arm64_temp_register(&rhs_var.name) {
+                        return true;
+                    }
+                }
+                // Stack canary load: var = *(*(GOT_address))
+                if is_stack_canary_load(expr) {
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn emit_node(&self, node: &StructuredNode, output: &mut String, depth: usize) {
         let indent = self.indent.repeat(depth);
 
@@ -717,7 +978,18 @@ impl PseudoCodeEmitter {
                 }
                 // Get data relocations for this block to resolve `reg = 0` assignments
                 let data_relocs = if let Some(ref reloc_table) = self.relocation_table {
-                    reloc_table.get_data_in_range(address_range.0, address_range.1)
+                    // Debug: show which range we're searching
+                    if address_range.0 >= 0x98ce0 && address_range.0 < 0x99000 {
+                        eprintln!("DEBUG EMITTER: searching {} [{:#x}..{:#x}]",
+                                  id, address_range.0, address_range.1);
+                    }
+                    let relocs = reloc_table.get_data_in_range(address_range.0, address_range.1);
+                    if !relocs.is_empty() {
+                        eprintln!("DEBUG EMITTER: {} [{:#x}..{:#x}] found {} data relocs: {:?}",
+                                  id, address_range.0, address_range.1, relocs.len(),
+                                  relocs.iter().map(|(a, s)| format!("{:#x}={}", a, s)).collect::<Vec<_>>());
+                    }
+                    relocs
                 } else {
                     Vec::new()
                 };
@@ -741,9 +1013,31 @@ impl PseudoCodeEmitter {
             }
 
             StructuredNode::If { condition, then_body, else_body } => {
+                // Skip stack canary check: if (check) { __stack_chk_fail(); }
+                // Check both then and else bodies since compiler may invert the condition
+                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                    return;
+                }
+                if let Some(else_nodes) = else_body {
+                    if is_stack_canary_check_body(else_nodes, self.symbol_table.as_ref()) {
+                        return;
+                    }
+                }
+
+                let then_empty = self.is_body_empty(then_body);
+                let else_empty = else_body.as_ref().map_or(true, |e| self.is_body_empty(e));
+
+                // If both bodies are empty, skip the if statement entirely
+                if then_empty && else_empty {
+                    return;
+                }
+
                 // If then_body is empty but else_body has content, invert the condition
-                let (actual_cond, actual_then, actual_else) = if then_body.is_empty() && else_body.is_some() {
+                let (actual_cond, actual_then, actual_else) = if then_empty && !else_empty {
                     (condition.clone().negate(), else_body.as_ref().unwrap().clone(), None)
+                } else if !then_empty && else_empty {
+                    // Only then_body has content, no else needed
+                    (condition.clone(), then_body.clone(), None)
                 } else {
                     (condition.clone(), then_body.clone(), else_body.clone())
                 };
@@ -752,16 +1046,18 @@ impl PseudoCodeEmitter {
                 self.emit_nodes(&actual_then, output, depth + 1);
 
                 if let Some(else_body) = actual_else {
-                    if else_body.len() == 1 {
-                        if let StructuredNode::If { .. } = &else_body[0] {
-                            // else if
-                            write!(output, "{}}} else ", indent).unwrap();
-                            self.emit_node(&else_body[0], output, depth);
-                            return;
+                    if !self.is_body_empty(&else_body) {
+                        if else_body.len() == 1 {
+                            if let StructuredNode::If { .. } = &else_body[0] {
+                                // else if
+                                write!(output, "{}}} else ", indent).unwrap();
+                                self.emit_node(&else_body[0], output, depth);
+                                return;
+                            }
                         }
+                        writeln!(output, "{}}} else {{", indent).unwrap();
+                        self.emit_nodes(&else_body, output, depth + 1);
                     }
-                    writeln!(output, "{}}} else {{", indent).unwrap();
-                    self.emit_nodes(&else_body, output, depth + 1);
                 }
 
                 writeln!(output, "{}}}", indent).unwrap();
@@ -855,6 +1151,11 @@ impl PseudoCodeEmitter {
             return;
         }
 
+        // Skip ARM64 argument setup noise and other skippable patterns
+        if self.is_skippable_statement(expr) {
+            return;
+        }
+
         let indent = self.indent.repeat(depth);
         let expr_str = self.format_expr(expr);
 
@@ -876,13 +1177,14 @@ impl PseudoCodeEmitter {
     /// These patterns don't add semantic value and clutter the output.
     fn is_prologue_epilogue(&self, expr: &Expr) -> bool {
         match &expr.kind {
-            // push(rbp) / pop(rbp) - prologue/epilogue
+            // push/pop of callee-saved registers - prologue/epilogue
+            // x86-64: rbp, rbx, r12-r15 are callee-saved
             ExprKind::Call { target, args } => {
                 if let CallTarget::Named(name) = target {
                     if name == "push" || name == "pop" {
                         if let Some(arg) = args.first() {
                             if let ExprKind::Var(v) = &arg.kind {
-                                if v.name == "rbp" {
+                                if is_callee_saved_register(&v.name) {
                                     return true;
                                 }
                             }
@@ -1077,6 +1379,18 @@ fn looks_like_address(n: i128) -> bool {
         return true; // Page-aligned addresses
     }
     false
+}
+
+/// Checks if a register name is a callee-saved register.
+/// These are saved/restored in prologue/epilogue and don't need to be shown.
+fn is_callee_saved_register(name: &str) -> bool {
+    matches!(name,
+        // x86-64 SysV ABI callee-saved: rbp, rbx, r12-r15
+        "rbp" | "rbx" | "r12" | "r13" | "r14" | "r15" |
+        // ARM64 AAPCS64 callee-saved: x19-x28, x29 (fp), x30 (lr)
+        "x19" | "x20" | "x21" | "x22" | "x23" | "x24" | "x25" | "x26" | "x27" | "x28" |
+        "x29" | "x30"
+    )
 }
 
 /// Escapes a string for C output.
@@ -1301,6 +1615,27 @@ fn is_epilogue_statement(expr: &Expr) -> bool {
     }
 }
 
+/// Renames registers to more meaningful variable names.
+/// Callee-saved registers used for return values/error codes get renamed.
+fn rename_register(name: &str) -> String {
+    let name_lower = name.to_lowercase();
+    match name_lower.as_str() {
+        // x86-64 callee-saved registers commonly used for error/result
+        "ebx" | "rbx" => "err".to_string(),
+        "r12" | "r12d" => "result".to_string(),
+        "r13" | "r13d" => "saved1".to_string(),
+        "r14" | "r14d" => "saved2".to_string(),
+        "r15" | "r15d" => "saved3".to_string(),
+        // ARM64 callee-saved registers
+        "x19" | "w19" => "err".to_string(),
+        "x20" | "w20" => "result".to_string(),
+        "x21" | "w21" => "saved1".to_string(),
+        "x22" | "w22" => "saved2".to_string(),
+        // Keep other registers as-is
+        _ => name.to_string(),
+    }
+}
+
 /// Checks if two expressions are structurally equal.
 fn exprs_equal(a: &Expr, b: &Expr) -> bool {
     match (&a.kind, &b.kind) {
@@ -1320,6 +1655,145 @@ fn exprs_equal(a: &Expr, b: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Checks if a body contains only a call to __stack_chk_fail.
+fn is_stack_canary_check_body(nodes: &[StructuredNode], symbol_table: Option<&SymbolTable>) -> bool {
+    // Look for a single statement that calls __stack_chk_fail
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    if is_stack_chk_fail_call(stmt, symbol_table) {
+                        return true;
+                    }
+                }
+            }
+            StructuredNode::Expr(expr) => {
+                if is_stack_chk_fail_call(expr, symbol_table) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Checks if an expression is a call to __stack_chk_fail.
+fn is_stack_chk_fail_call(expr: &Expr, symbol_table: Option<&SymbolTable>) -> bool {
+    if let ExprKind::Call { target, .. } = &expr.kind {
+        match target {
+            CallTarget::Named(name) => {
+                if name.contains("stack_chk_fail") {
+                    return true;
+                }
+            }
+            CallTarget::Direct { target: addr, .. } => {
+                // Check if this address resolves to stack_chk_fail
+                if let Some(sym_table) = symbol_table {
+                    if let Some(name) = sym_table.get(*addr) {
+                        if name.contains("stack_chk_fail") {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Checks if an expression is a stack canary load.
+/// Pattern: local_X = *(*(GOT_address))
+fn is_stack_canary_load(expr: &Expr) -> bool {
+    if let ExprKind::Assign { rhs, .. } = &expr.kind {
+        // Check for double dereference: *(*(something))
+        if let ExprKind::Deref { addr: inner, .. } = &rhs.kind {
+            if let ExprKind::Deref { .. } = &inner.kind {
+                // Double dereference - likely GOT access to __stack_chk_guard
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Checks if a register name is an ARM64 temporary/scratch register (x8-x17 or w8-w17).
+/// These are used for intermediate values during argument setup and don't need to appear
+/// in the output.
+fn is_arm64_temp_register(name: &str) -> bool {
+    matches!(name,
+        "x8" | "x9" | "x10" | "x11" | "x12" | "x13" | "x14" | "x15" | "x16" | "x17" |
+        "w8" | "w9" | "w10" | "w11" | "w12" | "w13" | "w14" | "w15" | "w16" | "w17"
+    )
+}
+
+/// Checks if an expression is an ARM64 temporary register variable.
+fn is_arm64_temp_register_expr(expr: &Expr) -> bool {
+    if let ExprKind::Var(v) = &expr.kind {
+        return is_arm64_temp_register(&v.name);
+    }
+    false
+}
+
+/// Attempts to extract array access components from an address expression.
+/// Matches patterns like `base + index * element_size` where `element_size == size`.
+/// Returns `Some((base, index))` if the pattern matches, `None` otherwise.
+fn try_extract_array_access(addr: &Expr, size: u8) -> Option<(Expr, Expr)> {
+    // Pattern: base + (index * element_size) or (index * element_size) + base
+    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+        // Try left as base, right as index * size
+        if let Some((index, element_size)) = extract_mul_by_constant(right) {
+            if element_size == size as i128 {
+                return Some(((**left).clone(), index));
+            }
+        }
+        // Try right as base, left as index * size (commutative)
+        if let Some((index, element_size)) = extract_mul_by_constant(left) {
+            if element_size == size as i128 {
+                return Some(((**right).clone(), index));
+            }
+        }
+        // Also try shift patterns: base + (index << shift) where 1 << shift == size
+        if let Some((index, shift_amount)) = extract_shift_left_by_constant(right) {
+            if (1i128 << shift_amount) == size as i128 {
+                return Some(((**left).clone(), index));
+            }
+        }
+        if let Some((index, shift_amount)) = extract_shift_left_by_constant(left) {
+            if (1i128 << shift_amount) == size as i128 {
+                return Some(((**right).clone(), index));
+            }
+        }
+    }
+    None
+}
+
+/// Extracts (operand, constant) from expressions like `operand * constant` or `constant * operand`.
+fn extract_mul_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
+    if let ExprKind::BinOp { op: BinOpKind::Mul, left, right } = &expr.kind {
+        // Try left * constant
+        if let ExprKind::IntLit(n) = right.kind {
+            return Some(((**left).clone(), n));
+        }
+        // Try constant * right
+        if let ExprKind::IntLit(n) = left.kind {
+            return Some(((**right).clone(), n));
+        }
+    }
+    None
+}
+
+/// Extracts (operand, shift_amount) from expressions like `operand << constant`.
+fn extract_shift_left_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
+    if let ExprKind::BinOp { op: BinOpKind::Shl, left, right } = &expr.kind {
+        if let ExprKind::IntLit(n) = right.kind {
+            return Some(((**left).clone(), n));
+        }
+    }
+    None
 }
 
 #[cfg(test)]

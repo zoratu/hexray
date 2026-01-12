@@ -49,6 +49,10 @@ pub enum LoadCommand {
         nextdefsym: u32,
         iundefsym: u32,
         nundefsym: u32,
+        /// File offset of indirect symbol table.
+        indirectsymoff: u32,
+        /// Number of indirect symbol table entries.
+        nindirectsyms: u32,
     },
     /// LC_MAIN
     Main {
@@ -125,6 +129,9 @@ impl LoadCommand {
                     nextdefsym: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
                     iundefsym: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
                     nundefsym: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
+                    // Indirect symbol table info is at offsets 56 and 60
+                    indirectsymoff: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
+                    nindirectsyms: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
                 })
             }
             LC_MAIN => {

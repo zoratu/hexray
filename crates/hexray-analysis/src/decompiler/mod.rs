@@ -178,6 +178,11 @@ impl RelocationTable {
         self.call_relocations.is_empty() && self.data_relocations.is_empty() && self.got_symbols.is_empty()
     }
 
+    /// Returns the number of data relocations.
+    pub fn data_relocation_count(&self) -> usize {
+        self.data_relocations.len()
+    }
+
     /// Adds a GOT entry mapping.
     pub fn insert_got(&mut self, got_addr: u64, symbol: String) {
         self.got_symbols.insert(got_addr, symbol);

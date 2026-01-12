@@ -1,7 +1,7 @@
 //! x86_64 instruction decoder.
 
-use super::modrm::{decode_gpr, decode_modrm_reg, decode_modrm_rm, ModRM};
-use super::opcodes::{OperandEncoding, OPCODE_TABLE, OPCODE_TABLE_0F, GROUP1_OPS, GROUP3_OPS, GROUP5_OPS};
+use super::modrm::{decode_gpr, decode_modrm_reg, decode_modrm_rm, decode_modrm_rm_xmm, decode_modrm_reg_xmm, decode_xmm, ModRM};
+use super::opcodes::{OperandEncoding, OPCODE_TABLE, OPCODE_TABLE_0F, GROUP1_OPS, GROUP3_OPS, GROUP5_OPS, SseEncoding, lookup_sse_opcode};
 use super::prefix::Prefixes;
 use crate::error::DecodeError;
 use crate::traits::{DecodedInstruction, Disassembler};
@@ -66,6 +66,32 @@ impl Disassembler for X86_64Disassembler {
             return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
         }
 
+        // Check if this is a VEX-encoded instruction
+        if prefixes.is_vex() {
+            // VEX-encoded: the opcode follows immediately after the VEX prefix
+            // The escape bytes are encoded in VEX.mmmmm
+            let vex = prefixes.vex.unwrap();
+            let opcode = bytes[offset];
+            offset += 1;
+
+            // Look up in SSE tables based on VEX.pp (implied prefix)
+            let prefix_66 = vex.pp == 1;
+            let prefix_f2 = vex.pp == 3;
+            let prefix_f3 = vex.pp == 2;
+
+            // For VEX.mmmmm == 1 (0x0F escape), look up in SSE tables
+            if vex.mmmmm == 1 {
+                if let Some(sse) = lookup_sse_opcode(opcode, prefix_66, prefix_f2, prefix_f3) {
+                    return self.decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse);
+                }
+            }
+            // For VEX.mmmmm == 2 (0x0F 0x38 escape) or VEX.mmmmm == 3 (0x0F 0x3A escape)
+            // These would need additional tables for AVX2/FMA instructions
+            // For now, fall back to unknown opcode
+            let end = offset.min(bytes.len());
+            return Err(DecodeError::unknown_opcode(address, &bytes[..end]));
+        }
+
         // Check for two-byte opcode escape
         let (opcode, is_two_byte) = if bytes[offset] == 0x0F {
             offset += 1;
@@ -80,6 +106,19 @@ impl Disassembler for X86_64Disassembler {
 
         // Look up opcode in table
         let entry = if is_two_byte {
+            // First check if this is an SSE instruction
+            let sse_entry = lookup_sse_opcode(
+                opcode,
+                prefixes.operand_size, // 66 prefix
+                prefixes.repne,        // F2 prefix
+                prefixes.rep,          // F3 prefix
+            );
+
+            if let Some(sse) = sse_entry {
+                // Decode SSE instruction
+                return self.decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse);
+            }
+
             OPCODE_TABLE_0F[opcode as usize].as_ref()
         } else {
             // Handle group 1 (0x80-0x83) specially
@@ -692,6 +731,219 @@ impl X86_64Disassembler {
             size: offset,
         })
     }
+
+    /// Decode SSE/AVX instructions.
+    fn decode_sse_instruction(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        _opcode: u8,
+        sse: &super::opcodes::SseOpcodeEntry,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        // Get effective REX prefix (from REX or VEX)
+        let effective_rex = prefixes.effective_rex();
+
+        // Parse ModR/M
+        let modrm = ModRM::parse(remaining[0], effective_rex);
+        offset += 1;
+
+        // Determine vector size (XMM=128 or YMM=256 for VEX)
+        let vector_size = prefixes.vector_size();
+
+        // Determine mnemonic (use VEX mnemonic if VEX-encoded)
+        let mnemonic = if prefixes.is_vex() {
+            sse.vex_mnemonic.unwrap_or(sse.mnemonic)
+        } else {
+            sse.mnemonic
+        };
+
+        // Decode operands based on encoding
+        let mut operands = Vec::new();
+
+        match sse.encoding {
+            SseEncoding::XmmRm => {
+                // xmm, xmm/m128
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                // For VEX 3-operand form, add vvvv register
+                if prefixes.is_vex() {
+                    let vex = prefixes.vex.unwrap();
+                    // VEX dest is reg, src1 is vvvv, src2 is rm
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
+                    operands.push(rm_operand);
+                } else {
+                    // SSE: dest is reg, src is rm
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(rm_operand);
+                }
+            }
+
+            SseEncoding::RmXmm => {
+                // xmm/m128, xmm
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                operands.push(rm_operand);
+                operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+            }
+
+            SseEncoding::XmmRmImm8 => {
+                // xmm, xmm/m128, imm8
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                // For VEX 4-operand form
+                if prefixes.is_vex() {
+                    let vex = prefixes.vex.unwrap();
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
+                    operands.push(rm_operand);
+                } else {
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(rm_operand);
+                }
+
+                // Read immediate
+                let imm_remaining = &bytes[offset..];
+                if imm_remaining.is_empty() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                operands.push(Operand::imm(imm_remaining[0] as i128, 8));
+                offset += 1;
+            }
+
+            SseEncoding::XmmXmmRm => {
+                // xmm, xmm, xmm/m128 (VEX 3-operand)
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                if prefixes.is_vex() {
+                    let vex = prefixes.vex.unwrap();
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
+                    operands.push(rm_operand);
+                } else {
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(rm_operand);
+                }
+            }
+
+            SseEncoding::XmmRmScalar64 => {
+                // xmm, xmm/m64
+                let rm_bytes = &bytes[offset..];
+                // For scalar, memory is 64-bit but registers are full vector size
+                let (rm_operand, rm_consumed) = if modrm.is_register() {
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                } else {
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, 64)
+                }
+                .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                if prefixes.is_vex() {
+                    let vex = prefixes.vex.unwrap();
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
+                    operands.push(rm_operand);
+                } else {
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(rm_operand);
+                }
+            }
+
+            SseEncoding::XmmRmScalar32 => {
+                // xmm, xmm/m32
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) = if modrm.is_register() {
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                } else {
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, 32)
+                }
+                .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                if prefixes.is_vex() {
+                    let vex = prefixes.vex.unwrap();
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
+                    operands.push(rm_operand);
+                } else {
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(rm_operand);
+                }
+            }
+
+            SseEncoding::XmmGpr => {
+                // xmm, r/m32/64
+                let rm_bytes = &bytes[offset..];
+                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) { 64 } else { 32 };
+                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                if prefixes.is_vex() {
+                    let vex = prefixes.vex.unwrap();
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
+                    operands.push(rm_operand);
+                } else {
+                    operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+                    operands.push(rm_operand);
+                }
+            }
+
+            SseEncoding::GprXmm => {
+                // r32/64, xmm/m
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) { 64 } else { 32 };
+                operands.push(Operand::Register(decode_gpr(modrm.reg, gpr_size)));
+                operands.push(rm_operand);
+            }
+
+            SseEncoding::XmmOnly => {
+                // Single xmm operand
+                operands.push(decode_modrm_reg_xmm(modrm, vector_size));
+            }
+        }
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation: sse.operation,
+            mnemonic: mnemonic.to_string(),
+            operands,
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -794,5 +1046,88 @@ mod tests {
         let result = disasm.decode_instruction(&[0xff, 0xe0], 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "jmp");
         assert!(matches!(result.instruction.control_flow, ControlFlow::IndirectBranch { .. }));
+    }
+
+    #[test]
+    fn test_movaps_xmm_xmm() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 28 C1 = movaps xmm0, xmm1
+        let result = disasm.decode_instruction(&[0x0f, 0x28, 0xc1], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "movaps");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 2);
+    }
+
+    #[test]
+    fn test_xorps_xmm_xmm() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 57 C0 = xorps xmm0, xmm0
+        let result = disasm.decode_instruction(&[0x0f, 0x57, 0xc0], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "xorps");
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_addps_xmm_xmm() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 58 C1 = addps xmm0, xmm1
+        let result = disasm.decode_instruction(&[0x0f, 0x58, 0xc1], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "addps");
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_movsd_xmm_mem() {
+        let disasm = X86_64Disassembler::new();
+        // F2 0F 10 04 25 00 10 00 00 = movsd xmm0, [0x1000]
+        let result = disasm.decode_instruction(&[0xf2, 0x0f, 0x10, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "movsd");
+    }
+
+    #[test]
+    fn test_movss_xmm_mem() {
+        let disasm = X86_64Disassembler::new();
+        // F3 0F 10 00 = movss xmm0, [rax]
+        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0x10, 0x00], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "movss");
+    }
+
+    #[test]
+    fn test_addpd_xmm_xmm() {
+        let disasm = X86_64Disassembler::new();
+        // 66 0F 58 C1 = addpd xmm0, xmm1
+        let result = disasm.decode_instruction(&[0x66, 0x0f, 0x58, 0xc1], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "addpd");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vex_vmovaps_ymm() {
+        let disasm = X86_64Disassembler::new();
+        // C5 FC 28 C1 = vmovaps ymm0, ymm1 (VEX.256.0F.WIG 28 /r)
+        let result = disasm.decode_instruction(&[0xc5, 0xfc, 0x28, 0xc1], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmovaps");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vex_vxorps_ymm() {
+        let disasm = X86_64Disassembler::new();
+        // C5 FC 57 C0 = vxorps ymm0, ymm0, ymm0
+        let result = disasm.decode_instruction(&[0xc5, 0xfc, 0x57, 0xc0], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vxorps");
+        assert_eq!(result.size, 4);
+        // Should have 3 operands for VEX encoding
+        assert_eq!(result.instruction.operands.len(), 3);
+    }
+
+    #[test]
+    fn test_vex_vaddps_xmm() {
+        let disasm = X86_64Disassembler::new();
+        // C5 F0 58 C2 = vaddps xmm0, xmm1, xmm2
+        let result = disasm.decode_instruction(&[0xc5, 0xf0, 0x58, 0xc2], 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vaddps");
+        assert_eq!(result.size, 4);
+        assert_eq!(result.instruction.operands.len(), 3);
     }
 }

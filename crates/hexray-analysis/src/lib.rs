@@ -12,16 +12,33 @@
 //! - SSA form construction
 //! - Type inference
 
+pub mod callgraph;
 pub mod cfg_builder;
 pub mod dataflow;
 pub mod decompiler;
 pub mod function_finder;
+pub mod output;
+pub mod parallel;
 pub mod ssa;
+pub mod strings;
 pub mod types;
+pub mod xrefs;
 
+pub use strings::{DetectedString, DetectedStringTable, StringConfig, StringDetector, StringEncoding};
+pub use xrefs::{Xref, XrefBuilder, XrefDatabase, XrefType};
+
+pub use callgraph::{CallGraph, CallGraphBuilder, CallGraphNode, CallSite, CallType};
 pub use cfg_builder::CfgBuilder;
-pub use dataflow::{DefUseChain, LivenessAnalysis, ReachingDefinitions, Location};
+pub use dataflow::{ConstValue, ConstState, ConstantPropagation, DefUseChain, LivenessAnalysis, ReachingDefinitions, Location};
 pub use decompiler::{Decompiler, StringTable, SymbolTable, RelocationTable};
 pub use function_finder::FunctionFinder;
-pub use ssa::{SsaBuilder, SsaFunction, SsaValue, PhiNode};
-pub use types::{Type, TypeInference, FunctionSignatures};
+pub use output::{
+    CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter,
+    CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
+};
+pub use parallel::{
+    disassemble_functions_parallel, DisassembledFunction, FunctionInfo,
+    ParallelCallGraphBuilder,
+};
+pub use ssa::{SsaBuilder, SsaFunction, SsaValue, PhiNode, SsaOptimizer, OptimizationStats};
+pub use types::{Type, TypeInference, FunctionSignatures, Constraint};

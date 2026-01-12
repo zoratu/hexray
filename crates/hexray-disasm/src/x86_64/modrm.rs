@@ -87,9 +87,25 @@ pub fn decode_gpr(reg: u8, size: u16) -> Register {
     )
 }
 
+/// Decode an XMM/YMM register from a register number.
+/// The size parameter should be 128 for XMM or 256 for YMM.
+pub fn decode_xmm(reg: u8, size: u16) -> Register {
+    Register::new(
+        Architecture::X86_64,
+        if size == 256 { RegisterClass::Vector } else { RegisterClass::FloatingPoint },
+        x86::XMM0 + reg as u16,
+        size,
+    )
+}
+
 /// Decode the reg field of ModR/M as a register operand.
 pub fn decode_modrm_reg(modrm: ModRM, size: u16) -> Operand {
     Operand::Register(decode_gpr(modrm.reg, size))
+}
+
+/// Decode the reg field of ModR/M as an XMM/YMM register operand.
+pub fn decode_modrm_reg_xmm(modrm: ModRM, size: u16) -> Operand {
+    Operand::Register(decode_xmm(modrm.reg, size))
 }
 
 /// Decode the r/m field of ModR/M.
@@ -205,4 +221,25 @@ pub fn decode_modrm_rm(
         }),
         offset,
     ))
+}
+
+/// Decode the r/m field of ModR/M for XMM/YMM operands.
+/// Returns (operand, bytes_consumed).
+pub fn decode_modrm_rm_xmm(
+    bytes: &[u8],
+    modrm: ModRM,
+    prefixes: &Prefixes,
+    vector_size: u16,
+) -> Option<(Operand, usize)> {
+    // If it's a register operand, decode as XMM/YMM
+    if modrm.is_register() {
+        return Some((
+            Operand::Register(decode_xmm(modrm.rm, vector_size)),
+            0,
+        ));
+    }
+
+    // Otherwise, it's a memory operand - use the same decoding but with vector size
+    // Memory operand size is the vector size / 8
+    decode_modrm_rm(bytes, modrm, prefixes, vector_size)
 }

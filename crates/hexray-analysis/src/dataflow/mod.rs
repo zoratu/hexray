@@ -12,10 +12,12 @@
 //! - SSA construction
 //! - Type inference
 
+pub mod const_prop;
 pub mod def_use;
 pub mod liveness;
 pub mod reaching_defs;
 
+pub use const_prop::{ConstValue, ConstState, ConstantPropagation};
 pub use def_use::{DefUseChain, DefUseInfo, Definition, Use};
 pub use liveness::LivenessAnalysis;
 pub use reaching_defs::ReachingDefinitions;

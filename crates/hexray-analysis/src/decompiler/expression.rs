@@ -44,6 +44,8 @@ pub enum ExprKind {
     GotRef {
         /// The computed absolute address (rip + inst_size + displacement).
         address: u64,
+        /// The address of the instruction that created this reference (for relocation lookup).
+        instruction_address: u64,
         /// Size of the dereference in bytes (0 for address-of/LEA).
         size: u8,
         /// The original expression for display if resolution fails.
@@ -364,10 +366,13 @@ impl Expr {
     }
 
     /// Creates a GOT/data reference with a computed absolute address (for MOV from memory).
-    pub fn got_ref(address: u64, size: u8, display_expr: Expr) -> Self {
+    /// `address` is the computed target address (rip + inst_size + displacement).
+    /// `instruction_address` is the address of the instruction for relocation lookup.
+    pub fn got_ref(address: u64, instruction_address: u64, size: u8, display_expr: Expr) -> Self {
         Self {
             kind: ExprKind::GotRef {
                 address,
+                instruction_address,
                 size,
                 display_expr: Box::new(display_expr),
                 is_deref: true,
@@ -376,10 +381,13 @@ impl Expr {
     }
 
     /// Creates a GOT/data address reference (for LEA - address-of, not dereference).
-    pub fn got_addr(address: u64, display_expr: Expr) -> Self {
+    /// `address` is the computed target address (rip + inst_size + displacement).
+    /// `instruction_address` is the address of the instruction for relocation lookup.
+    pub fn got_addr(address: u64, instruction_address: u64, display_expr: Expr) -> Self {
         Self {
             kind: ExprKind::GotRef {
                 address,
+                instruction_address,
                 size: 0,
                 display_expr: Box::new(display_expr),
                 is_deref: false,
@@ -417,6 +425,155 @@ impl Expr {
                 *operand
             }
             _ => Self::unary(UnaryOpKind::LogicalNot, self),
+        }
+    }
+
+    /// Simplifies an expression by performing constant folding and algebraic simplifications.
+    ///
+    /// This includes:
+    /// - Constant folding: `5 + 3` → `8`
+    /// - Identity elimination: `x + 0` → `x`, `x * 1` → `x`
+    /// - Zero multiplication: `x * 0` → `0`
+    /// - Bitwise identity: `x | 0` → `x`, `x & 0xFFFFFFFF` → `x`
+    /// - Double negation: `--x` → `x`, `~~x` → `x`
+    pub fn simplify(self) -> Self {
+        match self.kind {
+            ExprKind::BinOp { op, left, right } => {
+                // Recursively simplify operands first
+                let left = left.simplify();
+                let right = right.simplify();
+
+                // Try constant folding
+                if let (ExprKind::IntLit(l), ExprKind::IntLit(r)) = (&left.kind, &right.kind) {
+                    if let Some(result) = fold_binary_constants(op, *l, *r) {
+                        return Self::int(result);
+                    }
+                }
+
+                // Algebraic simplifications
+                match op {
+                    // x + 0 = x, 0 + x = x
+                    BinOpKind::Add => {
+                        if matches!(right.kind, ExprKind::IntLit(0)) {
+                            return left;
+                        }
+                        if matches!(left.kind, ExprKind::IntLit(0)) {
+                            return right;
+                        }
+                    }
+                    // x - 0 = x
+                    BinOpKind::Sub => {
+                        if matches!(right.kind, ExprKind::IntLit(0)) {
+                            return left;
+                        }
+                        // x - x = 0 (when expressions are structurally equal)
+                        if exprs_structurally_equal(&left, &right) {
+                            return Self::int(0);
+                        }
+                    }
+                    // x * 0 = 0, 0 * x = 0
+                    // x * 1 = x, 1 * x = x
+                    BinOpKind::Mul => {
+                        if matches!(right.kind, ExprKind::IntLit(0)) || matches!(left.kind, ExprKind::IntLit(0)) {
+                            return Self::int(0);
+                        }
+                        if matches!(right.kind, ExprKind::IntLit(1)) {
+                            return left;
+                        }
+                        if matches!(left.kind, ExprKind::IntLit(1)) {
+                            return right;
+                        }
+                    }
+                    // x / 1 = x
+                    BinOpKind::Div => {
+                        if matches!(right.kind, ExprKind::IntLit(1)) {
+                            return left;
+                        }
+                    }
+                    // x | 0 = x, 0 | x = x
+                    BinOpKind::Or => {
+                        if matches!(right.kind, ExprKind::IntLit(0)) {
+                            return left;
+                        }
+                        if matches!(left.kind, ExprKind::IntLit(0)) {
+                            return right;
+                        }
+                        // x | x = x
+                        if exprs_structurally_equal(&left, &right) {
+                            return left;
+                        }
+                    }
+                    // x & 0 = 0, 0 & x = 0
+                    BinOpKind::And => {
+                        if matches!(right.kind, ExprKind::IntLit(0)) || matches!(left.kind, ExprKind::IntLit(0)) {
+                            return Self::int(0);
+                        }
+                        // x & x = x
+                        if exprs_structurally_equal(&left, &right) {
+                            return left;
+                        }
+                    }
+                    // x ^ 0 = x, 0 ^ x = x
+                    BinOpKind::Xor => {
+                        if matches!(right.kind, ExprKind::IntLit(0)) {
+                            return left;
+                        }
+                        if matches!(left.kind, ExprKind::IntLit(0)) {
+                            return right;
+                        }
+                        // x ^ x = 0
+                        if exprs_structurally_equal(&left, &right) {
+                            return Self::int(0);
+                        }
+                    }
+                    // x << 0 = x, x >> 0 = x
+                    BinOpKind::Shl | BinOpKind::Shr | BinOpKind::Sar => {
+                        if matches!(right.kind, ExprKind::IntLit(0)) {
+                            return left;
+                        }
+                    }
+                    _ => {}
+                }
+
+                Self::binop(op, left, right)
+            }
+            ExprKind::UnaryOp { op, operand } => {
+                let operand = operand.simplify();
+
+                // Constant folding for unary ops
+                if let ExprKind::IntLit(n) = operand.kind {
+                    match op {
+                        UnaryOpKind::Neg => return Self::int(-n),
+                        UnaryOpKind::Not => return Self::int(!n),
+                        UnaryOpKind::LogicalNot => return Self::int(if n == 0 { 1 } else { 0 }),
+                        _ => {}
+                    }
+                }
+
+                // Double negation elimination
+                if let ExprKind::UnaryOp { op: inner_op, operand: inner_operand } = &operand.kind {
+                    match (op, inner_op) {
+                        (UnaryOpKind::Neg, UnaryOpKind::Neg) => return *inner_operand.clone(),
+                        (UnaryOpKind::Not, UnaryOpKind::Not) => return *inner_operand.clone(),
+                        (UnaryOpKind::LogicalNot, UnaryOpKind::LogicalNot) => return *inner_operand.clone(),
+                        _ => {}
+                    }
+                }
+
+                Self::unary(op, operand)
+            }
+            ExprKind::Assign { lhs, rhs } => {
+                Self::assign(lhs.simplify(), rhs.simplify())
+            }
+            ExprKind::Deref { addr, size } => {
+                Self::deref(addr.simplify(), size)
+            }
+            ExprKind::Call { target, args } => {
+                let args = args.into_iter().map(|a| a.simplify()).collect();
+                Self::call(target, args)
+            }
+            // Other expression kinds pass through unchanged
+            _ => self,
         }
     }
 
@@ -474,11 +631,12 @@ impl Expr {
                 if ops.len() >= 2 {
                     // Check for RIP-relative memory load (e.g., mov rdi, [rip + offset])
                     let rhs = if let Operand::Memory(mem) = &ops[1] {
-                        if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip" && mem.index.is_none() {
+                        let base_name = mem.base.as_ref().map(|r| r.name()).unwrap_or("");
+                        if base_name == "rip" && mem.index.is_none() {
                             // Compute absolute address: inst.address + inst.size + displacement
                             let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
                             let display_expr = Self::from_memory_ref(mem);
-                            Self::got_ref(abs_addr, mem.size, display_expr)
+                            Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
                         } else {
                             Self::from_operand(&ops[1])
                         }
@@ -714,7 +872,7 @@ impl Expr {
                                 let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
                                 // Use GotAddr for LEA (address-of, not dereference)
                                 let display_expr = Self::int(abs_addr as i128);
-                                Self::got_addr(abs_addr, display_expr)
+                                Self::got_addr(abs_addr, inst.address, display_expr)
                             } else {
                                 Self::from_memory_ref(mem)
                             }
@@ -954,4 +1112,259 @@ fn match_add_assignment(expr: &Expr) -> Option<(String, String, i128)> {
         }
     }
     None
+}
+
+/// Performs constant folding for binary operations.
+/// Returns Some(result) if both operands are constants, None otherwise.
+fn fold_binary_constants(op: BinOpKind, left: i128, right: i128) -> Option<i128> {
+    match op {
+        BinOpKind::Add => Some(left.wrapping_add(right)),
+        BinOpKind::Sub => Some(left.wrapping_sub(right)),
+        BinOpKind::Mul => Some(left.wrapping_mul(right)),
+        BinOpKind::Div => {
+            if right != 0 {
+                Some(left / right)
+            } else {
+                None // Avoid division by zero
+            }
+        }
+        BinOpKind::Mod => {
+            if right != 0 {
+                Some(left % right)
+            } else {
+                None
+            }
+        }
+        BinOpKind::And => Some(left & right),
+        BinOpKind::Or => Some(left | right),
+        BinOpKind::Xor => Some(left ^ right),
+        BinOpKind::Shl => {
+            if right >= 0 && right < 128 {
+                Some(left << (right as u32))
+            } else {
+                None
+            }
+        }
+        BinOpKind::Shr | BinOpKind::Sar => {
+            if right >= 0 && right < 128 {
+                Some(left >> (right as u32))
+            } else {
+                None
+            }
+        }
+        // Comparison operators return 0 or 1
+        BinOpKind::Eq => Some(if left == right { 1 } else { 0 }),
+        BinOpKind::Ne => Some(if left != right { 1 } else { 0 }),
+        BinOpKind::Lt | BinOpKind::ULt => Some(if left < right { 1 } else { 0 }),
+        BinOpKind::Le | BinOpKind::ULe => Some(if left <= right { 1 } else { 0 }),
+        BinOpKind::Gt | BinOpKind::UGt => Some(if left > right { 1 } else { 0 }),
+        BinOpKind::Ge | BinOpKind::UGe => Some(if left >= right { 1 } else { 0 }),
+        BinOpKind::LogicalAnd => Some(if left != 0 && right != 0 { 1 } else { 0 }),
+        BinOpKind::LogicalOr => Some(if left != 0 || right != 0 { 1 } else { 0 }),
+    }
+}
+
+/// Checks if two expressions are structurally equal.
+/// Used for simplifications like `x - x = 0` and `x ^ x = 0`.
+fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
+    match (&left.kind, &right.kind) {
+        (ExprKind::Var(v1), ExprKind::Var(v2)) => v1 == v2,
+        (ExprKind::IntLit(n1), ExprKind::IntLit(n2)) => n1 == n2,
+        (
+            ExprKind::BinOp { op: op1, left: l1, right: r1 },
+            ExprKind::BinOp { op: op2, left: l2, right: r2 }
+        ) => {
+            op1 == op2 && exprs_structurally_equal(l1, l2) && exprs_structurally_equal(r1, r2)
+        }
+        (
+            ExprKind::UnaryOp { op: op1, operand: o1 },
+            ExprKind::UnaryOp { op: op2, operand: o2 }
+        ) => {
+            op1 == op2 && exprs_structurally_equal(o1, o2)
+        }
+        (
+            ExprKind::Deref { addr: a1, size: s1 },
+            ExprKind::Deref { addr: a2, size: s2 }
+        ) => {
+            s1 == s2 && exprs_structurally_equal(a1, a2)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_folding_arithmetic() {
+        // 5 + 3 = 8
+        let expr = Expr::binop(BinOpKind::Add, Expr::int(5), Expr::int(3));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(8)));
+
+        // 10 - 4 = 6
+        let expr = Expr::binop(BinOpKind::Sub, Expr::int(10), Expr::int(4));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(6)));
+
+        // 6 * 7 = 42
+        let expr = Expr::binop(BinOpKind::Mul, Expr::int(6), Expr::int(7));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(42)));
+
+        // 20 / 4 = 5
+        let expr = Expr::binop(BinOpKind::Div, Expr::int(20), Expr::int(4));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(5)));
+    }
+
+    #[test]
+    fn test_identity_elimination() {
+        let x = Expr::unknown("x");
+
+        // x + 0 = x
+        let expr = Expr::binop(BinOpKind::Add, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // 0 + x = x
+        let expr = Expr::binop(BinOpKind::Add, Expr::int(0), x.clone());
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // x - 0 = x
+        let expr = Expr::binop(BinOpKind::Sub, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // x * 1 = x
+        let expr = Expr::binop(BinOpKind::Mul, x.clone(), Expr::int(1));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // 1 * x = x
+        let expr = Expr::binop(BinOpKind::Mul, Expr::int(1), x.clone());
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // x / 1 = x
+        let expr = Expr::binop(BinOpKind::Div, x.clone(), Expr::int(1));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+    }
+
+    #[test]
+    fn test_zero_multiplication() {
+        let x = Expr::unknown("x");
+
+        // x * 0 = 0
+        let expr = Expr::binop(BinOpKind::Mul, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(0)));
+
+        // 0 * x = 0
+        let expr = Expr::binop(BinOpKind::Mul, Expr::int(0), x.clone());
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(0)));
+    }
+
+    #[test]
+    fn test_bitwise_simplifications() {
+        let x = Expr::unknown("x");
+
+        // x | 0 = x
+        let expr = Expr::binop(BinOpKind::Or, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // x & 0 = 0
+        let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(0)));
+
+        // x ^ 0 = x
+        let expr = Expr::binop(BinOpKind::Xor, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // Constant bitwise
+        let expr = Expr::binop(BinOpKind::And, Expr::int(0xFF), Expr::int(0x0F));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(0x0F)));
+    }
+
+    #[test]
+    fn test_unary_constant_folding() {
+        // -5 = -5
+        let expr = Expr::unary(UnaryOpKind::Neg, Expr::int(5));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(-5)));
+
+        // !0 = 1
+        let expr = Expr::unary(UnaryOpKind::LogicalNot, Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(1)));
+
+        // !5 = 0
+        let expr = Expr::unary(UnaryOpKind::LogicalNot, Expr::int(5));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(0)));
+    }
+
+    #[test]
+    fn test_double_negation_elimination() {
+        let x = Expr::unknown("x");
+
+        // --x = x
+        let expr = Expr::unary(UnaryOpKind::Neg, Expr::unary(UnaryOpKind::Neg, x.clone()));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // ~~x = x
+        let expr = Expr::unary(UnaryOpKind::Not, Expr::unary(UnaryOpKind::Not, x.clone()));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // !!x = x
+        let expr = Expr::unary(UnaryOpKind::LogicalNot, Expr::unary(UnaryOpKind::LogicalNot, x.clone()));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+    }
+
+    #[test]
+    fn test_shift_simplifications() {
+        let x = Expr::unknown("x");
+
+        // x << 0 = x
+        let expr = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // x >> 0 = x
+        let expr = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(0));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // 8 << 2 = 32
+        let expr = Expr::binop(BinOpKind::Shl, Expr::int(8), Expr::int(2));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(32)));
+    }
+
+    #[test]
+    fn test_nested_simplification() {
+        // (5 + 3) * 2 = 16
+        let inner = Expr::binop(BinOpKind::Add, Expr::int(5), Expr::int(3));
+        let expr = Expr::binop(BinOpKind::Mul, inner, Expr::int(2));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::IntLit(16)));
+
+        // (x + 0) * 1 = x
+        let x = Expr::unknown("x");
+        let inner = Expr::binop(BinOpKind::Add, x.clone(), Expr::int(0));
+        let expr = Expr::binop(BinOpKind::Mul, inner, Expr::int(1));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+    }
 }

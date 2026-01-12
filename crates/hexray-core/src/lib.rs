@@ -10,6 +10,7 @@ pub mod cfg;
 pub mod error;
 pub mod instruction;
 pub mod operand;
+pub mod output;
 pub mod register;
 pub mod symbol;
 
@@ -19,5 +20,6 @@ pub use cfg::ControlFlowGraph;
 pub use error::Error;
 pub use instruction::{Condition, ControlFlow, Instruction, Operation};
 pub use operand::{Immediate, MemoryRef, Operand};
+pub use output::{escape_dot_string, DotConfig};
 pub use register::{Register, RegisterClass};
 pub use symbol::{Symbol, SymbolBinding, SymbolKind};

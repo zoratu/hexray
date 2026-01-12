@@ -1,15 +1,19 @@
 //! Type inference for decompilation.
 //!
-//! This module provides basic type inference for variables based on:
+//! This module provides type inference for variables based on:
 //! - How values are used (pointer dereference, comparison, arithmetic)
 //! - Size hints from memory operations
 //! - Known library function signatures
 //! - Comparison with constants
+//! - Call site argument/return type propagation
+//! - Floating-point operation detection
 //!
-//! The type system is simple and focused on decompilation needs:
+//! The type system is focused on decompilation needs:
 //! - Distinguishing pointers from integers
 //! - Inferring signedness from comparisons
+//! - Detecting floating-point values
 //! - Detecting common types (strings, arrays, structs)
+//! - Propagating types through function calls
 
 use crate::ssa::{SsaFunction, SsaValue};
 use crate::ssa::types::SsaOperand;
@@ -35,6 +39,11 @@ pub enum Type {
         signed: bool,   // signed or unsigned
     },
 
+    /// Floating-point type.
+    Float {
+        size: u8,       // 4 (float), 8 (double), 16 (long double)
+    },
+
     /// Pointer to another type.
     Pointer(Box<Type>),
 
@@ -56,6 +65,9 @@ pub enum Type {
         fields: Vec<(i64, Type)>, // (offset, type)
         size: usize,
     },
+
+    /// C-string (null-terminated char*).
+    CString,
 }
 
 impl Type {
@@ -74,6 +86,21 @@ impl Type {
         Self::Int { size, signed: true }
     }
 
+    /// Creates a floating-point type.
+    pub fn float(size: u8) -> Self {
+        Self::Float { size }
+    }
+
+    /// Creates a single-precision float.
+    pub fn f32() -> Self {
+        Self::Float { size: 4 }
+    }
+
+    /// Creates a double-precision float.
+    pub fn f64() -> Self {
+        Self::Float { size: 8 }
+    }
+
     /// Creates a pointer type.
     pub fn ptr(pointee: Type) -> Self {
         Self::Pointer(Box::new(pointee))
@@ -81,12 +108,22 @@ impl Type {
 
     /// Returns true if this type is a pointer.
     pub fn is_pointer(&self) -> bool {
-        matches!(self, Self::Pointer(_))
+        matches!(self, Self::Pointer(_) | Self::CString)
     }
 
     /// Returns true if this type is an integer.
     pub fn is_integer(&self) -> bool {
         matches!(self, Self::Int { .. })
+    }
+
+    /// Returns true if this type is a floating-point type.
+    pub fn is_float(&self) -> bool {
+        matches!(self, Self::Float { .. })
+    }
+
+    /// Returns true if this type is numeric (int or float).
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Self::Int { .. } | Self::Float { .. })
     }
 
     /// Returns the size in bytes, if known.
@@ -95,7 +132,8 @@ impl Type {
             Self::Unknown | Self::Void => None,
             Self::Bool => Some(1),
             Self::Int { size, .. } => Some(*size),
-            Self::Pointer(_) | Self::Function { .. } => Some(8), // Assuming 64-bit
+            Self::Float { size } => Some(*size),
+            Self::Pointer(_) | Self::Function { .. } | Self::CString => Some(8), // 64-bit
             Self::Array { element, count } => {
                 let elem_size = element.size()?;
                 Some(elem_size * (*count)? as u8)
@@ -115,8 +153,16 @@ impl Type {
                     signed: *sg1 || *sg2,
                 }
             }
+            (Type::Float { size: s1 }, Type::Float { size: s2 }) => {
+                // Take larger float size
+                Type::Float { size: (*s1).max(*s2) }
+            }
             (Type::Pointer(p1), Type::Pointer(p2)) => {
                 Type::Pointer(Box::new(p1.merge(p2)))
+            }
+            // CString is more specific than char*
+            (Type::CString, Type::Pointer(_)) | (Type::Pointer(_), Type::CString) => {
+                Type::CString
             }
             // Default: keep first type
             _ => self.clone(),
@@ -133,6 +179,14 @@ impl fmt::Display for Type {
             Type::Int { size, signed } => {
                 let prefix = if *signed { "int" } else { "uint" };
                 write!(f, "{}{}", prefix, size * 8)
+            }
+            Type::Float { size } => {
+                match size {
+                    4 => write!(f, "float"),
+                    8 => write!(f, "double"),
+                    16 => write!(f, "long double"),
+                    _ => write!(f, "float{}", size * 8),
+                }
             }
             Type::Pointer(inner) => write!(f, "{}*", inner),
             Type::Array { element, count } => {
@@ -159,6 +213,7 @@ impl fmt::Display for Type {
                     write!(f, "struct")
                 }
             }
+            Type::CString => write!(f, "char*"),
         }
     }
 }
@@ -176,8 +231,14 @@ pub enum Constraint {
     IsSigned,
     /// Value is used in unsigned comparison.
     IsUnsigned,
+    /// Value is a floating-point type.
+    IsFloat(u8), // size in bytes
     /// Value equals another value (types should match).
     Equals(SsaValue),
+    /// Value is a function return value with this type.
+    ReturnType(Type),
+    /// Value is a function argument with this type.
+    ArgumentType(Type),
 }
 
 /// Type inference engine.
@@ -186,6 +247,8 @@ pub struct TypeInference {
     types: HashMap<SsaValue, Type>,
     /// Constraints collected during analysis.
     constraints: Vec<(SsaValue, Constraint)>,
+    /// Known function signatures for call site propagation.
+    signatures: FunctionSignatures,
 }
 
 impl TypeInference {
@@ -194,6 +257,25 @@ impl TypeInference {
         Self {
             types: HashMap::new(),
             constraints: Vec::new(),
+            signatures: FunctionSignatures::new(),
+        }
+    }
+
+    /// Creates a type inference engine with libc signatures.
+    pub fn with_libc() -> Self {
+        Self {
+            types: HashMap::new(),
+            constraints: Vec::new(),
+            signatures: FunctionSignatures::with_libc(),
+        }
+    }
+
+    /// Creates a type inference engine with custom signatures.
+    pub fn with_signatures(signatures: FunctionSignatures) -> Self {
+        Self {
+            types: HashMap::new(),
+            constraints: Vec::new(),
+            signatures,
         }
     }
 
@@ -316,7 +398,97 @@ impl TypeInference {
                 }
             }
 
+            // Call instructions - try to propagate return type
+            Operation::Call => {
+                // Return value is typically first def (e.g., rax/x0)
+                if let Some(def) = inst.defs.first() {
+                    // Try to get function name from the call target
+                    // For now, check mnemonic for common patterns
+                    self.infer_call_types(inst, def);
+                }
+            }
+
             _ => {}
+        }
+
+        // Check mnemonic for floating-point operations
+        self.check_fp_mnemonic(inst);
+    }
+
+    /// Infers types from call instructions.
+    fn infer_call_types(&mut self, inst: &crate::ssa::types::SsaInstruction, ret_val: &SsaValue) {
+        // Try to extract function name from operands or mnemonic
+        // This is a simplified approach - real implementation would need call target resolution
+        let mnemonic = inst.mnemonic.to_lowercase();
+
+        // Check for known function names in the call
+        for (name, sig) in [
+            ("printf", self.signatures.get("printf")),
+            ("malloc", self.signatures.get("malloc")),
+            ("free", self.signatures.get("free")),
+            ("strlen", self.signatures.get("strlen")),
+            ("strcmp", self.signatures.get("strcmp")),
+            ("memcpy", self.signatures.get("memcpy")),
+        ] {
+            if mnemonic.contains(name) {
+                if let Some(sig) = sig {
+                    self.constraints.push((
+                        ret_val.clone(),
+                        Constraint::ReturnType(sig.return_type.clone()),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Checks if instruction mnemonic indicates floating-point operation.
+    fn check_fp_mnemonic(&mut self, inst: &crate::ssa::types::SsaInstruction) {
+        let mnemonic = inst.mnemonic.to_lowercase();
+
+        // Floating-point operation prefixes/patterns
+        let is_fp = mnemonic.starts_with("f") && (
+            mnemonic.starts_with("fadd") ||
+            mnemonic.starts_with("fsub") ||
+            mnemonic.starts_with("fmul") ||
+            mnemonic.starts_with("fdiv") ||
+            mnemonic.starts_with("fmov") ||
+            mnemonic.starts_with("fcmp") ||
+            mnemonic.starts_with("fcvt") ||
+            mnemonic.starts_with("fsqrt") ||
+            mnemonic.starts_with("fabs") ||
+            mnemonic.starts_with("fneg")
+        ) || mnemonic.contains("ss") || mnemonic.contains("sd") || // SSE single/double
+           mnemonic.starts_with("vf") || // AVX FP
+           mnemonic.starts_with("adds") || mnemonic.starts_with("addd") ||
+           mnemonic.starts_with("muls") || mnemonic.starts_with("muld");
+
+        if is_fp {
+            // Determine size from mnemonic
+            let size = if mnemonic.contains("sd") || mnemonic.contains("pd") ||
+                         mnemonic.ends_with("d") && mnemonic.len() > 3 {
+                8 // double
+            } else {
+                4 // single (default)
+            };
+
+            // Mark all defs as floating-point
+            for def in &inst.defs {
+                self.constraints.push((
+                    def.clone(),
+                    Constraint::IsFloat(size),
+                ));
+            }
+
+            // Mark FP source operands
+            for op in &inst.uses {
+                if let SsaOperand::Value(v) = op {
+                    self.constraints.push((
+                        v.clone(),
+                        Constraint::IsFloat(size),
+                    ));
+                }
+            }
         }
     }
 
@@ -385,9 +557,21 @@ impl TypeInference {
                 }
             }
 
+            Constraint::IsFloat(size) => {
+                match current {
+                    Type::Unknown => Type::float(*size),
+                    Type::Float { size: s } => Type::float((*s).max(*size)),
+                    _ => current.clone(),
+                }
+            }
+
             Constraint::Equals(other) => {
                 let other_type = self.types.get(other).cloned().unwrap_or(Type::Unknown);
                 current.merge(&other_type)
+            }
+
+            Constraint::ReturnType(t) | Constraint::ArgumentType(t) => {
+                current.merge(t)
             }
         }
     }

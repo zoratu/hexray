@@ -340,3 +340,588 @@ pub static GROUP5_OPS: [(&str, Operation); 8] = [
     ("push", Operation::Push),    // /6 PUSH r/m64
     ("", Operation::Other(255)),  // /7 (reserved)
 ];
+
+// ============================================================================
+// SSE/AVX Opcode Tables
+// ============================================================================
+
+/// SSE operand encoding types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseEncoding {
+    /// xmm, xmm/m128
+    XmmRm,
+    /// xmm/m128, xmm
+    RmXmm,
+    /// xmm, xmm/m128, imm8
+    XmmRmImm8,
+    /// xmm, xmm, xmm/m128 (3 operands for VEX)
+    XmmXmmRm,
+    /// xmm, xmm/m64 (scalar double)
+    XmmRmScalar64,
+    /// xmm, xmm/m32 (scalar single)
+    XmmRmScalar32,
+    /// xmm, r/m32 (move to/from general register)
+    XmmGpr,
+    /// r/m32, xmm
+    GprXmm,
+    /// xmm (single operand)
+    XmmOnly,
+}
+
+/// SSE/AVX opcode entry.
+#[derive(Debug, Clone)]
+pub struct SseOpcodeEntry {
+    /// Mnemonic (SSE version)
+    pub mnemonic: &'static str,
+    /// VEX mnemonic (None if same as SSE)
+    pub vex_mnemonic: Option<&'static str>,
+    /// Operation category
+    pub operation: Operation,
+    /// Encoding type
+    pub encoding: SseEncoding,
+    /// Required prefix: None, 0x66, 0xF2, or 0xF3
+    pub prefix: Option<u8>,
+}
+
+impl SseOpcodeEntry {
+    pub const fn new(
+        mnemonic: &'static str,
+        operation: Operation,
+        encoding: SseEncoding,
+    ) -> Self {
+        Self {
+            mnemonic,
+            vex_mnemonic: None,
+            operation,
+            encoding,
+            prefix: None,
+        }
+    }
+
+    pub const fn with_prefix(mut self, prefix: u8) -> Self {
+        self.prefix = Some(prefix);
+        self
+    }
+
+    pub const fn with_vex_mnemonic(mut self, vex_mnemonic: &'static str) -> Self {
+        self.vex_mnemonic = Some(vex_mnemonic);
+        self
+    }
+}
+
+/// Const None for SSE array initialization
+const NONE_SSE_ENTRY: Option<SseOpcodeEntry> = None;
+
+/// SSE opcode table (0F xx opcodes).
+/// Index is the opcode byte after 0F.
+pub static SSE_OPCODE_TABLE: [Option<SseOpcodeEntry>; 256] = {
+    let mut table: [Option<SseOpcodeEntry>; 256] = [NONE_SSE_ENTRY; 256];
+
+    // MOVUPS xmm, xmm/m128 (no prefix)
+    table[0x10] = Some(SseOpcodeEntry::new("movups", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmovups"));
+
+    // MOVUPD xmm, xmm/m128 (66 prefix)
+    // Note: handled separately based on prefix
+
+    // MOVSS xmm, xmm/m32 (F3 prefix)
+    // MOVSD xmm, xmm/m64 (F2 prefix)
+
+    // MOVUPS xmm/m128, xmm (no prefix)
+    table[0x11] = Some(SseOpcodeEntry::new("movups", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovups"));
+
+    // MOVLPS/MOVHLPS xmm, xmm/m64
+    table[0x12] = Some(SseOpcodeEntry::new("movlps", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmovlps"));
+
+    // MOVLPS m64, xmm
+    table[0x13] = Some(SseOpcodeEntry::new("movlps", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovlps"));
+
+    // UNPCKLPS xmm, xmm/m128
+    table[0x14] = Some(SseOpcodeEntry::new("unpcklps", Operation::Other(0x14), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vunpcklps"));
+
+    // UNPCKHPS xmm, xmm/m128
+    table[0x15] = Some(SseOpcodeEntry::new("unpckhps", Operation::Other(0x15), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vunpckhps"));
+
+    // MOVHPS/MOVLHPS xmm, xmm/m64
+    table[0x16] = Some(SseOpcodeEntry::new("movhps", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmovhps"));
+
+    // MOVHPS m64, xmm
+    table[0x17] = Some(SseOpcodeEntry::new("movhps", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovhps"));
+
+    // MOVAPS xmm, xmm/m128
+    table[0x28] = Some(SseOpcodeEntry::new("movaps", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmovaps"));
+
+    // MOVAPS xmm/m128, xmm
+    table[0x29] = Some(SseOpcodeEntry::new("movaps", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovaps"));
+
+    // CVTSI2SS xmm, r/m32
+    table[0x2A] = Some(SseOpcodeEntry::new("cvtsi2ss", Operation::Move, SseEncoding::XmmGpr)
+        .with_vex_mnemonic("vcvtsi2ss"));
+
+    // MOVNTPS m128, xmm (non-temporal store)
+    table[0x2B] = Some(SseOpcodeEntry::new("movntps", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovntps"));
+
+    // CVTTSS2SI r32, xmm/m32
+    table[0x2C] = Some(SseOpcodeEntry::new("cvttss2si", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vcvttss2si"));
+
+    // CVTSS2SI r32, xmm/m32
+    table[0x2D] = Some(SseOpcodeEntry::new("cvtss2si", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vcvtss2si"));
+
+    // UCOMISS xmm, xmm/m32
+    table[0x2E] = Some(SseOpcodeEntry::new("ucomiss", Operation::Compare, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vucomiss"));
+
+    // COMISS xmm, xmm/m32
+    table[0x2F] = Some(SseOpcodeEntry::new("comiss", Operation::Compare, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vcomiss"));
+
+    // MOVMSKPS r32, xmm
+    table[0x50] = Some(SseOpcodeEntry::new("movmskps", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vmovmskps"));
+
+    // SQRTPS xmm, xmm/m128
+    table[0x51] = Some(SseOpcodeEntry::new("sqrtps", Operation::Other(0x51), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vsqrtps"));
+
+    // RSQRTPS xmm, xmm/m128
+    table[0x52] = Some(SseOpcodeEntry::new("rsqrtps", Operation::Other(0x52), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vrsqrtps"));
+
+    // RCPPS xmm, xmm/m128
+    table[0x53] = Some(SseOpcodeEntry::new("rcpps", Operation::Other(0x53), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vrcpps"));
+
+    // ANDPS xmm, xmm/m128
+    table[0x54] = Some(SseOpcodeEntry::new("andps", Operation::And, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vandps"));
+
+    // ANDNPS xmm, xmm/m128
+    table[0x55] = Some(SseOpcodeEntry::new("andnps", Operation::Other(0x55), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vandnps"));
+
+    // ORPS xmm, xmm/m128
+    table[0x56] = Some(SseOpcodeEntry::new("orps", Operation::Or, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vorps"));
+
+    // XORPS xmm, xmm/m128
+    table[0x57] = Some(SseOpcodeEntry::new("xorps", Operation::Xor, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vxorps"));
+
+    // ADDPS xmm, xmm/m128
+    table[0x58] = Some(SseOpcodeEntry::new("addps", Operation::Add, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vaddps"));
+
+    // MULPS xmm, xmm/m128
+    table[0x59] = Some(SseOpcodeEntry::new("mulps", Operation::Mul, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmulps"));
+
+    // CVTPS2PD xmm, xmm/m64
+    table[0x5A] = Some(SseOpcodeEntry::new("cvtps2pd", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vcvtps2pd"));
+
+    // CVTDQ2PS xmm, xmm/m128
+    table[0x5B] = Some(SseOpcodeEntry::new("cvtdq2ps", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vcvtdq2ps"));
+
+    // SUBPS xmm, xmm/m128
+    table[0x5C] = Some(SseOpcodeEntry::new("subps", Operation::Sub, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vsubps"));
+
+    // MINPS xmm, xmm/m128
+    table[0x5D] = Some(SseOpcodeEntry::new("minps", Operation::Other(0x5D), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vminps"));
+
+    // DIVPS xmm, xmm/m128
+    table[0x5E] = Some(SseOpcodeEntry::new("divps", Operation::Div, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vdivps"));
+
+    // MAXPS xmm, xmm/m128
+    table[0x5F] = Some(SseOpcodeEntry::new("maxps", Operation::Other(0x5F), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmaxps"));
+
+    // PUNPCKLBW/PUNPCKLWD/etc - 0x60-0x6F (MMX/SSE2 integer)
+    // ... (can be extended)
+
+    // MOVD/MOVQ xmm, r/m32/64
+    table[0x6E] = Some(SseOpcodeEntry::new("movd", Operation::Move, SseEncoding::XmmGpr)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vmovd"));
+
+    // MOVDQA xmm, xmm/m128 (66 prefix)
+    table[0x6F] = Some(SseOpcodeEntry::new("movdqa", Operation::Move, SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vmovdqa"));
+
+    // PSHUFD xmm, xmm/m128, imm8
+    table[0x70] = Some(SseOpcodeEntry::new("pshufd", Operation::Other(0x70), SseEncoding::XmmRmImm8)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpshufd"));
+
+    // PCMPEQB/PCMPEQW/PCMPEQD - packed compare equal
+    table[0x74] = Some(SseOpcodeEntry::new("pcmpeqb", Operation::Compare, SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpcmpeqb"));
+    table[0x75] = Some(SseOpcodeEntry::new("pcmpeqw", Operation::Compare, SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpcmpeqw"));
+    table[0x76] = Some(SseOpcodeEntry::new("pcmpeqd", Operation::Compare, SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpcmpeqd"));
+
+    // MOVD/MOVQ r/m32/64, xmm
+    table[0x7E] = Some(SseOpcodeEntry::new("movd", Operation::Store, SseEncoding::GprXmm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vmovd"));
+
+    // MOVDQA xmm/m128, xmm
+    table[0x7F] = Some(SseOpcodeEntry::new("movdqa", Operation::Store, SseEncoding::RmXmm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vmovdqa"));
+
+    // SHUFPS xmm, xmm/m128, imm8
+    table[0xC6] = Some(SseOpcodeEntry::new("shufps", Operation::Other(0xC6), SseEncoding::XmmRmImm8)
+        .with_vex_mnemonic("vshufps"));
+
+    // PAND xmm, xmm/m128
+    table[0xDB] = Some(SseOpcodeEntry::new("pand", Operation::And, SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpand"));
+
+    // PANDN xmm, xmm/m128
+    table[0xDF] = Some(SseOpcodeEntry::new("pandn", Operation::Other(0xDF), SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpandn"));
+
+    // PAVGB xmm, xmm/m128
+    table[0xE0] = Some(SseOpcodeEntry::new("pavgb", Operation::Other(0xE0), SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpavgb"));
+
+    // POR xmm, xmm/m128
+    table[0xEB] = Some(SseOpcodeEntry::new("por", Operation::Or, SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpor"));
+
+    // PXOR xmm, xmm/m128
+    table[0xEF] = Some(SseOpcodeEntry::new("pxor", Operation::Xor, SseEncoding::XmmRm)
+        .with_prefix(0x66)
+        .with_vex_mnemonic("vpxor"));
+
+    // MOVDQU xmm, xmm/m128 (F3 prefix)
+    // MOVDQU xmm/m128, xmm (F3 prefix)
+    // Note: F3 prefix variants handled in decoder with prefix check
+
+    table
+};
+
+/// SSE2 opcode variants with 0x66 prefix.
+/// These override the no-prefix versions for packed double operations.
+pub static SSE2_OPCODE_TABLE_66: [Option<SseOpcodeEntry>; 256] = {
+    let mut table: [Option<SseOpcodeEntry>; 256] = [NONE_SSE_ENTRY; 256];
+
+    // MOVUPD xmm, xmm/m128
+    table[0x10] = Some(SseOpcodeEntry::new("movupd", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmovupd"));
+
+    // MOVUPD xmm/m128, xmm
+    table[0x11] = Some(SseOpcodeEntry::new("movupd", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovupd"));
+
+    // MOVLPD xmm, m64
+    table[0x12] = Some(SseOpcodeEntry::new("movlpd", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmovlpd"));
+
+    // MOVLPD m64, xmm
+    table[0x13] = Some(SseOpcodeEntry::new("movlpd", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovlpd"));
+
+    // UNPCKLPD xmm, xmm/m128
+    table[0x14] = Some(SseOpcodeEntry::new("unpcklpd", Operation::Other(0x14), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vunpcklpd"));
+
+    // UNPCKHPD xmm, xmm/m128
+    table[0x15] = Some(SseOpcodeEntry::new("unpckhpd", Operation::Other(0x15), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vunpckhpd"));
+
+    // MOVHPD xmm, m64
+    table[0x16] = Some(SseOpcodeEntry::new("movhpd", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmovhpd"));
+
+    // MOVHPD m64, xmm
+    table[0x17] = Some(SseOpcodeEntry::new("movhpd", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovhpd"));
+
+    // MOVAPD xmm, xmm/m128
+    table[0x28] = Some(SseOpcodeEntry::new("movapd", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmovapd"));
+
+    // MOVAPD xmm/m128, xmm
+    table[0x29] = Some(SseOpcodeEntry::new("movapd", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovapd"));
+
+    // CVTPI2PD xmm, mm/m64
+    table[0x2A] = Some(SseOpcodeEntry::new("cvtpi2pd", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vcvtpi2pd"));
+
+    // MOVNTPD m128, xmm
+    table[0x2B] = Some(SseOpcodeEntry::new("movntpd", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovntpd"));
+
+    // UCOMISD xmm, xmm/m64
+    table[0x2E] = Some(SseOpcodeEntry::new("ucomisd", Operation::Compare, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vucomisd"));
+
+    // COMISD xmm, xmm/m64
+    table[0x2F] = Some(SseOpcodeEntry::new("comisd", Operation::Compare, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vcomisd"));
+
+    // MOVMSKPD r32, xmm
+    table[0x50] = Some(SseOpcodeEntry::new("movmskpd", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vmovmskpd"));
+
+    // SQRTPD xmm, xmm/m128
+    table[0x51] = Some(SseOpcodeEntry::new("sqrtpd", Operation::Other(0x51), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vsqrtpd"));
+
+    // ANDPD xmm, xmm/m128
+    table[0x54] = Some(SseOpcodeEntry::new("andpd", Operation::And, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vandpd"));
+
+    // ANDNPD xmm, xmm/m128
+    table[0x55] = Some(SseOpcodeEntry::new("andnpd", Operation::Other(0x55), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vandnpd"));
+
+    // ORPD xmm, xmm/m128
+    table[0x56] = Some(SseOpcodeEntry::new("orpd", Operation::Or, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vorpd"));
+
+    // XORPD xmm, xmm/m128
+    table[0x57] = Some(SseOpcodeEntry::new("xorpd", Operation::Xor, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vxorpd"));
+
+    // ADDPD xmm, xmm/m128
+    table[0x58] = Some(SseOpcodeEntry::new("addpd", Operation::Add, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vaddpd"));
+
+    // MULPD xmm, xmm/m128
+    table[0x59] = Some(SseOpcodeEntry::new("mulpd", Operation::Mul, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmulpd"));
+
+    // CVTPD2PS xmm, xmm/m128
+    table[0x5A] = Some(SseOpcodeEntry::new("cvtpd2ps", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vcvtpd2ps"));
+
+    // CVTPS2DQ xmm, xmm/m128
+    table[0x5B] = Some(SseOpcodeEntry::new("cvtps2dq", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vcvtps2dq"));
+
+    // SUBPD xmm, xmm/m128
+    table[0x5C] = Some(SseOpcodeEntry::new("subpd", Operation::Sub, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vsubpd"));
+
+    // MINPD xmm, xmm/m128
+    table[0x5D] = Some(SseOpcodeEntry::new("minpd", Operation::Other(0x5D), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vminpd"));
+
+    // DIVPD xmm, xmm/m128
+    table[0x5E] = Some(SseOpcodeEntry::new("divpd", Operation::Div, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vdivpd"));
+
+    // MAXPD xmm, xmm/m128
+    table[0x5F] = Some(SseOpcodeEntry::new("maxpd", Operation::Other(0x5F), SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmaxpd"));
+
+    // SHUFPD xmm, xmm/m128, imm8
+    table[0xC6] = Some(SseOpcodeEntry::new("shufpd", Operation::Other(0xC6), SseEncoding::XmmRmImm8)
+        .with_vex_mnemonic("vshufpd"));
+
+    table
+};
+
+/// SSE scalar single (F3 prefix) opcode variants.
+pub static SSE_OPCODE_TABLE_F3: [Option<SseOpcodeEntry>; 256] = {
+    let mut table: [Option<SseOpcodeEntry>; 256] = [NONE_SSE_ENTRY; 256];
+
+    // MOVSS xmm, xmm/m32
+    table[0x10] = Some(SseOpcodeEntry::new("movss", Operation::Move, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vmovss"));
+
+    // MOVSS xmm/m32, xmm
+    table[0x11] = Some(SseOpcodeEntry::new("movss", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovss"));
+
+    // MOVSLDUP xmm, xmm/m128
+    table[0x12] = Some(SseOpcodeEntry::new("movsldup", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmovsldup"));
+
+    // MOVSHDUP xmm, xmm/m128
+    table[0x16] = Some(SseOpcodeEntry::new("movshdup", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmovshdup"));
+
+    // CVTSI2SS xmm, r/m32/64
+    table[0x2A] = Some(SseOpcodeEntry::new("cvtsi2ss", Operation::Move, SseEncoding::XmmGpr)
+        .with_vex_mnemonic("vcvtsi2ss"));
+
+    // CVTTSS2SI r32/64, xmm/m32
+    table[0x2C] = Some(SseOpcodeEntry::new("cvttss2si", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vcvttss2si"));
+
+    // CVTSS2SI r32/64, xmm/m32
+    table[0x2D] = Some(SseOpcodeEntry::new("cvtss2si", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vcvtss2si"));
+
+    // SQRTSS xmm, xmm/m32
+    table[0x51] = Some(SseOpcodeEntry::new("sqrtss", Operation::Other(0x51), SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vsqrtss"));
+
+    // RSQRTSS xmm, xmm/m32
+    table[0x52] = Some(SseOpcodeEntry::new("rsqrtss", Operation::Other(0x52), SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vrsqrtss"));
+
+    // RCPSS xmm, xmm/m32
+    table[0x53] = Some(SseOpcodeEntry::new("rcpss", Operation::Other(0x53), SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vrcpss"));
+
+    // ADDSS xmm, xmm/m32
+    table[0x58] = Some(SseOpcodeEntry::new("addss", Operation::Add, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vaddss"));
+
+    // MULSS xmm, xmm/m32
+    table[0x59] = Some(SseOpcodeEntry::new("mulss", Operation::Mul, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vmulss"));
+
+    // CVTSS2SD xmm, xmm/m32
+    table[0x5A] = Some(SseOpcodeEntry::new("cvtss2sd", Operation::Move, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vcvtss2sd"));
+
+    // CVTTPS2DQ xmm, xmm/m128
+    table[0x5B] = Some(SseOpcodeEntry::new("cvttps2dq", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vcvttps2dq"));
+
+    // SUBSS xmm, xmm/m32
+    table[0x5C] = Some(SseOpcodeEntry::new("subss", Operation::Sub, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vsubss"));
+
+    // MINSS xmm, xmm/m32
+    table[0x5D] = Some(SseOpcodeEntry::new("minss", Operation::Other(0x5D), SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vminss"));
+
+    // DIVSS xmm, xmm/m32
+    table[0x5E] = Some(SseOpcodeEntry::new("divss", Operation::Div, SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vdivss"));
+
+    // MAXSS xmm, xmm/m32
+    table[0x5F] = Some(SseOpcodeEntry::new("maxss", Operation::Other(0x5F), SseEncoding::XmmRmScalar32)
+        .with_vex_mnemonic("vmaxss"));
+
+    // MOVDQU xmm, xmm/m128
+    table[0x6F] = Some(SseOpcodeEntry::new("movdqu", Operation::Move, SseEncoding::XmmRm)
+        .with_vex_mnemonic("vmovdqu"));
+
+    // PSHUFHW xmm, xmm/m128, imm8
+    table[0x70] = Some(SseOpcodeEntry::new("pshufhw", Operation::Other(0x70), SseEncoding::XmmRmImm8)
+        .with_vex_mnemonic("vpshufhw"));
+
+    // MOVQ xmm, xmm/m64
+    table[0x7E] = Some(SseOpcodeEntry::new("movq", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmovq"));
+
+    // MOVDQU xmm/m128, xmm
+    table[0x7F] = Some(SseOpcodeEntry::new("movdqu", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovdqu"));
+
+    table
+};
+
+/// SSE scalar double (F2 prefix) opcode variants.
+pub static SSE_OPCODE_TABLE_F2: [Option<SseOpcodeEntry>; 256] = {
+    let mut table: [Option<SseOpcodeEntry>; 256] = [NONE_SSE_ENTRY; 256];
+
+    // MOVSD xmm, xmm/m64
+    table[0x10] = Some(SseOpcodeEntry::new("movsd", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmovsd"));
+
+    // MOVSD xmm/m64, xmm
+    table[0x11] = Some(SseOpcodeEntry::new("movsd", Operation::Store, SseEncoding::RmXmm)
+        .with_vex_mnemonic("vmovsd"));
+
+    // MOVDDUP xmm, xmm/m64
+    table[0x12] = Some(SseOpcodeEntry::new("movddup", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmovddup"));
+
+    // CVTSI2SD xmm, r/m32/64
+    table[0x2A] = Some(SseOpcodeEntry::new("cvtsi2sd", Operation::Move, SseEncoding::XmmGpr)
+        .with_vex_mnemonic("vcvtsi2sd"));
+
+    // CVTTSD2SI r32/64, xmm/m64
+    table[0x2C] = Some(SseOpcodeEntry::new("cvttsd2si", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vcvttsd2si"));
+
+    // CVTSD2SI r32/64, xmm/m64
+    table[0x2D] = Some(SseOpcodeEntry::new("cvtsd2si", Operation::Move, SseEncoding::GprXmm)
+        .with_vex_mnemonic("vcvtsd2si"));
+
+    // SQRTSD xmm, xmm/m64
+    table[0x51] = Some(SseOpcodeEntry::new("sqrtsd", Operation::Other(0x51), SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vsqrtsd"));
+
+    // ADDSD xmm, xmm/m64
+    table[0x58] = Some(SseOpcodeEntry::new("addsd", Operation::Add, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vaddsd"));
+
+    // MULSD xmm, xmm/m64
+    table[0x59] = Some(SseOpcodeEntry::new("mulsd", Operation::Mul, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmulsd"));
+
+    // CVTSD2SS xmm, xmm/m64
+    table[0x5A] = Some(SseOpcodeEntry::new("cvtsd2ss", Operation::Move, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vcvtsd2ss"));
+
+    // SUBSD xmm, xmm/m64
+    table[0x5C] = Some(SseOpcodeEntry::new("subsd", Operation::Sub, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vsubsd"));
+
+    // MINSD xmm, xmm/m64
+    table[0x5D] = Some(SseOpcodeEntry::new("minsd", Operation::Other(0x5D), SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vminsd"));
+
+    // DIVSD xmm, xmm/m64
+    table[0x5E] = Some(SseOpcodeEntry::new("divsd", Operation::Div, SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vdivsd"));
+
+    // MAXSD xmm, xmm/m64
+    table[0x5F] = Some(SseOpcodeEntry::new("maxsd", Operation::Other(0x5F), SseEncoding::XmmRmScalar64)
+        .with_vex_mnemonic("vmaxsd"));
+
+    // PSHUFLW xmm, xmm/m128, imm8
+    table[0x70] = Some(SseOpcodeEntry::new("pshuflw", Operation::Other(0x70), SseEncoding::XmmRmImm8)
+        .with_vex_mnemonic("vpshuflw"));
+
+    table
+};
+
+/// Looks up an SSE opcode based on the opcode byte and prefix.
+pub fn lookup_sse_opcode(opcode: u8, prefix_66: bool, prefix_f2: bool, prefix_f3: bool) -> Option<&'static SseOpcodeEntry> {
+    // Priority: F2 > F3 > 66 > none
+    if prefix_f2 {
+        SSE_OPCODE_TABLE_F2[opcode as usize].as_ref()
+    } else if prefix_f3 {
+        SSE_OPCODE_TABLE_F3[opcode as usize].as_ref()
+    } else if prefix_66 {
+        SSE2_OPCODE_TABLE_66[opcode as usize].as_ref()
+    } else {
+        SSE_OPCODE_TABLE[opcode as usize].as_ref()
+    }
+}

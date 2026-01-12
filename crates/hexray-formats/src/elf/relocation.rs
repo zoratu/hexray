@@ -50,6 +50,10 @@ pub enum RelocationType {
     GotOff64,
     /// 32-bit signed PC-relative offset to GOT
     GotPc32,
+    /// Relaxable GOT PC-relative (for mov from GOT)
+    GotPcRelX,
+    /// Relaxable GOT PC-relative with REX prefix
+    RexGotPcRelX,
     /// Unknown relocation type
     Unknown(u32),
 }
@@ -77,6 +81,8 @@ impl RelocationType {
             24 => Self::Pc64,
             25 => Self::GotOff64,
             26 => Self::GotPc32,
+            41 => Self::GotPcRelX,
+            42 => Self::RexGotPcRelX,
             other => Self::Unknown(other),
         }
     }

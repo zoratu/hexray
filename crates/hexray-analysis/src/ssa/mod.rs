@@ -16,9 +16,11 @@
 
 pub mod types;
 pub mod builder;
+pub mod optimize;
 
 pub use types::{SsaValue, SsaInstruction, SsaBlock, SsaFunction, PhiNode, Version};
 pub use builder::SsaBuilder;
+pub use optimize::{SsaOptimizer, OptimizationStats};
 
 use crate::dataflow::Location;
 use hexray_core::{BasicBlockId, ControlFlowGraph};

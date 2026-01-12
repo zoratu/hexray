@@ -99,7 +99,7 @@ impl<'a> Elf<'a> {
         };
 
         // Parse symbols (with section base address adjustment for ET_REL)
-        let symbols = Self::parse_symbols(data, &sections, &header)?;
+        let symbols = Self::parse_symbols(data, &sections, &header, &section_names)?;
 
         // Parse relocations for relocatable files and dynamic binaries
         // - Relocatable files: need relocations for symbol resolution in decompilation
@@ -179,6 +179,7 @@ impl<'a> Elf<'a> {
         data: &[u8],
         sections: &[SectionHeader],
         header: &ElfHeader,
+        section_names: &StringTable,
     ) -> Result<Vec<Symbol>, ParseError> {
         let mut symbols = Vec::new();
         let is_relocatable = header.file_type == ElfType::Relocatable;
@@ -224,8 +225,17 @@ impl<'a> Elf<'a> {
                     header.endianness,
                 )?;
 
-                let name = strtab.get(entry.st_name as usize).unwrap_or("");
-                let mut sym = entry.to_symbol(name.to_string());
+                let mut name = strtab.get(entry.st_name as usize).unwrap_or("").to_string();
+
+                // Section symbols (STT_SECTION) have st_name=0, so use section name instead
+                if name.is_empty() && entry.st_shndx > 0 && (entry.st_shndx as usize) < sections.len() {
+                    let sym_section = &sections[entry.st_shndx as usize];
+                    if let Some(sec_name) = section_names.get(sym_section.sh_name as usize) {
+                        name = sec_name.to_string();
+                    }
+                }
+
+                let mut sym = entry.to_symbol(name);
 
                 // For relocatable files, adjust symbol address to be globally unique
                 // by adding the section's file offset
@@ -374,6 +384,11 @@ impl<'a> Elf<'a> {
     /// Returns true if this is a relocatable object file.
     pub fn is_relocatable(&self) -> bool {
         self.header.file_type == ElfType::Relocatable
+    }
+
+    /// Returns the raw data of the ELF file.
+    pub fn data(&self) -> &[u8] {
+        self.data
     }
 
     /// Get bytes from a relocatable file using section-based addressing.

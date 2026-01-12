@@ -8,7 +8,12 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use hexray_analysis::{CfgBuilder, Decompiler, StringTable, SymbolTable, RelocationTable};
+use hexray_analysis::{
+    CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter,
+    CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
+    Decompiler, FunctionInfo, ParallelCallGraphBuilder, StringTable, SymbolTable, RelocationTable,
+    StringDetector, StringConfig, XrefBuilder, XrefType,
+};
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
 use hexray_disasm::{Disassembler, X86_64Disassembler, Arm64Disassembler, RiscVDisassembler};
@@ -55,6 +60,15 @@ enum Commands {
     Cfg {
         /// Symbol name or address
         target: String,
+        /// Output in Graphviz DOT format
+        #[arg(long)]
+        dot: bool,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+        /// Output in interactive HTML format
+        #[arg(long)]
+        html: bool,
     },
     /// Decompile a function to pseudo-code
     Decompile {
@@ -63,6 +77,44 @@ enum Commands {
         /// Show basic block address comments
         #[arg(long)]
         show_addresses: bool,
+    },
+    /// Build and display call graph
+    Callgraph {
+        /// Symbol name, address, or "all" for full binary
+        #[arg(default_value = "all")]
+        target: String,
+        /// Output in Graphviz DOT format
+        #[arg(long)]
+        dot: bool,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+        /// Output in interactive HTML format
+        #[arg(long)]
+        html: bool,
+    },
+    /// Extract strings from the binary
+    Strings {
+        /// Minimum string length
+        #[arg(short, long, default_value = "4")]
+        min_length: usize,
+        /// Search for strings matching a pattern
+        #[arg(short, long)]
+        search: Option<String>,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build cross-reference database
+    Xrefs {
+        /// Target address to find references to
+        target: Option<String>,
+        /// Show only calls
+        #[arg(long)]
+        calls_only: bool,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -134,11 +186,20 @@ fn main() -> Result<()> {
         Some(Commands::Info) => {
             print_info(&binary);
         }
-        Some(Commands::Cfg { target }) => {
-            disassemble_cfg(fmt, &target)?;
+        Some(Commands::Cfg { target, dot, json, html }) => {
+            disassemble_cfg(fmt, &target, dot, json, html)?;
         }
         Some(Commands::Decompile { target, show_addresses }) => {
             decompile_function(&binary, &target, show_addresses)?;
+        }
+        Some(Commands::Callgraph { target, dot, json, html }) => {
+            build_callgraph(fmt, &target, dot, json, html)?;
+        }
+        Some(Commands::Strings { min_length, search, json }) => {
+            extract_strings(fmt, min_length, search.as_deref(), json)?;
+        }
+        Some(Commands::Xrefs { target, calls_only, json }) => {
+            build_xrefs(fmt, target.as_deref(), calls_only, json)?;
         }
         None => {
             // Default: disassemble
@@ -474,7 +535,7 @@ fn disassemble_with<D: Disassembler>(
     Ok(())
 }
 
-fn disassemble_cfg(fmt: &dyn BinaryFormat, target: &str) -> Result<()> {
+fn disassemble_cfg(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, html: bool) -> Result<()> {
     // Try to parse as address first
     let address = if let Some(stripped) = target.strip_prefix("0x") {
         u64::from_str_radix(stripped, 16).ok()
@@ -490,8 +551,6 @@ fn disassemble_cfg(fmt: &dyn BinaryFormat, target: &str) -> Result<()> {
             .with_context(|| format!("Symbol '{}' not found", target))?;
         (symbol.address, demangle_or_original(&symbol.name))
     };
-
-    println!("Building CFG for {} at {:#x}\n", name, start_addr);
 
     // Disassemble instructions
     let bytes = fmt
@@ -524,24 +583,40 @@ fn disassemble_cfg(fmt: &dyn BinaryFormat, target: &str) -> Result<()> {
     // Build CFG
     let cfg = CfgBuilder::build(&instructions, start_addr);
 
-    println!("CFG has {} basic blocks\n", cfg.num_blocks());
+    if html {
+        // Output in interactive HTML format
+        let exporter = CfgHtmlExporter::new();
+        exporter.export_to_stdout(&cfg, &name)?;
+    } else if json {
+        // Output in JSON format using the exporter
+        let exporter = CfgJsonExporter::pretty();
+        exporter.export_to_stdout(&cfg, &name)?;
+    } else if dot {
+        // Output in Graphviz DOT format using the exporter
+        let exporter = CfgDotExporter::new();
+        exporter.export_to_stdout(&cfg, &name)?;
+    } else {
+        // Text output
+        println!("Building CFG for {} at {:#x}\n", name, start_addr);
+        println!("CFG has {} basic blocks\n", cfg.num_blocks());
 
-    // Print each block
-    for block_id in cfg.reverse_post_order() {
-        let block = cfg.block(block_id).unwrap();
-        println!("{}:  ; [{:#x} - {:#x})", block_id, block.start, block.end);
+        // Print each block
+        for block_id in cfg.reverse_post_order() {
+            let block = cfg.block(block_id).unwrap();
+            println!("{}:  ; [{:#x} - {:#x})", block_id, block.start, block.end);
 
-        for inst in &block.instructions {
-            println!("    {}", inst);
+            for inst in &block.instructions {
+                println!("    {}", inst);
+            }
+
+            // Print successors
+            let succs = cfg.successors(block_id);
+            if !succs.is_empty() {
+                let succ_strs: Vec<_> = succs.iter().map(|s| format!("{}", s)).collect();
+                println!("    ; -> {}", succ_strs.join(", "));
+            }
+            println!();
         }
-
-        // Print successors
-        let succs = cfg.successors(block_id);
-        if !succs.is_empty() {
-            let succ_strs: Vec<_> = succs.iter().map(|s| format!("{}", s)).collect();
-            println!("    ; -> {}", succ_strs.join(", "));
-        }
-        println!();
     }
 
     Ok(())
@@ -692,6 +767,33 @@ fn build_symbol_table(fmt: &dyn BinaryFormat) -> SymbolTable {
 }
 
 /// Builds a relocation table from ELF relocations.
+/// Reads a null-terminated C string from ELF data at the given offset.
+/// Returns None if the offset is out of bounds or the string is too long/invalid.
+fn read_cstring_from_elf(data: &[u8], offset: usize) -> Option<String> {
+    if offset >= data.len() {
+        return None;
+    }
+
+    // Find the null terminator, with a reasonable max length
+    let max_len = 256;
+    let end = data[offset..]
+        .iter()
+        .take(max_len)
+        .position(|&b| b == 0)?;
+
+    // Try to convert to UTF-8 string
+    let bytes = &data[offset..offset + end];
+    let s = std::str::from_utf8(bytes).ok()?;
+
+    // Skip if empty or contains non-printable characters
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+        return None;
+    }
+
+    // Format as a C string literal, escaping if needed
+    Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
 ///
 /// For kernel modules and other relocatable files, call instructions have
 /// unresolved targets. This table maps call instruction addresses to the
@@ -744,7 +846,26 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                         // Instruction starts 3 bytes before the relocation offset
                         // for "mov reg, imm32" with REX prefix
                         let inst_addr = section.sh_offset + reloc.offset - 3;
-                        table.insert_data(inst_addr, symbol.name.clone());
+
+                        // Try to read actual string content from .rodata.str* sections
+                        // These sections (e.g., .rodata.str1.1, .rodata.str1.8) contain string literals
+                        let sym_name = if symbol.name.starts_with(".rodata.str") {
+                            // Find the target section and read the string
+                            if let Some(rodata_section) = elf.sections.iter()
+                                .find(|s| elf.section_name(s).map(|n| n == symbol.name).unwrap_or(false))
+                            {
+                                let string_offset = rodata_section.sh_offset as usize + reloc.addend as usize;
+                                read_cstring_from_elf(elf.data(), string_offset)
+                                    .unwrap_or_else(|| format!("{}+{:#x}", symbol.name, reloc.addend))
+                            } else {
+                                format!("{}+{:#x}", symbol.name, reloc.addend)
+                            }
+                        } else if reloc.addend != 0 {
+                            format!("{}+{:#x}", symbol.name, reloc.addend)
+                        } else {
+                            symbol.name.clone()
+                        };
+                        table.insert_data(inst_addr, sym_name);
                     }
                 }
                 // 64-bit absolute relocations
@@ -755,10 +876,379 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                         table.insert_data(inst_addr, symbol.name.clone());
                     }
                 }
+                // GOT-relative relocations (for mov reg, [rip+X] accessing global variables)
+                // The relocation points to the displacement (4 bytes), instruction starts 3 bytes before
+                // Format: REX.W MOV ModRM disp32 = 48 8b XX 00 00 00 00
+                RelocationType::GotPcRel
+                | RelocationType::GotPcRelX
+                | RelocationType::RexGotPcRelX => {
+                    if let Some(section) = elf.sections.get(reloc.section_index) {
+                        // Instruction starts 3 bytes before the displacement
+                        let inst_addr = section.sh_offset + reloc.offset - 3;
+                        table.insert_got(inst_addr, symbol.name.clone());
+                    }
+                }
                 _ => {}
             }
         }
     }
 
     table
+}
+
+fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, html: bool) -> Result<()> {
+    let symbols: Vec<_> = fmt.symbols().cloned().collect();
+    let arch = fmt.architecture();
+
+    // Determine which functions to analyze (address, name, size)
+    // Note: Mach-O symbols don't have size info (nlist doesn't store it),
+    // so we use a default size for symbols with size == 0
+    let functions_to_analyze: Vec<(u64, String, u64)> = if target == "all" {
+        symbols
+            .iter()
+            .filter(|s| s.is_function() && s.address != 0)
+            .map(|s| {
+                let size = if s.size > 0 { s.size } else { 256 }; // Default for Mach-O
+                (s.address, demangle_or_original(&s.name), size)
+            })
+            .collect()
+    } else {
+        // Parse as address or find symbol by name
+        let address = if let Some(stripped) = target.strip_prefix("0x") {
+            u64::from_str_radix(stripped, 16).ok()
+        } else {
+            u64::from_str_radix(target, 16).ok()
+        };
+
+        let (addr, name, size) = if let Some(a) = address {
+            // For raw addresses, use a default size
+            (a, format!("sub_{:x}", a), 4096u64)
+        } else {
+            let symbol = find_symbol(fmt, target)
+                .with_context(|| format!("Symbol '{}' not found", target))?;
+            let size = if symbol.size > 0 { symbol.size } else { 4096 };
+            (symbol.address, demangle_or_original(&symbol.name), size)
+        };
+
+        vec![(addr, name, size)]
+    };
+
+    // Collect function info for parallel disassembly
+    let function_infos: Vec<FunctionInfo> = functions_to_analyze
+        .iter()
+        .filter_map(|(func_addr, _, func_size)| {
+            let size = (*func_size).max(64) as usize;
+            fmt.bytes_at(*func_addr, size).map(|bytes| FunctionInfo {
+                address: *func_addr,
+                size,
+                bytes: bytes.to_vec(),
+            })
+        })
+        .collect();
+
+    // Build call graph using parallel disassembly
+    let callgraph = match arch {
+        Architecture::X86_64 | Architecture::X86 => {
+            let disasm = X86_64Disassembler::new();
+            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+        }
+        Architecture::Arm64 => {
+            let disasm = Arm64Disassembler::new();
+            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+        }
+        Architecture::RiscV64 => {
+            let disasm = RiscVDisassembler::new();
+            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+        }
+        Architecture::RiscV32 => {
+            let disasm = RiscVDisassembler::new_rv32();
+            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+        }
+        _ => {
+            // Fallback to sequential for unsupported architectures
+            let mut builder = CallGraphBuilder::new();
+            builder.add_symbols(&symbols);
+            builder.build()
+        }
+    };
+
+    if html {
+        // Output in interactive HTML format
+        let exporter = CallGraphHtmlExporter::new();
+        exporter.export_to_stdout(&callgraph)?;
+    } else if json {
+        // Output in JSON format using the exporter
+        let exporter = CallGraphJsonExporter::pretty();
+        exporter.export_to_stdout(&callgraph)?;
+    } else if dot {
+        // Output in Graphviz DOT format using the exporter
+        let exporter = CallGraphDotExporter::new();
+        exporter.export_to_stdout(&callgraph)?;
+    } else {
+        // Text output
+        println!("Call Graph Analysis");
+        println!("===================");
+        println!("Functions: {}", callgraph.node_count());
+        println!("Call edges: {}", callgraph.edge_count());
+        println!();
+
+        for node in callgraph.nodes() {
+            let node_name = node.name.clone().unwrap_or_else(|| format!("sub_{:x}", node.address));
+            let callees: Vec<_> = callgraph
+                .callees(node.address)
+                .filter_map(|(addr, _)| callgraph.get_node(addr))
+                .collect();
+
+            if !callees.is_empty() {
+                println!("{} ({:#x}):", node_name, node.address);
+                for callee in callees {
+                    let callee_name = callee.name.clone().unwrap_or_else(|| format!("sub_{:x}", callee.address));
+                    println!("  -> {} ({:#x})", callee_name, callee.address);
+                }
+                println!();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_strings(
+    fmt: &dyn BinaryFormat,
+    min_length: usize,
+    search: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let config = StringConfig {
+        min_length,
+        ..Default::default()
+    };
+    let detector = StringDetector::with_config(config);
+
+    let mut all_strings = Vec::new();
+
+    // Extract strings from all sections
+    for section in fmt.sections() {
+        let data = section.data();
+        if !data.is_empty() {
+            let strings = detector.detect(data, section.virtual_address());
+            all_strings.extend(strings);
+        }
+    }
+
+    // Sort by address
+    all_strings.sort_by_key(|s| s.address);
+
+    // Filter by search pattern if provided
+    if let Some(pattern) = search {
+        let pattern_lower = pattern.to_lowercase();
+        all_strings.retain(|s| s.content.to_lowercase().contains(&pattern_lower));
+    }
+
+    if json {
+        // JSON output
+        println!("{{");
+        println!("  \"strings\": [");
+        for (i, s) in all_strings.iter().enumerate() {
+            let escaped_content = s.content
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+
+            let comma = if i < all_strings.len() - 1 { "," } else { "" };
+            println!("    {{");
+            println!("      \"address\": \"{:#x}\",", s.address);
+            println!("      \"length\": {},", s.length);
+            println!("      \"encoding\": \"{:?}\",", s.encoding);
+            println!("      \"content\": \"{}\"", escaped_content);
+            println!("    }}{}", comma);
+        }
+        println!("  ],");
+        println!("  \"total\": {}", all_strings.len());
+        println!("}}");
+    } else {
+        // Text output
+        println!("Strings ({} found)", all_strings.len());
+        println!("{}", "=".repeat(50));
+        println!();
+
+        for s in &all_strings {
+            let type_marker = match s.encoding {
+                hexray_analysis::StringEncoding::Ascii => "",
+                hexray_analysis::StringEncoding::Utf8 => " (UTF-8)",
+                hexray_analysis::StringEncoding::Utf16Le => " (UTF-16 LE)",
+                hexray_analysis::StringEncoding::Utf16Be => " (UTF-16 BE)",
+            };
+
+            // Truncate very long strings
+            let display_content = if s.content.len() > 80 {
+                format!("{}...", &s.content[..77])
+            } else {
+                s.content.clone()
+            };
+
+            // Add indicators for special string types
+            let mut indicators = Vec::new();
+            if s.is_path() {
+                indicators.push("PATH");
+            }
+            if s.is_url() {
+                indicators.push("URL");
+            }
+            if s.is_error_message() {
+                indicators.push("ERROR");
+            }
+
+            let indicator_str = if indicators.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", indicators.join(", "))
+            };
+
+            println!("{:#016x}{}: \"{}\"{}",
+                     s.address, type_marker, display_content, indicator_str);
+        }
+    }
+
+    Ok(())
+}
+
+fn build_xrefs(
+    fmt: &dyn BinaryFormat,
+    target: Option<&str>,
+    calls_only: bool,
+    json: bool,
+) -> Result<()> {
+    let arch = fmt.architecture();
+    let symbols: Vec<_> = fmt.symbols().cloned().collect();
+
+    // Build xref database by disassembling all functions
+    let mut xref_builder = XrefBuilder::new();
+
+    // Gather function addresses and disassemble
+    let functions: Vec<_> = symbols
+        .iter()
+        .filter(|s| s.is_function() && s.address != 0)
+        .collect();
+
+    for func in &functions {
+        let size = if func.size > 0 { func.size as usize } else { 256 };
+        if let Some(bytes) = fmt.bytes_at(func.address, size) {
+            let instructions = match arch {
+                Architecture::X86_64 | Architecture::X86 => {
+                    let disasm = X86_64Disassembler::new();
+                    disassemble_for_cfg(&disasm, bytes, func.address)
+                }
+                Architecture::Arm64 => {
+                    let disasm = Arm64Disassembler::new();
+                    disassemble_for_cfg(&disasm, bytes, func.address)
+                }
+                Architecture::RiscV64 => {
+                    let disasm = RiscVDisassembler::new();
+                    disassemble_for_cfg(&disasm, bytes, func.address)
+                }
+                Architecture::RiscV32 => {
+                    let disasm = RiscVDisassembler::new_rv32();
+                    disassemble_for_cfg(&disasm, bytes, func.address)
+                }
+                _ => Vec::new(),
+            };
+            xref_builder.analyze_instructions(&instructions);
+        }
+    }
+
+    let db = xref_builder.build();
+
+    // If a target is specified, show refs to that target
+    if let Some(target_str) = target {
+        let target_addr = if let Some(stripped) = target_str.strip_prefix("0x") {
+            u64::from_str_radix(stripped, 16)
+                .with_context(|| format!("Invalid address: {}", target_str))?
+        } else if let Ok(addr) = u64::from_str_radix(target_str, 16) {
+            addr
+        } else {
+            // Try to find symbol
+            let symbol = find_symbol(fmt, target_str)
+                .with_context(|| format!("Symbol '{}' not found", target_str))?;
+            symbol.address
+        };
+
+        let refs = if calls_only {
+            db.call_refs_to(target_addr)
+        } else {
+            db.refs_to(target_addr).iter().collect()
+        };
+
+        let target_name = fmt
+            .symbol_at(target_addr)
+            .map(|s| demangle_or_original(&s.name))
+            .unwrap_or_else(|| format!("sub_{:x}", target_addr));
+
+        if json {
+            println!("{{");
+            println!("  \"target\": \"{:#x}\",", target_addr);
+            println!("  \"target_name\": \"{}\",", target_name);
+            println!("  \"references\": [");
+            for (i, xref) in refs.iter().enumerate() {
+                let from_name = fmt
+                    .symbol_at(xref.from)
+                    .map(|s| demangle_or_original(&s.name))
+                    .unwrap_or_else(|| format!("sub_{:x}", xref.from));
+                let comma = if i < refs.len() - 1 { "," } else { "" };
+                println!("    {{");
+                println!("      \"from\": \"{:#x}\",", xref.from);
+                println!("      \"from_name\": \"{}\",", from_name);
+                println!("      \"type\": \"{:?}\"", xref.xref_type);
+                println!("    }}{}", comma);
+            }
+            println!("  ],");
+            println!("  \"count\": {}", refs.len());
+            println!("}}");
+        } else {
+            println!("Cross-references to {} ({:#x})", target_name, target_addr);
+            println!("{}", "=".repeat(50));
+            println!();
+
+            if refs.is_empty() {
+                println!("No references found.");
+            } else {
+                for xref in &refs {
+                    let from_name = fmt
+                        .symbol_at(xref.from)
+                        .map(|s| demangle_or_original(&s.name))
+                        .unwrap_or_else(|| format!("sub_{:x}", xref.from));
+                    let type_str = match xref.xref_type {
+                        XrefType::Call => "CALL",
+                        XrefType::Jump => "JUMP",
+                        XrefType::DataRead => "READ",
+                        XrefType::DataWrite => "WRITE",
+                        XrefType::Unknown => "???",
+                    };
+                    println!("{:#016x} {} from {}", xref.from, type_str, from_name);
+                }
+                println!();
+                println!("Total: {} references", refs.len());
+            }
+        }
+    } else {
+        // No target - show summary
+        if json {
+            println!("{{");
+            println!("  \"total_xrefs\": {},", db.total_xrefs());
+            println!("  \"referenced_addresses\": {}", db.all_referenced().count());
+            println!("}}");
+        } else {
+            println!("Cross-reference Database Summary");
+            println!("{}", "=".repeat(50));
+            println!();
+            println!("Total cross-references: {}", db.total_xrefs());
+            println!("Referenced addresses: {}", db.all_referenced().count());
+            println!();
+            println!("Use 'xrefs <address>' or 'xrefs <symbol>' to see references to a specific target.");
+        }
+    }
+
+    Ok(())
 }

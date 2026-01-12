@@ -98,7 +98,18 @@ impl CfgBuilder {
                         }
                     }
                     ControlFlow::UnconditionalBranch { target } => {
-                        if let Some(&target_id) = address_to_block.get(target) {
+                        // Check if this is an unresolved relocation (jump to next instruction)
+                        // In kernel modules, `jmp` with 0 offset (e9 00 00 00 00) is typically
+                        // a relocation placeholder for __x86_return_thunk
+                        let is_unresolved_reloc = *target == last_inst.end_address() &&
+                            last_inst.bytes.len() >= 5 &&
+                            last_inst.bytes[0] == 0xe9 &&
+                            last_inst.bytes[1..5] == [0, 0, 0, 0];
+
+                        if is_unresolved_reloc {
+                            // Treat as a return (likely __x86_return_thunk)
+                            BlockTerminator::Return
+                        } else if let Some(&target_id) = address_to_block.get(target) {
                             cfg.add_edge(block_id, target_id);
                             BlockTerminator::Jump { target: target_id }
                         } else {

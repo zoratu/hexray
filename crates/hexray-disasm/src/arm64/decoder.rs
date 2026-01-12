@@ -782,11 +782,14 @@ impl Arm64Disassembler {
 
         let scale = size;
         let offset = imm12 << scale;
-        let is_load = opc & 1 == 1;
+        // opc encoding: 00=store, 01=load, 10=ldrsw/prfm, 11=signed loads
+        // Only opc=00 is a store; all others are loads
+        let is_load = opc != 0b00;
         let is_signed = opc & 0b10 != 0;
 
         let access_size = 1u8 << size;
-        let is_64bit = size == 3 || (is_signed && size != 2);
+        // Signed loads (ldrsb, ldrsh, ldrsw) always produce 64-bit results in X registers
+        let is_64bit = size == 3 || is_signed;
 
         let (mnemonic, operation) = match (is_load, is_signed, size) {
             (true, false, 0) => ("ldrb", Operation::Load),
@@ -1413,17 +1416,621 @@ impl Arm64Disassembler {
         Ok(DecodedInstruction { instruction: inst, size: 4 })
     }
 
-    /// Decode SIMD/FP instructions (placeholder).
+    /// Decode SIMD/FP instructions.
     fn decode_simd_fp(
         &self,
         insn: u32,
         address: u64,
         bytes: Vec<u8>,
     ) -> Result<DecodedInstruction, DecodeError> {
-        // For now, just output the raw encoding
-        let inst = Instruction::new(address, 4, bytes, "simd/fp")
-            .with_operation(Operation::Other(0));
+        // ARM64 SIMD/FP encoding classification
+        // Bits 28-25 = 0111 or 1111 for SIMD/FP
+        let op0 = (insn >> 28) & 0xF;
+        let op1 = (insn >> 23) & 0x3;
+        let op2 = (insn >> 19) & 0xF;
+        let op3 = (insn >> 10) & 0x1FF;
+
+        // Bit 31 = Q (vector size: 0=64-bit, 1=128-bit)
+        let q = (insn >> 30) & 1;
+        // Bit 29 = U (unsigned)
+        let u = (insn >> 29) & 1;
+
+        // Check for various SIMD instruction groups
+        // SIMD three-same: op0=x111, op1=10
+        // SIMD three-different: op0=x111, op1=01/11
+        // SIMD two-reg misc: op0=x111, op1=00, bit 17=1
+        // Crypto: specific patterns
+
+        // First, try to identify crypto instructions (SHA, AES)
+        if self.is_crypto_insn(insn) {
+            return self.decode_crypto(insn, address, bytes);
+        }
+
+        // Scalar floating-point data processing: bits 28-24 = 11110
+        // This must be checked BEFORE SIMD checks as the bit patterns overlap
+        if (insn >> 24) & 0x1F == 0b11110 {
+            return self.decode_scalar_fp(insn, address, bytes);
+        }
+
+        // SIMD across lanes: bits 21-17 = 0x18, bits 10-6 = 0
+        if (insn >> 17) & 0x1F == 0x18 && (insn >> 10) & 0x1F == 0x0 {
+            return self.decode_simd_across_lanes(insn, address, bytes);
+        }
+
+        // SIMD three-same register: bits 28-24 = x1110, bit 21 = 1, bit 10 = 1
+        let bits_28_24 = (insn >> 24) & 0x1F;
+        if bits_28_24 & 0xF == 0xE && (insn >> 21) & 0x1 == 1 && (insn >> 10) & 0x1 == 1 {
+            return self.decode_simd_three_same(insn, address, bytes);
+        }
+
+        // SIMD two-reg misc: bits 21-17 = 0b10000
+        if (insn >> 17) & 0x1F == 0b10000 {
+            return self.decode_simd_two_reg_misc(insn, address, bytes);
+        }
+
+        // SIMD copy/duplicate
+        if (insn >> 29) & 0x3 == 0x0 && (insn >> 21) & 0xF == 0x0 {
+            return self.decode_simd_copy(insn, address, bytes);
+        }
+
+        // Fallback scalar FP (backup path)
+        if op0 & 0x4 == 0 {
+            return self.decode_scalar_fp(insn, address, bytes);
+        }
+
+        // Fallback: output generic SIMD/FP mnemonic
+        let mnemonic = self.identify_simd_mnemonic(insn);
+        let operands = self.decode_simd_operands(insn);
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Other(0))
+            .with_operands(operands);
         Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Check if instruction is a crypto instruction.
+    fn is_crypto_insn(&self, insn: u32) -> bool {
+        // AES: bits 31-24 = 01001110 00, bit 21-17 for operation
+        // SHA: bits 31-24 = 01011110 or similar patterns
+        let top8 = (insn >> 24) & 0xFF;
+        let op21_17 = (insn >> 17) & 0x1F;
+
+        // AES instructions: 0x4E28xxxx pattern
+        if top8 == 0x4E && (insn >> 12) & 0x3FF == 0b0010100001 {
+            return true;
+        }
+
+        // SHA instructions: 0x5E28xxxx or 0x5E00xxxx patterns
+        if (top8 == 0x5E || top8 == 0x0E) && ((insn >> 10) & 0x3F) < 8 {
+            let op = (insn >> 12) & 0x1F;
+            if op <= 7 {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Decode crypto instructions (AES, SHA).
+    fn decode_crypto(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let op = (insn >> 12) & 0x1F;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        // AES two-register
+        let (mnemonic, is_aes) = if (insn >> 24) & 0xFF == 0x4E {
+            match op {
+                0b00100 => ("aese", true),
+                0b00101 => ("aesd", true),
+                0b00110 => ("aesmc", true),
+                0b00111 => ("aesimc", true),
+                _ => ("aes_unknown", true),
+            }
+        } else {
+            // SHA instructions
+            match op {
+                0b00000 => ("sha1c", false),
+                0b00001 => ("sha1p", false),
+                0b00010 => ("sha1m", false),
+                0b00011 => ("sha1su0", false),
+                0b00100 => ("sha256h", false),
+                0b00101 => ("sha256h2", false),
+                0b00110 => ("sha256su1", false),
+                _ => ("sha_unknown", false),
+            }
+        };
+
+        let vd = self.vreg(rd, 128);
+        let vn = self.vreg(rn, 128);
+
+        let operands = if is_aes && (op == 0b00110 || op == 0b00111) {
+            // Single source for AESMC/AESIMC
+            vec![Operand::reg(vd), Operand::reg(vn)]
+        } else {
+            vec![Operand::reg(vd), Operand::reg(vn)]
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Other(0x100)) // Crypto ops
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode SIMD three-same register instructions.
+    fn decode_simd_three_same(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let q = (insn >> 30) & 1;
+        let u = (insn >> 29) & 1;
+        let size = (insn >> 22) & 0x3;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let opcode = (insn >> 11) & 0x1F;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let vec_bits = if q == 1 { 128 } else { 64 };
+        let elem_size = match size {
+            0 => "8b",
+            1 => "16b",
+            2 => if q == 1 { "4s" } else { "2s" },
+            3 => if q == 1 { "2d" } else { "1d" },
+            _ => "?",
+        };
+
+        let (mnemonic, operation) = match (u, opcode) {
+            // Integer operations
+            (0, 0b00000) => ("shadd", Operation::Add),
+            (0, 0b00001) => ("sqadd", Operation::Add),
+            (0, 0b00010) => ("srhadd", Operation::Add),
+            (0, 0b00100) => ("shsub", Operation::Sub),
+            (0, 0b00101) => ("sqsub", Operation::Sub),
+            (0, 0b00110) => ("cmgt", Operation::Compare),
+            (0, 0b00111) => ("cmge", Operation::Compare),
+            (0, 0b01000) => ("sshl", Operation::Shl),
+            (0, 0b01001) => ("sqshl", Operation::Shl),
+            (0, 0b01010) => ("srshl", Operation::Shr),
+            (0, 0b01011) => ("sqrshl", Operation::Shr),
+            (0, 0b01100) => ("smax", Operation::Other(0)),
+            (0, 0b01101) => ("smin", Operation::Other(0)),
+            (0, 0b01110) => ("sabd", Operation::Sub),
+            (0, 0b01111) => ("saba", Operation::Add),
+            (0, 0b10000) => ("add", Operation::Add),
+            (0, 0b10001) => ("cmtst", Operation::Test),
+            (0, 0b10010) => ("mla", Operation::Add),
+            (0, 0b10011) => ("mul", Operation::Mul),
+            (0, 0b10100) => ("smaxp", Operation::Other(0)),
+            (0, 0b10101) => ("sminp", Operation::Other(0)),
+            (0, 0b10110) => ("sqdmulh", Operation::Mul),
+            (0, 0b10111) => ("addp", Operation::Add),
+
+            // Floating-point (size=0/1 for S/D)
+            (0, 0b11000) if size >= 2 => ("fmaxnm", Operation::Other(0)),
+            (0, 0b11001) if size >= 2 => ("fmla", Operation::Add),
+            (0, 0b11010) if size >= 2 => ("fadd", Operation::Add),
+            (0, 0b11011) if size >= 2 => ("fmulx", Operation::Mul),
+            (0, 0b11100) if size >= 2 => ("fcmeq", Operation::Compare),
+            (0, 0b11110) if size >= 2 => ("fmax", Operation::Other(0)),
+            (0, 0b11111) if size >= 2 => ("frecps", Operation::Div),
+
+            // Unsigned integer operations
+            (1, 0b00000) => ("uhadd", Operation::Add),
+            (1, 0b00001) => ("uqadd", Operation::Add),
+            (1, 0b00010) => ("urhadd", Operation::Add),
+            (1, 0b00100) => ("uhsub", Operation::Sub),
+            (1, 0b00101) => ("uqsub", Operation::Sub),
+            (1, 0b00110) => ("cmhi", Operation::Compare),
+            (1, 0b00111) => ("cmhs", Operation::Compare),
+            (1, 0b01000) => ("ushl", Operation::Shl),
+            (1, 0b01001) => ("uqshl", Operation::Shl),
+            (1, 0b01010) => ("urshl", Operation::Shr),
+            (1, 0b01011) => ("uqrshl", Operation::Shr),
+            (1, 0b01100) => ("umax", Operation::Other(0)),
+            (1, 0b01101) => ("umin", Operation::Other(0)),
+            (1, 0b01110) => ("uabd", Operation::Sub),
+            (1, 0b01111) => ("uaba", Operation::Add),
+            (1, 0b10000) => ("sub", Operation::Sub),
+            (1, 0b10001) => ("cmeq", Operation::Compare),
+            (1, 0b10010) => ("mls", Operation::Sub),
+            (1, 0b10011) => ("pmul", Operation::Mul),
+            (1, 0b10100) => ("umaxp", Operation::Other(0)),
+            (1, 0b10101) => ("uminp", Operation::Other(0)),
+            (1, 0b10110) => ("sqrdmulh", Operation::Mul),
+
+            // Unsigned floating-point
+            (1, 0b11000) if size >= 2 => ("fminnm", Operation::Other(0)),
+            (1, 0b11001) if size >= 2 => ("fmls", Operation::Sub),
+            (1, 0b11010) if size >= 2 => ("fsub", Operation::Sub),
+            (1, 0b11100) if size >= 2 => ("fcmge", Operation::Compare),
+            (1, 0b11101) if size >= 2 => ("facge", Operation::Compare),
+            (1, 0b11110) if size >= 2 => ("fmin", Operation::Other(0)),
+            (1, 0b11111) if size >= 2 => ("frsqrts", Operation::Div),
+
+            // Bitwise
+            (0, 0b00011) if size == 0 => ("and", Operation::And),
+            (0, 0b00011) if size == 1 => ("bic", Operation::And),
+            (0, 0b00011) if size == 2 => ("orr", Operation::Or),
+            (0, 0b00011) if size == 3 => ("orn", Operation::Or),
+            (1, 0b00011) if size == 0 => ("eor", Operation::Xor),
+            (1, 0b00011) if size == 1 => ("bsl", Operation::Other(0)),
+            (1, 0b00011) if size == 2 => ("bit", Operation::Other(0)),
+            (1, 0b00011) if size == 3 => ("bif", Operation::Other(0)),
+
+            _ => ("simd_3same", Operation::Other(0)),
+        };
+
+        let vd = self.vreg(rd, vec_bits);
+        let vn = self.vreg(rn, vec_bits);
+        let vm = self.vreg(rm, vec_bits);
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_operands(vec![Operand::reg(vd), Operand::reg(vn), Operand::reg(vm)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode SIMD two-register misc instructions.
+    fn decode_simd_two_reg_misc(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let q = (insn >> 30) & 1;
+        let u = (insn >> 29) & 1;
+        let size = (insn >> 22) & 0x3;
+        let opcode = (insn >> 12) & 0x1F;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let vec_bits = if q == 1 { 128 } else { 64 };
+
+        let mnemonic = match (u, opcode) {
+            (0, 0b00000) => "rev64",
+            (0, 0b00001) => "rev16",
+            (0, 0b00010) => "saddlp",
+            (0, 0b00011) => "suqadd",
+            (0, 0b00100) => "cls",
+            (0, 0b00101) => "cnt",
+            (0, 0b00110) => "sadalp",
+            (0, 0b00111) => "sqabs",
+            (0, 0b01000) => "cmgt",  // compare vs zero
+            (0, 0b01001) => "cmeq",
+            (0, 0b01010) => "cmlt",
+            (0, 0b01011) => "abs",
+            (0, 0b10010) => "xtn",
+            (0, 0b10100) => "sqxtn",
+            (0, 0b10110) if size >= 2 => "fcvtn",
+            (0, 0b10111) if size >= 2 => "fcvtl",
+            (0, 0b11000) if size >= 2 => "frintn",
+            (0, 0b11001) if size >= 2 => "frintm",
+            (0, 0b11010) if size >= 2 => "fcvtns",
+            (0, 0b11011) if size >= 2 => "fcvtms",
+            (0, 0b11100) if size >= 2 => "fcvtas",
+            (0, 0b11101) if size >= 2 => "scvtf",
+            (0, 0b11110) if size >= 2 => "fcmgt",  // vs zero
+            (0, 0b11111) if size >= 2 => "fcmeq",  // vs zero
+
+            (1, 0b00000) => "rev32",
+            (1, 0b00010) => "uaddlp",
+            (1, 0b00011) => "usqadd",
+            (1, 0b00100) => "clz",
+            (1, 0b00101) => "not",
+            (1, 0b00110) => "uadalp",
+            (1, 0b00111) => "sqneg",
+            (1, 0b01000) => "cmge",  // vs zero
+            (1, 0b01001) => "cmle",  // vs zero
+            (1, 0b01011) => "neg",
+            (1, 0b10010) => "sqxtun",
+            (1, 0b10011) => "shll",
+            (1, 0b10100) => "uqxtn",
+            (1, 0b10110) if size >= 2 => "fcvtxn",
+            (1, 0b11000) if size >= 2 => "frinta",
+            (1, 0b11001) if size >= 2 => "frintx",
+            (1, 0b11010) if size >= 2 => "fcvtnu",
+            (1, 0b11011) if size >= 2 => "fcvtmu",
+            (1, 0b11100) if size >= 2 => "fcvtau",
+            (1, 0b11101) if size >= 2 => "ucvtf",
+            (1, 0b11110) if size >= 2 => "fcmlt",  // vs zero
+            (1, 0b11111) if size >= 2 => "fcmle",  // vs zero
+
+            _ => "simd_2reg",
+        };
+
+        let vd = self.vreg(rd, vec_bits);
+        let vn = self.vreg(rn, vec_bits);
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Other(0))
+            .with_operands(vec![Operand::reg(vd), Operand::reg(vn)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode SIMD across lanes instructions.
+    fn decode_simd_across_lanes(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let q = (insn >> 30) & 1;
+        let u = (insn >> 29) & 1;
+        let size = (insn >> 22) & 0x3;
+        let opcode = (insn >> 12) & 0x1F;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let mnemonic = match (u, opcode) {
+            (0, 0b00011) => "saddlv",
+            (0, 0b01010) => "smaxv",
+            (0, 0b11010) => "sminv",
+            (0, 0b11011) => "addv",
+            (1, 0b00011) => "uaddlv",
+            (1, 0b01010) => "umaxv",
+            (1, 0b11010) => "uminv",
+            (1, 0b01100) if size >= 2 => "fmaxnmv",
+            (1, 0b01101) if size >= 2 => "fmaxv",
+            (1, 0b01110) if size >= 2 => "fminnmv",
+            (1, 0b01111) if size >= 2 => "fminv",
+            _ => "simd_across",
+        };
+
+        let vec_bits = if q == 1 { 128 } else { 64 };
+        let scalar_bits = 8 << size;
+
+        let vd = self.vreg(rd, scalar_bits as u16);
+        let vn = self.vreg(rn, vec_bits);
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Other(0))
+            .with_operands(vec![Operand::reg(vd), Operand::reg(vn)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode SIMD copy/duplicate instructions.
+    fn decode_simd_copy(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let q = (insn >> 30) & 1;
+        let op = (insn >> 29) & 1;
+        let imm5 = (insn >> 16) & 0x1F;
+        let imm4 = (insn >> 11) & 0xF;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let vec_bits = if q == 1 { 128 } else { 64 };
+
+        let (mnemonic, operands) = if op == 0 {
+            // DUP, SMOV, UMOV
+            if imm4 == 0 {
+                // DUP (element)
+                let vd = self.vreg(rd, vec_bits);
+                let vn = self.vreg(rn, 128);
+                ("dup", vec![Operand::reg(vd), Operand::reg(vn)])
+            } else if imm4 == 1 {
+                // DUP (general)
+                let vd = self.vreg(rd, vec_bits);
+                let gpr = Self::xreg(rn);
+                ("dup", vec![Operand::reg(vd), Operand::reg(gpr)])
+            } else if imm4 == 5 {
+                // SMOV
+                let gpr = if q == 1 { Self::xreg(rd) } else { Self::wreg(rd) };
+                let vn = self.vreg(rn, 128);
+                ("smov", vec![Operand::reg(gpr), Operand::reg(vn)])
+            } else if imm4 == 7 {
+                // UMOV
+                let gpr = if q == 1 { Self::xreg(rd) } else { Self::wreg(rd) };
+                let vn = self.vreg(rn, 128);
+                ("umov", vec![Operand::reg(gpr), Operand::reg(vn)])
+            } else {
+                let vd = self.vreg(rd, vec_bits);
+                ("simd_copy", vec![Operand::reg(vd)])
+            }
+        } else {
+            // INS (element from element or general)
+            let vd = self.vreg(rd, 128);
+            let vn = self.vreg(rn, 128);
+            ("ins", vec![Operand::reg(vd), Operand::reg(vn)])
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::Move)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode scalar floating-point instructions.
+    fn decode_scalar_fp(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let m = (insn >> 31) & 1;
+        let s = (insn >> 29) & 1;
+        let ptype = (insn >> 22) & 0x3;
+        let opcode = (insn >> 15) & 0x3F;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let fp_size = match ptype {
+            0 => 32,  // Single
+            1 => 64,  // Double
+            3 => 16,  // Half
+            _ => 32,
+        };
+
+        // Scalar FP data-processing (2-source): bit 21=1, bits 11-10=10
+        if (insn >> 21) & 0x1 == 1 && (insn >> 10) & 0x3 == 0b10 {
+            let rm = ((insn >> 16) & 0x1F) as u16;
+            let op = (insn >> 12) & 0xF;
+
+            let mnemonic = match op {
+                0b0000 => "fmul",
+                0b0001 => "fdiv",
+                0b0010 => "fadd",
+                0b0011 => "fsub",
+                0b0100 => "fmax",
+                0b0101 => "fmin",
+                0b0110 => "fmaxnm",
+                0b0111 => "fminnm",
+                0b1000 => "fnmul",
+                _ => "fp_2src",
+            };
+
+            let fd = self.fpreg(rd, fp_size);
+            let fn_ = self.fpreg(rn, fp_size);
+            let fm = self.fpreg(rm, fp_size);
+
+            let operation = match op {
+                0b0000 | 0b1000 => Operation::Mul,
+                0b0001 => Operation::Div,
+                0b0010 => Operation::Add,
+                0b0011 => Operation::Sub,
+                _ => Operation::Other(0),
+            };
+
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(operation)
+                .with_operands(vec![Operand::reg(fd), Operand::reg(fn_), Operand::reg(fm)]);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+        }
+
+        // Scalar FP data-processing (1-source): bit 21=1, bits 15-10=010000
+        if (insn >> 21) & 0x1 == 1 && (insn >> 10) & 0x3F == 0b010000 {
+            let op = (insn >> 15) & 0x3F;
+
+            let mnemonic = match op {
+                0b000000 => "fmov",
+                0b000001 => "fabs",
+                0b000010 => "fneg",
+                0b000011 => "fsqrt",
+                0b000101 => "fcvt",  // to double
+                0b000100 => "fcvt",  // to single
+                0b001000 => "frintn",
+                0b001001 => "frintp",
+                0b001010 => "frintm",
+                0b001011 => "frintz",
+                0b001100 => "frinta",
+                0b001110 => "frintx",
+                0b001111 => "frinti",
+                _ => "fp_1src",
+            };
+
+            let fd = self.fpreg(rd, fp_size);
+            let fn_ = self.fpreg(rn, fp_size);
+
+            let operation = match op {
+                0b000000 => Operation::Move,
+                0b000010 => Operation::Neg,
+                _ => Operation::Other(0),
+            };
+
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(operation)
+                .with_operands(vec![Operand::reg(fd), Operand::reg(fn_)]);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+        }
+
+        // Scalar FP compare
+        if (insn >> 21) & 0xF == 0x0 && (insn >> 14) & 0x3 == 0x2 {
+            let rm = ((insn >> 16) & 0x1F) as u16;
+            let op = (insn >> 3) & 0x3;
+
+            let mnemonic = match op {
+                0b00 => "fcmp",
+                0b01 => "fcmpe",
+                0b10 => "fcmp",  // vs zero
+                0b11 => "fcmpe", // vs zero
+                _ => "fcmp",
+            };
+
+            let fn_ = self.fpreg(rn, fp_size);
+            let operands = if op >= 2 {
+                vec![Operand::reg(fn_), Operand::imm(0, 8)]
+            } else {
+                let fm = self.fpreg(rm, fp_size);
+                vec![Operand::reg(fn_), Operand::reg(fm)]
+            };
+
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(Operation::Compare)
+                .with_operands(operands);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+        }
+
+        // Fallback
+        let fd = self.fpreg(rd, fp_size);
+        let inst = Instruction::new(address, 4, bytes, "fp_scalar")
+            .with_operation(Operation::Other(0))
+            .with_operands(vec![Operand::reg(fd)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Create a NEON vector register.
+    fn vreg(&self, id: u16, bits: u16) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::Vector,
+            arm64::V0 + id,
+            bits,
+        )
+    }
+
+    /// Create a floating-point register.
+    fn fpreg(&self, id: u16, bits: u16) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::FloatingPoint,
+            arm64::V0 + id,
+            bits,
+        )
+    }
+
+    /// Try to identify SIMD mnemonic from instruction bits.
+    fn identify_simd_mnemonic(&self, insn: u32) -> &'static str {
+        let u = (insn >> 29) & 1;
+        let opcode = (insn >> 11) & 0x1F;
+
+        // Very simplified fallback
+        match (u, opcode & 0xF) {
+            (0, 0) => "simd_add",
+            (1, 0) => "simd_sub",
+            (_, 3) => "simd_mul",
+            _ => "simd",
+        }
+    }
+
+    /// Decode basic SIMD operands.
+    fn decode_simd_operands(&self, insn: u32) -> Vec<Operand> {
+        let q = (insn >> 30) & 1;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rd = (insn & 0x1F) as u16;
+
+        let vec_bits = if q == 1 { 128 } else { 64 };
+        let vd = self.vreg(rd, vec_bits);
+        let vn = self.vreg(rn, vec_bits);
+
+        vec![Operand::reg(vd), Operand::reg(vn)]
     }
 
     /// Decode unknown instruction.
@@ -1512,24 +2119,34 @@ fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
         return 0; // Invalid encoding
     }
 
-    let size = 1u64 << (len + 1);
-    let s = (imms & ((1 << (len + 1)) - 1)) as u64;
-    let r = (immr & ((1 << (len + 1)) - 1)) as u64;
+    // Element size: when len=6, size=64 (not 128); element size is capped at 64
+    let size = if len >= 6 { 64u64 } else { 1u64 << (len + 1) };
+    let mask = if len >= 6 { 0x3Fu64 } else { (1u64 << (len + 1)) - 1 };
+    let s = (imms as u64) & mask;
+    let r = (immr as u64) & mask;
 
-    // Create base pattern
-    let ones = (1u64 << (s + 1)) - 1;
-    // Rotate right by r
+    // Create base pattern: s+1 ones
+    let ones = if s + 1 >= 64 { !0u64 } else { (1u64 << (s + 1)) - 1 };
+
+    // Rotate right by r within element size
     let rotated = if r == 0 {
         ones
+    } else if size == 64 {
+        // Use built-in rotate for 64-bit elements to avoid overflow
+        ones.rotate_right(r as u32)
     } else {
-        (ones >> r) | (ones << (size - r))
+        // For smaller elements, rotate within element size
+        let r = r % size;
+        ((ones >> r) | (ones << (size - r))) & ((1u64 << size) - 1)
     };
-    let pattern = rotated & ((1u64 << size) - 1);
 
-    // Replicate pattern
+    // Mask to element size
+    let pattern = if size >= 64 { rotated } else { rotated & ((1u64 << size) - 1) };
+
+    // Replicate pattern across register
     let mut result = 0u64;
-    let mut pos = 0;
-    let reg_size = if is_64bit { 64 } else { 32 };
+    let mut pos = 0u64;
+    let reg_size = if is_64bit { 64u64 } else { 32u64 };
     while pos < reg_size {
         result |= pattern << pos;
         pos += size;
@@ -1583,5 +2200,45 @@ mod tests {
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "bl");
         assert!(result.instruction.is_call());
+    }
+
+    #[test]
+    fn test_fadd_scalar() {
+        let disasm = Arm64Disassembler::new();
+        // FADD D0, D1, D2: 0x1E622820
+        let bytes = [0x20, 0x28, 0x62, 0x1E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fadd");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmul_scalar() {
+        let disasm = Arm64Disassembler::new();
+        // FMUL D0, D1, D2: 0x1E620820
+        let bytes = [0x20, 0x08, 0x62, 0x1E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmul");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_add_simd_vector() {
+        let disasm = Arm64Disassembler::new();
+        // ADD V0.4S, V1.4S, V2.4S: 0x4EA28420
+        let bytes = [0x20, 0x84, 0xA2, 0x4E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "add");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmov_scalar() {
+        let disasm = Arm64Disassembler::new();
+        // FMOV D0, D1: 0x1E604020
+        let bytes = [0x20, 0x40, 0x60, 0x1E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmov");
+        assert_eq!(result.size, 4);
     }
 }

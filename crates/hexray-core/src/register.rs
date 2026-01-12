@@ -100,6 +100,42 @@ pub mod x86 {
     pub const FS: u16 = 35;
     pub const GS: u16 = 36;
     pub const SS: u16 = 37;
+
+    // XMM registers (128-bit, SSE)
+    pub const XMM0: u16 = 64;
+    pub const XMM1: u16 = 65;
+    pub const XMM2: u16 = 66;
+    pub const XMM3: u16 = 67;
+    pub const XMM4: u16 = 68;
+    pub const XMM5: u16 = 69;
+    pub const XMM6: u16 = 70;
+    pub const XMM7: u16 = 71;
+    pub const XMM8: u16 = 72;
+    pub const XMM9: u16 = 73;
+    pub const XMM10: u16 = 74;
+    pub const XMM11: u16 = 75;
+    pub const XMM12: u16 = 76;
+    pub const XMM13: u16 = 77;
+    pub const XMM14: u16 = 78;
+    pub const XMM15: u16 = 79;
+
+    // YMM registers (256-bit, AVX) - same IDs as XMM but different size
+    pub const YMM0: u16 = 64;
+    pub const YMM1: u16 = 65;
+    pub const YMM2: u16 = 66;
+    pub const YMM3: u16 = 67;
+    pub const YMM4: u16 = 68;
+    pub const YMM5: u16 = 69;
+    pub const YMM6: u16 = 70;
+    pub const YMM7: u16 = 71;
+    pub const YMM8: u16 = 72;
+    pub const YMM9: u16 = 73;
+    pub const YMM10: u16 = 74;
+    pub const YMM11: u16 = 75;
+    pub const YMM12: u16 = 76;
+    pub const YMM13: u16 = 77;
+    pub const YMM14: u16 = 78;
+    pub const YMM15: u16 = 79;
 }
 
 fn x86_reg_name(id: u16, size: u16) -> &'static str {
@@ -170,6 +206,42 @@ fn x86_reg_name(id: u16, size: u16) -> &'static str {
         (x86::GS, _) => "gs",
         (x86::SS, _) => "ss",
 
+        // XMM registers (128-bit)
+        (x86::XMM0, 128) => "xmm0",
+        (x86::XMM1, 128) => "xmm1",
+        (x86::XMM2, 128) => "xmm2",
+        (x86::XMM3, 128) => "xmm3",
+        (x86::XMM4, 128) => "xmm4",
+        (x86::XMM5, 128) => "xmm5",
+        (x86::XMM6, 128) => "xmm6",
+        (x86::XMM7, 128) => "xmm7",
+        (x86::XMM8, 128) => "xmm8",
+        (x86::XMM9, 128) => "xmm9",
+        (x86::XMM10, 128) => "xmm10",
+        (x86::XMM11, 128) => "xmm11",
+        (x86::XMM12, 128) => "xmm12",
+        (x86::XMM13, 128) => "xmm13",
+        (x86::XMM14, 128) => "xmm14",
+        (x86::XMM15, 128) => "xmm15",
+
+        // YMM registers (256-bit)
+        (x86::YMM0, 256) => "ymm0",
+        (x86::YMM1, 256) => "ymm1",
+        (x86::YMM2, 256) => "ymm2",
+        (x86::YMM3, 256) => "ymm3",
+        (x86::YMM4, 256) => "ymm4",
+        (x86::YMM5, 256) => "ymm5",
+        (x86::YMM6, 256) => "ymm6",
+        (x86::YMM7, 256) => "ymm7",
+        (x86::YMM8, 256) => "ymm8",
+        (x86::YMM9, 256) => "ymm9",
+        (x86::YMM10, 256) => "ymm10",
+        (x86::YMM11, 256) => "ymm11",
+        (x86::YMM12, 256) => "ymm12",
+        (x86::YMM13, 256) => "ymm13",
+        (x86::YMM14, 256) => "ymm14",
+        (x86::YMM15, 256) => "ymm15",
+
         _ => "unknown",
     }
 }
@@ -187,6 +259,41 @@ pub mod arm64 {
     pub const SP: u16 = 31;  // Stack pointer
     pub const XZR: u16 = 32; // Zero register (reads as 0, writes discarded)
     pub const PC: u16 = 33;  // Program counter
+
+    // SIMD/FP vector registers V0-V31
+    // These can be accessed as B/H/S/D/Q (8/16/32/64/128 bit) or V (128-bit vector)
+    pub const V0: u16 = 64;
+    pub const V1: u16 = 65;
+    pub const V2: u16 = 66;
+    pub const V3: u16 = 67;
+    pub const V4: u16 = 68;
+    pub const V5: u16 = 69;
+    pub const V6: u16 = 70;
+    pub const V7: u16 = 71;
+    pub const V8: u16 = 72;
+    pub const V9: u16 = 73;
+    pub const V10: u16 = 74;
+    pub const V11: u16 = 75;
+    pub const V12: u16 = 76;
+    pub const V13: u16 = 77;
+    pub const V14: u16 = 78;
+    pub const V15: u16 = 79;
+    pub const V16: u16 = 80;
+    pub const V17: u16 = 81;
+    pub const V18: u16 = 82;
+    pub const V19: u16 = 83;
+    pub const V20: u16 = 84;
+    pub const V21: u16 = 85;
+    pub const V22: u16 = 86;
+    pub const V23: u16 = 87;
+    pub const V24: u16 = 88;
+    pub const V25: u16 = 89;
+    pub const V26: u16 = 90;
+    pub const V27: u16 = 91;
+    pub const V28: u16 = 92;
+    pub const V29: u16 = 93;
+    pub const V30: u16 = 94;
+    pub const V31: u16 = 95;
 }
 
 fn arm64_reg_name(id: u16, size: u16) -> &'static str {
@@ -261,6 +368,176 @@ fn arm64_reg_name(id: u16, size: u16) -> &'static str {
         (30, 32) => "w30",
         (arm64::SP, 32) => "wsp",
         (arm64::XZR, 32) => "wzr",
+
+        // 128-bit V registers (SIMD)
+        (arm64::V0, 128) => "v0",
+        (arm64::V1, 128) => "v1",
+        (arm64::V2, 128) => "v2",
+        (arm64::V3, 128) => "v3",
+        (arm64::V4, 128) => "v4",
+        (arm64::V5, 128) => "v5",
+        (arm64::V6, 128) => "v6",
+        (arm64::V7, 128) => "v7",
+        (arm64::V8, 128) => "v8",
+        (arm64::V9, 128) => "v9",
+        (arm64::V10, 128) => "v10",
+        (arm64::V11, 128) => "v11",
+        (arm64::V12, 128) => "v12",
+        (arm64::V13, 128) => "v13",
+        (arm64::V14, 128) => "v14",
+        (arm64::V15, 128) => "v15",
+        (arm64::V16, 128) => "v16",
+        (arm64::V17, 128) => "v17",
+        (arm64::V18, 128) => "v18",
+        (arm64::V19, 128) => "v19",
+        (arm64::V20, 128) => "v20",
+        (arm64::V21, 128) => "v21",
+        (arm64::V22, 128) => "v22",
+        (arm64::V23, 128) => "v23",
+        (arm64::V24, 128) => "v24",
+        (arm64::V25, 128) => "v25",
+        (arm64::V26, 128) => "v26",
+        (arm64::V27, 128) => "v27",
+        (arm64::V28, 128) => "v28",
+        (arm64::V29, 128) => "v29",
+        (arm64::V30, 128) => "v30",
+        (arm64::V31, 128) => "v31",
+
+        // 64-bit D registers (FP/lower half of V)
+        (arm64::V0, 64) => "d0",
+        (arm64::V1, 64) => "d1",
+        (arm64::V2, 64) => "d2",
+        (arm64::V3, 64) => "d3",
+        (arm64::V4, 64) => "d4",
+        (arm64::V5, 64) => "d5",
+        (arm64::V6, 64) => "d6",
+        (arm64::V7, 64) => "d7",
+        (arm64::V8, 64) => "d8",
+        (arm64::V9, 64) => "d9",
+        (arm64::V10, 64) => "d10",
+        (arm64::V11, 64) => "d11",
+        (arm64::V12, 64) => "d12",
+        (arm64::V13, 64) => "d13",
+        (arm64::V14, 64) => "d14",
+        (arm64::V15, 64) => "d15",
+        (arm64::V16, 64) => "d16",
+        (arm64::V17, 64) => "d17",
+        (arm64::V18, 64) => "d18",
+        (arm64::V19, 64) => "d19",
+        (arm64::V20, 64) => "d20",
+        (arm64::V21, 64) => "d21",
+        (arm64::V22, 64) => "d22",
+        (arm64::V23, 64) => "d23",
+        (arm64::V24, 64) => "d24",
+        (arm64::V25, 64) => "d25",
+        (arm64::V26, 64) => "d26",
+        (arm64::V27, 64) => "d27",
+        (arm64::V28, 64) => "d28",
+        (arm64::V29, 64) => "d29",
+        (arm64::V30, 64) => "d30",
+        (arm64::V31, 64) => "d31",
+
+        // 32-bit S registers (FP single)
+        (arm64::V0, 32) => "s0",
+        (arm64::V1, 32) => "s1",
+        (arm64::V2, 32) => "s2",
+        (arm64::V3, 32) => "s3",
+        (arm64::V4, 32) => "s4",
+        (arm64::V5, 32) => "s5",
+        (arm64::V6, 32) => "s6",
+        (arm64::V7, 32) => "s7",
+        (arm64::V8, 32) => "s8",
+        (arm64::V9, 32) => "s9",
+        (arm64::V10, 32) => "s10",
+        (arm64::V11, 32) => "s11",
+        (arm64::V12, 32) => "s12",
+        (arm64::V13, 32) => "s13",
+        (arm64::V14, 32) => "s14",
+        (arm64::V15, 32) => "s15",
+        (arm64::V16, 32) => "s16",
+        (arm64::V17, 32) => "s17",
+        (arm64::V18, 32) => "s18",
+        (arm64::V19, 32) => "s19",
+        (arm64::V20, 32) => "s20",
+        (arm64::V21, 32) => "s21",
+        (arm64::V22, 32) => "s22",
+        (arm64::V23, 32) => "s23",
+        (arm64::V24, 32) => "s24",
+        (arm64::V25, 32) => "s25",
+        (arm64::V26, 32) => "s26",
+        (arm64::V27, 32) => "s27",
+        (arm64::V28, 32) => "s28",
+        (arm64::V29, 32) => "s29",
+        (arm64::V30, 32) => "s30",
+        (arm64::V31, 32) => "s31",
+
+        // 16-bit H registers (FP half)
+        (arm64::V0, 16) => "h0",
+        (arm64::V1, 16) => "h1",
+        (arm64::V2, 16) => "h2",
+        (arm64::V3, 16) => "h3",
+        (arm64::V4, 16) => "h4",
+        (arm64::V5, 16) => "h5",
+        (arm64::V6, 16) => "h6",
+        (arm64::V7, 16) => "h7",
+        (arm64::V8, 16) => "h8",
+        (arm64::V9, 16) => "h9",
+        (arm64::V10, 16) => "h10",
+        (arm64::V11, 16) => "h11",
+        (arm64::V12, 16) => "h12",
+        (arm64::V13, 16) => "h13",
+        (arm64::V14, 16) => "h14",
+        (arm64::V15, 16) => "h15",
+        (arm64::V16, 16) => "h16",
+        (arm64::V17, 16) => "h17",
+        (arm64::V18, 16) => "h18",
+        (arm64::V19, 16) => "h19",
+        (arm64::V20, 16) => "h20",
+        (arm64::V21, 16) => "h21",
+        (arm64::V22, 16) => "h22",
+        (arm64::V23, 16) => "h23",
+        (arm64::V24, 16) => "h24",
+        (arm64::V25, 16) => "h25",
+        (arm64::V26, 16) => "h26",
+        (arm64::V27, 16) => "h27",
+        (arm64::V28, 16) => "h28",
+        (arm64::V29, 16) => "h29",
+        (arm64::V30, 16) => "h30",
+        (arm64::V31, 16) => "h31",
+
+        // 8-bit B registers (byte)
+        (arm64::V0, 8) => "b0",
+        (arm64::V1, 8) => "b1",
+        (arm64::V2, 8) => "b2",
+        (arm64::V3, 8) => "b3",
+        (arm64::V4, 8) => "b4",
+        (arm64::V5, 8) => "b5",
+        (arm64::V6, 8) => "b6",
+        (arm64::V7, 8) => "b7",
+        (arm64::V8, 8) => "b8",
+        (arm64::V9, 8) => "b9",
+        (arm64::V10, 8) => "b10",
+        (arm64::V11, 8) => "b11",
+        (arm64::V12, 8) => "b12",
+        (arm64::V13, 8) => "b13",
+        (arm64::V14, 8) => "b14",
+        (arm64::V15, 8) => "b15",
+        (arm64::V16, 8) => "b16",
+        (arm64::V17, 8) => "b17",
+        (arm64::V18, 8) => "b18",
+        (arm64::V19, 8) => "b19",
+        (arm64::V20, 8) => "b20",
+        (arm64::V21, 8) => "b21",
+        (arm64::V22, 8) => "b22",
+        (arm64::V23, 8) => "b23",
+        (arm64::V24, 8) => "b24",
+        (arm64::V25, 8) => "b25",
+        (arm64::V26, 8) => "b26",
+        (arm64::V27, 8) => "b27",
+        (arm64::V28, 8) => "b28",
+        (arm64::V29, 8) => "b29",
+        (arm64::V30, 8) => "b30",
+        (arm64::V31, 8) => "b31",
 
         _ => "unknown",
     }
