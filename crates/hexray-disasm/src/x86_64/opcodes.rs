@@ -35,7 +35,7 @@ pub enum OperandEncoding {
 }
 
 /// Opcode table entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct OpcodeEntry {
     /// Mnemonic
     pub mnemonic: &'static str,

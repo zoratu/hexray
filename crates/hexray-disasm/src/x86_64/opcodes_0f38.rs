@@ -12,7 +12,7 @@ use hexray_core::Operation;
 /// Opcode table for 0F 38 escape (VEX.mmmmm = 2).
 /// Indexed by the opcode byte following 0F 38.
 pub static OPCODE_TABLE_0F38: [Option<OpcodeEntry>; 256] = {
-    let mut table: [Option<OpcodeEntry>; 256] = [const { None }; 256];
+    let mut table: [Option<OpcodeEntry>; 256] = [None; 256];
 
     // SSSE3/SSE4 style instructions (also VEX-encoded)
 

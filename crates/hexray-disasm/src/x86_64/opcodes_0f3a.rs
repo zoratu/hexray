@@ -13,7 +13,7 @@ use hexray_core::Operation;
 /// Indexed by the opcode byte following 0F 3A.
 /// These instructions take an immediate byte operand.
 pub static OPCODE_TABLE_0F3A: [Option<OpcodeEntry>; 256] = {
-    let mut table: [Option<OpcodeEntry>; 256] = [const { None }; 256];
+    let mut table: [Option<OpcodeEntry>; 256] = [None; 256];
 
     // SSE4.1 instructions with immediate
 
