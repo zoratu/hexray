@@ -1341,6 +1341,8 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
             let call_targets = extract_internal_call_targets(&instructions, fmt);
             for (target_addr, target_name) in call_targets {
                 if !decompiled.contains(&target_addr) {
+                    eprintln!("DEBUG: Adding target {:#x} ({}) from {} at depth {}",
+                        target_addr, target_name, func_name, depth + 1);
                     // Check for special patterns like __libc_start_main
                     // which passes main as first argument
                     let actual_name = if func_name == "__libc_start_main" || func_name.contains("libc_start_main") {
