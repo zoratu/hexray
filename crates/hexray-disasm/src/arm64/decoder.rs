@@ -8,14 +8,22 @@ use hexray_core::{
     Register, RegisterClass,
     register::arm64,
 };
+use super::sme::SmeDecoder;
+use super::sve::SveDecoder;
 
 /// ARM64 disassembler.
-pub struct Arm64Disassembler;
+pub struct Arm64Disassembler {
+    sve_decoder: SveDecoder,
+    sme_decoder: SmeDecoder,
+}
 
 impl Arm64Disassembler {
     /// Creates a new ARM64 disassembler.
     pub fn new() -> Self {
-        Self
+        Self {
+            sve_decoder: SveDecoder::new(),
+            sme_decoder: SmeDecoder::new(),
+        }
     }
 
     /// Creates an ARM64 general-purpose register with SP interpretation for register 31.
@@ -65,6 +73,76 @@ impl Arm64Disassembler {
         Self::gpr_sp(id, false)
     }
 
+    /// Creates a B register (8-bit SIMD/FP scalar).
+    #[allow(dead_code)]
+    fn breg(id: u16) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::FloatingPoint,
+            hexray_core::register::arm64::V0 + id,
+            8,
+        )
+    }
+
+    /// Creates an H register (16-bit SIMD/FP scalar).
+    #[allow(dead_code)]
+    fn hreg(id: u16) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::FloatingPoint,
+            hexray_core::register::arm64::V0 + id,
+            16,
+        )
+    }
+
+    /// Creates an S register (32-bit SIMD/FP scalar).
+    fn sreg(id: u16) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::FloatingPoint,
+            hexray_core::register::arm64::V0 + id,
+            32,
+        )
+    }
+
+    /// Creates a D register (64-bit SIMD/FP scalar).
+    fn dreg(id: u16) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::FloatingPoint,
+            hexray_core::register::arm64::V0 + id,
+            64,
+        )
+    }
+
+    /// Creates a Q register (128-bit SIMD/FP vector).
+    fn qreg(id: u16) -> Register {
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::Vector,
+            hexray_core::register::arm64::V0 + id,
+            128,
+        )
+    }
+
+    /// Creates a SIMD/FP register based on size encoding.
+    /// size: 0=B(8), 1=H(16), 2=S(32), 3=D(64), 4=Q(128)
+    fn simd_reg(id: u16, size: u32) -> Register {
+        let (class, bits) = match size {
+            0 => (RegisterClass::FloatingPoint, 8),
+            1 => (RegisterClass::FloatingPoint, 16),
+            2 => (RegisterClass::FloatingPoint, 32),
+            3 => (RegisterClass::FloatingPoint, 64),
+            _ => (RegisterClass::Vector, 128),
+        };
+        Register::new(
+            Architecture::Arm64,
+            class,
+            hexray_core::register::arm64::V0 + id,
+            bits,
+        )
+    }
+
     /// Decode the instruction at the given address.
     fn decode(&self, bytes: &[u8], address: u64) -> Result<DecodedInstruction, DecodeError> {
         if bytes.len() < 4 {
@@ -74,6 +152,22 @@ impl Arm64Disassembler {
         // ARM64 instructions are little-endian 32-bit
         let insn = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let raw_bytes = bytes[0..4].to_vec();
+
+        // Check for SME instructions first (they have distinctive bit patterns)
+        if SmeDecoder::is_sme_instruction(insn) {
+            if let Some(decoded) = self.sme_decoder.decode(insn, address, raw_bytes.clone()) {
+                return Ok(decoded);
+            }
+            // Fall through to SVE/standard decode if SME decoder can't handle it
+        }
+
+        // Check for SVE/SVE2 instructions (they have distinctive bit patterns)
+        if SveDecoder::is_sve_instruction(insn) {
+            if let Some(decoded) = self.sve_decoder.decode(insn, address, raw_bytes.clone()) {
+                return Ok(decoded);
+            }
+            // Fall through to standard decode if SVE decoder can't handle it
+        }
 
         // Extract op0 (bits 25-28) for major classification
         let op0 = (insn >> 25) & 0xF;
@@ -669,6 +763,14 @@ impl Arm64Disassembler {
 
         // Load/store register variants (bits 29-27 = 111)
         if op_29_27 == 0b111 {
+            // Atomic memory operations (ARMv8.1): bits 25-24 = 00, bit 21 = 1, V=0
+            // Must check BEFORE unscaled/pre/post-indexed as they have the same bits 25-24
+            // Pattern: size[31:30]=xx, 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
+            // V=0 distinguishes from SIMD/FP register offset loads which have V=1
+            if (op_25_23 >> 1) == 0b00 && op_21 == 1 && v == 0 {
+                return self.decode_atomic_memory(insn, address, bytes);
+            }
+
             // Unsigned offset: bits 25-24 = 01
             if (op_25_23 >> 1) == 0b01 {
                 return self.decode_ldst_unsigned_imm(insn, address, bytes);
@@ -688,11 +790,25 @@ impl Arm64Disassembler {
         }
 
         // Load literal (bits 29-27 = 011)
-        if op_29_27 == 0b011 && v == 0 {
+        // Handles both GPR (v=0) and SIMD/FP (v=1) literal loads
+        if op_29_27 == 0b011 {
             return self.decode_ldr_literal(insn, address, bytes);
         }
 
-        // Load/store exclusive, etc. - fall through to unknown for now
+        // Load/store exclusive: bits 31-24 = xx001000
+        // Pattern: size[31:30]=xx, 001000, o2, L, o1, Rs, o0, Rt2, Rn, Rt
+        let bits_29_24 = (insn >> 24) & 0x3F;
+        if bits_29_24 == 0b001000 {
+            return self.decode_ldst_exclusive(insn, address, bytes);
+        }
+
+        // Atomic memory operations (ARMv8.1): bits 31-24 = xx111000, bit 21 = 1
+        // Pattern: size[31:30]=xx, 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
+        if bits_29_24 == 0b111000 && (insn >> 21) & 1 == 1 {
+            return self.decode_atomic_memory(insn, address, bytes);
+        }
+
+        // Load/store exclusive and atomic operations - fall through to unknown
         self.decode_unknown(insn, address, bytes)
     }
 
@@ -711,29 +827,33 @@ impl Arm64Disassembler {
         let rn = ((insn >> 5) & 0x1F) as u16;
         let rt = (insn & 0x1F) as u16;
 
-        let (mnemonic, is_load, data_size) = if v == 0 {
+        let (mnemonic, is_load, data_size, simd_size) = if v == 0 {
             match (size, opc) {
-                (0, 0) => ("sturb", false, 1),
-                (0, 1) => ("ldurb", true, 1),
-                (1, 0) => ("sturh", false, 2),
-                (1, 1) => ("ldurh", true, 2),
-                (2, 0) => ("stur", false, 4),
-                (2, 1) => ("ldur", true, 4),
-                (3, 0) => ("stur", false, 8),
-                (3, 1) => ("ldur", true, 8),
+                (0, 0) => ("sturb", false, 1, None),
+                (0, 1) => ("ldurb", true, 1, None),
+                (1, 0) => ("sturh", false, 2, None),
+                (1, 1) => ("ldurh", true, 2, None),
+                (2, 0) => ("stur", false, 4, None),
+                (2, 1) => ("ldur", true, 4, None),
+                (3, 0) => ("stur", false, 8, None),
+                (3, 1) => ("ldur", true, 8, None),
                 _ => return self.decode_unknown(insn, address, bytes),
             }
         } else {
-            // SIMD/FP
+            // SIMD/FP unscaled immediate
+            // size:opc determines register size:
+            // 00:00 = STUR Bt, 00:01 = LDUR Bt (8-bit)
+            // 01:00 = STUR Ht, 01:01 = LDUR Ht (16-bit)
+            // 10:00 = STUR St, 10:01 = LDUR St (32-bit)
+            // 11:00 = STUR Dt, 11:01 = LDUR Dt (64-bit)
+            // 00:10 = STUR Qt, 00:11 = LDUR Qt (128-bit)
+            let is_load = opc & 1 != 0;
             match (size, opc) {
-                (0, 0) => ("stur", false, 1),  // B register
-                (0, 1) => ("ldur", true, 1),
-                (1, 0) => ("stur", false, 2),  // H register
-                (1, 1) => ("ldur", true, 2),
-                (2, 0) => ("stur", false, 4),  // S register
-                (2, 1) => ("ldur", true, 4),
-                (3, 0) => ("stur", false, 8),  // D register
-                (3, 1) => ("ldur", true, 8),
+                (0, 0) | (0, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 1, Some(0u32)),   // B
+                (0, 2) | (0, 3) => (if is_load { "ldur" } else { "stur" }, is_load, 16, Some(4u32)), // Q
+                (1, 0) | (1, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 2, Some(1u32)),   // H
+                (2, 0) | (2, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 4, Some(2u32)),   // S
+                (3, 0) | (3, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 8, Some(3u32)),   // D
                 _ => return self.decode_unknown(insn, address, bytes),
             }
         };
@@ -745,8 +865,8 @@ impl Arm64Disassembler {
                 (Self::wreg(rt), Self::xreg_sp(rn))
             }
         } else {
-            // SIMD register naming (simplified)
-            (Self::xreg(rt), Self::xreg_sp(rn))
+            // SIMD/FP register
+            (Self::simd_reg(rt, simd_size.unwrap()), Self::xreg_sp(rn))
         };
 
         let mem = MemoryRef::base_disp(reg_base.clone(), imm9, data_size as u8);
@@ -776,8 +896,41 @@ impl Arm64Disassembler {
         let rt = (insn & 0x1F) as u16;
 
         if v == 1 {
-            // SIMD/FP load/store - simplified
-            return self.decode_unknown(insn, address, bytes);
+            // SIMD/FP load/store with unsigned immediate offset
+            // size:opc determines the register size:
+            // 00:00 = STR Bt, 00:01 = LDR Bt (8-bit)
+            // 01:00 = STR Ht, 01:01 = LDR Ht (16-bit)
+            // 10:00 = STR St, 10:01 = LDR St (32-bit)
+            // 11:00 = STR Dt, 11:01 = LDR Dt (64-bit)
+            // 00:10 = STR Qt, 00:11 = LDR Qt (128-bit)
+            let is_load = opc & 0b01 != 0;
+            let (mnemonic, simd_size) = match (size, opc) {
+                (0, 0b00) | (0, 0b01) => (if is_load { "ldr" } else { "str" }, 0), // B
+                (0, 0b10) | (0, 0b11) => (if is_load { "ldr" } else { "str" }, 4), // Q
+                (1, _) => (if is_load { "ldr" } else { "str" }, 1), // H
+                (2, _) => (if is_load { "ldr" } else { "str" }, 2), // S
+                (3, _) => (if is_load { "ldr" } else { "str" }, 3), // D
+                _ => return self.decode_unknown(insn, address, bytes),
+            };
+
+            let scale = if simd_size == 4 { 4 } else { simd_size }; // Q is 16 bytes = 2^4
+            let offset = imm12 << scale;
+            let access_size = 1u8 << scale;
+
+            let reg = Self::simd_reg(rt, simd_size);
+            let base = Self::xreg_sp(rn);
+            let mem = if offset == 0 {
+                MemoryRef::base(base, access_size)
+            } else {
+                MemoryRef::base_disp(base, offset as i64, access_size)
+            };
+
+            let operation = if is_load { Operation::Load } else { Operation::Store };
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(operation)
+                .with_operands(vec![Operand::reg(reg), Operand::Memory(mem)]);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
         }
 
         let scale = size;
@@ -839,8 +992,36 @@ impl Arm64Disassembler {
         let rt = (insn & 0x1F) as u16;
 
         if v == 1 {
-            // SIMD/FP pair - simplified
-            return self.decode_unknown(insn, address, bytes);
+            // SIMD/FP pair load/store
+            // opc determines register size: 00=S(32), 01=D(64), 10=Q(128)
+            let is_load = l == 1;
+            let (simd_size, scale) = match opc {
+                0b00 => (2u32, 2u32), // S register, 4 bytes, scale=2
+                0b01 => (3, 3),       // D register, 8 bytes, scale=3
+                0b10 => (4, 4),       // Q register, 16 bytes, scale=4
+                _ => return self.decode_unknown(insn, address, bytes),
+            };
+
+            let offset = sign_extend((imm7 << scale) as u64, 7 + scale as u8);
+            let access_size = (1u8 << scale) * 2; // Pair access
+
+            let mnemonic = if is_load { "ldp" } else { "stp" };
+            let reg1 = Self::simd_reg(rt, simd_size);
+            let reg2 = Self::simd_reg(rt2, simd_size);
+            let base = Self::xreg_sp(rn);
+
+            let mem = if offset == 0 {
+                MemoryRef::base(base, access_size)
+            } else {
+                MemoryRef::base_disp(base, offset, access_size)
+            };
+
+            let operation = if is_load { Operation::Load } else { Operation::Store };
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(operation)
+                .with_operands(vec![Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)]);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
         }
 
         let is_load = l == 1;
@@ -876,6 +1057,7 @@ impl Arm64Disassembler {
         bytes: Vec<u8>,
     ) -> Result<DecodedInstruction, DecodeError> {
         let size = (insn >> 30) & 0x3;
+        let v = (insn >> 26) & 1;
         let opc = (insn >> 22) & 0x3;
         let rm = ((insn >> 16) & 0x1F) as u16;
         let option = (insn >> 13) & 0x7;
@@ -884,6 +1066,46 @@ impl Arm64Disassembler {
         let rt = (insn & 0x1F) as u16;
 
         let is_load = opc & 1 == 1;
+
+        if v == 1 {
+            // SIMD/FP load/store with register offset
+            // size:opc determines register size:
+            // 00:00 = STR Bt, 00:01 = LDR Bt (8-bit)
+            // 01:00 = STR Ht, 01:01 = LDR Ht (16-bit)
+            // 10:00 = STR St, 10:01 = LDR St (32-bit)
+            // 11:00 = STR Dt, 11:01 = LDR Dt (64-bit)
+            // 00:10 = STR Qt, 00:11 = LDR Qt (128-bit)
+            let (simd_size, scale) = match (size, opc) {
+                (0, 0) | (0, 1) => (0u32, 0u32), // B register, 1 byte
+                (0, 2) | (0, 3) => (4, 4),       // Q register, 16 bytes
+                (1, 0) | (1, 1) => (1, 1),       // H register, 2 bytes
+                (2, 0) | (2, 1) => (2, 2),       // S register, 4 bytes
+                (3, 0) | (3, 1) => (3, 3),       // D register, 8 bytes
+                _ => return self.decode_unknown(insn, address, bytes),
+            };
+
+            let access_size = 1u8 << scale;
+            let shift_amount = if s == 1 { scale as u8 } else { 0 };
+
+            let mnemonic = if is_load { "ldr" } else { "str" };
+            let reg = Self::simd_reg(rt, simd_size);
+            let base = Self::xreg_sp(rn);
+            let index = if option & 0b011 == 0b011 {
+                Self::xreg(rm)
+            } else {
+                Self::wreg(rm)
+            };
+
+            let mem = MemoryRef::sib(Some(base), Some(index), 1 << shift_amount, 0, access_size);
+            let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
+
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(if is_load { Operation::Load } else { Operation::Store })
+                .with_operands(operands);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+        }
+
         let access_size = 1u8 << size;
         let is_64bit = size == 3;
 
@@ -931,14 +1153,48 @@ impl Arm64Disassembler {
         bytes: Vec<u8>,
     ) -> Result<DecodedInstruction, DecodeError> {
         let size = (insn >> 30) & 0x3;
+        let v = (insn >> 26) & 1;
         let opc = (insn >> 22) & 0x3;
         let imm9 = ((insn >> 12) & 0x1FF) as i64;
         let rn = ((insn >> 5) & 0x1F) as u16;
         let rt = (insn & 0x1F) as u16;
-        let is_pre = (insn >> 11) & 1 == 1;
+        let _is_pre = (insn >> 11) & 1 == 1;
 
         let is_load = opc & 1 == 1;
         let offset = sign_extend(imm9 as u64, 9);
+
+        if v == 1 {
+            // SIMD/FP load/store with pre/post-indexed immediate
+            // size:opc determines register size:
+            // 00:00 = STR Bt, 00:01 = LDR Bt (8-bit)
+            // 01:00 = STR Ht, 01:01 = LDR Ht (16-bit)
+            // 10:00 = STR St, 10:01 = LDR St (32-bit)
+            // 11:00 = STR Dt, 11:01 = LDR Dt (64-bit)
+            // 00:10 = STR Qt, 00:11 = LDR Qt (128-bit)
+            let (simd_size, scale) = match (size, opc) {
+                (0, 0) | (0, 1) => (0u32, 0u32), // B register, 1 byte
+                (0, 2) | (0, 3) => (4, 4),       // Q register, 16 bytes
+                (1, 0) | (1, 1) => (1, 1),       // H register, 2 bytes
+                (2, 0) | (2, 1) => (2, 2),       // S register, 4 bytes
+                (3, 0) | (3, 1) => (3, 3),       // D register, 8 bytes
+                _ => return self.decode_unknown(insn, address, bytes),
+            };
+
+            let access_size = 1u8 << scale;
+            let mnemonic = if is_load { "ldr" } else { "str" };
+            let reg = Self::simd_reg(rt, simd_size);
+            let base = Self::xreg_sp(rn);
+            let mem = MemoryRef::base_disp(base, offset, access_size);
+
+            let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
+
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(if is_load { Operation::Load } else { Operation::Store })
+                .with_operands(operands);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+        }
+
         let access_size = 1u8 << size;
         let is_64bit = size == 3;
 
@@ -989,7 +1245,19 @@ impl Arm64Disassembler {
 
         if v == 1 {
             // SIMD/FP literal load
-            return self.decode_unknown(insn, address, bytes);
+            // opc: 00=S(32-bit), 01=D(64-bit), 10=Q(128-bit), 11=reserved
+            let reg = match opc {
+                0b00 => Self::sreg(rt),  // LDR S<t>, <label>
+                0b01 => Self::dreg(rt),  // LDR D<t>, <label>
+                0b10 => Self::qreg(rt),  // LDR Q<t>, <label>
+                _ => return self.decode_unknown(insn, address, bytes),
+            };
+
+            let inst = Instruction::new(address, 4, bytes, "ldr")
+                .with_operation(Operation::Load)
+                .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)]);
+
+            return Ok(DecodedInstruction { instruction: inst, size: 4 });
         }
 
         let (mnemonic, is_64bit) = match opc {
@@ -1004,6 +1272,269 @@ impl Arm64Disassembler {
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(Operation::Load)
             .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)]);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode load/store exclusive instructions (LDXR, STXR, LDXP, STXP, LDAXR, STLXR, etc.).
+    fn decode_ldst_exclusive(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        // Encoding: size[31:30], 001000, o2, L, o1, Rs, o0, Rt2, Rn, Rt
+        let size = (insn >> 30) & 0x3;
+        let o2 = (insn >> 23) & 1;   // 0=exclusive, 1=ordered (LDAPR/STLR)
+        let l = (insn >> 22) & 1;    // Load/store: 1=load, 0=store
+        let o1 = (insn >> 21) & 1;   // Pair: 1=pair
+        let rs = ((insn >> 16) & 0x1F) as u16;  // Status register (for store)
+        let o0 = (insn >> 15) & 1;   // Acquire-release: 1=acquire/release
+        let rt2 = ((insn >> 10) & 0x1F) as u16; // Second register (for pair)
+        let rn = ((insn >> 5) & 0x1F) as u16;   // Base register
+        let rt = (insn & 0x1F) as u16;          // Data register
+
+        let is_pair = o1 == 1;
+        let is_load = l == 1;
+        let is_acquire_release = o0 == 1;
+        let is_ordered = o2 == 1;
+
+        // Determine register size from size field
+        let is_64bit = size == 3 || (is_pair && size == 2);
+        let access_size = match size {
+            0 => 1u8,  // byte
+            1 => 2,    // halfword
+            2 => 4,    // word
+            3 => 8,    // doubleword
+            _ => 4,
+        };
+
+        // Build mnemonic based on instruction type
+        let mnemonic = if is_ordered && !is_pair {
+            // Load-acquire / Store-release (non-exclusive ordered access)
+            match (is_load, size) {
+                (true, 0) => if is_acquire_release { "ldarb" } else { "ldlarb" },
+                (true, 1) => if is_acquire_release { "ldarh" } else { "ldlarh" },
+                (true, 2) => if is_acquire_release { "ldar" } else { "ldlar" },
+                (true, 3) => if is_acquire_release { "ldar" } else { "ldlar" },
+                (false, 0) => if is_acquire_release { "stlrb" } else { "stllrb" },
+                (false, 1) => if is_acquire_release { "stlrh" } else { "stllrh" },
+                (false, 2) => if is_acquire_release { "stlr" } else { "stllr" },
+                (false, 3) => if is_acquire_release { "stlr" } else { "stllr" },
+                _ => "unknown",
+            }
+        } else if is_pair {
+            // Exclusive pair
+            match (is_load, is_acquire_release, size) {
+                (true, false, 2) => "ldxp",
+                (true, false, 3) => "ldxp",
+                (true, true, 2) => "ldaxp",
+                (true, true, 3) => "ldaxp",
+                (false, false, 2) => "stxp",
+                (false, false, 3) => "stxp",
+                (false, true, 2) => "stlxp",
+                (false, true, 3) => "stlxp",
+                _ => "unknown",
+            }
+        } else {
+            // Single exclusive
+            match (is_load, is_acquire_release, size) {
+                (true, false, 0) => "ldxrb",
+                (true, false, 1) => "ldxrh",
+                (true, false, 2) => "ldxr",
+                (true, false, 3) => "ldxr",
+                (true, true, 0) => "ldaxrb",
+                (true, true, 1) => "ldaxrh",
+                (true, true, 2) => "ldaxr",
+                (true, true, 3) => "ldaxr",
+                (false, false, 0) => "stxrb",
+                (false, false, 1) => "stxrh",
+                (false, false, 2) => "stxr",
+                (false, false, 3) => "stxr",
+                (false, true, 0) => "stlxrb",
+                (false, true, 1) => "stlxrh",
+                (false, true, 2) => "stlxr",
+                (false, true, 3) => "stlxr",
+                _ => "unknown",
+            }
+        };
+
+        let base = Self::xreg_sp(rn);
+        let mem = MemoryRef::base(base, access_size);
+
+        let operands = if is_load {
+            if is_pair {
+                // LDXP/LDAXP: Rt, Rt2, [Xn|SP]
+                let reg1 = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+                let reg2 = if is_64bit { Self::xreg(rt2) } else { Self::wreg(rt2) };
+                vec![Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)]
+            } else if is_ordered {
+                // LDAR/LDLAR: Rt, [Xn|SP]
+                let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+                vec![Operand::reg(reg), Operand::Memory(mem)]
+            } else {
+                // LDXR/LDAXR: Rt, [Xn|SP]
+                let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+                vec![Operand::reg(reg), Operand::Memory(mem)]
+            }
+        } else if is_pair {
+            // STXP/STLXP: Ws, Wt, Wt2, [Xn|SP]  (Ws is status)
+            let status = Self::wreg(rs);
+            let reg1 = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+            let reg2 = if is_64bit { Self::xreg(rt2) } else { Self::wreg(rt2) };
+            vec![Operand::reg(status), Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)]
+        } else if is_ordered && !is_acquire_release {
+            // STLLR: Rt, [Xn|SP] (no status register)
+            let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+            vec![Operand::reg(reg), Operand::Memory(mem)]
+        } else if is_ordered {
+            // STLR: Rt, [Xn|SP]
+            let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+            vec![Operand::reg(reg), Operand::Memory(mem)]
+        } else {
+            // STXR/STLXR: Ws, Wt, [Xn|SP]  (Ws is status)
+            let status = Self::wreg(rs);
+            let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+            vec![Operand::reg(status), Operand::reg(reg), Operand::Memory(mem)]
+        };
+
+        let operation = if is_load {
+            Operation::LoadExclusive
+        } else {
+            Operation::StoreExclusive
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode atomic memory operations (ARMv8.1 atomics: LDADD, LDCLR, LDEOR, LDSET, SWP, CAS, etc.).
+    fn decode_atomic_memory(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        // Encoding: size[31:30], 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
+        let size = (insn >> 30) & 0x3;
+        let a = (insn >> 23) & 1;    // Acquire
+        let r = (insn >> 22) & 1;    // Release
+        let rs = ((insn >> 16) & 0x1F) as u16;  // Source register
+        let o3 = (insn >> 15) & 1;   // 0 for most atomics, 1 for SWP
+        let opc = (insn >> 12) & 0x7; // Operation code
+        let rn = ((insn >> 5) & 0x1F) as u16;   // Base register
+        let rt = (insn & 0x1F) as u16;          // Destination register
+
+        let is_64bit = size == 3;
+        let access_size = 1u8 << size;
+
+        // Build acquire-release suffix
+        let ar_suffix = match (a, r) {
+            (0, 0) => "",
+            (1, 0) => "a",   // Acquire
+            (0, 1) => "l",   // Release
+            (1, 1) => "al",  // Acquire-release
+            _ => "",
+        };
+
+        // Size suffix
+        let size_suffix = match size {
+            0 => "b",
+            1 => "h",
+            _ => "",
+        };
+
+        // Determine instruction and operation based on o3 and opc
+        let (base_mnemonic, operation) = if o3 == 0 {
+            match opc {
+                0b000 => ("ldadd", Operation::AtomicAdd),
+                0b001 => ("ldclr", Operation::AtomicClear),
+                0b010 => ("ldeor", Operation::AtomicXor),
+                0b011 => ("ldset", Operation::AtomicSet),
+                0b100 => ("ldsmax", Operation::AtomicSignedMax),
+                0b101 => ("ldsmin", Operation::AtomicSignedMin),
+                0b110 => ("ldumax", Operation::AtomicUnsignedMax),
+                0b111 => ("ldumin", Operation::AtomicUnsignedMin),
+                _ => ("atomic", Operation::Other(0)),
+            }
+        } else {
+            // o3 == 1: SWP or special variants
+            match opc {
+                0b000 => ("swp", Operation::AtomicSwap),
+                _ => ("atomic", Operation::Other(0)),
+            }
+        };
+
+        // Build full mnemonic
+        let mnemonic = format!("{}{}{}", base_mnemonic, ar_suffix, size_suffix);
+
+        let base = Self::xreg_sp(rn);
+        let mem = MemoryRef::base(base, access_size);
+        let src = if is_64bit { Self::xreg(rs) } else { Self::wreg(rs) };
+        let dst = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+
+        // Operands: Rs (source/operand), Rt (destination/old value), [Xn|SP]
+        let operands = vec![Operand::reg(src), Operand::reg(dst), Operand::Memory(mem)];
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_operands(operands);
+
+        Ok(DecodedInstruction { instruction: inst, size: 4 })
+    }
+
+    /// Decode compare and swap instructions (CAS, CASP - ARMv8.1).
+    #[allow(dead_code)]
+    fn decode_compare_and_swap(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        // CAS encoding: size[31:30], 0010001, L, 1, Rs, o0, 11111, Rn, Rt
+        // CASP encoding: 0, sz, 0010000, L, 1, Rs, o0, 11111, Rn, Rt
+        let size = (insn >> 30) & 0x3;
+        let l = (insn >> 22) & 1;    // 1=Acquire
+        let rs = ((insn >> 16) & 0x1F) as u16;  // Compare value register
+        let o0 = (insn >> 15) & 1;   // 1=Release
+        let rn = ((insn >> 5) & 0x1F) as u16;   // Base register
+        let rt = (insn & 0x1F) as u16;          // Destination/swap value register
+
+        let is_64bit = size == 3;
+        let access_size = 1u8 << size;
+
+        // Build acquire-release suffix
+        let ar_suffix = match (l, o0) {
+            (0, 0) => "",
+            (1, 0) => "a",   // Acquire
+            (0, 1) => "l",   // Release
+            (1, 1) => "al",  // Acquire-release
+            _ => "",
+        };
+
+        // Size suffix
+        let size_suffix = match size {
+            0 => "b",
+            1 => "h",
+            _ => "",
+        };
+
+        let mnemonic = format!("cas{}{}", ar_suffix, size_suffix);
+
+        let base = Self::xreg_sp(rn);
+        let mem = MemoryRef::base(base, access_size);
+        let compare_reg = if is_64bit { Self::xreg(rs) } else { Self::wreg(rs) };
+        let swap_reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+
+        // Operands: Xs (compare), Xt (swap/result), [Xn|SP]
+        let operands = vec![Operand::reg(compare_reg), Operand::reg(swap_reg), Operand::Memory(mem)];
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::CompareAndSwap)
+            .with_operands(operands);
 
         Ok(DecodedInstruction { instruction: inst, size: 4 })
     }
@@ -2240,5 +2771,446 @@ mod tests {
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "fmov");
         assert_eq!(result.size, 4);
+    }
+
+    // SIMD/FP load/store tests
+
+    #[test]
+    fn test_ldr_simd_s_unsigned_imm() {
+        let disasm = Arm64Disassembler::new();
+        // LDR S0, [X1, #4]: 0xBD400420
+        // Encoding: size=10, V=1, opc=01, imm12=1, Rn=1, Rt=0
+        let bytes = [0x20, 0x04, 0x40, 0xBD];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldr");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_str_simd_d_unsigned_imm() {
+        let disasm = Arm64Disassembler::new();
+        // STR D0, [X1, #8]: 0xFD000420
+        // Encoding: size=11, V=1, opc=00, imm12=1, Rn=1, Rt=0
+        let bytes = [0x20, 0x04, 0x00, 0xFD];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "str");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ldr_simd_q_unsigned_imm() {
+        let disasm = Arm64Disassembler::new();
+        // LDR Q0, [X1, #16]: 0x3DC00420
+        // Encoding: size=00, V=1, opc=11, imm12=1, Rn=1, Rt=0
+        let bytes = [0x20, 0x04, 0xC0, 0x3D];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldr");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ldp_simd_d() {
+        let disasm = Arm64Disassembler::new();
+        // LDP D0, D1, [X2]: 0x6D400440
+        // Encoding: opc=01, V=1, L=1, imm7=0, Rt2=1, Rn=2, Rt=0
+        let bytes = [0x40, 0x04, 0x40, 0x6D];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldp");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_stp_simd_q() {
+        let disasm = Arm64Disassembler::new();
+        // STP Q0, Q1, [X2]: 0xAD000440
+        // Encoding: opc=10, V=1, L=0, imm7=0, Rt2=1, Rn=2, Rt=0
+        let bytes = [0x40, 0x04, 0x00, 0xAD];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "stp");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ldr_simd_d_register() {
+        let disasm = Arm64Disassembler::new();
+        // LDR D0, [X1, X2]: 0xFC626820
+        // Encoding: size=11, V=1, opc=01, Rm=2, option=011, S=0, Rn=1, Rt=0
+        let bytes = [0x20, 0x68, 0x62, 0xFC];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldr");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_str_simd_s_pre_index() {
+        let disasm = Arm64Disassembler::new();
+        // STR S0, [X1, #-4]!: 0xBC1FC020
+        // Encoding: size=10, V=1, opc=00, imm9=-4, pre=1, Rn=1, Rt=0
+        let bytes = [0x20, 0xCC, 0x1F, 0xBC];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "str");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ldur_simd_d() {
+        let disasm = Arm64Disassembler::new();
+        // LDUR D0, [X1, #-8]: 0xFC5F8020
+        // Encoding: size=11, V=1, opc=01, imm9=-8, Rn=1, Rt=0
+        let bytes = [0x20, 0x80, 0x5F, 0xFC];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldur");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ldr_simd_literal() {
+        let disasm = Arm64Disassembler::new();
+        // LDR S0, label (offset +8): 0x1C000040
+        // Encoding: opc=00, V=1, imm19=2, Rt=0
+        let bytes = [0x40, 0x00, 0x00, 0x1C];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldr");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ldr_simd_b_unsigned_imm() {
+        let disasm = Arm64Disassembler::new();
+        // LDR B0, [X1, #1]: 0x3D400420
+        // Encoding: size=00, V=1, opc=01, imm12=1, Rn=1, Rt=0
+        let bytes = [0x20, 0x04, 0x40, 0x3D];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldr");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_str_simd_h_unsigned_imm() {
+        let disasm = Arm64Disassembler::new();
+        // STR H0, [X1, #2]: 0x7D000420
+        // Encoding: size=01, V=1, opc=00, imm12=1, Rn=1, Rt=0
+        let bytes = [0x20, 0x04, 0x00, 0x7D];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "str");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.size, 4);
+    }
+
+    // Load/Store Exclusive tests
+
+    #[test]
+    fn test_ldxr() {
+        let disasm = Arm64Disassembler::new();
+        // LDXR X0, [X1]: 0xC85F7C20
+        // Encoding: size=11, 001000, o2=0, L=1, o1=0, Rs=11111, o0=0, Rt2=11111, Rn=1, Rt=0
+        let bytes = [0x20, 0x7C, 0x5F, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldxr");
+        assert_eq!(result.instruction.operation, Operation::LoadExclusive);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ldxr_32bit() {
+        let disasm = Arm64Disassembler::new();
+        // LDXR W0, [X1]: 0x885F7C20
+        // Encoding: size=10, 001000, o2=0, L=1, o1=0, Rs=11111, o0=0, Rt2=11111, Rn=1, Rt=0
+        let bytes = [0x20, 0x7C, 0x5F, 0x88];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldxr");
+        assert_eq!(result.instruction.operation, Operation::LoadExclusive);
+    }
+
+    #[test]
+    fn test_stxr() {
+        let disasm = Arm64Disassembler::new();
+        // STXR W2, X0, [X1]: 0xC8027C20
+        // Encoding: size=11, 001000, o2=0, L=0, o1=0, Rs=2, o0=0, Rt2=11111, Rn=1, Rt=0
+        let bytes = [0x20, 0x7C, 0x02, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "stxr");
+        assert_eq!(result.instruction.operation, Operation::StoreExclusive);
+    }
+
+    #[test]
+    fn test_ldaxr() {
+        let disasm = Arm64Disassembler::new();
+        // LDAXR X0, [X1]: 0xC85FFC20
+        // Encoding: size=11, 001000, o2=0, L=1, o1=0, Rs=11111, o0=1, Rt2=11111, Rn=1, Rt=0
+        let bytes = [0x20, 0xFC, 0x5F, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldaxr");
+        assert_eq!(result.instruction.operation, Operation::LoadExclusive);
+    }
+
+    #[test]
+    fn test_stlxr() {
+        let disasm = Arm64Disassembler::new();
+        // STLXR W2, X0, [X1]: 0xC802FC20
+        // Encoding: size=11, 001000, o2=0, L=0, o1=0, Rs=2, o0=1, Rt2=11111, Rn=1, Rt=0
+        let bytes = [0x20, 0xFC, 0x02, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "stlxr");
+        assert_eq!(result.instruction.operation, Operation::StoreExclusive);
+    }
+
+    #[test]
+    fn test_ldxp() {
+        let disasm = Arm64Disassembler::new();
+        // LDXP X0, X3, [X1]: 0xC8600C20
+        // Encoding: size=11, 001000, o2=0, L=1, o1=1, Rs=00000, o0=0, Rt2=3, Rn=1, Rt=0
+        let bytes = [0x20, 0x0C, 0x60, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldxp");
+        assert_eq!(result.instruction.operation, Operation::LoadExclusive);
+        assert_eq!(result.instruction.operands.len(), 3); // X0, X3, [X1]
+    }
+
+    #[test]
+    fn test_stxp() {
+        let disasm = Arm64Disassembler::new();
+        // STXP W2, X0, X3, [X1]: 0xC8220C20
+        // Encoding: size=11, 001000, o2=0, L=0, o1=1, Rs=2, o0=0, Rt2=3, Rn=1, Rt=0
+        let bytes = [0x20, 0x0C, 0x22, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "stxp");
+        assert_eq!(result.instruction.operation, Operation::StoreExclusive);
+        assert_eq!(result.instruction.operands.len(), 4); // W2, X0, X3, [X1]
+    }
+
+    #[test]
+    fn test_ldar() {
+        let disasm = Arm64Disassembler::new();
+        // LDAR X0, [X1]: 0xC8DFFC20
+        // Encoding: size=11, 001000, o2=1, L=1, o1=0, Rs=11111, o0=1, Rt2=11111, Rn=1, Rt=0
+        let bytes = [0x20, 0xFC, 0xDF, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldar");
+        assert_eq!(result.instruction.operation, Operation::LoadExclusive);
+    }
+
+    #[test]
+    fn test_stlr() {
+        let disasm = Arm64Disassembler::new();
+        // STLR X0, [X1]: 0xC89FFC20
+        // Encoding: size=11, 001000, o2=1, L=0, o1=0, Rs=11111, o0=1, Rt2=11111, Rn=1, Rt=0
+        let bytes = [0x20, 0xFC, 0x9F, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "stlr");
+        assert_eq!(result.instruction.operation, Operation::StoreExclusive);
+    }
+
+    // Atomic memory operation tests (ARMv8.1)
+
+    #[test]
+    fn test_ldadd() {
+        let disasm = Arm64Disassembler::new();
+        // LDADD X2, X0, [X1]: 0xF8220020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=000, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x00, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldadd");
+        assert_eq!(result.instruction.operation, Operation::AtomicAdd);
+    }
+
+    #[test]
+    fn test_ldadda() {
+        let disasm = Arm64Disassembler::new();
+        // LDADDA X2, X0, [X1]: 0xF8A20020
+        // Encoding: size=11, 111000, A=1, R=0, 1, Rs=2, o3=0, opc=000, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x00, 0xA2, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldadda");
+        assert_eq!(result.instruction.operation, Operation::AtomicAdd);
+    }
+
+    #[test]
+    fn test_ldaddal() {
+        let disasm = Arm64Disassembler::new();
+        // LDADDAL X2, X0, [X1]: 0xF8E20020
+        // Encoding: size=11, 111000, A=1, R=1, 1, Rs=2, o3=0, opc=000, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x00, 0xE2, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldaddal");
+        assert_eq!(result.instruction.operation, Operation::AtomicAdd);
+    }
+
+    #[test]
+    fn test_ldclr() {
+        let disasm = Arm64Disassembler::new();
+        // LDCLR X2, X0, [X1]: 0xF8221020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=001, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x10, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldclr");
+        assert_eq!(result.instruction.operation, Operation::AtomicClear);
+    }
+
+    #[test]
+    fn test_ldeor() {
+        let disasm = Arm64Disassembler::new();
+        // LDEOR X2, X0, [X1]: 0xF8222020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=010, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x20, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldeor");
+        assert_eq!(result.instruction.operation, Operation::AtomicXor);
+    }
+
+    #[test]
+    fn test_ldset() {
+        let disasm = Arm64Disassembler::new();
+        // LDSET X2, X0, [X1]: 0xF8223020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=011, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x30, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldset");
+        assert_eq!(result.instruction.operation, Operation::AtomicSet);
+    }
+
+    #[test]
+    fn test_ldsmax() {
+        let disasm = Arm64Disassembler::new();
+        // LDSMAX X2, X0, [X1]: 0xF8224020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=100, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x40, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldsmax");
+        assert_eq!(result.instruction.operation, Operation::AtomicSignedMax);
+    }
+
+    #[test]
+    fn test_ldsmin() {
+        let disasm = Arm64Disassembler::new();
+        // LDSMIN X2, X0, [X1]: 0xF8225020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=101, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x50, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldsmin");
+        assert_eq!(result.instruction.operation, Operation::AtomicSignedMin);
+    }
+
+    #[test]
+    fn test_ldumax() {
+        let disasm = Arm64Disassembler::new();
+        // LDUMAX X2, X0, [X1]: 0xF8226020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=110, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x60, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldumax");
+        assert_eq!(result.instruction.operation, Operation::AtomicUnsignedMax);
+    }
+
+    #[test]
+    fn test_ldumin() {
+        let disasm = Arm64Disassembler::new();
+        // LDUMIN X2, X0, [X1]: 0xF8227020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=111, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x70, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldumin");
+        assert_eq!(result.instruction.operation, Operation::AtomicUnsignedMin);
+    }
+
+    #[test]
+    fn test_swp() {
+        let disasm = Arm64Disassembler::new();
+        // SWP X2, X0, [X1]: 0xF8228020
+        // Encoding: size=11, 111000, A=0, R=0, 1, Rs=2, o3=1, opc=000, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x80, 0x22, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "swp");
+        assert_eq!(result.instruction.operation, Operation::AtomicSwap);
+    }
+
+    #[test]
+    fn test_swpal() {
+        let disasm = Arm64Disassembler::new();
+        // SWPAL X2, X0, [X1]: 0xF8E28020
+        // Encoding: size=11, 111000, A=1, R=1, 1, Rs=2, o3=1, opc=000, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x80, 0xE2, 0xF8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "swpal");
+        assert_eq!(result.instruction.operation, Operation::AtomicSwap);
+    }
+
+    #[test]
+    fn test_ldaddb() {
+        let disasm = Arm64Disassembler::new();
+        // LDADDB W2, W0, [X1]: 0x38220020
+        // Encoding: size=00, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=000, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x00, 0x22, 0x38];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldaddb");
+        assert_eq!(result.instruction.operation, Operation::AtomicAdd);
+    }
+
+    #[test]
+    fn test_ldaddh() {
+        let disasm = Arm64Disassembler::new();
+        // LDADDH W2, W0, [X1]: 0x78220020
+        // Encoding: size=01, 111000, A=0, R=0, 1, Rs=2, o3=0, opc=000, 00, Rn=1, Rt=0
+        let bytes = [0x20, 0x00, 0x22, 0x78];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ldaddh");
+        assert_eq!(result.instruction.operation, Operation::AtomicAdd);
+    }
+
+    // SVE (Scalable Vector Extension) tests
+
+    #[test]
+    fn test_sve_cntd() {
+        let disasm = Arm64Disassembler::new();
+        // CNTD X0: 0x04EE0FE0
+        // Encoding: 0000_0100_11_10_1110_0000_11_11111_00000
+        let bytes = [0xE0, 0x0F, 0xEE, 0x04];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "cntd");
+        assert_eq!(result.instruction.operation, Operation::SveCount);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_sve_cntb() {
+        let disasm = Arm64Disassembler::new();
+        // CNTB X0: 0x042E0FE0
+        // Encoding: 0000_0100_00_10_1110_0000_11_11111_00000
+        let bytes = [0xE0, 0x0F, 0x2E, 0x04];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "cntb");
+        assert_eq!(result.instruction.operation, Operation::SveCount);
+    }
+
+    #[test]
+    fn test_sve_cnth() {
+        let disasm = Arm64Disassembler::new();
+        // CNTH X1: 0x046E0FE1
+        // Encoding: 0000_0100_01_10_1110_0000_11_11111_00001
+        let bytes = [0xE1, 0x0F, 0x6E, 0x04];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "cnth");
+        assert_eq!(result.instruction.operation, Operation::SveCount);
+    }
+
+    #[test]
+    fn test_sve_cntw() {
+        let disasm = Arm64Disassembler::new();
+        // CNTW X2: 0x04AE0FE2
+        // Encoding: 0000_0100_10_10_1110_0000_11_11111_00010
+        let bytes = [0xE2, 0x0F, 0xAE, 0x04];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "cntw");
+        assert_eq!(result.instruction.operation, Operation::SveCount);
     }
 }

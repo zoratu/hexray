@@ -1,6 +1,6 @@
 //! ModR/M and SIB byte decoding.
 
-use super::prefix::{Prefixes, Rex};
+use super::prefix::{Evex, Prefixes, Rex};
 use hexray_core::{
     register::{x86, RegisterClass},
     Architecture, MemoryRef, Operand, Register,
@@ -25,6 +25,21 @@ impl ModRM {
             mod_: (byte >> 6) & 0x3,
             reg: ((byte >> 3) & 0x7) | ((rex.r as u8) << 3),
             rm: (byte & 0x7) | ((rex.b as u8) << 3),
+        }
+    }
+
+    /// Parse a ModR/M byte with EVEX extension.
+    /// EVEX provides R', R, X, B bits for 5-bit register encoding.
+    pub fn parse_evex(byte: u8, evex: &Evex) -> Self {
+        // EVEX provides:
+        // - R and R' for reg field (5 bits total)
+        // - B and X for rm field with SIB (5 bits total)
+        Self {
+            mod_: (byte >> 6) & 0x3,
+            // reg = modrm.reg[2:0] | EVEX.R << 3 | EVEX.R' << 4
+            reg: ((byte >> 3) & 0x7) | ((evex.r as u8) << 3) | ((evex.r_prime as u8) << 4),
+            // rm = modrm.rm[2:0] | EVEX.B << 3 | EVEX.X << 4 (X used when SIB present)
+            rm: (byte & 0x7) | ((evex.b as u8) << 3),
         }
     }
 
@@ -87,14 +102,43 @@ pub fn decode_gpr(reg: u8, size: u16) -> Register {
     )
 }
 
-/// Decode an XMM/YMM register from a register number.
-/// The size parameter should be 128 for XMM or 256 for YMM.
+/// Decode an XMM/YMM/ZMM register from a register number.
+/// The size parameter should be 128 for XMM, 256 for YMM, or 512 for ZMM.
+/// reg can be 0-31 for EVEX-encoded instructions.
 pub fn decode_xmm(reg: u8, size: u16) -> Register {
+    // For extended registers (16-31), use the XMM16 base
+    let reg_id = if reg >= 16 {
+        x86::XMM16 + (reg - 16) as u16
+    } else {
+        x86::XMM0 + reg as u16
+    };
+
+    let class = match size {
+        512 | 256 => RegisterClass::Vector,
+        _ => RegisterClass::FloatingPoint,
+    };
+
+    Register::new(Architecture::X86_64, class, reg_id, size)
+}
+
+/// Decode an opmask register (k0-k7) from a register number.
+#[allow(dead_code)]
+pub fn decode_opmask(reg: u8) -> Register {
     Register::new(
         Architecture::X86_64,
-        if size == 256 { RegisterClass::Vector } else { RegisterClass::FloatingPoint },
-        x86::XMM0 + reg as u16,
-        size,
+        RegisterClass::Other,
+        x86::K0 + (reg & 0x7) as u16,
+        64, // opmask registers are 64-bit
+    )
+}
+
+/// Decode an AMX tile register (tmm0-tmm7) from a register number.
+pub fn decode_tmm(reg: u8) -> Register {
+    Register::new(
+        Architecture::X86_64,
+        RegisterClass::Tile,
+        x86::TMM0 + (reg & 0x7) as u16,
+        0, // tile size is configuration-dependent
     )
 }
 

@@ -10,10 +10,22 @@
 mod expression;
 mod structurer;
 mod emitter;
+mod naming;
+mod struct_inference;
+mod switch_recovery;
+mod signature;
+pub mod array_detection;
 
-pub use expression::{Expr, ExprKind, Variable};
+pub use expression::{Expr, ExprKind, Variable, BinOpKind, UnaryOpKind};
 pub use structurer::{StructuredCfg, StructuredNode, LoopKind};
+pub use switch_recovery::{SwitchRecovery, SwitchInfo, SwitchKind, JumpTableInfo};
 pub use emitter::PseudoCodeEmitter;
+pub use naming::{NamingContext, TypeHint};
+pub use struct_inference::{StructInference, InferredStruct, InferredField, InferredType};
+pub use signature::{
+    CallingConvention, FunctionSignature, Parameter, ParameterLocation,
+    ParamType, SignatureRecovery,
+};
 
 use hexray_core::ControlFlowGraph;
 use std::collections::HashMap;
@@ -208,6 +220,18 @@ pub struct Decompiler {
     pub symbol_table: Option<SymbolTable>,
     /// Relocation table for resolving call targets in relocatable files.
     pub relocation_table: Option<RelocationTable>,
+    /// Type information for variables (var_name -> type_string).
+    /// Comes from type inference analysis.
+    pub type_info: HashMap<String, String>,
+    /// DWARF variable names (stack_offset -> name).
+    /// Comes from DWARF debug info.
+    pub dwarf_names: HashMap<i128, String>,
+    /// Whether to enable struct field inference.
+    pub enable_struct_inference: bool,
+    /// Calling convention for function signature recovery.
+    pub calling_convention: CallingConvention,
+    /// Whether to enable signature recovery (default: true).
+    pub enable_signature_recovery: bool,
 }
 
 impl Default for Decompiler {
@@ -218,6 +242,11 @@ impl Default for Decompiler {
             string_table: None,
             symbol_table: None,
             relocation_table: None,
+            type_info: HashMap::new(),
+            dwarf_names: HashMap::new(),
+            enable_struct_inference: false,
+            calling_convention: CallingConvention::default(),
+            enable_signature_recovery: true,
         }
     }
 }
@@ -258,22 +287,145 @@ impl Decompiler {
         self
     }
 
+    /// Sets the type information for variables.
+    /// Keys should be variable names (e.g., "var_8", "local_10"),
+    /// values should be C type strings (e.g., "int", "char*", "float").
+    pub fn with_type_info(mut self, type_info: HashMap<String, String>) -> Self {
+        self.type_info = type_info;
+        self
+    }
+
+    /// Sets the DWARF variable names.
+    /// Keys are stack offsets (frame-relative), values are variable names.
+    pub fn with_dwarf_names(mut self, names: HashMap<i128, String>) -> Self {
+        self.dwarf_names = names;
+        self
+    }
+
+    /// Enables or disables struct field inference.
+    ///
+    /// When enabled, the decompiler will analyze memory access patterns
+    /// to infer struct layouts and convert `*(ptr + offset)` to `ptr->field`.
+    pub fn with_struct_inference(mut self, enable: bool) -> Self {
+        self.enable_struct_inference = enable;
+        self
+    }
+
+    /// Sets the calling convention for function signature recovery.
+    ///
+    /// Different calling conventions use different registers for arguments:
+    /// - `SystemV`: x86_64 Linux/macOS/BSD (RDI, RSI, RDX, RCX, R8, R9)
+    /// - `Win64`: Windows x64 (RCX, RDX, R8, R9)
+    /// - `Aarch64`: ARM64 (X0-X7)
+    /// - `RiscV`: RISC-V (a0-a7)
+    pub fn with_calling_convention(mut self, convention: CallingConvention) -> Self {
+        self.calling_convention = convention;
+        self
+    }
+
+    /// Enables or disables signature recovery.
+    ///
+    /// When enabled (default), the decompiler analyzes register usage to infer
+    /// function parameter count and types based on the calling convention.
+    pub fn with_signature_recovery(mut self, enable: bool) -> Self {
+        self.enable_signature_recovery = enable;
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 1: Structure the control flow
         let structured = StructuredCfg::from_cfg(cfg);
 
-        // Step 2: Emit pseudo-code
+        // Step 2: Apply struct inference if enabled
+        let structured = if self.enable_struct_inference {
+            let mut inference = StructInference::new();
+            inference.analyze(&structured.body);
+            let transformed_body: Vec<_> = structured.body.iter()
+                .map(|n| inference.transform_node(n))
+                .collect();
+            StructuredCfg {
+                body: transformed_body,
+                cfg_entry: structured.cfg_entry,
+            }
+        } else {
+            structured
+        };
+
+        // Step 3: Emit pseudo-code
         let emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
-            .with_relocation_table(self.relocation_table.clone());
+            .with_relocation_table(self.relocation_table.clone())
+            .with_type_info(self.type_info.clone())
+            .with_dwarf_names(self.dwarf_names.clone())
+            .with_calling_convention(self.calling_convention)
+            .with_signature_recovery(self.enable_signature_recovery);
         emitter.emit(&structured, func_name)
+    }
+
+    /// Recovers the function signature from a CFG.
+    ///
+    /// This performs signature recovery without generating decompiled code,
+    /// useful for building symbol tables or function prototypes.
+    pub fn recover_signature(&self, cfg: &ControlFlowGraph) -> FunctionSignature {
+        let structured = StructuredCfg::from_cfg(cfg);
+        let mut recovery = SignatureRecovery::new(self.calling_convention);
+        recovery.analyze(&structured)
     }
 
     /// Decompiles a CFG and returns the structured representation.
     pub fn structure(&self, cfg: &ControlFlowGraph) -> StructuredCfg {
         StructuredCfg::from_cfg(cfg)
+    }
+
+    /// Analyzes a CFG for struct patterns and returns inferred struct definitions.
+    ///
+    /// This can be used to generate struct type definitions to prepend to the
+    /// decompiled output. The returned vector contains all structs inferred
+    /// from memory access patterns.
+    pub fn infer_structs(&self, cfg: &ControlFlowGraph) -> Vec<InferredStruct> {
+        let structured = StructuredCfg::from_cfg(cfg);
+        let mut inference = StructInference::new();
+        inference.analyze(&structured.body);
+        inference.structs().to_vec()
+    }
+
+    /// Decompiles a CFG and returns both the code and inferred struct definitions.
+    ///
+    /// This combines `infer_structs` and `decompile` for convenience.
+    /// Returns a tuple of (struct_definitions, pseudo_code).
+    pub fn decompile_with_structs(&self, cfg: &ControlFlowGraph, func_name: &str) -> (String, String) {
+        let structured = StructuredCfg::from_cfg(cfg);
+
+        // Run struct inference
+        let mut inference = StructInference::new();
+        inference.analyze(&structured.body);
+
+        // Get struct definitions
+        let struct_defs = inference.generate_struct_definitions();
+
+        // Transform expressions to use field access
+        let transformed_body: Vec<_> = structured.body.iter()
+            .map(|n| inference.transform_node(n))
+            .collect();
+        let transformed = StructuredCfg {
+            body: transformed_body,
+            cfg_entry: structured.cfg_entry,
+        };
+
+        // Emit pseudo-code
+        let emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
+            .with_string_table(self.string_table.clone())
+            .with_symbol_table(self.symbol_table.clone())
+            .with_relocation_table(self.relocation_table.clone())
+            .with_type_info(self.type_info.clone())
+            .with_dwarf_names(self.dwarf_names.clone())
+            .with_calling_convention(self.calling_convention)
+            .with_signature_recovery(self.enable_signature_recovery);
+        let code = emitter.emit(&transformed, func_name);
+
+        (struct_defs, code)
     }
 }
 

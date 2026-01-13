@@ -12,6 +12,16 @@ pub enum RegisterClass {
     FloatingPoint,
     /// Vector/SIMD register (ymm0, zmm0, v0, etc.)
     Vector,
+    /// SVE scalable vector register (z0-z31)
+    ScalableVector,
+    /// SVE predicate register (p0-p15)
+    Predicate,
+    /// SME ZA matrix register (tile storage)
+    MatrixArray,
+    /// SME streaming SVE mode control
+    StreamingMode,
+    /// AMX tile register (tmm0-tmm7) - x86 specific
+    Tile,
     /// Segment register (cs, ds, etc.) - x86 specific
     Segment,
     /// Control register (cr0, etc.)
@@ -136,6 +146,52 @@ pub mod x86 {
     pub const YMM13: u16 = 77;
     pub const YMM14: u16 = 78;
     pub const YMM15: u16 = 79;
+
+    // Extended vector registers (AVX-512, XMM16-XMM31/YMM16-YMM31/ZMM16-ZMM31)
+    pub const XMM16: u16 = 80;
+    pub const XMM17: u16 = 81;
+    pub const XMM18: u16 = 82;
+    pub const XMM19: u16 = 83;
+    pub const XMM20: u16 = 84;
+    pub const XMM21: u16 = 85;
+    pub const XMM22: u16 = 86;
+    pub const XMM23: u16 = 87;
+    pub const XMM24: u16 = 88;
+    pub const XMM25: u16 = 89;
+    pub const XMM26: u16 = 90;
+    pub const XMM27: u16 = 91;
+    pub const XMM28: u16 = 92;
+    pub const XMM29: u16 = 93;
+    pub const XMM30: u16 = 94;
+    pub const XMM31: u16 = 95;
+
+    // Opmask registers (AVX-512)
+    pub const K0: u16 = 96;
+    pub const K1: u16 = 97;
+    pub const K2: u16 = 98;
+    pub const K3: u16 = 99;
+    pub const K4: u16 = 100;
+    pub const K5: u16 = 101;
+    pub const K6: u16 = 102;
+    pub const K7: u16 = 103;
+
+    // AMX tile registers (tmm0-tmm7)
+    #[allow(dead_code)]
+    pub const TMM0: u16 = 112;
+    #[allow(dead_code)]
+    pub const TMM1: u16 = 113;
+    #[allow(dead_code)]
+    pub const TMM2: u16 = 114;
+    #[allow(dead_code)]
+    pub const TMM3: u16 = 115;
+    #[allow(dead_code)]
+    pub const TMM4: u16 = 116;
+    #[allow(dead_code)]
+    pub const TMM5: u16 = 117;
+    #[allow(dead_code)]
+    pub const TMM6: u16 = 118;
+    #[allow(dead_code)]
+    pub const TMM7: u16 = 119;
 }
 
 fn x86_reg_name(id: u16, size: u16) -> &'static str {
@@ -242,6 +298,98 @@ fn x86_reg_name(id: u16, size: u16) -> &'static str {
         (x86::YMM14, 256) => "ymm14",
         (x86::YMM15, 256) => "ymm15",
 
+        // ZMM registers (512-bit, AVX-512) - same IDs as XMM/YMM
+        (x86::XMM0, 512) => "zmm0",
+        (x86::XMM1, 512) => "zmm1",
+        (x86::XMM2, 512) => "zmm2",
+        (x86::XMM3, 512) => "zmm3",
+        (x86::XMM4, 512) => "zmm4",
+        (x86::XMM5, 512) => "zmm5",
+        (x86::XMM6, 512) => "zmm6",
+        (x86::XMM7, 512) => "zmm7",
+        (x86::XMM8, 512) => "zmm8",
+        (x86::XMM9, 512) => "zmm9",
+        (x86::XMM10, 512) => "zmm10",
+        (x86::XMM11, 512) => "zmm11",
+        (x86::XMM12, 512) => "zmm12",
+        (x86::XMM13, 512) => "zmm13",
+        (x86::XMM14, 512) => "zmm14",
+        (x86::XMM15, 512) => "zmm15",
+
+        // Extended XMM registers (AVX-512)
+        (x86::XMM16, 128) => "xmm16",
+        (x86::XMM17, 128) => "xmm17",
+        (x86::XMM18, 128) => "xmm18",
+        (x86::XMM19, 128) => "xmm19",
+        (x86::XMM20, 128) => "xmm20",
+        (x86::XMM21, 128) => "xmm21",
+        (x86::XMM22, 128) => "xmm22",
+        (x86::XMM23, 128) => "xmm23",
+        (x86::XMM24, 128) => "xmm24",
+        (x86::XMM25, 128) => "xmm25",
+        (x86::XMM26, 128) => "xmm26",
+        (x86::XMM27, 128) => "xmm27",
+        (x86::XMM28, 128) => "xmm28",
+        (x86::XMM29, 128) => "xmm29",
+        (x86::XMM30, 128) => "xmm30",
+        (x86::XMM31, 128) => "xmm31",
+
+        // Extended YMM registers (AVX-512)
+        (x86::XMM16, 256) => "ymm16",
+        (x86::XMM17, 256) => "ymm17",
+        (x86::XMM18, 256) => "ymm18",
+        (x86::XMM19, 256) => "ymm19",
+        (x86::XMM20, 256) => "ymm20",
+        (x86::XMM21, 256) => "ymm21",
+        (x86::XMM22, 256) => "ymm22",
+        (x86::XMM23, 256) => "ymm23",
+        (x86::XMM24, 256) => "ymm24",
+        (x86::XMM25, 256) => "ymm25",
+        (x86::XMM26, 256) => "ymm26",
+        (x86::XMM27, 256) => "ymm27",
+        (x86::XMM28, 256) => "ymm28",
+        (x86::XMM29, 256) => "ymm29",
+        (x86::XMM30, 256) => "ymm30",
+        (x86::XMM31, 256) => "ymm31",
+
+        // Extended ZMM registers (AVX-512)
+        (x86::XMM16, 512) => "zmm16",
+        (x86::XMM17, 512) => "zmm17",
+        (x86::XMM18, 512) => "zmm18",
+        (x86::XMM19, 512) => "zmm19",
+        (x86::XMM20, 512) => "zmm20",
+        (x86::XMM21, 512) => "zmm21",
+        (x86::XMM22, 512) => "zmm22",
+        (x86::XMM23, 512) => "zmm23",
+        (x86::XMM24, 512) => "zmm24",
+        (x86::XMM25, 512) => "zmm25",
+        (x86::XMM26, 512) => "zmm26",
+        (x86::XMM27, 512) => "zmm27",
+        (x86::XMM28, 512) => "zmm28",
+        (x86::XMM29, 512) => "zmm29",
+        (x86::XMM30, 512) => "zmm30",
+        (x86::XMM31, 512) => "zmm31",
+
+        // Opmask registers (AVX-512)
+        (x86::K0, _) => "k0",
+        (x86::K1, _) => "k1",
+        (x86::K2, _) => "k2",
+        (x86::K3, _) => "k3",
+        (x86::K4, _) => "k4",
+        (x86::K5, _) => "k5",
+        (x86::K6, _) => "k6",
+        (x86::K7, _) => "k7",
+
+        // AMX tile registers
+        (x86::TMM0, _) => "tmm0",
+        (x86::TMM1, _) => "tmm1",
+        (x86::TMM2, _) => "tmm2",
+        (x86::TMM3, _) => "tmm3",
+        (x86::TMM4, _) => "tmm4",
+        (x86::TMM5, _) => "tmm5",
+        (x86::TMM6, _) => "tmm6",
+        (x86::TMM7, _) => "tmm7",
+
         _ => "unknown",
     }
 }
@@ -294,6 +442,86 @@ pub mod arm64 {
     pub const V29: u16 = 93;
     pub const V30: u16 = 94;
     pub const V31: u16 = 95;
+
+    // SVE scalable vector registers Z0-Z31 (128-2048 bits)
+    pub const Z0: u16 = 128;
+    pub const Z1: u16 = 129;
+    pub const Z2: u16 = 130;
+    pub const Z3: u16 = 131;
+    pub const Z4: u16 = 132;
+    pub const Z5: u16 = 133;
+    pub const Z6: u16 = 134;
+    pub const Z7: u16 = 135;
+    pub const Z8: u16 = 136;
+    pub const Z9: u16 = 137;
+    pub const Z10: u16 = 138;
+    pub const Z11: u16 = 139;
+    pub const Z12: u16 = 140;
+    pub const Z13: u16 = 141;
+    pub const Z14: u16 = 142;
+    pub const Z15: u16 = 143;
+    pub const Z16: u16 = 144;
+    pub const Z17: u16 = 145;
+    pub const Z18: u16 = 146;
+    pub const Z19: u16 = 147;
+    pub const Z20: u16 = 148;
+    pub const Z21: u16 = 149;
+    pub const Z22: u16 = 150;
+    pub const Z23: u16 = 151;
+    pub const Z24: u16 = 152;
+    pub const Z25: u16 = 153;
+    pub const Z26: u16 = 154;
+    pub const Z27: u16 = 155;
+    pub const Z28: u16 = 156;
+    pub const Z29: u16 = 157;
+    pub const Z30: u16 = 158;
+    pub const Z31: u16 = 159;
+
+    // SVE predicate registers P0-P15
+    pub const P0: u16 = 160;
+    pub const P1: u16 = 161;
+    pub const P2: u16 = 162;
+    pub const P3: u16 = 163;
+    pub const P4: u16 = 164;
+    pub const P5: u16 = 165;
+    pub const P6: u16 = 166;
+    pub const P7: u16 = 167;
+    pub const P8: u16 = 168;
+    pub const P9: u16 = 169;
+    pub const P10: u16 = 170;
+    pub const P11: u16 = 171;
+    pub const P12: u16 = 172;
+    pub const P13: u16 = 173;
+    pub const P14: u16 = 174;
+    pub const P15: u16 = 175;
+
+    // SVE First Fault Register
+    pub const FFR: u16 = 176;
+
+    // SME (Scalable Matrix Extension) registers
+    // ZA - The matrix register array
+    pub const ZA: u16 = 192;
+
+    // SME tile registers (sub-portions of ZA)
+    // ZA0-ZA7 for various element sizes
+    pub const ZA0_B: u16 = 193;  // Byte tiles
+    pub const ZA0_H: u16 = 201;  // Halfword tiles (ZA0.H-ZA1.H)
+    pub const ZA1_H: u16 = 202;
+    pub const ZA0_S: u16 = 209;  // Word tiles (ZA0.S-ZA3.S)
+    pub const ZA1_S: u16 = 210;
+    pub const ZA2_S: u16 = 211;
+    pub const ZA3_S: u16 = 212;
+    pub const ZA0_D: u16 = 217;  // Doubleword tiles (ZA0.D-ZA7.D)
+    pub const ZA1_D: u16 = 218;
+    pub const ZA2_D: u16 = 219;
+    pub const ZA3_D: u16 = 220;
+    pub const ZA4_D: u16 = 221;
+    pub const ZA5_D: u16 = 222;
+    pub const ZA6_D: u16 = 223;
+    pub const ZA7_D: u16 = 224;
+
+    // SME streaming mode control (pseudo-register for tracking mode)
+    pub const SVCR: u16 = 240;  // Streaming Vector Control Register
 }
 
 fn arm64_reg_name(id: u16, size: u16) -> &'static str {
@@ -539,12 +767,91 @@ fn arm64_reg_name(id: u16, size: u16) -> &'static str {
         (arm64::V30, 8) => "b30",
         (arm64::V31, 8) => "b31",
 
+        // SVE Z registers (scalable vector, all sizes map to z0-z31)
+        (arm64::Z0, _) => "z0",
+        (arm64::Z1, _) => "z1",
+        (arm64::Z2, _) => "z2",
+        (arm64::Z3, _) => "z3",
+        (arm64::Z4, _) => "z4",
+        (arm64::Z5, _) => "z5",
+        (arm64::Z6, _) => "z6",
+        (arm64::Z7, _) => "z7",
+        (arm64::Z8, _) => "z8",
+        (arm64::Z9, _) => "z9",
+        (arm64::Z10, _) => "z10",
+        (arm64::Z11, _) => "z11",
+        (arm64::Z12, _) => "z12",
+        (arm64::Z13, _) => "z13",
+        (arm64::Z14, _) => "z14",
+        (arm64::Z15, _) => "z15",
+        (arm64::Z16, _) => "z16",
+        (arm64::Z17, _) => "z17",
+        (arm64::Z18, _) => "z18",
+        (arm64::Z19, _) => "z19",
+        (arm64::Z20, _) => "z20",
+        (arm64::Z21, _) => "z21",
+        (arm64::Z22, _) => "z22",
+        (arm64::Z23, _) => "z23",
+        (arm64::Z24, _) => "z24",
+        (arm64::Z25, _) => "z25",
+        (arm64::Z26, _) => "z26",
+        (arm64::Z27, _) => "z27",
+        (arm64::Z28, _) => "z28",
+        (arm64::Z29, _) => "z29",
+        (arm64::Z30, _) => "z30",
+        (arm64::Z31, _) => "z31",
+
+        // SVE predicate registers P0-P15
+        (arm64::P0, _) => "p0",
+        (arm64::P1, _) => "p1",
+        (arm64::P2, _) => "p2",
+        (arm64::P3, _) => "p3",
+        (arm64::P4, _) => "p4",
+        (arm64::P5, _) => "p5",
+        (arm64::P6, _) => "p6",
+        (arm64::P7, _) => "p7",
+        (arm64::P8, _) => "p8",
+        (arm64::P9, _) => "p9",
+        (arm64::P10, _) => "p10",
+        (arm64::P11, _) => "p11",
+        (arm64::P12, _) => "p12",
+        (arm64::P13, _) => "p13",
+        (arm64::P14, _) => "p14",
+        (arm64::P15, _) => "p15",
+
+        // SVE First Fault Register
+        (arm64::FFR, _) => "ffr",
+
+        // SME ZA matrix register
+        (arm64::ZA, _) => "za",
+
+        // SME tile registers
+        (arm64::ZA0_B, _) => "za0.b",
+        (arm64::ZA0_H, _) => "za0.h",
+        (arm64::ZA1_H, _) => "za1.h",
+        (arm64::ZA0_S, _) => "za0.s",
+        (arm64::ZA1_S, _) => "za1.s",
+        (arm64::ZA2_S, _) => "za2.s",
+        (arm64::ZA3_S, _) => "za3.s",
+        (arm64::ZA0_D, _) => "za0.d",
+        (arm64::ZA1_D, _) => "za1.d",
+        (arm64::ZA2_D, _) => "za2.d",
+        (arm64::ZA3_D, _) => "za3.d",
+        (arm64::ZA4_D, _) => "za4.d",
+        (arm64::ZA5_D, _) => "za5.d",
+        (arm64::ZA6_D, _) => "za6.d",
+        (arm64::ZA7_D, _) => "za7.d",
+
+        // SME streaming mode control
+        (arm64::SVCR, _) => "svcr",
+
         _ => "unknown",
     }
 }
 
-// RISC-V register IDs (x0-x31)
+// RISC-V register IDs
 pub mod riscv {
+    // General purpose registers x0-x31
     pub const X0: u16 = 0;   // zero
     pub const X1: u16 = 1;   // ra (return address)
     pub const X2: u16 = 2;   // sp (stack pointer)
@@ -578,10 +885,81 @@ pub mod riscv {
     pub const X30: u16 = 30; // t5
     pub const X31: u16 = 31; // t6
     pub const PC: u16 = 32;
+
+    // Floating-point registers f0-f31 (F/D extensions)
+    // IDs 64-95 for floating-point registers
+    pub const F0: u16 = 64;   // ft0
+    pub const F1: u16 = 65;   // ft1
+    pub const F2: u16 = 66;   // ft2
+    pub const F3: u16 = 67;   // ft3
+    pub const F4: u16 = 68;   // ft4
+    pub const F5: u16 = 69;   // ft5
+    pub const F6: u16 = 70;   // ft6
+    pub const F7: u16 = 71;   // ft7
+    pub const F8: u16 = 72;   // fs0
+    pub const F9: u16 = 73;   // fs1
+    pub const F10: u16 = 74;  // fa0
+    pub const F11: u16 = 75;  // fa1
+    pub const F12: u16 = 76;  // fa2
+    pub const F13: u16 = 77;  // fa3
+    pub const F14: u16 = 78;  // fa4
+    pub const F15: u16 = 79;  // fa5
+    pub const F16: u16 = 80;  // fa6
+    pub const F17: u16 = 81;  // fa7
+    pub const F18: u16 = 82;  // fs2
+    pub const F19: u16 = 83;  // fs3
+    pub const F20: u16 = 84;  // fs4
+    pub const F21: u16 = 85;  // fs5
+    pub const F22: u16 = 86;  // fs6
+    pub const F23: u16 = 87;  // fs7
+    pub const F24: u16 = 88;  // fs8
+    pub const F25: u16 = 89;  // fs9
+    pub const F26: u16 = 90;  // fs10
+    pub const F27: u16 = 91;  // fs11
+    pub const F28: u16 = 92;  // ft8
+    pub const F29: u16 = 93;  // ft9
+    pub const F30: u16 = 94;  // ft10
+    pub const F31: u16 = 95;  // ft11
+
+    // Vector registers v0-v31 (V extension)
+    // IDs 128-159 for vector registers
+    pub const V0: u16 = 128;
+    pub const V1: u16 = 129;
+    pub const V2: u16 = 130;
+    pub const V3: u16 = 131;
+    pub const V4: u16 = 132;
+    pub const V5: u16 = 133;
+    pub const V6: u16 = 134;
+    pub const V7: u16 = 135;
+    pub const V8: u16 = 136;
+    pub const V9: u16 = 137;
+    pub const V10: u16 = 138;
+    pub const V11: u16 = 139;
+    pub const V12: u16 = 140;
+    pub const V13: u16 = 141;
+    pub const V14: u16 = 142;
+    pub const V15: u16 = 143;
+    pub const V16: u16 = 144;
+    pub const V17: u16 = 145;
+    pub const V18: u16 = 146;
+    pub const V19: u16 = 147;
+    pub const V20: u16 = 148;
+    pub const V21: u16 = 149;
+    pub const V22: u16 = 150;
+    pub const V23: u16 = 151;
+    pub const V24: u16 = 152;
+    pub const V25: u16 = 153;
+    pub const V26: u16 = 154;
+    pub const V27: u16 = 155;
+    pub const V28: u16 = 156;
+    pub const V29: u16 = 157;
+    pub const V30: u16 = 158;
+    pub const V31: u16 = 159;
 }
 
 fn riscv_reg_name(id: u16) -> &'static str {
     match id {
+        // General purpose registers
         0 => "zero",
         1 => "ra",
         2 => "sp",
@@ -615,6 +993,75 @@ fn riscv_reg_name(id: u16) -> &'static str {
         30 => "t5",
         31 => "t6",
         riscv::PC => "pc",
+
+        // Floating-point registers (F/D extensions)
+        riscv::F0 => "ft0",
+        riscv::F1 => "ft1",
+        riscv::F2 => "ft2",
+        riscv::F3 => "ft3",
+        riscv::F4 => "ft4",
+        riscv::F5 => "ft5",
+        riscv::F6 => "ft6",
+        riscv::F7 => "ft7",
+        riscv::F8 => "fs0",
+        riscv::F9 => "fs1",
+        riscv::F10 => "fa0",
+        riscv::F11 => "fa1",
+        riscv::F12 => "fa2",
+        riscv::F13 => "fa3",
+        riscv::F14 => "fa4",
+        riscv::F15 => "fa5",
+        riscv::F16 => "fa6",
+        riscv::F17 => "fa7",
+        riscv::F18 => "fs2",
+        riscv::F19 => "fs3",
+        riscv::F20 => "fs4",
+        riscv::F21 => "fs5",
+        riscv::F22 => "fs6",
+        riscv::F23 => "fs7",
+        riscv::F24 => "fs8",
+        riscv::F25 => "fs9",
+        riscv::F26 => "fs10",
+        riscv::F27 => "fs11",
+        riscv::F28 => "ft8",
+        riscv::F29 => "ft9",
+        riscv::F30 => "ft10",
+        riscv::F31 => "ft11",
+
+        // Vector registers (V extension)
+        riscv::V0 => "v0",
+        riscv::V1 => "v1",
+        riscv::V2 => "v2",
+        riscv::V3 => "v3",
+        riscv::V4 => "v4",
+        riscv::V5 => "v5",
+        riscv::V6 => "v6",
+        riscv::V7 => "v7",
+        riscv::V8 => "v8",
+        riscv::V9 => "v9",
+        riscv::V10 => "v10",
+        riscv::V11 => "v11",
+        riscv::V12 => "v12",
+        riscv::V13 => "v13",
+        riscv::V14 => "v14",
+        riscv::V15 => "v15",
+        riscv::V16 => "v16",
+        riscv::V17 => "v17",
+        riscv::V18 => "v18",
+        riscv::V19 => "v19",
+        riscv::V20 => "v20",
+        riscv::V21 => "v21",
+        riscv::V22 => "v22",
+        riscv::V23 => "v23",
+        riscv::V24 => "v24",
+        riscv::V25 => "v25",
+        riscv::V26 => "v26",
+        riscv::V27 => "v27",
+        riscv::V28 => "v28",
+        riscv::V29 => "v29",
+        riscv::V30 => "v30",
+        riscv::V31 => "v31",
+
         _ => "unknown",
     }
 }

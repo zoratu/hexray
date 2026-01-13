@@ -253,6 +253,23 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
     // SYSCALL
     table[0x05] = Some(OpcodeEntry::new("syscall", Operation::Syscall, OperandEncoding::None));
 
+    // System instructions
+    // 0F 01 - handled specially in decoder (SGDT, SIDT, LGDT, LIDT, SMSW, LMSW, INVLPG, RDTSCP)
+    // We mark 0x01 as having ModRM but handle reg field dispatch in decoder
+    table[0x01] = Some(OpcodeEntry::new("system_0f01", Operation::Other(0x0F01), OperandEncoding::ModRmRmOnly));
+
+    // WRMSR - Write Model Specific Register (0F 30)
+    table[0x30] = Some(OpcodeEntry::new("wrmsr", Operation::WriteMsr, OperandEncoding::None));
+
+    // RDTSC - Read Time Stamp Counter (0F 31)
+    table[0x31] = Some(OpcodeEntry::new("rdtsc", Operation::ReadTsc, OperandEncoding::None));
+
+    // RDMSR - Read Model Specific Register (0F 32)
+    table[0x32] = Some(OpcodeEntry::new("rdmsr", Operation::ReadMsr, OperandEncoding::None));
+
+    // CPUID - CPU Identification (0F A2)
+    table[0xA2] = Some(OpcodeEntry::new("cpuid", Operation::CpuId, OperandEncoding::None));
+
     // Conditional jumps (Jcc rel32)
     table[0x80] = Some(OpcodeEntry::new("jo", Operation::ConditionalJump, OperandEncoding::Rel32));
     table[0x81] = Some(OpcodeEntry::new("jno", Operation::ConditionalJump, OperandEncoding::Rel32));
@@ -366,6 +383,8 @@ pub enum SseEncoding {
     GprXmm,
     /// xmm (single operand)
     XmmOnly,
+    /// r, r/m (GPR to GPR, for POPCNT/LZCNT/TZCNT)
+    GprGprRm,
 }
 
 /// SSE/AVX opcode entry.
@@ -841,6 +860,15 @@ pub static SSE_OPCODE_TABLE_F3: [Option<SseOpcodeEntry>; 256] = {
     // MOVDQU xmm/m128, xmm
     table[0x7F] = Some(SseOpcodeEntry::new("movdqu", Operation::Store, SseEncoding::RmXmm)
         .with_vex_mnemonic("vmovdqu"));
+
+    // POPCNT r, r/m (F3 0F B8)
+    table[0xB8] = Some(SseOpcodeEntry::new("popcnt", Operation::Popcnt, SseEncoding::GprGprRm));
+
+    // TZCNT r, r/m (F3 0F BC)
+    table[0xBC] = Some(SseOpcodeEntry::new("tzcnt", Operation::Tzcnt, SseEncoding::GprGprRm));
+
+    // LZCNT r, r/m (F3 0F BD)
+    table[0xBD] = Some(SseOpcodeEntry::new("lzcnt", Operation::Lzcnt, SseEncoding::GprGprRm));
 
     table
 };

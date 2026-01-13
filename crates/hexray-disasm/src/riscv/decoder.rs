@@ -1,12 +1,22 @@
 //! RISC-V instruction decoder implementation.
 //!
-//! Implements decoding for RV64I/RV32I base integer instruction set.
+//! Implements decoding for RV64I/RV32I base integer instruction set
+//! with support for extensions:
+//! - M: Multiply/Divide
+//! - A: Atomics
+//! - C: Compressed instructions
+//! - F: Single-precision floating-point
+//! - D: Double-precision floating-point
+//! - V: Vector operations
 
 use crate::{DecodeError, DecodedInstruction, Disassembler};
 use hexray_core::{
     Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand, Operation,
     Register, RegisterClass,
 };
+
+use super::float::FloatDecoder;
+use super::vector::VectorDecoder;
 
 // Standard 32-bit opcodes (bits 6:0)
 const OP_LUI: u32 = 0b0110111;      // 0x37
@@ -24,21 +34,45 @@ const OP_SYSTEM: u32 = 0b1110011;   // 0x73
 const OP_FENCE: u32 = 0b0001111;    // 0x0F
 const OP_AMO: u32 = 0b0101111;      // 0x2F (A extension)
 
+// Floating-point opcodes (F/D extensions)
+const OP_LOAD_FP: u32 = 0b0000111;  // 0x07 - FLW, FLD, vector loads
+const OP_STORE_FP: u32 = 0b0100111; // 0x27 - FSW, FSD, vector stores
+const OP_MADD: u32 = 0b1000011;     // 0x43 - FMADD.S, FMADD.D
+const OP_MSUB: u32 = 0b1000111;     // 0x47 - FMSUB.S, FMSUB.D
+const OP_NMSUB: u32 = 0b1001011;    // 0x4B - FNMSUB.S, FNMSUB.D
+const OP_NMADD: u32 = 0b1001111;    // 0x4F - FNMADD.S, FNMADD.D
+const OP_FP: u32 = 0b1010011;       // 0x53 - All other FP ops
+
+// Vector opcode (V extension)
+const OP_V: u32 = 0b1010111;        // 0x57 - Vector operations
+
 /// RISC-V disassembler.
 pub struct RiscVDisassembler {
     /// Whether to decode as 64-bit (RV64) or 32-bit (RV32).
     is_64bit: bool,
+    /// Float decoder for F/D extensions.
+    float_decoder: FloatDecoder,
+    /// Vector decoder for V extension.
+    vector_decoder: VectorDecoder,
 }
 
 impl RiscVDisassembler {
     /// Creates a new RISC-V disassembler for RV64I.
     pub fn new() -> Self {
-        Self { is_64bit: true }
+        Self {
+            is_64bit: true,
+            float_decoder: FloatDecoder::new(true),
+            vector_decoder: VectorDecoder::new(true),
+        }
     }
 
     /// Creates a new RISC-V disassembler for RV32I.
     pub fn new_rv32() -> Self {
-        Self { is_64bit: false }
+        Self {
+            is_64bit: false,
+            float_decoder: FloatDecoder::new(false),
+            vector_decoder: VectorDecoder::new(false),
+        }
     }
 
     /// Creates a general-purpose register.
@@ -90,6 +124,30 @@ impl RiscVDisassembler {
             OP_SYSTEM => self.decode_system(insn, address, raw_bytes),
             OP_FENCE => self.decode_fence(insn, address, raw_bytes),
             OP_AMO => self.decode_amo(insn, address, raw_bytes),
+            // Floating-point extension (F/D)
+            OP_LOAD_FP => {
+                // Check if this is a vector load or FP load
+                if VectorDecoder::is_vector_load(insn) {
+                    self.vector_decoder.decode_vector_load(insn, address, raw_bytes)
+                } else {
+                    self.float_decoder.decode_load(insn, address, raw_bytes)
+                }
+            }
+            OP_STORE_FP => {
+                // Check if this is a vector store or FP store
+                if VectorDecoder::is_vector_store(insn) {
+                    self.vector_decoder.decode_vector_store(insn, address, raw_bytes)
+                } else {
+                    self.float_decoder.decode_store(insn, address, raw_bytes)
+                }
+            }
+            OP_MADD => self.float_decoder.decode_fmadd(insn, address, raw_bytes),
+            OP_MSUB => self.float_decoder.decode_fmsub(insn, address, raw_bytes),
+            OP_NMSUB => self.float_decoder.decode_fnmsub(insn, address, raw_bytes),
+            OP_NMADD => self.float_decoder.decode_fnmadd(insn, address, raw_bytes),
+            OP_FP => self.float_decoder.decode_op_fp(insn, address, raw_bytes),
+            // Vector extension (V)
+            OP_V => self.vector_decoder.decode_vector_arith(insn, address, raw_bytes),
             _ => Err(DecodeError::unknown_opcode(address, &raw_bytes)),
         }
     }
@@ -1823,5 +1881,416 @@ mod tests {
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "c.sdsp");
         assert_eq!(result.size, 2);
+    }
+
+    // ==================== Floating-Point Extension (F/D) Tests ====================
+
+    #[test]
+    fn test_flw() {
+        let disasm = RiscVDisassembler::new();
+        // flw f1, 0(x2): imm=0, rs1=2, funct3=010, rd=1, opcode=0000111
+        let insn: u32 = (0 << 20) | (2 << 15) | (0b010 << 12) | (1 << 7) | 0b0000111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "flw");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fld() {
+        let disasm = RiscVDisassembler::new();
+        // fld f1, 8(x2): imm=8, rs1=2, funct3=011, rd=1, opcode=0000111
+        let insn: u32 = (8 << 20) | (2 << 15) | (0b011 << 12) | (1 << 7) | 0b0000111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fld");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fsw() {
+        let disasm = RiscVDisassembler::new();
+        // fsw f1, 0(x2): imm[11:5]=0, rs2=1, rs1=2, funct3=010, imm[4:0]=0, opcode=0100111
+        let insn: u32 = (0 << 25) | (1 << 20) | (2 << 15) | (0b010 << 12) | (0 << 7) | 0b0100111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fsw");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fsd() {
+        let disasm = RiscVDisassembler::new();
+        // fsd f1, 8(x2): imm[11:5]=0, rs2=1, rs1=2, funct3=011, imm[4:0]=8, opcode=0100111
+        let insn: u32 = (0 << 25) | (1 << 20) | (2 << 15) | (0b011 << 12) | (8 << 7) | 0b0100111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fsd");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fadd_s() {
+        let disasm = RiscVDisassembler::new();
+        // fadd.s f3, f1, f2: funct7=0000000, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b0000000 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fadd.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fadd_d() {
+        let disasm = RiscVDisassembler::new();
+        // fadd.d f3, f1, f2: funct7=0000001, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b0000001 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fadd.d");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fsub_s() {
+        let disasm = RiscVDisassembler::new();
+        // fsub.s f3, f1, f2: funct7=0000100, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b0000100 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fsub.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmul_s() {
+        let disasm = RiscVDisassembler::new();
+        // fmul.s f3, f1, f2: funct7=0001000, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b0001000 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmul.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fdiv_s() {
+        let disasm = RiscVDisassembler::new();
+        // fdiv.s f3, f1, f2: funct7=0001100, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b0001100 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fdiv.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fsqrt_s() {
+        let disasm = RiscVDisassembler::new();
+        // fsqrt.s f2, f1: funct7=0101100, rs2=0, rs1=1, rm=000, rd=2, opcode=1010011
+        let insn: u32 = (0b0101100 << 25) | (0 << 20) | (1 << 15) | (0b000 << 12) | (2 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fsqrt.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmin_s() {
+        let disasm = RiscVDisassembler::new();
+        // fmin.s f3, f1, f2: funct7=0010100, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b0010100 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmin.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmax_s() {
+        let disasm = RiscVDisassembler::new();
+        // fmax.s f3, f1, f2: funct7=0010100, rs2=2, rs1=1, rm=001, rd=3, opcode=1010011
+        let insn: u32 = (0b0010100 << 25) | (2 << 20) | (1 << 15) | (0b001 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmax.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_feq_s() {
+        let disasm = RiscVDisassembler::new();
+        // feq.s x3, f1, f2: funct7=1010000, rs2=2, rs1=1, rm=010, rd=3, opcode=1010011
+        let insn: u32 = (0b1010000 << 25) | (2 << 20) | (1 << 15) | (0b010 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "feq.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_flt_s() {
+        let disasm = RiscVDisassembler::new();
+        // flt.s x3, f1, f2: funct7=1010000, rs2=2, rs1=1, rm=001, rd=3, opcode=1010011
+        let insn: u32 = (0b1010000 << 25) | (2 << 20) | (1 << 15) | (0b001 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "flt.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fle_s() {
+        let disasm = RiscVDisassembler::new();
+        // fle.s x3, f1, f2: funct7=1010000, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b1010000 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fle.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmadd_s() {
+        let disasm = RiscVDisassembler::new();
+        // fmadd.s f4, f1, f2, f3: rs3=3, fmt=00, rs2=2, rs1=1, rm=000, rd=4, opcode=1000011
+        let insn: u32 = (3 << 27) | (0b00 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (4 << 7) | 0b1000011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmadd.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmsub_s() {
+        let disasm = RiscVDisassembler::new();
+        // fmsub.s f4, f1, f2, f3: rs3=3, fmt=00, rs2=2, rs1=1, rm=000, rd=4, opcode=1000111
+        let insn: u32 = (3 << 27) | (0b00 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (4 << 7) | 0b1000111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmsub.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fcvt_w_s() {
+        let disasm = RiscVDisassembler::new();
+        // fcvt.w.s x3, f1: funct7=1100000, rs2=0, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b1100000 << 25) | (0 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fcvt.w.s");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fcvt_s_w() {
+        let disasm = RiscVDisassembler::new();
+        // fcvt.s.w f3, x1: funct7=1101000, rs2=0, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b1101000 << 25) | (0 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fcvt.s.w");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmv_x_w() {
+        let disasm = RiscVDisassembler::new();
+        // fmv.x.w x3, f1: funct7=1110000, rs2=0, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b1110000 << 25) | (0 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmv.x.w");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_fmv_w_x() {
+        let disasm = RiscVDisassembler::new();
+        // fmv.w.x f3, x1: funct7=1111000, rs2=0, rs1=1, rm=000, rd=3, opcode=1010011
+        let insn: u32 = (0b1111000 << 25) | (0 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "fmv.w.x");
+        assert_eq!(result.size, 4);
+    }
+
+    // ==================== Vector Extension (V) Tests ====================
+
+    #[test]
+    fn test_vsetvli() {
+        let disasm = RiscVDisassembler::new();
+        // vsetvli x1, x2, e32,m1: bit31=0, zimm=0x008, rs1=2, funct3=111, rd=1, opcode=1010111
+        let insn: u32 = (0b0 << 31) | (0x008 << 20) | (2 << 15) | (0b111 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vsetvli");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vsetivli() {
+        let disasm = RiscVDisassembler::new();
+        // vsetivli x1, 8, e32,m1: bit31=1, bit30=1, zimm=0x008, uimm=8, funct3=111, rd=1, opcode=1010111
+        let insn: u32 = (0b11 << 30) | (0x008 << 20) | (8 << 15) | (0b111 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vsetivli");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vsetvl() {
+        let disasm = RiscVDisassembler::new();
+        // vsetvl x1, x2, x3: bit31=1, bit30=0, rs2=3, rs1=2, funct3=111, rd=1, opcode=1010111
+        let insn: u32 = (0b10 << 30) | (3 << 20) | (2 << 15) | (0b111 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vsetvl");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vadd_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vadd.vv v1, v2, v3: funct6=000000, vm=1, vs2=2, vs1=3, funct3=000, vd=1, opcode=1010111
+        let insn: u32 = (0b000000 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b000 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vadd.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vadd_vx() {
+        let disasm = RiscVDisassembler::new();
+        // vadd.vx v1, v2, x3: funct6=000000, vm=1, vs2=2, rs1=3, funct3=100, vd=1, opcode=1010111
+        let insn: u32 = (0b000000 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b100 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vadd.vx");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vadd_vi() {
+        let disasm = RiscVDisassembler::new();
+        // vadd.vi v1, v2, 5: funct6=000000, vm=1, vs2=2, imm=5, funct3=011, vd=1, opcode=1010111
+        let insn: u32 = (0b000000 << 26) | (1 << 25) | (2 << 20) | (5 << 15) | (0b011 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vadd.vi");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vsub_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vsub.vv v1, v2, v3: funct6=000010, vm=1, vs2=2, vs1=3, funct3=000, vd=1, opcode=1010111
+        let insn: u32 = (0b000010 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b000 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vsub.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vmul_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vmul.vv v1, v2, v3: funct6=100100, vm=1, vs2=2, vs1=3, funct3=010, vd=1, opcode=1010111
+        let insn: u32 = (0b100100 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b010 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmul.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vdiv_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vdiv.vv v1, v2, v3: funct6=100001, vm=1, vs2=2, vs1=3, funct3=010, vd=1, opcode=1010111
+        let insn: u32 = (0b100001 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b010 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vdiv.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vand_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vand.vv v1, v2, v3: funct6=001001, vm=1, vs2=2, vs1=3, funct3=000, vd=1, opcode=1010111
+        let insn: u32 = (0b001001 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b000 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vand.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vor_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vor.vv v1, v2, v3: funct6=001010, vm=1, vs2=2, vs1=3, funct3=000, vd=1, opcode=1010111
+        let insn: u32 = (0b001010 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b000 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vor.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vxor_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vxor.vv v1, v2, v3: funct6=001011, vm=1, vs2=2, vs1=3, funct3=000, vd=1, opcode=1010111
+        let insn: u32 = (0b001011 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b000 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vxor.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vmseq_vv() {
+        let disasm = RiscVDisassembler::new();
+        // vmseq.vv v1, v2, v3: funct6=011000, vm=1, vs2=2, vs1=3, funct3=000, vd=1, opcode=1010111
+        let insn: u32 = (0b011000 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b000 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmseq.vv");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vle32() {
+        let disasm = RiscVDisassembler::new();
+        // vle32.v v1, (x2): nf=000, mop=00, vm=1, rs2=0, rs1=2, width=110, vd=1, opcode=0000111
+        let insn: u32 = (0b000 << 29) | (0b00 << 26) | (1 << 25) | (0 << 20) | (2 << 15) | (0b110 << 12) | (1 << 7) | 0b0000111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vle32.v");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vse32() {
+        let disasm = RiscVDisassembler::new();
+        // vse32.v v1, (x2): nf=000, mop=00, vm=1, rs2=0, rs1=2, width=110, vs3=1, opcode=0100111
+        let insn: u32 = (0b000 << 29) | (0b00 << 26) | (1 << 25) | (0 << 20) | (2 << 15) | (0b110 << 12) | (1 << 7) | 0b0100111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vse32.v");
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_vfadd_vf() {
+        let disasm = RiscVDisassembler::new();
+        // vfadd.vf v1, v2, f3: funct6=000000, vm=1, vs2=2, rs1=3, funct3=101, vd=1, opcode=1010111
+        let insn: u32 = (0b000000 << 26) | (1 << 25) | (2 << 20) | (3 << 15) | (0b101 << 12) | (1 << 7) | 0b1010111;
+        let bytes = insn.to_le_bytes();
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "vfadd.vf");
+        assert_eq!(result.size, 4);
     }
 }

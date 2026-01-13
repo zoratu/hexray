@@ -1,0 +1,49 @@
+[package]
+name = "hexray-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hexray-disasm = { path = "../crates/hexray-disasm" }
+hexray-formats = { path = "../crates/hexray-formats" }
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "x86_64_decoder"
+path = "fuzz_targets/x86_64_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arm64_decoder"
+path = "fuzz_targets/arm64_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "riscv_decoder"
+path = "fuzz_targets/riscv_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_parser"
+path = "fuzz_targets/elf_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macho_parser"
+path = "fuzz_targets/macho_parser.rs"
+test = false
+doc = false
+bench = false

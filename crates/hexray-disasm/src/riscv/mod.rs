@@ -6,10 +6,15 @@
 //! - M extension: Multiply/Divide
 //! - A extension: Atomics (LR/SC, AMO operations)
 //! - C extension: Compressed 16-bit instructions
+//! - F extension: Single-precision floating-point
+//! - D extension: Double-precision floating-point
+//! - V extension: Vector operations
 //!
 //! RISC-V uses a clean, regular encoding with 32-bit standard instructions
 //! and 16-bit compressed instructions (C extension).
 
 mod decoder;
+mod float;
+mod vector;
 
 pub use decoder::RiscVDisassembler;

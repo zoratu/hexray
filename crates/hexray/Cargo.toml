@@ -21,3 +21,13 @@ clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+hexray-core.workspace = true
+hexray-formats.workspace = true
+hexray-disasm = { workspace = true, features = ["all-archs"] }
+hexray-analysis.workspace = true
+
+[[test]]
+name = "differential_tests"
+path = "tests/differential_tests.rs"

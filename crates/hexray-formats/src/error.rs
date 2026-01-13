@@ -16,6 +16,18 @@ pub enum ParseError {
     #[error("file too short: expected at least {expected} bytes, got {actual}")]
     TooShort { expected: usize, actual: usize },
 
+    /// Truncated data while parsing.
+    #[error("truncated data: expected {expected} bytes, got {actual} while parsing {context}")]
+    TruncatedData {
+        expected: usize,
+        actual: usize,
+        context: &'static str,
+    },
+
+    /// Invalid value encountered during parsing.
+    #[error("invalid value: {0}")]
+    InvalidValue(&'static str),
+
     /// Unsupported format version.
     #[error("unsupported {format} version: {version}")]
     UnsupportedVersion { format: &'static str, version: u32 },

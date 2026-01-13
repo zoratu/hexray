@@ -620,6 +620,82 @@ impl TypeInference {
     pub fn all_types(&self) -> &HashMap<SsaValue, Type> {
         &self.types
     }
+
+    /// Exports types as a HashMap<String, String> suitable for the decompiler.
+    ///
+    /// This converts SSA values to their base register names and Type to C-style
+    /// type strings. For full integration with stack slot variables (var_8, local_10, etc.),
+    /// additional mapping is needed during the structuring phase.
+    pub fn export_for_decompiler(&self) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        for (value, ty) in &self.types {
+            // Use the base name without SSA version (e.g., "rax" instead of "rax_0")
+            let var_name = value.to_string();
+            let base_name = var_name.split('_').next().unwrap_or(&var_name).to_string();
+
+            // Convert Type to C-style string
+            let type_str = Self::type_to_c_string(ty);
+
+            // Only add if we have a meaningful type
+            if type_str != "unknown" && type_str != "int" {
+                result.insert(base_name, type_str);
+            }
+        }
+        result
+    }
+
+    /// Converts a Type to a C-style type string.
+    pub fn type_to_c_string(ty: &Type) -> String {
+        match ty {
+            Type::Unknown => "int".to_string(), // Default to int for unknown
+            Type::Void => "void".to_string(),
+            Type::Bool => "bool".to_string(),
+            Type::Int { size, signed } => {
+                match (size, signed) {
+                    (1, true) => "int8_t".to_string(),
+                    (1, false) => "uint8_t".to_string(),
+                    (2, true) => "int16_t".to_string(),
+                    (2, false) => "uint16_t".to_string(),
+                    (4, true) => "int".to_string(),
+                    (4, false) => "unsigned int".to_string(),
+                    (8, true) => "int64_t".to_string(),
+                    (8, false) => "uint64_t".to_string(),
+                    _ => if *signed { "int".to_string() } else { "unsigned int".to_string() }
+                }
+            }
+            Type::Float { size } => {
+                match size {
+                    4 => "float".to_string(),
+                    8 => "double".to_string(),
+                    16 => "long double".to_string(),
+                    _ => "double".to_string(),
+                }
+            }
+            Type::Pointer(inner) => {
+                format!("{}*", Self::type_to_c_string(inner))
+            }
+            Type::Array { element, count } => {
+                if let Some(n) = count {
+                    format!("{}[{}]", Self::type_to_c_string(element), n)
+                } else {
+                    format!("{}[]", Self::type_to_c_string(element))
+                }
+            }
+            Type::Function { return_type, params } => {
+                let ret = Self::type_to_c_string(return_type);
+                let param_strs: Vec<_> = params.iter().map(Self::type_to_c_string).collect();
+                format!("{} (*)({})", ret, param_strs.join(", "))
+            }
+            Type::Struct { name, .. } => {
+                if let Some(n) = name {
+                    format!("struct {}", n)
+                } else {
+                    "struct".to_string()
+                }
+            }
+            Type::CString => "char*".to_string(),
+        }
+    }
 }
 
 impl Default for TypeInference {

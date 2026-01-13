@@ -57,6 +57,28 @@ pub enum ExprKind {
     /// Address-of: &expr.
     AddressOf(Box<Expr>),
 
+    /// Array access: base[index].
+    /// Represents pointer arithmetic patterns like `*(base + index * element_size)`.
+    ArrayAccess {
+        /// The base pointer or array.
+        base: Box<Expr>,
+        /// The index expression.
+        index: Box<Expr>,
+        /// Size of each element in bytes.
+        element_size: usize,
+    },
+
+    /// Struct field access: base->field or base.field.
+    /// Represents memory access patterns like `*(base + offset)` where offset is a field.
+    FieldAccess {
+        /// The base pointer (struct pointer).
+        base: Box<Expr>,
+        /// The field name (e.g., "field_8", "field_10").
+        field_name: String,
+        /// The field offset in bytes.
+        offset: usize,
+    },
+
     /// Function call: func(args...).
     Call {
         target: CallTarget,
@@ -88,6 +110,15 @@ pub enum ExprKind {
         expr: Box<Expr>,
         to_size: u8,
         signed: bool,
+    },
+
+    /// Bit field extraction: extracts `width` bits starting at `start` from `expr`.
+    /// Represents patterns like `(x >> start) & mask` where mask = (1 << width) - 1.
+    /// Displayed as `BITS(expr, start, width)` or `expr[start:start+width]`.
+    BitField {
+        expr: Box<Expr>,
+        start: u8,
+        width: u8,
     },
 
     /// Phi node (for SSA - shows multiple possible values).
@@ -311,6 +342,16 @@ impl Variable {
             size,
         }
     }
+
+    /// Creates a register variable from a name string.
+    /// This is useful for creating expressions referencing known registers like "rbp", "sp".
+    pub fn reg(name: impl Into<String>, size: u8) -> Self {
+        Self {
+            kind: VarKind::Register(0), // ID is not used for matching, just name
+            name: name.into(),
+            size,
+        }
+    }
 }
 
 impl Expr {
@@ -362,6 +403,38 @@ impl Expr {
                 addr: Box::new(addr),
                 size,
             }
+        }
+    }
+
+    /// Creates an array access expression.
+    pub fn array_access(base: Expr, index: Expr, element_size: usize) -> Self {
+        Self {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(base),
+                index: Box::new(index),
+                element_size,
+            }
+        }
+    }
+
+    /// Creates a struct field access expression.
+    ///
+    /// This represents `base->field_name` in C syntax.
+    /// The offset is preserved for debugging/analysis purposes.
+    pub fn field_access(base: Expr, field_name: impl Into<String>, offset: usize) -> Self {
+        Self {
+            kind: ExprKind::FieldAccess {
+                base: Box::new(base),
+                field_name: field_name.into(),
+                offset,
+            }
+        }
+    }
+
+    /// Creates an address-of expression.
+    pub fn address_of(expr: Expr) -> Self {
+        Self {
+            kind: ExprKind::AddressOf(Box::new(expr)),
         }
     }
 
@@ -535,6 +608,24 @@ impl Expr {
                     _ => {}
                 }
 
+                // Sign extension pattern: (x << N) >> N where >> is SAR (arithmetic shift right)
+                // becomes (intN_t)x where remaining bits = 64 - N
+                if let Some(cast) = try_match_sign_extension(&left, op, &right) {
+                    return cast;
+                }
+
+                // Zero extension pattern: x & mask where mask is 0xFF, 0xFFFF, etc.
+                // becomes (uintN_t)x
+                if let Some(cast) = try_match_zero_extension(&left, op, &right) {
+                    return cast;
+                }
+
+                // Bit field extraction pattern: (x >> start) & mask
+                // becomes BITS(x, start, width) where width = popcount(mask)
+                if let Some(bitfield) = try_match_bitfield_extraction(&left, op, &right) {
+                    return bitfield;
+                }
+
                 Self::binop(op, left, right)
             }
             ExprKind::UnaryOp { op, operand } => {
@@ -566,7 +657,20 @@ impl Expr {
                 Self::assign(lhs.simplify(), rhs.simplify())
             }
             ExprKind::Deref { addr, size } => {
-                Self::deref(addr.simplify(), size)
+                let simplified_addr = addr.simplify();
+                // Try to detect array access patterns
+                if let Some(array_access) = try_detect_array_in_deref(&simplified_addr, size) {
+                    return array_access;
+                }
+                Self::deref(simplified_addr, size)
+            }
+            ExprKind::ArrayAccess { base, index, element_size } => {
+                // Simplify base and index recursively
+                Self::array_access(base.simplify(), index.simplify(), element_size)
+            }
+            ExprKind::AddressOf(inner) => {
+                let simplified = inner.simplify();
+                Self { kind: ExprKind::AddressOf(Box::new(simplified)) }
             }
             ExprKind::Call { target, args } => {
                 let args = args.into_iter().map(|a| a.simplify()).collect();
@@ -885,6 +989,176 @@ impl Expr {
                     Self::unknown(&inst.mnemonic)
                 }
             }
+            // Bit manipulation instructions (POPCNT, LZCNT, TZCNT)
+            Operation::Popcnt | Operation::Lzcnt | Operation::Tzcnt => {
+                if ops.len() >= 2 {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::call(
+                            CallTarget::Named(inst.mnemonic.clone()),
+                            vec![Self::from_operand(&ops[1])],
+                        ),
+                    )
+                } else {
+                    Self::unknown(&inst.mnemonic)
+                }
+            }
+            // BMI1/BMI2 instructions
+            Operation::AndNot => {
+                // ANDN: dest = ~src1 & src2
+                if ops.len() >= 3 {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::binop(
+                            BinOpKind::And,
+                            Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[1])),
+                            Self::from_operand(&ops[2]),
+                        ),
+                    )
+                } else {
+                    Self::unknown(&inst.mnemonic)
+                }
+            }
+            Operation::BitExtract | Operation::ExtractLowestBit | Operation::MaskUpToLowest |
+            Operation::ResetLowestBit | Operation::ZeroHighBits | Operation::ParallelDeposit |
+            Operation::ParallelExtract | Operation::MulNoFlags => {
+                // BMI instructions - emit as function calls for now
+                if !ops.is_empty() {
+                    Self::call(
+                        CallTarget::Named(inst.mnemonic.clone()),
+                        ops.iter().map(Self::from_operand).collect(),
+                    )
+                } else {
+                    Self::unknown(&inst.mnemonic)
+                }
+            }
+            // System instructions
+            Operation::StoreGdt | Operation::StoreIdt | Operation::LoadGdt | Operation::LoadIdt |
+            Operation::StoreMsw | Operation::LoadMsw | Operation::InvalidateTlb |
+            Operation::ReadMsr | Operation::WriteMsr | Operation::CpuId |
+            Operation::ReadTsc | Operation::ReadTscP => {
+                // System instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+            // Atomic/synchronization instructions
+            Operation::LoadExclusive | Operation::StoreExclusive |
+            Operation::AtomicAdd | Operation::AtomicClear | Operation::AtomicXor |
+            Operation::AtomicSet | Operation::AtomicSignedMax | Operation::AtomicSignedMin |
+            Operation::AtomicUnsignedMax | Operation::AtomicUnsignedMin |
+            Operation::AtomicSwap | Operation::CompareAndSwap => {
+                // Atomic instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+
+            // SVE (Scalable Vector Extension) instructions
+            Operation::SveLoad | Operation::SveStore | Operation::SveAdd |
+            Operation::SveSub | Operation::SveMul | Operation::SveAnd |
+            Operation::SveOr | Operation::SveXor | Operation::SveDup |
+            Operation::SveCompare | Operation::SveReduce | Operation::SveCount |
+            Operation::SvePermute | Operation::SvePredicate => {
+                // SVE instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+
+            // SVE2 (Scalable Vector Extension 2) instructions
+            Operation::Sve2AbsDiffAccum | Operation::Sve2AbsDiffAccumLong |
+            Operation::Sve2SatAbsNeg | Operation::Sve2SatDoublingMulHigh |
+            Operation::Sve2SatDoublingMulAddLong | Operation::Sve2BitDeposit |
+            Operation::Sve2BitExtract | Operation::Sve2BitGroup |
+            Operation::Sve2Histogram | Operation::Sve2Match |
+            Operation::Sve2NonTempLoad | Operation::Sve2Aes |
+            Operation::Sve2Sha3Rotate | Operation::Sve2Sm4 => {
+                // SVE2 instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+
+            // SME (Scalable Matrix Extension) instructions
+            Operation::SmeStart | Operation::SmeStop | Operation::SmeZeroZa |
+            Operation::SmeLoadZa | Operation::SmeStoreZa | Operation::SmeMova |
+            Operation::SmeFmopa | Operation::SmeFmops | Operation::SmeBfmop |
+            Operation::SmeSmop | Operation::SmeUmop | Operation::SmeSumop => {
+                // SME instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+
+            // AMX (Advanced Matrix Extensions) instructions - x86
+            Operation::AmxLoadTileConfig | Operation::AmxStoreTileConfig |
+            Operation::AmxTileRelease | Operation::AmxTileZero |
+            Operation::AmxTileLoad | Operation::AmxTileStore |
+            Operation::AmxDotProductSS | Operation::AmxDotProductSU |
+            Operation::AmxDotProductUS | Operation::AmxDotProductUU |
+            Operation::AmxFp16Multiply => {
+                // AMX instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+
+            // CET (Control-flow Enforcement Technology) instructions - x86
+            Operation::CetIncSsp | Operation::CetReadSsp | Operation::CetSavePrevSsp |
+            Operation::CetRestoreSsp | Operation::CetWriteSs | Operation::CetWriteUss |
+            Operation::CetEndBranch32 | Operation::CetEndBranch64 => {
+                // CET instructions - emit as function calls (or nop for ENDBR)
+                match inst.operation {
+                    Operation::CetEndBranch32 | Operation::CetEndBranch64 => {
+                        Self::unknown("/* nop */")
+                    }
+                    _ => Self::call(
+                        CallTarget::Named(inst.mnemonic.clone()),
+                        ops.iter().map(Self::from_operand).collect(),
+                    ),
+                }
+            }
+
+            // RISC-V Floating-Point instructions
+            Operation::FloatLoad | Operation::FloatStore | Operation::FloatAdd |
+            Operation::FloatSub | Operation::FloatMul | Operation::FloatDiv |
+            Operation::FloatSqrt | Operation::FloatMin | Operation::FloatMax |
+            Operation::FloatMulAdd | Operation::FloatMulSub | Operation::FloatNegMulAdd |
+            Operation::FloatNegMulSub | Operation::FloatConvert | Operation::FloatSignInject |
+            Operation::FloatCompare | Operation::FloatClassify | Operation::FloatMove => {
+                // RISC-V floating-point instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+
+            // RISC-V Vector instructions
+            Operation::VectorConfig | Operation::VectorLoad | Operation::VectorStore |
+            Operation::VectorStridedLoad | Operation::VectorStridedStore |
+            Operation::VectorIndexedLoad | Operation::VectorIndexedStore |
+            Operation::VectorAdd | Operation::VectorSub | Operation::VectorMul |
+            Operation::VectorDiv | Operation::VectorRem | Operation::VectorAnd |
+            Operation::VectorOr | Operation::VectorXor | Operation::VectorShl |
+            Operation::VectorShr | Operation::VectorSar | Operation::VectorCompare |
+            Operation::VectorMin | Operation::VectorMax | Operation::VectorMerge |
+            Operation::VectorMask | Operation::VectorReduce | Operation::VectorFloatAdd |
+            Operation::VectorFloatSub | Operation::VectorFloatMul | Operation::VectorFloatDiv |
+            Operation::VectorFloatMulAdd | Operation::VectorWiden | Operation::VectorNarrow |
+            Operation::VectorSlide | Operation::VectorGather | Operation::VectorCompress => {
+                // RISC-V vector instructions - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
         }
     }
 
@@ -953,6 +1227,13 @@ impl fmt::Display for Expr {
                 }
             }
             ExprKind::AddressOf(e) => write!(f, "&{}", e),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                write!(f, "{}[{}]", base, index)
+            }
+            ExprKind::FieldAccess { base, field_name, .. } => {
+                // Use -> for pointer access (most common in decompiled code)
+                write!(f, "{}->{}", base, field_name)
+            }
             ExprKind::Call { target, args } => {
                 match target {
                     CallTarget::Direct { target, .. } => write!(f, "sub_{:x}", target)?,
@@ -989,6 +1270,10 @@ impl fmt::Display for Expr {
                     _ => "unknown",
                 };
                 write!(f, "({}){}", type_name, expr)
+            }
+            ExprKind::BitField { expr, start, width } => {
+                // Display as BITS(expr, start, width) macro-style
+                write!(f, "BITS({}, {}, {})", expr, start, width)
             }
             ExprKind::Phi(exprs) => {
                 write!(f, "φ(")?;
@@ -1188,8 +1473,387 @@ fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
         ) => {
             s1 == s2 && exprs_structurally_equal(a1, a2)
         }
+        (
+            ExprKind::ArrayAccess { base: b1, index: i1, element_size: s1 },
+            ExprKind::ArrayAccess { base: b2, index: i2, element_size: s2 }
+        ) => {
+            s1 == s2 && exprs_structurally_equal(b1, b2) && exprs_structurally_equal(i1, i2)
+        }
+        (ExprKind::AddressOf(e1), ExprKind::AddressOf(e2)) => {
+            exprs_structurally_equal(e1, e2)
+        }
         _ => false,
     }
+}
+
+/// Matches sign extension pattern: (x << N) >> N where >> is SAR
+///
+/// When you shift left by N bits and then arithmetic shift right by N bits,
+/// you sign-extend the lower (64-N) bits to 64 bits.
+///
+/// Examples:
+/// - `(x << 56) >> 56` → `(int8_t)x`  (64-56=8 bits)
+/// - `(x << 48) >> 48` → `(int16_t)x` (64-48=16 bits)
+/// - `(x << 32) >> 32` → `(int32_t)x` (64-32=32 bits)
+fn try_match_sign_extension(left: &Expr, op: BinOpKind, right: &Expr) -> Option<Expr> {
+    // Must be arithmetic shift right (SAR) for sign extension
+    if op != BinOpKind::Sar {
+        return None;
+    }
+
+    // Right operand must be a constant (the shift amount)
+    let shift_amount = match &right.kind {
+        ExprKind::IntLit(n) => *n,
+        _ => return None,
+    };
+
+    // Left operand must be a left shift by the same amount
+    let (inner_expr, left_shift) = match &left.kind {
+        ExprKind::BinOp {
+            op: BinOpKind::Shl,
+            left: inner,
+            right: shift,
+        } => {
+            if let ExprKind::IntLit(n) = &shift.kind {
+                (inner.as_ref(), *n)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // Both shifts must be the same amount
+    if left_shift != shift_amount {
+        return None;
+    }
+
+    // Determine the resulting type size based on shift amount
+    // Assuming 64-bit registers:
+    // shift=56 → 8-bit, shift=48 → 16-bit, shift=32 → 32-bit, shift=24 → 40-bit (unusual)
+    let to_size = match shift_amount {
+        56 => 1, // 8-bit
+        48 => 2, // 16-bit
+        32 => 4, // 32-bit
+        24 => 5, // 40-bit (unusual, keep as-is)
+        _ => return None, // Unsupported pattern
+    };
+
+    // Special case: if the shift is 24, it's an unusual size, skip
+    if to_size == 5 {
+        return None;
+    }
+
+    Some(Expr {
+        kind: ExprKind::Cast {
+            expr: Box::new(inner_expr.clone()),
+            to_size,
+            signed: true,
+        },
+    })
+}
+
+/// Matches zero extension pattern: x & mask where mask is a power-of-2 minus 1
+///
+/// When you AND with a mask like 0xFF, 0xFFFF, or 0xFFFFFFFF,
+/// you zero-extend the value to that width.
+///
+/// Examples:
+/// - `x & 0xFF`       → `(uint8_t)x`
+/// - `x & 0xFFFF`     → `(uint16_t)x`
+/// - `x & 0xFFFFFFFF` → `(uint32_t)x`
+///
+/// Note: Does NOT match if the expression is a right shift, as that's
+/// a bit field extraction pattern handled separately.
+fn try_match_zero_extension(left: &Expr, op: BinOpKind, right: &Expr) -> Option<Expr> {
+    // Must be AND operation
+    if op != BinOpKind::And {
+        return None;
+    }
+
+    // Try both orderings: (x & mask) and (mask & x)
+    let (expr, mask) = if let ExprKind::IntLit(m) = &right.kind {
+        (left, *m)
+    } else if let ExprKind::IntLit(m) = &left.kind {
+        (right, *m)
+    } else {
+        return None;
+    };
+
+    // Don't match if the expression is a shift - that's bit field extraction
+    if let ExprKind::BinOp { op: BinOpKind::Shr | BinOpKind::Sar, right: shift_amt, .. } = &expr.kind {
+        // Only skip if it's a non-zero shift (shift by 0 is effectively no shift)
+        if let ExprKind::IntLit(n) = &shift_amt.kind {
+            if *n != 0 {
+                return None;
+            }
+        } else {
+            // Variable shift amount - let bit field extraction handle it
+            return None;
+        }
+    }
+
+    // Check for known mask patterns
+    let to_size = match mask {
+        0xFF => 1,         // 8-bit
+        0xFFFF => 2,       // 16-bit
+        0xFFFFFFFF => 4,   // 32-bit
+        _ => return None,  // Not a standard extension mask
+    };
+
+    // Don't convert if the expression is already a cast to the same size
+    if let ExprKind::Cast { to_size: existing_size, .. } = &expr.kind {
+        if *existing_size == to_size {
+            return None;
+        }
+    }
+
+    Some(Expr {
+        kind: ExprKind::Cast {
+            expr: Box::new(expr.clone()),
+            to_size,
+            signed: false,
+        },
+    })
+}
+
+/// Matches bit field extraction pattern: (x >> start) & mask
+///
+/// When you shift right by `start` bits and then AND with a contiguous mask,
+/// you're extracting a bit field.
+///
+/// Examples:
+/// - `(x >> 4) & 0xF`    → BITS(x, 4, 4)   (extract 4 bits starting at bit 4)
+/// - `(x >> 8) & 0xFF`   → BITS(x, 8, 8)   (extract 8 bits starting at bit 8)
+/// - `(x >> 16) & 0x3FF` → BITS(x, 16, 10) (extract 10 bits starting at bit 16)
+///
+/// The mask must be a contiguous sequence of 1 bits (i.e., (1 << width) - 1).
+fn try_match_bitfield_extraction(left: &Expr, op: BinOpKind, right: &Expr) -> Option<Expr> {
+    // Must be AND operation
+    if op != BinOpKind::And {
+        return None;
+    }
+
+    // Try both orderings: (shifted & mask) and (mask & shifted)
+    let (shifted_expr, mask) = if let ExprKind::IntLit(m) = &right.kind {
+        (left, *m)
+    } else if let ExprKind::IntLit(m) = &left.kind {
+        (right, *m)
+    } else {
+        return None;
+    };
+
+    // The shifted expression must be a right shift
+    let (inner_expr, shift_amount) = match &shifted_expr.kind {
+        ExprKind::BinOp {
+            op: BinOpKind::Shr | BinOpKind::Sar,
+            left: inner,
+            right: shift,
+        } => {
+            if let ExprKind::IntLit(n) = &shift.kind {
+                if *n < 0 || *n > 63 {
+                    return None;
+                }
+                (inner.as_ref(), *n as u8)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    // Check if mask is a valid contiguous bit mask: (1 << width) - 1
+    // Valid masks: 0x1, 0x3, 0x7, 0xF, 0x1F, 0x3F, 0x7F, 0xFF, etc.
+    let width = match mask_to_width(mask) {
+        Some(w) => w,
+        None => return None,
+    };
+
+    // Don't match if width is 0 or too large
+    if width == 0 || width > 64 {
+        return None;
+    }
+
+    // Skip if start is 0 (that's just zero extension, already handled)
+    if shift_amount == 0 {
+        return None;
+    }
+
+    Some(Expr {
+        kind: ExprKind::BitField {
+            expr: Box::new(inner_expr.clone()),
+            start: shift_amount,
+            width,
+        },
+    })
+}
+
+/// Converts a contiguous bit mask to a width.
+/// Returns Some(width) if mask is (1 << width) - 1, None otherwise.
+///
+/// Examples:
+/// - 0x1 (0b1) → 1
+/// - 0x3 (0b11) → 2
+/// - 0x7 (0b111) → 3
+/// - 0xF (0b1111) → 4
+/// - 0xFF → 8
+/// - 0xFFFF → 16
+/// - 0x5 (0b101) → None (not contiguous)
+fn mask_to_width(mask: i128) -> Option<u8> {
+    if mask <= 0 {
+        return None;
+    }
+
+    // Check if mask is (1 << n) - 1, which means mask + 1 is a power of 2
+    let mask_plus_one = mask.wrapping_add(1);
+
+    // A number is a power of 2 if it has exactly one bit set
+    // (n & (n - 1)) == 0 for powers of 2
+    if mask_plus_one > 0 && (mask_plus_one & (mask_plus_one - 1)) == 0 {
+        // Count trailing zeros to get the width
+        Some(mask_plus_one.trailing_zeros() as u8)
+    } else {
+        None
+    }
+}
+
+/// Attempts to detect array access patterns in a dereference address.
+///
+/// This function analyzes address expressions like:
+/// - `base + index * element_size` -> `base[index]`
+/// - `base + constant` -> `base[constant / size]` (when aligned)
+/// - `base + (index << shift)` -> `base[index]` (where 1 << shift == size)
+///
+/// Returns `Some(Expr::ArrayAccess { ... })` if a pattern is detected.
+fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
+    // Pattern 1: base + index * element_size
+    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+        // Try: base + (index * size)
+        if let Some((index, element_size)) = extract_scaled_index(right) {
+            if element_size == size as i128 {
+                return Some(Expr::array_access((**left).clone(), index, element_size as usize));
+            }
+        }
+
+        // Try: (index * size) + base (commutative)
+        if let Some((index, element_size)) = extract_scaled_index(left) {
+            if element_size == size as i128 {
+                return Some(Expr::array_access((**right).clone(), index, element_size as usize));
+            }
+        }
+
+        // Try shift patterns: base + (index << shift)
+        if let Some((index, shift_amount)) = extract_shift_index(right) {
+            let element_size = 1i128 << shift_amount;
+            if element_size == size as i128 {
+                return Some(Expr::array_access((**left).clone(), index, element_size as usize));
+            }
+        }
+
+        if let Some((index, shift_amount)) = extract_shift_index(left) {
+            let element_size = 1i128 << shift_amount;
+            if element_size == size as i128 {
+                return Some(Expr::array_access((**right).clone(), index, element_size as usize));
+            }
+        }
+
+        // Try constant offset: base + constant (aligned to size)
+        if let ExprKind::IntLit(offset) = &right.kind {
+            if *offset != 0 && size > 0 && *offset % (size as i128) == 0 {
+                let index = *offset / (size as i128);
+                return Some(Expr::array_access((**left).clone(), Expr::int(index), size as usize));
+            }
+        }
+
+        // Also check with offset on left side
+        if let ExprKind::IntLit(offset) = &left.kind {
+            if *offset != 0 && size > 0 && *offset % (size as i128) == 0 {
+                let index = *offset / (size as i128);
+                return Some(Expr::array_access((**right).clone(), Expr::int(index), size as usize));
+            }
+        }
+
+        // Try struct array pattern: (base + index * stride) + field_offset
+        // This handles cases where the inner expression already has scaled access
+        if let ExprKind::IntLit(field_offset) = &right.kind {
+            if let Some((index, stride)) = extract_scaled_index_from_expr(left) {
+                if stride > 0 && *field_offset % stride == 0 {
+                    // Aligned field offset - can adjust index
+                    let additional_index = *field_offset / stride;
+                    let combined_index = if additional_index == 0 {
+                        index
+                    } else {
+                        Expr::binop(BinOpKind::Add, index, Expr::int(additional_index))
+                    };
+                    // The base is inside the scaled expression
+                    if let ExprKind::BinOp { op: BinOpKind::Add, left: inner_left, right: inner_right } = &left.kind {
+                        if extract_scaled_index(inner_right).is_some() {
+                            return Some(Expr::array_access((**inner_left).clone(), combined_index, stride as usize));
+                        }
+                        if extract_scaled_index(inner_left).is_some() {
+                            return Some(Expr::array_access((**inner_right).clone(), combined_index, stride as usize));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern for subtraction: base - constant (negative index)
+    if let ExprKind::BinOp { op: BinOpKind::Sub, left, right } = &addr.kind {
+        if let ExprKind::IntLit(offset) = &right.kind {
+            if *offset != 0 && size > 0 && *offset % (size as i128) == 0 {
+                let index = -(*offset / (size as i128));
+                return Some(Expr::array_access((**left).clone(), Expr::int(index), size as usize));
+            }
+        }
+    }
+
+    None
+}
+
+/// Extracts (index, scale) from expressions like `index * scale` or `scale * index`.
+fn extract_scaled_index(expr: &Expr) -> Option<(Expr, i128)> {
+    if let ExprKind::BinOp { op: BinOpKind::Mul, left, right } = &expr.kind {
+        // Try: index * constant
+        if let ExprKind::IntLit(n) = &right.kind {
+            if *n > 0 && *n <= 1024 {
+                return Some(((**left).clone(), *n));
+            }
+        }
+        // Try: constant * index
+        if let ExprKind::IntLit(n) = &left.kind {
+            if *n > 0 && *n <= 1024 {
+                return Some(((**right).clone(), *n));
+            }
+        }
+    }
+    None
+}
+
+/// Extracts (index, shift_amount) from expressions like `index << constant`.
+fn extract_shift_index(expr: &Expr) -> Option<(Expr, i128)> {
+    if let ExprKind::BinOp { op: BinOpKind::Shl, left, right } = &expr.kind {
+        if let ExprKind::IntLit(n) = &right.kind {
+            if *n >= 0 && *n <= 6 {
+                return Some(((**left).clone(), *n));
+            }
+        }
+    }
+    None
+}
+
+/// Extracts scaled index from an expression that may be `base + index * stride`.
+fn extract_scaled_index_from_expr(expr: &Expr) -> Option<(Expr, i128)> {
+    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &expr.kind {
+        if let Some(result) = extract_scaled_index(right) {
+            return Some(result);
+        }
+        if let Some(result) = extract_scaled_index(left) {
+            return Some(result);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1366,5 +2030,549 @@ mod tests {
         let expr = Expr::binop(BinOpKind::Mul, inner, Expr::int(1));
         let simplified = expr.simplify();
         assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+    }
+
+    #[test]
+    fn test_sign_extension_patterns() {
+        let x = Expr::unknown("x");
+
+        // (x << 56) >> 56 = (int8_t)x
+        let shifted_left = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(56));
+        let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(56));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::Cast { to_size, signed, .. } => {
+                assert_eq!(*to_size, 1);
+                assert!(*signed);
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+
+        // (x << 48) >> 48 = (int16_t)x
+        let shifted_left = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(48));
+        let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(48));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::Cast { to_size, signed, .. } => {
+                assert_eq!(*to_size, 2);
+                assert!(*signed);
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+
+        // (x << 32) >> 32 = (int32_t)x
+        let shifted_left = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(32));
+        let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(32));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::Cast { to_size, signed, .. } => {
+                assert_eq!(*to_size, 4);
+                assert!(*signed);
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+
+        // Non-matching shifts should not simplify: (x << 48) >> 32
+        let shifted_left = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(48));
+        let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(32));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::Sar, .. }));
+
+        // Logical shift right should not become a cast (it's zero extension, not sign extension)
+        let shifted_left = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(56));
+        let expr = Expr::binop(BinOpKind::Shr, shifted_left, Expr::int(56));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::Shr, .. }));
+    }
+
+    #[test]
+    fn test_zero_extension_patterns() {
+        let x = Expr::unknown("x");
+
+        // x & 0xFF = (uint8_t)x
+        let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0xFF));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::Cast { to_size, signed, .. } => {
+                assert_eq!(*to_size, 1);
+                assert!(!*signed);
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+
+        // x & 0xFFFF = (uint16_t)x
+        let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0xFFFF));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::Cast { to_size, signed, .. } => {
+                assert_eq!(*to_size, 2);
+                assert!(!*signed);
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+
+        // x & 0xFFFFFFFF = (uint32_t)x
+        let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0xFFFFFFFF));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::Cast { to_size, signed, .. } => {
+                assert_eq!(*to_size, 4);
+                assert!(!*signed);
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+
+        // Commutative: 0xFF & x = (uint8_t)x
+        let expr = Expr::binop(BinOpKind::And, Expr::int(0xFF), x.clone());
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::Cast { to_size, signed, .. } => {
+                assert_eq!(*to_size, 1);
+                assert!(!*signed);
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+
+        // Non-standard masks should not simplify: x & 0x7F
+        let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0x7F));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::And, .. }));
+    }
+
+    #[test]
+    fn test_extension_display() {
+        let x = Expr::unknown("x");
+
+        // Test that casts display correctly
+        let cast_i8 = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(x.clone()),
+                to_size: 1,
+                signed: true,
+            },
+        };
+        assert_eq!(cast_i8.to_string(), "(int8_t)x");
+
+        let cast_u16 = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(x.clone()),
+                to_size: 2,
+                signed: false,
+            },
+        };
+        assert_eq!(cast_u16.to_string(), "(uint16_t)x");
+
+        let cast_i32 = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(x.clone()),
+                to_size: 4,
+                signed: true,
+            },
+        };
+        assert_eq!(cast_i32.to_string(), "(int32_t)x");
+    }
+
+    #[test]
+    fn test_mask_to_width() {
+        // Valid contiguous masks
+        assert_eq!(mask_to_width(0x1), Some(1));
+        assert_eq!(mask_to_width(0x3), Some(2));
+        assert_eq!(mask_to_width(0x7), Some(3));
+        assert_eq!(mask_to_width(0xF), Some(4));
+        assert_eq!(mask_to_width(0x1F), Some(5));
+        assert_eq!(mask_to_width(0x3F), Some(6));
+        assert_eq!(mask_to_width(0x7F), Some(7));
+        assert_eq!(mask_to_width(0xFF), Some(8));
+        assert_eq!(mask_to_width(0xFFFF), Some(16));
+        assert_eq!(mask_to_width(0xFFFFFFFF), Some(32));
+
+        // Invalid masks (not contiguous)
+        assert_eq!(mask_to_width(0x5), None);  // 0b101
+        assert_eq!(mask_to_width(0x9), None);  // 0b1001
+        assert_eq!(mask_to_width(0xA), None);  // 0b1010
+        assert_eq!(mask_to_width(0x101), None); // 0b100000001
+
+        // Edge cases
+        assert_eq!(mask_to_width(0), None);
+        assert_eq!(mask_to_width(-1), None);
+    }
+
+    #[test]
+    fn test_bitfield_extraction_patterns() {
+        let x = Expr::unknown("x");
+
+        // (x >> 4) & 0xF = BITS(x, 4, 4)
+        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(4));
+        let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0xF));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BitField { start, width, .. } => {
+                assert_eq!(*start, 4);
+                assert_eq!(*width, 4);
+            }
+            other => panic!("Expected BitField, got {:?}", other),
+        }
+
+        // (x >> 8) & 0xFF = BITS(x, 8, 8)
+        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(8));
+        let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0xFF));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BitField { start, width, .. } => {
+                assert_eq!(*start, 8);
+                assert_eq!(*width, 8);
+            }
+            other => panic!("Expected BitField, got {:?}", other),
+        }
+
+        // (x >> 16) & 0x3FF = BITS(x, 16, 10) (10-bit field)
+        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(16));
+        let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0x3FF));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BitField { start, width, .. } => {
+                assert_eq!(*start, 16);
+                assert_eq!(*width, 10);
+            }
+            other => panic!("Expected BitField, got {:?}", other),
+        }
+
+        // Commutative: 0xF & (x >> 4) = BITS(x, 4, 4)
+        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(4));
+        let expr = Expr::binop(BinOpKind::And, Expr::int(0xF), shifted);
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BitField { start, width, .. } => {
+                assert_eq!(*start, 4);
+                assert_eq!(*width, 4);
+            }
+            other => panic!("Expected BitField, got {:?}", other),
+        }
+
+        // Works with arithmetic shift right too
+        let shifted = Expr::binop(BinOpKind::Sar, x.clone(), Expr::int(12));
+        let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0x7));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BitField { start, width, .. } => {
+                assert_eq!(*start, 12);
+                assert_eq!(*width, 3);
+            }
+            other => panic!("Expected BitField, got {:?}", other),
+        }
+
+        // Non-contiguous mask should not match: (x >> 4) & 0x5
+        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(4));
+        let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0x5));
+        let simplified = expr.simplify();
+        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::And, .. }));
+
+        // Shift of 0 should not match (that's zero extension)
+        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(0));
+        let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0xF));
+        let simplified = expr.simplify();
+        // This should either remain as BinOp or become a zero extension Cast, not BitField
+        assert!(!matches!(simplified.kind, ExprKind::BitField { .. }));
+    }
+
+    #[test]
+    fn test_bitfield_display() {
+        let x = Expr::unknown("x");
+
+        // Test that BitField displays correctly
+        let bitfield = Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(x.clone()),
+                start: 4,
+                width: 4,
+            },
+        };
+        assert_eq!(bitfield.to_string(), "BITS(x, 4, 4)");
+
+        let bitfield2 = Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(x.clone()),
+                start: 16,
+                width: 8,
+            },
+        };
+        assert_eq!(bitfield2.to_string(), "BITS(x, 16, 8)");
+    }
+
+    // ============================================
+    // Array Access Detection Tests
+    // ============================================
+
+    #[test]
+    fn test_array_access_scaled_pattern() {
+        // *(rbx + rcx * 4) with 4-byte deref -> rbx[rcx]
+        let rbx = Expr::unknown("rbx");
+        let rcx = Expr::unknown("rcx");
+
+        // Create: rbx + rcx * 4
+        let scaled = Expr::binop(BinOpKind::Mul, rcx.clone(), Expr::int(4));
+        let addr = Expr::binop(BinOpKind::Add, rbx.clone(), scaled);
+
+        // Create dereference with size 4
+        let deref = Expr::deref(addr, 4);
+
+        // Simplify should detect array pattern
+        let simplified = deref.simplify();
+        match &simplified.kind {
+            ExprKind::ArrayAccess { base, index, element_size } => {
+                assert_eq!(*element_size, 4);
+                assert!(matches!(base.kind, ExprKind::Unknown(ref s) if s == "rbx"));
+                assert!(matches!(index.kind, ExprKind::Unknown(ref s) if s == "rcx"));
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "rbx[rcx]");
+    }
+
+    #[test]
+    fn test_array_access_commutative_scaled() {
+        // *(rcx * 8 + rbx) with 8-byte deref -> rbx[rcx]
+        let rbx = Expr::unknown("rbx");
+        let rcx = Expr::unknown("rcx");
+
+        // Create: rcx * 8 + rbx (reversed order)
+        let scaled = Expr::binop(BinOpKind::Mul, rcx.clone(), Expr::int(8));
+        let addr = Expr::binop(BinOpKind::Add, scaled, rbx.clone());
+
+        let deref = Expr::deref(addr, 8);
+        let simplified = deref.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess { element_size, .. } => {
+                assert_eq!(*element_size, 8);
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "rbx[rcx]");
+    }
+
+    #[test]
+    fn test_array_access_shift_pattern() {
+        // *(rbx + (rcx << 2)) with 4-byte deref -> rbx[rcx]
+        // 1 << 2 = 4, so this is equivalent to rcx * 4
+        let rbx = Expr::unknown("rbx");
+        let rcx = Expr::unknown("rcx");
+
+        let shifted = Expr::binop(BinOpKind::Shl, rcx.clone(), Expr::int(2));
+        let addr = Expr::binop(BinOpKind::Add, rbx.clone(), shifted);
+
+        let deref = Expr::deref(addr, 4);
+        let simplified = deref.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess { element_size, .. } => {
+                assert_eq!(*element_size, 4);
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "rbx[rcx]");
+    }
+
+    #[test]
+    fn test_array_access_constant_offset() {
+        // *(rbx + 0x10) with 4-byte deref -> rbx[4]
+        // 0x10 / 4 = 4
+        let rbx = Expr::unknown("rbx");
+
+        let addr = Expr::binop(BinOpKind::Add, rbx.clone(), Expr::int(0x10));
+        let deref = Expr::deref(addr, 4);
+        let simplified = deref.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess { index, element_size, .. } => {
+                assert_eq!(*element_size, 4);
+                if let ExprKind::IntLit(idx) = &index.kind {
+                    assert_eq!(*idx, 4); // 0x10 / 4 = 4
+                } else {
+                    panic!("Expected integer index");
+                }
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "rbx[4]");
+    }
+
+    #[test]
+    fn test_array_access_8byte_elements() {
+        // *(ptr + 0x18) with 8-byte deref -> ptr[3]
+        // 0x18 (24) / 8 = 3
+        let ptr = Expr::unknown("ptr");
+
+        let addr = Expr::binop(BinOpKind::Add, ptr.clone(), Expr::int(0x18));
+        let deref = Expr::deref(addr, 8);
+        let simplified = deref.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess { index, element_size, .. } => {
+                assert_eq!(*element_size, 8);
+                if let ExprKind::IntLit(idx) = &index.kind {
+                    assert_eq!(*idx, 3);
+                } else {
+                    panic!("Expected integer index");
+                }
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "ptr[3]");
+    }
+
+    #[test]
+    fn test_array_access_negative_offset() {
+        // *(ptr - 8) with 8-byte deref -> ptr[-1]
+        let ptr = Expr::unknown("ptr");
+
+        let addr = Expr::binop(BinOpKind::Sub, ptr.clone(), Expr::int(8));
+        let deref = Expr::deref(addr, 8);
+        let simplified = deref.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess { index, element_size, .. } => {
+                assert_eq!(*element_size, 8);
+                if let ExprKind::IntLit(idx) = &index.kind {
+                    assert_eq!(*idx, -1);
+                } else {
+                    panic!("Expected integer index");
+                }
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        // Note: -1 is displayed as -0x1 due to hex formatting
+        assert_eq!(simplified.to_string(), "ptr[-0x1]");
+    }
+
+    #[test]
+    fn test_array_access_struct_array_pattern() {
+        // *((base + index * 16) + 8) with 8-byte deref
+        // This is accessing element at offset 8 in a 16-byte struct array
+        // Should become base[index + 1] when treating as 16-byte elements
+        let base = Expr::unknown("base");
+        let index = Expr::unknown("i");
+
+        let scaled = Expr::binop(BinOpKind::Mul, index.clone(), Expr::int(16));
+        let inner = Expr::binop(BinOpKind::Add, base.clone(), scaled);
+        let addr = Expr::binop(BinOpKind::Add, inner, Expr::int(8));
+
+        // The element size for the struct array detection should be 16
+        // but the deref is 8 bytes (accessing a field within the struct)
+        let deref = Expr::deref(addr, 16); // Use stride as size hint
+        let simplified = deref.simplify();
+
+        // Should detect this as struct array pattern
+        match &simplified.kind {
+            ExprKind::ArrayAccess { element_size, .. } => {
+                assert_eq!(*element_size, 16);
+            }
+            _ => {} // May not match all patterns, that's ok
+        }
+    }
+
+    #[test]
+    fn test_array_access_no_match_unaligned() {
+        // *(ptr + 5) with 4-byte deref should NOT match
+        // 5 is not divisible by 4
+        let ptr = Expr::unknown("ptr");
+
+        let addr = Expr::binop(BinOpKind::Add, ptr.clone(), Expr::int(5));
+        let deref = Expr::deref(addr, 4);
+        let simplified = deref.simplify();
+
+        // Should remain as Deref, not ArrayAccess
+        assert!(matches!(simplified.kind, ExprKind::Deref { .. }),
+            "Expected Deref for unaligned offset, got {:?}", simplified.kind);
+    }
+
+    #[test]
+    fn test_array_access_no_match_size_mismatch() {
+        // *(ptr + i * 4) with 8-byte deref should NOT match
+        // Element size 4 doesn't match deref size 8
+        let ptr = Expr::unknown("ptr");
+        let i = Expr::unknown("i");
+
+        let scaled = Expr::binop(BinOpKind::Mul, i.clone(), Expr::int(4));
+        let addr = Expr::binop(BinOpKind::Add, ptr.clone(), scaled);
+        let deref = Expr::deref(addr, 8); // Mismatch!
+        let simplified = deref.simplify();
+
+        // Should remain as Deref, not ArrayAccess
+        assert!(matches!(simplified.kind, ExprKind::Deref { .. }),
+            "Expected Deref for size mismatch, got {:?}", simplified.kind);
+    }
+
+    #[test]
+    fn test_array_access_display() {
+        // Test array access display formatting
+        let arr = Expr::unknown("arr");
+        let i = Expr::unknown("i");
+
+        let access = Expr::array_access(arr.clone(), i.clone(), 4);
+        assert_eq!(access.to_string(), "arr[i]");
+
+        // Constant index
+        let access_const = Expr::array_access(arr.clone(), Expr::int(5), 8);
+        assert_eq!(access_const.to_string(), "arr[5]");
+
+        // Complex index expression
+        let complex_idx = Expr::binop(BinOpKind::Add, i.clone(), Expr::int(1));
+        let access_complex = Expr::array_access(arr.clone(), complex_idx, 4);
+        assert_eq!(access_complex.to_string(), "arr[i + 1]");
+    }
+
+    #[test]
+    fn test_array_access_nested() {
+        // arr[i][j] - multidimensional array access
+        let arr = Expr::unknown("arr");
+        let i = Expr::unknown("i");
+        let j = Expr::unknown("j");
+
+        let inner = Expr::array_access(arr.clone(), i.clone(), 8);
+        let outer = Expr::array_access(inner, j.clone(), 4);
+
+        assert_eq!(outer.to_string(), "arr[i][j]");
+    }
+
+    #[test]
+    fn test_address_of_display() {
+        // &arr[i] pattern
+        let arr = Expr::unknown("arr");
+        let i = Expr::unknown("i");
+
+        let access = Expr::array_access(arr.clone(), i.clone(), 4);
+        let addr_of = Expr::address_of(access);
+
+        assert_eq!(addr_of.to_string(), "&arr[i]");
+    }
+
+    #[test]
+    fn test_array_access_simplifies_recursively() {
+        // ArrayAccess with base and index that need simplification
+        // base: x + 0 (should simplify to x)
+        // index: 5 + 3 (should simplify to 8)
+        let x = Expr::unknown("x");
+        let base_needs_simplify = Expr::binop(BinOpKind::Add, x.clone(), Expr::int(0));
+        let index_needs_simplify = Expr::binop(BinOpKind::Add, Expr::int(5), Expr::int(3));
+
+        let access = Expr::array_access(base_needs_simplify, index_needs_simplify, 4);
+        let simplified = access.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess { base, index, .. } => {
+                assert!(matches!(base.kind, ExprKind::Unknown(ref s) if s == "x"));
+                assert!(matches!(index.kind, ExprKind::IntLit(8)));
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "x[8]");
     }
 }

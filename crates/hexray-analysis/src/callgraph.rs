@@ -244,6 +244,8 @@ pub struct CallGraphBuilder {
     call_graph: CallGraph,
     /// Maps function entry addresses to their instructions.
     function_instructions: HashMap<u64, Vec<Instruction>>,
+    /// Optional indirect call resolver for resolving indirect calls.
+    indirect_resolver: Option<crate::IndirectCallResolver>,
 }
 
 impl CallGraphBuilder {
@@ -252,7 +254,17 @@ impl CallGraphBuilder {
         Self {
             call_graph: CallGraph::new(),
             function_instructions: HashMap::new(),
+            indirect_resolver: None,
         }
+    }
+
+    /// Sets an indirect call resolver for resolving indirect calls during build.
+    ///
+    /// When set, the builder will attempt to resolve indirect calls and add
+    /// the resolved targets as edges in the call graph with `CallType::Indirect`.
+    pub fn with_indirect_resolver(mut self, resolver: crate::IndirectCallResolver) -> Self {
+        self.indirect_resolver = Some(resolver);
+        self
     }
 
     /// Add symbols to populate function names.
@@ -292,6 +304,11 @@ impl CallGraphBuilder {
         let functions: Vec<_> = self.function_instructions.iter().collect();
 
         for (&caller_entry, instructions) in &functions {
+            // First, try to resolve indirect calls using the resolver
+            let resolved_indirect_calls = self.indirect_resolver.as_ref().map(|resolver| {
+                resolver.analyze(instructions)
+            });
+
             for instr in *instructions {
                 match &instr.control_flow {
                     ControlFlow::Call { target, .. } => {
@@ -310,9 +327,35 @@ impl CallGraphBuilder {
                         );
                     }
                     ControlFlow::IndirectCall { .. } => {
-                        // Record unresolved indirect call
-                        self.call_graph
-                            .add_unresolved_call(caller_entry, instr.address);
+                        // Try to find a resolution for this indirect call
+                        let resolved = resolved_indirect_calls.as_ref().and_then(|resolutions| {
+                            resolutions.iter().find(|r| r.call_site == instr.address)
+                        });
+
+                        if let Some(resolution) = resolved {
+                            if resolution.is_resolved() {
+                                // Add edges for all resolved targets
+                                for &target in &resolution.possible_targets {
+                                    if !self.call_graph.nodes.contains_key(&target) {
+                                        self.call_graph.add_node(target, None, false);
+                                    }
+                                    self.call_graph.add_call(
+                                        caller_entry,
+                                        target,
+                                        CallSite {
+                                            call_address: instr.address,
+                                            call_type: CallType::Indirect,
+                                        },
+                                    );
+                                }
+                            } else {
+                                // Record as unresolved
+                                self.call_graph.add_unresolved_call(caller_entry, instr.address);
+                            }
+                        } else {
+                            // No resolver or no resolution found
+                            self.call_graph.add_unresolved_call(caller_entry, instr.address);
+                        }
                     }
                     _ => {}
                 }

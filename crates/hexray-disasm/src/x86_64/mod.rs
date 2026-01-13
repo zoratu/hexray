@@ -10,6 +10,9 @@
 mod decoder;
 mod modrm;
 mod opcodes;
+mod opcodes_0f38;
+mod opcodes_0f3a;
 mod prefix;
 
 pub use decoder::X86_64Disassembler;
+pub use prefix::{Prefixes, Rex, Vex, Evex};

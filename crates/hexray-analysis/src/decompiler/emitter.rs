@@ -6,7 +6,10 @@
 
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
+use super::naming::NamingContext;
+use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
 use super::{StringTable, SymbolTable, RelocationTable};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write;
 
@@ -59,6 +62,17 @@ pub struct PseudoCodeEmitter {
     string_table: Option<StringTable>,
     symbol_table: Option<SymbolTable>,
     relocation_table: Option<RelocationTable>,
+    /// Type information for variables (var_name -> type_string).
+    type_info: std::collections::HashMap<String, String>,
+    /// DWARF variable names (stack_offset -> name).
+    dwarf_names: std::collections::HashMap<i128, String>,
+    /// Naming context for pattern-based variable naming.
+    /// Uses RefCell for interior mutability during emission.
+    naming_ctx: RefCell<NamingContext>,
+    /// Calling convention for signature recovery.
+    calling_convention: CallingConvention,
+    /// Whether to use advanced signature recovery.
+    use_signature_recovery: bool,
 }
 
 impl PseudoCodeEmitter {
@@ -70,7 +84,24 @@ impl PseudoCodeEmitter {
             string_table: None,
             symbol_table: None,
             relocation_table: None,
+            type_info: std::collections::HashMap::new(),
+            dwarf_names: std::collections::HashMap::new(),
+            naming_ctx: RefCell::new(NamingContext::new()),
+            calling_convention: CallingConvention::default(),
+            use_signature_recovery: true,
         }
+    }
+
+    /// Sets the calling convention for signature recovery.
+    pub fn with_calling_convention(mut self, convention: CallingConvention) -> Self {
+        self.calling_convention = convention;
+        self
+    }
+
+    /// Enables or disables advanced signature recovery.
+    pub fn with_signature_recovery(mut self, enabled: bool) -> Self {
+        self.use_signature_recovery = enabled;
+        self
     }
 
     /// Sets the string table for resolving addresses.
@@ -91,17 +122,40 @@ impl PseudoCodeEmitter {
         self
     }
 
+    /// Sets type information for variables.
+    /// Keys should be variable names (e.g., "var_8", "local_10"),
+    /// values should be C type strings (e.g., "int", "char*", "float").
+    pub fn with_type_info(mut self, type_info: std::collections::HashMap<String, String>) -> Self {
+        self.type_info = type_info;
+        self
+    }
+
+    /// Sets DWARF variable names.
+    /// Keys are stack offsets (frame-relative), values are variable names.
+    pub fn with_dwarf_names(mut self, names: std::collections::HashMap<i128, String>) -> Self {
+        // Also add to naming context for consistent lookup
+        self.naming_ctx.borrow_mut().add_dwarf_names(names.clone());
+        self.dwarf_names = names;
+        self
+    }
+
+    /// Gets the DWARF name for a stack offset, if available.
+    fn get_dwarf_name(&self, offset: i128) -> Option<&str> {
+        self.dwarf_names.get(&offset).map(|s| s.as_str())
+    }
+
+    /// Gets the type string for a variable, defaulting to "int".
+    fn get_type(&self, var_name: &str) -> &str {
+        self.type_info.get(var_name).map(|s| s.as_str()).unwrap_or("int")
+    }
+
     /// Formats an expression, resolving strings from the string table.
     fn format_expr(&self, expr: &Expr) -> String {
-        // Use format_expr_with_strings if we have a string table OR relocation table
-        // This ensures GOT/relocation lookups happen even without a string table
-        if self.string_table.is_some() || self.relocation_table.is_some() {
-            let empty = super::StringTable::new();
-            let table = self.string_table.as_ref().unwrap_or(&empty);
-            self.format_expr_with_strings(expr, table)
-        } else {
-            expr.to_string()
-        }
+        // Always use format_expr_with_strings for stack slot resolution and DWARF names
+        // The string table is optional - we pass an empty one if not available
+        let empty = super::StringTable::new();
+        let table = self.string_table.as_ref().unwrap_or(&empty);
+        self.format_expr_with_strings(expr, table)
     }
 
     /// Formats an expression with string resolution.
@@ -298,18 +352,68 @@ impl PseudoCodeEmitter {
     pub fn emit(&self, cfg: &StructuredCfg, func_name: &str) -> String {
         let mut output = String::new();
 
-        // Analyze function to detect parameters and return type
-        let func_info = self.analyze_function(&cfg.body);
+        // Analyze function body for pattern-based variable naming (loop indices, etc.)
+        self.naming_ctx.borrow_mut().analyze(&cfg.body);
+
+        // Use advanced signature recovery if enabled
+        let (signature, func_info) = if self.use_signature_recovery {
+            let mut recovery = SignatureRecovery::new(self.calling_convention);
+            let sig = recovery.analyze(cfg);
+
+            // Convert recovered signature to FunctionInfo for compatibility
+            let params: Vec<String> = sig.parameters.iter()
+                .map(|p| p.name.clone())
+                .collect();
+
+            let info = self.analyze_function(&cfg.body);
+            let merged_info = FunctionInfo {
+                parameters: if params.is_empty() { info.parameters } else { params },
+                has_return_value: sig.has_return || info.has_return_value,
+                skip_statements: info.skip_statements,
+            };
+
+            (Some(sig), merged_info)
+        } else {
+            (None, self.analyze_function(&cfg.body))
+        };
 
         // Function header with detected signature
-        let return_type = if func_info.has_return_value { "int" } else { "void" };
-        if func_info.parameters.is_empty() {
-            writeln!(output, "{} {}()", return_type, func_name).unwrap();
+        if let Some(ref sig) = signature {
+            // Use the recovered signature for type information
+            let return_type = if sig.has_return {
+                sig.return_type.to_c_string()
+            } else if func_info.has_return_value {
+                "int".to_string()
+            } else {
+                "void".to_string()
+            };
+
+            if sig.parameters.is_empty() && func_info.parameters.is_empty() {
+                writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
+            } else if !sig.parameters.is_empty() {
+                // Use recovered signature with inferred types
+                let params: Vec<_> = sig.parameters.iter()
+                    .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
+                    .collect();
+                writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+            } else {
+                // Fall back to legacy parameter detection
+                let params: Vec<_> = func_info.parameters.iter()
+                    .map(|p| format!("{} {}", self.get_type(p), p))
+                    .collect();
+                writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+            }
         } else {
-            let params: Vec<_> = func_info.parameters.iter()
-                .map(|p| format!("int {}", p))
-                .collect();
-            writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+            // Legacy fallback
+            let return_type = if func_info.has_return_value { "int" } else { "void" };
+            if func_info.parameters.is_empty() {
+                writeln!(output, "{} {}()", return_type, func_name).unwrap();
+            } else {
+                let params: Vec<_> = func_info.parameters.iter()
+                    .map(|p| format!("{} {}", self.get_type(p), p))
+                    .collect();
+                writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+            }
         }
         writeln!(output, "{{").unwrap();
 
@@ -320,7 +424,8 @@ impl PseudoCodeEmitter {
         if !all_vars.is_empty() {
             let indent = &self.indent;
             for var in &all_vars {
-                writeln!(output, "{}int {};", indent, var).unwrap();
+                let var_type = self.get_type(var);
+                writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
             }
             writeln!(output).unwrap(); // Blank line after declarations
         }
@@ -334,6 +439,74 @@ impl PseudoCodeEmitter {
 
         writeln!(output, "}}").unwrap();
         output
+    }
+
+    /// Emits pseudo-code with a specific function signature.
+    ///
+    /// This allows providing a pre-computed signature for cases where
+    /// additional context (like symbol information) is available.
+    pub fn emit_with_signature(&self, cfg: &StructuredCfg, func_name: &str, signature: &FunctionSignature) -> String {
+        let mut output = String::new();
+
+        // Analyze function body for pattern-based variable naming
+        self.naming_ctx.borrow_mut().analyze(&cfg.body);
+
+        // Use provided signature for header
+        let return_type = if signature.has_return {
+            signature.return_type.to_c_string()
+        } else {
+            "void".to_string()
+        };
+
+        if signature.parameters.is_empty() {
+            writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
+        } else {
+            let params: Vec<_> = signature.parameters.iter()
+                .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
+                .collect();
+            writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+        }
+        writeln!(output, "{{").unwrap();
+
+        // Legacy analysis for skipping parameter statements
+        let func_info = self.analyze_function(&cfg.body);
+
+        // Collect parameter names from signature
+        let param_names: Vec<String> = signature.parameters.iter()
+            .map(|p| p.name.clone())
+            .collect();
+
+        // Collect all local variables used in the function (excluding parameters)
+        let all_vars = self.collect_local_variables(&cfg.body, &param_names);
+
+        // Emit variable declarations at the top (C89 style)
+        if !all_vars.is_empty() {
+            let indent = &self.indent;
+            for var in &all_vars {
+                let var_type = self.get_type(var);
+                writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
+            }
+            writeln!(output).unwrap();
+        }
+
+        // Track declared variables (parameters + locals)
+        let mut declared_vars: HashSet<String> = param_names.into_iter().collect();
+        declared_vars.extend(all_vars);
+
+        // Emit body
+        self.emit_nodes_with_skip_and_decls(&cfg.body, &mut output, 1, &func_info.skip_statements, &mut declared_vars);
+
+        writeln!(output, "}}").unwrap();
+        output
+    }
+
+    /// Recovers the function signature for the given CFG.
+    ///
+    /// This can be used to get the signature separately from emission,
+    /// for example to display it in a symbol table or for further analysis.
+    pub fn recover_signature(&self, cfg: &StructuredCfg) -> FunctionSignature {
+        let mut recovery = SignatureRecovery::new(self.calling_convention);
+        recovery.analyze(cfg)
     }
 
     /// Collects all local variables assigned to in the function body.
@@ -367,7 +540,8 @@ impl PseudoCodeEmitter {
                         continue;
                     }
                     if let ExprKind::Assign { lhs, .. } = &stmt.kind {
-                        if let Some(var_name) = get_stack_var_name(lhs) {
+                        // Use try_format_stack_slot to get DWARF-aware variable name
+                        if let Some(var_name) = self.try_get_var_name(lhs) {
                             vars.insert(var_name);
                         }
                     }
@@ -388,7 +562,7 @@ impl PseudoCodeEmitter {
                 // Collect variable from init expression (e.g., for (i = 0; ...))
                 if let Some(init_expr) = init {
                     if let ExprKind::Assign { lhs, .. } = &init_expr.kind {
-                        if let Some(var_name) = get_stack_var_name(lhs) {
+                        if let Some(var_name) = self.try_get_var_name(lhs) {
                             vars.insert(var_name);
                         }
                     }
@@ -432,10 +606,11 @@ impl PseudoCodeEmitter {
                     // Check if RHS is an argument register
                     if let ExprKind::Var(rhs_var) = &rhs.kind {
                         if let Some(arg_idx) = get_arg_register_index(&rhs_var.name) {
-                            // Check if LHS is a stack variable (either Var or Deref that formats to var_N)
-                            let lhs_name = get_stack_var_name(lhs);
+                            // Check if LHS is a stack variable - use DWARF-aware naming
+                            let lhs_name = self.try_get_var_name(lhs);
                             if let Some(var_name) = lhs_name {
-                                if var_name.starts_with("var_") || var_name.starts_with("local_") {
+                                // Accept any DWARF name or standard stack var patterns
+                                if !var_name.is_empty() {
                                     // This is a parameter: use the stack var name as param name
                                     // Ensure we have enough slots
                                     while info.parameters.len() <= arg_idx {
@@ -1284,6 +1459,24 @@ impl PseudoCodeEmitter {
         false
     }
 
+    /// Try to get a variable name from an expression (either Var or Deref of stack slot).
+    /// Uses DWARF names when available.
+    fn try_get_var_name(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Var(v) => {
+                if v.name.starts_with("var_") || v.name.starts_with("arg_") || v.name.starts_with("local_") {
+                    Some(v.name.clone())
+                } else {
+                    None
+                }
+            }
+            ExprKind::Deref { addr, size } => {
+                self.try_format_stack_slot(addr, *size)
+            }
+            _ => None,
+        }
+    }
+
     /// Try to format a stack slot dereference as a local variable name.
     /// Detects patterns like rbp + -0x8 and converts to var_8.
     fn try_format_stack_slot(&self, addr: &Expr, _size: u8) -> Option<String> {
@@ -1292,6 +1485,10 @@ impl PseudoCodeEmitter {
         // Check for base-only pattern (offset 0): just "sp" or "x29"
         if let ExprKind::Var(base) = &addr.kind {
             if base.name == "sp" {
+                // Check for DWARF name at offset 0
+                if let Some(name) = self.get_dwarf_name(0) {
+                    return Some(name.to_string());
+                }
                 return Some("var_0".to_string());
             }
         }
@@ -1312,20 +1509,16 @@ impl PseudoCodeEmitter {
                             _ => return None,
                         };
 
-                        if is_frame_pointer {
-                            // Frame pointer: locals at negative offsets, args at positive
-                            // Use different prefix to avoid collision with sp-relative vars
-                            if actual_offset < 0 {
-                                return Some(format!("local_{:x}", -actual_offset));
-                            } else if actual_offset > 0 {
-                                return Some(format!("arg_{:x}", actual_offset));
-                            }
-                        } else {
-                            // Stack pointer: locals at positive offsets
-                            if actual_offset >= 0 {
-                                return Some(format!("var_{:x}", actual_offset));
-                            }
+                        // First, check for DWARF name at this offset
+                        if let Some(name) = self.get_dwarf_name(actual_offset) {
+                            return Some(name.to_string());
                         }
+
+                        // Use NamingContext for pattern-based naming (loop indices, type hints, etc.)
+                        // This will return names like 'i', 'j', 'k' for loop counters
+                        let is_param = is_frame_pointer && actual_offset > 0;
+                        let name = self.naming_ctx.borrow_mut().get_name(actual_offset, is_param);
+                        return Some(name);
                     }
                 }
             }
@@ -1800,6 +1993,7 @@ fn extract_shift_left_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
 mod tests {
     use super::*;
     use super::super::expression::BinOpKind;
+    use std::collections::HashMap;
 
     #[test]
     fn test_emit_if_else() {
@@ -1854,7 +2048,158 @@ mod tests {
         let emitter = PseudoCodeEmitter::new("    ", false);
         let output = emitter.emit(&cfg, "test");
 
-        assert!(output.contains("while (i < 0xa)"));
-        assert!(output.contains("i = i + 1"));
+        assert!(output.contains("while (i < 10)"), "Expected 'while (i < 10)', got: {}", output);
+        assert!(output.contains("i++") || output.contains("i = i + 1"), "Expected increment, got: {}", output);
+    }
+
+    #[test]
+    fn test_type_inference_integration() {
+        use super::super::expression::Variable;
+
+        // Create a structured CFG with stack slot variables
+        // Simulating [rbp - 0x8] and [rbp - 0x10] patterns that become local_8 and local_10
+
+        // Create expressions for stack slots: *(rbp + -8) and *(rbp + -16)
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let local_8_addr = Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(-8));
+        let local_10_addr = Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(-16));
+
+        // Create deref expressions for the stack slots
+        let local_8 = Expr::deref(local_8_addr.clone(), 8);
+        let local_10 = Expr::deref(local_10_addr.clone(), 4);
+
+        // Create assignments to these stack slots
+        let stmt1 = Expr::assign(local_8.clone(), Expr::int(42));
+        let stmt2 = Expr::assign(local_10.clone(), Expr::int(100));
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![stmt1, stmt2],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        // Test without type info - should use default "int"
+        let emitter_no_types = PseudoCodeEmitter::new("    ", false);
+        let output_no_types = emitter_no_types.emit(&cfg, "test_func");
+
+        // Variable declarations should show the local variable names (local_8, local_10)
+        // and the statements should use those names
+        assert!(output_no_types.contains("local_8") || output_no_types.contains("local_10"),
+            "Expected local_8/local_10 variables in output:\n{}", output_no_types);
+
+        // Test with type info - should use inferred types
+        let mut type_info = HashMap::new();
+        type_info.insert("local_8".to_string(), "int64_t".to_string());
+        type_info.insert("local_10".to_string(), "uint32_t".to_string());
+
+        let emitter_with_types = PseudoCodeEmitter::new("    ", false)
+            .with_type_info(type_info);
+        let output_with_types = emitter_with_types.emit(&cfg, "test_func");
+
+        // Variable declarations should use the inferred types
+        assert!(output_with_types.contains("int64_t local_8"),
+            "Expected 'int64_t local_8' in output:\n{}", output_with_types);
+        assert!(output_with_types.contains("uint32_t local_10"),
+            "Expected 'uint32_t local_10' in output:\n{}", output_with_types);
+    }
+
+    #[test]
+    fn test_type_inference_with_parameters() {
+        use super::super::expression::Variable;
+
+        // Test that type info is used for function parameters
+
+        // Create a function with a parameter (simulating ARM64 w0 -> local_4)
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let local_4_addr = Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(-4));
+        let local_4 = Expr::deref(local_4_addr, 4);
+
+        // Parameter setup: local_4 = w0 (first parameter)
+        let param_setup = Expr::assign(local_4.clone(), Expr::var(Variable::reg("w0", 4)));
+
+        // Some computation using the parameter
+        let result = Expr::assign(
+            Expr::unknown("result"),
+            Expr::binop(BinOpKind::Mul, local_4.clone(), Expr::int(2))
+        );
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![param_setup, result],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        // Test with type info for the parameter
+        let mut type_info = HashMap::new();
+        type_info.insert("local_4".to_string(), "size_t".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_type_info(type_info);
+        let output = emitter.emit(&cfg, "compute");
+
+        // The parameter should have the inferred type
+        assert!(output.contains("size_t local_4"),
+            "Expected 'size_t local_4' in output:\n{}", output);
+    }
+
+    #[test]
+    fn test_get_type_defaults_to_int() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Without type info, should default to "int"
+        assert_eq!(emitter.get_type("var_4"), "int");
+        assert_eq!(emitter.get_type("local_8"), "int");
+        assert_eq!(emitter.get_type("unknown_var"), "int");
+    }
+
+    #[test]
+    fn test_try_format_stack_slot() {
+        use super::super::expression::Variable;
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Test rbp + -8 pattern (frame pointer with negative offset)
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let addr = Expr::binop(BinOpKind::Add, rbp, Expr::int(-8));
+        let result = emitter.try_format_stack_slot(&addr, 8);
+        assert!(result.is_some(), "Expected Some for rbp + -8, got None");
+        let name = result.unwrap();
+        assert!(name.contains("local") || name.contains("var"),
+            "Expected local/var name, got: {}", name);
+
+        // Test sp + 16 pattern (stack pointer with positive offset)
+        let sp = Expr::var(Variable::reg("sp", 8));
+        let addr_sp = Expr::binop(BinOpKind::Add, sp, Expr::int(16));
+        let result_sp = emitter.try_format_stack_slot(&addr_sp, 4);
+        assert!(result_sp.is_some(), "Expected Some for sp + 16, got None");
+    }
+
+    #[test]
+    fn test_get_type_uses_type_info() {
+        let mut type_info = HashMap::new();
+        type_info.insert("var_4".to_string(), "uint64_t".to_string());
+        type_info.insert("local_8".to_string(), "float".to_string());
+        type_info.insert("ptr".to_string(), "char*".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_type_info(type_info);
+
+        // Should use the provided type info
+        assert_eq!(emitter.get_type("var_4"), "uint64_t");
+        assert_eq!(emitter.get_type("local_8"), "float");
+        assert_eq!(emitter.get_type("ptr"), "char*");
+
+        // Unknown variables should still default to "int"
+        assert_eq!(emitter.get_type("unknown_var"), "int");
     }
 }

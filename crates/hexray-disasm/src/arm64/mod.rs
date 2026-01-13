@@ -8,7 +8,14 @@
 //! - Move instructions (MOV, MOVZ, MOVK, MOVN)
 //! - Compare (CMP, CMN, TST)
 //! - System instructions (NOP, SVC, BRK)
+//! - SVE (Scalable Vector Extension) instructions
+//! - SVE2 (SVE version 2) instructions including crypto extensions
+//! - SME (Scalable Matrix Extension) instructions
 
 mod decoder;
+mod sme;
+mod sve;
 
 pub use decoder::Arm64Disassembler;
+pub use sme::SmeDecoder;
+pub use sve::SveDecoder;

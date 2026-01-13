@@ -8,6 +8,7 @@ use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlF
 use std::collections::{HashMap, HashSet};
 
 use super::expression::{Expr, BinOpKind, resolve_adrp_patterns};
+use super::switch_recovery::SwitchRecovery;
 
 /// A structured representation of control flow.
 #[derive(Debug)]
@@ -527,7 +528,54 @@ impl<'a> Structurer<'a> {
                     current = Some(*return_block);
                 }
 
-                BlockTerminator::IndirectJump { .. } => {
+                BlockTerminator::IndirectJump { possible_targets, .. } => {
+                    // Try to recover a switch statement from the indirect jump
+                    let switch_recovery = SwitchRecovery::new(self.cfg);
+                    if let Some(switch_info) = switch_recovery.try_recover_switch(block_id) {
+                        // Successfully detected a switch pattern
+                        // Add block statements first
+                        if !statements.is_empty() {
+                            result.push(StructuredNode::Block {
+                                id: block_id,
+                                statements,
+                                address_range,
+                            });
+                        }
+
+                        // Structure the switch cases
+                        let switch_node = self.structure_switch_from_recovery(switch_info);
+                        result.push(switch_node);
+                        break;
+                    }
+
+                    // If switch recovery failed but we have possible_targets, try to structure them
+                    if !possible_targets.is_empty() {
+                        if !statements.is_empty() {
+                            result.push(StructuredNode::Block {
+                                id: block_id,
+                                statements,
+                                address_range,
+                            });
+                        }
+                        // Emit a basic switch with unknown values, using indices
+                        let switch_expr = Expr::unknown("switch_value".to_string());
+                        let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = possible_targets
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &target)| {
+                                let body = self.structure_region(target, end);
+                                (vec![i as i128], body)
+                            })
+                            .collect();
+                        result.push(StructuredNode::Switch {
+                            value: switch_expr,
+                            cases,
+                            default: None,
+                        });
+                        break;
+                    }
+
+                    // Fallback: emit block and break
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
                             id: block_id,
@@ -535,7 +583,6 @@ impl<'a> Structurer<'a> {
                             address_range,
                         });
                     }
-                    // Can't follow indirect jump
                     break;
                 }
 
@@ -714,6 +761,33 @@ impl<'a> Structurer<'a> {
             condition: cond_expr,
             then_body,
             else_body,
+        }
+    }
+
+    /// Structures a switch statement from recovered switch information.
+    fn structure_switch_from_recovery(
+        &mut self,
+        switch_info: super::switch_recovery::SwitchInfo,
+    ) -> StructuredNode {
+        // Structure each case body
+        let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = switch_info
+            .cases
+            .into_iter()
+            .map(|(values, target)| {
+                let body = self.structure_region(target, None);
+                (values, body)
+            })
+            .collect();
+
+        // Structure the default case if present
+        let default = switch_info.default.map(|target| {
+            self.structure_region(target, None)
+        });
+
+        StructuredNode::Switch {
+            value: switch_info.switch_value,
+            cases,
+            default,
         }
     }
 

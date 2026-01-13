@@ -4,9 +4,11 @@
 //! - ELF (Executable and Linkable Format) - Linux/Unix binaries
 //! - Mach-O - macOS/iOS binaries
 //! - PE (Portable Executable) - Windows binaries
+//! - DWARF - Debug information format
 //!
 //! These parsers are built from scratch for educational purposes.
 
+pub mod dwarf;
 pub mod elf;
 pub mod error;
 pub mod macho;
