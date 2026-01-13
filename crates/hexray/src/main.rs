@@ -78,6 +78,12 @@ enum Commands {
         /// Show basic block address comments
         #[arg(long)]
         show_addresses: bool,
+        /// Follow and decompile internal called functions
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Maximum depth for --follow (default: 3)
+        #[arg(long, default_value = "3")]
+        depth: usize,
     },
     /// Build and display call graph
     Callgraph {
@@ -190,9 +196,13 @@ fn main() -> Result<()> {
         Some(Commands::Cfg { target, dot, json, html }) => {
             disassemble_cfg(fmt, &target, dot, json, html)?;
         }
-        Some(Commands::Decompile { target, show_addresses }) => {
+        Some(Commands::Decompile { target, show_addresses, follow, depth }) => {
             let target = resolve_decompile_target(&binary, target)?;
-            decompile_function(&binary, &target, show_addresses)?;
+            if follow {
+                decompile_with_follow(&binary, &target, show_addresses, depth)?;
+            } else {
+                decompile_function(&binary, &target, show_addresses)?;
+            }
         }
         Some(Commands::Callgraph { target, dot, json, html }) => {
             build_callgraph(fmt, &target, dot, json, html)?;
@@ -1210,6 +1220,197 @@ fn extract_strings(
     }
 
     Ok(())
+}
+
+/// Decompile a function and follow internal calls recursively.
+fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, max_depth: usize) -> Result<()> {
+    use std::collections::HashSet;
+
+    let fmt = binary.as_format();
+    let arch = fmt.architecture();
+
+    // Track which functions we've already decompiled to avoid duplicates
+    let mut decompiled: HashSet<u64> = HashSet::new();
+
+    // Queue of (address, name, depth) to decompile
+    let mut queue: Vec<(u64, String, usize)> = Vec::new();
+
+    // Resolve the initial target
+    let address = if let Some(stripped) = target.strip_prefix("0x") {
+        u64::from_str_radix(stripped, 16).ok()
+    } else {
+        u64::from_str_radix(target, 16).ok()
+    };
+
+    let (start_addr, name) = if let Some(addr) = address {
+        (addr, format!("sub_{:x}", addr))
+    } else {
+        let symbol = find_symbol(fmt, target)
+            .with_context(|| format!("Symbol '{}' not found", target))?;
+        (symbol.address, demangle_or_original(&symbol.name))
+    };
+
+    queue.push((start_addr, name, 0));
+
+    // Build tables once for all decompilations
+    let string_table = build_string_table(fmt);
+    let symbol_table = build_symbol_table(fmt);
+    let relocation_table = build_relocation_table(binary);
+
+    // Try to load DWARF debug info once
+    let debug_info = load_dwarf_info(binary);
+
+    while let Some((func_addr, func_name, depth)) = queue.pop() {
+        if decompiled.contains(&func_addr) {
+            continue;
+        }
+
+        // Validate address
+        if func_addr == 0 {
+            continue;
+        }
+
+        // Check if in executable section
+        let in_executable = fmt.sections().any(|s| {
+            let section_start = s.virtual_address();
+            let section_end = section_start.saturating_add(s.size());
+            func_addr >= section_start && func_addr < section_end && s.is_executable()
+        });
+        if !in_executable {
+            continue;
+        }
+
+        decompiled.insert(func_addr);
+
+        // Print separator between functions
+        if decompiled.len() > 1 {
+            println!("\n{}\n", "─".repeat(60));
+        }
+
+        println!("// Decompiling {} at {:#x} (depth {})\n", func_name, func_addr, depth);
+
+        // Disassemble
+        let bytes = match fmt.bytes_at(func_addr, 4096) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let instructions = match arch {
+            Architecture::X86_64 | Architecture::X86 => {
+                let disasm = X86_64Disassembler::new();
+                disassemble_for_cfg(&disasm, bytes, func_addr)
+            }
+            Architecture::Arm64 => {
+                let disasm = Arm64Disassembler::new();
+                disassemble_for_cfg(&disasm, bytes, func_addr)
+            }
+            Architecture::RiscV64 => {
+                let disasm = RiscVDisassembler::new();
+                disassemble_for_cfg(&disasm, bytes, func_addr)
+            }
+            Architecture::RiscV32 => {
+                let disasm = RiscVDisassembler::new_rv32();
+                disassemble_for_cfg(&disasm, bytes, func_addr)
+            }
+            _ => continue,
+        };
+
+        // Build CFG
+        let cfg = CfgBuilder::build(&instructions, func_addr);
+
+        // Get DWARF variable names for this function
+        let dwarf_names = if let Some(ref di) = debug_info {
+            get_dwarf_variable_names(di, func_addr)
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Decompile
+        let decompiler = Decompiler::new()
+            .with_addresses(show_addresses)
+            .with_string_table(string_table.clone())
+            .with_symbol_table(symbol_table.clone())
+            .with_relocation_table(relocation_table.clone())
+            .with_dwarf_names(dwarf_names);
+        let pseudocode = decompiler.decompile(&cfg, &func_name);
+
+        println!("{}", pseudocode);
+
+        // If we haven't reached max depth, find internal calls to follow
+        if depth < max_depth {
+            let call_targets = extract_internal_call_targets(&instructions, fmt);
+            for (target_addr, target_name) in call_targets {
+                if !decompiled.contains(&target_addr) {
+                    // Check for special patterns like __libc_start_main
+                    // which passes main as first argument
+                    let actual_name = if func_name == "__libc_start_main" || func_name.contains("libc_start_main") {
+                        // The first argument to __libc_start_main is typically main
+                        if target_name.starts_with("sub_") {
+                            "main".to_string()
+                        } else {
+                            target_name
+                        }
+                    } else {
+                        target_name
+                    };
+                    queue.push((target_addr, actual_name, depth + 1));
+                }
+            }
+        }
+    }
+
+    println!("\n// Decompiled {} function(s)", decompiled.len());
+
+    Ok(())
+}
+
+/// Extract internal call targets from instructions.
+/// Returns addresses of functions that are called within this function.
+fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt: &dyn BinaryFormat) -> Vec<(u64, String)> {
+    use hexray_core::ControlFlow;
+
+    let mut targets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for inst in instructions {
+        // Look for call instructions
+        if let ControlFlow::Call { target, .. } = inst.control_flow {
+            if target == 0 || seen.contains(&target) {
+                continue;
+            }
+            let target_addr = target;
+
+            // Check if this is an internal call (not to PLT/external/stubs)
+            // by verifying the target is in an executable section
+            let is_internal = fmt.sections().any(|s| {
+                let section_start = s.virtual_address();
+                let section_end = section_start.saturating_add(s.size());
+                let section_name = s.name().to_lowercase();
+                // Exclude PLT sections (ELF) and __stubs/__stub_helper (Mach-O)
+                if section_name.contains("plt") || section_name.contains("stub") {
+                    return false;
+                }
+                target_addr >= section_start && target_addr < section_end && s.is_executable()
+            });
+
+            if is_internal {
+                seen.insert(target_addr);
+                // Try to get symbol name
+                let name = if let Some(sym) = fmt.symbol_at(target_addr) {
+                    if !sym.name.is_empty() {
+                        demangle_or_original(&sym.name)
+                    } else {
+                        format!("sub_{:x}", target_addr)
+                    }
+                } else {
+                    format!("sub_{:x}", target_addr)
+                };
+                targets.push((target_addr, name));
+            }
+        }
+    }
+
+    targets
 }
 
 fn build_xrefs(
