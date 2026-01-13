@@ -1368,7 +1368,7 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
 /// Returns addresses of functions that are called within this function.
 /// Also detects function pointers passed as arguments (e.g., main passed to __libc_start_main).
 fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt: &dyn BinaryFormat) -> Vec<(u64, String)> {
-    use hexray_core::{ControlFlow, Operand};
+    use hexray_core::{ControlFlow, Operand, register::x86};
 
     let mut targets = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1440,7 +1440,9 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
                     // Check for RIP-relative addressing: lea reg, [rip + offset]
                     // This is common for loading function pointers on x86_64
                     if let Some(base) = &mem.base {
-                        if base.name().to_lowercase() == "rip" && mem.index.is_none() {
+                        // Check for RIP by ID (more reliable than name comparison)
+                        let is_rip = base.id == x86::RIP;
+                        if is_rip && mem.index.is_none() {
                             // Calculate effective address: inst_addr + inst_size + displacement
                             // For RIP-relative, displacement is relative to the next instruction
                             let effective_addr = (inst.address as i64)
@@ -1448,6 +1450,8 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
                                 .wrapping_add(mem.displacement) as u64;
                             // For RIP-relative LEA, we trust it's a valid function pointer
                             // even without a symbol (common in stripped PIE binaries)
+                            eprintln!("DEBUG: RIP-relative at {:#x}: disp={}, effective={:#x}, is_internal={}",
+                                inst.address, mem.displacement, effective_addr, is_internal_addr(effective_addr));
                             if is_internal_addr(effective_addr) {
                                 add_target(effective_addr, &mut seen, &mut targets);
                             }
