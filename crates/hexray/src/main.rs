@@ -1366,46 +1366,77 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
 
 /// Extract internal call targets from instructions.
 /// Returns addresses of functions that are called within this function.
+/// Also detects function pointers passed as arguments (e.g., main passed to __libc_start_main).
 fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt: &dyn BinaryFormat) -> Vec<(u64, String)> {
-    use hexray_core::ControlFlow;
+    use hexray_core::{ControlFlow, Operand};
 
     let mut targets = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for inst in instructions {
-        // Look for call instructions
-        if let ControlFlow::Call { target, .. } = inst.control_flow {
-            if target == 0 || seen.contains(&target) {
-                continue;
+    // Helper to check if an address is in an internal executable section
+    let is_internal_addr = |addr: u64| -> bool {
+        if addr == 0 {
+            return false;
+        }
+        fmt.sections().any(|s| {
+            let section_start = s.virtual_address();
+            let section_end = section_start.saturating_add(s.size());
+            let section_name = s.name().to_lowercase();
+            // Exclude PLT sections (ELF) and __stubs/__stub_helper (Mach-O)
+            if section_name.contains("plt") || section_name.contains("stub") {
+                return false;
             }
-            let target_addr = target;
+            addr >= section_start && addr < section_end && s.is_executable()
+        })
+    };
 
-            // Check if this is an internal call (not to PLT/external/stubs)
-            // by verifying the target is in an executable section
-            let is_internal = fmt.sections().any(|s| {
-                let section_start = s.virtual_address();
-                let section_end = section_start.saturating_add(s.size());
-                let section_name = s.name().to_lowercase();
-                // Exclude PLT sections (ELF) and __stubs/__stub_helper (Mach-O)
-                if section_name.contains("plt") || section_name.contains("stub") {
-                    return false;
-                }
-                target_addr >= section_start && target_addr < section_end && s.is_executable()
-            });
-
-            if is_internal {
-                seen.insert(target_addr);
-                // Try to get symbol name
-                let name = if let Some(sym) = fmt.symbol_at(target_addr) {
-                    if !sym.name.is_empty() {
-                        demangle_or_original(&sym.name)
-                    } else {
-                        format!("sub_{:x}", target_addr)
-                    }
+    // Helper to add a target if it's valid
+    let add_target = |target_addr: u64, seen: &mut std::collections::HashSet<u64>, targets: &mut Vec<(u64, String)>| {
+        if target_addr == 0 || seen.contains(&target_addr) {
+            return;
+        }
+        if is_internal_addr(target_addr) {
+            seen.insert(target_addr);
+            let name = if let Some(sym) = fmt.symbol_at(target_addr) {
+                if !sym.name.is_empty() {
+                    demangle_or_original(&sym.name)
                 } else {
                     format!("sub_{:x}", target_addr)
-                };
-                targets.push((target_addr, name));
+                }
+            } else {
+                format!("sub_{:x}", target_addr)
+            };
+            targets.push((target_addr, name));
+        }
+    };
+
+    for inst in instructions {
+        // Look for direct call instructions
+        if let ControlFlow::Call { target, .. } = inst.control_flow {
+            add_target(target, &mut seen, &mut targets);
+        }
+
+        // Also look for function addresses in operands (e.g., LEA for function pointers)
+        // This catches cases like: lea rdi, [rip + main] ; call __libc_start_main
+        for operand in &inst.operands {
+            match operand {
+                Operand::PcRelative { target, .. } => {
+                    // Check if this looks like a function pointer (in .text, has symbol)
+                    if is_internal_addr(*target) {
+                        // Only add if there's a symbol or it looks like a function start
+                        if fmt.symbol_at(*target).is_some() {
+                            add_target(*target, &mut seen, &mut targets);
+                        }
+                    }
+                }
+                Operand::Immediate(imm) => {
+                    // Check if immediate value is a function address
+                    let addr = imm.value as u64;
+                    if is_internal_addr(addr) && fmt.symbol_at(addr).is_some() {
+                        add_target(addr, &mut seen, &mut targets);
+                    }
+                }
+                _ => {}
             }
         }
     }
