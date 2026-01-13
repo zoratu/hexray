@@ -1413,6 +1413,9 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
     for inst in instructions {
         // Look for direct call instructions
         if let ControlFlow::Call { target, .. } = inst.control_flow {
+            if target != 0 && !is_internal_addr(target) {
+                eprintln!("DEBUG: Skipping call to {:#x} (not internal)", target);
+            }
             add_target(target, &mut seen, &mut targets);
         }
 
