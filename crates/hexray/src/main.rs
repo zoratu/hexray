@@ -1380,7 +1380,7 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
         if addr == 0 {
             return false;
         }
-        fmt.sections().any(|s| {
+        let result = fmt.sections().any(|s| {
             let section_start = s.virtual_address();
             let section_end = section_start.saturating_add(s.size());
             let section_name = s.name().to_lowercase();
@@ -1388,8 +1388,14 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
             if section_name.contains("plt") || section_name.contains("stub") {
                 return false;
             }
-            addr >= section_start && addr < section_end && s.is_executable()
-        })
+            let in_range = addr >= section_start && addr < section_end && s.is_executable();
+            if in_range {
+                eprintln!("DEBUG: is_internal_addr({:#x}) = true via section '{}' ({:#x}-{:#x})",
+                    addr, s.name(), section_start, section_end);
+            }
+            in_range
+        });
+        result
     };
 
     // Helper to add a target if it's valid
