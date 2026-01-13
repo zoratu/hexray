@@ -1446,7 +1446,9 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
                             let effective_addr = (inst.address as i64)
                                 .wrapping_add(inst.size as i64)
                                 .wrapping_add(mem.displacement) as u64;
-                            if is_internal_addr(effective_addr) && fmt.symbol_at(effective_addr).is_some() {
+                            // For RIP-relative LEA, we trust it's a valid function pointer
+                            // even without a symbol (common in stripped PIE binaries)
+                            if is_internal_addr(effective_addr) {
                                 add_target(effective_addr, &mut seen, &mut targets);
                             }
                         }
