@@ -1341,8 +1341,6 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
             let call_targets = extract_internal_call_targets(&instructions, fmt);
             for (target_addr, target_name) in call_targets {
                 if !decompiled.contains(&target_addr) {
-                    eprintln!("DEBUG: Adding target {:#x} ({}) from {} at depth {}",
-                        target_addr, target_name, func_name, depth + 1);
                     // Check for special patterns like __libc_start_main
                     // which passes main as first argument
                     let actual_name = if func_name == "__libc_start_main" || func_name.contains("libc_start_main") {
@@ -1380,7 +1378,7 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
         if addr == 0 {
             return false;
         }
-        let result = fmt.sections().any(|s| {
+        fmt.sections().any(|s| {
             let section_start = s.virtual_address();
             let section_end = section_start.saturating_add(s.size());
             let section_name = s.name().to_lowercase();
@@ -1388,14 +1386,8 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
             if section_name.contains("plt") || section_name.contains("stub") {
                 return false;
             }
-            let in_range = addr >= section_start && addr < section_end && s.is_executable();
-            if in_range {
-                eprintln!("DEBUG: is_internal_addr({:#x}) = true via section '{}' ({:#x}-{:#x})",
-                    addr, s.name(), section_start, section_end);
-            }
-            in_range
-        });
-        result
+            addr >= section_start && addr < section_end && s.is_executable()
+        })
     };
 
     // Helper to add a target if it's valid
@@ -1421,9 +1413,6 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
     for inst in instructions {
         // Look for direct call instructions
         if let ControlFlow::Call { target, .. } = inst.control_flow {
-            if target != 0 && !is_internal_addr(target) {
-                eprintln!("DEBUG: Skipping call to {:#x} (not internal)", target);
-            }
             add_target(target, &mut seen, &mut targets);
         }
 
@@ -1461,8 +1450,6 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
                                 .wrapping_add(mem.displacement) as u64;
                             // For RIP-relative LEA, we trust it's a valid function pointer
                             // even without a symbol (common in stripped PIE binaries)
-                            eprintln!("DEBUG: RIP-relative at {:#x}: disp={}, effective={:#x}, is_internal={}",
-                                inst.address, mem.displacement, effective_addr, is_internal_addr(effective_addr));
                             if is_internal_addr(effective_addr) {
                                 add_target(effective_addr, &mut seen, &mut targets);
                             }

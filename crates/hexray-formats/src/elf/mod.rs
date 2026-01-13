@@ -98,6 +98,14 @@ impl<'a> Elf<'a> {
             StringTable::empty()
         };
 
+        // Populate section name caches for the Section trait
+        let mut sections = sections;
+        for section in &mut sections {
+            if let Some(name) = section_names.get(section.sh_name as usize) {
+                section.set_name(name.to_string());
+            }
+        }
+
         // Parse symbols (with section base address adjustment for ET_REL)
         let symbols = Self::parse_symbols(data, &sections, &header, &section_names)?;
 
