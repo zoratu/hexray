@@ -73,8 +73,8 @@ enum Commands {
     },
     /// Decompile a function to pseudo-code
     Decompile {
-        /// Symbol name or address
-        target: String,
+        /// Symbol name or address (defaults to entry point or main)
+        target: Option<String>,
         /// Show basic block address comments
         #[arg(long)]
         show_addresses: bool,
@@ -191,6 +191,7 @@ fn main() -> Result<()> {
             disassemble_cfg(fmt, &target, dot, json, html)?;
         }
         Some(Commands::Decompile { target, show_addresses }) => {
+            let target = resolve_decompile_target(&binary, target)?;
             decompile_function(&binary, &target, show_addresses)?;
         }
         Some(Commands::Callgraph { target, dot, json, html }) => {
@@ -394,6 +395,33 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool) {
         println!("{:#016x} {:<8} {:<8} {:<8} {}",
                  symbol.address, symbol.size, type_str, bind_str, demangled);
     }
+}
+
+/// Resolve the target for decompilation.
+/// If target is provided, use it. Otherwise, try to find main, then fall back to entry point.
+fn resolve_decompile_target(binary: &Binary, target: Option<String>) -> Result<String> {
+    // If user provided a target, use it
+    if let Some(t) = target {
+        return Ok(t);
+    }
+
+    let fmt = binary.as_format();
+
+    // Try to find "main" symbol first
+    if let Some(sym) = find_symbol(fmt, "main") {
+        println!("(auto-selected 'main' at {:#x})\n", sym.address);
+        return Ok("main".to_string());
+    }
+
+    // Fall back to entry point
+    if let Some(entry) = fmt.entry_point() {
+        if entry != 0 {
+            println!("(auto-selected entry point at {:#x})\n", entry);
+            return Ok(format!("{:#x}", entry));
+        }
+    }
+
+    bail!("No target specified and could not find 'main' or entry point")
 }
 
 /// Find a symbol by name, preferring exact matches over partial matches.
