@@ -18,6 +18,7 @@ use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
 use hexray_disasm::{Disassembler, X86_64Disassembler, Arm64Disassembler, RiscVDisassembler};
 use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
+use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
 use std::fs;
 use std::path::PathBuf;
 
@@ -398,8 +399,11 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool) {
 /// Find a symbol by name, preferring exact matches over partial matches.
 /// For function decompilation, we want the most specific match.
 fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
-    // Collect symbols into owned values
-    let symbols: Vec<hexray_core::Symbol> = fmt.symbols().cloned().collect();
+    // Collect symbols into owned values, filtering out undefined/external symbols
+    let symbols: Vec<hexray_core::Symbol> = fmt.symbols()
+        .filter(|s| s.is_defined() && s.address != 0)
+        .cloned()
+        .collect();
 
     // 1. Try exact match first (highest priority)
     if let Some(sym) = symbols.iter().find(|s| s.name == name) {
@@ -668,9 +672,24 @@ fn decompile_function(binary: &Binary, target: &str, show_addresses: bool) -> Re
     } else {
         // Find symbol using improved search
         let symbol = find_symbol(fmt, target)
-            .with_context(|| format!("Symbol '{}' not found", target))?;
+            .with_context(|| format!("Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).", target))?;
         (symbol.address, demangle_or_original(&symbol.name))
     };
+
+    // Validate the address is reasonable
+    if start_addr == 0 {
+        bail!("Invalid address 0x0 - symbol may be undefined or external");
+    }
+
+    // Check if address is in an executable section
+    let in_executable = fmt.sections().any(|s| {
+        let section_start = s.virtual_address();
+        let section_end = section_start.saturating_add(s.size());
+        start_addr >= section_start && start_addr < section_end && s.is_executable()
+    });
+    if !in_executable {
+        bail!("Address {:#x} is not in an executable section - cannot decompile data", start_addr);
+    }
 
     println!("Decompiling {} at {:#x}\n", name, start_addr);
 
@@ -714,12 +733,24 @@ fn decompile_function(binary: &Binary, target: &str, show_addresses: bool) -> Re
     // Build relocation table for kernel modules
     let relocation_table = build_relocation_table(binary);
 
+    // Try to load DWARF debug info for variable names
+    let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary) {
+        let names = get_dwarf_variable_names(&debug_info, start_addr);
+        if !names.is_empty() {
+            println!("(using DWARF debug info for variable names)\n");
+        }
+        names
+    } else {
+        std::collections::HashMap::new()
+    };
+
     // Decompile
     let decompiler = Decompiler::new()
         .with_addresses(show_addresses)
         .with_string_table(string_table)
         .with_symbol_table(symbol_table)
-        .with_relocation_table(relocation_table);
+        .with_relocation_table(relocation_table)
+        .with_dwarf_names(dwarf_names);
     let pseudocode = decompiler.decompile(&cfg, &name);
 
     println!("{}", pseudocode);
@@ -894,6 +925,44 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
     }
 
     table
+}
+
+/// Attempts to load DWARF debug info from a binary.
+/// Returns None if DWARF sections are not present.
+fn load_dwarf_info(binary: &Binary) -> Option<DebugInfo> {
+    let fmt = binary.as_format();
+
+    // Get DWARF sections
+    let debug_info = fmt.sections()
+        .find(|s| s.name() == ".debug_info" || s.name() == "__debug_info")?
+        .data();
+    let debug_abbrev = fmt.sections()
+        .find(|s| s.name() == ".debug_abbrev" || s.name() == "__debug_abbrev")?
+        .data();
+    let debug_str = fmt.sections()
+        .find(|s| s.name() == ".debug_str" || s.name() == "__debug_str")
+        .map(|s| s.data());
+    let debug_line = fmt.sections()
+        .find(|s| s.name() == ".debug_line" || s.name() == "__debug_line")
+        .map(|s| s.data());
+
+    // Determine address size based on architecture
+    let address_size = match fmt.architecture() {
+        Architecture::X86 | Architecture::RiscV32 => 4,
+        _ => 8,
+    };
+
+    // Parse DWARF info
+    parse_debug_info(debug_info, debug_abbrev, debug_str, debug_line, address_size).ok()
+}
+
+/// Gets DWARF variable names for a function at the given address.
+fn get_dwarf_variable_names(debug_info: &DebugInfo, func_addr: u64) -> std::collections::HashMap<i128, String> {
+    if let Some(func) = debug_info.find_function(func_addr) {
+        func.variable_names()
+    } else {
+        std::collections::HashMap::new()
+    }
 }
 
 fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, html: bool) -> Result<()> {
