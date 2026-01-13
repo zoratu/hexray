@@ -1436,6 +1436,22 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
                         add_target(addr, &mut seen, &mut targets);
                     }
                 }
+                Operand::Memory(mem) => {
+                    // Check for RIP-relative addressing: lea reg, [rip + offset]
+                    // This is common for loading function pointers on x86_64
+                    if let Some(base) = &mem.base {
+                        if base.name().to_lowercase() == "rip" && mem.index.is_none() {
+                            // Calculate effective address: inst_addr + inst_size + displacement
+                            // For RIP-relative, displacement is relative to the next instruction
+                            let effective_addr = (inst.address as i64)
+                                .wrapping_add(inst.size as i64)
+                                .wrapping_add(mem.displacement) as u64;
+                            if is_internal_addr(effective_addr) && fmt.symbol_at(effective_addr).is_some() {
+                                add_target(effective_addr, &mut seen, &mut targets);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
