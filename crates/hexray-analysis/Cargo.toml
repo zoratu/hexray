@@ -18,3 +18,4 @@ rayon.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+tempfile = "3.24.0"

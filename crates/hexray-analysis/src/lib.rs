@@ -23,6 +23,7 @@ pub mod function_finder;
 pub mod indirect_calls;
 pub mod output;
 pub mod parallel;
+pub mod project;
 pub mod ssa;
 pub mod stack_canary;
 pub mod strings;
@@ -60,4 +61,8 @@ pub use vtable::{
 };
 pub use stack_canary::{
     CanarySource, SegmentRegister, StackCanaryAnalysis, StackCanaryDetector, StackCanaryInfo,
+};
+pub use project::{
+    AnalysisProject, Annotation, AnnotationKind, Bookmark, FunctionOverride,
+    ProjectError, ProjectResult, ProjectStats, SignatureOverride, TypeOverride,
 };

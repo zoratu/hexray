@@ -9,6 +9,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
+    AnalysisProject,
     CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter,
     CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
     Decompiler, FunctionInfo, ParallelCallGraphBuilder, StringTable, SymbolTable, RelocationTable,
@@ -43,6 +44,10 @@ struct Cli {
     /// Number of bytes/instructions to disassemble
     #[arg(short, long, default_value = "100")]
     count: usize,
+
+    /// Project file for annotations
+    #[arg(short, long)]
+    project: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -84,6 +89,9 @@ enum Commands {
         /// Maximum depth for --follow (default: 3)
         #[arg(long, default_value = "3")]
         depth: usize,
+        /// Project file for function names and comments
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
     /// Build and display call graph
     Callgraph {
@@ -122,6 +130,92 @@ enum Commands {
         /// Output in JSON format
         #[arg(long)]
         json: bool,
+    },
+    /// Manage analysis project (annotations, bookmarks, etc.)
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+}
+
+/// Project management actions
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Create a new project for a binary
+    Create {
+        /// Output project file path
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Load and show project information
+    Info {
+        /// Project file path
+        project: PathBuf,
+    },
+    /// Add a comment at an address
+    Comment {
+        /// Project file path
+        project: PathBuf,
+        /// Address to comment (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Comment text
+        comment: String,
+    },
+    /// Set a custom function name
+    Name {
+        /// Project file path
+        project: PathBuf,
+        /// Function address (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Custom function name
+        name: String,
+    },
+    /// Add a label at an address
+    Label {
+        /// Project file path
+        project: PathBuf,
+        /// Address to label (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Label text
+        label: String,
+    },
+    /// Add a bookmark
+    Bookmark {
+        /// Project file path
+        project: PathBuf,
+        /// Address to bookmark (hex)
+        #[arg(value_parser = parse_hex)]
+        address: u64,
+        /// Optional label for the bookmark
+        #[arg(short, long)]
+        label: Option<String>,
+    },
+    /// List all annotations in a project
+    List {
+        /// Project file path
+        project: PathBuf,
+        /// Show only comments
+        #[arg(long)]
+        comments: bool,
+        /// Show only function names
+        #[arg(long)]
+        functions: bool,
+        /// Show only bookmarks
+        #[arg(long)]
+        bookmarks: bool,
+    },
+    /// Undo the last action
+    Undo {
+        /// Project file path
+        project: PathBuf,
+    },
+    /// Redo the last undone action
+    Redo {
+        /// Project file path
+        project: PathBuf,
     },
 }
 
@@ -196,12 +290,17 @@ fn main() -> Result<()> {
         Some(Commands::Cfg { target, dot, json, html }) => {
             disassemble_cfg(fmt, &target, dot, json, html)?;
         }
-        Some(Commands::Decompile { target, show_addresses, follow, depth }) => {
+        Some(Commands::Decompile { target, show_addresses, follow, depth, project }) => {
             let target = resolve_decompile_target(&binary, target)?;
+            let project = match project {
+                Some(path) => Some(AnalysisProject::load(&path)
+                    .with_context(|| format!("Failed to load project: {}", path.display()))?),
+                None => None,
+            };
             if follow {
-                decompile_with_follow(&binary, &target, show_addresses, depth)?;
+                decompile_with_follow(&binary, &target, show_addresses, depth, project.as_ref())?;
             } else {
-                decompile_function(&binary, &target, show_addresses)?;
+                decompile_function(&binary, &target, show_addresses, project.as_ref())?;
             }
         }
         Some(Commands::Callgraph { target, dot, json, html }) => {
@@ -212,6 +311,9 @@ fn main() -> Result<()> {
         }
         Some(Commands::Xrefs { target, calls_only, json }) => {
             build_xrefs(fmt, target.as_deref(), calls_only, json)?;
+        }
+        Some(Commands::Project { action }) => {
+            handle_project_command(&cli.binary, action)?;
         }
         None => {
             // Default: disassemble
@@ -695,7 +797,7 @@ fn disassemble_for_cfg<D: Disassembler>(
     instructions
 }
 
-fn decompile_function(binary: &Binary, target: &str, show_addresses: bool) -> Result<()> {
+fn decompile_function(binary: &Binary, target: &str, show_addresses: bool, project: Option<&AnalysisProject>) -> Result<()> {
     let fmt = binary.as_format();
 
     // Try to parse as address first
@@ -706,12 +808,22 @@ fn decompile_function(binary: &Binary, target: &str, show_addresses: bool) -> Re
     };
 
     let (start_addr, name) = if let Some(addr) = address {
-        (addr, format!("sub_{:x}", addr))
+        // Check if project has a custom name for this address
+        let name = project
+            .and_then(|p| p.get_function_name(addr))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("sub_{:x}", addr));
+        (addr, name)
     } else {
         // Find symbol using improved search
         let symbol = find_symbol(fmt, target)
             .with_context(|| format!("Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).", target))?;
-        (symbol.address, demangle_or_original(&symbol.name))
+        // Check if project has a custom name for this address
+        let name = project
+            .and_then(|p| p.get_function_name(symbol.address))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| demangle_or_original(&symbol.name));
+        (symbol.address, name)
     };
 
     // Validate the address is reasonable
@@ -765,8 +877,15 @@ fn decompile_function(binary: &Binary, target: &str, show_addresses: bool) -> Re
     // Build string table from data sections
     let string_table = build_string_table(fmt);
 
-    // Build symbol table for function names
-    let symbol_table = build_symbol_table(fmt);
+    // Build symbol table for function names, merging with project overrides
+    let mut symbol_table = build_symbol_table(fmt);
+    if let Some(proj) = project {
+        for addr in proj.overridden_functions() {
+            if let Some(name) = proj.get_function_name(addr) {
+                symbol_table.insert(addr, name.to_string());
+            }
+        }
+    }
 
     // Build relocation table for kernel modules
     let relocation_table = build_relocation_table(binary);
@@ -1223,7 +1342,7 @@ fn extract_strings(
 }
 
 /// Decompile a function and follow internal calls recursively.
-fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, max_depth: usize) -> Result<()> {
+fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, max_depth: usize, project: Option<&AnalysisProject>) -> Result<()> {
     use std::collections::HashSet;
 
     let fmt = binary.as_format();
@@ -1243,18 +1362,36 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
     };
 
     let (start_addr, name) = if let Some(addr) = address {
-        (addr, format!("sub_{:x}", addr))
+        // Check if project has a custom name for this address
+        let name = project
+            .and_then(|p| p.get_function_name(addr))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("sub_{:x}", addr));
+        (addr, name)
     } else {
         let symbol = find_symbol(fmt, target)
             .with_context(|| format!("Symbol '{}' not found", target))?;
-        (symbol.address, demangle_or_original(&symbol.name))
+        // Check if project has a custom name for this address
+        let name = project
+            .and_then(|p| p.get_function_name(symbol.address))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| demangle_or_original(&symbol.name));
+        (symbol.address, name)
     };
 
     queue.push((start_addr, name, 0));
 
     // Build tables once for all decompilations
     let string_table = build_string_table(fmt);
-    let symbol_table = build_symbol_table(fmt);
+    let mut symbol_table = build_symbol_table(fmt);
+    // Merge project function names into symbol table
+    if let Some(proj) = project {
+        for addr in proj.overridden_functions() {
+            if let Some(name) = proj.get_function_name(addr) {
+                symbol_table.insert(addr, name.to_string());
+            }
+        }
+    }
     let relocation_table = build_relocation_table(binary);
 
     // Try to load DWARF debug info once
@@ -1596,6 +1733,173 @@ fn build_xrefs(
             println!("Referenced addresses: {}", db.all_referenced().count());
             println!();
             println!("Use 'xrefs <address>' or 'xrefs <symbol>' to see references to a specific target.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle project management commands
+fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Result<()> {
+    match action {
+        ProjectAction::Create { output } => {
+            let project = AnalysisProject::new(binary_path)
+                .with_context(|| format!("Failed to create project for {}", binary_path.display()))?;
+
+            let mut project = project;
+            project.save(&output)
+                .with_context(|| format!("Failed to save project to {}", output.display()))?;
+
+            println!("Created project: {}", output.display());
+            println!("Binary: {}", binary_path.display());
+        }
+
+        ProjectAction::Info { project: project_path } => {
+            let project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            let stats = project.stats();
+
+            println!("Project Information");
+            println!("{}", "=".repeat(40));
+            println!("Binary:              {}", project.binary_path.display());
+            println!("Annotations:         {}", stats.annotation_count);
+            println!("  Comments:          {}", stats.comment_count);
+            println!("  Labels:            {}", stats.label_count);
+            println!("Function overrides:  {}", stats.function_override_count);
+            println!("Type overrides:      {}", stats.type_override_count);
+            println!("Bookmarks:           {}", stats.bookmark_count);
+        }
+
+        ProjectAction::Comment { project: project_path, address, comment } => {
+            let mut project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            project.set_comment(address, &comment);
+            project.save(&project_path)?;
+
+            println!("Added comment at {:#x}: {}", address, comment);
+        }
+
+        ProjectAction::Name { project: project_path, address, name } => {
+            let mut project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            project.set_function_name(address, &name);
+            project.save(&project_path)?;
+
+            println!("Set function name at {:#x}: {}", address, name);
+        }
+
+        ProjectAction::Label { project: project_path, address, label } => {
+            let mut project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            project.set_label(address, &label);
+            project.save(&project_path)?;
+
+            println!("Added label at {:#x}: {}", address, label);
+        }
+
+        ProjectAction::Bookmark { project: project_path, address, label } => {
+            let mut project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            project.add_bookmark(address, label.clone());
+            project.save(&project_path)?;
+
+            if let Some(lbl) = label {
+                println!("Added bookmark at {:#x}: {}", address, lbl);
+            } else {
+                println!("Added bookmark at {:#x}", address);
+            }
+        }
+
+        ProjectAction::List { project: project_path, comments, functions, bookmarks } => {
+            let project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            let show_all = !comments && !functions && !bookmarks;
+
+            if show_all || comments {
+                println!("Comments");
+                println!("{}", "-".repeat(40));
+                let mut count = 0;
+                for addr in project.annotated_addresses() {
+                    if let Some(comment) = project.get_comment(addr) {
+                        println!("{:#016x}: {}", addr, comment);
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    println!("(none)");
+                }
+                println!();
+            }
+
+            if show_all || functions {
+                println!("Function Names");
+                println!("{}", "-".repeat(40));
+                let mut count = 0;
+                for addr in project.overridden_functions() {
+                    if let Some(name) = project.get_function_name(addr) {
+                        println!("{:#016x}: {}", addr, name);
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    println!("(none)");
+                }
+                println!();
+            }
+
+            if show_all || bookmarks {
+                println!("Bookmarks");
+                println!("{}", "-".repeat(40));
+                let bm = project.get_bookmarks();
+                if bm.is_empty() {
+                    println!("(none)");
+                } else {
+                    for b in bm {
+                        if let Some(label) = &b.label {
+                            println!("{:#016x}: {}", b.address, label);
+                        } else {
+                            println!("{:#016x}", b.address);
+                        }
+                    }
+                }
+                println!();
+            }
+        }
+
+        ProjectAction::Undo { project: project_path } => {
+            let mut project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            match project.undo() {
+                Ok(msg) => {
+                    project.save(&project_path)?;
+                    println!("{}", msg);
+                }
+                Err(e) => {
+                    println!("Cannot undo: {}", e);
+                }
+            }
+        }
+
+        ProjectAction::Redo { project: project_path } => {
+            let mut project = AnalysisProject::load(&project_path)
+                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
+
+            match project.redo() {
+                Ok(msg) => {
+                    project.save(&project_path)?;
+                    println!("{}", msg);
+                }
+                Err(e) => {
+                    println!("Cannot redo: {}", e);
+                }
+            }
         }
     }
 
