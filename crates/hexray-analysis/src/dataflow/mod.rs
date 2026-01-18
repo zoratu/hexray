@@ -5,21 +5,25 @@
 //! - Reaching definitions analysis
 //! - Liveness analysis
 //! - Generic dataflow equation solver
+//! - Interactive data flow queries (backward/forward slicing)
 //!
 //! These analyses are fundamental for:
 //! - Dead code elimination
 //! - Constant propagation
 //! - SSA construction
 //! - Type inference
+//! - Understanding data dependencies
 
 pub mod const_prop;
 pub mod def_use;
 pub mod liveness;
+pub mod queries;
 pub mod reaching_defs;
 
 pub use const_prop::{ConstValue, ConstState, ConstantPropagation};
-pub use def_use::{DefUseChain, DefUseInfo, Definition, Use};
+pub use def_use::{DefUseChain, DefUseInfo, Definition, Use, DefId};
 pub use liveness::LivenessAnalysis;
+pub use queries::{DataFlowQuery, DataFlowQueryEngine, DataFlowResult, DataFlowStep, DataFlowRole};
 pub use reaching_defs::ReachingDefinitions;
 
 use hexray_core::{BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation, Register};

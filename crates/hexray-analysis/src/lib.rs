@@ -40,7 +40,11 @@ pub use indirect_calls::{
 
 pub use callgraph::{CallGraph, CallGraphBuilder, CallGraphNode, CallSite, CallType};
 pub use cfg_builder::CfgBuilder;
-pub use dataflow::{ConstValue, ConstState, ConstantPropagation, DefUseChain, LivenessAnalysis, ReachingDefinitions, Location};
+pub use dataflow::{
+    ConstValue, ConstState, ConstantPropagation, DefUseChain, LivenessAnalysis,
+    ReachingDefinitions, Location, DataFlowQuery, DataFlowQueryEngine, DataFlowResult,
+    DataFlowStep, DataFlowRole,
+};
 pub use decompiler::{
     Decompiler, StringTable, SymbolTable, RelocationTable,
     CallingConvention, FunctionSignature, Parameter, ParameterLocation, ParamType, SignatureRecovery,
