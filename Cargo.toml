@@ -16,6 +16,7 @@ hexray-formats = { path = "crates/hexray-formats" }
 hexray-disasm = { path = "crates/hexray-disasm" }
 hexray-analysis = { path = "crates/hexray-analysis" }
 hexray-demangle = { path = "crates/hexray-demangle" }
+hexray-types = { path = "crates/hexray-types" }
 
 # Error handling
 thiserror = "2.0"
