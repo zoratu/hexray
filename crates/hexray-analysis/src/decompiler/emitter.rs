@@ -9,9 +9,11 @@ use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
 use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
 use super::{StringTable, SymbolTable, RelocationTable};
+use hexray_types::TypeDatabase;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::sync::Arc;
 
 /// Information about a function's signature detected from analysis.
 struct FunctionInfo {
@@ -73,6 +75,8 @@ pub struct PseudoCodeEmitter {
     calling_convention: CallingConvention,
     /// Whether to use advanced signature recovery.
     use_signature_recovery: bool,
+    /// Type database for struct field access and function prototypes.
+    type_database: Option<Arc<TypeDatabase>>,
 }
 
 impl PseudoCodeEmitter {
@@ -89,6 +93,7 @@ impl PseudoCodeEmitter {
             naming_ctx: RefCell::new(NamingContext::new()),
             calling_convention: CallingConvention::default(),
             use_signature_recovery: true,
+            type_database: None,
         }
     }
 
@@ -139,6 +144,16 @@ impl PseudoCodeEmitter {
         self
     }
 
+    /// Sets the type database for struct field access and function prototypes.
+    ///
+    /// When set, the emitter will use the type database to:
+    /// - Convert pointer dereferences with offsets to struct field access
+    /// - Look up function prototypes for better call site rendering
+    pub fn with_type_database(mut self, db: Arc<TypeDatabase>) -> Self {
+        self.type_database = Some(db);
+        self
+    }
+
     /// Gets the DWARF name for a stack offset, if available.
     fn get_dwarf_name(&self, offset: i128) -> Option<&str> {
         self.dwarf_names.get(&offset).map(|s| s.as_str())
@@ -147,6 +162,80 @@ impl PseudoCodeEmitter {
     /// Gets the type string for a variable, defaulting to "int".
     fn get_type(&self, var_name: &str) -> &str {
         self.type_info.get(var_name).map(|s| s.as_str()).unwrap_or("int")
+    }
+
+    /// Try to format a dereference as struct field access using the type database.
+    ///
+    /// Given a deref like `*(ptr + 8)` and the knowledge that ptr points to struct stat,
+    /// this will return `ptr->st_ino` (assuming offset 8 is st_ino).
+    ///
+    /// For now, this is opportunistic - it will look at the variable's type hint
+    /// in type_info to determine the struct type.
+    fn try_format_struct_field(&self, addr: &Expr, _size: usize, table: &StringTable) -> Option<String> {
+        let type_db = self.type_database.as_ref()?;
+
+        // Extract base + offset from the address expression
+        // Common patterns: base + offset, base - offset
+        let (base, offset) = match &addr.kind {
+            ExprKind::BinOp { op: BinOpKind::Add, left, right } => {
+                // base + offset
+                if let ExprKind::IntLit(off) = right.kind {
+                    (left.as_ref(), off as usize)
+                } else if let ExprKind::IntLit(off) = left.kind {
+                    (right.as_ref(), off as usize)
+                } else {
+                    return None;
+                }
+            }
+            ExprKind::BinOp { op: BinOpKind::Sub, left, right } => {
+                // base - offset (negative offset)
+                if let ExprKind::IntLit(off) = right.kind {
+                    // Negative offsets are unusual for struct fields
+                    if off >= 0 {
+                        return None;
+                    }
+                    (left.as_ref(), (-off) as usize)
+                } else {
+                    return None;
+                }
+            }
+            // Direct dereference: *ptr (offset 0)
+            _ => (addr, 0),
+        };
+
+        // Get the base expression's variable name to look up its type
+        let var_name = match &base.kind {
+            ExprKind::Var(v) => &v.name,
+            _ => return None,
+        };
+
+        // Look up the type of this variable in type_info
+        let type_str = self.type_info.get(var_name)?;
+
+        // Extract struct name from type string
+        // Patterns: "struct foo *", "struct foo*", "struct foo"
+        let struct_name = if type_str.starts_with("struct ") {
+            let rest = &type_str[7..]; // Skip "struct "
+            // Find the end of the struct name (before * or space or end)
+            let name_end = rest.find(|c: char| c == '*' || c == ' ').unwrap_or(rest.len());
+            let name = rest[..name_end].trim();
+            format!("struct {}", name)
+        } else {
+            return None;
+        };
+
+        // Look up field at offset in type database
+        let field_access = type_db.format_field_access(&struct_name, offset)?;
+
+        // Format as ptr->field (pointer) or base.field (direct)
+        let base_str = self.format_expr_with_strings(base, table);
+        let is_pointer = type_str.contains('*');
+
+        if is_pointer {
+            Some(format!("{}{}", base_str, field_access.replace('.', "->")))
+        } else {
+            Some(format!("{}{}", base_str, field_access))
+        }
     }
 
     /// Formats an expression, resolving strings from the string table.
@@ -186,6 +275,10 @@ impl PseudoCodeEmitter {
                 // Check if this is a stack slot access (rbp + offset or rbp - offset)
                 if let Some(var_name) = self.try_format_stack_slot(addr, *size) {
                     return var_name;
+                }
+                // Check if this is a struct field access using the type database
+                if let Some(field_access) = self.try_format_struct_field(addr, *size as usize, table) {
+                    return field_access;
                 }
                 // Check if this is an array access pattern: base + index * size
                 if let Some((base, index)) = try_extract_array_access(addr, *size) {

@@ -17,6 +17,7 @@ hexray-formats.workspace = true
 hexray-disasm = { workspace = true, features = ["all-archs"] }
 hexray-analysis.workspace = true
 hexray-demangle.workspace = true
+hexray-types.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

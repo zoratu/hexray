@@ -20,6 +20,7 @@ use hexray_demangle::demangle_or_original;
 use hexray_disasm::{Disassembler, X86_64Disassembler, Arm64Disassembler, RiscVDisassembler};
 use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
 use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
+use hexray_types::TypeDatabase;
 use std::fs;
 use std::path::PathBuf;
 
@@ -27,8 +28,8 @@ use std::path::PathBuf;
 #[command(name = "hexray")]
 #[command(about = "A multi-architecture disassembler", long_about = None)]
 struct Cli {
-    /// Path to the binary file
-    binary: PathBuf,
+    /// Path to the binary file (not required for 'types' command)
+    binary: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -92,6 +93,9 @@ enum Commands {
         /// Project file for function names and comments
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Load type library for struct field resolution (posix, linux, macos, libc, all, or auto)
+        #[arg(long, short = 't')]
+        types: Option<String>,
     },
     /// Build and display call graph
     Callgraph {
@@ -135,6 +139,11 @@ enum Commands {
     Project {
         #[command(subcommand)]
         action: ProjectAction,
+    },
+    /// Manage C type libraries for decompilation
+    Types {
+        #[command(subcommand)]
+        action: TypesAction,
     },
 }
 
@@ -219,6 +228,39 @@ enum ProjectAction {
     },
 }
 
+/// Type library management actions
+#[derive(Subcommand)]
+enum TypesAction {
+    /// List builtin type databases
+    Builtin,
+    /// List types in a type database
+    List {
+        /// Type category: "posix", "linux", "macos", or "libc"
+        category: String,
+        /// Show only structs
+        #[arg(long)]
+        structs: bool,
+        /// Show only functions
+        #[arg(long)]
+        functions: bool,
+    },
+    /// Show details of a specific type
+    Show {
+        /// Type name (e.g., "struct stat", "size_t", "printf")
+        name: String,
+        /// Type category: "posix", "linux", "macos", or "libc"
+        #[arg(short, long, default_value = "posix")]
+        category: String,
+    },
+    /// Parse a C header file and show extracted types
+    Parse {
+        /// Path to C header file
+        header: PathBuf,
+    },
+    /// List all types available for decompilation
+    All,
+}
+
 fn parse_hex(s: &str) -> Result<u64, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     u64::from_str_radix(s, 16).map_err(|e| e.to_string())
@@ -252,9 +294,18 @@ impl<'a> Binary<'a> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Handle commands that don't require a binary file
+    if let Some(Commands::Types { action }) = cli.command {
+        return handle_types_command(action);
+    }
+
+    // Get binary path (required for all other commands)
+    let binary_path = cli.binary.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Binary file path is required. Usage: hexray <BINARY> [COMMAND]"))?;
+
     // Read the binary file
-    let data = fs::read(&cli.binary)
-        .with_context(|| format!("Failed to read binary: {}", cli.binary.display()))?;
+    let data = fs::read(binary_path)
+        .with_context(|| format!("Failed to read binary: {}", binary_path.display()))?;
 
     // Detect and parse the binary format
     let binary = match detect_format(&data) {
@@ -290,17 +341,18 @@ fn main() -> Result<()> {
         Some(Commands::Cfg { target, dot, json, html }) => {
             disassemble_cfg(fmt, &target, dot, json, html)?;
         }
-        Some(Commands::Decompile { target, show_addresses, follow, depth, project }) => {
+        Some(Commands::Decompile { target, show_addresses, follow, depth, project, types }) => {
             let target = resolve_decompile_target(&binary, target)?;
             let project = match project {
                 Some(path) => Some(AnalysisProject::load(&path)
                     .with_context(|| format!("Failed to load project: {}", path.display()))?),
                 None => None,
             };
+            let type_db = load_type_database(&binary, types.as_deref())?;
             if follow {
-                decompile_with_follow(&binary, &target, show_addresses, depth, project.as_ref())?;
+                decompile_with_follow(&binary, &target, show_addresses, depth, project.as_ref(), type_db.as_ref())?;
             } else {
-                decompile_function(&binary, &target, show_addresses, project.as_ref())?;
+                decompile_function(&binary, &target, show_addresses, project.as_ref(), type_db.as_ref())?;
             }
         }
         Some(Commands::Callgraph { target, dot, json, html }) => {
@@ -313,7 +365,11 @@ fn main() -> Result<()> {
             build_xrefs(fmt, target.as_deref(), calls_only, json)?;
         }
         Some(Commands::Project { action }) => {
-            handle_project_command(&cli.binary, action)?;
+            handle_project_command(binary_path, action)?;
+        }
+        Some(Commands::Types { .. }) => {
+            // Already handled before binary loading
+            unreachable!("Types command should have been handled earlier");
         }
         None => {
             // Default: disassemble
@@ -797,7 +853,7 @@ fn disassemble_for_cfg<D: Disassembler>(
     instructions
 }
 
-fn decompile_function(binary: &Binary, target: &str, show_addresses: bool, project: Option<&AnalysisProject>) -> Result<()> {
+fn decompile_function(binary: &Binary, target: &str, show_addresses: bool, project: Option<&AnalysisProject>, type_db: Option<&std::sync::Arc<TypeDatabase>>) -> Result<()> {
     let fmt = binary.as_format();
 
     // Try to parse as address first
@@ -902,12 +958,15 @@ fn decompile_function(binary: &Binary, target: &str, show_addresses: bool, proje
     };
 
     // Decompile
-    let decompiler = Decompiler::new()
+    let mut decompiler = Decompiler::new()
         .with_addresses(show_addresses)
         .with_string_table(string_table)
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
         .with_dwarf_names(dwarf_names);
+    if let Some(db) = type_db {
+        decompiler = decompiler.with_type_database(db.clone());
+    }
     let pseudocode = decompiler.decompile(&cfg, &name);
 
     println!("{}", pseudocode);
@@ -1082,6 +1141,59 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
     }
 
     table
+}
+
+/// Loads a type database based on the specified type library option.
+/// If no option is given, returns None.
+/// If "auto" is specified, selects based on binary format (linux/macos).
+fn load_type_database(binary: &Binary, types_opt: Option<&str>) -> Result<Option<std::sync::Arc<TypeDatabase>>> {
+    use hexray_types::builtin::{posix, linux, macos, libc};
+
+    let types_str = match types_opt {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    let mut db = TypeDatabase::new();
+
+    match types_str.to_lowercase().as_str() {
+        "posix" => {
+            posix::load_posix_types(&mut db);
+        }
+        "linux" => {
+            posix::load_posix_types(&mut db);
+            linux::load_linux_types(&mut db);
+            libc::load_libc_functions(&mut db);
+        }
+        "macos" | "darwin" => {
+            posix::load_posix_types(&mut db);
+            macos::load_macos_types(&mut db);
+            libc::load_libc_functions(&mut db);
+        }
+        "libc" => {
+            posix::load_posix_types(&mut db);
+            libc::load_libc_functions(&mut db);
+        }
+        "all" => {
+            posix::load_posix_types(&mut db);
+            linux::load_linux_types(&mut db);
+            macos::load_macos_types(&mut db);
+            libc::load_libc_functions(&mut db);
+        }
+        "auto" => {
+            // Detect based on binary format
+            posix::load_posix_types(&mut db);
+            libc::load_libc_functions(&mut db);
+            match binary {
+                Binary::Elf(_) => linux::load_linux_types(&mut db),
+                Binary::MachO(_) => macos::load_macos_types(&mut db),
+                Binary::Pe(_) => {} // TODO: Windows types
+            }
+        }
+        _ => bail!("Unknown type library '{}'. Use: posix, linux, macos, libc, all, or auto", types_str),
+    }
+
+    Ok(Some(std::sync::Arc::new(db)))
 }
 
 /// Attempts to load DWARF debug info from a binary.
@@ -1342,7 +1454,7 @@ fn extract_strings(
 }
 
 /// Decompile a function and follow internal calls recursively.
-fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, max_depth: usize, project: Option<&AnalysisProject>) -> Result<()> {
+fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, max_depth: usize, project: Option<&AnalysisProject>, type_db: Option<&std::sync::Arc<TypeDatabase>>) -> Result<()> {
     use std::collections::HashSet;
 
     let fmt = binary.as_format();
@@ -1463,12 +1575,15 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
         };
 
         // Decompile
-        let decompiler = Decompiler::new()
+        let mut decompiler = Decompiler::new()
             .with_addresses(show_addresses)
             .with_string_table(string_table.clone())
             .with_symbol_table(symbol_table.clone())
             .with_relocation_table(relocation_table.clone())
             .with_dwarf_names(dwarf_names);
+        if let Some(db) = type_db {
+            decompiler = decompiler.with_type_database(db.clone());
+        }
         let pseudocode = decompiler.decompile(&cfg, &func_name);
 
         println!("{}", pseudocode);
@@ -1899,6 +2014,145 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
                 Err(e) => {
                     println!("Cannot redo: {}", e);
                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle types management commands
+fn handle_types_command(action: TypesAction) -> Result<()> {
+    use hexray_types::builtin::{posix, linux, macos, libc};
+
+    match action {
+        TypesAction::Builtin => {
+            println!("Available builtin type databases:");
+            println!("{}", "=".repeat(40));
+            println!("  posix  - POSIX types (size_t, pid_t, struct timeval, etc.)");
+            println!("  linux  - Linux-specific types (struct stat, mmap, socket, etc.)");
+            println!("  macos  - macOS-specific types (mach_port_t, dispatch_*, etc.)");
+            println!("  libc   - Standard C library functions (printf, malloc, etc.)");
+        }
+
+        TypesAction::List { category, structs, functions } => {
+            let mut db = TypeDatabase::new();
+
+            match category.to_lowercase().as_str() {
+                "posix" => posix::load_posix_types(&mut db),
+                "linux" => {
+                    posix::load_posix_types(&mut db);
+                    linux::load_linux_types(&mut db);
+                }
+                "macos" => {
+                    posix::load_posix_types(&mut db);
+                    macos::load_macos_types(&mut db);
+                }
+                "libc" => {
+                    posix::load_posix_types(&mut db);
+                    libc::load_libc_functions(&mut db);
+                }
+                _ => bail!("Unknown category '{}'. Use: posix, linux, macos, or libc", category),
+            }
+
+            println!("Types in '{}' database:", category);
+            println!("{}", "=".repeat(50));
+
+            if !functions {
+                println!("\nTypes/Typedefs:");
+                for name in db.type_names() {
+                    if structs && !name.starts_with("struct ") {
+                        continue;
+                    }
+                    println!("  {}", name);
+                }
+            }
+
+            if !structs {
+                println!("\nFunctions:");
+                for name in db.function_names() {
+                    println!("  {}()", name);
+                }
+            }
+        }
+
+        TypesAction::Show { name, category } => {
+            let mut db = TypeDatabase::new();
+
+            match category.to_lowercase().as_str() {
+                "posix" => posix::load_posix_types(&mut db),
+                "linux" => {
+                    posix::load_posix_types(&mut db);
+                    linux::load_linux_types(&mut db);
+                }
+                "macos" => {
+                    posix::load_posix_types(&mut db);
+                    macos::load_macos_types(&mut db);
+                }
+                "libc" => {
+                    posix::load_posix_types(&mut db);
+                    libc::load_libc_functions(&mut db);
+                }
+                _ => bail!("Unknown category '{}'. Use: posix, linux, macos, or libc", category),
+            }
+
+            // Try as a type first
+            if db.get_type(&name).is_some() {
+                println!("Type: {}", name);
+                println!("{}", "=".repeat(40));
+                println!("{}", db.format_type(&name));
+            } else if let Some(func) = db.get_function(&name) {
+                println!("Function: {}", name);
+                println!("{}", "=".repeat(40));
+                println!("{}", func.format());
+            } else {
+                bail!("Type or function '{}' not found in '{}' database", name, category);
+            }
+        }
+
+        TypesAction::Parse { header } => {
+            let content = fs::read_to_string(&header)
+                .with_context(|| format!("Failed to read header: {}", header.display()))?;
+
+            let parser = hexray_types::Parser::new(&content)
+                .with_context(|| format!("Failed to parse header: {}", header.display()))?;
+            let db = parser.parse()
+                .with_context(|| format!("Failed to parse header: {}", header.display()))?;
+
+            println!("Parsed types from {}:", header.display());
+            println!("{}", "=".repeat(50));
+
+            println!("\nTypes:");
+            for name in db.type_names() {
+                println!("  {}", name);
+            }
+
+            println!("\nFunctions:");
+            for name in db.function_names() {
+                println!("  {}()", name);
+            }
+        }
+
+        TypesAction::All => {
+            let mut db = TypeDatabase::new();
+            posix::load_posix_types(&mut db);
+            linux::load_linux_types(&mut db);
+            macos::load_macos_types(&mut db);
+            libc::load_libc_functions(&mut db);
+
+            println!("All available types ({} types, {} functions):",
+                     db.type_names().count(),
+                     db.function_names().count());
+            println!("{}", "=".repeat(50));
+
+            println!("\nTypes:");
+            for name in db.type_names() {
+                println!("  {}", name);
+            }
+
+            println!("\nFunctions:");
+            for name in db.function_names() {
+                println!("  {}()", name);
             }
         }
     }

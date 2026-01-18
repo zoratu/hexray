@@ -223,6 +223,53 @@ impl TypeDatabase {
         }
     }
 
+    // ==================== Formatting ====================
+
+    /// Format a type as a C type definition.
+    pub fn format_type(&self, name: &str) -> String {
+        if let Some(ty) = self.get_type(name) {
+            match ty {
+                CType::Struct(s) => {
+                    let mut result = format!("struct {} {{\n", s.name.as_deref().unwrap_or("anonymous"));
+                    for field in &s.fields {
+                        result.push_str(&format!("    {}; // offset {}\n",
+                            field.field_type.to_c_string(Some(&field.name)),
+                            field.offset));
+                    }
+                    result.push_str("}");
+                    if s.size > 0 {
+                        result.push_str(&format!(" // size: {} bytes", s.size));
+                    }
+                    result
+                }
+                CType::Union(u) => {
+                    let mut result = format!("union {} {{\n", u.name.as_deref().unwrap_or("anonymous"));
+                    for member in &u.members {
+                        result.push_str(&format!("    {};\n", member.member_type.to_c_string(Some(&member.name))));
+                    }
+                    result.push_str("}");
+                    result
+                }
+                CType::Enum(e) => {
+                    let mut result = format!("enum {} {{\n", e.name.as_deref().unwrap_or("anonymous"));
+                    for (name, value) in &e.values {
+                        result.push_str(&format!("    {} = {},\n", name, value));
+                    }
+                    result.push_str("}");
+                    result
+                }
+                CType::Typedef(t) => {
+                    format!("typedef {} {};", t.target.to_c_string(None), name)
+                }
+                _ => ty.to_c_string(Some(name)),
+            }
+        } else if let Some(typedef_target) = self.typedefs.get(name) {
+            format!("typedef {} {};", typedef_target.to_c_string(None), name)
+        } else {
+            format!("// Unknown type: {}", name)
+        }
+    }
+
     // ==================== Merging ====================
 
     /// Merge another database into this one.

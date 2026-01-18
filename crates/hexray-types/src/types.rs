@@ -541,6 +541,16 @@ impl FunctionPrototype {
         };
         format!("{} {}({})", ret, self.name, params_str)
     }
+
+    /// Format for display (includes documentation if available).
+    pub fn format(&self) -> String {
+        let mut result = self.to_c_string();
+        result.push(';');
+        if let Some(ref doc) = self.doc {
+            result.push_str(&format!("\n// {}", doc));
+        }
+        result
+    }
 }
 
 // Common type constructors for convenience

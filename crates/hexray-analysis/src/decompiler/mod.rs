@@ -28,7 +28,9 @@ pub use signature::{
 };
 
 use hexray_core::ControlFlowGraph;
+use hexray_types::TypeDatabase;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// String table for resolving addresses to string literals.
 #[derive(Debug, Clone, Default)]
@@ -232,6 +234,8 @@ pub struct Decompiler {
     pub calling_convention: CallingConvention,
     /// Whether to enable signature recovery (default: true).
     pub enable_signature_recovery: bool,
+    /// Type database for struct field access and function prototypes.
+    pub type_database: Option<Arc<TypeDatabase>>,
 }
 
 impl Default for Decompiler {
@@ -247,6 +251,7 @@ impl Default for Decompiler {
             enable_struct_inference: false,
             calling_convention: CallingConvention::default(),
             enable_signature_recovery: true,
+            type_database: None,
         }
     }
 }
@@ -332,6 +337,16 @@ impl Decompiler {
         self
     }
 
+    /// Sets the type database for struct field access and function prototypes.
+    ///
+    /// When set, the decompiler will use the type database to:
+    /// - Convert memory offsets to struct field names (e.g., `*(ptr + 8)` -> `ptr->st_size`)
+    /// - Look up function prototypes for better call site rendering
+    pub fn with_type_database(mut self, db: Arc<TypeDatabase>) -> Self {
+        self.type_database = Some(db);
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 1: Structure the control flow
@@ -353,7 +368,7 @@ impl Decompiler {
         };
 
         // Step 3: Emit pseudo-code
-        let emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
+        let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_relocation_table(self.relocation_table.clone())
@@ -361,6 +376,9 @@ impl Decompiler {
             .with_dwarf_names(self.dwarf_names.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
+        if let Some(ref db) = self.type_database {
+            emitter = emitter.with_type_database(db.clone());
+        }
         emitter.emit(&structured, func_name)
     }
 
@@ -415,7 +433,7 @@ impl Decompiler {
         };
 
         // Emit pseudo-code
-        let emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
+        let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_relocation_table(self.relocation_table.clone())
@@ -423,6 +441,9 @@ impl Decompiler {
             .with_dwarf_names(self.dwarf_names.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
+        if let Some(ref db) = self.type_database {
+            emitter = emitter.with_type_database(db.clone());
+        }
         let code = emitter.emit(&transformed, func_name);
 
         (struct_defs, code)
