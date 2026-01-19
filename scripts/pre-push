@@ -1,0 +1,17 @@
+#!/bin/bash
+# Pre-push hook: Run tests in Docker on both x86_64 and ARM64 Linux
+#
+# To install: cp scripts/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# Or run: scripts/install-hooks.sh
+
+set -e
+
+echo "=== Running tests on linux/amd64 ==="
+docker run --platform linux/amd64 --rm hexray-test:amd64
+
+echo ""
+echo "=== Running tests on linux/arm64 ==="
+docker run --platform linux/arm64 --rm hexray-test:arm64
+
+echo ""
+echo "All tests passed on both architectures. Pushing..."
