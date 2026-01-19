@@ -25,7 +25,10 @@ use hexray_types::TypeDatabase;
 use hexray_signatures::{SignatureMatcher, builtin as sig_builtin};
 use hexray_emulate::{Emulator, EmulatorConfig};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+mod session;
+use session::{Session, Repl, list_sessions, AnnotationKind};
 
 #[derive(Parser)]
 #[command(name = "hexray")]
@@ -162,6 +165,11 @@ enum Commands {
     Emulate {
         #[command(subcommand)]
         action: EmulateAction,
+    },
+    /// Interactive analysis session with persistent history
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
     },
 }
 
@@ -432,6 +440,44 @@ enum EmulateAction {
     },
 }
 
+/// Interactive session actions
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Start a new analysis session
+    New {
+        /// Output session file path (.hrp)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Resume an existing session
+    Resume {
+        /// Session file path (.hrp)
+        session: PathBuf,
+    },
+    /// List available sessions in a directory
+    List {
+        /// Directory to search (defaults to current directory)
+        #[arg(default_value = ".")]
+        directory: PathBuf,
+    },
+    /// Show session information
+    Info {
+        /// Session file path (.hrp)
+        session: PathBuf,
+    },
+    /// Export session history to a file
+    Export {
+        /// Session file path (.hrp)
+        session: PathBuf,
+        /// Output file (stdout if not specified)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Export format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+    },
+}
+
 fn parse_hex(s: &str) -> Result<u64, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     u64::from_str_radix(s, 16).map_err(|e| e.to_string())
@@ -479,6 +525,27 @@ fn main() -> Result<()> {
             }
             SignaturesAction::Scan { .. } => {
                 // Scan requires a binary, handled below
+            }
+        }
+    }
+
+    // Handle session subcommands that don't require a binary on command line
+    if let Some(Commands::Session { ref action }) = cli.command {
+        match action {
+            SessionAction::List { directory } => {
+                return handle_session_list(directory);
+            }
+            SessionAction::Info { session } => {
+                return handle_session_info(session);
+            }
+            SessionAction::Resume { session } => {
+                return handle_session_resume(session);
+            }
+            SessionAction::Export { session, output, format } => {
+                return handle_session_export(session, output.as_ref(), format);
+            }
+            SessionAction::New { .. } => {
+                // New requires a binary, handled below
             }
         }
     }
@@ -563,6 +630,17 @@ fn main() -> Result<()> {
         }
         Some(Commands::Emulate { action }) => {
             handle_emulate_command(&binary, action)?;
+        }
+        Some(Commands::Session { action }) => {
+            match action {
+                SessionAction::New { output } => {
+                    handle_session_new(binary_path, output.as_ref())?;
+                }
+                _ => {
+                    // Already handled before binary loading
+                    unreachable!("Session command should have been handled earlier");
+                }
+            }
         }
         None => {
             // Default: disassemble
@@ -3037,4 +3115,496 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Session Command Handlers
+// =============================================================================
+
+fn handle_session_list(directory: &Path) -> Result<()> {
+    println!("Sessions in {}:", directory.display());
+    println!("{}", "-".repeat(80));
+
+    let sessions = list_sessions(directory)?;
+
+    if sessions.is_empty() {
+        println!("No session files (.hrp) found.");
+        return Ok(());
+    }
+
+    println!("{:<40} {:<20} {:<20}", "File", "Binary", "Last Accessed");
+    println!("{}", "-".repeat(80));
+
+    for (path, meta) in sessions {
+        let filename = path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "???".to_string());
+        let binary_name = PathBuf::from(&meta.binary_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "???".to_string());
+        let last_accessed = meta.last_accessed.format("%Y-%m-%d %H:%M");
+
+        println!("{:<40} {:<20} {:<20}", filename, binary_name, last_accessed);
+    }
+
+    Ok(())
+}
+
+fn handle_session_info(session_path: &Path) -> Result<()> {
+    let session = Session::resume(session_path)?;
+    let stats = session.stats()?;
+
+    println!("Session Information");
+    println!("===================");
+    println!("Session ID:    {}", session.meta.id);
+    println!("Name:          {}", session.meta.name);
+    println!("Binary:        {}", session.meta.binary_path);
+    println!("Binary Hash:   {}", &session.meta.binary_hash[..16]);
+    println!("Created:       {}", session.meta.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!("Last Accessed: {}", session.meta.last_accessed.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!();
+    println!("Statistics");
+    println!("----------");
+    println!("History entries: {}", stats.history_entries);
+    println!("Annotations:     {}", stats.annotations);
+    println!("  Renames:       {}", stats.renames);
+    println!("  Comments:      {}", stats.comments);
+    println!("  Bookmarks:     {}", stats.bookmarks);
+
+    // Verify binary
+    match session.verify_binary() {
+        Ok(true) => println!("\nBinary verification: OK"),
+        Ok(false) => println!("\nWARNING: Binary has changed since session creation!"),
+        Err(e) => println!("\nWARNING: Could not verify binary: {}", e),
+    }
+
+    Ok(())
+}
+
+fn handle_session_resume(session_path: &Path) -> Result<()> {
+    let session = Session::resume(session_path)?;
+    let binary_path = PathBuf::from(&session.meta.binary_path);
+
+    // Load the binary
+    let data = fs::read(&binary_path)
+        .with_context(|| format!("Failed to read binary: {}", binary_path.display()))?;
+
+    let binary = match detect_format(&data) {
+        BinaryType::Elf => Binary::Elf(Elf::parse(&data)?),
+        BinaryType::MachO => Binary::MachO(MachO::parse(&data)?),
+        BinaryType::Pe => Binary::Pe(Pe::parse(&data)?),
+        BinaryType::Unknown => bail!("Unknown binary format"),
+    };
+
+    run_session_repl(session, binary)?;
+    Ok(())
+}
+
+fn handle_session_new(binary_path: &Path, output: Option<&PathBuf>) -> Result<()> {
+    // Determine session file path
+    let session_path = match output {
+        Some(p) => p.clone(),
+        None => {
+            let stem = binary_path.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "session".to_string());
+            PathBuf::from(format!("{}.hrp", stem))
+        }
+    };
+
+    // Create session
+    let session = Session::create(binary_path, &session_path)?;
+    println!("Created session: {}", session_path.display());
+
+    // Load binary and start REPL
+    let data = fs::read(binary_path)?;
+    let binary = match detect_format(&data) {
+        BinaryType::Elf => Binary::Elf(Elf::parse(&data)?),
+        BinaryType::MachO => Binary::MachO(MachO::parse(&data)?),
+        BinaryType::Pe => Binary::Pe(Pe::parse(&data)?),
+        BinaryType::Unknown => bail!("Unknown binary format"),
+    };
+
+    run_session_repl(session, binary)?;
+    Ok(())
+}
+
+fn handle_session_export(session_path: &Path, output: Option<&PathBuf>, format: &str) -> Result<()> {
+    let session = Session::resume(session_path)?;
+    let history = session.get_history(None)?;
+
+    let content = match format {
+        "json" => {
+            serde_json::to_string_pretty(&history)?
+        }
+        "text" | _ => {
+            let mut s = String::new();
+            s.push_str(&format!("# Session: {}\n", session.meta.name));
+            s.push_str(&format!("# Binary: {}\n", session.meta.binary_path));
+            s.push_str(&format!("# Created: {}\n", session.meta.created_at));
+            s.push_str(&format!("# Exported: {}\n\n", chrono::Utc::now()));
+
+            for entry in &history {
+                s.push_str(&format!("--- [{}] {} ---\n", entry.index, entry.timestamp));
+                s.push_str(&format!("> {}\n", entry.command));
+                if !entry.output.is_empty() {
+                    s.push_str(&entry.output);
+                    if !entry.output.ends_with('\n') {
+                        s.push('\n');
+                    }
+                }
+                s.push('\n');
+            }
+            s
+        }
+    };
+
+    match output {
+        Some(path) => {
+            fs::write(path, &content)?;
+            println!("Exported {} history entries to {}", history.len(), path.display());
+        }
+        None => {
+            println!("{}", content);
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the interactive REPL with a session
+fn run_session_repl(session: Session, binary: Binary<'_>) -> Result<()> {
+    let mut repl = Repl::new(session)?;
+
+    repl.run(|session, line| {
+        // Parse the REPL command and execute it
+        execute_repl_command(session, &binary, line)
+    })?;
+
+    Ok(())
+}
+
+/// Execute a command within the REPL context
+fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) -> Result<String> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.is_empty() {
+        return Ok(String::new());
+    }
+
+    let fmt = binary.as_format();
+
+    match parts[0] {
+        "info" => {
+            let mut output = String::new();
+            output.push_str("Binary Information\n");
+            output.push_str("==================\n");
+            output.push_str(&format!("Format:        {}\n", binary.format_name()));
+            output.push_str(&format!("Architecture:  {:?}\n", fmt.architecture()));
+            output.push_str(&format!("Endianness:    {:?}\n", fmt.endianness()));
+            if let Some(entry) = fmt.entry_point() {
+                output.push_str(&format!("Entry Point:   {:#x}\n", entry));
+            }
+            let sym_count: usize = fmt.symbols().count();
+            output.push_str(&format!("Symbols:       {}\n", sym_count));
+            Ok(output)
+        }
+
+        "symbols" | "syms" => {
+            let functions_only = parts.iter().any(|&p| p == "-f" || p == "--functions");
+            let mut output = String::new();
+            output.push_str(&format!("{:<16} {:<8} {:<8} {:<8} {}\n",
+                "Address", "Size", "Type", "Bind", "Name"));
+            output.push_str(&format!("{}\n", "-".repeat(70)));
+
+            let mut symbols: Vec<_> = fmt.symbols().collect();
+            symbols.sort_by_key(|s| s.address);
+
+            for symbol in symbols {
+                if functions_only && !symbol.is_function() {
+                    continue;
+                }
+                if symbol.name.is_empty() {
+                    continue;
+                }
+
+                let type_str = if symbol.is_function() { "FUNC" } else { "OTHER" };
+                let bind_str = match symbol.binding {
+                    hexray_core::SymbolBinding::Local => "LOCAL",
+                    hexray_core::SymbolBinding::Global => "GLOBAL",
+                    hexray_core::SymbolBinding::Weak => "WEAK",
+                    _ => "OTHER",
+                };
+
+                // Check for renames
+                let name = session.get_rename(symbol.address)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| demangle_or_original(&symbol.name));
+
+                output.push_str(&format!("{:#016x} {:<8} {:<8} {:<8} {}\n",
+                    symbol.address, symbol.size, type_str, bind_str, name));
+            }
+            Ok(output)
+        }
+
+        "sections" => {
+            let mut output = String::new();
+            output.push_str(&format!("{:<4} {:<24} {:<16} {:<16} {:<8}\n",
+                "Idx", "Name", "Address", "Size", "Flags"));
+            output.push_str(&format!("{}\n", "-".repeat(75)));
+
+            for (idx, section) in fmt.sections().enumerate() {
+                output.push_str(&format!("{:<4} {:<24} {:#016x} {:#016x} {:<8}\n",
+                    idx, section.name(), section.virtual_address(), section.size(), ""));
+            }
+            Ok(output)
+        }
+
+        "strings" => {
+            let min_len = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let mut output = String::new();
+            let mut all_strings = Vec::new();
+
+            // Detect strings in all sections
+            let config = StringConfig {
+                min_length: min_len,
+                ..Default::default()
+            };
+            let detector = StringDetector::with_config(config);
+
+            for section in fmt.sections() {
+                let bytes = section.data();
+                let base_addr = section.virtual_address();
+                all_strings.extend(detector.detect(bytes, base_addr));
+            }
+
+            output.push_str(&format!("{:<16} {:<6} {}\n", "Address", "Length", "String"));
+            output.push_str(&format!("{}\n", "-".repeat(60)));
+
+            for s in all_strings.iter().take(100) {
+                let display = if s.content.len() > 60 {
+                    format!("{}...", &s.content[..57])
+                } else {
+                    s.content.clone()
+                };
+                output.push_str(&format!("{:#016x} {:<6} {}\n", s.address, s.length, display));
+            }
+
+            if all_strings.len() > 100 {
+                output.push_str(&format!("... ({} more)\n", all_strings.len() - 100));
+            }
+
+            Ok(output)
+        }
+
+        "disasm" | "d" => {
+            if parts.len() < 2 {
+                return Ok("Usage: disasm <symbol|address> [count]".to_string());
+            }
+
+            let target = parts[1];
+            let count = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
+
+            // Try to parse as address
+            let (addr, size) = if let Ok(a) = parse_address_str(target) {
+                (a, count * 10) // Estimate bytes
+            } else {
+                // Try to find symbol
+                if let Some(sym) = fmt.symbols().find(|s| s.name == target || demangle_or_original(&s.name) == target) {
+                    let size = if sym.size > 0 { sym.size as usize } else { count * 10 };
+                    (sym.address, size)
+                } else {
+                    return Ok(format!("Symbol not found: {}", target));
+                }
+            };
+
+            if let Some(bytes) = fmt.bytes_at(addr, size) {
+                let mut output = String::new();
+
+                // Disassemble using disassemble_block and take first `count` instructions
+                let results = disassemble_block_for_arch(fmt.architecture(), bytes, addr);
+
+                for (i, result) in results.into_iter().enumerate().take(count) {
+                    match result {
+                        Ok(inst) => {
+                            let comment = session.get_comment(inst.address)
+                                .map(|c| format!("  ; {}", c))
+                                .unwrap_or_default();
+                            output.push_str(&format!("{:#010x}  {:<32}{}\n",
+                                inst.address, inst.to_string(), comment));
+                        }
+                        Err(_) => {
+                            let estimated_addr = addr + i as u64;
+                            output.push_str(&format!("{:#010x}  <invalid>\n", estimated_addr));
+                        }
+                    }
+                }
+                Ok(output)
+            } else {
+                Ok(format!("No data at address {:#x}", addr))
+            }
+        }
+
+        "decompile" | "dec" => {
+            if parts.len() < 2 {
+                return Ok("Usage: decompile <symbol|address>".to_string());
+            }
+
+            let target = parts[1];
+
+            // Find function
+            let (addr, size) = if let Ok(a) = parse_address_str(target) {
+                // Find symbol at address for size
+                if let Some(sym) = fmt.symbols().find(|s| s.address == a && s.is_function()) {
+                    (a, sym.size as usize)
+                } else {
+                    (a, 1000) // Default size
+                }
+            } else {
+                if let Some(sym) = fmt.symbols().find(|s| s.name == target || demangle_or_original(&s.name) == target) {
+                    let size = if sym.size > 0 { sym.size as usize } else { 1000 };
+                    (sym.address, size)
+                } else {
+                    return Ok(format!("Symbol not found: {}", target));
+                }
+            };
+
+            if let Some(bytes) = fmt.bytes_at(addr, size.max(1000)) {
+                // Disassemble the function
+                let results = disassemble_block_for_arch(fmt.architecture(), bytes, addr);
+                let instructions: Vec<_> = results.into_iter()
+                    .filter_map(|r| r.ok())
+                    .take(500)
+                    .take_while(|inst| !inst.is_return())
+                    .chain(
+                        // Include one return instruction if we stopped at one
+                        disassemble_block_for_arch(fmt.architecture(), bytes, addr)
+                            .into_iter()
+                            .filter_map(|r| r.ok())
+                            .take(500)
+                            .find(|inst| inst.is_return())
+                    )
+                    .collect();
+
+                if instructions.is_empty() {
+                    return Ok("No instructions decoded".to_string());
+                }
+
+                let cfg = CfgBuilder::build(&instructions, addr);
+
+                // Build symbol table from session renames
+                let mut symbols = SymbolTable::new();
+                for (rename_addr, name) in session.get_all_annotations(AnnotationKind::Rename) {
+                    symbols.insert(rename_addr, name);
+                }
+                // Add original symbols
+                for sym in fmt.symbols() {
+                    symbols.insert(sym.address, demangle_or_original(&sym.name));
+                }
+
+                // Get function name
+                let func_name = session.get_rename(addr)
+                    .map(|s| s.to_string())
+                    .or_else(|| fmt.symbols().find(|s| s.address == addr).map(|s| demangle_or_original(&s.name)))
+                    .unwrap_or_else(|| format!("sub_{:x}", addr));
+
+                let decompiler = Decompiler::new()
+                    .with_addresses(false)
+                    .with_symbol_table(symbols);
+
+                let pseudo_code = decompiler.decompile(&cfg, &func_name);
+                Ok(pseudo_code)
+            } else {
+                Ok(format!("No data at address {:#x}", addr))
+            }
+        }
+
+        "xrefs" => {
+            if parts.len() < 2 {
+                return Ok("Usage: xrefs <address>".to_string());
+            }
+
+            let addr = match parse_address_str(parts[1]) {
+                Ok(a) => a,
+                Err(_) => {
+                    // Try to find symbol
+                    if let Some(sym) = fmt.symbols().find(|s| s.name == parts[1]) {
+                        sym.address
+                    } else {
+                        return Ok(format!("Invalid address or symbol: {}", parts[1]));
+                    }
+                }
+            };
+
+            // Build xref database (this is expensive, could be cached in session)
+            let mut builder = XrefBuilder::new();
+
+            for section in fmt.sections() {
+                if section.is_executable() {
+                    let bytes = section.data();
+                    let section_addr = section.virtual_address();
+                    let results = disassemble_block_for_arch(fmt.architecture(), bytes, section_addr);
+                    for result in results {
+                        if let Ok(inst) = result {
+                            builder.analyze_instruction(&inst);
+                        }
+                    }
+                }
+            }
+
+            let xref_db = builder.build();
+            let refs = xref_db.refs_to(addr);
+
+            if refs.is_empty() {
+                return Ok(format!("No references to {:#x}", addr));
+            }
+
+            let mut output = String::new();
+            output.push_str(&format!("Cross-references to {:#x}:\n", addr));
+            output.push_str(&format!("{}\n", "-".repeat(50)));
+
+            for xref in refs {
+                let type_str = match xref.xref_type {
+                    XrefType::Call => "CALL",
+                    XrefType::Jump => "JUMP",
+                    XrefType::DataRead => "READ",
+                    XrefType::DataWrite => "WRITE",
+                    XrefType::Unknown => "UNKNOWN",
+                };
+                output.push_str(&format!("{:#016x}  {}\n", xref.from, type_str));
+            }
+
+            Ok(output)
+        }
+
+        _ => {
+            Ok(format!("Unknown command: {}. Type 'help' for available commands.", parts[0]))
+        }
+    }
+}
+
+fn parse_address_str(s: &str) -> Result<u64> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u64::from_str_radix(s, 16).context("Invalid address")
+}
+
+/// Helper function to disassemble a block of bytes using the appropriate architecture
+fn disassemble_block_for_arch(arch: Architecture, bytes: &[u8], start_addr: u64) -> Vec<Result<hexray_core::Instruction, hexray_disasm::DecodeError>> {
+    match arch {
+        Architecture::X86_64 | Architecture::X86 => {
+            X86_64Disassembler::new().disassemble_block(bytes, start_addr)
+        }
+        Architecture::Arm64 => {
+            Arm64Disassembler::new().disassemble_block(bytes, start_addr)
+        }
+        Architecture::RiscV64 => {
+            RiscVDisassembler::new().disassemble_block(bytes, start_addr)
+        }
+        Architecture::RiscV32 => {
+            RiscVDisassembler::new_rv32().disassemble_block(bytes, start_addr)
+        }
+        _ => {
+            X86_64Disassembler::new().disassemble_block(bytes, start_addr)
+        }
+    }
 }

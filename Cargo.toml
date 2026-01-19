@@ -46,3 +46,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Testing
 pretty_assertions = "1.4"
+
+# Session/REPL
+rusqlite = { version = "0.31", features = ["bundled"] }
+rustyline = "14.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+sha2 = "0.10"
