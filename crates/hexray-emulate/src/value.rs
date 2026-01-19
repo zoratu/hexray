@@ -26,7 +26,7 @@ impl fmt::Display for SymbolicId {
 }
 
 /// A value in the emulator.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Value {
     /// A concrete numeric value.
     Concrete(u64),

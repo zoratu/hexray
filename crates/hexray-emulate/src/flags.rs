@@ -3,9 +3,10 @@
 //! Tracks the standard x86 flags: CF, ZF, SF, OF, PF, AF.
 
 use crate::value::Value;
+use serde::{Deserialize, Serialize};
 
 /// CPU flags register state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flags {
     /// Carry flag - set on unsigned overflow.
     pub cf: Option<bool>,

@@ -4,6 +4,7 @@
 //! while only allocating memory for accessed regions.
 
 use crate::value::Value;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Page size for memory (4KB).
@@ -11,22 +12,32 @@ const PAGE_SIZE: u64 = 4096;
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
 
 /// A page of memory containing byte values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MemoryPage {
     /// Byte values in this page.
-    bytes: [Value; PAGE_SIZE as usize],
+    bytes: Vec<Value>, // Changed from array for serde compatibility
 }
 
 impl Default for MemoryPage {
     fn default() -> Self {
         Self {
-            bytes: std::array::from_fn(|_| Value::Unknown),
+            bytes: (0..PAGE_SIZE as usize).map(|_| Value::Unknown).collect(),
         }
     }
 }
 
+impl MemoryPage {
+    fn get(&self, offset: usize) -> &Value {
+        &self.bytes[offset]
+    }
+
+    fn set(&mut self, offset: usize, value: Value) {
+        self.bytes[offset] = value;
+    }
+}
+
 /// Sparse memory model that only allocates pages when accessed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SparseMemory {
     /// Pages indexed by page number (address >> 12).
     pages: HashMap<u64, MemoryPage>,
@@ -52,7 +63,7 @@ impl SparseMemory {
 
         // Check if we have a modified page
         if let Some(page) = self.pages.get(&page_num) {
-            let value = &page.bytes[page_offset];
+            let value = page.get(page_offset);
             if !value.is_unknown() {
                 return value.clone();
             }
@@ -75,7 +86,7 @@ impl SparseMemory {
         let page_offset = (address & PAGE_MASK) as usize;
 
         let page = self.pages.entry(page_num).or_default();
-        page.bytes[page_offset] = value;
+        page.set(page_offset, value);
     }
 
     /// Read an N-byte value (little-endian).
@@ -172,7 +183,7 @@ impl SparseMemory {
         let page_offset = (address & PAGE_MASK) as usize;
 
         if let Some(page) = self.pages.get(&page_num) {
-            !page.bytes[page_offset].is_unknown()
+            !page.get(page_offset).is_unknown()
         } else {
             false
         }

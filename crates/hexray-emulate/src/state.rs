@@ -5,6 +5,7 @@
 use crate::flags::Flags;
 use crate::memory::SparseMemory;
 use crate::value::Value;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// x86-64 register IDs (matching hexray-core convention).
@@ -58,7 +59,7 @@ pub mod x86_regs {
 }
 
 /// Full machine state for emulation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineState {
     /// General purpose registers (64-bit values).
     registers: HashMap<u16, Value>,

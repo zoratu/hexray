@@ -35,12 +35,17 @@ pub mod flags;
 pub mod state;
 pub mod executor;
 pub mod x86_64;
+pub mod simulation;
 
 pub use value::{Value, SymbolicId};
 pub use memory::SparseMemory;
 pub use flags::Flags;
 pub use state::MachineState;
 pub use executor::{Emulator, EmulatorConfig, ExecutionResult, StopReason};
+pub use simulation::{
+    ExecutionTrace, FaultKind, Simulation, SimulationComparison, SimulationConfig,
+    SimulationSnapshot, TraceStep, compare_simulations,
+};
 
 use thiserror::Error;
 

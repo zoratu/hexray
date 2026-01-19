@@ -415,7 +415,7 @@ impl Arm64Disassembler {
                         // UBFM aliases
                         if imms + 1 == immr {
                             // LSL
-                            let shift = (reg_size - immr) & (reg_size - 1);
+                            let shift = reg_size.wrapping_sub(immr) & (reg_size - 1);
                             ("lsl", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(shift as u64, 8)])
                         } else if imms == reg_size - 1 {
                             // LSR
