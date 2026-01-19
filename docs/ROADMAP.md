@@ -1,6 +1,6 @@
 # Hexray Roadmap
 
-This document outlines the development roadmap, competitive analysis, and planned features for hexray.
+This document outlines the development roadmap, competitive analysis, and feature status for hexray.
 
 ## Competitive Analysis
 
@@ -25,11 +25,11 @@ This document outlines the development roadmap, competitive analysis, and planne
 | SSA form | ✅ | ✅ | ✅ | ✅ |
 | Type inference | ✅ | ✅ | ✅ | ✅ |
 | **Advanced Features** |
-| FLIRT/signatures | ✅ | ✅ | ✅ | ❌ Planned |
-| Type libraries | ✅ | ✅ | ✅ | ❌ Planned |
-| DWARF debug info | ✅ | ✅ | ✅ | ❌ Planned |
-| Data flow queries | ✅ | ✅ | ✅ | ❌ Planned |
-| Emulation | ✅ | ✅ | ✅ | ❌ Planned |
+| FLIRT/signatures | ✅ | ✅ | ✅ | ✅ |
+| Type libraries | ✅ | ✅ | ✅ | ✅ |
+| DWARF debug info | ✅ | ✅ | ✅ | ✅ |
+| Data flow queries | ✅ | ✅ | ✅ | ✅ |
+| Emulation | ✅ | ✅ | ✅ | ✅ |
 | **Interactive** |
 | Annotations/comments | ✅ | ✅ | ✅ | ❌ Planned |
 | Undo/redo | ✅ | ✅ | ✅ | ❌ Planned |
@@ -71,10 +71,11 @@ This document outlines the development roadmap, competitive analysis, and planne
 
 ## Current Status
 
-### Completed Features
+### Completed Phases
 
+#### Phase 1-9: Foundation ✅
 - Multi-architecture disassembly (x86_64, ARM64, RISC-V)
-- Multiple binary formats (ELF, Mach-O, PE)
+- Multiple binary formats (ELF, Mach-O)
 - Control flow graph construction
 - SSA-based decompiler with control flow structuring
 - Cross-reference analysis
@@ -84,308 +85,130 @@ This document outlines the development roadmap, competitive analysis, and planne
 - Multiple output formats (text, JSON, DOT, HTML)
 - Parallel disassembly
 
----
+#### Phase 10: Debug Info & Extended Coverage ✅
 
-## Planned Features
+**10.1 DWARF Debug Info** ✅
+- Location: `crates/hexray-formats/src/dwarf/`
+- Full DWARF4 parser with compilation units, DIEs
+- Line number lookup (address → source location)
+- Function discovery with parameters and local variables
+- Variable name extraction with stack offsets
 
-### Phase 1: Debug Info & Extended Coverage
+**10.2 Extended Instruction Coverage** ✅
+- x86_64: EVEX/AVX-512, VEX 0F38/0F3A, BMI1/BMI2, POPCNT/LZCNT/TZCNT
+- ARM64: SVE/SVE2 (Z0-Z31, P0-P15), atomics (LDXR, STXR, CAS, LDADD)
+- ARM64: SIMD/FP load/store with V=1 flag, advanced NEON
 
-#### DWARF Debug Info Parsing
+**10.4 Fuzz Testing** ✅
+- Location: `fuzz/`
+- Fuzz targets for x86_64, ARM64, RISC-V decoders
+- Fuzz targets for ELF and Mach-O parsers
 
-**New files:**
-```
-crates/hexray-formats/src/dwarf/
-    mod.rs           - Module root, public API
-    leb128.rs        - LEB128 encoding/decoding
-    abbrev.rs        - Abbreviation table parsing (.debug_abbrev)
-    die.rs           - Debug Information Entry parsing
-    line.rs          - Line number program (.debug_line)
-    info.rs          - Compilation units (.debug_info)
-    types.rs         - DWARF type representation
-```
+#### Phase 11: Competitive Feature Parity ✅
 
-**Key structures:**
-- `DebugInfo` - Parsed DWARF data
-- `LineNumberTable` - Address → source location mapping
-- `DebugInfoTable` - Bridge to decompiler for variable names
+**11.1 Function Signatures (FLIRT-like)** ✅
+- Location: `crates/hexray-signatures/`
+- Byte pattern matching with wildcards
+- Signature database with libc patterns
+- Builtin signatures for x86_64 and AArch64
 
-**Files to modify:**
-- `crates/hexray-formats/src/elf/mod.rs` - Add debug_info() method
-- `crates/hexray-analysis/src/decompiler/emitter.rs` - Use DWARF variable names
+**11.2 Type Libraries** ✅
+- Location: `crates/hexray-types/`
+- C type representation (structs, unions, enums, typedefs)
+- Type database with lookup
+- Builtin types for POSIX, Linux, macOS
 
----
+**11.3 Data Flow Queries** ✅
+- Location: `crates/hexray-analysis/src/dataflow/queries.rs`
+- Backward tracing: "where does this value come from?"
+- Forward tracing: "where does this value go?"
+- Find all uses/definitions of a value
 
-### Phase 2: Competitive Feature Parity
+**11.4 Static Emulation** ✅
+- Location: `crates/hexray-emulate/`
+- Concrete execution with x86_64 semantics
+- Register and memory state tracking
+- Indirect jump/call resolution
+- Value types: Concrete, Symbolic, Unknown
 
-#### Function Signature Recognition (FLIRT-like)
+#### Phase 12: Advanced Decompilation ✅
 
-**Goal:** Automatically identify standard library functions without symbols.
-
-**New crate:** `hexray-signatures`
-```
-crates/hexray-signatures/
-    Cargo.toml
-    src/
-        lib.rs           - Public API
-        pattern.rs       - Byte pattern with wildcards
-        matcher.rs       - Pattern matching engine
-        database.rs      - Signature database format
-        generators/
-            mod.rs
-            libc.rs      - Generate signatures from libc
-            libcxx.rs    - Generate signatures from libstdc++
-```
-
-**Key structures:**
-```rust
-pub struct FunctionSignature {
-    pub name: String,
-    pub pattern: BytePattern,       // First N bytes with wildcards
-    pub size_hint: Option<usize>,
-    pub calling_convention: CallingConvention,
-    pub return_type: Option<Type>,
-    pub parameters: Vec<Parameter>,
-    pub library: String,            // "glibc-2.31", "musl-1.2"
-}
-
-pub struct BytePattern {
-    bytes: Vec<PatternByte>,  // Concrete(u8) | Wildcard | MaskedWildcard
-}
-```
-
-**Implementation steps:**
-1. Define byte pattern format with wildcards
-2. Build pattern matcher (prefix tree for efficiency)
-3. Create signature database format (YAML, optimize to binary later)
-4. Generate initial signatures for common libc functions
-5. Integrate into analysis pipeline
-6. CLI: `hexray signatures <binary>`
-
----
-
-#### Type Libraries & Header Parsing
-
-**Goal:** Load C/C++ type definitions for accurate struct layouts.
-
-**New crate:** `hexray-types`
-```
-crates/hexray-types/
-    Cargo.toml
-    src/
-        lib.rs           - Public API
-        parser.rs        - C header parser (simplified)
-        types.rs         - Type representation
-        database.rs      - Type database with lookup
-        builtin/
-            mod.rs
-            posix.rs     - POSIX types
-            linux.rs     - Linux-specific
-            darwin.rs    - macOS-specific
-```
-
-**Key structures:**
-```rust
-pub enum CType {
-    Void,
-    Int { signed: bool, bits: u8 },
-    Float { bits: u8 },
-    Pointer(Box<CType>),
-    Array { element: Box<CType>, size: Option<usize> },
-    Struct(StructType),
-    Union(UnionType),
-    Enum(EnumType),
-    Function(FunctionType),
-    Typedef { name: String, target: Box<CType> },
-}
-
-pub struct FunctionPrototype {
-    pub name: String,
-    pub return_type: CType,
-    pub parameters: Vec<(String, CType)>,
-    pub variadic: bool,
-}
-```
-
-**Builtin types to include:**
-- Standard C: `size_t`, `ptrdiff_t`, `FILE`
-- POSIX: `pid_t`, `uid_t`, `struct stat`, `struct sockaddr`
-- Linux syscalls: `struct iovec`, `struct pollfd`
-
----
-
-#### Data Flow Queries (Watchpoint-style Analysis)
-
-**Goal:** Answer "where does this value come from?" and "where does this value go?"
-
-**New module:** `hexray-analysis/src/dataflow/queries.rs`
-
-**Key structures:**
-```rust
-pub enum DataFlowQuery {
-    TraceBackward { address: u64, operand_index: usize },
-    TraceForward { address: u64, operand_index: usize },
-    FindUses { def_address: u64, register: Register },
-    FindDefs { use_address: u64, register: Register },
-}
-
-pub struct DataFlowResult {
-    pub query: DataFlowQuery,
-    pub chain: Vec<DataFlowStep>,
-}
-```
-
-**Implementation steps:**
-1. Build on existing def-use chains and reaching definitions
-2. Implement backward slice: find all contributing definitions
-3. Implement forward slice: find all uses of a definition
-4. Handle inter-procedural flow
-5. CLI: `hexray trace --backward 0x1234:0`
-6. CLI: `hexray trace --forward 0x1234:rax`
-
----
-
-#### Static Emulation / Symbolic Execution
-
-**Goal:** Resolve indirect calls/jumps without running.
-
-**New crate:** `hexray-emulate`
-```
-crates/hexray-emulate/
-    Cargo.toml
-    src/
-        lib.rs           - Public API
-        state.rs         - Machine state (registers, memory, flags)
-        executor.rs      - Instruction interpreter
-        symbolic.rs      - Symbolic values and constraints
-        solver.rs        - Constraint solver
-        x86_64.rs        - x86_64 semantics
-        arm64.rs         - ARM64 semantics
-```
-
-**Use cases:**
-- Resolve jump tables: `jmp [rax*8 + table]`
-- Resolve virtual calls: `call [rax + vtable_offset]`
-- Trace string construction
-
-**Complexity notes:**
-- Start with concrete execution only
-- Add symbolic execution incrementally
-- Focus on common patterns first
-
----
-
-#### Interactive Analysis Database
-
-**Goal:** Persist user annotations and type overrides.
-
-**New module:** `hexray-analysis/src/project.rs`
-
-**Key structures:**
-```rust
-pub struct AnalysisProject {
-    pub binary_path: PathBuf,
-    pub binary_hash: [u8; 32],
-    pub annotations: HashMap<u64, Annotation>,
-    pub function_overrides: HashMap<u64, FunctionOverride>,
-    pub type_overrides: HashMap<u64, TypeOverride>,
-    pub comments: HashMap<u64, String>,
-    pub bookmarks: Vec<Bookmark>,
-    pub history: Vec<HistoryEntry>,  // For undo/redo
-}
-```
-
-**CLI commands:**
-- `hexray project create <binary> --output project.hrp`
-- `hexray project annotate 0x1234 --name "process_input"`
-- `hexray project comment 0x1234 "Validates user input"`
-
----
-
-### Priority Order
-
-```
-                    ┌─────────────────────┐
-                    │  Project Database   │ (can start anytime)
-                    └─────────────────────┘
-                              │
-    ┌─────────────────────────┼─────────────────────────┐
-    │                         │                         │
-    v                         v                         v
-┌───────────┐         ┌───────────────┐         ┌───────────────┐
-│ Signatures│         │ Type Libraries│         │ Data Flow     │
-└───────────┘         └───────────────┘         └───────────────┘
-    │                         │                         │
-    └────────────┬────────────┘                         │
-                 │                                      │
-                 v                                      │
-         ┌───────────────┐                             │
-         │  Decompiler   │◄────────────────────────────┘
-         │  Integration  │
-         └───────────────┘
-                 │
-                 v
-         ┌───────────────┐
-         │  Emulation    │ (uses all above)
-         └───────────────┘
-```
-
-**Recommended order:**
-1. **Project DB** - Enables iterative analysis, no dependencies
-2. **Type Libraries** - High impact on decompiler output
-3. **Signatures** - Identifies unknown functions
-4. **Data Flow Queries** - Builds on existing analysis
-5. **Emulation** - Most complex, benefits from all above
-
----
-
-### Phase 3: Advanced Decompilation
-
-#### Control Flow Improvements
+**12.1 Control Flow Improvements** ✅
 - Switch statement reconstruction (jump table detection)
-- Loop canonicalization (do-while, for-loop detection)
-- Short-circuit boolean optimization
+- Loop canonicalization (while, do-while, for loops)
+- Short-circuit boolean optimization (`a && b`, `a || b`)
 
-#### Expression Quality
-- Cast elimination where type is obvious
+**12.2 Expression Quality** ✅
 - Compound assignment detection (`x += 1`)
 - Array access detection (`arr[i]` from pointer math)
-- Struct field access (`s.field` from offset)
+- Struct field access inference
 
-#### C++ Decompilation
-- Virtual function table reconstruction
-- Constructor/destructor identification
-- Exception handling (try/catch from landing pads)
-- RTTI parsing for class names
+**12.3 C++ Decompilation** (Partial)
+- [x] Virtual function table reconstruction
+- [ ] Constructor/destructor identification
+- [ ] Exception handling (try/catch)
+- [ ] RTTI parsing
 
----
+#### Phase 13: Platform Expansion ✅
 
-### Phase 4: Platform Expansion
-
-#### PE/COFF Format (Windows)
-```
-crates/hexray-formats/src/pe/
-    mod.rs           - PE parser
-    header.rs        - DOS/PE/optional headers
-    sections.rs      - Section table
-    imports.rs       - Import directory
-    exports.rs       - Export directory
-    resources.rs     - Resource directory
-    relocations.rs   - Base relocations
-```
-
-#### Windows Type Libraries
-- Win32 API prototypes
-- Windows structures (HANDLE, HWND, etc.)
-- COM interface definitions
+**13.1 PE/COFF Format** ✅
+- Location: `crates/hexray-formats/src/pe/`
+- PE32 and PE32+ (64-bit) support
+- Import and export table parsing
+- Section handling with RVA conversion
+- Architecture detection (x86, x64, ARM64)
 
 ---
 
-### Future Work
+## Remaining Work
+
+### Phase 11.5: Interactive Analysis Database
+**Status:** Not started
+
+**Goal:** Persist user annotations, renamed functions, and type overrides.
+
+**Planned features:**
+- Project files with binary hash verification
+- Function/variable renaming
+- Comments and annotations
+- Type overrides
+- Bookmarks
+- Undo/redo history
+
+**CLI commands:**
+```bash
+hexray project create <binary> --output project.hrp
+hexray project annotate 0x1234 --name "process_input"
+hexray project comment 0x1234 "Validates user input"
+```
+
+### Phase 14: User Interface
+**Status:** Future
 
 - GUI/TUI interface (ratatui for TUI, egui for GUI)
 - Plugin system (dynamic loading, Lua/Python scripting)
 - Remote debugging protocol integration
 - Collaborative analysis (server mode)
+
+---
+
+## Project Structure
+
+```
+hexray/
+├── crates/
+│   ├── hexray/              # CLI application
+│   ├── hexray-core/         # Core types (Instruction, CFG, etc.)
+│   ├── hexray-formats/      # ELF, Mach-O, PE parsers + DWARF
+│   ├── hexray-disasm/       # Architecture decoders (x86_64, ARM64, RISC-V)
+│   ├── hexray-analysis/     # CFG, decompiler, data flow, xrefs
+│   ├── hexray-demangle/     # C++/Rust symbol demangling
+│   ├── hexray-signatures/   # Function signature matching
+│   ├── hexray-types/        # C type libraries
+│   └── hexray-emulate/      # Static emulation
+├── fuzz/                    # Fuzz testing targets
+└── docs/                    # Documentation
+```
 
 ---
 

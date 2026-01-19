@@ -4,8 +4,16 @@ The hexray decompiler transforms machine code into readable pseudo-code through 
 
 ## Pipeline Overview
 
-```
-Machine Code → Disassembly → CFG → SSA → Data Flow → Types → Structured CFG → Expressions → Pseudo-code
+```mermaid
+flowchart LR
+    A[Machine Code] --> B[Disassembly]
+    B --> C[CFG]
+    C --> D[SSA]
+    D --> E[Data Flow]
+    E --> F[Types]
+    F --> G[Structured CFG]
+    G --> H[Expressions]
+    H --> I[Pseudo-code]
 ```
 
 ### Stage 1: Disassembly
@@ -30,19 +38,17 @@ Instructions are grouped into basic blocks based on control flow:
 - **Edges**: Represent possible control flow between blocks
 - **Terminators**: Branch, ConditionalBranch, Return, etc.
 
-```
-bb0: [0x401000 - 0x401010]
-  ├── instructions...
-  └── terminator: ConditionalBranch { true: bb1, false: bb2 }
+```mermaid
+flowchart TB
+    bb0["bb0: 0x401000-0x401010<br/>ConditionalBranch"]
+    bb1["bb1: 0x401010-0x401020<br/>Jump"]
+    bb2["bb2: 0x401020-0x401030<br/>Fallthrough"]
+    bb3["bb3: 0x401030-0x401040<br/>Return"]
 
-bb1: [0x401010 - 0x401020]
-  └── terminator: Jump { target: bb3 }
-
-bb2: [0x401020 - 0x401030]
-  └── terminator: Fallthrough { target: bb3 }
-
-bb3: [0x401030 - 0x401040]
-  └── terminator: Return
+    bb0 -->|true| bb1
+    bb0 -->|false| bb2
+    bb1 --> bb3
+    bb2 --> bb3
 ```
 
 ### Stage 3: SSA Conversion
@@ -52,11 +58,17 @@ The CFG is converted to Static Single Assignment (SSA) form, where each variable
 **Phi Node Placement:**
 At control flow join points, phi nodes merge values from different paths:
 
-```
-bb0: x_0 = 1, br cond, bb1, bb2
-bb1: x_1 = 2, jmp bb3
-bb2: x_2 = 3, jmp bb3
-bb3: x_3 = φ(x_1:bb1, x_2:bb2)  // x_3 is either x_1 or x_2
+```mermaid
+flowchart TB
+    bb0["bb0: x_0 = 1<br/>br cond"]
+    bb1["bb1: x_1 = 2"]
+    bb2["bb2: x_2 = 3"]
+    bb3["bb3: x_3 = φ(x_1, x_2)"]
+
+    bb0 -->|true| bb1
+    bb0 -->|false| bb2
+    bb1 --> bb3
+    bb2 --> bb3
 ```
 
 **Version Numbering:**
@@ -94,6 +106,13 @@ Links each definition to all its uses, enabling:
 - Constant propagation
 - Copy propagation
 
+**Data Flow Queries:**
+Interactive queries for tracing values:
+- `TraceBackward`: Where does this value come from?
+- `TraceForward`: Where does this value go?
+- `FindUses`: All uses of a definition
+- `FindDefs`: All definitions reaching a use
+
 ### Stage 5: Type Inference
 
 Constraint-based type recovery infers types from instruction semantics:
@@ -119,26 +138,42 @@ Type::Struct { fields: [(0, int32), (4, int32)], size: 8 }
 The CFG is analyzed to recover high-level constructs:
 
 **If-Then-Else Detection:**
-```
-     bb0 (condition)
-    /   \
-  bb1   bb2
-    \   /
-     bb3 (join)
 
-→ if (cond) { bb1 } else { bb2 }
+```mermaid
+flowchart TB
+    bb0["bb0 (condition)"]
+    bb1["bb1 (then)"]
+    bb2["bb2 (else)"]
+    bb3["bb3 (join)"]
+
+    bb0 -->|true| bb1
+    bb0 -->|false| bb2
+    bb1 --> bb3
+    bb2 --> bb3
 ```
+
+→ `if (cond) { bb1 } else { bb2 }`
 
 **While Loop Detection:**
-```
-  → bb0 (header/condition)
-  ↑   ↓
-  ← bb1 (body, back-edge to header)
-      ↓
-    bb2 (exit)
 
-→ while (cond) { bb1 }
+```mermaid
+flowchart TB
+    bb0["bb0 (header/condition)"]
+    bb1["bb1 (body)"]
+    bb2["bb2 (exit)"]
+
+    bb0 -->|true| bb1
+    bb1 -->|back-edge| bb0
+    bb0 -->|false| bb2
 ```
+
+→ `while (cond) { bb1 }`
+
+**Switch Statement Detection:**
+Jump tables are analyzed to recover switch statements with case labels.
+
+**Short-Circuit Boolean:**
+Nested conditionals are combined into `&&` and `||` expressions.
 
 ### Stage 7: Expression Generation
 
@@ -147,10 +182,16 @@ Instructions are converted to high-level expressions:
 | Instruction | Expression |
 |-------------|------------|
 | `mov rax, rbx` | `rax = rbx` |
-| `add rax, 5` | `rax = rax + 5` |
+| `add rax, 5` | `rax = rax + 5` → `rax += 5` |
 | `cmp rax, 0` | `rax == 0` (condition) |
 | `call 0x401000` | `func_name()` |
 | `mov rax, [rbp-8]` | `rax = *(rbp - 8)` |
+| `mov rax, [rbx + rcx*4]` | `rax = arr[rcx]` |
+
+**Expression Simplifications:**
+- Compound assignment: `x = x + 1` → `x += 1`
+- Array access: `*(arr + i*4)` → `arr[i]`
+- Struct field: `*(ptr + 8)` → `ptr->field`
 
 ### Stage 8: Pseudo-code Emission
 
@@ -159,8 +200,7 @@ Structured nodes and expressions are formatted as C-like code:
 ```c
 void main()
 {
-    push(rbp);
-    rbp = rsp;
+    int local_8;
 
     if (eax == 0) {
         eax = 1;
@@ -168,7 +208,10 @@ void main()
         eax = 2;
     }
 
-    pop(rbp);
+    while (counter > 0) {
+        counter -= 1;
+    }
+
     return;
 }
 ```
@@ -214,6 +257,13 @@ if (flags.eq) goto bb1;
 // After
 if (w0 == 10) { ... }
 ```
+
+### DWARF Integration
+
+When debug info is available:
+- Variable names from debug symbols
+- Source file and line numbers
+- Parameter and local variable information
 
 ## Usage
 
@@ -263,25 +313,22 @@ let pseudo_code = decompiler.decompile(&cfg, "main");
 println!("{}", pseudo_code);
 ```
 
-### Data Flow Analysis
+### Data Flow Queries
 
 ```rust
-use hexray_analysis::{LivenessAnalysis, ReachingDefinitions, DefUseChain, Location};
+use hexray_analysis::dataflow::{DataFlowQueryEngine, DataFlowQuery};
 
-// Run liveness analysis
-let liveness = LivenessAnalysis::analyze(&cfg);
-for (block_id, (live_in, live_out)) in &liveness {
-    println!("Block {:?}: live_in={:?}", block_id, live_in.live);
-}
+// Create query engine from CFG
+let engine = DataFlowQueryEngine::new(&cfg);
 
-// Run reaching definitions
-let reaching = ReachingDefinitions::analyze(&cfg);
+// Trace backward: where does rax at 0x1006 come from?
+let result = engine.query(&DataFlowQuery::TraceBackward {
+    address: 0x1006,
+    register_id: 0, // rax
+});
 
-// Build def-use chains
-let chains = DefUseChain::build(&cfg);
-for (def, uses) in chains.iter() {
-    println!("Def {:?} used at {:?}", def, uses);
-}
+// Print the trace
+println!("{}", result);
 ```
 
 ### SSA Conversion
@@ -324,20 +371,25 @@ if let Some(ty) = inference.type_of(&Location::Register(0)) {
 }
 ```
 
-## Limitations
-
-1. **Simple Structuring**: Complex goto patterns may not structure cleanly
-2. **Architecture-Specific Idioms**: Some patterns (like ARM64 ADRP+ADD) need special handling
-3. **Basic Type Inference**: Infers integers, pointers, simple structs; no function pointer types yet
-4. **No Dead Code Elimination**: Unused assignments not yet removed from output
-
-## Future Improvements
+## Implemented Features
 
 - [x] SSA-based intermediate representation
 - [x] Type inference and recovery
 - [x] Data flow analysis framework
-- [ ] Dead code elimination
-- [ ] Expression simplification
-- [ ] Switch statement recovery
-- [ ] Stack variable naming
+- [x] Data flow queries (trace backward/forward)
+- [x] Dead code elimination (SSA-based)
+- [x] Expression simplification
+- [x] Compound assignment detection
+- [x] Short-circuit boolean optimization
+- [x] Switch statement recovery
+- [x] Array access detection
+- [x] Struct field inference
+- [x] Constant propagation
+- [x] Copy propagation
+
+## Future Improvements
+
+- [ ] Full DWARF variable name integration
 - [ ] Inter-procedural analysis
+- [ ] Function pointer type recovery
+- [ ] C++ exception handling reconstruction
