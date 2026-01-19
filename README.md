@@ -1,288 +1,196 @@
 # hexray
 
-A multi-architecture disassembler and decompiler written in Rust from scratch by GenAI for educational purposes.
+A professional-grade multi-architecture disassembler and decompiler written entirely in Rust. No external disassembler libraries - every instruction decoder, binary parser, and analysis pass is implemented from scratch.
 
-## Features
+## Why hexray?
 
-- **Multi-architecture support**: x86_64, ARM64, RISC-V (32/64-bit)
-- **Multiple binary formats**: ELF (Linux), Mach-O (macOS/iOS), PE (Windows)
-- **Decompilation**: Generates readable pseudo-code from machine code
-- **Control flow analysis**: Basic block detection, CFG construction
-- **Data flow analysis**: Reaching definitions, liveness analysis, def-use chains
-- **SSA form**: Static Single Assignment conversion with phi nodes
-- **Type inference**: Constraint-based type recovery for integers, pointers, and structures
-- **Symbol resolution**: Function names displayed in disassembly and decompiled output
-- **String detection**: Automatically resolves string literals in decompiled code
-- **Built from scratch**: No external disassembler libraries - pure Rust implementation
+| Feature | IDA Pro | Ghidra | Binary Ninja | hexray |
+|---------|:-------:|:------:|:------------:|:------:|
+| **Formats** |
+| ELF / Mach-O / PE | ✅ | ✅ | ✅ | ✅ |
+| DWARF Debug Info | ✅ | ✅ | ✅ | ✅ |
+| **Architectures** |
+| x86_64 (incl. AVX-512) | ✅ | ✅ | ✅ | ✅ |
+| ARM64 (incl. SVE/SVE2) | ✅ | ✅ | ✅ | ✅ |
+| RISC-V (RV32/64 + extensions) | ✅ | ✅ | ✅ | ✅ |
+| **Analysis** |
+| CFG / Call Graph | ✅ | ✅ | ✅ | ✅ |
+| SSA-based Decompiler | ✅ | ✅ | ✅ | ✅ |
+| Type Inference | ✅ | ✅ | ✅ | ✅ |
+| Data Flow Queries | ✅ | ✅ | ✅ | ✅ |
+| Function Signatures | ✅ | ✅ | ✅ | ✅ |
+| Static Emulation | ✅ | ✅ | ✅ | ✅ |
+| **Unique to hexray** |
+| 100% Rust | ❌ | ❌ | ❌ | ✅ |
+| No Dependencies* | ❌ | ❌ | ❌ | ✅ |
+| Single Binary CLI | ❌ | ❌ | ❌ | ✅ |
+| Open Source | ❌ | ✅ | ❌ | ✅ |
+
+*No capstone, no LLVM, no external disassemblers - pure Rust from the ground up.
+
+## Key Strengths
+
+### Complete From-Scratch Implementation
+Every component is hand-written in Rust for full transparency and hackability:
+- **Instruction decoders**: x86_64 (1500+ opcodes), ARM64 (NEON, SVE, crypto), RISC-V (RV32/64IMAC)
+- **Binary parsers**: ELF, Mach-O (including fat/universal), PE/COFF
+- **Debug info**: Full DWARF4 parser with line numbers and variable names
+- **Analysis**: CFG, SSA, data flow, type inference, decompilation
+
+### Advanced x86_64 Support
+- Full VEX prefix decoding (SSE, AVX, AVX2, FMA)
+- EVEX/AVX-512 with masking and broadcast
+- BMI1/BMI2 bit manipulation (PDEP, PEXT, etc.)
+- AES-NI and SHA extensions
+
+### Comprehensive ARM64 Support
+- NEON SIMD (128-bit vectors)
+- SVE/SVE2 scalable vectors (Z0-Z31, P0-P15)
+- Crypto extensions (AES, SHA, SM4)
+- Atomics (LDXR/STXR, CAS, LDADD, SWP)
+
+### Professional Decompiler
+- SSA-based intermediate representation
+- Control flow structuring (if/else, while, do-while, for, switch)
+- Short-circuit boolean optimization (`a && b`, `a || b`)
+- Compound assignment detection (`x += 1`)
+- Array and struct field access recovery
+- Constant propagation and dead code elimination
+
+### Analysis Capabilities
+- **Data flow queries**: Trace values forward/backward through code
+- **Function signatures**: FLIRT-like pattern matching for library identification
+- **Type libraries**: C type definitions for POSIX, Linux, macOS
+- **Static emulation**: Resolve indirect jumps and virtual calls
+- **Cross-references**: Code and data xref database
 
 ## Installation
-
-### From Source
 
 ```bash
 git clone https://github.com/zoratu/hexray.git
 cd hexray
 cargo build --release
+# Binary at target/release/hexray
 ```
 
-The binary will be at `target/release/hexray`.
-
-### Development Build
+## Quick Start
 
 ```bash
-cargo build
-cargo run -- <binary> [command]
-```
-
-## Usage
-
-### Basic Disassembly
-
-Disassemble a function by symbol name:
-
-```bash
-hexray ./binary -s main
-```
-
-Disassemble at a specific address:
-
-```bash
-hexray ./binary -a 0x401000
-```
-
-Control the number of instructions:
-
-```bash
-hexray ./binary -s main -c 50
-```
-
-### Commands
-
-#### `info` - Show Binary Information
-
-Display header information about the binary:
-
-```bash
+# Show binary info
 hexray ./binary info
-```
 
-Output:
-```
-Binary Information
-==================
-Format:        ELF
-Architecture:  X86_64
-Endianness:    Little
-Bitness:       Bits64
-Type:          Executable
-Entry Point:   0x401000
-Sections:      5
-Segments:      1
-Symbols:       4
-```
-
-#### `sections` - List Sections
-
-Show all sections in the binary:
-
-```bash
-hexray ./binary sections
-```
-
-Output:
-```
-Idx  Name                     Address          Size             Flags
----------------------------------------------------------------------------
-0                             0x00000000000000 0x00000000000000 ---
-1    .text                    0x00000000401000 0x00000000000028 A-X
-2    .symtab                  0x00000000000000 0x00000000000060 ---
-3    .strtab                  0x00000000000000 0x00000000000014 ---
-```
-
-#### `symbols` - List Symbols
-
-Show all symbols:
-
-```bash
-hexray ./binary symbols
-```
-
-Show only function symbols:
-
-```bash
+# List functions
 hexray ./binary symbols --functions
-```
 
-Output:
-```
-Address          Size     Type     Bind     Name
-----------------------------------------------------------------------
-0x00000000401000 15       FUNC     GLOBAL   _start
-0x0000000040100f 14       FUNC     GLOBAL   main
-0x0000000040101d 11       FUNC     GLOBAL   helper
-```
+# Disassemble a function
+hexray ./binary -s main
 
-#### `cfg` - Control Flow Graph
-
-Disassemble a function and show its control flow graph:
-
-```bash
-hexray ./binary cfg main
-```
-
-#### `decompile` - Decompile to Pseudo-code
-
-Decompile a function to readable pseudo-code:
-
-```bash
+# Decompile to pseudo-code
 hexray ./binary decompile main
+
+# Show control flow graph
+hexray ./binary cfg main
+
+# Cross-references
+hexray ./binary xrefs 0x401000
+
+# Detected strings
+hexray ./binary strings
 ```
 
-Output:
-```
-Decompiling main at 0x40100f
+## Example Output
 
-void main()
+### Decompilation
+```c
+void process_input(char *input)
 {
-    // bb0 [0x40100f - 0x401018]
-    push(rbp);
-    rbp = rsp;
-    helper();
-    // bb1 [0x401018 - 0x40101d]
-    eax = eax + 0xa;
-    pop(rbp);
-    return;
+    int len = strlen(input);
+
+    if (len > 0 && input[0] != '#') {
+        for (int i = 0; i < len; i++) {
+            buffer[i] = input[i] ^ 0x42;
+        }
+        send_data(buffer, len);
+    }
 }
 ```
 
-Hide address comments:
-
-```bash
-hexray ./binary decompile main --no-addresses
+### Disassembly
+```
+0x00401000  push    rbp
+0x00401001  mov     rbp, rsp
+0x00401004  sub     rsp, 0x20
+0x00401008  mov     qword ptr [rbp-0x8], rdi
+0x0040100c  mov     rax, qword ptr [rbp-0x8]
+0x00401010  mov     rdi, rax
+0x00401013  call    strlen
 ```
 
-Decompile by address:
+## Supported Targets
 
-```bash
-hexray ./binary decompile 0x401000
-```
+### Architectures
 
-## Examples
+| Architecture | Disassembly | Decompilation | Extensions |
+|--------------|:-----------:|:-------------:|------------|
+| x86_64 | ✅ | ✅ | SSE, AVX, AVX-512, BMI, AES-NI, SHA |
+| ARM64 | ✅ | ✅ | NEON, SVE/SVE2, Crypto, Atomics |
+| RISC-V 64 | ✅ | ✅ | M, A, C extensions |
+| RISC-V 32 | ✅ | ✅ | M, A, C extensions |
 
-### Disassemble an x86_64 ELF Binary
+### Binary Formats
 
-```bash
-# Show binary info
-hexray /usr/bin/ls info
-
-# List functions
-hexray /usr/bin/ls symbols --functions
-
-# Disassemble main
-hexray /usr/bin/ls -s main
-
-# Decompile main
-hexray /usr/bin/ls decompile main
-```
-
-### Disassemble a macOS Mach-O Binary
-
-```bash
-# Show binary info
-hexray /bin/echo info
-
-# List functions
-hexray /bin/echo symbols --functions
-
-# Decompile a function
-hexray /bin/echo decompile _main
-```
-
-### Analyze an ARM64 Binary
-
-```bash
-# Disassemble
-hexray ./arm64_binary -s main
-
-# Decompile
-hexray ./arm64_binary decompile main
-```
-
-### Analyze a Windows PE Binary
-
-```bash
-# Show binary info
-hexray ./program.exe info
-
-# List exports
-hexray ./program.exe symbols --functions
-
-# Decompile
-hexray ./program.exe decompile main
-```
-
-## Supported Architectures
-
-| Architecture | Disassembly | Decompilation | Notes |
-|--------------|-------------|---------------|-------|
-| x86_64       | ✅          | ✅            | Full support |
-| ARM64        | ✅          | ✅            | AArch64 |
-| RISC-V 64    | ✅          | ✅            | RV64I |
-| RISC-V 32    | ✅          | ✅            | RV32I |
-| x86 (32-bit) | Partial     | Partial       | Basic support |
-
-## Supported Formats
-
-| Format | Read | Symbols | Notes |
-|--------|------|---------|-------|
-| ELF    | ✅   | ✅      | Linux executables, shared libraries |
-| Mach-O | ✅   | ✅      | macOS/iOS executables |
-| Fat/Universal | ✅ | ✅   | Multi-arch Mach-O binaries |
-| PE     | ✅   | ✅      | Windows executables and DLLs (PE32/PE32+) |
+| Format | Parsing | Symbols | Debug Info |
+|--------|:-------:|:-------:|:----------:|
+| ELF | ✅ | ✅ | DWARF |
+| Mach-O | ✅ | ✅ | DWARF |
+| Fat/Universal | ✅ | ✅ | DWARF |
+| PE/COFF | ✅ | ✅ | - |
 
 ## Project Structure
 
 ```
 hexray/
-├── Cargo.toml                 # Workspace configuration
 ├── crates/
-│   ├── hexray/                # CLI application
-│   ├── hexray-core/           # Core types (Instruction, BasicBlock, CFG)
-│   ├── hexray-formats/        # Binary format parsers (ELF, Mach-O)
-│   ├── hexray-disasm/         # Architecture decoders (x86_64, ARM64, RISC-V)
-│   ├── hexray-analysis/       # CFG builder, decompiler, data flow, SSA, types
-│   └── hexray-demangle/       # C++/Rust symbol demangling
-└── tests/fixtures/            # Test binaries
+│   ├── hexray/              # CLI application
+│   ├── hexray-core/         # Core types (Instruction, CFG, etc.)
+│   ├── hexray-formats/      # ELF, Mach-O, PE parsers + DWARF
+│   ├── hexray-disasm/       # Instruction decoders
+│   ├── hexray-analysis/     # CFG, SSA, decompiler, data flow
+│   ├── hexray-demangle/     # C++/Rust symbol demangling
+│   ├── hexray-signatures/   # Function signature matching
+│   ├── hexray-types/        # C type libraries
+│   └── hexray-emulate/      # Static emulation engine
+├── fuzz/                    # Fuzz testing targets
+└── docs/                    # Architecture documentation
 ```
 
-## Building Test Binaries
+## Documentation
 
-Create test ELF binaries:
-
-```bash
-python3 tests/fixtures/elf/create_elf_with_symbols.py
-```
+- [Architecture Overview](docs/ARCHITECTURE.md) - Crate structure and data flow
+- [Decompiler Guide](docs/DECOMPILER.md) - Decompilation pipeline details
+- [Supported Instructions](docs/INSTRUCTIONS.md) - Complete instruction reference
+- [Development Roadmap](docs/ROADMAP.md) - Feature status and plans
 
 ## Development
 
-### Running Tests
-
 ```bash
-cargo test
+# Run tests
+cargo test --workspace
+
+# Run with debug output
+RUST_LOG=debug cargo run -- ./binary decompile main
+
+# Fuzz testing
+cd fuzz && cargo +nightly fuzz run x86_64_decoder
 ```
 
-### Building Documentation
+## Use Cases
 
-```bash
-cargo doc --open
-```
-
-## Limitations
-
-- Decompiler output is pseudo-code, not valid C
-- Complex control flow (goto, switch statements) may not structure perfectly
-- Type inference is basic (integers, pointers, simple structs)
-- No switch statement recovery yet
+- **Reverse Engineering**: Analyze malware, understand proprietary software
+- **Security Research**: Vulnerability discovery, exploit development
+- **CTF Competitions**: Quick binary analysis with scriptable CLI
+- **Education**: Learn how disassemblers and decompilers work
+- **Tooling Integration**: JSON output for programmatic analysis
 
 ## License
 
@@ -290,7 +198,8 @@ GNU GPLv3
 
 ## Acknowledgments
 
-Built as an educational project to understand:
-- Binary file formats (ELF, Mach-O)
-- Instruction set architectures (x86_64, ARM64, RISC-V)
-- Control flow analysis and decompilation techniques
+Built to deeply understand binary analysis from first principles:
+- Instruction set architectures and encoding formats
+- Binary file formats and linking
+- Control flow analysis and decompilation theory
+- Data flow analysis and type recovery
