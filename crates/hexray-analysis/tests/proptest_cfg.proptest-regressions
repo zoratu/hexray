@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 099c46652ce05a8f05dc3f3f9d032a6f76f8b9a868d65019c968565636a8735d # shrinks to cfg = ControlFlowGraph { entry: BasicBlockId(0), blocks: {BasicBlockId(0): BasicBlock { id: BasicBlockId(0), start: 4096, end: 4096, instructions: [], terminator: Unknown }, BasicBlockId(1): BasicBlock { id: BasicBlockId(1), start: 4352, end: 4352, instructions: [], terminator: Unknown }, BasicBlockId(2): BasicBlock { id: BasicBlockId(2), start: 4608, end: 4608, instructions: [], terminator: Unknown }}, successors: {BasicBlockId(0): [BasicBlockId(2)], BasicBlockId(1): [BasicBlockId(2)], BasicBlockId(2): [BasicBlockId(0)]}, predecessors: {BasicBlockId(0): [BasicBlockId(2)], BasicBlockId(1): [], BasicBlockId(2): [BasicBlockId(1), BasicBlockId(0)]} }

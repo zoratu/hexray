@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a1955c31fadcb20f5204067bee59c36c8fd9ff51781e48d69074e5a6157a3769 # shrinks to a = Float { size: 4 }, b = Void
+cc 8ea7fcb34ec68280e50771d6de82c1d65085f344a86c929ffb591d572e33ecac # shrinks to a = Void, b = CString
