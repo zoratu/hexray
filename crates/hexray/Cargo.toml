@@ -19,6 +19,7 @@ hexray-analysis.workspace = true
 hexray-demangle.workspace = true
 hexray-types.workspace = true
 hexray-signatures.workspace = true
+hexray-emulate.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
