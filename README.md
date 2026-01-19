@@ -20,6 +20,7 @@ A professional-grade multi-architecture disassembler and decompiler written enti
 | Data Flow Queries | ✅ | ✅ | ✅ | ✅ |
 | Function Signatures | ✅ | ✅ | ✅ | ✅ |
 | Static Emulation | ✅ | ✅ | ✅ | ✅ |
+| Interactive Sessions | ✅ | ✅ | ✅ | ✅ |
 | **Unique to hexray** |
 | 100% Rust | ❌ | ❌ | ❌ | ✅ |
 | No Dependencies* | ❌ | ❌ | ❌ | ✅ |
@@ -64,6 +65,12 @@ Every component is hand-written in Rust for full transparency and hackability:
 - **Static emulation**: Resolve indirect jumps and virtual calls
 - **Cross-references**: Code and data xref database
 
+### Interactive Sessions
+- **Persistent REPL**: SQLite-backed sessions with command history
+- **Annotations**: Rename functions/variables, add comments, bookmarks
+- **Session management**: Detach and resume sessions later
+- **Binary verification**: SHA256 hash ensures session matches binary
+
 ## Installation
 
 ```bash
@@ -96,6 +103,10 @@ hexray ./binary xrefs 0x401000
 
 # Detected strings
 hexray ./binary strings
+
+# Interactive session (persistent annotations)
+hexray session new ./binary --output project.hrp
+hexray session resume project.hrp
 ```
 
 ## Example Output

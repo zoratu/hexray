@@ -31,9 +31,9 @@ This document outlines the development roadmap, competitive analysis, and featur
 | Data flow queries | ✅ | ✅ | ✅ | ✅ |
 | Emulation | ✅ | ✅ | ✅ | ✅ |
 | **Interactive** |
-| Annotations/comments | ✅ | ✅ | ✅ | ❌ Planned |
+| Annotations/comments | ✅ | ✅ | ✅ | ✅ |
 | Undo/redo | ✅ | ✅ | ✅ | ❌ Planned |
-| Project files | ✅ | ✅ | ✅ | ❌ Planned |
+| Session/Project files | ✅ | ✅ | ✅ | ✅ |
 | Scripting/plugins | ✅ | ✅ | ✅ | ❌ Future |
 | GUI | ✅ | ✅ | ✅ | ❌ Future |
 
@@ -158,29 +158,45 @@ This document outlines the development roadmap, competitive analysis, and featur
 - Section handling with RVA conversion
 - Architecture detection (x86, x64, ARM64)
 
----
+#### Phase 11.5: Interactive Analysis Database ✅
 
-## Remaining Work
+**Location:** `crates/hexray/src/session.rs`
 
-### Phase 11.5: Interactive Analysis Database
-**Status:** Not started
+**Features implemented:**
+- Interactive REPL with rustyline (readline support, history navigation)
+- SQLite-based session persistence (.hrp files)
+- Binary hash verification (SHA256)
+- Command history with outputs saved between sessions
+- Annotations: function/variable renaming, comments, bookmarks, tags
+- Pager integration (`less`) for long outputs
+- Session management (create, resume, list, info, export)
 
-**Goal:** Persist user annotations, renamed functions, and type overrides.
-
-**Planned features:**
-- Project files with binary hash verification
-- Function/variable renaming
-- Comments and annotations
-- Type overrides
-- Bookmarks
-- Undo/redo history
+**REPL commands:**
+- `help` - Show available commands
+- `disasm <addr> [count]` - Disassemble instructions
+- `func <addr|name>` - Analyze function
+- `xrefs <addr>` - Show cross-references
+- `strings [min_len]` - Detect strings
+- `rename <addr> <name>` - Rename function/variable
+- `comment <addr> <text>` - Add comment
+- `bookmark <addr> [name]` - Add bookmark
+- `bookmarks`, `renames`, `comments` - List annotations
+- `history [n]` - Show command history
+- `recall <n>` - Recall output from history
+- `stats` - Session statistics
 
 **CLI commands:**
 ```bash
-hexray project create <binary> --output project.hrp
-hexray project annotate 0x1234 --name "process_input"
-hexray project comment 0x1234 "Validates user input"
+hexray session new <binary> --output project.hrp
+hexray session resume project.hrp
+hexray session list <directory>
+hexray session info project.hrp
+hexray session export project.hrp --format json
 ```
+
+---
+
+## Remaining Work
 
 ### Phase 14: User Interface
 **Status:** Future
