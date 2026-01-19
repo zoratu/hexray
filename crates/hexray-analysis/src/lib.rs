@@ -17,6 +17,7 @@
 
 pub mod callgraph;
 pub mod cfg_builder;
+pub mod cpp_special;
 pub mod dataflow;
 pub mod decompiler;
 pub mod function_finder;
@@ -24,6 +25,7 @@ pub mod indirect_calls;
 pub mod output;
 pub mod parallel;
 pub mod project;
+pub mod rtti;
 pub mod ssa;
 pub mod stack_canary;
 pub mod strings;
@@ -62,6 +64,14 @@ pub use ssa::{SsaBuilder, SsaFunction, SsaValue, PhiNode, SsaOptimizer, Optimiza
 pub use types::{Type, TypeInference, FunctionSignatures, Constraint};
 pub use vtable::{
     Vtable, VtableConfig, VtableDatabase, VtableDetector, VtableEntry, VirtualCallSite,
+};
+pub use rtti::{
+    BaseClassFlags, BaseClassInfo, ClassHierarchy, RttiDatabase, RttiParser,
+    TypeInfo, TypeInfoKind, TypeInfoVtableKind, VmiFlags,
+};
+pub use cpp_special::{
+    BaseCall, CppSpecialDatabase, CppSpecialDetector, SpecialMemberAnalysis,
+    SpecialMemberKind, VtableAssignment,
 };
 pub use stack_canary::{
     CanarySource, SegmentRegister, StackCanaryAnalysis, StackCanaryDetector, StackCanaryInfo,

@@ -51,6 +51,7 @@ pub mod eh_frame;
 mod info;
 mod leb128;
 mod line;
+pub mod lsda;
 mod types;
 
 pub use abbrev::{Abbreviation, AbbreviationTable, AttributeSpec};
@@ -59,6 +60,10 @@ pub use eh_frame::{Cie, CfiInstruction, EhFrame, EhFrameParser, Fde, parse_eh_fr
 pub use info::{CompilationUnit, CompilationUnitHeader, DebugInfoParser};
 pub use leb128::{decode_sleb128, decode_uleb128};
 pub use line::{FileEntry, LineNumberProgram, LineNumberProgramHeader, LineRow};
+pub use lsda::{
+    ActionRecord, CallSite, CatchHandler, CatchType, CleanupHandler,
+    ExceptionHandlingInfo, Lsda, LsdaParser, TryBlock,
+};
 pub use types::{DwAt, DwAte, DwForm, DwLang, DwLne, DwLns, DwTag};
 
 /// High-level debug information interface.

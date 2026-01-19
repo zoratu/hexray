@@ -32,7 +32,7 @@ This document outlines the development roadmap, competitive analysis, and featur
 | Emulation | ✅ | ✅ | ✅ | ✅ |
 | **Interactive** |
 | Annotations/comments | ✅ | ✅ | ✅ | ✅ |
-| Undo/redo | ✅ | ✅ | ✅ | ❌ Planned |
+| Undo/redo | ✅ | ✅ | ✅ | ✅ |
 | Session/Project files | ✅ | ✅ | ✅ | ✅ |
 | Scripting/plugins | ✅ | ✅ | ✅ | ❌ Future |
 | GUI | ✅ | ✅ | ✅ | ❌ Future |
@@ -143,11 +143,23 @@ This document outlines the development roadmap, competitive analysis, and featur
 - Array access detection (`arr[i]` from pointer math)
 - Struct field access inference
 
-**12.3 C++ Decompilation** (Partial)
+**12.3 C++ Decompilation** ✅
 - [x] Virtual function table reconstruction
-- [ ] Constructor/destructor identification
-- [ ] Exception handling (try/catch)
-- [ ] RTTI parsing
+- [x] Constructor/destructor identification
+  - Location: `crates/hexray-analysis/src/cpp_special.rs`
+  - Symbol name analysis for Itanium C++ ABI (C1, C2, C3, D0, D1, D2)
+  - Vtable pointer assignment detection
+  - Base class constructor/destructor call tracking
+- [x] Exception handling (try/catch)
+  - Location: `crates/hexray-formats/src/dwarf/lsda.rs`
+  - LSDA (Language Specific Data Area) parsing
+  - Call site tables, action tables, type tables
+  - Try block and catch handler reconstruction
+- [x] RTTI parsing
+  - Location: `crates/hexray-analysis/src/rtti.rs`
+  - Itanium C++ ABI typeinfo structure parsing
+  - Single and virtual multiple inheritance support
+  - Class hierarchy reconstruction
 
 #### Phase 13: Platform Expansion ✅
 
@@ -168,6 +180,7 @@ This document outlines the development roadmap, competitive analysis, and featur
 - Binary hash verification (SHA256)
 - Command history with outputs saved between sessions
 - Annotations: function/variable renaming, comments, bookmarks, tags
+- Undo/redo for all annotation changes
 - Pager integration (`less`) for long outputs
 - Session management (create, resume, list, info, export)
 
@@ -180,7 +193,10 @@ This document outlines the development roadmap, competitive analysis, and featur
 - `rename <addr> <name>` - Rename function/variable
 - `comment <addr> <text>` - Add comment
 - `bookmark <addr> [name]` - Add bookmark
+- `delete <kind> <addr>` - Delete annotation (rename, comment, bookmark)
 - `bookmarks`, `renames`, `comments` - List annotations
+- `undo` - Undo last annotation change
+- `redo` - Redo last undone change
 - `history [n]` - Show command history
 - `recall <n>` - Recall output from history
 - `stats` - Session statistics

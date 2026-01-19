@@ -88,6 +88,43 @@ impl std::str::FromStr for AnnotationKind {
     }
 }
 
+/// An undo/redo action record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoAction {
+    /// Unique ID for this action
+    pub id: i64,
+    /// Description of the action
+    pub description: String,
+    /// Type of action
+    pub action_type: UndoActionType,
+    /// Timestamp when the action was performed
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Type of undo action
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UndoActionType {
+    /// Annotation was added
+    AnnotationAdd {
+        address: u64,
+        kind: AnnotationKind,
+        new_value: String,
+    },
+    /// Annotation was modified
+    AnnotationModify {
+        address: u64,
+        kind: AnnotationKind,
+        old_value: String,
+        new_value: String,
+    },
+    /// Annotation was deleted
+    AnnotationDelete {
+        address: u64,
+        kind: AnnotationKind,
+        old_value: String,
+    },
+}
+
 /// Interactive analysis session
 pub struct Session {
     /// Database connection
@@ -100,6 +137,8 @@ pub struct Session {
     pub session_path: PathBuf,
     /// Lines threshold for paging
     pager_threshold: usize,
+    /// Current undo position (ID of last action that is "done")
+    undo_position: Option<i64>,
 }
 
 impl Session {
@@ -152,6 +191,7 @@ impl Session {
             annotations: HashMap::new(),
             session_path: session_path.to_path_buf(),
             pager_threshold: 50,
+            undo_position: None,
         })
     }
 
@@ -212,12 +252,20 @@ impl Session {
             annotations
         };
 
+        // Load undo position (max ID that is "done", i.e., not undone)
+        let undo_position: Option<i64> = conn.query_row(
+            "SELECT MAX(id) FROM undo_history WHERE undone = 0",
+            [],
+            |row| row.get(0),
+        ).ok().flatten();
+
         Ok(Self {
             conn,
             meta,
             annotations,
             session_path: session_path.to_path_buf(),
             pager_threshold: 50,
+            undo_position,
         })
     }
 
@@ -250,8 +298,18 @@ impl Session {
                 PRIMARY KEY (address, kind)
             );
 
+            CREATE TABLE IF NOT EXISTS undo_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                description TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                action_data TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                undone INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp);
             CREATE INDEX IF NOT EXISTS idx_annotations_address ON annotations(address);
+            CREATE INDEX IF NOT EXISTS idx_undo_history_undone ON undo_history(undone);
         "#)?;
         Ok(())
     }
@@ -334,8 +392,15 @@ impl Session {
         }
     }
 
-    /// Add an annotation
+    /// Add an annotation (with undo support)
     pub fn add_annotation(&mut self, address: u64, kind: AnnotationKind, value: &str) -> Result<()> {
+        // Check if there's an existing value (for undo)
+        let old_value = self.annotations
+            .get(&address)
+            .and_then(|kinds| kinds.get(&kind))
+            .cloned();
+
+        // Insert the annotation
         self.conn.execute(
             "INSERT OR REPLACE INTO annotations (address, kind, value, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![
@@ -346,12 +411,239 @@ impl Session {
             ],
         )?;
 
+        // Record undo action
+        let action_type = if let Some(old_val) = old_value {
+            UndoActionType::AnnotationModify {
+                address,
+                kind,
+                old_value: old_val,
+                new_value: value.to_string(),
+            }
+        } else {
+            UndoActionType::AnnotationAdd {
+                address,
+                kind,
+                new_value: value.to_string(),
+            }
+        };
+
+        self.record_undo_action(&format!("{} at 0x{:x}", kind, address), action_type)?;
+
         // Update cache
         self.annotations.entry(address)
             .or_insert_with(HashMap::new)
             .insert(kind, value.to_string());
 
         Ok(())
+    }
+
+    /// Delete an annotation (with undo support)
+    pub fn delete_annotation(&mut self, address: u64, kind: AnnotationKind) -> Result<bool> {
+        // Check if there's an existing value
+        let old_value = self.annotations
+            .get(&address)
+            .and_then(|kinds| kinds.get(&kind))
+            .cloned();
+
+        if let Some(old_val) = old_value {
+            // Delete from database
+            self.conn.execute(
+                "DELETE FROM annotations WHERE address = ?1 AND kind = ?2",
+                params![address as i64, kind.to_string()],
+            )?;
+
+            // Record undo action
+            let action_type = UndoActionType::AnnotationDelete {
+                address,
+                kind,
+                old_value: old_val,
+            };
+            self.record_undo_action(&format!("delete {} at 0x{:x}", kind, address), action_type)?;
+
+            // Update cache
+            if let Some(kinds) = self.annotations.get_mut(&address) {
+                kinds.remove(&kind);
+                if kinds.is_empty() {
+                    self.annotations.remove(&address);
+                }
+            }
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Record an undo action
+    fn record_undo_action(&mut self, description: &str, action_type: UndoActionType) -> Result<()> {
+        // Clear any "redo" actions (actions after current position)
+        if let Some(pos) = self.undo_position {
+            self.conn.execute(
+                "DELETE FROM undo_history WHERE id > ?1",
+                params![pos],
+            )?;
+        }
+
+        // Serialize action type
+        let action_data = serde_json::to_string(&action_type)?;
+        let type_name = match &action_type {
+            UndoActionType::AnnotationAdd { .. } => "add",
+            UndoActionType::AnnotationModify { .. } => "modify",
+            UndoActionType::AnnotationDelete { .. } => "delete",
+        };
+
+        // Insert the action
+        self.conn.execute(
+            "INSERT INTO undo_history (description, action_type, action_data, timestamp, undone) VALUES (?1, ?2, ?3, ?4, 0)",
+            params![
+                description,
+                type_name,
+                action_data,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+
+        // Update undo position
+        self.undo_position = Some(self.conn.last_insert_rowid());
+
+        Ok(())
+    }
+
+    /// Undo the last action
+    pub fn undo(&mut self) -> Result<Option<String>> {
+        // Find the last non-undone action
+        let action: Option<(i64, String, String)> = self.conn.query_row(
+            "SELECT id, description, action_data FROM undo_history WHERE undone = 0 ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).ok();
+
+        if let Some((id, description, action_data)) = action {
+            let action_type: UndoActionType = serde_json::from_str(&action_data)?;
+
+            // Apply the reverse action
+            match action_type {
+                UndoActionType::AnnotationAdd { address, kind, .. } => {
+                    // Undo add = delete
+                    self.conn.execute(
+                        "DELETE FROM annotations WHERE address = ?1 AND kind = ?2",
+                        params![address as i64, kind.to_string()],
+                    )?;
+                    if let Some(kinds) = self.annotations.get_mut(&address) {
+                        kinds.remove(&kind);
+                    }
+                }
+                UndoActionType::AnnotationModify { address, kind, old_value, .. } => {
+                    // Undo modify = restore old value
+                    self.conn.execute(
+                        "UPDATE annotations SET value = ?1 WHERE address = ?2 AND kind = ?3",
+                        params![&old_value, address as i64, kind.to_string()],
+                    )?;
+                    if let Some(kinds) = self.annotations.get_mut(&address) {
+                        kinds.insert(kind, old_value);
+                    }
+                }
+                UndoActionType::AnnotationDelete { address, kind, old_value } => {
+                    // Undo delete = restore
+                    self.conn.execute(
+                        "INSERT INTO annotations (address, kind, value, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![address as i64, kind.to_string(), &old_value, Utc::now().to_rfc3339()],
+                    )?;
+                    self.annotations.entry(address)
+                        .or_insert_with(HashMap::new)
+                        .insert(kind, old_value);
+                }
+            }
+
+            // Mark as undone
+            self.conn.execute(
+                "UPDATE undo_history SET undone = 1 WHERE id = ?1",
+                params![id],
+            )?;
+
+            // Update undo position
+            self.undo_position = self.conn.query_row(
+                "SELECT MAX(id) FROM undo_history WHERE undone = 0",
+                [],
+                |row| row.get(0),
+            ).ok().flatten();
+
+            Ok(Some(format!("Undone: {}", description)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Redo the last undone action
+    pub fn redo(&mut self) -> Result<Option<String>> {
+        // Find the first undone action
+        let action: Option<(i64, String, String)> = self.conn.query_row(
+            "SELECT id, description, action_data FROM undo_history WHERE undone = 1 ORDER BY id ASC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).ok();
+
+        if let Some((id, description, action_data)) = action {
+            let action_type: UndoActionType = serde_json::from_str(&action_data)?;
+
+            // Re-apply the action
+            match action_type {
+                UndoActionType::AnnotationAdd { address, kind, new_value } => {
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO annotations (address, kind, value, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![address as i64, kind.to_string(), &new_value, Utc::now().to_rfc3339()],
+                    )?;
+                    self.annotations.entry(address)
+                        .or_insert_with(HashMap::new)
+                        .insert(kind, new_value);
+                }
+                UndoActionType::AnnotationModify { address, kind, new_value, .. } => {
+                    self.conn.execute(
+                        "UPDATE annotations SET value = ?1 WHERE address = ?2 AND kind = ?3",
+                        params![&new_value, address as i64, kind.to_string()],
+                    )?;
+                    if let Some(kinds) = self.annotations.get_mut(&address) {
+                        kinds.insert(kind, new_value);
+                    }
+                }
+                UndoActionType::AnnotationDelete { address, kind, .. } => {
+                    self.conn.execute(
+                        "DELETE FROM annotations WHERE address = ?1 AND kind = ?2",
+                        params![address as i64, kind.to_string()],
+                    )?;
+                    if let Some(kinds) = self.annotations.get_mut(&address) {
+                        kinds.remove(&kind);
+                    }
+                }
+            }
+
+            // Mark as not undone
+            self.conn.execute(
+                "UPDATE undo_history SET undone = 0 WHERE id = ?1",
+                params![id],
+            )?;
+
+            // Update undo position
+            self.undo_position = Some(id);
+
+            Ok(Some(format!("Redone: {}", description)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Check if undo is available
+    pub fn can_undo(&self) -> bool {
+        self.undo_position.is_some()
+    }
+
+    /// Check if redo is available
+    pub fn can_redo(&self) -> bool {
+        self.conn.query_row::<i64, _, _>(
+            "SELECT COUNT(*) FROM undo_history WHERE undone = 1",
+            [],
+            |row| row.get(0),
+        ).map(|count| count > 0).unwrap_or(false)
     }
 
     /// Get annotations for an address
@@ -668,6 +960,35 @@ impl Repl {
                     Ok(Some(output))
                 }
             }
+            "undo" => {
+                match self.session.undo()? {
+                    Some(msg) => Ok(Some(msg)),
+                    None => Ok(Some("Nothing to undo".to_string())),
+                }
+            }
+            "redo" => {
+                match self.session.redo()? {
+                    Some(msg) => Ok(Some(msg)),
+                    None => Ok(Some("Nothing to redo".to_string())),
+                }
+            }
+            "delete" => {
+                if parts.len() >= 3 {
+                    let addr = parse_address(parts[1])?;
+                    let kind_str = parts[2];
+                    if let Ok(kind) = kind_str.parse::<AnnotationKind>() {
+                        if self.session.delete_annotation(addr, kind)? {
+                            Ok(Some(format!("Deleted {} at 0x{:x}", kind, addr)))
+                        } else {
+                            Ok(Some(format!("No {} found at 0x{:x}", kind, addr)))
+                        }
+                    } else {
+                        Ok(Some(format!("Unknown annotation kind: {}. Use: rename, comment, bookmark, type, tag", kind_str)))
+                    }
+                } else {
+                    Ok(Some("Usage: delete <address> <kind>  (kind: rename, comment, bookmark, type, tag)".to_string()))
+                }
+            }
             "stats" => {
                 let stats = self.session.stats()?;
                 Ok(Some(format!(
@@ -708,6 +1029,11 @@ Annotations:
   rename <addr> <name>  Rename a function/address
   comment <addr> <text> Add a comment to an address
   bookmark <addr> [lbl] Bookmark an address with optional label
+  delete <addr> <kind>  Delete an annotation (kind: rename, comment, bookmark, type, tag)
+
+Undo/Redo:
+  undo                  Undo the last annotation change
+  redo                  Redo the last undone change
 
 List Annotations:
   renames               List all renamed addresses
