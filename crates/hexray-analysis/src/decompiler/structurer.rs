@@ -134,6 +134,9 @@ impl StructuredCfg {
         // Post-process to detect switch statements from if-else chains
         let body = detect_switch_statements(body);
 
+        // Post-process to detect short-circuit boolean patterns (a && b, a || b)
+        let body = detect_short_circuit(body);
+
         // Post-process to convert gotos to break/continue where applicable
         let body = convert_gotos_to_break_continue(body, None);
 
@@ -2638,5 +2641,307 @@ fn simplify_expressions_in_node(node: StructuredNode) -> StructuredNode {
         }
         // Other nodes pass through unchanged
         other => other,
+    }
+}
+
+// ==================== Short-Circuit Boolean Detection ====================
+
+/// Detects short-circuit boolean patterns and converts nested ifs to && / ||.
+///
+/// Patterns detected:
+/// 1. `if (a) { if (b) { body }}` → `if (a && b) { body }`
+/// 2. `if (a) { body } else { if (b) { same_body }}` → `if (a || b) { body }`
+/// 3. Chains: `if (a) { if (b) { if (c) { body }}}` → `if (a && b && c) { body }`
+fn detect_short_circuit(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    nodes.into_iter().map(detect_short_circuit_in_node).collect()
+}
+
+/// Recursively detect short-circuit patterns in a single node.
+fn detect_short_circuit_in_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::If { condition, then_body, else_body } => {
+            // First, recursively process children
+            let then_body = detect_short_circuit(then_body);
+            let else_body = else_body.map(detect_short_circuit);
+
+            // Try to detect short-circuit AND: if (a) { if (b) { body } }
+            if else_body.is_none() {
+                if let Some((combined_cond, inner_body, inner_else)) = try_extract_and_chain(&condition, &then_body) {
+                    return StructuredNode::If {
+                        condition: combined_cond,
+                        then_body: inner_body,
+                        else_body: inner_else,
+                    };
+                }
+            }
+
+            // Try to detect short-circuit OR: if (a) { body } else { if (b) { same_body } }
+            if let Some(ref else_nodes) = else_body {
+                if let Some((combined_cond, body)) = try_extract_or_chain(&condition, &then_body, else_nodes) {
+                    return StructuredNode::If {
+                        condition: combined_cond,
+                        then_body: body,
+                        else_body: None,
+                    };
+                }
+            }
+
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            }
+        }
+        StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition,
+                body: detect_short_circuit(body),
+            }
+        }
+        StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body: detect_short_circuit(body),
+                condition,
+            }
+        }
+        StructuredNode::For { init, condition, update, body } => {
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: detect_short_circuit(body),
+            }
+        }
+        StructuredNode::Loop { body } => {
+            StructuredNode::Loop {
+                body: detect_short_circuit(body),
+            }
+        }
+        StructuredNode::Switch { value, cases, default } => {
+            StructuredNode::Switch {
+                value,
+                cases: cases
+                    .into_iter()
+                    .map(|(vals, body)| (vals, detect_short_circuit(body)))
+                    .collect(),
+                default: default.map(detect_short_circuit),
+            }
+        }
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(detect_short_circuit(nodes))
+        }
+        other => other,
+    }
+}
+
+/// Try to extract a short-circuit AND chain from nested ifs.
+/// Pattern: `if (a) { if (b) { body } }` → Some((a && b, body, None))
+/// Pattern: `if (a) { if (b) { body } else { e } }` → Some((a && b, body, Some(e)))
+fn try_extract_and_chain(
+    outer_cond: &Expr,
+    then_body: &[StructuredNode],
+) -> Option<(Expr, Vec<StructuredNode>, Option<Vec<StructuredNode>>)> {
+    // The then_body must contain exactly one If node (possibly with surrounding trivial nodes)
+    let (inner_if, prefix, suffix) = extract_single_if(then_body)?;
+
+    // Don't combine if there's non-trivial code before/after the inner if
+    if !prefix.is_empty() || !suffix.is_empty() {
+        return None;
+    }
+
+    // Extract the inner if
+    let (inner_cond, inner_body, inner_else) = match inner_if {
+        StructuredNode::If { condition, then_body, else_body } => {
+            (condition, then_body, else_body)
+        }
+        _ => return None,
+    };
+
+    // Recursively try to extract more AND conditions from the inner body
+    let (final_cond, final_body, final_else) = if inner_else.is_none() {
+        if let Some((nested_cond, nested_body, nested_else)) = try_extract_and_chain(&inner_cond, &inner_body) {
+            (nested_cond, nested_body, nested_else)
+        } else {
+            (inner_cond.clone(), inner_body.clone(), inner_else.clone())
+        }
+    } else {
+        (inner_cond.clone(), inner_body.clone(), inner_else.clone())
+    };
+
+    // Combine: outer_cond && final_cond
+    let combined = Expr::binop(BinOpKind::LogicalAnd, outer_cond.clone(), final_cond);
+
+    Some((combined, final_body, final_else))
+}
+
+/// Try to extract a short-circuit OR chain from if-else with same body.
+/// Pattern: `if (a) { body } else { if (b) { same_body } }` → Some((a || b, body))
+fn try_extract_or_chain(
+    outer_cond: &Expr,
+    then_body: &[StructuredNode],
+    else_body: &[StructuredNode],
+) -> Option<(Expr, Vec<StructuredNode>)> {
+    // The else_body must contain exactly one If node
+    let (inner_if, prefix, suffix) = extract_single_if(else_body)?;
+
+    // Don't combine if there's non-trivial code
+    if !prefix.is_empty() || !suffix.is_empty() {
+        return None;
+    }
+
+    let (inner_cond, inner_body, inner_else) = match inner_if {
+        StructuredNode::If { condition, then_body, else_body } => {
+            (condition, then_body, else_body)
+        }
+        _ => return None,
+    };
+
+    // The inner if must not have an else, and bodies must be structurally equal
+    if inner_else.is_some() {
+        return None;
+    }
+
+    if !bodies_are_equal(then_body, &inner_body) {
+        return None;
+    }
+
+    // Recursively try to extract more OR conditions
+    let (final_cond, _) = if let Some((nested_cond, _)) = try_extract_or_chain(&inner_cond, &inner_body, &[]) {
+        (nested_cond, inner_body.clone())
+    } else {
+        (inner_cond.clone(), inner_body.clone())
+    };
+
+    // Combine: outer_cond || final_cond
+    let combined = Expr::binop(BinOpKind::LogicalOr, outer_cond.clone(), final_cond);
+
+    Some((combined, then_body.to_vec()))
+}
+
+/// Extract a single If node from a body, returning (if_node, prefix_nodes, suffix_nodes).
+/// Returns None if there's no If or multiple Ifs.
+fn extract_single_if(body: &[StructuredNode]) -> Option<(StructuredNode, Vec<StructuredNode>, Vec<StructuredNode>)> {
+    let mut if_idx = None;
+
+    for (i, node) in body.iter().enumerate() {
+        match node {
+            StructuredNode::If { .. } => {
+                if if_idx.is_some() {
+                    // Multiple ifs, can't combine
+                    return None;
+                }
+                if_idx = Some(i);
+            }
+            StructuredNode::Block { statements, .. } if statements.is_empty() => {
+                // Empty block, ignore
+            }
+            StructuredNode::Expr(_) => {
+                // Expression statement before/after the if prevents combining
+                // (side effects matter)
+                if if_idx.is_some() {
+                    return None; // Side effect after the if
+                }
+            }
+            _ => {
+                // Other node types prevent combining
+                return None;
+            }
+        }
+    }
+
+    let idx = if_idx?;
+    let prefix: Vec<_> = body[..idx].iter()
+        .filter(|n| !matches!(n, StructuredNode::Block { statements, .. } if statements.is_empty()))
+        .cloned()
+        .collect();
+    let suffix: Vec<_> = body[idx + 1..].iter()
+        .filter(|n| !matches!(n, StructuredNode::Block { statements, .. } if statements.is_empty()))
+        .cloned()
+        .collect();
+
+    Some((body[idx].clone(), prefix, suffix))
+}
+
+/// Check if two structured bodies are structurally equal.
+/// This is a simplified check - full equality would require deep comparison.
+fn bodies_are_equal(a: &[StructuredNode], b: &[StructuredNode]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    for (node_a, node_b) in a.iter().zip(b.iter()) {
+        if !nodes_are_equal(node_a, node_b) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check if two nodes are structurally equal.
+fn nodes_are_equal(a: &StructuredNode, b: &StructuredNode) -> bool {
+    match (a, b) {
+        (StructuredNode::Block { statements: s1, .. },
+         StructuredNode::Block { statements: s2, .. }) => {
+            s1.len() == s2.len() && s1.iter().zip(s2.iter()).all(|(e1, e2)| exprs_are_equal(e1, e2))
+        }
+        (StructuredNode::Return(e1), StructuredNode::Return(e2)) => {
+            match (e1, e2) {
+                (Some(e1), Some(e2)) => exprs_are_equal(e1, e2),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        (StructuredNode::Break, StructuredNode::Break) => true,
+        (StructuredNode::Continue, StructuredNode::Continue) => true,
+        (StructuredNode::Goto(a), StructuredNode::Goto(b)) => a == b,
+        (StructuredNode::Expr(e1), StructuredNode::Expr(e2)) => exprs_are_equal(e1, e2),
+        // For more complex nodes, we're conservative and say they're not equal
+        // This could be expanded for more thorough comparison
+        _ => false,
+    }
+}
+
+/// Check if two expressions are structurally equal.
+fn exprs_are_equal(a: &Expr, b: &Expr) -> bool {
+    use super::expression::ExprKind;
+
+    match (&a.kind, &b.kind) {
+        (ExprKind::Var(v1), ExprKind::Var(v2)) => v1.name == v2.name,
+        (ExprKind::IntLit(n1), ExprKind::IntLit(n2)) => n1 == n2,
+        (ExprKind::BinOp { op: op1, left: l1, right: r1 },
+         ExprKind::BinOp { op: op2, left: l2, right: r2 }) => {
+            op1 == op2 && exprs_are_equal(l1, l2) && exprs_are_equal(r1, r2)
+        }
+        (ExprKind::UnaryOp { op: op1, operand: o1 },
+         ExprKind::UnaryOp { op: op2, operand: o2 }) => {
+            op1 == op2 && exprs_are_equal(o1, o2)
+        }
+        (ExprKind::Call { target: t1, args: a1 },
+         ExprKind::Call { target: t2, args: a2 }) => {
+            call_targets_equal(t1, t2) && a1.len() == a2.len() &&
+            a1.iter().zip(a2.iter()).all(|(e1, e2)| exprs_are_equal(e1, e2))
+        }
+        (ExprKind::Deref { addr: a1, size: s1 },
+         ExprKind::Deref { addr: a2, size: s2 }) => {
+            s1 == s2 && exprs_are_equal(a1, a2)
+        }
+        (ExprKind::Assign { lhs: l1, rhs: r1 },
+         ExprKind::Assign { lhs: l2, rhs: r2 }) => {
+            exprs_are_equal(l1, l2) && exprs_are_equal(r1, r2)
+        }
+        _ => false,
+    }
+}
+
+/// Check if two call targets are equal.
+fn call_targets_equal(a: &super::expression::CallTarget, b: &super::expression::CallTarget) -> bool {
+    use super::expression::CallTarget;
+    match (a, b) {
+        (CallTarget::Direct { target: t1, .. }, CallTarget::Direct { target: t2, .. }) => t1 == t2,
+        (CallTarget::Named(n1), CallTarget::Named(n2)) => n1 == n2,
+        (CallTarget::Indirect(e1), CallTarget::Indirect(e2)) => exprs_are_equal(e1, e2),
+        (CallTarget::IndirectGot { got_address: a1, .. }, CallTarget::IndirectGot { got_address: a2, .. }) => a1 == a2,
+        _ => false,
     }
 }

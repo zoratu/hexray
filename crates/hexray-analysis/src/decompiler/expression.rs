@@ -654,7 +654,15 @@ impl Expr {
                 Self::unary(op, operand)
             }
             ExprKind::Assign { lhs, rhs } => {
-                Self::assign(lhs.simplify(), rhs.simplify())
+                let lhs = lhs.simplify();
+                let rhs = rhs.simplify();
+
+                // Try to detect compound assignment pattern: x = x op y → x op= y
+                if let Some(compound) = try_detect_compound_assign(&lhs, &rhs) {
+                    return compound;
+                }
+
+                Self::assign(lhs, rhs)
             }
             ExprKind::Deref { addr, size } => {
                 let simplified_addr = addr.simplify();
@@ -1455,6 +1463,7 @@ fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
     match (&left.kind, &right.kind) {
         (ExprKind::Var(v1), ExprKind::Var(v2)) => v1 == v2,
         (ExprKind::IntLit(n1), ExprKind::IntLit(n2)) => n1 == n2,
+        (ExprKind::Unknown(s1), ExprKind::Unknown(s2)) => s1 == s2,
         (
             ExprKind::BinOp { op: op1, left: l1, right: r1 },
             ExprKind::BinOp { op: op2, left: l2, right: r2 }
@@ -1482,6 +1491,30 @@ fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
         (ExprKind::AddressOf(e1), ExprKind::AddressOf(e2)) => {
             exprs_structurally_equal(e1, e2)
         }
+        (
+            ExprKind::FieldAccess { base: b1, offset: o1, .. },
+            ExprKind::FieldAccess { base: b2, offset: o2, .. }
+        ) => {
+            o1 == o2 && exprs_structurally_equal(b1, b2)
+        }
+        (
+            ExprKind::Call { target: t1, args: a1 },
+            ExprKind::Call { target: t2, args: a2 }
+        ) => {
+            call_targets_equal(t1, t2) && a1.len() == a2.len() &&
+            a1.iter().zip(a2.iter()).all(|(e1, e2)| exprs_structurally_equal(e1, e2))
+        }
+        _ => false,
+    }
+}
+
+/// Check if two call targets are equal.
+fn call_targets_equal(t1: &CallTarget, t2: &CallTarget) -> bool {
+    match (t1, t2) {
+        (CallTarget::Direct { target: a1, .. }, CallTarget::Direct { target: a2, .. }) => a1 == a2,
+        (CallTarget::Named(n1), CallTarget::Named(n2)) => n1 == n2,
+        (CallTarget::Indirect(e1), CallTarget::Indirect(e2)) => exprs_structurally_equal(e1, e2),
+        (CallTarget::IndirectGot { got_address: a1, .. }, CallTarget::IndirectGot { got_address: a2, .. }) => a1 == a2,
         _ => false,
     }
 }
@@ -1715,6 +1748,70 @@ fn mask_to_width(mask: i128) -> Option<u8> {
     } else {
         None
     }
+}
+
+/// Attempts to detect compound assignment patterns.
+///
+/// Detects patterns like:
+/// - `x = x + y` -> `x += y`
+/// - `x = x - y` -> `x -= y`
+/// - `x = x * y` -> `x *= y`
+/// - `x = x / y` -> `x /= y`
+/// - `x = x % y` -> `x %= y`
+/// - `x = x & y` -> `x &= y`
+/// - `x = x | y` -> `x |= y`
+/// - `x = x ^ y` -> `x ^= y`
+/// - `x = x << y` -> `x <<= y`
+/// - `x = x >> y` -> `x >>= y`
+///
+/// Returns `Some(CompoundAssign)` if a pattern is detected.
+fn try_detect_compound_assign(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    // The RHS must be a binary operation
+    let (op, bin_left, bin_right) = match &rhs.kind {
+        ExprKind::BinOp { op, left, right } => {
+            // Only certain operators support compound assignment
+            match op {
+                BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul |
+                BinOpKind::Div | BinOpKind::Mod | BinOpKind::And |
+                BinOpKind::Or | BinOpKind::Xor | BinOpKind::Shl |
+                BinOpKind::Shr | BinOpKind::Sar => (*op, left, right),
+                // Comparison and logical operators don't support compound assignment
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Check if the left operand of the binary operation matches the LHS
+    if exprs_structurally_equal(lhs, bin_left) {
+        return Some(Expr {
+            kind: ExprKind::CompoundAssign {
+                op,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new((**bin_right).clone()),
+            }
+        });
+    }
+
+    // For commutative operations, also check if right operand matches the LHS
+    // (e.g., `x = y + x` could become `x += y`)
+    if is_commutative(op) && exprs_structurally_equal(lhs, bin_right) {
+        return Some(Expr {
+            kind: ExprKind::CompoundAssign {
+                op,
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new((**bin_left).clone()),
+            }
+        });
+    }
+
+    None
+}
+
+/// Check if a binary operation is commutative.
+fn is_commutative(op: BinOpKind) -> bool {
+    matches!(op, BinOpKind::Add | BinOpKind::Mul | BinOpKind::And |
+                 BinOpKind::Or | BinOpKind::Xor)
 }
 
 /// Attempts to detect array access patterns in a dereference address.
@@ -2574,5 +2671,123 @@ mod tests {
         }
 
         assert_eq!(simplified.to_string(), "x[8]");
+    }
+
+    #[test]
+    fn test_compound_assignment_basic() {
+        let x = Expr::unknown("x");
+        let y = Expr::int(5);
+
+        // x = x + 5 -> x += 5
+        let rhs = Expr::binop(BinOpKind::Add, x.clone(), y.clone());
+        let assign = Expr::assign(x.clone(), rhs);
+        let simplified = assign.simplify();
+
+        match &simplified.kind {
+            ExprKind::CompoundAssign { op, lhs, rhs } => {
+                assert_eq!(*op, BinOpKind::Add);
+                assert!(matches!(lhs.kind, ExprKind::Unknown(ref s) if s == "x"));
+                assert!(matches!(rhs.kind, ExprKind::IntLit(5)));
+            }
+            other => panic!("Expected CompoundAssign, got {:?}", other),
+        }
+        assert_eq!(simplified.to_string(), "x += 5");
+    }
+
+    #[test]
+    fn test_compound_assignment_all_operators() {
+        let x = Expr::unknown("x");
+        let y = Expr::int(2);
+
+        // Test all supported operators
+        let ops = vec![
+            (BinOpKind::Add, "+="),
+            (BinOpKind::Sub, "-="),
+            (BinOpKind::Mul, "*="),
+            (BinOpKind::Div, "/="),
+            (BinOpKind::Mod, "%="),
+            (BinOpKind::And, "&="),
+            (BinOpKind::Or, "|="),
+            (BinOpKind::Xor, "^="),
+            (BinOpKind::Shl, "<<="),
+            (BinOpKind::Shr, ">>="),
+        ];
+
+        for (op, expected_op_str) in ops {
+            let rhs = Expr::binop(op, x.clone(), y.clone());
+            let assign = Expr::assign(x.clone(), rhs);
+            let simplified = assign.simplify();
+
+            match &simplified.kind {
+                ExprKind::CompoundAssign { op: result_op, .. } => {
+                    assert_eq!(*result_op, op);
+                }
+                other => panic!("Expected CompoundAssign for {:?}, got {:?}", op, other),
+            }
+            assert!(simplified.to_string().contains(expected_op_str),
+                    "Expected '{}' in output for {:?}, got: {}", expected_op_str, op, simplified);
+        }
+    }
+
+    #[test]
+    fn test_compound_assignment_commutative() {
+        let x = Expr::unknown("x");
+        let y = Expr::int(3);
+
+        // y + x = x should also simplify (commutative case)
+        let rhs = Expr::binop(BinOpKind::Add, y.clone(), x.clone());
+        let assign = Expr::assign(x.clone(), rhs);
+        let simplified = assign.simplify();
+
+        match &simplified.kind {
+            ExprKind::CompoundAssign { op, rhs, .. } => {
+                assert_eq!(*op, BinOpKind::Add);
+                // rhs should be the other operand (y = 3)
+                assert!(matches!(rhs.kind, ExprKind::IntLit(3)));
+            }
+            other => panic!("Expected CompoundAssign, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compound_assignment_no_match() {
+        let x = Expr::unknown("x");
+        let y = Expr::unknown("y");
+        let z = Expr::int(5);
+
+        // x = y + z should not become compound (x not in rhs)
+        let rhs = Expr::binop(BinOpKind::Add, y.clone(), z.clone());
+        let assign = Expr::assign(x.clone(), rhs);
+        let simplified = assign.simplify();
+
+        assert!(matches!(simplified.kind, ExprKind::Assign { .. }));
+
+        // x = y - z should not become compound (non-commutative, x not on left)
+        let rhs = Expr::binop(BinOpKind::Sub, y.clone(), x.clone());
+        let assign = Expr::assign(x.clone(), rhs);
+        let simplified = assign.simplify();
+
+        // Sub is not commutative, so y - x cannot become x -= y
+        assert!(matches!(simplified.kind, ExprKind::Assign { .. }));
+    }
+
+    #[test]
+    fn test_compound_assignment_display() {
+        let x = Expr::unknown("counter");
+        let y = Expr::int(1);
+
+        // Test display formatting
+        let rhs = Expr::binop(BinOpKind::Add, x.clone(), y.clone());
+        let assign = Expr::assign(x.clone(), rhs);
+        let simplified = assign.simplify();
+
+        assert_eq!(simplified.to_string(), "counter += 1");
+
+        // Test with subtraction (integers >= 10 are displayed in hex)
+        let rhs = Expr::binop(BinOpKind::Sub, x.clone(), Expr::int(10));
+        let assign = Expr::assign(x.clone(), rhs);
+        let simplified = assign.simplify();
+
+        assert_eq!(simplified.to_string(), "counter -= 0xa");
     }
 }
