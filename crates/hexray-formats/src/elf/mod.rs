@@ -99,9 +99,14 @@ impl<'a> Elf<'a> {
 
         // Populate section name and data caches for the Section trait
         let mut sections = sections;
+        let is_relocatable = header.file_type == ElfType::Relocatable;
         for section in &mut sections {
             if let Some(name) = section_names.get(section.sh_name as usize) {
                 section.set_name(name.to_string());
+            }
+            // Mark sections from relocatable files so virtual_address() returns sh_offset
+            if is_relocatable {
+                section.set_relocatable(true);
             }
             // Populate data cache for sections that have file data
             // (skip NOBITS sections like .bss which have no file data)
@@ -546,7 +551,8 @@ impl BinaryFormat for Elf<'_> {
         self.sections
             .iter()
             .find(|s| {
-                let start = s.sh_addr;
+                // Use virtual_address() which handles relocatable files correctly
+                let start = s.virtual_address();
                 let end = start + s.sh_size;
                 addr >= start && addr < end
             })

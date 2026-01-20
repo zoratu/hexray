@@ -61,7 +61,8 @@ impl<'a> ItaniumDemangler<'a> {
     }
 
     fn remaining(&self) -> &str {
-        &self.input[self.pos..]
+        // Use get() to safely handle positions that might not be at char boundaries
+        self.input.get(self.pos..).unwrap_or("")
     }
 
     fn peek(&self) -> Option<char> {
@@ -71,14 +72,27 @@ impl<'a> ItaniumDemangler<'a> {
     fn peek_n(&self, n: usize) -> &str {
         let remaining = self.remaining();
         if remaining.len() >= n {
-            &remaining[..n]
+            // Check if the slice position is at a valid char boundary
+            if remaining.is_char_boundary(n) {
+                &remaining[..n]
+            } else {
+                // Not at a valid char boundary, return empty or full remaining
+                // Since demangling expects ASCII, non-ASCII input is invalid anyway
+                remaining
+            }
         } else {
             remaining
         }
     }
 
     fn consume(&mut self, n: usize) {
-        self.pos += n;
+        let new_pos = self.pos + n;
+        // Ensure we don't advance past the end or to an invalid position
+        if new_pos <= self.input.len() {
+            self.pos = new_pos;
+        } else {
+            self.pos = self.input.len();
+        }
     }
 
     fn expect(&mut self, s: &str) -> bool {

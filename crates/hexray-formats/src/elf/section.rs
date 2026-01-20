@@ -49,6 +49,9 @@ pub struct SectionHeader {
     name_cache: Option<String>,
     /// Cached section data (set after parsing).
     data_cache: Option<Vec<u8>>,
+    /// Whether this section is from a relocatable file.
+    /// For relocatable files, virtual_address() returns sh_offset instead of sh_addr.
+    is_relocatable: bool,
 }
 
 impl SectionHeader {
@@ -92,6 +95,7 @@ impl SectionHeader {
             sh_entsize: read_u32(36) as u64,
             name_cache: None,
             data_cache: None,
+            is_relocatable: false,
         })
     }
 
@@ -144,6 +148,7 @@ impl SectionHeader {
             sh_entsize: read_u64(56),
             name_cache: None,
             data_cache: None,
+            is_relocatable: false,
         })
     }
 
@@ -174,6 +179,12 @@ impl SectionHeader {
     pub fn set_data(&mut self, data: Vec<u8>) {
         self.data_cache = Some(data);
     }
+
+    /// Marks this section as being from a relocatable file.
+    /// This affects how virtual_address() returns addresses.
+    pub fn set_relocatable(&mut self, is_relocatable: bool) {
+        self.is_relocatable = is_relocatable;
+    }
 }
 
 impl Section for SectionHeader {
@@ -182,7 +193,13 @@ impl Section for SectionHeader {
     }
 
     fn virtual_address(&self) -> u64 {
-        self.sh_addr
+        // For relocatable files, use file offset as the virtual address
+        // since sh_addr is typically 0 in .o files
+        if self.is_relocatable {
+            self.sh_offset
+        } else {
+            self.sh_addr
+        }
     }
 
     fn size(&self) -> u64 {

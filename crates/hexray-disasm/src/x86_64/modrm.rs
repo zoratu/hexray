@@ -172,6 +172,7 @@ pub fn decode_modrm_rm(
     let mut index: Option<Register> = None;
     let mut scale: u8 = 1;
     let mut displacement: i64 = 0;
+    let mut sib_disp32 = false; // Track SIB with base=5, mod=00 case
 
     // Handle SIB byte if needed
     if modrm.needs_sib() {
@@ -188,8 +189,10 @@ pub fn decode_modrm_rm(
         }
 
         // Base register
+        // When SIB base=5 and mod=00, there's no base register but there IS a 32-bit displacement
         if (sib.base & 0x7) == 0x5 && modrm.mod_ == 0b00 {
-            // No base, just displacement
+            // No base, just displacement (disp32)
+            sib_disp32 = true;
         } else {
             base = Some(decode_gpr(sib.base, 64));
         }
@@ -231,7 +234,8 @@ pub fn decode_modrm_rm(
     }
 
     // Read displacement
-    if modrm.has_disp32() || ((modrm.rm & 0x7) == 0x5 && modrm.mod_ == 0b00) {
+    // disp32 is needed for: mod=10, or mod=00 with rm=5 (RIP-relative), or SIB with base=5 and mod=00
+    if modrm.has_disp32() || sib_disp32 {
         if bytes.len() < offset + 4 {
             return None;
         }

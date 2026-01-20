@@ -258,6 +258,14 @@ pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
     table[0x5F] =
         Some(OpcodeEntry::new("pop", Operation::Pop, OperandEncoding::OpReg).with_default_64());
 
+    // MOVSXD (sign-extend dword to qword) - 0x63 with REX.W
+    // In 64-bit mode, this is movsxd; in 32-bit mode it was ARPL
+    table[0x63] = Some(OpcodeEntry::new(
+        "movsxd",
+        Operation::Move,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+
     // JMP rel8
     table[0xEB] = Some(OpcodeEntry::new(
         "jmp",
@@ -693,6 +701,218 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
         Operation::Nop,
         OperandEncoding::ModRmRmOnly,
     ));
+
+    // CMOVcc - Conditional move (0F 40 - 0F 4F)
+    table[0x40] = Some(OpcodeEntry::new(
+        "cmovo",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x41] = Some(OpcodeEntry::new(
+        "cmovno",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x42] = Some(OpcodeEntry::new(
+        "cmovb",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x43] = Some(OpcodeEntry::new(
+        "cmovae",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x44] = Some(OpcodeEntry::new(
+        "cmove",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x45] = Some(OpcodeEntry::new(
+        "cmovne",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x46] = Some(OpcodeEntry::new(
+        "cmovbe",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x47] = Some(OpcodeEntry::new(
+        "cmova",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x48] = Some(OpcodeEntry::new(
+        "cmovs",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x49] = Some(OpcodeEntry::new(
+        "cmovns",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x4A] = Some(OpcodeEntry::new(
+        "cmovp",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x4B] = Some(OpcodeEntry::new(
+        "cmovnp",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x4C] = Some(OpcodeEntry::new(
+        "cmovl",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x4D] = Some(OpcodeEntry::new(
+        "cmovge",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x4E] = Some(OpcodeEntry::new(
+        "cmovle",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0x4F] = Some(OpcodeEntry::new(
+        "cmovg",
+        Operation::ConditionalMove,
+        OperandEncoding::ModRmReg_Rm,
+    ));
+
+    // SETcc - Set byte on condition (0F 90 - 0F 9F)
+    table[0x90] = Some(
+        OpcodeEntry::new(
+            "seto",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x91] = Some(
+        OpcodeEntry::new(
+            "setno",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x92] = Some(
+        OpcodeEntry::new(
+            "setb",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x93] = Some(
+        OpcodeEntry::new(
+            "setae",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x94] = Some(
+        OpcodeEntry::new(
+            "sete",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x95] = Some(
+        OpcodeEntry::new(
+            "setne",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x96] = Some(
+        OpcodeEntry::new(
+            "setbe",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x97] = Some(
+        OpcodeEntry::new(
+            "seta",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x98] = Some(
+        OpcodeEntry::new(
+            "sets",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x99] = Some(
+        OpcodeEntry::new(
+            "setns",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x9A] = Some(
+        OpcodeEntry::new(
+            "setp",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x9B] = Some(
+        OpcodeEntry::new(
+            "setnp",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x9C] = Some(
+        OpcodeEntry::new(
+            "setl",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x9D] = Some(
+        OpcodeEntry::new(
+            "setge",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x9E] = Some(
+        OpcodeEntry::new(
+            "setle",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
+    table[0x9F] = Some(
+        OpcodeEntry::new(
+            "setg",
+            Operation::SetConditional,
+            OperandEncoding::ModRmRmOnly,
+        )
+        .with_size(8),
+    );
 
     table
 };

@@ -392,4 +392,21 @@ if let Some(ty) = inference.type_of(&Location::Register(0)) {
 - [ ] Full DWARF variable name integration
 - [ ] Inter-procedural analysis
 - [ ] Function pointer type recovery
-- [ ] C++ exception handling reconstruction
+
+## Module Structure
+
+The decompiler is organized into focused modules:
+
+| Module | Purpose |
+|--------|---------|
+| `structurer.rs` | CFG to structured control flow (if/else, loops, switch) |
+| `expression.rs` | Expression types and simplification |
+| `emitter.rs` | Pseudo-code generation |
+| `short_circuit.rs` | Short-circuit boolean detection (`&&`, `||`) |
+| `for_loop_detection.rs` | For-loop pattern recognition from while loops |
+| `switch_recovery.rs` | Switch statement recovery (jump tables, if-chains) |
+| `array_detection.rs` | Array access pattern detection |
+| `struct_inference.rs` | Struct field inference from memory access |
+| `signature.rs` | Function signature recovery |
+| `naming.rs` | Variable naming heuristics |
+| `abi.rs` | ABI-specific calling conventions |

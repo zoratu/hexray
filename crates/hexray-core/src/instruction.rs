@@ -147,6 +147,10 @@ pub enum Operation {
     // Comparison
     Compare,
     Test,
+    /// Set byte on condition (SETcc instructions)
+    SetConditional,
+    /// Conditional move (CMOVcc instructions)
+    ConditionalMove,
 
     // Control flow
     Jump,
@@ -644,6 +648,8 @@ impl Operation {
             Self::VectorSlide => "vector_slide",
             Self::VectorGather => "vector_gather",
             Self::VectorCompress => "vector_compress",
+            Self::SetConditional => "set_conditional",
+            Self::ConditionalMove => "conditional_move",
             Self::Other(_) => "other",
         }
     }

@@ -1208,9 +1208,14 @@ impl Expr {
                 )
             }
             // Atomic/synchronization instructions
-            Operation::LoadExclusive
-            | Operation::StoreExclusive
-            | Operation::AtomicAdd
+            Operation::LoadExclusive | Operation::StoreExclusive => {
+                // Load/store exclusive - emit as function calls
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    ops.iter().map(Self::from_operand).collect(),
+                )
+            }
+            Operation::AtomicAdd
             | Operation::AtomicClear
             | Operation::AtomicXor
             | Operation::AtomicSet
@@ -1218,11 +1223,44 @@ impl Expr {
             | Operation::AtomicSignedMin
             | Operation::AtomicUnsignedMax
             | Operation::AtomicUnsignedMin
-            | Operation::AtomicSwap
-            | Operation::CompareAndSwap => {
-                // Atomic instructions - emit as function calls
+            | Operation::AtomicSwap => {
+                // ARM64 atomic operations: Rs, Rt, [Xn]
+                // Semantics: Rt = atomicOp(mem[Xn], Rs)
+                // Emit as: dest = atomic_op(mem, operand)
+                if ops.len() >= 3 {
+                    let source = Self::from_operand(&ops[0]);
+                    let dest = Self::from_operand(&ops[1]);
+                    let mem = Self::from_operand(&ops[2]);
+
+                    // Create a C-style atomic function call
+                    let func_name = match inst.operation {
+                        Operation::AtomicAdd => "atomic_fetch_add",
+                        Operation::AtomicClear => "atomic_fetch_and_not",
+                        Operation::AtomicXor => "atomic_fetch_xor",
+                        Operation::AtomicSet => "atomic_fetch_or",
+                        Operation::AtomicSignedMax => "atomic_fetch_max",
+                        Operation::AtomicSignedMin => "atomic_fetch_min",
+                        Operation::AtomicUnsignedMax => "atomic_fetch_umax",
+                        Operation::AtomicUnsignedMin => "atomic_fetch_umin",
+                        Operation::AtomicSwap => "atomic_exchange",
+                        _ => "atomic_op",
+                    };
+
+                    Self::assign(
+                        dest,
+                        Self::call(CallTarget::Named(func_name.to_string()), vec![mem, source]),
+                    )
+                } else {
+                    Self::call(
+                        CallTarget::Named(inst.mnemonic.clone()),
+                        ops.iter().map(Self::from_operand).collect(),
+                    )
+                }
+            }
+            Operation::CompareAndSwap => {
+                // CAS: compare and swap
                 Self::call(
-                    CallTarget::Named(inst.mnemonic.clone()),
+                    CallTarget::Named("atomic_compare_exchange".to_string()),
                     ops.iter().map(Self::from_operand).collect(),
                 )
             }
@@ -1397,6 +1435,39 @@ impl Expr {
                     CallTarget::Named(inst.mnemonic.clone()),
                     ops.iter().map(Self::from_operand).collect(),
                 )
+            }
+            Operation::SetConditional => {
+                // SETcc instructions: set byte on condition
+                // The result is assigned to the destination operand (typically a register)
+                if !ops.is_empty() {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::call(CallTarget::Named(inst.mnemonic.clone()), vec![]),
+                    )
+                } else {
+                    Self::unknown(&inst.mnemonic)
+                }
+            }
+            Operation::ConditionalMove => {
+                // CMOVcc instructions: conditional move
+                // dest = condition ? src : dest
+                if ops.len() >= 2 {
+                    // Show as: dest = cmovcc(src) or as ternary
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::call(
+                            CallTarget::Named(inst.mnemonic.clone()),
+                            vec![Self::from_operand(&ops[1])],
+                        ),
+                    )
+                } else if !ops.is_empty() {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::call(CallTarget::Named(inst.mnemonic.clone()), vec![]),
+                    )
+                } else {
+                    Self::unknown(&inst.mnemonic)
+                }
             }
         }
     }
