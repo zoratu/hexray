@@ -285,6 +285,68 @@ hexray library.so decompile _compress --types auto
 hexray library.so decompile _compress --follow --depth 2
 ```
 
+### Scenario 5: Firmware Analysis
+
+**Goal**: Analyze embedded device firmware (routers, IoT, industrial controllers)
+
+> **Note**: First extract the firmware filesystem using tools like `binwalk`, `jefferson`, or `ubi_reader`
+
+```bash
+# 1. Identify architecture and format
+hexray firmware.bin info
+# Common architectures: ARM, MIPS (big/little endian), RISC-V
+
+# 2. If it's a raw binary, find the load address from vectors or strings
+hexray firmware.bin strings | grep -i "version\|copyright\|build"
+
+# 3. For extracted ELF binaries, get an overview
+hexray httpd info
+hexray httpd sections
+hexray httpd symbols --functions | head -30
+
+# 4. Find command handlers and CGI endpoints
+hexray httpd symbols | grep -iE "cgi|handler|cmd|api|route"
+hexray httpd strings | grep -iE "\.cgi|/api/|/cgi-bin/"
+
+# 5. Look for authentication functions
+hexray httpd symbols | grep -iE "auth|login|password|session|token"
+hexray httpd decompile check_auth
+
+# 6. Find hardcoded credentials (common in firmware)
+hexray httpd strings | grep -iE "admin|root|password|secret|key"
+hexray httpd strings | grep -E "^[a-zA-Z0-9]{8,32}$"  # potential passwords
+
+# 7. Analyze network protocol handlers
+hexray httpd symbols | grep -iE "recv|send|socket|packet|parse"
+hexray httpd xrefs recv  # find what processes received data
+
+# 8. Look for dangerous functions (potential vulnerabilities)
+hexray httpd symbols | grep -iE "strcpy|sprintf|gets|system|popen|exec"
+hexray httpd xrefs system  # find command injection points
+```
+
+**Common vulnerability patterns in firmware:**
+```c
+// Command injection - user input passed to system()
+sprintf(cmd, "ping %s", user_input);
+system(cmd);
+
+// Buffer overflow - no bounds checking
+char buf[64];
+strcpy(buf, user_input);
+
+// Hardcoded backdoor
+if (strcmp(password, "superSecretAdmin") == 0)
+    grant_access();
+```
+
+**Firmware-specific tips:**
+- MIPS firmware often uses `jalr $t9` for function calls - follow `$t9` loads
+- ARM firmware may have Thumb/ARM mode switches - watch for `bx` instructions
+- Look for NVRAM access functions (`nvram_get`, `nvram_set`) for config data
+- Web servers often use string tables for HTML - xref these to find handlers
+- Check `/etc/passwd`, `/etc/shadow` equivalent strings for default accounts
+
 ---
 
 ## Advanced Techniques
