@@ -510,8 +510,10 @@ struct ComparisonInfo {
 
 /// Types of comparisons in a switch pattern.
 /// The comparison values are stored for future use in range-based case detection.
+/// Currently only Equal values are extracted; other comparison values are tracked
+/// for future support of range-based switch cases (e.g., case 1..5:).
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Inner values tracked for future range-case support
 enum ComparisonType {
     Equal(i128),
     Less(i128),

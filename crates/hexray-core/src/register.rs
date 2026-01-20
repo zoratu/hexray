@@ -176,21 +176,13 @@ pub mod x86 {
     pub const K7: u16 = 103;
 
     // AMX tile registers (tmm0-tmm7)
-    #[allow(dead_code)]
     pub const TMM0: u16 = 112;
-    #[allow(dead_code)]
     pub const TMM1: u16 = 113;
-    #[allow(dead_code)]
     pub const TMM2: u16 = 114;
-    #[allow(dead_code)]
     pub const TMM3: u16 = 115;
-    #[allow(dead_code)]
     pub const TMM4: u16 = 116;
-    #[allow(dead_code)]
     pub const TMM5: u16 = 117;
-    #[allow(dead_code)]
     pub const TMM6: u16 = 118;
-    #[allow(dead_code)]
     pub const TMM7: u16 = 119;
 }
 

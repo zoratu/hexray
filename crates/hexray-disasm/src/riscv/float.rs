@@ -9,28 +9,6 @@ use hexray_core::{
     Architecture, Instruction, MemoryRef, Operand, Operation, Register, RegisterClass,
 };
 
-// Floating-point opcodes (documented for reference, used in decoder.rs)
-#[allow(dead_code)]
-pub const OP_LOAD_FP: u32 = 0b0000111; // 0x07 - FLW, FLD
-#[allow(dead_code)]
-pub const OP_STORE_FP: u32 = 0b0100111; // 0x27 - FSW, FSD
-#[allow(dead_code)]
-pub const OP_MADD: u32 = 0b1000011; // 0x43 - FMADD.S, FMADD.D
-#[allow(dead_code)]
-pub const OP_MSUB: u32 = 0b1000111; // 0x47 - FMSUB.S, FMSUB.D
-#[allow(dead_code)]
-pub const OP_NMSUB: u32 = 0b1001011; // 0x4B - FNMSUB.S, FNMSUB.D
-#[allow(dead_code)]
-pub const OP_NMADD: u32 = 0b1001111; // 0x4F - FNMADD.S, FNMADD.D
-#[allow(dead_code)]
-pub const OP_FP: u32 = 0b1010011; // 0x53 - All other FP ops
-
-/// Rounding mode names (for future use in displaying rounding modes)
-#[allow(dead_code)]
-const RM_NAMES: [&str; 8] = [
-    "rne", "rtz", "rdn", "rup", "rmm", "reserved", "reserved", "dyn",
-];
-
 /// Floating-point decoder for RISC-V F/D extensions.
 pub struct FloatDecoder {
     is_64bit: bool,

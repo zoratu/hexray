@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+use super::abi::{get_arg_register_index, is_callee_saved_register};
 use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
 use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
@@ -23,38 +24,6 @@ struct FunctionInfo {
     has_return_value: bool,
     /// Statements to skip (block_idx, stmt_idx) - these are parameter assignments.
     skip_statements: HashSet<(usize, usize)>,
-}
-
-/// Returns the argument index (0-based) for an argument register, or None if not an arg register.
-fn get_arg_register_index(name: &str) -> Option<usize> {
-    match name {
-        // x86-64 System V ABI
-        "edi" | "rdi" => Some(0),
-        "esi" | "rsi" => Some(1),
-        "edx" | "rdx" => Some(2),
-        "ecx" | "rcx" => Some(3),
-        "r8d" | "r8" => Some(4),
-        "r9d" | "r9" => Some(5),
-        // ARM64 AAPCS64
-        "x0" | "w0" => Some(0),
-        "x1" | "w1" => Some(1),
-        "x2" | "w2" => Some(2),
-        "x3" | "w3" => Some(3),
-        "x4" | "w4" => Some(4),
-        "x5" | "w5" => Some(5),
-        "x6" | "w6" => Some(6),
-        "x7" | "w7" => Some(7),
-        // RISC-V
-        "a0" => Some(0),
-        "a1" => Some(1),
-        "a2" => Some(2),
-        "a3" => Some(3),
-        "a4" => Some(4),
-        "a5" => Some(5),
-        "a6" => Some(6),
-        "a7" => Some(7),
-        _ => None,
-    }
 }
 
 /// Emits pseudo-code from structured control flow.
@@ -2175,19 +2144,6 @@ fn looks_like_address(n: i128) -> bool {
         return true; // Page-aligned addresses
     }
     false
-}
-
-/// Checks if a register name is a callee-saved register.
-/// These are saved/restored in prologue/epilogue and don't need to be shown.
-fn is_callee_saved_register(name: &str) -> bool {
-    matches!(
-        name,
-        // x86-64 SysV ABI callee-saved: rbp, rbx, r12-r15
-        "rbp" | "rbx" | "r12" | "r13" | "r14" | "r15" |
-        // ARM64 AAPCS64 callee-saved: x19-x28, x29 (fp), x30 (lr)
-        "x19" | "x20" | "x21" | "x22" | "x23" | "x24" | "x25" | "x26" | "x27" | "x28" |
-        "x29" | "x30"
-    )
 }
 
 /// Escapes a string for C output.

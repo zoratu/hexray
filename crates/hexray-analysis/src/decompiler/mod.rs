@@ -7,6 +7,7 @@
 //! 2. **Expression Recovery** - Convert instructions to high-level expressions
 //! 3. **Pseudo-code Emission** - Generate readable pseudo-code output
 
+pub mod abi;
 pub mod array_detection;
 mod emitter;
 mod expression;

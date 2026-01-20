@@ -8,13 +8,9 @@ use hexray_core::{
     Architecture, Instruction, MemoryRef, Operand, Operation, Register, RegisterClass,
 };
 
-// Vector extension opcodes (documented for reference, used in decoder.rs)
-#[allow(dead_code)]
-pub const OP_V: u32 = 0b1010111; // 0x57 - Vector arithmetic
-#[allow(dead_code)]
-pub const OP_LOAD_FP: u32 = 0b0000111; // 0x07 - Vector loads (shared with FP loads)
-#[allow(dead_code)]
-pub const OP_STORE_FP: u32 = 0b0100111; // 0x27 - Vector stores (shared with FP stores)
+// Vector extension opcodes (shared with FP loads/stores)
+const OP_LOAD_FP: u32 = 0b0000111; // 0x07 - Vector loads (shared with FP loads)
+const OP_STORE_FP: u32 = 0b0100111; // 0x27 - Vector stores (shared with FP stores)
 
 /// Vector decoder for RISC-V V extension.
 pub struct VectorDecoder {

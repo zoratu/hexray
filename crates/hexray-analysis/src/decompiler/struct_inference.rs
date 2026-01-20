@@ -146,13 +146,13 @@ impl fmt::Display for InferredType {
 
 /// Tracks memory access information for a single access.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields kept for future enhancements
 struct MemoryAccess {
     /// Offset from base.
     offset: usize,
     /// Size of access in bytes.
     size: usize,
-    /// Whether this is a read or write.
+    /// Whether this is a read or write (tracked for future write-pattern analysis).
+    #[allow(dead_code)]
     is_write: bool,
     /// Whether the value is dereferenced (indicating pointer type).
     is_dereferenced: bool,
@@ -166,9 +166,9 @@ struct MemoryAccess {
 
 /// Tracks all accesses through a particular base variable.
 #[derive(Debug)]
-#[allow(dead_code)] // base_name kept for debugging
 struct BasePointerAccesses {
     /// The base variable name (e.g., "rbx", "arg_0").
+    #[allow(dead_code)] // Used as HashMap key, not via field access
     base_name: String,
     /// All accesses through this base, keyed by offset.
     accesses: BTreeMap<usize, Vec<MemoryAccess>>,

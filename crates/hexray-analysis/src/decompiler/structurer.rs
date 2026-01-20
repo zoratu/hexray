@@ -9,6 +9,9 @@ use hexray_core::{
 };
 use std::collections::{HashMap, HashSet};
 
+use super::abi::{
+    get_arg_register_index, is_callee_saved_register, is_return_register, is_temp_register,
+};
 use super::expression::{resolve_adrp_patterns, BinOpKind, Expr};
 use super::switch_recovery::SwitchRecovery;
 
@@ -1660,46 +1663,6 @@ fn substitute_global_refs(expr: &Expr, global_refs: &HashMap<String, Expr>) -> E
     }
 }
 
-/// Check if a register name is a temporary (likely to be eliminated)
-/// Note: Only caller-saved registers should be temps; callee-saved are preserved
-fn is_temp_register(name: &str) -> bool {
-    matches!(
-        name,
-        // x86-64 caller-saved registers (SysV ABI)
-        // Note: rbx, rbp, r12-r15 are callee-saved and should NOT be temps
-        "eax" | "rax" | "ecx" | "rcx" | "edx" | "rdx" |
-        "esi" | "rsi" | "edi" | "rdi" | "r8" | "r8d" | "r9" | "r9d" |
-        "r10" | "r10d" | "r11" | "r11d" |
-        // ARM64 registers (x0-x18 and w0-w18 are caller-saved/temp)
-        // Note: x19-x28 are callee-saved
-        "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7" |
-        "x8" | "x9" | "x10" | "x11" | "x12" | "x13" | "x14" | "x15" |
-        "x16" | "x17" | "x18" |
-        "w0" | "w1" | "w2" | "w3" | "w4" | "w5" | "w6" | "w7" |
-        "w8" | "w9" | "w10" | "w11" | "w12" | "w13" | "w14" | "w15" |
-        "w16" | "w17" | "w18" |
-        // RISC-V registers (a0-a7 are argument/caller-saved)
-        "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7" |
-        "t0" | "t1" | "t2" | "t3" | "t4" | "t5" | "t6"
-    )
-}
-
-/// Check if a register is callee-saved (preserved across function calls)
-/// These registers are used to save return values that need to survive subsequent calls
-fn is_callee_saved_register(name: &str) -> bool {
-    matches!(
-        name,
-        // x86-64 callee-saved registers (SysV ABI)
-        "ebx" | "rbx" | "ebp" | "rbp" |
-        "r12" | "r12d" | "r13" | "r13d" | "r14" | "r14d" | "r15" | "r15d" |
-        // ARM64 callee-saved registers (AAPCS64)
-        "x19" | "x20" | "x21" | "x22" | "x23" | "x24" | "x25" | "x26" | "x27" | "x28" |
-        "w19" | "w20" | "w21" | "w22" | "w23" | "w24" | "w25" | "w26" | "w27" | "w28" |
-        // RISC-V callee-saved registers
-        "s0" | "s1" | "s2" | "s3" | "s4" | "s5" | "s6" | "s7" | "s8" | "s9" | "s10" | "s11"
-    )
-}
-
 /// Substitute variable references with their known values
 fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
     use super::expression::ExprKind;
@@ -1871,43 +1834,6 @@ fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
         .filter(|(idx, _)| !to_remove.contains(idx))
         .map(|(_, stmt)| stmt)
         .collect()
-}
-
-/// Returns the argument index (0-based) for an argument register, or None if not an arg register.
-fn get_arg_register_index(name: &str) -> Option<usize> {
-    match name {
-        // x86-64 System V ABI
-        "edi" | "rdi" => Some(0),
-        "esi" | "rsi" => Some(1),
-        "edx" | "rdx" => Some(2),
-        "ecx" | "rcx" => Some(3),
-        "r8d" | "r8" => Some(4),
-        "r9d" | "r9" => Some(5),
-        // ARM64 AAPCS64
-        "x0" | "w0" => Some(0),
-        "x1" | "w1" => Some(1),
-        "x2" | "w2" => Some(2),
-        "x3" | "w3" => Some(3),
-        "x4" | "w4" => Some(4),
-        "x5" | "w5" => Some(5),
-        "x6" | "w6" => Some(6),
-        "x7" | "w7" => Some(7),
-        // RISC-V
-        "a0" => Some(0),
-        "a1" => Some(1),
-        "a2" => Some(2),
-        "a3" => Some(3),
-        "a4" => Some(4),
-        "a5" => Some(5),
-        "a6" => Some(6),
-        "a7" => Some(7),
-        _ => None,
-    }
-}
-
-/// Checks if a register is a return value register.
-fn is_return_register(name: &str) -> bool {
-    matches!(name, "eax" | "rax" | "x0" | "w0" | "a0")
 }
 
 /// Checks if a call target is a "real" function call (not push/pop/syscall etc.)

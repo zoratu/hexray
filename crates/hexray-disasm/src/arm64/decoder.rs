@@ -67,7 +67,6 @@ impl Arm64Disassembler {
     }
 
     /// Creates a W register (32-bit) with SP interpretation for register 31.
-    #[allow(dead_code)]
     fn wreg_sp(id: u16) -> Register {
         Self::gpr_sp(id, false)
     }
