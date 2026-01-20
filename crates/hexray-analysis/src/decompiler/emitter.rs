@@ -167,6 +167,132 @@ impl PseudoCodeEmitter {
             .unwrap_or("int")
     }
 
+    /// Gets the type of an expression if known.
+    ///
+    /// This checks:
+    /// 1. Stack slot variables (var_X, local_X) in type_info
+    /// 2. Register names with known roles
+    /// 3. DWARF variable names
+    fn get_expr_type(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            // For stack slot dereferences, try to get the variable name and its type
+            ExprKind::Deref { addr, .. } => {
+                if let Some(var_name) = self.try_get_stack_var_name(addr) {
+                    if let Some(ty) = self.type_info.get(&var_name) {
+                        return Some(ty.clone());
+                    }
+                }
+                None
+            }
+            // For named variables
+            ExprKind::Var(var) => {
+                // Check type_info for this variable
+                if let Some(ty) = self.type_info.get(&var.name) {
+                    return Some(ty.clone());
+                }
+                // Try lowercase version
+                if let Some(ty) = self.type_info.get(&var.name.to_lowercase()) {
+                    return Some(ty.clone());
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to extract a stack variable name from an address expression.
+    fn try_get_stack_var_name(&self, addr: &Expr) -> Option<String> {
+        if let ExprKind::BinOp { op, left, right } = &addr.kind {
+            if let ExprKind::Var(base) = &left.kind {
+                // Check for frame/stack pointers
+                let is_frame_ptr = matches!(base.name.as_str(), "rbp" | "x29" | "fp");
+                let is_stack_ptr = matches!(base.name.as_str(), "rsp" | "sp");
+
+                if is_frame_ptr || is_stack_ptr {
+                    if let ExprKind::IntLit(offset) = &right.kind {
+                        let actual_offset = match op {
+                            BinOpKind::Add => *offset,
+                            BinOpKind::Sub => -*offset,
+                            _ => return None,
+                        };
+                        // Generate variable name for this offset
+                        if actual_offset < 0 {
+                            return Some(format!("local_{:x}", (-actual_offset) as u128));
+                        } else {
+                            return Some(format!("var_{:x}", actual_offset as u128));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Checks if a type string matches a cast target.
+    ///
+    /// Returns true if the variable's type is compatible with the cast,
+    /// meaning the cast is redundant and can be eliminated.
+    fn type_matches_cast(&self, type_str: &str, to_size: u8, signed: bool) -> bool {
+        let type_lower = type_str.to_lowercase();
+
+        // Match common C type names
+        match (to_size, signed) {
+            (1, true) => {
+                matches!(
+                    type_lower.as_str(),
+                    "int8_t" | "char" | "signed char" | "i8"
+                )
+            }
+            (1, false) => {
+                matches!(
+                    type_lower.as_str(),
+                    "uint8_t" | "unsigned char" | "u8" | "byte"
+                )
+            }
+            (2, true) => {
+                matches!(type_lower.as_str(), "int16_t" | "short" | "i16")
+            }
+            (2, false) => {
+                matches!(
+                    type_lower.as_str(),
+                    "uint16_t" | "unsigned short" | "u16" | "ushort"
+                )
+            }
+            (4, true) => {
+                matches!(
+                    type_lower.as_str(),
+                    "int32_t" | "int" | "i32" | "long" | "int32"
+                )
+            }
+            (4, false) => {
+                matches!(
+                    type_lower.as_str(),
+                    "uint32_t"
+                        | "unsigned int"
+                        | "unsigned"
+                        | "u32"
+                        | "uint"
+                        | "unsigned long"
+                        | "uint32"
+                        | "size_t"
+                )
+            }
+            (8, true) => {
+                matches!(
+                    type_lower.as_str(),
+                    "int64_t" | "long long" | "i64" | "int64" | "ssize_t" | "ptrdiff_t"
+                )
+            }
+            (8, false) => {
+                matches!(
+                    type_lower.as_str(),
+                    "uint64_t" | "unsigned long long" | "u64" | "uint64" | "size_t" | "uintptr_t"
+                )
+            }
+            _ => false,
+        }
+    }
+
     /// Try to format a dereference as struct field access using the type database.
     ///
     /// Given a deref like `*(ptr + 8)` and the knowledge that ptr points to struct stat,
@@ -476,6 +602,36 @@ impl PseudoCodeEmitter {
                     // These are commonly used to hold return values/error codes
                     rename_register(&var.name)
                 }
+            }
+            // Handle casts with potential elimination based on known types
+            ExprKind::Cast {
+                expr: inner,
+                to_size,
+                signed,
+            } => {
+                let inner_str = self.format_expr_with_strings(inner, table);
+
+                // Try to eliminate redundant casts based on known variable types
+                if let Some(var_type) = self.get_expr_type(inner) {
+                    if self.type_matches_cast(&var_type, *to_size, *signed) {
+                        // Cast is redundant - the variable already has the right type
+                        return inner_str;
+                    }
+                }
+
+                // Generate the cast
+                let type_name = match (to_size, signed) {
+                    (1, true) => "int8_t",
+                    (1, false) => "uint8_t",
+                    (2, true) => "int16_t",
+                    (2, false) => "uint16_t",
+                    (4, true) => "int32_t",
+                    (4, false) => "uint32_t",
+                    (8, true) => "int64_t",
+                    (8, false) => "uint64_t",
+                    _ => "int",
+                };
+                format!("({}){}", type_name, inner_str)
             }
             // For other cases, use default formatting
             _ => expr.to_string(),

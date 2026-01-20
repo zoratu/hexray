@@ -20,6 +20,7 @@ pub mod cfg_builder;
 pub mod cpp_special;
 pub mod dataflow;
 pub mod decompiler;
+pub mod exception_handling;
 pub mod function_finder;
 pub mod indirect_calls;
 pub mod output;
@@ -57,6 +58,10 @@ pub use decompiler::{
     CallingConvention, CatchInfo, CleanupInfo, Decompiler, ExceptionInfo, FunctionSignature,
     ParamType, Parameter, ParameterLocation, RelocationTable, SignatureRecovery, StringTable,
     SymbolTable, TryBlockInfo,
+};
+pub use exception_handling::{
+    extract_all_exception_info, extract_all_exception_info_with_rtti, ExceptionError,
+    ExceptionExtractor, ExceptionResult,
 };
 pub use function_finder::FunctionFinder;
 pub use output::{

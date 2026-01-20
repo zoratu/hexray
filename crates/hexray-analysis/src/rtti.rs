@@ -794,6 +794,11 @@ impl RttiDatabase {
     pub fn vtable_for_typeinfo(&self, typeinfo_addr: u64) -> Option<u64> {
         self.typeinfo_to_vtable.get(&typeinfo_addr).copied()
     }
+
+    /// Gets typeinfo by its address.
+    pub fn get_typeinfo(&self, typeinfo_addr: u64) -> Option<&TypeInfo> {
+        self.hierarchy.get(typeinfo_addr)
+    }
 }
 
 #[cfg(test)]
