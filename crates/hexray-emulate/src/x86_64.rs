@@ -54,8 +54,10 @@ pub fn execute(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
 /// Get the size in bits for an operand.
 fn operand_size(op: &Operand) -> u32 {
     match op {
-        Operand::Register(reg) => (reg.size * 8) as u32,
-        Operand::Memory(mem) => (mem.size * 8) as u32,
+        // Register.size is already in bits
+        Operand::Register(reg) => reg.size as u32,
+        // MemoryRef.size is in bytes, convert to bits
+        Operand::Memory(mem) => (mem.size as u32) * 8,
         Operand::Immediate(_) => 64,
         Operand::PcRelative { .. } => 64,
     }
@@ -66,11 +68,12 @@ fn read_operand(state: &MachineState, op: &Operand, inst: &Instruction) -> Value
     match op {
         Operand::Register(reg) => {
             let full = state.get_register(reg.id);
+            // reg.size is in bits
             match reg.size {
-                1 => full.trunc(8),
-                2 => full.trunc(16),
-                4 => full.trunc(32),
-                _ => full,
+                8 => full.trunc(8),
+                16 => full.trunc(16),
+                32 => full.trunc(32),
+                _ => full, // 64-bit or larger
             }
         }
         Operand::Memory(mem) => {
@@ -97,11 +100,12 @@ fn read_operand(state: &MachineState, op: &Operand, inst: &Instruction) -> Value
 /// Write a value to an operand.
 fn write_operand(state: &mut MachineState, op: &Operand, value: Value, inst: &Instruction) {
     match op {
+        // reg.size is in bits
         Operand::Register(reg) => match reg.size {
-            1 => state.set_register_8l(reg.id, value),
-            2 => state.set_register_16(reg.id, value),
-            4 => state.set_register_32(reg.id, value),
-            _ => state.set_register(reg.id, value),
+            8 => state.set_register_8l(reg.id, value),
+            16 => state.set_register_16(reg.id, value),
+            32 => state.set_register_32(reg.id, value),
+            _ => state.set_register(reg.id, value), // 64-bit or larger
         },
         Operand::Memory(mem) => {
             let addr = compute_effective_address(state, mem, inst);

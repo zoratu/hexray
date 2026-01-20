@@ -1289,8 +1289,8 @@ impl fmt::Display for Expr {
                 };
                 write!(f, "{}({})", prefix, addr)
             }
-            ExprKind::GotRef { display_expr, size, is_deref, .. } => {
-                // Default display falls back to showing the original expression
+            ExprKind::GotRef { address, size, is_deref, .. } => {
+                // Display using computed address rather than "rip + offset"
                 if *is_deref {
                     let prefix = match size {
                         1 => "*(uint8_t*)",
@@ -1299,10 +1299,10 @@ impl fmt::Display for Expr {
                         8 => "*(uint64_t*)",
                         _ => "*",
                     };
-                    write!(f, "{}({})", prefix, display_expr)
+                    write!(f, "{}(&data_{:x})", prefix, address)
                 } else {
-                    // Address-of (LEA) - just show the address
-                    write!(f, "{}", display_expr)
+                    // Address-of (LEA) - show as data address
+                    write!(f, "data_{:x}", address)
                 }
             }
             ExprKind::AddressOf(e) => write!(f, "&{}", e),

@@ -388,8 +388,9 @@ impl Disassembler for X86_64Disassembler {
                 offset += rm_consumed;
 
                 // Decode immediate
+                // For Rm_Imm8 or when entry.default_size is 8, use 8-bit immediate
                 let remaining = &bytes[offset..];
-                let (imm, imm_size) = if matches!(entry.encoding, OperandEncoding::Rm_Imm8) {
+                let (imm, imm_size) = if matches!(entry.encoding, OperandEncoding::Rm_Imm8) || entry.default_size == 8 {
                     if remaining.is_empty() {
                         return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
                     }

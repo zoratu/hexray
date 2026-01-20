@@ -1274,9 +1274,9 @@ fn build_string_table(fmt: &dyn BinaryFormat) -> StringTable {
 fn build_symbol_table(fmt: &dyn BinaryFormat) -> SymbolTable {
     let mut table = SymbolTable::new();
 
-    // Add all function symbols
+    // Add all symbols (both functions and data) for proper resolution
     for symbol in fmt.symbols() {
-        if symbol.is_function() && symbol.address != 0 {
+        if symbol.address != 0 && !symbol.name.is_empty() {
             table.insert(symbol.address, symbol.name.clone());
         }
     }
@@ -1505,6 +1505,42 @@ fn get_dwarf_variable_names(debug_info: &DebugInfo, func_addr: u64) -> std::coll
     }
 }
 
+/// Disassemble bytes to extract call instructions (for function discovery).
+fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
+    disasm: &D,
+    bytes: &[u8],
+    start_addr: u64,
+) -> Vec<hexray_core::Instruction> {
+    let mut instructions = Vec::new();
+    let mut offset = 0;
+
+    // Limit to 2000 instructions to prevent runaway disassembly
+    while offset < bytes.len() && instructions.len() < 2000 {
+        let remaining = &bytes[offset..];
+        let addr = start_addr + offset as u64;
+
+        match disasm.decode_instruction(remaining, addr) {
+            Ok(decoded) => {
+                let is_ret = decoded.instruction.is_return();
+                instructions.push(decoded.instruction);
+                offset += decoded.size;
+
+                // Don't stop at return - we want to find all calls in the function
+                // including those after conditional returns
+                if is_ret && offset >= bytes.len() / 2 {
+                    // Only stop if we're past the midpoint
+                    break;
+                }
+            }
+            Err(_) => {
+                offset += disasm.min_instruction_size().max(1);
+            }
+        }
+    }
+
+    instructions
+}
+
 fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, html: bool) -> Result<()> {
     let symbols: Vec<_> = fmt.symbols().cloned().collect();
     let arch = fmt.architecture();
@@ -1512,15 +1548,30 @@ fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, 
     // Determine which functions to analyze (address, name, size)
     // Note: Mach-O symbols don't have size info (nlist doesn't store it),
     // so we use a default size for symbols with size == 0
-    let functions_to_analyze: Vec<(u64, String, u64)> = if target == "all" {
-        symbols
+    let mut functions_to_analyze: Vec<(u64, String, u64)> = if target == "all" {
+        // Start with defined internal function symbols
+        let mut funcs: Vec<_> = symbols
             .iter()
-            .filter(|s| s.is_function() && s.address != 0)
+            .filter(|s| s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some())
             .map(|s| {
-                let size = if s.size > 0 { s.size } else { 256 }; // Default for Mach-O
+                let size = if s.size > 0 { s.size } else { 4096 }; // Larger default for actual code
                 (s.address, demangle_or_original(&s.name), size)
             })
-            .collect()
+            .collect();
+
+        // Also add the entry point if present (important for stripped binaries)
+        if let Some(entry) = fmt.entry_point() {
+            let entry_name = symbols
+                .iter()
+                .find(|s| s.address == entry)
+                .map(|s| demangle_or_original(&s.name))
+                .unwrap_or_else(|| format!("_start_{:x}", entry));
+            if !funcs.iter().any(|(addr, _, _)| *addr == entry) {
+                funcs.push((entry, entry_name, 8192)); // Entry functions are often large
+            }
+        }
+
+        funcs
     } else {
         // Parse as address or find symbol by name
         let address = if let Some(stripped) = target.strip_prefix("0x") {
@@ -1542,36 +1593,98 @@ fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, 
         vec![(addr, name, size)]
     };
 
-    // Collect function info for parallel disassembly
-    let function_infos: Vec<FunctionInfo> = functions_to_analyze
-        .iter()
-        .filter_map(|(func_addr, _, func_size)| {
-            let size = (*func_size).max(64) as usize;
-            fmt.bytes_at(*func_addr, size).map(|bytes| FunctionInfo {
-                address: *func_addr,
-                size,
-                bytes: bytes.to_vec(),
-            })
+    // Helper to check if an address is in executable code (not a stub/import)
+    let is_internal_code = |addr: u64| -> bool {
+        fmt.executable_sections().any(|sec| {
+            let sec_start = sec.virtual_address();
+            let sec_end = sec_start + sec.size();
+            let sec_name = sec.name();
+            // Exclude stub sections
+            addr >= sec_start && addr < sec_end && !sec_name.contains("stub")
         })
-        .collect();
+    };
 
-    // Build call graph using parallel disassembly
+    // Iteratively discover functions by following calls
+    let mut known_functions: std::collections::HashSet<u64> = functions_to_analyze.iter().map(|(a, _, _)| *a).collect();
+    let mut pending_functions: Vec<(u64, String, u64)> = functions_to_analyze.clone();
+    let mut all_function_infos: Vec<FunctionInfo> = Vec::new();
+
+    // Create disassembler once based on architecture
+    let disasm_x86 = X86_64Disassembler::new();
+    let disasm_arm64 = Arm64Disassembler::new();
+    let disasm_riscv = RiscVDisassembler::new();
+    let disasm_riscv32 = RiscVDisassembler::new_rv32();
+
+    // Iteratively discover functions (up to 3 iterations to avoid infinite loops)
+    for _iteration in 0..3 {
+        if pending_functions.is_empty() {
+            break;
+        }
+
+        // Collect function info for current batch
+        let function_infos: Vec<FunctionInfo> = pending_functions
+            .iter()
+            .filter_map(|(func_addr, _, func_size)| {
+                let size = (*func_size).max(64) as usize;
+                fmt.bytes_at(*func_addr, size).map(|bytes| FunctionInfo {
+                    address: *func_addr,
+                    size,
+                    bytes: bytes.to_vec(),
+                })
+            })
+            .collect();
+
+        // Disassemble and find call targets
+        let mut new_call_targets: Vec<(u64, String, u64)> = Vec::new();
+        for func_info in &function_infos {
+            let instructions: Vec<hexray_core::Instruction> = match arch {
+                Architecture::X86_64 | Architecture::X86 => {
+                    disassemble_for_calls(&disasm_x86, &func_info.bytes, func_info.address)
+                }
+                Architecture::Arm64 => {
+                    disassemble_for_calls(&disasm_arm64, &func_info.bytes, func_info.address)
+                }
+                Architecture::RiscV64 => {
+                    disassemble_for_calls(&disasm_riscv, &func_info.bytes, func_info.address)
+                }
+                Architecture::RiscV32 => {
+                    disassemble_for_calls(&disasm_riscv32, &func_info.bytes, func_info.address)
+                }
+                _ => Vec::new(),
+            };
+
+            // Extract call targets
+            for instr in instructions {
+                if let hexray_core::ControlFlow::Call { target, .. } = instr.control_flow {
+                    if !known_functions.contains(&target) && is_internal_code(target) {
+                        known_functions.insert(target);
+                        let name = symbols.iter()
+                            .find(|s| s.address == target)
+                            .map(|s| demangle_or_original(&s.name))
+                            .unwrap_or_else(|| format!("sub_{:x}", target));
+                        new_call_targets.push((target, name, 4096));
+                    }
+                }
+            }
+        }
+
+        all_function_infos.extend(function_infos);
+        pending_functions = new_call_targets;
+    }
+
+    // Build call graph using all discovered functions
     let callgraph = match arch {
         Architecture::X86_64 | Architecture::X86 => {
-            let disasm = X86_64Disassembler::new();
-            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_x86, &symbols)
         }
         Architecture::Arm64 => {
-            let disasm = Arm64Disassembler::new();
-            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_arm64, &symbols)
         }
         Architecture::RiscV64 => {
-            let disasm = RiscVDisassembler::new();
-            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_riscv, &symbols)
         }
         Architecture::RiscV32 => {
-            let disasm = RiscVDisassembler::new_rv32();
-            ParallelCallGraphBuilder::build(&function_infos, &disasm, &symbols)
+            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_riscv32, &symbols)
         }
         _ => {
             // Fallback to sequential for unsupported architectures

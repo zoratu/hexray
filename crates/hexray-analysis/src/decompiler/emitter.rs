@@ -322,7 +322,7 @@ impl PseudoCodeEmitter {
                     self.format_expr_with_strings(lhs, table),
                     self.format_expr_with_strings(rhs, table))
             }
-            ExprKind::GotRef { address, instruction_address, size, display_expr, is_deref } => {
+            ExprKind::GotRef { address, instruction_address, size, display_expr: _, is_deref } => {
                 // Try to resolve using instruction address first (for relocatable objects)
                 // This uses the relocation at the instruction to find the symbol
                 if let Some(ref reloc_table) = self.relocation_table {
@@ -344,7 +344,7 @@ impl PseudoCodeEmitter {
                 if let Some(s) = table.get(*address) {
                     return format!("\"{}\"", escape_string(s));
                 }
-                // Fall back to default display
+                // Fall back to showing computed address (better than "rip + offset")
                 if *is_deref {
                     let prefix = match size {
                         1 => "*(uint8_t*)",
@@ -353,7 +353,8 @@ impl PseudoCodeEmitter {
                         8 => "*(uint64_t*)",
                         _ => "*",
                     };
-                    format!("{}({})", prefix, self.format_expr_with_strings(display_expr, table))
+                    // Use computed address as data_XXXX instead of showing "rip + offset"
+                    format!("{}(&data_{:x})", prefix, address)
                 } else {
                     // Address-of (LEA) - format as sub_XXXX if it looks like a code address
                     format!("sub_{:x}", address)

@@ -939,8 +939,20 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
         }
     }
 
-    // Fallback: use placeholder if no compare found
-    Expr::binop(op, Expr::unknown("cmp_left"), Expr::unknown("cmp_right"))
+    // Fallback: show condition check on flags if no compare found
+    // This is more informative than generic placeholders
+    let flag_name = match cond {
+        Condition::Equal | Condition::NotEqual => "ZF",
+        Condition::Less | Condition::GreaterOrEqual => "SF^OF",
+        Condition::Greater | Condition::LessOrEqual => "SF^OF|ZF",
+        Condition::Below | Condition::AboveOrEqual => "CF",
+        Condition::Above | Condition::BelowOrEqual => "CF|ZF",
+        Condition::Sign | Condition::NotSign => "SF",
+        Condition::Overflow | Condition::NotOverflow => "OF",
+        Condition::Parity | Condition::NotParity => "PF",
+        _ => "flags",
+    };
+    Expr::binop(op, Expr::unknown(flag_name), Expr::int(0))
 }
 
 /// Builds a map of register names to their values from MOV/LDR instructions in a block.
@@ -1077,7 +1089,19 @@ fn condition_to_expr(cond: Condition) -> Expr {
         Condition::AboveOrEqual => BinOpKind::UGe,
         _ => BinOpKind::Ne,
     };
-    Expr::binop(op, Expr::unknown("cmp_left"), Expr::unknown("cmp_right"))
+    // Fallback: show condition check on flags
+    let flag_name = match cond {
+        Condition::Equal | Condition::NotEqual => "ZF",
+        Condition::Less | Condition::GreaterOrEqual => "SF^OF",
+        Condition::Greater | Condition::LessOrEqual => "SF^OF|ZF",
+        Condition::Below | Condition::AboveOrEqual => "CF",
+        Condition::Above | Condition::BelowOrEqual => "CF|ZF",
+        Condition::Sign | Condition::NotSign => "SF",
+        Condition::Overflow | Condition::NotOverflow => "OF",
+        Condition::Parity | Condition::NotParity => "PF",
+        _ => "flags",
+    };
+    Expr::binop(op, Expr::unknown(flag_name), Expr::int(0))
 }
 
 /// Negates a condition expression.

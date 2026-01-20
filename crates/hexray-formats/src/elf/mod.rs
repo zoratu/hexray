@@ -98,11 +98,20 @@ impl<'a> Elf<'a> {
             StringTable::empty()
         };
 
-        // Populate section name caches for the Section trait
+        // Populate section name and data caches for the Section trait
         let mut sections = sections;
         for section in &mut sections {
             if let Some(name) = section_names.get(section.sh_name as usize) {
                 section.set_name(name.to_string());
+            }
+            // Populate data cache for sections that have file data
+            // (skip NOBITS sections like .bss which have no file data)
+            if section.sh_type != section::SHT_NOBITS && section.sh_size > 0 {
+                let start = section.sh_offset as usize;
+                let end = start + section.sh_size as usize;
+                if end <= data.len() {
+                    section.set_data(data[start..end].to_vec());
+                }
             }
         }
 

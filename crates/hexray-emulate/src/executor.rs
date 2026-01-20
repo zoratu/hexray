@@ -413,7 +413,7 @@ mod tests {
             Architecture::X86_64,
             RegisterClass::General,
             id,
-            8,
+            64, // Register.size is in bits
         ))
     }
 
