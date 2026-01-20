@@ -1,0 +1,6 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+Idx  Name                     Address          Size             Flags   
+---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use super::{
     compare_strings as compare_string_sets, fixture_path, parse_strings_ordered,
     parse_strings_output, run_strings, run_strings_with_encoding, StringDiffResult,
 };
-use hexray_analysis::{StringConfig, StringDetector, StringEncoding};
+use hexray_analysis::{DetectedString, StringConfig, StringDetector, StringEncoding};
 use std::collections::HashSet;
 use std::fs;
 
@@ -136,9 +136,9 @@ pub fn compare_strings_analyzed(binary_path: &str, min_len: usize) {
     println!("Total strings found: {}", hexray_strings.len());
 
     // Categorize strings
-    let paths: Vec<_> = hexray_strings.iter().filter(|s| s.is_path()).collect();
-    let urls: Vec<_> = hexray_strings.iter().filter(|s| s.is_url()).collect();
-    let errors: Vec<_> = hexray_strings
+    let paths: Vec<&DetectedString> = hexray_strings.iter().filter(|s| s.is_path()).collect();
+    let urls: Vec<&DetectedString> = hexray_strings.iter().filter(|s| s.is_url()).collect();
+    let errors: Vec<&DetectedString> = hexray_strings
         .iter()
         .filter(|s| s.is_error_message())
         .collect();
@@ -276,7 +276,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_strings_test_strings() {
         skip_if_missing!("test_strings", "strings");
 
@@ -295,7 +294,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_strings_test_strings2() {
         skip_if_missing!("test_strings2", "strings");
 
@@ -312,7 +310,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_strings_test_decompile() {
         skip_if_missing!("test_decompile", "strings");
 
@@ -329,7 +326,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_strings_macho_x86_64() {
         skip_if_missing!("test_x86_64_macho", "strings");
 
@@ -347,7 +343,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_strings_different_min_lengths() {
         skip_if_missing!("test_strings", "strings");
 
@@ -376,7 +371,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_strings_analysis() {
         skip_if_missing!("test_strings", "strings");
 
@@ -385,7 +379,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_strings_threshold_comparison() {
         skip_if_missing!("test_strings", "strings");
 
@@ -394,7 +387,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_missing_strings_analysis() {
         skip_if_missing!("test_strings", "strings");
 
@@ -418,7 +410,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires strings command and test fixtures
     fn test_extra_strings_analysis() {
         skip_if_missing!("test_strings", "strings");
 
@@ -442,7 +433,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_strings_all_fixtures() {
         // Run string comparison on all available fixtures
         let fixtures = [
@@ -511,9 +501,9 @@ mod tests {
         ];
 
         for config in configs {
-            let detector = StringDetector::with_config(config.clone());
+            let detector: StringDetector = StringDetector::with_config(config.clone());
             let test_data = b"Hello, World!\x00Short\x00This is a longer test string\x00";
-            let strings = detector.detect(test_data, 0);
+            let strings: Vec<DetectedString> = detector.detect(test_data, 0);
 
             // Verify min_length filter
             for s in &strings {
@@ -545,11 +535,11 @@ mod tests {
             min_length: 4,
             ..Default::default()
         });
-        let strings = detector.detect(data, 0);
+        let strings: Vec<DetectedString> = detector.detect(data, 0);
 
-        let paths: Vec<_> = strings.iter().filter(|s| s.is_path()).collect();
-        let urls: Vec<_> = strings.iter().filter(|s| s.is_url()).collect();
-        let errors: Vec<_> = strings.iter().filter(|s| s.is_error_message()).collect();
+        let paths: Vec<&DetectedString> = strings.iter().filter(|s| s.is_path()).collect();
+        let urls: Vec<&DetectedString> = strings.iter().filter(|s| s.is_url()).collect();
+        let errors: Vec<&DetectedString> = strings.iter().filter(|s| s.is_error_message()).collect();
 
         assert!(!paths.is_empty(), "Should find path string");
         assert!(!urls.is_empty(), "Should find URL string");

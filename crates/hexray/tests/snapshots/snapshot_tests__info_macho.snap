@@ -1,0 +1,23 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+Binary Information
+==================
+Format:        Mach-O
+Architecture:  X86_64
+Endianness:    Little
+Bitness:       Bits64
+Type:          Execute
+CPU Type:      X86_64
+Entry Point:   [ADDR]
+
+Segments:      3
+Load Commands: 15
+
+Segments:
+  __PAGEZERO       [ADDR] - [ADDR] (0 sections)
+  __TEXT           [ADDR] - [ADDR] (2 sections)
+  __LINKEDIT       [ADDR] - [ADDR] (0 sections)
+
+Symbols:       5

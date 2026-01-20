@@ -37,6 +37,7 @@ hexray-core.workspace = true
 hexray-formats.workspace = true
 hexray-disasm = { workspace = true, features = ["all-archs"] }
 hexray-analysis.workspace = true
+insta = { version = "1.40", features = ["json", "redactions"] }
 
 [[test]]
 name = "differential_tests"

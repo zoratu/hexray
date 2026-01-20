@@ -1,0 +1,19 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: sorted
+---
+digraph "callgraph" {
+
+
+    "__mh_execute_header" [label="__mh_execute_header"];
+    "_conditional" [label="_conditional"];
+    "_factorial" [label="_factorial"];
+    "_main" -> "_conditional";
+    "_main" -> "_factorial";
+    "_main" -> "_sum_while";
+    "_main" [label="_main"];
+    "_sum_while" [label="_sum_while"];
+    edge [fontname="Courier", fontsize=9];
+    node [shape=box, fontname="Courier", fontsize=10];
+    rankdir=LR;
+}

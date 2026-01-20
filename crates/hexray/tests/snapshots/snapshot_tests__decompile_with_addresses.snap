@@ -1,0 +1,22 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+(auto-selected 'main' at [ADDR])
+
+Decompiling _main at [ADDR]
+
+int32_t _main(void)
+{
+    int var_0;
+
+    // bb0 [[ADDR]..[ADDR]]
+    x29[-0x1] = 0;
+    // bb1 [[ADDR]..[ADDR]]
+    sp[2] = _factorial(5);
+    // bb2 [[ADDR]..[ADDR]]
+    sp[1] = _sum_while(10);
+    // bb3 [[ADDR]..[ADDR]]
+    var_0 = _conditional(7);
+    return sp[2] + sp[1] + var_0;
+}

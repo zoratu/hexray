@@ -27,7 +27,7 @@ pub fn disassemble_elf_with_hexray(binary_path: &str) -> Vec<(u64, String)> {
         }
     };
 
-    let elf = match Elf::parse(&data) {
+    let elf: Elf = match Elf::parse(&data) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Failed to parse ELF {}: {:?}", binary_path, e);
@@ -75,7 +75,7 @@ pub fn disassemble_macho_with_hexray(binary_path: &str) -> Vec<(u64, String)> {
         }
     };
 
-    let macho = match MachO::parse(&data) {
+    let macho: MachO = match MachO::parse(&data) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Failed to parse Mach-O {}: {:?}", binary_path, e);
@@ -185,7 +185,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires objdump and test fixtures
     fn test_disasm_elf_simple_x86_64() {
         skip_if_missing!("elf/simple_x86_64", "objdump");
 
@@ -207,7 +206,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires objdump and test fixtures
     fn test_disasm_elf_with_symbols() {
         skip_if_missing!("elf/test_with_symbols", "objdump");
 
@@ -228,7 +226,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires objdump and test fixtures
     fn test_disasm_macho_x86_64() {
         skip_if_missing!("test_x86_64_macho", "objdump");
 
@@ -250,7 +247,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires objdump and test fixtures
     fn test_disasm_test_decompile() {
         skip_if_missing!("test_decompile", "objdump");
 
@@ -270,7 +266,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires objdump and test fixtures
     fn test_disasm_test_strings() {
         skip_if_missing!("test_strings", "objdump");
 
@@ -290,7 +285,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_disasm_all_fixtures() {
         // Run disassembly comparison on all available fixtures
         let fixtures = [

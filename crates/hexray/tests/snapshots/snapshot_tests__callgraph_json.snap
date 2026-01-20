@@ -1,0 +1,59 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: sorted
+---
+{
+  "edge_count": 3,
+  "node_count": 5,
+  "nodes": [
+    {
+      "address": "[ADDR]",
+      "callees": [],
+      "is_external": false,
+      "name": "__mh_execute_header"
+    },
+    {
+      "address": "[ADDR]",
+      "callees": [],
+      "is_external": false,
+      "name": "_conditional"
+    },
+    {
+      "address": "[ADDR]",
+      "callees": [],
+      "is_external": false,
+      "name": "_factorial"
+    },
+    {
+      "address": "[ADDR]",
+      "callees": [],
+      "is_external": false,
+      "name": "_sum_while"
+    },
+    {
+      "address": "[ADDR]",
+      "callees": [
+        {
+          "address": "[ADDR]",
+          "call_address": "[ADDR]",
+          "call_type": "Direct",
+          "name": "_conditional"
+        },
+        {
+          "address": "[ADDR]",
+          "call_address": "[ADDR]",
+          "call_type": "Direct",
+          "name": "_factorial"
+        },
+        {
+          "address": "[ADDR]",
+          "call_address": "[ADDR]",
+          "call_type": "Direct",
+          "name": "_sum_while"
+        }
+      ],
+      "is_external": false,
+      "name": "_main"
+    }
+  ]
+}

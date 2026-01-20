@@ -1,0 +1,20 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+Binary Information
+==================
+Format:        PE
+Architecture:  X86_64
+Endianness:    Little
+Bitness:       Bits64
+Type:          Executable
+Machine:       0x8664
+Image Base:    [ADDR]
+Entry Point:   [ADDR]
+
+Sections:      1
+Imports:       0
+Exports:       0
+
+Symbols:       0

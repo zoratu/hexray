@@ -26,7 +26,7 @@ pub fn extract_elf_symbols_hexray(binary_path: &str) -> Vec<(u64, String)> {
         }
     };
 
-    let elf = match Elf::parse(&data) {
+    let elf: Elf = match Elf::parse(&data) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Failed to parse ELF {}: {:?}", binary_path, e);
@@ -50,7 +50,7 @@ pub fn extract_macho_symbols_hexray(binary_path: &str) -> Vec<(u64, String)> {
         }
     };
 
-    let macho = match MachO::parse(&data) {
+    let macho: MachO = match MachO::parse(&data) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Failed to parse Mach-O {}: {:?}", binary_path, e);
@@ -139,11 +139,13 @@ pub fn compare_function_symbols(binary_path: &str) -> SymbolDiffResult {
         };
 
         if let Ok(elf) = Elf::parse(&data) {
+            let elf: Elf = elf;
             elf.symbols()
                 .filter(|s| s.is_function() && !s.name.is_empty() && s.address != 0)
                 .map(|s| (s.address, s.name.to_string()))
                 .collect()
         } else if let Ok(macho) = MachO::parse(&data) {
+            let macho: MachO = macho;
             macho
                 .symbols()
                 .filter(|s| s.is_function() && !s.name.is_empty() && s.address != 0)
@@ -184,11 +186,13 @@ pub fn compare_global_symbols(binary_path: &str) -> SymbolDiffResult {
         };
 
         if let Ok(elf) = Elf::parse(&data) {
+            let elf: Elf = elf;
             elf.symbols()
                 .filter(|s| s.is_global() && !s.name.is_empty() && s.address != 0)
                 .map(|s| (s.address, s.name.to_string()))
                 .collect()
         } else if let Ok(macho) = MachO::parse(&data) {
+            let macho: MachO = macho;
             macho
                 .symbols()
                 .filter(|s| s.is_global() && !s.name.is_empty() && s.address != 0)
@@ -224,11 +228,13 @@ pub fn compare_symbol_names(binary_path: &str) -> (usize, usize, f64) {
         };
 
         if let Ok(elf) = Elf::parse(&data) {
+            let elf: Elf = elf;
             elf.symbols()
                 .filter(|s| !s.name.is_empty())
                 .map(|s| s.name.to_string())
                 .collect()
         } else if let Ok(macho) = MachO::parse(&data) {
+            let macho: MachO = macho;
             macho
                 .symbols()
                 .filter(|s| !s.name.is_empty())
@@ -276,7 +282,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires nm and test fixtures
     fn test_symbols_elf_with_symbols() {
         skip_if_missing!("elf/test_with_symbols", "nm");
 
@@ -295,7 +300,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires nm and test fixtures
     fn test_symbols_elf_simple() {
         skip_if_missing!("elf/simple_x86_64", "nm");
 
@@ -316,7 +320,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires nm and test fixtures
     fn test_symbols_macho_x86_64() {
         skip_if_missing!("test_x86_64_macho", "nm");
 
@@ -335,7 +338,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires nm and test fixtures
     fn test_symbols_test_decompile() {
         skip_if_missing!("test_decompile", "nm");
 
@@ -351,7 +353,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires nm and test fixtures
     fn test_function_symbols_only() {
         skip_if_missing!("test_decompile", "nm");
 
@@ -371,7 +372,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires nm and test fixtures
     fn test_global_symbols_only() {
         skip_if_missing!("test_decompile", "nm");
 
@@ -391,7 +391,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires nm and test fixtures
     fn test_symbol_names_coverage() {
         skip_if_missing!("test_decompile", "nm");
 
@@ -414,7 +413,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_symbols_all_fixtures() {
         // Run symbol comparison on all available fixtures
         let fixtures = [

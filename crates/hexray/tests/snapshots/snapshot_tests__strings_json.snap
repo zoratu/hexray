@@ -1,0 +1,21 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: redacted
+---
+{
+  "strings": [
+    {
+      "address": "[ADDR]",
+      "content": "Hello, World!",
+      "encoding": "Ascii",
+      "length": 13
+    },
+    {
+      "address": "[ADDR]",
+      "content": "This is a test string",
+      "encoding": "Ascii",
+      "length": 21
+    }
+  ],
+  "total": 2
+}

@@ -1,0 +1,8 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+Idx  Name                     Address          Size             Flags   
+---------------------------------------------------------------------------
+0    __TEXT,__text            [ADDR] [ADDR] AX      
+1    __TEXT,__unwind_info     [ADDR] [ADDR] A-

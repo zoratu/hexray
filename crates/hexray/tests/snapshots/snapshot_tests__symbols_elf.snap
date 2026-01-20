@@ -1,0 +1,9 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+Address          Size     Type     Bind     Name
+----------------------------------------------------------------------
+[ADDR] 15       FUNC     GLOBAL   _start
+[ADDR] 14       FUNC     GLOBAL   main
+[ADDR] 11       FUNC     GLOBAL   helper

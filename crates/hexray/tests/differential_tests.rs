@@ -96,7 +96,6 @@ fn run_all_comparisons(binary_path: &str) {
 }
 
 #[test]
-#[ignore] // Requires external tools and test fixtures
 fn integration_test_decompile() {
     let path = fixture_path("test_decompile");
     if !Path::new(&path).exists() {
@@ -107,7 +106,6 @@ fn integration_test_decompile() {
 }
 
 #[test]
-#[ignore] // Requires external tools and test fixtures
 fn integration_test_strings() {
     let path = fixture_path("test_strings");
     if !Path::new(&path).exists() {
@@ -118,7 +116,6 @@ fn integration_test_strings() {
 }
 
 #[test]
-#[ignore] // Requires external tools and test fixtures
 fn integration_test_x86_64_macho() {
     let path = fixture_path("test_x86_64_macho");
     if !Path::new(&path).exists() {
@@ -281,7 +278,6 @@ fn sanity_test_tool_detection() {
 // =============================================================================
 
 #[test]
-#[ignore]
 fn benchmark_disassembly_comparison() {
     let fixtures = [
         "elf/simple_x86_64",
@@ -313,7 +309,6 @@ fn benchmark_disassembly_comparison() {
 }
 
 #[test]
-#[ignore]
 fn benchmark_symbol_comparison() {
     let fixtures = [
         "elf/test_with_symbols",
@@ -344,7 +339,6 @@ fn benchmark_symbol_comparison() {
 }
 
 #[test]
-#[ignore]
 fn benchmark_string_comparison() {
     let fixtures = ["test_strings", "test_strings2", "test_decompile"];
 

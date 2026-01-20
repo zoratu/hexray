@@ -1,0 +1,18 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+Binary Information
+==================
+Format:        ELF
+Architecture:  X86_64
+Endianness:    Little
+Bitness:       Bits64
+Type:          Executable
+Machine:       X86_64
+Entry Point:   0x401000
+
+Sections:      0
+Segments:      1
+
+Symbols:       0

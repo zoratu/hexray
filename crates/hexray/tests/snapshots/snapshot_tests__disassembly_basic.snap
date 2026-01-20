@@ -1,0 +1,11 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+expression: normalized
+---
+Disassembling entry point at 0x401000
+
+[ADDR]:  55                       push rbp
+[ADDR]:  48 89 e5                 mov rbp, rsp
+[ADDR]:  b8 2a 00 00 00           mov eax, 0x2a
+[ADDR]:  5d                       pop rbp
+[ADDR]:  c3                       ret
