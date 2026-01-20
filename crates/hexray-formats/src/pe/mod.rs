@@ -90,6 +90,7 @@ impl<'a> Pe<'a> {
         // Parse section headers
         let sections_offset = opt_offset + coff_header.size_of_optional_header as usize;
         let mut sections = Vec::with_capacity(coff_header.number_of_sections as usize);
+        let image_base = optional_header.image_base;
 
         for i in 0..coff_header.number_of_sections as usize {
             let sec_offset = sections_offset + i * section::SECTION_HEADER_SIZE;
@@ -97,7 +98,7 @@ impl<'a> Pe<'a> {
                 break;
             }
             let mut section = SectionHeader::parse(&data[sec_offset..])?;
-            section.populate_data(data);
+            section.populate_data(data, image_base);
             sections.push(section);
         }
 

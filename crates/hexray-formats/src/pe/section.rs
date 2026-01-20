@@ -33,6 +33,8 @@ pub struct SectionHeader {
     pub characteristics: u32,
     /// Cached section data
     data_cache: Vec<u8>,
+    /// Image base (for computing absolute virtual addresses)
+    image_base: u64,
 }
 
 impl SectionHeader {
@@ -59,11 +61,13 @@ impl SectionHeader {
             number_of_linenumbers: u16::from_le_bytes([data[34], data[35]]),
             characteristics: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
             data_cache: Vec::new(),
+            image_base: 0, // Will be set by populate_data
         })
     }
 
     /// Populate the section data cache from file data.
-    pub fn populate_data(&mut self, file_data: &[u8]) {
+    pub fn populate_data(&mut self, file_data: &[u8], image_base: u64) {
+        self.image_base = image_base;
         let start = self.pointer_to_raw_data as usize;
         let size = self.size_of_raw_data as usize;
         let end = start + size;
@@ -108,7 +112,7 @@ impl crate::Section for SectionHeader {
     }
 
     fn virtual_address(&self) -> u64 {
-        self.virtual_address as u64
+        self.image_base + self.virtual_address as u64
     }
 
     fn size(&self) -> u64 {

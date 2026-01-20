@@ -844,13 +844,14 @@ fn print_sections(binary: &Binary) {
             }
         }
         Binary::Pe(pe) => {
+            use hexray_formats::Section;
             for (idx, section) in pe.sections.iter().enumerate() {
                 let flags = section.flags_string();
                 println!(
                     "{:<4} {:<24} {:#016x} {:#016x} {:<8}",
                     idx,
                     section.name,
-                    pe.image_base() + section.virtual_address as u64,
+                    section.virtual_address(), // Now returns absolute address including image_base
                     section.virtual_size,
                     flags
                 );
