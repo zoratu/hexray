@@ -1469,6 +1469,12 @@ impl Expr {
                     Self::unknown(&inst.mnemonic)
                 }
             }
+            Operation::SignExtend => {
+                // CBW/CWDE/CDQE: sign-extend accumulator
+                // CWD/CDQ/CQO: sign-extend accumulator to DX:AX/EDX:EAX/RDX:RAX
+                // Show as a cast or function call since these have no explicit operands
+                Self::call(CallTarget::Named(inst.mnemonic.clone()), vec![])
+            }
         }
     }
 

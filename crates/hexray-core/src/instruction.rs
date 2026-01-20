@@ -117,6 +117,10 @@ pub enum Operation {
     Inc,
     Dec,
 
+    // Sign extension
+    /// Sign-extend accumulator (CBW, CWDE, CDQE, CWD, CDQ, CQO)
+    SignExtend,
+
     // Logical
     And,
     Or,
@@ -476,6 +480,7 @@ impl Operation {
             Self::Neg => "neg",
             Self::Inc => "inc",
             Self::Dec => "dec",
+            Self::SignExtend => "sign_extend",
             Self::And => "and",
             Self::Or => "or",
             Self::Xor => "xor",

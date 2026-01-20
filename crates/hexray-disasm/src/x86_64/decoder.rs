@@ -523,12 +523,31 @@ impl Disassembler for X86_64Disassembler {
             _ => ControlFlow::Sequential,
         };
 
+        // Select correct mnemonic for sign-extension instructions based on operand size
+        let mnemonic = if opcode == 0x98 {
+            // CBW (16) / CWDE (32) / CDQE (64)
+            match operand_size {
+                16 => "cbw",
+                64 => "cdqe",
+                _ => "cwde",
+            }
+        } else if opcode == 0x99 {
+            // CWD (16) / CDQ (32) / CQO (64)
+            match operand_size {
+                16 => "cwd",
+                64 => "cqo",
+                _ => "cdq",
+            }
+        } else {
+            entry.mnemonic
+        };
+
         let instruction = Instruction {
             address,
             size: offset,
             bytes: bytes[..offset].to_vec(),
             operation: entry.operation,
-            mnemonic: entry.mnemonic.to_string(),
+            mnemonic: mnemonic.to_string(),
             operands,
             control_flow,
             reads: vec![],
