@@ -7,9 +7,7 @@ use super::{
     compare_symbols, fixture_path, parse_nm_output, parse_nm_simple, run_nm, SymbolDiffResult,
     SymbolInfo,
 };
-use hexray_formats::elf::Elf;
-use hexray_formats::macho::MachO;
-use hexray_formats::BinaryFormat;
+use hexray_formats::{BinaryFormat, Elf, MachO};
 use std::collections::HashSet;
 use std::fs;
 

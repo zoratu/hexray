@@ -3,16 +3,10 @@
 //! This example loads a binary, runs type inference on a function,
 //! and shows the decompiled output with inferred types.
 
-use hexray_analysis::decompiler::Decompiler;
-use hexray_analysis::ssa::SsaBuilder;
-use hexray_analysis::types::TypeInference;
-use hexray_analysis::CfgBuilder;
-use hexray_core::Architecture;
-use hexray_disasm::arm64::Arm64Disassembler;
-use hexray_disasm::x86_64::X86_64Disassembler;
-use hexray_disasm::Disassembler;
-use hexray_formats::macho::MachO;
-use hexray_formats::BinaryFormat;
+use hexray_analysis::{CfgBuilder, Decompiler, SsaBuilder, TypeInference};
+use hexray_core::{Architecture, Instruction};
+use hexray_disasm::{Arm64Disassembler, Disassembler, X86_64Disassembler};
+use hexray_formats::{BinaryFormat, MachO};
 use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,7 +124,7 @@ fn disassemble_function<D: Disassembler>(
     disasm: &D,
     bytes: &[u8],
     start_addr: u64,
-) -> Vec<hexray_core::Instruction> {
+) -> Vec<Instruction> {
     let mut instructions = Vec::new();
     let mut offset = 0;
 

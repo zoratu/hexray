@@ -7,11 +7,8 @@ use super::{
     compare_instructions, fixture_path, normalize_mnemonic, parse_objdump_simple, run_objdump,
     DisasmDiffResult,
 };
-use hexray_disasm::traits::Disassembler;
-use hexray_disasm::X86_64Disassembler;
-use hexray_formats::elf::Elf;
-use hexray_formats::macho::MachO;
-use hexray_formats::BinaryFormat;
+use hexray_disasm::{Disassembler, X86_64Disassembler};
+use hexray_formats::{BinaryFormat, Elf, MachO};
 use std::fs;
 
 /// Minimum match rate threshold for disassembly tests.
