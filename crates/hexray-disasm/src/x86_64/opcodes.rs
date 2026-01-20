@@ -1738,6 +1738,18 @@ pub static SSE2_OPCODE_TABLE_66: [Option<SseOpcodeEntry>; 256] = {
             .with_vex_mnemonic("vhsubpd"),
     );
 
+    // MOVD/MOVQ r/m32/64, xmm (66 prefix store form)
+    table[0x7E] = Some(
+        SseOpcodeEntry::new("movd", Operation::Store, SseEncoding::GprXmm)
+            .with_vex_mnemonic("vmovd"),
+    );
+
+    // MOVDQA xmm/m128, xmm (66 prefix store form)
+    table[0x7F] = Some(
+        SseOpcodeEntry::new("movdqa", Operation::Store, SseEncoding::RmXmm)
+            .with_vex_mnemonic("vmovdqa"),
+    );
+
     // SHUFPD xmm, xmm/m128, imm8
     table[0xC6] = Some(
         SseOpcodeEntry::new("shufpd", Operation::Other(0xC6), SseEncoding::XmmRmImm8)
