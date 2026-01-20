@@ -269,8 +269,7 @@ impl VtableDetector {
         // If we don't have explicit ranges, be more permissive
         if self.executable_ranges.is_empty() {
             // Heuristic: addresses above 0x1000 and below typical kernel space
-            return addr >= 0x1000
-                && (self.pointer_size == 4 || addr < 0x7fff_ffff_ffff_ffff);
+            return addr >= 0x1000 && (self.pointer_size == 4 || addr < 0x7fff_ffff_ffff_ffff);
         }
 
         self.executable_ranges
@@ -295,7 +294,12 @@ impl VtableDetector {
     }
 
     /// Attempts to extract RTTI class name from typeinfo.
-    fn extract_rtti_class_name(&self, data: &[u8], base_addr: u64, typeinfo_addr: u64) -> Option<String> {
+    fn extract_rtti_class_name(
+        &self,
+        data: &[u8],
+        base_addr: u64,
+        typeinfo_addr: u64,
+    ) -> Option<String> {
         // The typeinfo structure (Itanium C++ ABI) layout:
         //   +0: vtable pointer (for type_info class itself)
         //   +ptr_size: pointer to name string (null-terminated)
@@ -326,9 +330,9 @@ impl VtableDetector {
             let name_bytes = &data[name_start..name_end];
             if let Ok(name) = std::str::from_utf8(name_bytes) {
                 // Try to demangle if it starts with mangling prefix
-                if name.starts_with("_ZTS") {
+                if let Some(stripped) = name.strip_prefix("_ZTS") {
                     // Extract the class name from _ZTS prefix
-                    return Some(self.demangle_type_name(&name[4..]));
+                    return Some(self.demangle_type_name(stripped));
                 }
                 return Some(name.to_string());
             }
@@ -424,17 +428,8 @@ impl VtableDetector {
         // Check for RTTI at offset -ptr_size (before vtable start)
         let typeinfo_addr = if self.config.detect_rtti && offset >= self.pointer_size {
             let rtti_offset = offset - self.pointer_size;
-            if let Some(ptr) = self.read_pointer(data, rtti_offset) {
-                // RTTI pointer should point to data, not code
-                // It's typically in the same or nearby section
-                if ptr != 0 && !self.is_executable(ptr) {
-                    Some(ptr)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            self.read_pointer(data, rtti_offset)
+                .filter(|&ptr| ptr != 0 && !self.is_executable(ptr))
         } else {
             None
         };
@@ -446,10 +441,7 @@ impl VtableDetector {
                     // Null pointer - could be a gap or end of vtable
                     if self.config.allow_gaps && gap_count < self.config.max_gap_size {
                         gap_count += 1;
-                        entries.push(VtableEntry::new(
-                            current_offset - offset,
-                            ptr,
-                        ));
+                        entries.push(VtableEntry::new(current_offset - offset, ptr));
                         current_offset += self.pointer_size;
                         continue;
                     } else {
@@ -559,10 +551,7 @@ impl VtableDetector {
     /// Detects vtables in multiple read-only data sections.
     ///
     /// This is a convenience method that scans common read-only section names.
-    pub fn detect_in_sections<S: AsRef<[u8]>>(
-        &self,
-        sections: &[(String, u64, S)],
-    ) -> Vec<Vtable> {
+    pub fn detect_in_sections<S: AsRef<[u8]>>(&self, sections: &[(String, u64, S)]) -> Vec<Vtable> {
         let rodata_names = [
             ".rodata",
             ".rdata",
@@ -576,9 +565,7 @@ impl VtableDetector {
 
         for (name, addr, data) in sections {
             // Check if this is a read-only data section
-            let is_rodata = rodata_names
-                .iter()
-                .any(|&n| name.contains(n) || name == n);
+            let is_rodata = rodata_names.iter().any(|&n| name.contains(n) || name == n);
 
             if is_rodata {
                 let detected = self.scan_section(data.as_ref(), *addr);
@@ -791,8 +778,7 @@ mod tests {
 
     #[test]
     fn test_vtable_with_known_functions() {
-        let detector = make_test_detector()
-            .with_known_functions([0x2000, 0x3000, 0x4000]);
+        let detector = make_test_detector().with_known_functions([0x2000, 0x3000, 0x4000]);
 
         // Create data with known functions
         let mut data = Vec::new();
@@ -810,11 +796,10 @@ mod tests {
 
     #[test]
     fn test_vtable_with_symbols() {
-        let detector = make_test_detector()
-            .with_symbols([
-                (0x2000, "MyClass::method1".to_string()),
-                (0x3000, "MyClass::method2".to_string()),
-            ]);
+        let detector = make_test_detector().with_symbols([
+            (0x2000, "MyClass::method1".to_string()),
+            (0x3000, "MyClass::method2".to_string()),
+        ]);
 
         let mut data = Vec::new();
         data.extend_from_slice(&0x2000u64.to_le_bytes());
@@ -843,10 +828,7 @@ mod tests {
     #[test]
     fn test_vtable_database() {
         let mut vtable1 = Vtable::new(0x100000);
-        vtable1.entries = vec![
-            VtableEntry::new(0, 0x2000),
-            VtableEntry::new(8, 0x3000),
-        ];
+        vtable1.entries = vec![VtableEntry::new(0, 0x2000), VtableEntry::new(8, 0x3000)];
         vtable1.class_name = Some("ClassA".to_string());
 
         let mut vtable2 = Vtable::new(0x100020);
@@ -891,7 +873,10 @@ mod tests {
 
         // Test nested name: "N9namespace5ClassE" approximation
         // Our simple demangler handles "9namespace5Class" -> "namespace::Class"
-        assert_eq!(detector.demangle_type_name("9namespace5Class"), "namespace::Class");
+        assert_eq!(
+            detector.demangle_type_name("9namespace5Class"),
+            "namespace::Class"
+        );
     }
 
     #[test]
@@ -924,7 +909,7 @@ mod tests {
         data.extend_from_slice(&0x2000u64.to_le_bytes());
         data.extend_from_slice(&0x3000u64.to_le_bytes());
         data.extend_from_slice(&0x00u64.to_le_bytes()); // End of first vtable
-        // Second vtable
+                                                        // Second vtable
         data.extend_from_slice(&0x4000u64.to_le_bytes());
         data.extend_from_slice(&0x5000u64.to_le_bytes());
         data.extend_from_slice(&0x00u64.to_le_bytes()); // End of second vtable
@@ -938,8 +923,7 @@ mod tests {
     #[test]
     fn test_pure_virtual_detection() {
         let pure_virtual_addr = 0x9000u64;
-        let detector = make_test_detector()
-            .with_pure_virtual_addrs([pure_virtual_addr]);
+        let detector = make_test_detector().with_pure_virtual_addrs([pure_virtual_addr]);
 
         let mut data = Vec::new();
         data.extend_from_slice(&0x2000u64.to_le_bytes());

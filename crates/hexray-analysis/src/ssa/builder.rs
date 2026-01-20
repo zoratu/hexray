@@ -102,12 +102,15 @@ impl<'a> SsaBuilder<'a> {
         self.reaching_def
             .get(loc)
             .and_then(|stack| stack.last().copied())
-            .unwrap_or(0)  // Version 0 is undefined/parameter
+            .unwrap_or(0) // Version 0 is undefined/parameter
     }
 
     /// Pushes a new definition.
     fn push_def(&mut self, loc: &Location, version: Version) {
-        self.reaching_def.entry(loc.clone()).or_default().push(version);
+        self.reaching_def
+            .entry(loc.clone())
+            .or_default()
+            .push(version);
     }
 
     /// Pops a definition (when leaving a block's scope).
@@ -147,9 +150,10 @@ impl<'a> SsaBuilder<'a> {
             let effects = InstructionEffects::from_instruction(inst);
 
             // Build SSA uses (look up current versions)
-            let uses: Vec<SsaOperand> = inst.operands
+            let uses: Vec<SsaOperand> = inst
+                .operands
                 .iter()
-                .skip(1)  // First operand is often the destination
+                .skip(1) // First operand is often the destination
                 .map(|op| self.operand_to_ssa(op))
                 .collect();
 
@@ -164,7 +168,7 @@ impl<'a> SsaBuilder<'a> {
 
             let ssa_inst = SsaInstruction {
                 address: inst.address,
-                operation: inst.operation.clone(),
+                operation: inst.operation,
                 defs,
                 uses,
                 mnemonic: inst.mnemonic.clone(),
@@ -249,7 +253,10 @@ impl<'a> SsaBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, BlockTerminator, Condition, Instruction, Operation, Immediate, RegisterClass, Architecture, Register};
+    use hexray_core::{
+        Architecture, BasicBlock, BlockTerminator, Condition, Immediate, Instruction, Operation,
+        Register, RegisterClass,
+    };
 
     fn make_register(id: u16, _name: &str) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, 64)
@@ -260,7 +267,11 @@ mod tests {
         inst.operation = Operation::Move;
         inst.operands = vec![
             Operand::Register(make_register(reg_id, reg_name)),
-            Operand::Immediate(Immediate { value, size: 8, signed: false }),
+            Operand::Immediate(Immediate {
+                value,
+                size: 8,
+                signed: false,
+            }),
         ];
         inst
     }

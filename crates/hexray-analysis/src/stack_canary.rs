@@ -47,9 +47,8 @@
 use std::collections::HashMap;
 
 use hexray_core::{
-    Architecture, BasicBlockId, ControlFlow, ControlFlowGraph, Instruction,
-    Operand, Operation,
-    register::x86,
+    register::x86, Architecture, BasicBlockId, ControlFlow, ControlFlowGraph, Instruction, Operand,
+    Operation,
 };
 
 /// Information about detected stack canary protection in a function.
@@ -121,7 +120,10 @@ impl std::fmt::Display for CanarySource {
                 write!(f, "{}:{:#x}", seg_name, offset)
             }
             Self::GlobalSymbol { name, .. } => write!(f, "{}", name),
-            Self::PcRelative { address: Some(addr), .. } => write!(f, "[{:#x}]", addr),
+            Self::PcRelative {
+                address: Some(addr),
+                ..
+            } => write!(f, "[{:#x}]", addr),
             Self::PcRelative { offset, .. } => write!(f, "[rip+{:#x}]", offset),
         }
     }
@@ -190,8 +192,7 @@ impl StackCanaryDetector {
         let function_addr = entry_block.start;
 
         // Phase 1: Find canary load and store in prologue
-        let (canary_source, store_addr, stack_offset) =
-            self.find_x86_canary_store(cfg)?;
+        let (canary_source, store_addr, stack_offset) = self.find_x86_canary_store(cfg)?;
 
         // Phase 2: Find canary check near function exit(s)
         let check_info = self.find_x86_canary_check(cfg, &canary_source, stack_offset);
@@ -309,7 +310,8 @@ impl StackCanaryDetector {
                 if let Some(base) = &mem.base {
                     if base.id == x86::RIP {
                         // This is a RIP-relative access
-                        let resolved_addr = instr.address
+                        let resolved_addr = instr
+                            .address
                             .wrapping_add(instr.size as u64)
                             .wrapping_add(mem.displacement as u64);
 
@@ -372,17 +374,16 @@ impl StackCanaryDetector {
 
             for (idx, instr) in instructions.iter().enumerate() {
                 // Look for XOR or CMP with the canary source
-                let is_canary_check = match &instr.operation {
-                    Operation::Xor | Operation::Compare => true,
-                    _ => false,
-                };
+                let is_canary_check =
+                    matches!(&instr.operation, Operation::Xor | Operation::Compare);
 
                 if !is_canary_check {
                     continue;
                 }
 
                 // Check if this involves the expected source
-                let involves_canary = self.instruction_involves_canary_source(instr, expected_source);
+                let involves_canary =
+                    self.instruction_involves_canary_source(instr, expected_source);
                 if !involves_canary {
                     // Also check if it involves the stack offset
                     let involves_stack = instr.operands.iter().any(|op| {
@@ -413,11 +414,16 @@ impl StackCanaryDetector {
 
                 // Look for following conditional branch
                 for following in instructions.iter().skip(idx + 1).take(3) {
-                    if matches!(following.control_flow, ControlFlow::ConditionalBranch { .. }) {
+                    if matches!(
+                        following.control_flow,
+                        ControlFlow::ConditionalBranch { .. }
+                    ) {
                         check_info.branch_addr = Some(following.address);
 
                         // Check if branch target is __stack_chk_fail
-                        if let ControlFlow::ConditionalBranch { target, .. } = &following.control_flow {
+                        if let ControlFlow::ConditionalBranch { target, .. } =
+                            &following.control_flow
+                        {
                             if self.fail_addresses.contains(target) {
                                 check_info.fail_call_addr = Some(*target);
                                 check_info.fail_target = Some(*target);
@@ -440,7 +446,11 @@ impl StackCanaryDetector {
     }
 
     /// Checks if an instruction involves the canary source.
-    fn instruction_involves_canary_source(&self, instr: &Instruction, source: &CanarySource) -> bool {
+    fn instruction_involves_canary_source(
+        &self,
+        instr: &Instruction,
+        source: &CanarySource,
+    ) -> bool {
         for operand in &instr.operands {
             match (operand, source) {
                 (Operand::Memory(mem), CanarySource::TlsOffset { segment, offset }) => {
@@ -454,10 +464,17 @@ impl StackCanaryDetector {
                         }
                     }
                 }
-                (Operand::Memory(mem), CanarySource::PcRelative { address: Some(addr), .. }) => {
+                (
+                    Operand::Memory(mem),
+                    CanarySource::PcRelative {
+                        address: Some(addr),
+                        ..
+                    },
+                ) => {
                     if let Some(base) = &mem.base {
                         if base.id == x86::RIP {
-                            let resolved = instr.address
+                            let resolved = instr
+                                .address
                                 .wrapping_add(instr.size as u64)
                                 .wrapping_add(mem.displacement as u64);
                             if resolved == *addr {
@@ -466,10 +483,17 @@ impl StackCanaryDetector {
                         }
                     }
                 }
-                (Operand::Memory(mem), CanarySource::GlobalSymbol { address: Some(addr), .. }) => {
+                (
+                    Operand::Memory(mem),
+                    CanarySource::GlobalSymbol {
+                        address: Some(addr),
+                        ..
+                    },
+                ) => {
                     if let Some(base) = &mem.base {
                         if base.id == x86::RIP {
-                            let resolved = instr.address
+                            let resolved = instr
+                                .address
                                 .wrapping_add(instr.size as u64)
                                 .wrapping_add(mem.displacement as u64);
                             if resolved == *addr {
@@ -485,7 +509,11 @@ impl StackCanaryDetector {
     }
 
     /// Looks for __stack_chk_fail call in successor blocks.
-    fn find_fail_call_in_successors(&self, cfg: &ControlFlowGraph, start: BasicBlockId) -> Option<u64> {
+    fn find_fail_call_in_successors(
+        &self,
+        cfg: &ControlFlowGraph,
+        start: BasicBlockId,
+    ) -> Option<u64> {
         // Check immediate successors
         for succ_id in cfg.successors(start) {
             if let Some(succ_block) = cfg.block(*succ_id) {
@@ -509,8 +537,7 @@ impl StackCanaryDetector {
         let function_addr = entry_block.start;
 
         // Phase 1: Find canary load and store in prologue
-        let (canary_source, store_addr, stack_offset) =
-            self.find_arm64_canary_store(cfg)?;
+        let (canary_source, store_addr, stack_offset) = self.find_arm64_canary_store(cfg)?;
 
         // Phase 2: Find canary check near function exit(s)
         let check_info = self.find_arm64_canary_check(cfg, stack_offset);
@@ -547,9 +574,13 @@ impl StackCanaryDetector {
                             // Look for str instruction
                             if let Some(str_instr) = block.instructions.get(idx + 2) {
                                 if str_instr.mnemonic.starts_with("str") {
-                                    if let Some(stack_offset) = self.get_arm64_stack_offset(str_instr) {
+                                    if let Some(stack_offset) =
+                                        self.get_arm64_stack_offset(str_instr)
+                                    {
                                         // Try to get the target address from ADRP
-                                        let source = if let Some(target) = self.get_arm64_adrp_target(instr) {
+                                        let source = if let Some(target) =
+                                            self.get_arm64_adrp_target(instr)
+                                        {
                                             if self.guard_addresses.contains(&target) {
                                                 CanarySource::GlobalSymbol {
                                                     name: "__stack_chk_guard".to_string(),
@@ -670,8 +701,9 @@ impl StackCanaryDetector {
                                             check_info.branch_addr = Some(following.address);
 
                                             // Check branch target
-                                            if let ControlFlow::ConditionalBranch { target, .. } =
-                                                &following.control_flow
+                                            if let ControlFlow::ConditionalBranch {
+                                                target, ..
+                                            } = &following.control_flow
                                             {
                                                 if self.fail_addresses.contains(target) {
                                                     check_info.fail_target = Some(*target);
@@ -754,27 +786,41 @@ impl StackCanaryAnalysis {
 
     /// Checks if a specific function address is protected.
     pub fn is_function_protected(&self, addr: u64) -> bool {
-        self.protected_functions.iter().any(|f| f.function_addr == addr)
+        self.protected_functions
+            .iter()
+            .any(|f| f.function_addr == addr)
     }
 
     /// Gets the canary info for a specific function.
     pub fn get_function_info(&self, addr: u64) -> Option<&StackCanaryInfo> {
-        self.protected_functions.iter().find(|f| f.function_addr == addr)
+        self.protected_functions
+            .iter()
+            .find(|f| f.function_addr == addr)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, Operand, MemoryRef};
     use hexray_core::Register;
+    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, MemoryRef, Operand};
 
     fn make_x86_register(id: u16, size: u16) -> Register {
-        Register::new(Architecture::X86_64, hexray_core::RegisterClass::General, id, size)
+        Register::new(
+            Architecture::X86_64,
+            hexray_core::RegisterClass::General,
+            id,
+            size,
+        )
     }
 
     fn make_fs_register() -> Register {
-        Register::new(Architecture::X86_64, hexray_core::RegisterClass::Segment, x86::FS, 16)
+        Register::new(
+            Architecture::X86_64,
+            hexray_core::RegisterClass::Segment,
+            x86::FS,
+            16,
+        )
     }
 
     #[test]
@@ -824,7 +870,12 @@ mod tests {
             segment: Some(fs_reg),
         };
 
-        let mut instr = Instruction::new(0x1000, 7, vec![0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00], "mov");
+        let mut instr = Instruction::new(
+            0x1000,
+            7,
+            vec![0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00],
+            "mov",
+        );
         instr.operation = Operation::Move;
         instr.operands = vec![
             Operand::Register(make_x86_register(x86::RAX, 64)),
@@ -837,7 +888,10 @@ mod tests {
         let (source, offset) = result.unwrap();
         assert_eq!(offset, 0x28);
         match source {
-            CanarySource::TlsOffset { segment: SegmentRegister::Fs, offset: 0x28 } => {}
+            CanarySource::TlsOffset {
+                segment: SegmentRegister::Fs,
+                offset: 0x28,
+            } => {}
             _ => panic!("Expected TLS offset source"),
         }
     }
@@ -944,7 +998,9 @@ mod tests {
         ];
         bb0.push_instruction(store_instr);
 
-        bb0.terminator = BlockTerminator::Fallthrough { target: BasicBlockId::new(1) };
+        bb0.terminator = BlockTerminator::Fallthrough {
+            target: BasicBlockId::new(1),
+        };
         cfg.add_block(bb0);
 
         // Check block with xor and conditional branch
@@ -1013,7 +1069,10 @@ mod tests {
         assert_eq!(info.store_addr, 0x1007);
 
         match &info.canary_source {
-            CanarySource::TlsOffset { segment: SegmentRegister::Fs, offset: 0x28 } => {}
+            CanarySource::TlsOffset {
+                segment: SegmentRegister::Fs,
+                offset: 0x28,
+            } => {}
             other => panic!("Unexpected canary source: {:?}", other),
         }
 

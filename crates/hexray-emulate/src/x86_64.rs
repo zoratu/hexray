@@ -195,9 +195,7 @@ fn execute_add(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
     let b = read_operand(state, &inst.operands[1], inst);
     let result = a.add(&b);
 
-    if let (Value::Concrete(av), Value::Concrete(bv), Value::Concrete(rv)) =
-        (&a, &b, &result)
-    {
+    if let (Value::Concrete(av), Value::Concrete(bv), Value::Concrete(rv)) = (&a, &b, &result) {
         state.flags.update_add(*av, *bv, *rv, size);
     }
 
@@ -214,9 +212,7 @@ fn execute_sub(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
     let b = read_operand(state, &inst.operands[1], inst);
     let result = a.sub(&b);
 
-    if let (Value::Concrete(av), Value::Concrete(bv), Value::Concrete(rv)) =
-        (&a, &b, &result)
-    {
+    if let (Value::Concrete(av), Value::Concrete(bv), Value::Concrete(rv)) = (&a, &b, &result) {
         state.flags.update_sub(*av, *bv, *rv, size);
     }
 
@@ -387,9 +383,7 @@ fn execute_cmp(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
     let b = read_operand(state, &inst.operands[1], inst);
     let result = a.sub(&b);
 
-    if let (Value::Concrete(av), Value::Concrete(bv), Value::Concrete(rv)) =
-        (&a, &b, &result)
-    {
+    if let (Value::Concrete(av), Value::Concrete(bv), Value::Concrete(rv)) = (&a, &b, &result) {
         state.flags.update_sub(*av, *bv, *rv, size);
     }
 

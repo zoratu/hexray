@@ -99,9 +99,9 @@ impl CompilationUnit {
     }
 
     fn find_subprogram_in(die: &Die, address: u64) -> Option<&Die> {
-        use super::types::DwTag;
         use super::die::AttributeValue;
         use super::types::DwAt;
+        use super::types::DwTag;
 
         // Check if this DIE is a subprogram containing the address
         if matches!(die.tag, DwTag::Subprogram | DwTag::InlinedSubroutine) {
@@ -136,10 +136,8 @@ impl CompilationUnit {
     fn find_variable_in<'a>(die: &'a Die, name: &str) -> Option<&'a Die> {
         use super::types::DwTag;
 
-        if matches!(die.tag, DwTag::Variable | DwTag::FormalParameter) {
-            if die.name() == Some(name) {
-                return Some(die);
-            }
+        if matches!(die.tag, DwTag::Variable | DwTag::FormalParameter) && die.name() == Some(name) {
+            return Some(die);
         }
 
         for child in &die.children {
@@ -238,11 +236,7 @@ pub struct DebugInfoParser<'a> {
 
 impl<'a> DebugInfoParser<'a> {
     /// Create a new debug info parser.
-    pub fn new(
-        debug_info: &'a [u8],
-        debug_abbrev: &'a [u8],
-        debug_str: Option<&'a [u8]>,
-    ) -> Self {
+    pub fn new(debug_info: &'a [u8], debug_abbrev: &'a [u8], debug_str: Option<&'a [u8]>) -> Self {
         Self {
             debug_info,
             debug_abbrev,
@@ -265,7 +259,10 @@ impl<'a> DebugInfoParser<'a> {
     }
 
     /// Parse a single compilation unit at the given offset.
-    fn parse_compilation_unit(&self, offset: usize) -> Result<(CompilationUnit, usize), ParseError> {
+    fn parse_compilation_unit(
+        &self,
+        offset: usize,
+    ) -> Result<(CompilationUnit, usize), ParseError> {
         let data = &self.debug_info[offset..];
 
         // Parse unit length
@@ -287,8 +284,7 @@ impl<'a> DebugInfoParser<'a> {
                     });
                 }
                 let len = u64::from_le_bytes([
-                    data[4], data[5], data[6], data[7],
-                    data[8], data[9], data[10], data[11],
+                    data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
                 ]);
                 (len, true)
             } else {
@@ -311,17 +307,23 @@ impl<'a> DebugInfoParser<'a> {
             local_offset += 1;
             let abbrev_offset = if is_64bit {
                 let off = u64::from_le_bytes([
-                    data[local_offset], data[local_offset + 1],
-                    data[local_offset + 2], data[local_offset + 3],
-                    data[local_offset + 4], data[local_offset + 5],
-                    data[local_offset + 6], data[local_offset + 7],
+                    data[local_offset],
+                    data[local_offset + 1],
+                    data[local_offset + 2],
+                    data[local_offset + 3],
+                    data[local_offset + 4],
+                    data[local_offset + 5],
+                    data[local_offset + 6],
+                    data[local_offset + 7],
                 ]);
                 local_offset += 8;
                 off
             } else {
                 let off = u32::from_le_bytes([
-                    data[local_offset], data[local_offset + 1],
-                    data[local_offset + 2], data[local_offset + 3],
+                    data[local_offset],
+                    data[local_offset + 1],
+                    data[local_offset + 2],
+                    data[local_offset + 3],
                 ]) as u64;
                 local_offset += 4;
                 off
@@ -331,17 +333,23 @@ impl<'a> DebugInfoParser<'a> {
             // DWARF 2/3/4
             let abbrev_offset = if is_64bit {
                 let off = u64::from_le_bytes([
-                    data[local_offset], data[local_offset + 1],
-                    data[local_offset + 2], data[local_offset + 3],
-                    data[local_offset + 4], data[local_offset + 5],
-                    data[local_offset + 6], data[local_offset + 7],
+                    data[local_offset],
+                    data[local_offset + 1],
+                    data[local_offset + 2],
+                    data[local_offset + 3],
+                    data[local_offset + 4],
+                    data[local_offset + 5],
+                    data[local_offset + 6],
+                    data[local_offset + 7],
                 ]);
                 local_offset += 8;
                 off
             } else {
                 let off = u32::from_le_bytes([
-                    data[local_offset], data[local_offset + 1],
-                    data[local_offset + 2], data[local_offset + 3],
+                    data[local_offset],
+                    data[local_offset + 1],
+                    data[local_offset + 2],
+                    data[local_offset + 3],
                 ]) as u64;
                 local_offset += 4;
                 off
@@ -379,9 +387,9 @@ impl<'a> DebugInfoParser<'a> {
             die_start,
         );
 
-        let root_die = parser.parse_die()?.ok_or_else(|| {
-            ParseError::InvalidValue("missing root DIE in compilation unit")
-        })?;
+        let root_die = parser.parse_die()?.ok_or(ParseError::InvalidValue(
+            "missing root DIE in compilation unit",
+        ))?;
 
         Ok((CompilationUnit { header, root_die }, cu_end))
     }

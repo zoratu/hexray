@@ -149,7 +149,7 @@ impl ConstantPropagation {
 
         while changed {
             changed = false;
-            let blocks: Vec<_> = worklist.drain(..).collect();
+            let blocks: Vec<_> = std::mem::take(&mut worklist);
 
             for block_id in blocks {
                 // Merge states from all predecessors
@@ -225,8 +225,12 @@ impl ConstantPropagation {
             }
 
             // Binary operations
-            Operation::Add | Operation::Sub | Operation::Mul | Operation::And |
-            Operation::Or | Operation::Xor => {
+            Operation::Add
+            | Operation::Sub
+            | Operation::Mul
+            | Operation::And
+            | Operation::Or
+            | Operation::Xor => {
                 if inst.operands.len() >= 2 {
                     if let Some(dest_loc) = operand_to_location(&inst.operands[0]) {
                         // Evaluate both operands

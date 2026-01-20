@@ -115,8 +115,8 @@ impl SimulationSnapshot {
 
     /// Compute a hash of the machine state for quick comparison.
     fn compute_hash(state: &MachineState) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         // Hash concrete register values in sorted order for determinism
@@ -242,9 +242,11 @@ impl Simulation {
             pending_faults.insert(*count, *fault);
         }
 
-        let mut trace = ExecutionTrace::default();
-        trace.seed = config.seed;
-        trace.initial_state_hash = SimulationSnapshot::compute_hash(&initial_state);
+        let trace = ExecutionTrace {
+            seed: config.seed,
+            initial_state_hash: SimulationSnapshot::compute_hash(&initial_state),
+            ..Default::default()
+        };
 
         Self {
             config,
@@ -302,7 +304,12 @@ impl Simulation {
         SimulationSnapshot::new(
             self.emulator.state(),
             self.instruction_count,
-            &self.trace.steps.iter().map(|s| s.address).collect::<Vec<_>>(),
+            &self
+                .trace
+                .steps
+                .iter()
+                .map(|s| s.address)
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -383,7 +390,10 @@ impl Simulation {
 
     /// Execute until a stop condition.
     pub fn run(&mut self, instructions: &[Instruction]) -> Result<ExecutionResult, String> {
-        let result = self.emulator.execute(instructions).map_err(|e| e.to_string())?;
+        let result = self
+            .emulator
+            .execute(instructions)
+            .map_err(|e| e.to_string())?;
         self.instruction_count = result.instruction_count;
         self.trace.final_state_hash = SimulationSnapshot::compute_hash(self.emulator.state());
         Ok(result)
@@ -467,7 +477,7 @@ pub struct SimulationComparison {
 mod tests {
     use super::*;
     use crate::state::x86_regs;
-    use hexray_core::{Architecture, ControlFlow, Operation, Operand, Register, RegisterClass};
+    use hexray_core::{Architecture, ControlFlow, Operand, Operation, Register, RegisterClass};
 
     fn make_inst(addr: u64, op: Operation, operands: Vec<Operand>) -> Instruction {
         Instruction {
@@ -516,7 +526,10 @@ mod tests {
         let _ = sim.run(&instructions);
         let snap2 = sim.snapshot();
 
-        assert!(snap1.states_equal(&snap2), "Determinism violation: states differ");
+        assert!(
+            snap1.states_equal(&snap2),
+            "Determinism violation: states differ"
+        );
     }
 
     #[test]
@@ -524,16 +537,19 @@ mod tests {
         let config = SimulationConfig::default();
         let mut sim = Simulation::new(config);
 
-        let instructions = vec![
-            make_inst(0x1000, Operation::Move, vec![reg(x86_regs::RAX), imm(42)]),
-        ];
+        let instructions = vec![make_inst(
+            0x1000,
+            Operation::Move,
+            vec![reg(x86_regs::RAX), imm(42)],
+        )];
 
         sim.reset();
         let _ = sim.run(&instructions);
         let snap1 = sim.snapshot();
 
         // Modify state
-        sim.state_mut().set_register(x86_regs::RBX, Value::Concrete(100));
+        sim.state_mut()
+            .set_register(x86_regs::RBX, Value::Concrete(100));
         let snap2 = sim.snapshot();
 
         assert!(!snap1.states_equal(&snap2), "Snapshots should differ");
@@ -550,7 +566,11 @@ mod tests {
         let instructions = vec![
             make_inst(0x1000, Operation::Move, vec![reg(x86_regs::RAX), imm(10)]),
             make_inst(0x1004, Operation::Add, vec![reg(x86_regs::RAX), imm(5)]),
-            make_inst(0x1008, Operation::Move, vec![reg(x86_regs::RBX), reg(x86_regs::RAX)]),
+            make_inst(
+                0x1008,
+                Operation::Move,
+                vec![reg(x86_regs::RBX), reg(x86_regs::RAX)],
+            ),
         ];
 
         let is_deterministic = sim.verify_determinism(&instructions).unwrap();
@@ -566,7 +586,7 @@ mod tests {
         };
         let mut sim = Simulation::new(config);
 
-        let instructions = vec![
+        let instructions = [
             make_inst(0x1000, Operation::Move, vec![reg(x86_regs::RAX), imm(10)]),
             make_inst(0x1004, Operation::Add, vec![reg(x86_regs::RAX), imm(5)]),
         ];

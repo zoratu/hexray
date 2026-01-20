@@ -145,7 +145,8 @@ impl CallTarget {
                 }
                 Operand::Memory(mem) => {
                     // Check if this is RIP-relative (x86_64)
-                    let is_rip_relative = mem.base
+                    let is_rip_relative = mem
+                        .base
                         .as_ref()
                         .map(|r| r.id == 16) // RIP = 16 in x86_64
                         .unwrap_or(false);
@@ -280,7 +281,9 @@ impl IndirectCallResolver {
                 // Try each resolution strategy in order of precision
                 if let Some(resolved) = self.try_got_plt_resolution(instr) {
                     info = resolved;
-                } else if let Some(resolved) = self.try_constant_prop_resolution(instr, &const_state) {
+                } else if let Some(resolved) =
+                    self.try_constant_prop_resolution(instr, &const_state)
+                {
                     info = resolved;
                 } else if let Some(resolved) = self.try_vtable_resolution(instr, &const_state) {
                     info = resolved;
@@ -304,7 +307,11 @@ impl IndirectCallResolver {
     }
 
     /// Analyzes a single indirect call instruction.
-    pub fn analyze_single(&self, instr: &Instruction, context: Option<&ConstState>) -> IndirectCallInfo {
+    pub fn analyze_single(
+        &self,
+        instr: &Instruction,
+        context: Option<&ConstState>,
+    ) -> IndirectCallInfo {
         let target = CallTarget::from_instruction(instr);
 
         // Try each resolution strategy
@@ -338,19 +345,20 @@ impl IndirectCallResolver {
 
         match target {
             CallTarget::Memory {
-                base_reg,
+                base_reg: Some(16),
                 displacement,
                 is_rip_relative: true,
                 ..
-            } if base_reg.map_or(false, |id| id == 16) => {
+            } => {
                 // RIP-relative addressing: effective address = RIP + displacement
                 // RIP points to the next instruction
-                let effective_addr = (instr.address + instr.size as u64)
-                    .wrapping_add(displacement as u64);
+                let effective_addr =
+                    (instr.address + instr.size as u64).wrapping_add(displacement as u64);
 
                 // Check if this points into the GOT
                 if let Some(entry) = self.got_entries.get(&effective_addr) {
-                    let resolved_addr = entry.resolved_address
+                    let resolved_addr = entry
+                        .resolved_address
                         .or_else(|| self.symbols_by_name.get(&entry.symbol_name).copied());
 
                     return Some(IndirectCallInfo {
@@ -385,7 +393,8 @@ impl IndirectCallResolver {
                 // Absolute address
                 let addr = displacement as u64;
                 if let Some(entry) = self.got_entries.get(&addr) {
-                    let resolved_addr = entry.resolved_address
+                    let resolved_addr = entry
+                        .resolved_address
                         .or_else(|| self.symbols_by_name.get(&entry.symbol_name).copied());
 
                     return Some(IndirectCallInfo {
@@ -415,32 +424,29 @@ impl IndirectCallResolver {
     ) -> Option<IndirectCallInfo> {
         let target = CallTarget::from_instruction(instr)?;
 
-        match target {
-            CallTarget::Register { reg_id, .. } => {
-                let loc = Location::Register(reg_id);
-                if let ConstValue::Constant(addr) = state.get(&loc) {
-                    let addr = addr as u64;
+        if let CallTarget::Register { reg_id, .. } = target {
+            let loc = Location::Register(reg_id);
+            if let ConstValue::Constant(addr) = state.get(&loc) {
+                let addr = addr as u64;
 
-                    // Verify this is a valid function address
-                    let is_valid = self.function_addresses.contains(&addr)
-                        || self.symbols.get(&addr).map_or(false, |s| s.is_function());
+                // Verify this is a valid function address
+                let is_valid = self.function_addresses.contains(&addr)
+                    || self.symbols.get(&addr).is_some_and(|s| s.is_function());
 
-                    let confidence = if is_valid {
-                        Confidence::High
-                    } else {
-                        Confidence::Medium
-                    };
+                let confidence = if is_valid {
+                    Confidence::High
+                } else {
+                    Confidence::Medium
+                };
 
-                    return Some(IndirectCallInfo {
-                        call_site: instr.address,
-                        possible_targets: vec![addr],
-                        resolution_method: ResolutionMethod::ConstantProp,
-                        confidence,
-                        target_operand: Some(target),
-                    });
-                }
+                return Some(IndirectCallInfo {
+                    call_site: instr.address,
+                    possible_targets: vec![addr],
+                    resolution_method: ResolutionMethod::ConstantProp,
+                    confidence,
+                    target_operand: Some(target),
+                });
             }
-            _ => {}
         }
 
         None
@@ -457,45 +463,43 @@ impl IndirectCallResolver {
     ) -> Option<IndirectCallInfo> {
         let target = CallTarget::from_instruction(instr)?;
 
-        match target {
-            CallTarget::Memory {
-                base_reg: Some(base_id),
-                displacement,
-                is_rip_relative: false,
-                ..
-            } => {
-                let loc = Location::Register(base_id);
-                if let ConstValue::Constant(vtable_addr) = state.get(&loc) {
-                    // Calculate the effective address in the vtable
-                    let slot_addr = (vtable_addr as u64).wrapping_add(displacement as u64);
+        if let CallTarget::Memory {
+            base_reg: Some(base_id),
+            displacement,
+            is_rip_relative: false,
+            ..
+        } = target
+        {
+            let loc = Location::Register(base_id);
+            if let ConstValue::Constant(vtable_addr) = state.get(&loc) {
+                // Calculate the effective address in the vtable
+                let slot_addr = (vtable_addr as u64).wrapping_add(displacement as u64);
 
-                    // Look up the function pointer in the symbol table
-                    if let Some(sym) = self.symbols.get(&slot_addr) {
-                        if sym.is_function() {
-                            return Some(IndirectCallInfo {
-                                call_site: instr.address,
-                                possible_targets: vec![sym.address],
-                                resolution_method: ResolutionMethod::Vtable,
-                                confidence: Confidence::Medium,
-                                target_operand: Some(target),
-                            });
-                        }
-                    }
-
-                    // Even without a symbol, we might know this is a vtable slot
-                    // Return with low confidence if the offset looks like a vtable
-                    if displacement >= 0 && displacement % 8 == 0 && displacement < 256 * 8 {
+                // Look up the function pointer in the symbol table
+                if let Some(sym) = self.symbols.get(&slot_addr) {
+                    if sym.is_function() {
                         return Some(IndirectCallInfo {
                             call_site: instr.address,
-                            possible_targets: Vec::new(),
+                            possible_targets: vec![sym.address],
                             resolution_method: ResolutionMethod::Vtable,
-                            confidence: Confidence::Low,
+                            confidence: Confidence::Medium,
                             target_operand: Some(target),
                         });
                     }
                 }
+
+                // Even without a symbol, we might know this is a vtable slot
+                // Return with low confidence if the offset looks like a vtable
+                if displacement >= 0 && displacement % 8 == 0 && displacement < 256 * 8 {
+                    return Some(IndirectCallInfo {
+                        call_site: instr.address,
+                        possible_targets: Vec::new(),
+                        resolution_method: ResolutionMethod::Vtable,
+                        confidence: Confidence::Low,
+                        target_operand: Some(target),
+                    });
+                }
             }
-            _ => {}
         }
 
         None
@@ -509,36 +513,34 @@ impl IndirectCallResolver {
         let xrefs = self.xrefs.as_ref()?;
         let target = CallTarget::from_instruction(instr)?;
 
-        match &target {
-            CallTarget::Memory {
-                base_reg: None,
-                index_reg: None,
-                displacement,
-                ..
-            } => {
-                // Absolute memory address - find all writes to this location
-                let addr = *displacement as u64;
-                let writes = xrefs.refs_to(addr);
+        if let CallTarget::Memory {
+            base_reg: None,
+            index_reg: None,
+            displacement,
+            ..
+        } = &target
+        {
+            // Absolute memory address - find all writes to this location
+            let addr = *displacement as u64;
+            let writes = xrefs.refs_to(addr);
 
-                let mut targets = Vec::new();
-                for xref in writes.iter().filter(|x| x.xref_type == XrefType::DataWrite) {
-                    // The write's source might be a function address
-                    if self.function_addresses.contains(&xref.from) {
-                        targets.push(xref.from);
-                    }
-                }
-
-                if !targets.is_empty() {
-                    return Some(IndirectCallInfo {
-                        call_site: instr.address,
-                        possible_targets: targets,
-                        resolution_method: ResolutionMethod::CrossReference,
-                        confidence: Confidence::Medium,
-                        target_operand: Some(target),
-                    });
+            let mut targets = Vec::new();
+            for xref in writes.iter().filter(|x| x.xref_type == XrefType::DataWrite) {
+                // The write's source might be a function address
+                if self.function_addresses.contains(&xref.from) {
+                    targets.push(xref.from);
                 }
             }
-            _ => {}
+
+            if !targets.is_empty() {
+                return Some(IndirectCallInfo {
+                    call_site: instr.address,
+                    possible_targets: targets,
+                    resolution_method: ResolutionMethod::CrossReference,
+                    confidence: Confidence::Medium,
+                    target_operand: Some(target),
+                });
+            }
         }
 
         None
@@ -593,8 +595,12 @@ impl IndirectCallResolver {
             }
 
             // Binary operations
-            Operation::Add | Operation::Sub | Operation::Mul |
-            Operation::And | Operation::Or | Operation::Xor => {
+            Operation::Add
+            | Operation::Sub
+            | Operation::Mul
+            | Operation::And
+            | Operation::Or
+            | Operation::Xor => {
                 if instr.operands.len() >= 2 {
                     if let Some(dest_loc) = operand_to_location(&instr.operands[0]) {
                         let (left_val, right_val) = if instr.operands.len() >= 3 {
@@ -731,7 +737,12 @@ impl GotEntryBuilder {
     }
 
     /// Adds a GOT entry.
-    pub fn add_entry(&mut self, got_address: u64, symbol_name: String, resolved_address: Option<u64>) {
+    pub fn add_entry(
+        &mut self,
+        got_address: u64,
+        symbol_name: String,
+        resolved_address: Option<u64>,
+    ) {
         self.entries.push(GotEntry {
             got_address,
             symbol_name,
@@ -765,8 +776,10 @@ pub struct ResolutionStats {
 impl ResolutionStats {
     /// Computes statistics from a list of resolution results.
     pub fn from_results(results: &[IndirectCallInfo]) -> Self {
-        let mut stats = Self::default();
-        stats.total_calls = results.len();
+        let mut stats = Self {
+            total_calls: results.len(),
+            ..Self::default()
+        };
 
         for info in results {
             if !info.is_resolved() {
@@ -835,7 +848,7 @@ mod tests {
             operation: Operation::Call,
             mnemonic: "call".to_string(),
             operands: vec![Operand::Memory(MemoryRef {
-                base: Some(base_reg.clone()),
+                base: Some(base_reg),
                 index: None,
                 scale: 1,
                 displacement: disp,
@@ -859,7 +872,7 @@ mod tests {
             operation: Operation::Call,
             mnemonic: "call".to_string(),
             operands: vec![Operand::Memory(MemoryRef {
-                base: Some(rip_reg.clone()),
+                base: Some(rip_reg),
                 index: None,
                 scale: 1,
                 displacement: disp,
@@ -945,8 +958,7 @@ mod tests {
         let mut builder = GotEntryBuilder::new();
         builder.add_entry(0x4000, "printf".to_string(), Some(0x7fff1234));
 
-        let resolver = IndirectCallResolver::new()
-            .with_got_entries(&builder.build());
+        let resolver = IndirectCallResolver::new().with_got_entries(&builder.build());
 
         // call [rip+offset] where rip+offset points to GOT
         // addr=0x1000, size=6, so RIP at call = 0x1006
@@ -964,11 +976,10 @@ mod tests {
 
     #[test]
     fn test_constant_prop_resolution() {
-        let resolver = IndirectCallResolver::new()
-            .with_functions(&[0x2000]);
+        let resolver = IndirectCallResolver::new().with_functions(&[0x2000]);
 
         let instructions = vec![
-            make_mov_imm(0x1000, 0, 0x2000), // mov rax, 0x2000
+            make_mov_imm(0x1000, 0, 0x2000),   // mov rax, 0x2000
             make_indirect_call_reg(0x100a, 0), // call rax
         ];
 

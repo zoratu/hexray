@@ -29,11 +29,11 @@
 //! }
 //! ```
 
-pub mod types;
-pub mod parser;
-pub mod database;
 pub mod builtin;
+pub mod database;
+pub mod parser;
+pub mod types;
 
-pub use types::*;
-pub use parser::{Parser, ParseError, ParseResult};
 pub use database::TypeDatabase;
+pub use parser::{ParseError, ParseResult, Parser};
+pub use types::*;

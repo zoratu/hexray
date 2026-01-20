@@ -2,7 +2,7 @@
 //!
 //! Converts low-level instructions into high-level expressions.
 
-use hexray_core::{Instruction, Operand, Operation, Register, MemoryRef};
+use hexray_core::{Instruction, MemoryRef, Operand, Operation, Register};
 use std::fmt;
 
 /// A high-level expression.
@@ -28,16 +28,10 @@ pub enum ExprKind {
     },
 
     /// Unary operation: op expr.
-    UnaryOp {
-        op: UnaryOpKind,
-        operand: Box<Expr>,
-    },
+    UnaryOp { op: UnaryOpKind, operand: Box<Expr> },
 
     /// Memory dereference: *expr or expr[index].
-    Deref {
-        addr: Box<Expr>,
-        size: u8,
-    },
+    Deref { addr: Box<Expr>, size: u8 },
 
     /// GOT/data reference: RIP-relative memory access with computed absolute address.
     /// Used for resolving `mov reg, [rip + offset]` patterns to symbol names.
@@ -80,16 +74,10 @@ pub enum ExprKind {
     },
 
     /// Function call: func(args...).
-    Call {
-        target: CallTarget,
-        args: Vec<Expr>,
-    },
+    Call { target: CallTarget, args: Vec<Expr> },
 
     /// Assignment: lhs = rhs.
-    Assign {
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
+    Assign { lhs: Box<Expr>, rhs: Box<Expr> },
 
     /// Compound assignment: lhs op= rhs.
     CompoundAssign {
@@ -184,7 +172,7 @@ impl BinOpKind {
             Self::Le => "<=",
             Self::Gt => ">",
             Self::Ge => ">=",
-            Self::ULt => "<",  // Could use <u for clarity
+            Self::ULt => "<", // Could use <u for clarity
             Self::ULe => "<=",
             Self::UGt => ">",
             Self::UGe => ">=",
@@ -222,8 +210,14 @@ impl BinOpKind {
             Self::Xor => 4,
             Self::And => 5,
             Self::Eq | Self::Ne => 6,
-            Self::Lt | Self::Le | Self::Gt | Self::Ge |
-            Self::ULt | Self::ULe | Self::UGt | Self::UGe => 7,
+            Self::Lt
+            | Self::Le
+            | Self::Gt
+            | Self::Ge
+            | Self::ULt
+            | Self::ULe
+            | Self::UGt
+            | Self::UGe => 7,
             Self::Shl | Self::Shr | Self::Sar => 8,
             Self::Add | Self::Sub => 9,
             Self::Mul | Self::Div | Self::Mod => 10,
@@ -357,12 +351,16 @@ impl Variable {
 impl Expr {
     /// Creates a variable expression.
     pub fn var(v: Variable) -> Self {
-        Self { kind: ExprKind::Var(v) }
+        Self {
+            kind: ExprKind::Var(v),
+        }
     }
 
     /// Creates an integer literal.
     pub fn int(value: i128) -> Self {
-        Self { kind: ExprKind::IntLit(value) }
+        Self {
+            kind: ExprKind::IntLit(value),
+        }
     }
 
     /// Creates a binary operation.
@@ -372,7 +370,7 @@ impl Expr {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
-            }
+            },
         }
     }
 
@@ -382,7 +380,7 @@ impl Expr {
             kind: ExprKind::UnaryOp {
                 op,
                 operand: Box::new(operand),
-            }
+            },
         }
     }
 
@@ -392,7 +390,7 @@ impl Expr {
             kind: ExprKind::Assign {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
-            }
+            },
         }
     }
 
@@ -402,7 +400,7 @@ impl Expr {
             kind: ExprKind::Deref {
                 addr: Box::new(addr),
                 size,
-            }
+            },
         }
     }
 
@@ -413,7 +411,7 @@ impl Expr {
                 base: Box::new(base),
                 index: Box::new(index),
                 element_size,
-            }
+            },
         }
     }
 
@@ -427,7 +425,7 @@ impl Expr {
                 base: Box::new(base),
                 field_name: field_name.into(),
                 offset,
-            }
+            },
         }
     }
 
@@ -449,7 +447,7 @@ impl Expr {
                 size,
                 display_expr: Box::new(display_expr),
                 is_deref: true,
-            }
+            },
         }
     }
 
@@ -464,20 +462,22 @@ impl Expr {
                 size: 0,
                 display_expr: Box::new(display_expr),
                 is_deref: false,
-            }
+            },
         }
     }
 
     /// Creates a call expression.
     pub fn call(target: CallTarget, args: Vec<Expr>) -> Self {
         Self {
-            kind: ExprKind::Call { target, args }
+            kind: ExprKind::Call { target, args },
         }
     }
 
     /// Creates an unknown expression.
     pub fn unknown(desc: impl Into<String>) -> Self {
-        Self { kind: ExprKind::Unknown(desc.into()) }
+        Self {
+            kind: ExprKind::Unknown(desc.into()),
+        }
     }
 
     /// Negates a boolean expression (for conditions).
@@ -490,10 +490,18 @@ impl Expr {
                     Self::binop(negated_op, *left, *right)
                 } else {
                     // Not a comparison, wrap with logical not
-                    Self::unary(UnaryOpKind::LogicalNot, Self { kind: ExprKind::BinOp { op, left, right } })
+                    Self::unary(
+                        UnaryOpKind::LogicalNot,
+                        Self {
+                            kind: ExprKind::BinOp { op, left, right },
+                        },
+                    )
                 }
             }
-            ExprKind::UnaryOp { op: UnaryOpKind::LogicalNot, operand } => {
+            ExprKind::UnaryOp {
+                op: UnaryOpKind::LogicalNot,
+                operand,
+            } => {
                 // Double negation: !!x -> x
                 *operand
             }
@@ -547,7 +555,9 @@ impl Expr {
                     // x * 0 = 0, 0 * x = 0
                     // x * 1 = x, 1 * x = x
                     BinOpKind::Mul => {
-                        if matches!(right.kind, ExprKind::IntLit(0)) || matches!(left.kind, ExprKind::IntLit(0)) {
+                        if matches!(right.kind, ExprKind::IntLit(0))
+                            || matches!(left.kind, ExprKind::IntLit(0))
+                        {
                             return Self::int(0);
                         }
                         if matches!(right.kind, ExprKind::IntLit(1)) {
@@ -578,7 +588,9 @@ impl Expr {
                     }
                     // x & 0 = 0, 0 & x = 0
                     BinOpKind::And => {
-                        if matches!(right.kind, ExprKind::IntLit(0)) || matches!(left.kind, ExprKind::IntLit(0)) {
+                        if matches!(right.kind, ExprKind::IntLit(0))
+                            || matches!(left.kind, ExprKind::IntLit(0))
+                        {
                             return Self::int(0);
                         }
                         // x & x = x
@@ -642,11 +654,17 @@ impl Expr {
                 }
 
                 // Double negation elimination
-                if let ExprKind::UnaryOp { op: inner_op, operand: inner_operand } = &operand.kind {
+                if let ExprKind::UnaryOp {
+                    op: inner_op,
+                    operand: inner_operand,
+                } = &operand.kind
+                {
                     match (op, inner_op) {
                         (UnaryOpKind::Neg, UnaryOpKind::Neg) => return *inner_operand.clone(),
                         (UnaryOpKind::Not, UnaryOpKind::Not) => return *inner_operand.clone(),
-                        (UnaryOpKind::LogicalNot, UnaryOpKind::LogicalNot) => return *inner_operand.clone(),
+                        (UnaryOpKind::LogicalNot, UnaryOpKind::LogicalNot) => {
+                            return *inner_operand.clone()
+                        }
                         _ => {}
                     }
                 }
@@ -672,19 +690,29 @@ impl Expr {
                 }
                 Self::deref(simplified_addr, size)
             }
-            ExprKind::ArrayAccess { base, index, element_size } => {
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
                 // Simplify base and index recursively
                 Self::array_access(base.simplify(), index.simplify(), element_size)
             }
             ExprKind::AddressOf(inner) => {
                 let simplified = inner.simplify();
-                Self { kind: ExprKind::AddressOf(Box::new(simplified)) }
+                Self {
+                    kind: ExprKind::AddressOf(Box::new(simplified)),
+                }
             }
             ExprKind::Call { target, args } => {
                 let args = args.into_iter().map(|a| a.simplify()).collect();
                 Self::call(target, args)
             }
-            ExprKind::Cast { expr, to_size, signed } => {
+            ExprKind::Cast {
+                expr,
+                to_size,
+                signed,
+            } => {
                 let simplified_expr = expr.simplify();
 
                 // Cast of integer literal: evaluate the cast
@@ -694,7 +722,15 @@ impl Expr {
                         2 => 0xFFFF,
                         4 => 0xFFFFFFFF,
                         8 => u64::MAX as i128,
-                        _ => return Self { kind: ExprKind::Cast { expr: Box::new(simplified_expr), to_size, signed } },
+                        _ => {
+                            return Self {
+                                kind: ExprKind::Cast {
+                                    expr: Box::new(simplified_expr),
+                                    to_size,
+                                    signed,
+                                },
+                            }
+                        }
                     };
                     let masked = n & mask;
                     // Sign extend if needed
@@ -713,27 +749,54 @@ impl Expr {
 
                 // Nested cast elimination: (T1)(T2)x
                 // If outer cast is larger or equal, inner cast may be redundant
-                if let ExprKind::Cast { expr: inner_expr, to_size: inner_size, signed: inner_signed } = &simplified_expr.kind {
+                if let ExprKind::Cast {
+                    expr: inner_expr,
+                    to_size: inner_size,
+                    signed: inner_signed,
+                } = &simplified_expr.kind
+                {
                     // If casting to same size with same signedness, remove redundant cast
                     if to_size == *inner_size && signed == *inner_signed {
                         return *inner_expr.clone();
                     }
                     // If outer cast is smaller, it dominates (truncation)
                     if to_size < *inner_size {
-                        return Self { kind: ExprKind::Cast { expr: inner_expr.clone(), to_size, signed } };
+                        return Self {
+                            kind: ExprKind::Cast {
+                                expr: inner_expr.clone(),
+                                to_size,
+                                signed,
+                            },
+                        };
                     }
                     // If outer cast is larger and same signedness, inner is redundant
                     if to_size > *inner_size && signed == *inner_signed {
-                        return Self { kind: ExprKind::Cast { expr: inner_expr.clone(), to_size, signed } };
+                        return Self {
+                            kind: ExprKind::Cast {
+                                expr: inner_expr.clone(),
+                                to_size,
+                                signed,
+                            },
+                        };
                     }
                 }
 
                 // Cast of a variable that's already known to be the right size
                 // This would require type info - skip for now
 
-                Self { kind: ExprKind::Cast { expr: Box::new(simplified_expr), to_size, signed } }
+                Self {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(simplified_expr),
+                        to_size,
+                        signed,
+                    },
+                }
             }
-            ExprKind::Conditional { cond, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
                 let cond = cond.simplify();
                 let then_expr = then_expr.simplify();
                 let else_expr = else_expr.simplify();
@@ -752,7 +815,7 @@ impl Expr {
                         cond: Box::new(cond),
                         then_expr: Box::new(then_expr),
                         else_expr: Box::new(else_expr),
-                    }
+                    },
                 }
             }
             // Other expression kinds pass through unchanged
@@ -817,7 +880,8 @@ impl Expr {
                         let base_name = mem.base.as_ref().map(|r| r.name()).unwrap_or("");
                         if base_name == "rip" && mem.index.is_none() {
                             // Compute absolute address: inst.address + inst.size + displacement
-                            let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+                            let abs_addr =
+                                (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
                             let display_expr = Self::from_memory_ref(mem);
                             Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
                         } else {
@@ -838,25 +902,16 @@ impl Expr {
                     // ARM64 ldp: load pair [reg1, reg2, mem]
                     // Just load into first register (second is typically x30/link register)
                     // This is used in epilogue (ldp x29, x30, [sp + X])
-                    Self::assign(
-                        Self::from_operand(&ops[0]),
-                        Self::from_operand(&ops[2]),
-                    )
+                    Self::assign(Self::from_operand(&ops[0]), Self::from_operand(&ops[2]))
                 } else if ops.len() >= 2 {
-                    Self::assign(
-                        Self::from_operand(&ops[0]),
-                        Self::from_operand(&ops[1]),
-                    )
+                    Self::assign(Self::from_operand(&ops[0]), Self::from_operand(&ops[1]))
                 } else {
                     Self::unknown(&inst.mnemonic)
                 }
             }
             Operation::Store => {
                 if ops.len() >= 2 {
-                    Self::assign(
-                        Self::from_operand(&ops[1]),
-                        Self::from_operand(&ops[0]),
-                    )
+                    Self::assign(Self::from_operand(&ops[1]), Self::from_operand(&ops[0]))
                 } else {
                     Self::unknown(&inst.mnemonic)
                 }
@@ -960,15 +1015,25 @@ impl Expr {
                 let call_site = inst.address;
                 let target = if !ops.is_empty() {
                     match &ops[0] {
-                        Operand::PcRelative { target, .. } => CallTarget::Direct { target: *target, call_site },
-                        Operand::Immediate(imm) => CallTarget::Direct { target: imm.as_u64(), call_site },
+                        Operand::PcRelative { target, .. } => CallTarget::Direct {
+                            target: *target,
+                            call_site,
+                        },
+                        Operand::Immediate(imm) => CallTarget::Direct {
+                            target: imm.as_u64(),
+                            call_site,
+                        },
                         Operand::Memory(mem) => {
                             // Check for RIP-relative addressing (GOT/PLT pattern)
                             // e.g., call [rip + 0x1234] = call through GOT entry
-                            if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip" && mem.index.is_none() {
+                            if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip"
+                                && mem.index.is_none()
+                            {
                                 // Compute GOT address: inst.address + inst.size + displacement
                                 // inst.size is stored in inst.size field
-                                let got_address = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+                                let got_address =
+                                    (inst.address as i64 + inst.size as i64 + mem.displacement)
+                                        as u64;
                                 CallTarget::IndirectGot {
                                     got_address,
                                     expr: Box::new(Self::from_operand(&ops[0])),
@@ -1009,7 +1074,10 @@ impl Expr {
             Operation::Syscall => Self::call(CallTarget::Named("syscall".to_string()), vec![]),
             Operation::Interrupt => {
                 if !ops.is_empty() {
-                    Self::call(CallTarget::Named("int".to_string()), vec![Self::from_operand(&ops[0])])
+                    Self::call(
+                        CallTarget::Named("int".to_string()),
+                        vec![Self::from_operand(&ops[0])],
+                    )
                 } else {
                     Self::call(CallTarget::Named("int".to_string()), vec![])
                 }
@@ -1050,9 +1118,13 @@ impl Expr {
                         Operand::PcRelative { target, .. } => Self::int(*target as i128),
                         Operand::Memory(mem) => {
                             // Check for RIP-relative addressing (e.g., lea rdi, [rip + offset])
-                            if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip" && mem.index.is_none() {
+                            if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip"
+                                && mem.index.is_none()
+                            {
                                 // Compute absolute address: inst.address + inst.size + displacement
-                                let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+                                let abs_addr =
+                                    (inst.address as i64 + inst.size as i64 + mem.displacement)
+                                        as u64;
                                 // Use GotAddr for LEA (address-of, not dereference)
                                 let display_expr = Self::int(abs_addr as i128);
                                 Self::got_addr(abs_addr, inst.address, display_expr)
@@ -1098,9 +1170,14 @@ impl Expr {
                     Self::unknown(&inst.mnemonic)
                 }
             }
-            Operation::BitExtract | Operation::ExtractLowestBit | Operation::MaskUpToLowest |
-            Operation::ResetLowestBit | Operation::ZeroHighBits | Operation::ParallelDeposit |
-            Operation::ParallelExtract | Operation::MulNoFlags => {
+            Operation::BitExtract
+            | Operation::ExtractLowestBit
+            | Operation::MaskUpToLowest
+            | Operation::ResetLowestBit
+            | Operation::ZeroHighBits
+            | Operation::ParallelDeposit
+            | Operation::ParallelExtract
+            | Operation::MulNoFlags => {
                 // BMI instructions - emit as function calls for now
                 if !ops.is_empty() {
                     Self::call(
@@ -1112,10 +1189,18 @@ impl Expr {
                 }
             }
             // System instructions
-            Operation::StoreGdt | Operation::StoreIdt | Operation::LoadGdt | Operation::LoadIdt |
-            Operation::StoreMsw | Operation::LoadMsw | Operation::InvalidateTlb |
-            Operation::ReadMsr | Operation::WriteMsr | Operation::CpuId |
-            Operation::ReadTsc | Operation::ReadTscP => {
+            Operation::StoreGdt
+            | Operation::StoreIdt
+            | Operation::LoadGdt
+            | Operation::LoadIdt
+            | Operation::StoreMsw
+            | Operation::LoadMsw
+            | Operation::InvalidateTlb
+            | Operation::ReadMsr
+            | Operation::WriteMsr
+            | Operation::CpuId
+            | Operation::ReadTsc
+            | Operation::ReadTscP => {
                 // System instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1123,11 +1208,18 @@ impl Expr {
                 )
             }
             // Atomic/synchronization instructions
-            Operation::LoadExclusive | Operation::StoreExclusive |
-            Operation::AtomicAdd | Operation::AtomicClear | Operation::AtomicXor |
-            Operation::AtomicSet | Operation::AtomicSignedMax | Operation::AtomicSignedMin |
-            Operation::AtomicUnsignedMax | Operation::AtomicUnsignedMin |
-            Operation::AtomicSwap | Operation::CompareAndSwap => {
+            Operation::LoadExclusive
+            | Operation::StoreExclusive
+            | Operation::AtomicAdd
+            | Operation::AtomicClear
+            | Operation::AtomicXor
+            | Operation::AtomicSet
+            | Operation::AtomicSignedMax
+            | Operation::AtomicSignedMin
+            | Operation::AtomicUnsignedMax
+            | Operation::AtomicUnsignedMin
+            | Operation::AtomicSwap
+            | Operation::CompareAndSwap => {
                 // Atomic instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1136,11 +1228,20 @@ impl Expr {
             }
 
             // SVE (Scalable Vector Extension) instructions
-            Operation::SveLoad | Operation::SveStore | Operation::SveAdd |
-            Operation::SveSub | Operation::SveMul | Operation::SveAnd |
-            Operation::SveOr | Operation::SveXor | Operation::SveDup |
-            Operation::SveCompare | Operation::SveReduce | Operation::SveCount |
-            Operation::SvePermute | Operation::SvePredicate => {
+            Operation::SveLoad
+            | Operation::SveStore
+            | Operation::SveAdd
+            | Operation::SveSub
+            | Operation::SveMul
+            | Operation::SveAnd
+            | Operation::SveOr
+            | Operation::SveXor
+            | Operation::SveDup
+            | Operation::SveCompare
+            | Operation::SveReduce
+            | Operation::SveCount
+            | Operation::SvePermute
+            | Operation::SvePredicate => {
                 // SVE instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1149,13 +1250,20 @@ impl Expr {
             }
 
             // SVE2 (Scalable Vector Extension 2) instructions
-            Operation::Sve2AbsDiffAccum | Operation::Sve2AbsDiffAccumLong |
-            Operation::Sve2SatAbsNeg | Operation::Sve2SatDoublingMulHigh |
-            Operation::Sve2SatDoublingMulAddLong | Operation::Sve2BitDeposit |
-            Operation::Sve2BitExtract | Operation::Sve2BitGroup |
-            Operation::Sve2Histogram | Operation::Sve2Match |
-            Operation::Sve2NonTempLoad | Operation::Sve2Aes |
-            Operation::Sve2Sha3Rotate | Operation::Sve2Sm4 => {
+            Operation::Sve2AbsDiffAccum
+            | Operation::Sve2AbsDiffAccumLong
+            | Operation::Sve2SatAbsNeg
+            | Operation::Sve2SatDoublingMulHigh
+            | Operation::Sve2SatDoublingMulAddLong
+            | Operation::Sve2BitDeposit
+            | Operation::Sve2BitExtract
+            | Operation::Sve2BitGroup
+            | Operation::Sve2Histogram
+            | Operation::Sve2Match
+            | Operation::Sve2NonTempLoad
+            | Operation::Sve2Aes
+            | Operation::Sve2Sha3Rotate
+            | Operation::Sve2Sm4 => {
                 // SVE2 instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1164,10 +1272,18 @@ impl Expr {
             }
 
             // SME (Scalable Matrix Extension) instructions
-            Operation::SmeStart | Operation::SmeStop | Operation::SmeZeroZa |
-            Operation::SmeLoadZa | Operation::SmeStoreZa | Operation::SmeMova |
-            Operation::SmeFmopa | Operation::SmeFmops | Operation::SmeBfmop |
-            Operation::SmeSmop | Operation::SmeUmop | Operation::SmeSumop => {
+            Operation::SmeStart
+            | Operation::SmeStop
+            | Operation::SmeZeroZa
+            | Operation::SmeLoadZa
+            | Operation::SmeStoreZa
+            | Operation::SmeMova
+            | Operation::SmeFmopa
+            | Operation::SmeFmops
+            | Operation::SmeBfmop
+            | Operation::SmeSmop
+            | Operation::SmeUmop
+            | Operation::SmeSumop => {
                 // SME instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1176,12 +1292,17 @@ impl Expr {
             }
 
             // AMX (Advanced Matrix Extensions) instructions - x86
-            Operation::AmxLoadTileConfig | Operation::AmxStoreTileConfig |
-            Operation::AmxTileRelease | Operation::AmxTileZero |
-            Operation::AmxTileLoad | Operation::AmxTileStore |
-            Operation::AmxDotProductSS | Operation::AmxDotProductSU |
-            Operation::AmxDotProductUS | Operation::AmxDotProductUU |
-            Operation::AmxFp16Multiply => {
+            Operation::AmxLoadTileConfig
+            | Operation::AmxStoreTileConfig
+            | Operation::AmxTileRelease
+            | Operation::AmxTileZero
+            | Operation::AmxTileLoad
+            | Operation::AmxTileStore
+            | Operation::AmxDotProductSS
+            | Operation::AmxDotProductSU
+            | Operation::AmxDotProductUS
+            | Operation::AmxDotProductUU
+            | Operation::AmxFp16Multiply => {
                 // AMX instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1190,9 +1311,14 @@ impl Expr {
             }
 
             // CET (Control-flow Enforcement Technology) instructions - x86
-            Operation::CetIncSsp | Operation::CetReadSsp | Operation::CetSavePrevSsp |
-            Operation::CetRestoreSsp | Operation::CetWriteSs | Operation::CetWriteUss |
-            Operation::CetEndBranch32 | Operation::CetEndBranch64 => {
+            Operation::CetIncSsp
+            | Operation::CetReadSsp
+            | Operation::CetSavePrevSsp
+            | Operation::CetRestoreSsp
+            | Operation::CetWriteSs
+            | Operation::CetWriteUss
+            | Operation::CetEndBranch32
+            | Operation::CetEndBranch64 => {
                 // CET instructions - emit as function calls (or nop for ENDBR)
                 match inst.operation {
                     Operation::CetEndBranch32 | Operation::CetEndBranch64 => {
@@ -1206,12 +1332,24 @@ impl Expr {
             }
 
             // RISC-V Floating-Point instructions
-            Operation::FloatLoad | Operation::FloatStore | Operation::FloatAdd |
-            Operation::FloatSub | Operation::FloatMul | Operation::FloatDiv |
-            Operation::FloatSqrt | Operation::FloatMin | Operation::FloatMax |
-            Operation::FloatMulAdd | Operation::FloatMulSub | Operation::FloatNegMulAdd |
-            Operation::FloatNegMulSub | Operation::FloatConvert | Operation::FloatSignInject |
-            Operation::FloatCompare | Operation::FloatClassify | Operation::FloatMove => {
+            Operation::FloatLoad
+            | Operation::FloatStore
+            | Operation::FloatAdd
+            | Operation::FloatSub
+            | Operation::FloatMul
+            | Operation::FloatDiv
+            | Operation::FloatSqrt
+            | Operation::FloatMin
+            | Operation::FloatMax
+            | Operation::FloatMulAdd
+            | Operation::FloatMulSub
+            | Operation::FloatNegMulAdd
+            | Operation::FloatNegMulSub
+            | Operation::FloatConvert
+            | Operation::FloatSignInject
+            | Operation::FloatCompare
+            | Operation::FloatClassify
+            | Operation::FloatMove => {
                 // RISC-V floating-point instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1220,18 +1358,40 @@ impl Expr {
             }
 
             // RISC-V Vector instructions
-            Operation::VectorConfig | Operation::VectorLoad | Operation::VectorStore |
-            Operation::VectorStridedLoad | Operation::VectorStridedStore |
-            Operation::VectorIndexedLoad | Operation::VectorIndexedStore |
-            Operation::VectorAdd | Operation::VectorSub | Operation::VectorMul |
-            Operation::VectorDiv | Operation::VectorRem | Operation::VectorAnd |
-            Operation::VectorOr | Operation::VectorXor | Operation::VectorShl |
-            Operation::VectorShr | Operation::VectorSar | Operation::VectorCompare |
-            Operation::VectorMin | Operation::VectorMax | Operation::VectorMerge |
-            Operation::VectorMask | Operation::VectorReduce | Operation::VectorFloatAdd |
-            Operation::VectorFloatSub | Operation::VectorFloatMul | Operation::VectorFloatDiv |
-            Operation::VectorFloatMulAdd | Operation::VectorWiden | Operation::VectorNarrow |
-            Operation::VectorSlide | Operation::VectorGather | Operation::VectorCompress => {
+            Operation::VectorConfig
+            | Operation::VectorLoad
+            | Operation::VectorStore
+            | Operation::VectorStridedLoad
+            | Operation::VectorStridedStore
+            | Operation::VectorIndexedLoad
+            | Operation::VectorIndexedStore
+            | Operation::VectorAdd
+            | Operation::VectorSub
+            | Operation::VectorMul
+            | Operation::VectorDiv
+            | Operation::VectorRem
+            | Operation::VectorAnd
+            | Operation::VectorOr
+            | Operation::VectorXor
+            | Operation::VectorShl
+            | Operation::VectorShr
+            | Operation::VectorSar
+            | Operation::VectorCompare
+            | Operation::VectorMin
+            | Operation::VectorMax
+            | Operation::VectorMerge
+            | Operation::VectorMask
+            | Operation::VectorReduce
+            | Operation::VectorFloatAdd
+            | Operation::VectorFloatSub
+            | Operation::VectorFloatMul
+            | Operation::VectorFloatDiv
+            | Operation::VectorFloatMulAdd
+            | Operation::VectorWiden
+            | Operation::VectorNarrow
+            | Operation::VectorSlide
+            | Operation::VectorGather
+            | Operation::VectorCompress => {
                 // RISC-V vector instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
@@ -1289,7 +1449,12 @@ impl fmt::Display for Expr {
                 };
                 write!(f, "{}({})", prefix, addr)
             }
-            ExprKind::GotRef { address, size, is_deref, .. } => {
+            ExprKind::GotRef {
+                address,
+                size,
+                is_deref,
+                ..
+            } => {
                 // Display using computed address rather than "rip + offset"
                 if *is_deref {
                     let prefix = match size {
@@ -1309,7 +1474,9 @@ impl fmt::Display for Expr {
             ExprKind::ArrayAccess { base, index, .. } => {
                 write!(f, "{}[{}]", base, index)
             }
-            ExprKind::FieldAccess { base, field_name, .. } => {
+            ExprKind::FieldAccess {
+                base, field_name, ..
+            } => {
                 // Use -> for pointer access (most common in decompiled code)
                 write!(f, "{}->{}", base, field_name)
             }
@@ -1333,10 +1500,18 @@ impl fmt::Display for Expr {
             ExprKind::CompoundAssign { op, lhs, rhs } => {
                 write!(f, "{} {}= {}", lhs, op.as_str(), rhs)
             }
-            ExprKind::Conditional { cond, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
                 write!(f, "{} ? {} : {}", cond, then_expr, else_expr)
             }
-            ExprKind::Cast { expr, to_size, signed } => {
+            ExprKind::Cast {
+                expr,
+                to_size,
+                signed,
+            } => {
                 let type_name = match (to_size, signed) {
                     (1, true) => "int8_t",
                     (1, false) => "uint8_t",
@@ -1421,7 +1596,7 @@ fn try_combine_adrp_add(exprs: &[Expr], i: usize) -> Option<Expr> {
         Expr::var(Variable {
             name: adrp_reg,
             kind: VarKind::Register(0), // Register ID not needed for display
-            size: 8, // 64-bit register
+            size: 8,                    // 64-bit register
         }),
         Expr::int(combined_addr as i128),
     ))
@@ -1461,7 +1636,12 @@ fn match_add_assignment(expr: &Expr) -> Option<(String, String, i128)> {
         };
 
         // RHS should be a binary add operation
-        if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &rhs.kind {
+        if let ExprKind::BinOp {
+            op: BinOpKind::Add,
+            left,
+            right,
+        } = &rhs.kind
+        {
             // Left operand should be a register
             let src_reg = if let ExprKind::Var(v) = &left.kind {
                 v.name.clone()
@@ -1503,14 +1683,14 @@ fn fold_binary_constants(op: BinOpKind, left: i128, right: i128) -> Option<i128>
         BinOpKind::Or => Some(left | right),
         BinOpKind::Xor => Some(left ^ right),
         BinOpKind::Shl => {
-            if right >= 0 && right < 128 {
+            if (0..128).contains(&right) {
                 Some(left << (right as u32))
             } else {
                 None
             }
         }
         BinOpKind::Shr | BinOpKind::Sar => {
-            if right >= 0 && right < 128 {
+            if (0..128).contains(&right) {
                 Some(left >> (right as u32))
             } else {
                 None
@@ -1536,44 +1716,71 @@ fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
         (ExprKind::IntLit(n1), ExprKind::IntLit(n2)) => n1 == n2,
         (ExprKind::Unknown(s1), ExprKind::Unknown(s2)) => s1 == s2,
         (
-            ExprKind::BinOp { op: op1, left: l1, right: r1 },
-            ExprKind::BinOp { op: op2, left: l2, right: r2 }
-        ) => {
-            op1 == op2 && exprs_structurally_equal(l1, l2) && exprs_structurally_equal(r1, r2)
-        }
+            ExprKind::BinOp {
+                op: op1,
+                left: l1,
+                right: r1,
+            },
+            ExprKind::BinOp {
+                op: op2,
+                left: l2,
+                right: r2,
+            },
+        ) => op1 == op2 && exprs_structurally_equal(l1, l2) && exprs_structurally_equal(r1, r2),
         (
-            ExprKind::UnaryOp { op: op1, operand: o1 },
-            ExprKind::UnaryOp { op: op2, operand: o2 }
-        ) => {
-            op1 == op2 && exprs_structurally_equal(o1, o2)
-        }
-        (
-            ExprKind::Deref { addr: a1, size: s1 },
-            ExprKind::Deref { addr: a2, size: s2 }
-        ) => {
+            ExprKind::UnaryOp {
+                op: op1,
+                operand: o1,
+            },
+            ExprKind::UnaryOp {
+                op: op2,
+                operand: o2,
+            },
+        ) => op1 == op2 && exprs_structurally_equal(o1, o2),
+        (ExprKind::Deref { addr: a1, size: s1 }, ExprKind::Deref { addr: a2, size: s2 }) => {
             s1 == s2 && exprs_structurally_equal(a1, a2)
         }
         (
-            ExprKind::ArrayAccess { base: b1, index: i1, element_size: s1 },
-            ExprKind::ArrayAccess { base: b2, index: i2, element_size: s2 }
-        ) => {
-            s1 == s2 && exprs_structurally_equal(b1, b2) && exprs_structurally_equal(i1, i2)
-        }
-        (ExprKind::AddressOf(e1), ExprKind::AddressOf(e2)) => {
-            exprs_structurally_equal(e1, e2)
-        }
+            ExprKind::ArrayAccess {
+                base: b1,
+                index: i1,
+                element_size: s1,
+            },
+            ExprKind::ArrayAccess {
+                base: b2,
+                index: i2,
+                element_size: s2,
+            },
+        ) => s1 == s2 && exprs_structurally_equal(b1, b2) && exprs_structurally_equal(i1, i2),
+        (ExprKind::AddressOf(e1), ExprKind::AddressOf(e2)) => exprs_structurally_equal(e1, e2),
         (
-            ExprKind::FieldAccess { base: b1, offset: o1, .. },
-            ExprKind::FieldAccess { base: b2, offset: o2, .. }
-        ) => {
-            o1 == o2 && exprs_structurally_equal(b1, b2)
-        }
+            ExprKind::FieldAccess {
+                base: b1,
+                offset: o1,
+                ..
+            },
+            ExprKind::FieldAccess {
+                base: b2,
+                offset: o2,
+                ..
+            },
+        ) => o1 == o2 && exprs_structurally_equal(b1, b2),
         (
-            ExprKind::Call { target: t1, args: a1 },
-            ExprKind::Call { target: t2, args: a2 }
+            ExprKind::Call {
+                target: t1,
+                args: a1,
+            },
+            ExprKind::Call {
+                target: t2,
+                args: a2,
+            },
         ) => {
-            call_targets_equal(t1, t2) && a1.len() == a2.len() &&
-            a1.iter().zip(a2.iter()).all(|(e1, e2)| exprs_structurally_equal(e1, e2))
+            call_targets_equal(t1, t2)
+                && a1.len() == a2.len()
+                && a1
+                    .iter()
+                    .zip(a2.iter())
+                    .all(|(e1, e2)| exprs_structurally_equal(e1, e2))
         }
         _ => false,
     }
@@ -1585,7 +1792,14 @@ fn call_targets_equal(t1: &CallTarget, t2: &CallTarget) -> bool {
         (CallTarget::Direct { target: a1, .. }, CallTarget::Direct { target: a2, .. }) => a1 == a2,
         (CallTarget::Named(n1), CallTarget::Named(n2)) => n1 == n2,
         (CallTarget::Indirect(e1), CallTarget::Indirect(e2)) => exprs_structurally_equal(e1, e2),
-        (CallTarget::IndirectGot { got_address: a1, .. }, CallTarget::IndirectGot { got_address: a2, .. }) => a1 == a2,
+        (
+            CallTarget::IndirectGot {
+                got_address: a1, ..
+            },
+            CallTarget::IndirectGot {
+                got_address: a2, ..
+            },
+        ) => a1 == a2,
         _ => false,
     }
 }
@@ -1636,10 +1850,10 @@ fn try_match_sign_extension(left: &Expr, op: BinOpKind, right: &Expr) -> Option<
     // Assuming 64-bit registers:
     // shift=56 → 8-bit, shift=48 → 16-bit, shift=32 → 32-bit, shift=24 → 40-bit (unusual)
     let to_size = match shift_amount {
-        56 => 1, // 8-bit
-        48 => 2, // 16-bit
-        32 => 4, // 32-bit
-        24 => 5, // 40-bit (unusual, keep as-is)
+        56 => 1,          // 8-bit
+        48 => 2,          // 16-bit
+        32 => 4,          // 32-bit
+        24 => 5,          // 40-bit (unusual, keep as-is)
         _ => return None, // Unsupported pattern
     };
 
@@ -1685,7 +1899,12 @@ fn try_match_zero_extension(left: &Expr, op: BinOpKind, right: &Expr) -> Option<
     };
 
     // Don't match if the expression is a shift - that's bit field extraction
-    if let ExprKind::BinOp { op: BinOpKind::Shr | BinOpKind::Sar, right: shift_amt, .. } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Shr | BinOpKind::Sar,
+        right: shift_amt,
+        ..
+    } = &expr.kind
+    {
         // Only skip if it's a non-zero shift (shift by 0 is effectively no shift)
         if let ExprKind::IntLit(n) = &shift_amt.kind {
             if *n != 0 {
@@ -1699,14 +1918,18 @@ fn try_match_zero_extension(left: &Expr, op: BinOpKind, right: &Expr) -> Option<
 
     // Check for known mask patterns
     let to_size = match mask {
-        0xFF => 1,         // 8-bit
-        0xFFFF => 2,       // 16-bit
-        0xFFFFFFFF => 4,   // 32-bit
-        _ => return None,  // Not a standard extension mask
+        0xFF => 1,        // 8-bit
+        0xFFFF => 2,      // 16-bit
+        0xFFFFFFFF => 4,  // 32-bit
+        _ => return None, // Not a standard extension mask
     };
 
     // Don't convert if the expression is already a cast to the same size
-    if let ExprKind::Cast { to_size: existing_size, .. } = &expr.kind {
+    if let ExprKind::Cast {
+        to_size: existing_size,
+        ..
+    } = &expr.kind
+    {
         if *existing_size == to_size {
             return None;
         }
@@ -1768,10 +1991,7 @@ fn try_match_bitfield_extraction(left: &Expr, op: BinOpKind, right: &Expr) -> Op
 
     // Check if mask is a valid contiguous bit mask: (1 << width) - 1
     // Valid masks: 0x1, 0x3, 0x7, 0xF, 0x1F, 0x3F, 0x7F, 0xFF, etc.
-    let width = match mask_to_width(mask) {
-        Some(w) => w,
-        None => return None,
-    };
+    let width = mask_to_width(mask)?;
 
     // Don't match if width is 0 or too large
     if width == 0 || width > 64 {
@@ -1842,10 +2062,17 @@ fn try_detect_compound_assign(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
         ExprKind::BinOp { op, left, right } => {
             // Only certain operators support compound assignment
             match op {
-                BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul |
-                BinOpKind::Div | BinOpKind::Mod | BinOpKind::And |
-                BinOpKind::Or | BinOpKind::Xor | BinOpKind::Shl |
-                BinOpKind::Shr | BinOpKind::Sar => (*op, left, right),
+                BinOpKind::Add
+                | BinOpKind::Sub
+                | BinOpKind::Mul
+                | BinOpKind::Div
+                | BinOpKind::Mod
+                | BinOpKind::And
+                | BinOpKind::Or
+                | BinOpKind::Xor
+                | BinOpKind::Shl
+                | BinOpKind::Shr
+                | BinOpKind::Sar => (*op, left, right),
                 // Comparison and logical operators don't support compound assignment
                 _ => return None,
             }
@@ -1860,7 +2087,7 @@ fn try_detect_compound_assign(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
                 op,
                 lhs: Box::new(lhs.clone()),
                 rhs: Box::new((**bin_right).clone()),
-            }
+            },
         });
     }
 
@@ -1872,7 +2099,7 @@ fn try_detect_compound_assign(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
                 op,
                 lhs: Box::new(lhs.clone()),
                 rhs: Box::new((**bin_left).clone()),
-            }
+            },
         });
     }
 
@@ -1881,8 +2108,10 @@ fn try_detect_compound_assign(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
 
 /// Check if a binary operation is commutative.
 fn is_commutative(op: BinOpKind) -> bool {
-    matches!(op, BinOpKind::Add | BinOpKind::Mul | BinOpKind::And |
-                 BinOpKind::Or | BinOpKind::Xor)
+    matches!(
+        op,
+        BinOpKind::Add | BinOpKind::Mul | BinOpKind::And | BinOpKind::Or | BinOpKind::Xor
+    )
 }
 
 /// Attempts to detect array access patterns in a dereference address.
@@ -1895,18 +2124,31 @@ fn is_commutative(op: BinOpKind) -> bool {
 /// Returns `Some(Expr::ArrayAccess { ... })` if a pattern is detected.
 fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
     // Pattern 1: base + index * element_size
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
         // Try: base + (index * size)
         if let Some((index, element_size)) = extract_scaled_index(right) {
             if element_size == size as i128 {
-                return Some(Expr::array_access((**left).clone(), index, element_size as usize));
+                return Some(Expr::array_access(
+                    (**left).clone(),
+                    index,
+                    element_size as usize,
+                ));
             }
         }
 
         // Try: (index * size) + base (commutative)
         if let Some((index, element_size)) = extract_scaled_index(left) {
             if element_size == size as i128 {
-                return Some(Expr::array_access((**right).clone(), index, element_size as usize));
+                return Some(Expr::array_access(
+                    (**right).clone(),
+                    index,
+                    element_size as usize,
+                ));
             }
         }
 
@@ -1914,14 +2156,22 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
         if let Some((index, shift_amount)) = extract_shift_index(right) {
             let element_size = 1i128 << shift_amount;
             if element_size == size as i128 {
-                return Some(Expr::array_access((**left).clone(), index, element_size as usize));
+                return Some(Expr::array_access(
+                    (**left).clone(),
+                    index,
+                    element_size as usize,
+                ));
             }
         }
 
         if let Some((index, shift_amount)) = extract_shift_index(left) {
             let element_size = 1i128 << shift_amount;
             if element_size == size as i128 {
-                return Some(Expr::array_access((**right).clone(), index, element_size as usize));
+                return Some(Expr::array_access(
+                    (**right).clone(),
+                    index,
+                    element_size as usize,
+                ));
             }
         }
 
@@ -1929,7 +2179,11 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
         if let ExprKind::IntLit(offset) = &right.kind {
             if *offset != 0 && size > 0 && *offset % (size as i128) == 0 {
                 let index = *offset / (size as i128);
-                return Some(Expr::array_access((**left).clone(), Expr::int(index), size as usize));
+                return Some(Expr::array_access(
+                    (**left).clone(),
+                    Expr::int(index),
+                    size as usize,
+                ));
             }
         }
 
@@ -1937,7 +2191,11 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
         if let ExprKind::IntLit(offset) = &left.kind {
             if *offset != 0 && size > 0 && *offset % (size as i128) == 0 {
                 let index = *offset / (size as i128);
-                return Some(Expr::array_access((**right).clone(), Expr::int(index), size as usize));
+                return Some(Expr::array_access(
+                    (**right).clone(),
+                    Expr::int(index),
+                    size as usize,
+                ));
             }
         }
 
@@ -1954,12 +2212,25 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
                         Expr::binop(BinOpKind::Add, index, Expr::int(additional_index))
                     };
                     // The base is inside the scaled expression
-                    if let ExprKind::BinOp { op: BinOpKind::Add, left: inner_left, right: inner_right } = &left.kind {
+                    if let ExprKind::BinOp {
+                        op: BinOpKind::Add,
+                        left: inner_left,
+                        right: inner_right,
+                    } = &left.kind
+                    {
                         if extract_scaled_index(inner_right).is_some() {
-                            return Some(Expr::array_access((**inner_left).clone(), combined_index, stride as usize));
+                            return Some(Expr::array_access(
+                                (**inner_left).clone(),
+                                combined_index,
+                                stride as usize,
+                            ));
                         }
                         if extract_scaled_index(inner_left).is_some() {
-                            return Some(Expr::array_access((**inner_right).clone(), combined_index, stride as usize));
+                            return Some(Expr::array_access(
+                                (**inner_right).clone(),
+                                combined_index,
+                                stride as usize,
+                            ));
                         }
                     }
                 }
@@ -1968,11 +2239,20 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
     }
 
     // Pattern for subtraction: base - constant (negative index)
-    if let ExprKind::BinOp { op: BinOpKind::Sub, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Sub,
+        left,
+        right,
+    } = &addr.kind
+    {
         if let ExprKind::IntLit(offset) = &right.kind {
             if *offset != 0 && size > 0 && *offset % (size as i128) == 0 {
                 let index = -(*offset / (size as i128));
-                return Some(Expr::array_access((**left).clone(), Expr::int(index), size as usize));
+                return Some(Expr::array_access(
+                    (**left).clone(),
+                    Expr::int(index),
+                    size as usize,
+                ));
             }
         }
     }
@@ -1982,7 +2262,12 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
 
 /// Extracts (index, scale) from expressions like `index * scale` or `scale * index`.
 fn extract_scaled_index(expr: &Expr) -> Option<(Expr, i128)> {
-    if let ExprKind::BinOp { op: BinOpKind::Mul, left, right } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Mul,
+        left,
+        right,
+    } = &expr.kind
+    {
         // Try: index * constant
         if let ExprKind::IntLit(n) = &right.kind {
             if *n > 0 && *n <= 1024 {
@@ -2001,7 +2286,12 @@ fn extract_scaled_index(expr: &Expr) -> Option<(Expr, i128)> {
 
 /// Extracts (index, shift_amount) from expressions like `index << constant`.
 fn extract_shift_index(expr: &Expr) -> Option<(Expr, i128)> {
-    if let ExprKind::BinOp { op: BinOpKind::Shl, left, right } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Shl,
+        left,
+        right,
+    } = &expr.kind
+    {
         if let ExprKind::IntLit(n) = &right.kind {
             if *n >= 0 && *n <= 6 {
                 return Some(((**left).clone(), *n));
@@ -2013,7 +2303,12 @@ fn extract_shift_index(expr: &Expr) -> Option<(Expr, i128)> {
 
 /// Extracts scaled index from an expression that may be `base + index * stride`.
 fn extract_scaled_index_from_expr(expr: &Expr) -> Option<(Expr, i128)> {
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &expr.kind
+    {
         if let Some(result) = extract_scaled_index(right) {
             return Some(result);
         }
@@ -2159,7 +2454,10 @@ mod tests {
         assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
 
         // !!x = x
-        let expr = Expr::unary(UnaryOpKind::LogicalNot, Expr::unary(UnaryOpKind::LogicalNot, x.clone()));
+        let expr = Expr::unary(
+            UnaryOpKind::LogicalNot,
+            Expr::unary(UnaryOpKind::LogicalNot, x.clone()),
+        );
         let simplified = expr.simplify();
         assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
     }
@@ -2209,7 +2507,9 @@ mod tests {
         let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(56));
         let simplified = expr.simplify();
         match &simplified.kind {
-            ExprKind::Cast { to_size, signed, .. } => {
+            ExprKind::Cast {
+                to_size, signed, ..
+            } => {
                 assert_eq!(*to_size, 1);
                 assert!(*signed);
             }
@@ -2221,7 +2521,9 @@ mod tests {
         let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(48));
         let simplified = expr.simplify();
         match &simplified.kind {
-            ExprKind::Cast { to_size, signed, .. } => {
+            ExprKind::Cast {
+                to_size, signed, ..
+            } => {
                 assert_eq!(*to_size, 2);
                 assert!(*signed);
             }
@@ -2233,7 +2535,9 @@ mod tests {
         let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(32));
         let simplified = expr.simplify();
         match &simplified.kind {
-            ExprKind::Cast { to_size, signed, .. } => {
+            ExprKind::Cast {
+                to_size, signed, ..
+            } => {
                 assert_eq!(*to_size, 4);
                 assert!(*signed);
             }
@@ -2244,13 +2548,25 @@ mod tests {
         let shifted_left = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(48));
         let expr = Expr::binop(BinOpKind::Sar, shifted_left, Expr::int(32));
         let simplified = expr.simplify();
-        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::Sar, .. }));
+        assert!(matches!(
+            simplified.kind,
+            ExprKind::BinOp {
+                op: BinOpKind::Sar,
+                ..
+            }
+        ));
 
         // Logical shift right should not become a cast (it's zero extension, not sign extension)
         let shifted_left = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(56));
         let expr = Expr::binop(BinOpKind::Shr, shifted_left, Expr::int(56));
         let simplified = expr.simplify();
-        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::Shr, .. }));
+        assert!(matches!(
+            simplified.kind,
+            ExprKind::BinOp {
+                op: BinOpKind::Shr,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2261,7 +2577,9 @@ mod tests {
         let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0xFF));
         let simplified = expr.simplify();
         match &simplified.kind {
-            ExprKind::Cast { to_size, signed, .. } => {
+            ExprKind::Cast {
+                to_size, signed, ..
+            } => {
                 assert_eq!(*to_size, 1);
                 assert!(!*signed);
             }
@@ -2272,7 +2590,9 @@ mod tests {
         let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0xFFFF));
         let simplified = expr.simplify();
         match &simplified.kind {
-            ExprKind::Cast { to_size, signed, .. } => {
+            ExprKind::Cast {
+                to_size, signed, ..
+            } => {
                 assert_eq!(*to_size, 2);
                 assert!(!*signed);
             }
@@ -2283,7 +2603,9 @@ mod tests {
         let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0xFFFFFFFF));
         let simplified = expr.simplify();
         match &simplified.kind {
-            ExprKind::Cast { to_size, signed, .. } => {
+            ExprKind::Cast {
+                to_size, signed, ..
+            } => {
                 assert_eq!(*to_size, 4);
                 assert!(!*signed);
             }
@@ -2294,7 +2616,9 @@ mod tests {
         let expr = Expr::binop(BinOpKind::And, Expr::int(0xFF), x.clone());
         let simplified = expr.simplify();
         match &simplified.kind {
-            ExprKind::Cast { to_size, signed, .. } => {
+            ExprKind::Cast {
+                to_size, signed, ..
+            } => {
                 assert_eq!(*to_size, 1);
                 assert!(!*signed);
             }
@@ -2304,7 +2628,13 @@ mod tests {
         // Non-standard masks should not simplify: x & 0x7F
         let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0x7F));
         let simplified = expr.simplify();
-        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::And, .. }));
+        assert!(matches!(
+            simplified.kind,
+            ExprKind::BinOp {
+                op: BinOpKind::And,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2355,9 +2685,9 @@ mod tests {
         assert_eq!(mask_to_width(0xFFFFFFFF), Some(32));
 
         // Invalid masks (not contiguous)
-        assert_eq!(mask_to_width(0x5), None);  // 0b101
-        assert_eq!(mask_to_width(0x9), None);  // 0b1001
-        assert_eq!(mask_to_width(0xA), None);  // 0b1010
+        assert_eq!(mask_to_width(0x5), None); // 0b101
+        assert_eq!(mask_to_width(0x9), None); // 0b1001
+        assert_eq!(mask_to_width(0xA), None); // 0b1010
         assert_eq!(mask_to_width(0x101), None); // 0b100000001
 
         // Edge cases
@@ -2433,7 +2763,13 @@ mod tests {
         let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(4));
         let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0x5));
         let simplified = expr.simplify();
-        assert!(matches!(simplified.kind, ExprKind::BinOp { op: BinOpKind::And, .. }));
+        assert!(matches!(
+            simplified.kind,
+            ExprKind::BinOp {
+                op: BinOpKind::And,
+                ..
+            }
+        ));
 
         // Shift of 0 should not match (that's zero extension)
         let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(0));
@@ -2487,7 +2823,11 @@ mod tests {
         // Simplify should detect array pattern
         let simplified = deref.simplify();
         match &simplified.kind {
-            ExprKind::ArrayAccess { base, index, element_size } => {
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
                 assert_eq!(*element_size, 4);
                 assert!(matches!(base.kind, ExprKind::Unknown(ref s) if s == "rbx"));
                 assert!(matches!(index.kind, ExprKind::Unknown(ref s) if s == "rcx"));
@@ -2555,7 +2895,11 @@ mod tests {
         let simplified = deref.simplify();
 
         match &simplified.kind {
-            ExprKind::ArrayAccess { index, element_size, .. } => {
+            ExprKind::ArrayAccess {
+                index,
+                element_size,
+                ..
+            } => {
                 assert_eq!(*element_size, 4);
                 if let ExprKind::IntLit(idx) = &index.kind {
                     assert_eq!(*idx, 4); // 0x10 / 4 = 4
@@ -2580,7 +2924,11 @@ mod tests {
         let simplified = deref.simplify();
 
         match &simplified.kind {
-            ExprKind::ArrayAccess { index, element_size, .. } => {
+            ExprKind::ArrayAccess {
+                index,
+                element_size,
+                ..
+            } => {
                 assert_eq!(*element_size, 8);
                 if let ExprKind::IntLit(idx) = &index.kind {
                     assert_eq!(*idx, 3);
@@ -2604,7 +2952,11 @@ mod tests {
         let simplified = deref.simplify();
 
         match &simplified.kind {
-            ExprKind::ArrayAccess { index, element_size, .. } => {
+            ExprKind::ArrayAccess {
+                index,
+                element_size,
+                ..
+            } => {
                 assert_eq!(*element_size, 8);
                 if let ExprKind::IntLit(idx) = &index.kind {
                     assert_eq!(*idx, -1);
@@ -2637,12 +2989,10 @@ mod tests {
         let simplified = deref.simplify();
 
         // Should detect this as struct array pattern
-        match &simplified.kind {
-            ExprKind::ArrayAccess { element_size, .. } => {
-                assert_eq!(*element_size, 16);
-            }
-            _ => {} // May not match all patterns, that's ok
+        if let ExprKind::ArrayAccess { element_size, .. } = &simplified.kind {
+            assert_eq!(*element_size, 16);
         }
+        // May not match all patterns, that's ok
     }
 
     #[test]
@@ -2656,8 +3006,11 @@ mod tests {
         let simplified = deref.simplify();
 
         // Should remain as Deref, not ArrayAccess
-        assert!(matches!(simplified.kind, ExprKind::Deref { .. }),
-            "Expected Deref for unaligned offset, got {:?}", simplified.kind);
+        assert!(
+            matches!(simplified.kind, ExprKind::Deref { .. }),
+            "Expected Deref for unaligned offset, got {:?}",
+            simplified.kind
+        );
     }
 
     #[test]
@@ -2673,8 +3026,11 @@ mod tests {
         let simplified = deref.simplify();
 
         // Should remain as Deref, not ArrayAccess
-        assert!(matches!(simplified.kind, ExprKind::Deref { .. }),
-            "Expected Deref for size mismatch, got {:?}", simplified.kind);
+        assert!(
+            matches!(simplified.kind, ExprKind::Deref { .. }),
+            "Expected Deref for size mismatch, got {:?}",
+            simplified.kind
+        );
     }
 
     #[test]
@@ -2795,8 +3151,13 @@ mod tests {
                 }
                 other => panic!("Expected CompoundAssign for {:?}, got {:?}", op, other),
             }
-            assert!(simplified.to_string().contains(expected_op_str),
-                    "Expected '{}' in output for {:?}, got: {}", expected_op_str, op, simplified);
+            assert!(
+                simplified.to_string().contains(expected_op_str),
+                "Expected '{}' in output for {:?}, got: {}",
+                expected_op_str,
+                op,
+                simplified
+            );
         }
     }
 

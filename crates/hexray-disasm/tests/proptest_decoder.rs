@@ -97,9 +97,10 @@ proptest! {
                 Ok(inst) => {
                     prop_assert!(inst.size > 0, "Decoded size must be positive");
                     // Mark bytes as covered
-                    for i in offset..(offset + inst.size).min(bytes.len()) {
-                        prop_assert!(!covered[i], "Byte {} covered twice", i);
-                        covered[i] = true;
+                    let end = (offset + inst.size).min(bytes.len());
+                    for (i, covered_byte) in covered[offset..end].iter_mut().enumerate() {
+                        prop_assert!(!*covered_byte, "Byte {} covered twice", offset + i);
+                        *covered_byte = true;
                     }
                     offset += inst.size;
                 }

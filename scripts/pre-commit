@@ -1,0 +1,37 @@
+#!/bin/bash
+# Pre-commit hook: Run fast checks before every commit
+#
+# To install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Or run: scripts/install-hooks.sh
+
+set -e
+
+echo "=== Checking formatting ==="
+cargo fmt --check || {
+    echo "ERROR: Code is not formatted. Run 'cargo fmt' to fix."
+    exit 1
+}
+
+echo ""
+echo "=== Running clippy ==="
+cargo clippy --all-targets --all-features -- -D warnings 2>/dev/null || {
+    echo "ERROR: Clippy found issues. Fix them before committing."
+    exit 1
+}
+
+echo ""
+echo "=== Building ==="
+cargo build --all-targets || {
+    echo "ERROR: Build failed."
+    exit 1
+}
+
+echo ""
+echo "=== Running tests ==="
+cargo test || {
+    echo "ERROR: Tests failed."
+    exit 1
+}
+
+echo ""
+echo "All checks passed!"

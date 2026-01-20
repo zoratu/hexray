@@ -485,7 +485,12 @@ impl CfgHtmlExporter {
     }
 
     /// Export the CFG to HTML format, writing to the provided writer.
-    pub fn export<W: Write>(&self, cfg: &ControlFlowGraph, name: &str, mut writer: W) -> io::Result<()> {
+    pub fn export<W: Write>(
+        &self,
+        cfg: &ControlFlowGraph,
+        name: &str,
+        mut writer: W,
+    ) -> io::Result<()> {
         let mut block_list = String::new();
         let mut blocks_html = String::new();
 
@@ -512,27 +517,60 @@ impl CfgHtmlExporter {
                     "block"
                 };
 
-                writeln!(blocks_html, r#"                <div class="{}" id="{}">"#, block_class, block_id).unwrap();
-                writeln!(blocks_html, r#"                    <div class="block-header">"#).unwrap();
-                writeln!(blocks_html, r#"                        <span class="name">{}{}</span>"#,
+                writeln!(
+                    blocks_html,
+                    r#"                <div class="{}" id="{}">"#,
+                    block_class, block_id
+                )
+                .unwrap();
+                writeln!(
+                    blocks_html,
+                    r#"                    <div class="block-header">"#
+                )
+                .unwrap();
+                writeln!(
+                    blocks_html,
+                    r#"                        <span class="name">{}{}</span>"#,
                     block_id,
-                    if is_entry { " (entry)" } else if is_exit { " (exit)" } else { "" }
-                ).unwrap();
-                writeln!(blocks_html, r#"                        <span class="range">{:#x} - {:#x}</span>"#, block.start, block.end).unwrap();
+                    if is_entry {
+                        " (entry)"
+                    } else if is_exit {
+                        " (exit)"
+                    } else {
+                        ""
+                    }
+                )
+                .unwrap();
+                writeln!(
+                    blocks_html,
+                    r#"                        <span class="range">{:#x} - {:#x}</span>"#,
+                    block.start, block.end
+                )
+                .unwrap();
                 writeln!(blocks_html, r#"                    </div>"#).unwrap();
 
                 if !block.instructions.is_empty() {
-                    writeln!(blocks_html, r#"                    <div class="instructions">"#).unwrap();
+                    writeln!(
+                        blocks_html,
+                        r#"                    <div class="instructions">"#
+                    )
+                    .unwrap();
                     for inst in &block.instructions {
-                        let bytes_str: String = inst.bytes.iter()
+                        let bytes_str: String = inst
+                            .bytes
+                            .iter()
                             .take(8)
                             .map(|b| format!("{:02x}", b))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        let operands_str = escape_html(&inst.operands.iter()
-                            .map(|op| format!("{}", op))
-                            .collect::<Vec<_>>()
-                            .join(", "));
+                        let operands_str = escape_html(
+                            &inst
+                                .operands
+                                .iter()
+                                .map(|op| format!("{}", op))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
 
                         writeln!(blocks_html,
                             r#"                        <div class="inst"><span class="addr">{:#x}</span><span class="bytes">{}</span><span class="mnemonic">{}</span><span class="operands">{}</span></div>"#,
@@ -544,12 +582,18 @@ impl CfgHtmlExporter {
 
                 let succs = cfg.successors(block_id);
                 if !succs.is_empty() {
-                    write!(blocks_html, r#"                    <div class="successors">→ "#).unwrap();
+                    write!(
+                        blocks_html,
+                        r#"                    <div class="successors">→ "#
+                    )
+                    .unwrap();
                     for succ in succs {
-                        write!(blocks_html,
+                        write!(
+                            blocks_html,
                             "<a href=\"#{}\" onclick=\"scrollToBlock('{}')\">{}</a>",
                             succ, succ, succ
-                        ).unwrap();
+                        )
+                        .unwrap();
                     }
                     writeln!(blocks_html, "</div>").unwrap();
                 }
@@ -572,7 +616,8 @@ impl CfgHtmlExporter {
     /// Export the CFG to HTML format, returning it as a String.
     pub fn export_to_string(&self, cfg: &ControlFlowGraph, name: &str) -> String {
         let mut buf = Vec::new();
-        self.export(cfg, name, &mut buf).expect("writing to Vec should not fail");
+        self.export(cfg, name, &mut buf)
+            .expect("writing to Vec should not fail");
         String::from_utf8(buf).expect("HTML output should be valid UTF-8")
     }
 
@@ -630,25 +675,63 @@ impl CallGraphHtmlExporter {
             ).unwrap();
 
             // Function detail card
-            writeln!(func_details, r#"            <div class="func-detail" id="func-{:x}">"#, node.address).unwrap();
+            writeln!(
+                func_details,
+                r#"            <div class="func-detail" id="func-{:x}">"#,
+                node.address
+            )
+            .unwrap();
             writeln!(func_details, r#"                <div class="func-card">"#).unwrap();
-            writeln!(func_details, r#"                    <div class="func-card-header">"#).unwrap();
-            writeln!(func_details, r#"                        <h3>{}</h3>"#, escaped_name).unwrap();
-            writeln!(func_details, r#"                        <div class="meta">Address: {:#x}{}</div>"#,
+            writeln!(
+                func_details,
+                r#"                    <div class="func-card-header">"#
+            )
+            .unwrap();
+            writeln!(
+                func_details,
+                r#"                        <h3>{}</h3>"#,
+                escaped_name
+            )
+            .unwrap();
+            writeln!(
+                func_details,
+                r#"                        <div class="meta">Address: {:#x}{}</div>"#,
                 node.address,
                 if node.is_external { " | External" } else { "" }
-            ).unwrap();
+            )
+            .unwrap();
             writeln!(func_details, r#"                    </div>"#).unwrap();
-            writeln!(func_details, r#"                    <div class="func-card-body">"#).unwrap();
+            writeln!(
+                func_details,
+                r#"                    <div class="func-card-body">"#
+            )
+            .unwrap();
 
             // Callees
             let callees: Vec<_> = callgraph.callees(node.address).collect();
-            writeln!(func_details, r#"                        <div class="call-section">"#).unwrap();
-            writeln!(func_details, r#"                            <h4>Calls ({} functions)</h4>"#, callees.len()).unwrap();
+            writeln!(
+                func_details,
+                r#"                        <div class="call-section">"#
+            )
+            .unwrap();
+            writeln!(
+                func_details,
+                r#"                            <h4>Calls ({} functions)</h4>"#,
+                callees.len()
+            )
+            .unwrap();
             if callees.is_empty() {
-                writeln!(func_details, r#"                            <p class="empty">No outgoing calls</p>"#).unwrap();
+                writeln!(
+                    func_details,
+                    r#"                            <p class="empty">No outgoing calls</p>"#
+                )
+                .unwrap();
             } else {
-                writeln!(func_details, r#"                            <ul class="call-list">"#).unwrap();
+                writeln!(
+                    func_details,
+                    r#"                            <ul class="call-list">"#
+                )
+                .unwrap();
                 for (callee_addr, site) in &callees {
                     if let Some(callee) = callgraph.get_node(*callee_addr) {
                         let callee_name = escape_html(&Self::node_display_name(callee));
@@ -664,12 +747,25 @@ impl CallGraphHtmlExporter {
 
             // Callers
             let callers: Vec<_> = callgraph.callers(node.address).collect();
-            writeln!(func_details, r#"                        <div class="call-section">"#).unwrap();
-            writeln!(func_details, r#"                            <h4>Called by ({} functions)</h4>"#, callers.len()).unwrap();
+            writeln!(
+                func_details,
+                r#"                        <div class="call-section">"#
+            )
+            .unwrap();
+            writeln!(
+                func_details,
+                r#"                            <h4>Called by ({} functions)</h4>"#,
+                callers.len()
+            )
+            .unwrap();
             if callers.is_empty() {
                 writeln!(func_details, r#"                            <p class="empty">No incoming calls (root or unreferenced)</p>"#).unwrap();
             } else {
-                writeln!(func_details, r#"                            <ul class="call-list">"#).unwrap();
+                writeln!(
+                    func_details,
+                    r#"                            <ul class="call-list">"#
+                )
+                .unwrap();
                 for (caller_addr, site) in &callers {
                     if let Some(caller) = callgraph.get_node(*caller_addr) {
                         let caller_name = escape_html(&Self::node_display_name(caller));
@@ -701,7 +797,8 @@ impl CallGraphHtmlExporter {
     /// Export the call graph to HTML format, returning it as a String.
     pub fn export_to_string(&self, callgraph: &CallGraph) -> String {
         let mut buf = Vec::new();
-        self.export(callgraph, &mut buf).expect("writing to Vec should not fail");
+        self.export(callgraph, &mut buf)
+            .expect("writing to Vec should not fail");
         String::from_utf8(buf).expect("HTML output should be valid UTF-8")
     }
 

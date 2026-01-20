@@ -71,17 +71,15 @@ impl XrefDatabase {
 
     /// Add a cross-reference.
     pub fn add_xref(&mut self, from: u64, to: u64, xref_type: XrefType) {
-        let xref = Xref { from, to, xref_type };
+        let xref = Xref {
+            from,
+            to,
+            xref_type,
+        };
 
-        self.refs_to
-            .entry(to)
-            .or_default()
-            .push(xref.clone());
+        self.refs_to.entry(to).or_default().push(xref.clone());
 
-        self.refs_from
-            .entry(from)
-            .or_default()
-            .push(xref);
+        self.refs_from.entry(from).or_default().push(xref);
 
         self.referenced_addrs.insert(to);
     }
@@ -93,7 +91,10 @@ impl XrefDatabase {
 
     /// Get all references FROM a specific address.
     pub fn refs_from(&self, addr: u64) -> &[Xref] {
-        self.refs_from.get(&addr).map(|v| v.as_slice()).unwrap_or(&[])
+        self.refs_from
+            .get(&addr)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Get the number of references TO a specific address.

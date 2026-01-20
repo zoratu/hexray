@@ -55,7 +55,8 @@ pub struct ReachingDefinitions {
 impl ReachingDefinitions {
     /// Creates a new reaching definitions analysis.
     pub fn new(cfg: &ControlFlowGraph) -> Self {
-        let mut gen_sets: HashMap<BasicBlockId, HashMap<Location, DefinitionPoint>> = HashMap::new();
+        let mut gen_sets: HashMap<BasicBlockId, HashMap<Location, DefinitionPoint>> =
+            HashMap::new();
         let mut kill_sets: HashMap<BasicBlockId, HashSet<Location>> = HashMap::new();
         let mut all_defs: HashMap<Location, HashSet<DefinitionPoint>> = HashMap::new();
 
@@ -88,7 +89,11 @@ impl ReachingDefinitions {
             kill_sets.insert(block.id, block_kill);
         }
 
-        Self { gen_sets, kill_sets, all_defs }
+        Self {
+            gen_sets,
+            kill_sets,
+            all_defs,
+        }
     }
 
     /// Runs the analysis and returns reaching definitions at each block.
@@ -153,7 +158,8 @@ impl DataflowAnalysis for ReachingDefinitions {
 
         for fact in facts {
             for (loc, defs) in &fact.reaching {
-                result.reaching
+                result
+                    .reaching
                     .entry(loc.clone())
                     .or_default()
                     .extend(defs.iter().copied());
@@ -186,7 +192,8 @@ impl DataflowAnalysis for ReachingDefinitions {
         // Apply gen: add the last definition of each location in this block
         if let Some(generated) = block_gen {
             for (loc, def_point) in generated {
-                output.reaching
+                output
+                    .reaching
                     .entry(loc.clone())
                     .or_default()
                     .insert(*def_point);
@@ -204,14 +211,26 @@ impl DataflowAnalysis for ReachingDefinitions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, ControlFlowGraph, Instruction, Operation, Operand, Register, RegisterClass, BlockTerminator, Architecture};
+    use hexray_core::{
+        Architecture, BasicBlock, BlockTerminator, ControlFlowGraph, Instruction, Operand,
+        Operation, Register, RegisterClass,
+    };
 
     fn make_mov(addr: u64, reg_id: u16, _reg_name: &str, value: i128) -> Instruction {
         let mut inst = Instruction::new(addr, 3, vec![0; 3], "mov");
         inst.operation = Operation::Move;
         inst.operands = vec![
-            Operand::Register(Register::new(Architecture::X86_64, RegisterClass::General, reg_id, 64)),
-            Operand::Immediate(hexray_core::Immediate { value, size: 8, signed: false }),
+            Operand::Register(Register::new(
+                Architecture::X86_64,
+                RegisterClass::General,
+                reg_id,
+                64,
+            )),
+            Operand::Immediate(hexray_core::Immediate {
+                value,
+                size: 8,
+                signed: false,
+            }),
         ];
         inst
     }
@@ -239,8 +258,8 @@ mod tests {
         let rax_loc = Location::Register(0);
         let rbx_loc = Location::Register(1);
 
-        assert!(output.reaching.get(&rax_loc).is_some());
-        assert!(output.reaching.get(&rbx_loc).is_some());
+        assert!(output.reaching.contains_key(&rax_loc));
+        assert!(output.reaching.contains_key(&rbx_loc));
 
         let rax_defs = output.reaching.get(&rax_loc).unwrap();
         assert_eq!(rax_defs.len(), 1);

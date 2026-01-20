@@ -164,10 +164,7 @@ pub fn decode_modrm_rm(
 
     // Register operand
     if modrm.is_register() {
-        return Some((
-            Operand::Register(decode_gpr(modrm.rm, operand_size)),
-            0,
-        ));
+        return Some((Operand::Register(decode_gpr(modrm.rm, operand_size)), 0));
     }
 
     // Memory operand
@@ -277,10 +274,7 @@ pub fn decode_modrm_rm_xmm(
 ) -> Option<(Operand, usize)> {
     // If it's a register operand, decode as XMM/YMM
     if modrm.is_register() {
-        return Some((
-            Operand::Register(decode_xmm(modrm.rm, vector_size)),
-            0,
-        ));
+        return Some((Operand::Register(decode_xmm(modrm.rm, vector_size)), 0));
     }
 
     // Otherwise, it's a memory operand - use the same decoding but with vector size

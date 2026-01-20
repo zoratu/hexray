@@ -56,13 +56,13 @@ mod types;
 
 pub use abbrev::{Abbreviation, AbbreviationTable, AttributeSpec};
 pub use die::{Attribute, AttributeValue, Die, DieParser};
-pub use eh_frame::{Cie, CfiInstruction, EhFrame, EhFrameParser, Fde, parse_eh_frame};
+pub use eh_frame::{parse_eh_frame, CfiInstruction, Cie, EhFrame, EhFrameParser, Fde};
 pub use info::{CompilationUnit, CompilationUnitHeader, DebugInfoParser};
 pub use leb128::{decode_sleb128, decode_uleb128};
 pub use line::{FileEntry, LineNumberProgram, LineNumberProgramHeader, LineRow};
 pub use lsda::{
-    ActionRecord, CallSite, CatchHandler, CatchType, CleanupHandler,
-    ExceptionHandlingInfo, Lsda, LsdaParser, TryBlock,
+    ActionRecord, CallSite, CatchHandler, CatchType, CleanupHandler, ExceptionHandlingInfo, Lsda,
+    LsdaParser, TryBlock,
 };
 pub use types::{DwAt, DwAte, DwForm, DwLang, DwLne, DwLns, DwTag};
 
@@ -100,7 +100,9 @@ impl DebugInfo {
                 if address >= low && address < high_addr {
                     // Found the compilation unit, now look up line info
                     if let Some(stmt_list) = cu.stmt_list() {
-                        if let Some((_, prog)) = self.line_programs.iter().find(|(off, _)| *off == stmt_list) {
+                        if let Some((_, prog)) =
+                            self.line_programs.iter().find(|(off, _)| *off == stmt_list)
+                        {
                             if let Some(row) = prog.find_location(address) {
                                 let file_name = prog.file_name(row.file);
                                 return Some(SourceLocation {
@@ -144,9 +146,9 @@ impl DebugInfo {
 
     /// Find a compilation unit by name.
     pub fn find_compilation_unit(&self, name: &str) -> Option<&CompilationUnit> {
-        self.compilation_units.iter().find(|cu| {
-            cu.name().map(|n| n.contains(name)).unwrap_or(false)
-        })
+        self.compilation_units
+            .iter()
+            .find(|cu| cu.name().map(|n| n.contains(name)).unwrap_or(false))
     }
 }
 
@@ -200,12 +202,18 @@ impl<'a> FunctionInfo<'a> {
 
     /// Get the function's parameters.
     pub fn parameters(&self) -> impl Iterator<Item = &Die> {
-        self.die.children.iter().filter(|d| matches!(d.tag, DwTag::FormalParameter))
+        self.die
+            .children
+            .iter()
+            .filter(|d| matches!(d.tag, DwTag::FormalParameter))
     }
 
     /// Get the function's local variables.
     pub fn local_variables(&self) -> impl Iterator<Item = &Die> {
-        self.die.children.iter().filter(|d| matches!(d.tag, DwTag::Variable))
+        self.die
+            .children
+            .iter()
+            .filter(|d| matches!(d.tag, DwTag::Variable))
     }
 
     /// Get all variable names mapped to their stack offsets.
@@ -236,7 +244,8 @@ impl<'a> FunctionInfo<'a> {
     pub fn parameter_info(&self) -> Vec<(String, Option<i64>)> {
         self.parameters()
             .filter_map(|p| {
-                p.name().map(|name| (name.to_string(), p.frame_base_offset()))
+                p.name()
+                    .map(|name| (name.to_string(), p.frame_base_offset()))
             })
             .collect()
     }
@@ -245,7 +254,8 @@ impl<'a> FunctionInfo<'a> {
     pub fn local_variable_info(&self) -> Vec<(String, Option<i64>)> {
         self.local_variables()
             .filter_map(|v| {
-                v.name().map(|name| (name.to_string(), v.frame_base_offset()))
+                v.name()
+                    .map(|name| (name.to_string(), v.frame_base_offset()))
             })
             .collect()
     }

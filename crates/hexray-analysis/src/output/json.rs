@@ -63,7 +63,12 @@ impl CfgJsonExporter {
     }
 
     /// Export the CFG to JSON format, writing to the provided writer.
-    pub fn export<W: Write>(&self, cfg: &ControlFlowGraph, name: &str, mut writer: W) -> io::Result<()> {
+    pub fn export<W: Write>(
+        &self,
+        cfg: &ControlFlowGraph,
+        name: &str,
+        mut writer: W,
+    ) -> io::Result<()> {
         let mut blocks = Vec::new();
 
         for block_id in cfg.reverse_post_order() {
@@ -126,7 +131,8 @@ impl CfgJsonExporter {
     /// Export the CFG to JSON format, returning it as a String.
     pub fn export_to_string(&self, cfg: &ControlFlowGraph, name: &str) -> String {
         let mut buf = Vec::new();
-        self.export(cfg, name, &mut buf).expect("writing to Vec should not fail");
+        self.export(cfg, name, &mut buf)
+            .expect("writing to Vec should not fail");
         String::from_utf8(buf).expect("JSON output should be valid UTF-8")
     }
 
@@ -237,7 +243,8 @@ impl CallGraphJsonExporter {
     /// Export the call graph to JSON format, returning it as a String.
     pub fn export_to_string(&self, callgraph: &CallGraph) -> String {
         let mut buf = Vec::new();
-        self.export(callgraph, &mut buf).expect("writing to Vec should not fail");
+        self.export(callgraph, &mut buf)
+            .expect("writing to Vec should not fail");
         String::from_utf8(buf).expect("JSON output should be valid UTF-8")
     }
 

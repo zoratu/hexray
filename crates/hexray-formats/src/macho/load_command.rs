@@ -55,38 +55,19 @@ pub enum LoadCommand {
         nindirectsyms: u32,
     },
     /// LC_MAIN
-    Main {
-        entryoff: u64,
-        stacksize: u64,
-    },
+    Main { entryoff: u64, stacksize: u64 },
     /// LC_UNIXTHREAD (legacy entry point)
-    UnixThread {
-        entry_point: u64,
-    },
+    UnixThread { entry_point: u64 },
     /// LC_UUID
-    Uuid {
-        uuid: [u8; 16],
-    },
+    Uuid { uuid: [u8; 16] },
     /// LC_LOAD_DYLIB
-    LoadDylib {
-        name: String,
-    },
+    LoadDylib { name: String },
     /// LC_BUILD_VERSION
-    BuildVersion {
-        platform: u32,
-        minos: u32,
-        sdk: u32,
-    },
+    BuildVersion { platform: u32, minos: u32, sdk: u32 },
     /// LC_FUNCTION_STARTS
-    FunctionStarts {
-        dataoff: u32,
-        datasize: u32,
-    },
+    FunctionStarts { dataoff: u32, datasize: u32 },
     /// Other/unknown load command
-    Other {
-        cmd: u32,
-        cmdsize: u32,
-    },
+    Other { cmd: u32, cmdsize: u32 },
 }
 
 impl LoadCommand {
@@ -140,12 +121,12 @@ impl LoadCommand {
                 }
                 Some(Self::Main {
                     entryoff: u64::from_le_bytes([
-                        data[8], data[9], data[10], data[11],
-                        data[12], data[13], data[14], data[15],
+                        data[8], data[9], data[10], data[11], data[12], data[13], data[14],
+                        data[15],
                     ]),
                     stacksize: u64::from_le_bytes([
-                        data[16], data[17], data[18], data[19],
-                        data[20], data[21], data[22], data[23],
+                        data[16], data[17], data[18], data[19], data[20], data[21], data[22],
+                        data[23],
                     ]),
                 })
             }
@@ -155,14 +136,19 @@ impl LoadCommand {
                 // Thread state starts at offset 16 (after cmd, cmdsize, flavor, count)
                 let entry_point = if is_64 && data.len() >= 16 + 136 + 8 {
                     u64::from_le_bytes([
-                        data[16 + 136], data[16 + 137], data[16 + 138], data[16 + 139],
-                        data[16 + 140], data[16 + 141], data[16 + 142], data[16 + 143],
+                        data[16 + 136],
+                        data[16 + 137],
+                        data[16 + 138],
+                        data[16 + 139],
+                        data[16 + 140],
+                        data[16 + 141],
+                        data[16 + 142],
+                        data[16 + 143],
                     ])
                 } else if !is_64 && data.len() >= 16 + 40 + 4 {
                     // For i386, EIP is at offset 10*4 = 40
-                    u32::from_le_bytes([
-                        data[16 + 40], data[16 + 41], data[16 + 42], data[16 + 43],
-                    ]) as u64
+                    u32::from_le_bytes([data[16 + 40], data[16 + 41], data[16 + 42], data[16 + 43]])
+                        as u64
                 } else {
                     0
                 };
@@ -180,10 +166,14 @@ impl LoadCommand {
                 if data.len() < 24 {
                     return Ok(Some(Self::Other { cmd, cmdsize }));
                 }
-                let name_offset = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+                let name_offset =
+                    u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
                 let name = if name_offset < data.len() {
                     let name_bytes = &data[name_offset..];
-                    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+                    let end = name_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(name_bytes.len());
                     String::from_utf8_lossy(&name_bytes[..end]).to_string()
                 } else {
                     String::new()

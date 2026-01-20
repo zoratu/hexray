@@ -21,10 +21,8 @@ fn arb_cfg(max_blocks: usize) -> impl Strategy<Value = ControlFlowGraph> {
     (1..=max_blocks)
         .prop_flat_map(|num_blocks| {
             // Generate edges as (from, to) pairs
-            let edge_strategy = prop::collection::vec(
-                (0..num_blocks, 0..num_blocks),
-                0..num_blocks * 2,
-            );
+            let edge_strategy =
+                prop::collection::vec((0..num_blocks, 0..num_blocks), 0..num_blocks * 2);
 
             (Just(num_blocks), edge_strategy)
         })

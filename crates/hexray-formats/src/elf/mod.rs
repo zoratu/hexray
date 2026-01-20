@@ -14,7 +14,7 @@ mod section;
 mod segment;
 mod symbol;
 
-pub use header::{ElfHeader, ElfClass, ElfType, Machine};
+pub use header::{ElfClass, ElfHeader, ElfType, Machine};
 pub use relocation::{Relocation, RelocationType};
 pub use section::SectionHeader;
 pub use segment::ProgramHeader;
@@ -83,20 +83,19 @@ impl<'a> Elf<'a> {
         let segments = Self::parse_program_headers(data, &header)?;
 
         // Get section name string table
-        let section_names = if header.e_shstrndx > 0
-            && (header.e_shstrndx as usize) < sections.len()
-        {
-            let shstrtab = &sections[header.e_shstrndx as usize];
-            let start = shstrtab.sh_offset as usize;
-            let end = start + shstrtab.sh_size as usize;
-            if end <= data.len() {
-                StringTable::new(&data[start..end])
+        let section_names =
+            if header.e_shstrndx > 0 && (header.e_shstrndx as usize) < sections.len() {
+                let shstrtab = &sections[header.e_shstrndx as usize];
+                let start = shstrtab.sh_offset as usize;
+                let end = start + shstrtab.sh_size as usize;
+                if end <= data.len() {
+                    StringTable::new(&data[start..end])
+                } else {
+                    StringTable::empty()
+                }
             } else {
                 StringTable::empty()
-            }
-        } else {
-            StringTable::empty()
-        };
+            };
 
         // Populate section name and data caches for the Section trait
         let mut sections = sections;
@@ -153,11 +152,7 @@ impl<'a> Elf<'a> {
                 ));
             }
 
-            let section = SectionHeader::parse(
-                &data[offset..],
-                header.class,
-                header.endianness,
-            )?;
+            let section = SectionHeader::parse(&data[offset..], header.class, header.endianness)?;
             sections.push(section);
             offset += header.e_shentsize as usize;
         }
@@ -180,11 +175,7 @@ impl<'a> Elf<'a> {
                 ));
             }
 
-            let segment = ProgramHeader::parse(
-                &data[offset..],
-                header.class,
-                header.endianness,
-            )?;
+            let segment = ProgramHeader::parse(&data[offset..], header.class, header.endianness)?;
             segments.push(segment);
             offset += header.e_phentsize as usize;
         }
@@ -202,10 +193,8 @@ impl<'a> Elf<'a> {
         let is_relocatable = header.file_type == ElfType::Relocatable;
 
         // Find symbol table sections (.symtab and .dynsym)
-        for (_idx, section) in sections.iter().enumerate() {
-            if section.sh_type != section::SHT_SYMTAB
-                && section.sh_type != section::SHT_DYNSYM
-            {
+        for section in sections.iter() {
+            if section.sh_type != section::SHT_SYMTAB && section.sh_type != section::SHT_DYNSYM {
                 continue;
             }
 
@@ -236,16 +225,15 @@ impl<'a> Elf<'a> {
 
             let mut offset = sym_start;
             while offset + entry_size <= sym_end {
-                let entry = SymbolEntry::parse(
-                    &data[offset..],
-                    header.class,
-                    header.endianness,
-                )?;
+                let entry = SymbolEntry::parse(&data[offset..], header.class, header.endianness)?;
 
                 let mut name = strtab.get(entry.st_name as usize).unwrap_or("").to_string();
 
                 // Section symbols (STT_SECTION) have st_name=0, so use section name instead
-                if name.is_empty() && entry.st_shndx > 0 && (entry.st_shndx as usize) < sections.len() {
+                if name.is_empty()
+                    && entry.st_shndx > 0
+                    && (entry.st_shndx as usize) < sections.len()
+                {
                     let sym_section = &sections[entry.st_shndx as usize];
                     if let Some(sec_name) = section_names.get(sym_section.sh_name as usize) {
                         name = sec_name.to_string();
@@ -256,7 +244,10 @@ impl<'a> Elf<'a> {
 
                 // For relocatable files, adjust symbol address to be globally unique
                 // by adding the section's file offset
-                if is_relocatable && entry.st_shndx > 0 && (entry.st_shndx as usize) < sections.len() {
+                if is_relocatable
+                    && entry.st_shndx > 0
+                    && (entry.st_shndx as usize) < sections.len()
+                {
                     let sym_section = &sections[entry.st_shndx as usize];
                     // Use section file offset + symbol value as the address
                     sym.address = sym_section.sh_offset + entry.st_value;
@@ -279,7 +270,7 @@ impl<'a> Elf<'a> {
         let mut relocations = Vec::new();
         let is_x86_64 = matches!(header.machine, Machine::X86_64);
 
-        for (_idx, section) in sections.iter().enumerate() {
+        for section in sections.iter() {
             // RELA sections have an explicit addend
             if section.sh_type == section::SHT_RELA {
                 let start = section.sh_offset as usize;

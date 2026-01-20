@@ -158,7 +158,9 @@ impl Value {
         match (self, other) {
             (Value::Concrete(a), Value::Concrete(b)) => Value::Concrete(a & b),
             (Value::Concrete(0), _) | (_, Value::Concrete(0)) => Value::Concrete(0),
-            (Value::Concrete(u64::MAX), other) | (other, Value::Concrete(u64::MAX)) => other.clone(),
+            (Value::Concrete(u64::MAX), other) | (other, Value::Concrete(u64::MAX)) => {
+                other.clone()
+            }
             _ => Value::Unknown,
         }
     }
@@ -168,7 +170,9 @@ impl Value {
         match (self, other) {
             (Value::Concrete(a), Value::Concrete(b)) => Value::Concrete(a | b),
             (Value::Concrete(0), other) | (other, Value::Concrete(0)) => other.clone(),
-            (Value::Concrete(u64::MAX), _) | (_, Value::Concrete(u64::MAX)) => Value::Concrete(u64::MAX),
+            (Value::Concrete(u64::MAX), _) | (_, Value::Concrete(u64::MAX)) => {
+                Value::Concrete(u64::MAX)
+            }
             _ => Value::Unknown,
         }
     }
@@ -246,9 +250,7 @@ impl Value {
     /// Compare equal.
     pub fn eq(&self, other: &Value) -> Value {
         match (self, other) {
-            (Value::Concrete(a), Value::Concrete(b)) => {
-                Value::Concrete(if a == b { 1 } else { 0 })
-            }
+            (Value::Concrete(a), Value::Concrete(b)) => Value::Concrete(if a == b { 1 } else { 0 }),
             _ => Value::Unknown,
         }
     }
@@ -256,9 +258,7 @@ impl Value {
     /// Compare not equal.
     pub fn ne(&self, other: &Value) -> Value {
         match (self, other) {
-            (Value::Concrete(a), Value::Concrete(b)) => {
-                Value::Concrete(if a != b { 1 } else { 0 })
-            }
+            (Value::Concrete(a), Value::Concrete(b)) => Value::Concrete(if a != b { 1 } else { 0 }),
             _ => Value::Unknown,
         }
     }
@@ -266,9 +266,7 @@ impl Value {
     /// Unsigned less than.
     pub fn ult(&self, other: &Value) -> Value {
         match (self, other) {
-            (Value::Concrete(a), Value::Concrete(b)) => {
-                Value::Concrete(if a < b { 1 } else { 0 })
-            }
+            (Value::Concrete(a), Value::Concrete(b)) => Value::Concrete(if a < b { 1 } else { 0 }),
             _ => Value::Unknown,
         }
     }
@@ -289,7 +287,11 @@ impl Value {
     pub fn zext(&self, from_bits: u32) -> Value {
         match self {
             Value::Concrete(v) => {
-                let mask = if from_bits >= 64 { u64::MAX } else { (1u64 << from_bits) - 1 };
+                let mask = if from_bits >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << from_bits) - 1
+                };
                 Value::Concrete(*v & mask)
             }
             _ => Value::Unknown,
@@ -321,7 +323,11 @@ impl Value {
     pub fn trunc(&self, to_bits: u32) -> Value {
         match self {
             Value::Concrete(v) => {
-                let mask = if to_bits >= 64 { u64::MAX } else { (1u64 << to_bits) - 1 };
+                let mask = if to_bits >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << to_bits) - 1
+                };
                 Value::Concrete(*v & mask)
             }
             _ => Value::Unknown,

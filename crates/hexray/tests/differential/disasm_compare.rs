@@ -4,14 +4,14 @@
 //! to verify instruction decoding accuracy.
 
 use super::{
-    compare_instructions, fixture_path, normalize_mnemonic, parse_objdump_simple,
-    run_objdump, DisasmDiffResult,
+    compare_instructions, fixture_path, normalize_mnemonic, parse_objdump_simple, run_objdump,
+    DisasmDiffResult,
 };
 use hexray_disasm::traits::Disassembler;
 use hexray_disasm::X86_64Disassembler;
 use hexray_formats::elf::Elf;
 use hexray_formats::macho::MachO;
-use hexray_formats::{BinaryFormat, Section};
+use hexray_formats::BinaryFormat;
 use std::fs;
 
 /// Minimum match rate threshold for disassembly tests.
@@ -347,7 +347,8 @@ mod tests {
         for (a, b, should_match) in test_cases {
             let result = normalize_mnemonic(a) == normalize_mnemonic(b);
             assert_eq!(
-                result, should_match,
+                result,
+                should_match,
                 "Expected normalize('{}') {} normalize('{}'), but got {}",
                 a,
                 if should_match { "==" } else { "!=" },

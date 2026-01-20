@@ -10,11 +10,11 @@ use hexray_core::{
 
 // Vector extension opcodes (documented for reference, used in decoder.rs)
 #[allow(dead_code)]
-pub const OP_V: u32 = 0b1010111;         // 0x57 - Vector arithmetic
+pub const OP_V: u32 = 0b1010111; // 0x57 - Vector arithmetic
 #[allow(dead_code)]
-pub const OP_LOAD_FP: u32 = 0b0000111;   // 0x07 - Vector loads (shared with FP loads)
+pub const OP_LOAD_FP: u32 = 0b0000111; // 0x07 - Vector loads (shared with FP loads)
 #[allow(dead_code)]
-pub const OP_STORE_FP: u32 = 0b0100111;  // 0x27 - Vector stores (shared with FP stores)
+pub const OP_STORE_FP: u32 = 0b0100111; // 0x27 - Vector stores (shared with FP stores)
 
 /// Vector decoder for RISC-V V extension.
 pub struct VectorDecoder {
@@ -393,13 +393,13 @@ impl VectorDecoder {
 
         // Determine operand type from funct3
         let suffix = match funct3 {
-            0b000 => ".vv",  // OPIVV - vector-vector
-            0b001 => ".vf",  // OPFVV - vector-scalar (FP)
-            0b010 => ".vv",  // OPMVV - vector-vector (masks)
-            0b011 => ".vi",  // OPIVI - vector-immediate
-            0b100 => ".vx",  // OPIVX - vector-scalar
-            0b101 => ".vf",  // OPFVF - vector-scalar (FP)
-            0b110 => ".vx",  // OPMVX - vector-scalar (masks)
+            0b000 => ".vv", // OPIVV - vector-vector
+            0b001 => ".vf", // OPFVV - vector-scalar (FP)
+            0b010 => ".vv", // OPMVV - vector-vector (masks)
+            0b011 => ".vi", // OPIVI - vector-immediate
+            0b100 => ".vx", // OPIVX - vector-scalar
+            0b101 => ".vf", // OPFVF - vector-scalar (FP)
+            0b110 => ".vx", // OPMVX - vector-scalar (masks)
             _ => return Err(DecodeError::unknown_opcode(address, &bytes)),
         };
 
@@ -536,12 +536,7 @@ mod tests {
         let decoder = VectorDecoder::new(true);
         // vsetvli x1, x2, e32,m1 (zimm = 0x008)
         // funct3=111, rd=1, rs1=2, zimm[10:0]=0x008
-        let insn: u32 = (0b0 << 31)
-            | (0x008 << 20)
-            | (2 << 15)
-            | (0b111 << 12)
-            | (1 << 7)
-            | 0b1010111;
+        let insn: u32 = (0x008 << 20) | (2 << 15) | (0b111 << 12) | (1 << 7) | 0b1010111;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_vset(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "vsetvli");
@@ -552,14 +547,7 @@ mod tests {
         let decoder = VectorDecoder::new(true);
         // vle32.v v1, (x2)
         // mop=00, vm=1, rs2=0, rs1=2, width=110, vd=1, opcode=0000111
-        let insn: u32 = (0b000 << 29)
-            | (0b00 << 26)
-            | (1 << 25)
-            | (0 << 20)
-            | (2 << 15)
-            | (0b110 << 12)
-            | (1 << 7)
-            | 0b0000111;
+        let insn: u32 = (1 << 25) | (2 << 15) | (0b110 << 12) | (1 << 7) | 0b0000111;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_vector_load(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "vle32.v");
@@ -570,13 +558,7 @@ mod tests {
         let decoder = VectorDecoder::new(true);
         // vadd.vv v1, v2, v3
         // funct6=000000, vm=1, vs2=2, vs1=3, funct3=000, vd=1, opcode=1010111
-        let insn: u32 = (0b000000 << 26)
-            | (1 << 25)
-            | (2 << 20)
-            | (3 << 15)
-            | (0b000 << 12)
-            | (1 << 7)
-            | 0b1010111;
+        let insn: u32 = ((1 << 25) | (2 << 20) | (3 << 15)) | (1 << 7) | 0b1010111;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_vector_arith(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "vadd.vv");
@@ -587,13 +569,7 @@ mod tests {
         let decoder = VectorDecoder::new(true);
         // vadd.vi v1, v2, 5
         // funct6=000000, vm=1, vs2=2, imm=5, funct3=011, vd=1, opcode=1010111
-        let insn: u32 = (0b000000 << 26)
-            | (1 << 25)
-            | (2 << 20)
-            | (5 << 15)
-            | (0b011 << 12)
-            | (1 << 7)
-            | 0b1010111;
+        let insn: u32 = (1 << 25) | (2 << 20) | (5 << 15) | (0b011 << 12) | (1 << 7) | 0b1010111;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_vector_arith(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "vadd.vi");

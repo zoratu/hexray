@@ -16,6 +16,7 @@ use hexray_analysis::types::Type;
 // =============================================================================
 
 /// Generate arbitrary types for testing.
+#[allow(dead_code)]
 fn arb_type() -> impl Strategy<Value = Type> {
     let leaf = prop_oneof![
         Just(Type::Unknown),
@@ -26,8 +27,7 @@ fn arb_type() -> impl Strategy<Value = Type> {
         (prop::sample::select(vec![1u8, 2, 4, 8]), prop::bool::ANY)
             .prop_map(|(size, signed)| Type::Int { size, signed }),
         // Float types
-        prop::sample::select(vec![4u8, 8, 16])
-            .prop_map(|size| Type::Float { size }),
+        prop::sample::select(vec![4u8, 8, 16]).prop_map(|size| Type::Float { size }),
     ];
 
     leaf.prop_recursive(
@@ -39,11 +39,12 @@ fn arb_type() -> impl Strategy<Value = Type> {
                 // Pointer types
                 inner.clone().prop_map(|t| Type::Pointer(Box::new(t))),
                 // Array types
-                (inner.clone(), proptest::option::of(1usize..100))
-                    .prop_map(|(elem, count)| Type::Array {
+                (inner.clone(), proptest::option::of(1usize..100)).prop_map(|(elem, count)| {
+                    Type::Array {
                         element: Box::new(elem),
                         count,
-                    }),
+                    }
+                }),
             ]
         },
     )
@@ -58,8 +59,7 @@ fn arb_simple_type() -> impl Strategy<Value = Type> {
         Just(Type::CString),
         (prop::sample::select(vec![1u8, 2, 4, 8]), prop::bool::ANY)
             .prop_map(|(size, signed)| Type::Int { size, signed }),
-        prop::sample::select(vec![4u8, 8, 16])
-            .prop_map(|size| Type::Float { size }),
+        prop::sample::select(vec![4u8, 8, 16]).prop_map(|size| Type::Float { size }),
         arb_simple_type_base().prop_map(|t| Type::Pointer(Box::new(t))),
     ]
 }
@@ -71,8 +71,7 @@ fn arb_simple_type_base() -> impl Strategy<Value = Type> {
         Just(Type::Bool),
         (prop::sample::select(vec![1u8, 2, 4, 8]), prop::bool::ANY)
             .prop_map(|(size, signed)| Type::Int { size, signed }),
-        prop::sample::select(vec![4u8, 8])
-            .prop_map(|size| Type::Float { size }),
+        prop::sample::select(vec![4u8, 8]).prop_map(|size| Type::Float { size }),
     ]
 }
 
@@ -356,7 +355,10 @@ proptest! {
 
 #[test]
 fn merge_same_int_is_identity() {
-    let t = Type::Int { size: 4, signed: true };
+    let t = Type::Int {
+        size: 4,
+        signed: true,
+    };
     assert_eq!(t.merge(&t), t);
 }
 
@@ -364,7 +366,10 @@ fn merge_same_int_is_identity() {
 fn merge_unknown_with_anything() {
     let types = vec![
         Type::Bool,
-        Type::Int { size: 4, signed: true },
+        Type::Int {
+            size: 4,
+            signed: true,
+        },
         Type::Float { size: 8 },
         Type::Pointer(Box::new(Type::Void)),
         Type::CString,
@@ -378,8 +383,14 @@ fn merge_unknown_with_anything() {
 
 #[test]
 fn merge_nested_pointers() {
-    let p1 = Type::Pointer(Box::new(Type::Pointer(Box::new(Type::Int { size: 4, signed: true }))));
-    let p2 = Type::Pointer(Box::new(Type::Pointer(Box::new(Type::Int { size: 8, signed: false }))));
+    let p1 = Type::Pointer(Box::new(Type::Pointer(Box::new(Type::Int {
+        size: 4,
+        signed: true,
+    }))));
+    let p2 = Type::Pointer(Box::new(Type::Pointer(Box::new(Type::Int {
+        size: 8,
+        signed: false,
+    }))));
 
     let merged = p1.merge(&p2);
 

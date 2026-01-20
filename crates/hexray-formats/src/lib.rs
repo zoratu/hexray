@@ -53,7 +53,8 @@ pub fn detect_format(data: &[u8]) -> BinaryType {
                     data[pe_offset + 2],
                     data[pe_offset + 3],
                 ]);
-                if pe_sig == 0x00004550 {  // "PE\0\0"
+                if pe_sig == 0x00004550 {
+                    // "PE\0\0"
                     return BinaryType::Pe;
                 }
             }

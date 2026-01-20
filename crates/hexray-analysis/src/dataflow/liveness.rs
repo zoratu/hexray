@@ -81,9 +81,7 @@ impl LivenessAnalysis {
     /// Runs the analysis and returns liveness at each block.
     ///
     /// Returns (live_in, live_out) for each block.
-    pub fn analyze(
-        cfg: &ControlFlowGraph,
-    ) -> HashMap<BasicBlockId, (LivenessFact, LivenessFact)> {
+    pub fn analyze(cfg: &ControlFlowGraph) -> HashMap<BasicBlockId, (LivenessFact, LivenessFact)> {
         let analysis = Self::new(cfg);
         DataflowSolver::solve_backward(&analysis, cfg)
     }
@@ -135,11 +133,8 @@ impl LivenessAnalysis {
     ) -> HashSet<Location> {
         let mut always_live: Option<HashSet<Location>> = None;
 
-        for (_, (live_in, live_out)) in facts {
-            let combined: HashSet<Location> = live_in.live
-                .union(&live_out.live)
-                .cloned()
-                .collect();
+        for (live_in, live_out) in facts.values() {
+            let combined: HashSet<Location> = live_in.live.union(&live_out.live).cloned().collect();
 
             always_live = Some(match always_live {
                 None => combined,
@@ -165,9 +160,7 @@ impl LivenessAnalysis {
                 let live_here = Self::at_instruction(facts, cfg, block.id, idx);
 
                 for loc in live_here.live {
-                    ranges.entry(loc)
-                        .or_default()
-                        .push((block.id, idx));
+                    ranges.entry(loc).or_default().push((block.id, idx));
                 }
             }
         }
@@ -197,10 +190,10 @@ impl DataflowAnalysis for LivenessAnalysis {
     fn transfer(
         &self,
         block_id: BasicBlockId,
-        input: &Self::Fact,  // This is live-out for backward analysis
+        input: &Self::Fact, // This is live-out for backward analysis
         _cfg: &ControlFlowGraph,
     ) -> Self::Fact {
-        let mut output = input.clone();  // Output is live-in
+        let mut output = input.clone(); // Output is live-in
 
         // Remove definitions (they're not live before the block)
         if let Some(defs) = self.def_sets.get(&block_id) {
@@ -218,20 +211,29 @@ impl DataflowAnalysis for LivenessAnalysis {
     }
 
     fn is_forward(&self) -> bool {
-        false  // Backward analysis
+        false // Backward analysis
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, ControlFlowGraph, Instruction, Operation, Operand, Register, RegisterClass, BlockTerminator, Architecture};
+    use hexray_core::{
+        Architecture, BasicBlock, BlockTerminator, ControlFlowGraph, Instruction, Operand,
+        Operation, Register, RegisterClass,
+    };
 
     fn make_register(id: u16, _name: &str) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, 64)
     }
 
-    fn make_mov(addr: u64, dst_id: u16, dst_name: &str, src_id: u16, src_name: &str) -> Instruction {
+    fn make_mov(
+        addr: u64,
+        dst_id: u16,
+        dst_name: &str,
+        src_id: u16,
+        src_name: &str,
+    ) -> Instruction {
         let mut inst = Instruction::new(addr, 3, vec![0; 3], "mov");
         inst.operation = Operation::Move;
         inst.operands = vec![
@@ -242,7 +244,13 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn make_add(addr: u64, dst_id: u16, dst_name: &str, src_id: u16, src_name: &str) -> Instruction {
+    fn make_add(
+        addr: u64,
+        dst_id: u16,
+        dst_name: &str,
+        src_id: u16,
+        src_name: &str,
+    ) -> Instruction {
         let mut inst = Instruction::new(addr, 3, vec![0; 3], "add");
         inst.operation = Operation::Add;
         inst.operands = vec![
@@ -260,8 +268,8 @@ mod tests {
         let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
         let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
 
-        bb.push_instruction(make_mov(0x1000, 0, "rax", 1, "rbx"));  // rax = rbx
-        bb.push_instruction(make_mov(0x1003, 2, "rcx", 0, "rax"));  // rcx = rax
+        bb.push_instruction(make_mov(0x1000, 0, "rax", 1, "rbx")); // rax = rbx
+        bb.push_instruction(make_mov(0x1003, 2, "rcx", 0, "rax")); // rcx = rax
         bb.terminator = BlockTerminator::Return;
 
         cfg.add_block(bb);
@@ -270,7 +278,7 @@ mod tests {
         let (live_in, _) = &facts[&BasicBlockId::new(0)];
 
         // At entry, rbx should be live (it's used before being defined)
-        assert!(live_in.is_live(&Location::Register(1)));  // rbx
+        assert!(live_in.is_live(&Location::Register(1))); // rbx
 
         // rax should not be live at entry (it's defined before use)
         assert!(!live_in.is_live(&Location::Register(0)));
@@ -287,7 +295,11 @@ mod tests {
         inst1.operation = Operation::Move;
         inst1.operands = vec![
             Operand::Register(make_register(0, "rax")),
-            Operand::Immediate(hexray_core::Immediate { value: 1, size: 8, signed: false }),
+            Operand::Immediate(hexray_core::Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb0.push_instruction(inst1);
         bb0.terminator = BlockTerminator::Jump {
@@ -324,7 +336,11 @@ mod tests {
         inst.operation = Operation::Move;
         inst.operands = vec![
             Operand::Register(make_register(0, "rax")),
-            Operand::Immediate(hexray_core::Immediate { value: 1, size: 8, signed: false }),
+            Operand::Immediate(hexray_core::Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst);
         bb.terminator = BlockTerminator::Return;

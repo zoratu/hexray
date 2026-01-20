@@ -59,9 +59,9 @@ pub struct Lsda {
 impl Lsda {
     /// Finds the landing pad for a given PC address.
     pub fn find_landing_pad(&self, pc: u64) -> Option<&CallSite> {
-        self.call_sites.iter().find(|site| {
-            pc >= site.start && pc < site.start + site.length
-        })
+        self.call_sites
+            .iter()
+            .find(|site| pc >= site.start && pc < site.start + site.length)
     }
 
     /// Gets exception types caught at a landing pad.
@@ -97,7 +97,7 @@ impl Lsda {
             }
             // next_action is a byte offset, but we indexed actions sequentially
             // This is a simplification - proper handling needs byte offset tracking
-            current = (current as i64 + action.next_action as i64) as usize;
+            current = (current as i64 + action.next_action) as usize;
             if current == 0 || current > self.actions.len() {
                 break;
             }
@@ -178,7 +178,7 @@ const DW_EH_PE_pcrel: u8 = 0x10;
 const DW_EH_PE_textrel: u8 = 0x20;
 const DW_EH_PE_datarel: u8 = 0x30;
 const DW_EH_PE_funcrel: u8 = 0x40;
-const DW_EH_PE_aligned: u8 = 0x50;
+const _DW_EH_PE_aligned: u8 = 0x50;
 const DW_EH_PE_indirect: u8 = 0x80;
 
 /// Parser for LSDA data.
@@ -389,13 +389,11 @@ impl<'a> LsdaParser<'a> {
         *offset += 8;
         Ok(if self.big_endian {
             u64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ])
         } else {
             u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ])
         })
     }
@@ -458,7 +456,9 @@ impl<'a> LsdaParser<'a> {
             0 => 0i64, // Absolute
             DW_EH_PE_pcrel => {
                 // PC-relative: relative to current position in LSDA
-                (self.lsda_addr + (*offset as u64).saturating_sub(self.encoded_size(encoding) as u64)) as i64
+                (self.lsda_addr
+                    + (*offset as u64).saturating_sub(self.encoded_size(encoding) as u64))
+                    as i64
             }
             DW_EH_PE_funcrel => self.func_start as i64,
             DW_EH_PE_datarel | DW_EH_PE_textrel => {
@@ -573,9 +573,9 @@ impl ExceptionHandlingInfo {
                         .collect();
 
                     // Check if any handler is not just cleanup
-                    let has_catch = handlers.iter().any(|h| {
-                        !matches!(h.catch_type, CatchType::Cleanup)
-                    });
+                    let has_catch = handlers
+                        .iter()
+                        .any(|h| !matches!(h.catch_type, CatchType::Cleanup));
 
                     if has_catch {
                         info.try_blocks.push(TryBlock {

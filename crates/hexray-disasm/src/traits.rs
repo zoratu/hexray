@@ -22,7 +22,11 @@ pub trait Disassembler {
     ///
     /// # Returns
     /// The decoded instruction and the number of bytes consumed.
-    fn decode_instruction(&self, bytes: &[u8], address: u64) -> Result<DecodedInstruction, DecodeError>;
+    fn decode_instruction(
+        &self,
+        bytes: &[u8],
+        address: u64,
+    ) -> Result<DecodedInstruction, DecodeError>;
 
     /// Returns the minimum instruction size for this architecture.
     fn min_instruction_size(&self) -> usize;
@@ -37,7 +41,11 @@ pub trait Disassembler {
     fn architecture(&self) -> Architecture;
 
     /// Disassemble a block of code into instructions.
-    fn disassemble_block(&self, bytes: &[u8], start_address: u64) -> Vec<Result<Instruction, DecodeError>> {
+    fn disassemble_block(
+        &self,
+        bytes: &[u8],
+        start_address: u64,
+    ) -> Vec<Result<Instruction, DecodeError>> {
         let mut instructions = Vec::new();
         let mut offset = 0;
 

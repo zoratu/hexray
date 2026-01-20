@@ -20,7 +20,7 @@ pub mod arm64;
 pub mod riscv;
 
 pub use error::DecodeError;
-pub use traits::{Disassembler, DecodedInstruction};
+pub use traits::{DecodedInstruction, Disassembler};
 
 #[cfg(feature = "x86_64")]
 pub use x86_64::X86_64Disassembler;

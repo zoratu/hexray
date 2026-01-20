@@ -78,7 +78,10 @@ impl ControlFlowGraph {
 
     /// Returns the successors of a block.
     pub fn successors(&self, id: BasicBlockId) -> &[BasicBlockId] {
-        self.successors.get(&id).map(|v| v.as_slice()).unwrap_or(&[])
+        self.successors
+            .get(&id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Returns the predecessors of a block.
@@ -164,7 +167,11 @@ impl ControlFlowGraph {
         DominatorTree::compute(self)
     }
 
-    fn collect_loop_body(&self, header: BasicBlockId, back_edge: BasicBlockId) -> Vec<BasicBlockId> {
+    fn collect_loop_body(
+        &self,
+        header: BasicBlockId,
+        back_edge: BasicBlockId,
+    ) -> Vec<BasicBlockId> {
         let mut body = vec![header];
         let mut worklist = vec![back_edge];
         let mut visited = std::collections::HashSet::new();
@@ -266,8 +273,12 @@ impl DominatorTree {
         mut b1: BasicBlockId,
         mut b2: BasicBlockId,
     ) -> BasicBlockId {
-        let rpo_number: IndexMap<BasicBlockId, usize> =
-            rpo.iter().copied().enumerate().map(|(i, b)| (b, i)).collect();
+        let rpo_number: IndexMap<BasicBlockId, usize> = rpo
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, b)| (b, i))
+            .collect();
 
         while b1 != b2 {
             while rpo_number.get(&b1) > rpo_number.get(&b2) {

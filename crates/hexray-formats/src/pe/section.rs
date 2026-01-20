@@ -1,7 +1,9 @@
 //! PE section parsing.
 
+use super::header::{
+    IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+};
 use crate::ParseError;
-use super::header::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE};
 
 /// Section header size
 pub const SECTION_HEADER_SIZE: usize = 40;

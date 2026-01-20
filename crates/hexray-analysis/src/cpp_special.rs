@@ -37,8 +37,8 @@
 //! }
 //! ```
 
+use hexray_core::{ControlFlowGraph, Instruction, Operand, Operation, Register};
 use std::collections::{HashMap, HashSet};
-use hexray_core::{ControlFlowGraph, Instruction, Operation, Operand, Register};
 
 /// Kind of C++ special member function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,11 +71,20 @@ impl SpecialMemberKind {
     /// Returns a human-readable description.
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Constructor { is_complete: true, .. } => "complete object constructor",
-            Self::Constructor { is_complete: false, is_allocating: true } => "allocating constructor",
+            Self::Constructor {
+                is_complete: true, ..
+            } => "complete object constructor",
+            Self::Constructor {
+                is_complete: false,
+                is_allocating: true,
+            } => "allocating constructor",
             Self::Constructor { .. } => "base object constructor",
-            Self::Destructor { is_deleting: true, .. } => "deleting destructor",
-            Self::Destructor { is_complete: true, .. } => "complete object destructor",
+            Self::Destructor {
+                is_deleting: true, ..
+            } => "deleting destructor",
+            Self::Destructor {
+                is_complete: true, ..
+            } => "complete object destructor",
             Self::Destructor { .. } => "base object destructor",
             Self::CopyConstructor => "copy constructor",
             Self::MoveConstructor => "move constructor",
@@ -162,10 +171,7 @@ impl CppSpecialDetector {
     }
 
     /// Adds known vtable-to-class mappings.
-    pub fn with_vtable_classes(
-        mut self,
-        vtables: impl IntoIterator<Item = (u64, String)>,
-    ) -> Self {
+    pub fn with_vtable_classes(mut self, vtables: impl IntoIterator<Item = (u64, String)>) -> Self {
         self.vtable_classes.extend(vtables);
         self
     }
@@ -313,13 +319,14 @@ impl CppSpecialDetector {
 
             // Heuristic: if vtable is at offset 0 and early in function, likely constructor
             // If vtable is at offset 0 and late in function (after cleanup), likely destructor
-            let first_vtable_pos = instructions
-                .iter()
-                .position(|i| {
-                    result.vtable_assignments.iter().any(|va| va.instruction_addr == i.address)
-                });
+            let first_vtable_pos = instructions.iter().position(|i| {
+                result
+                    .vtable_assignments
+                    .iter()
+                    .any(|va| va.instruction_addr == i.address)
+            });
 
-            let is_early = first_vtable_pos.map_or(false, |pos| pos < instructions.len() / 3);
+            let is_early = first_vtable_pos.is_some_and(|pos| pos < instructions.len() / 3);
 
             if is_early {
                 result.kind = Some(SpecialMemberKind::Constructor {
@@ -327,14 +334,18 @@ impl CppSpecialDetector {
                     is_allocating: false,
                 });
                 result.confidence = 0.6;
-                result.notes.push("Vtable assignment early in function".to_string());
+                result
+                    .notes
+                    .push("Vtable assignment early in function".to_string());
             } else {
                 result.kind = Some(SpecialMemberKind::Destructor {
                     is_deleting: false,
                     is_complete: !has_multiple_vtables,
                 });
                 result.confidence = 0.5;
-                result.notes.push("Vtable assignment late in function".to_string());
+                result
+                    .notes
+                    .push("Vtable assignment late in function".to_string());
             }
 
             // Try to get class name from vtable
@@ -351,14 +362,21 @@ impl CppSpecialDetector {
         // Adjust confidence based on additional evidence
         if !result.base_calls.is_empty() {
             result.confidence = (result.confidence + 0.1).min(1.0);
-            result.notes.push(format!("Found {} base class call(s)", result.base_calls.len()));
+            result.notes.push(format!(
+                "Found {} base class call(s)",
+                result.base_calls.len()
+            ));
         }
 
         result
     }
 
     /// Finds vtable pointer assignments in instructions.
-    fn find_vtable_assignments(&self, instructions: &[Instruction], result: &mut SpecialMemberAnalysis) {
+    fn find_vtable_assignments(
+        &self,
+        instructions: &[Instruction],
+        result: &mut SpecialMemberAnalysis,
+    ) {
         for instr in instructions {
             // Look for: mov [reg], imm  or  mov [reg+offset], imm
             // where imm looks like a vtable address
@@ -381,7 +399,7 @@ impl CppSpecialDetector {
                         continue; // Skip indexed memory (like [rax + rcx*8])
                     }
                     if let Some(ref reg) = mem.base {
-                        (reg.clone(), mem.displacement)
+                        (*reg, mem.displacement)
                     } else {
                         continue;
                     }
@@ -408,7 +426,9 @@ impl CppSpecialDetector {
             }
 
             // Either we know this vtable, or it looks like a reasonable address
-            if self.vtable_classes.contains_key(&vtable_addr) || self.looks_like_vtable_addr(vtable_addr) {
+            if self.vtable_classes.contains_key(&vtable_addr)
+                || self.looks_like_vtable_addr(vtable_addr)
+            {
                 result.vtable_assignments.push(VtableAssignment {
                     instruction_addr: instr.address,
                     vtable_addr,
@@ -471,7 +491,7 @@ impl CppSpecialDetector {
         // - PIE/ASLR: higher addresses
 
         // Basic sanity: non-zero, reasonable range
-        addr >= 0x1000 && addr < 0x7fff_ffff_ffff_ffff
+        (0x1000..0x7fff_ffff_ffff_ffff).contains(&addr)
     }
 }
 
@@ -500,16 +520,24 @@ impl CppSpecialDatabase {
             let class_name = analysis.class_name.clone();
 
             match kind {
-                SpecialMemberKind::Constructor { .. } | SpecialMemberKind::CopyConstructor | SpecialMemberKind::MoveConstructor => {
+                SpecialMemberKind::Constructor { .. }
+                | SpecialMemberKind::CopyConstructor
+                | SpecialMemberKind::MoveConstructor => {
                     self.constructors.insert(func_addr, analysis);
                     if let Some(name) = class_name {
-                        self.class_constructors.entry(name).or_default().push(func_addr);
+                        self.class_constructors
+                            .entry(name)
+                            .or_default()
+                            .push(func_addr);
                     }
                 }
                 SpecialMemberKind::Destructor { .. } => {
                     self.destructors.insert(func_addr, analysis);
                     if let Some(name) = class_name {
-                        self.class_destructors.entry(name).or_default().push(func_addr);
+                        self.class_destructors
+                            .entry(name)
+                            .or_default()
+                            .push(func_addr);
                     }
                 }
                 _ => {}
@@ -531,7 +559,12 @@ impl CppSpecialDatabase {
     pub fn constructors_for_class(&self, class_name: &str) -> Vec<&SpecialMemberAnalysis> {
         self.class_constructors
             .get(class_name)
-            .map(|addrs| addrs.iter().filter_map(|a| self.constructors.get(a)).collect())
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .filter_map(|a| self.constructors.get(a))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -539,7 +572,12 @@ impl CppSpecialDatabase {
     pub fn destructors_for_class(&self, class_name: &str) -> Vec<&SpecialMemberAnalysis> {
         self.class_destructors
             .get(class_name)
-            .map(|addrs| addrs.iter().filter_map(|a| self.destructors.get(a)).collect())
+            .map(|addrs| {
+                addrs
+                    .iter()
+                    .filter_map(|a| self.destructors.get(a))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -577,13 +615,25 @@ mod tests {
         assert!(result.is_some());
         let (kind, name) = result.unwrap();
         assert_eq!(name, "Shape");
-        assert!(matches!(kind, SpecialMemberKind::Constructor { is_complete: true, .. }));
+        assert!(matches!(
+            kind,
+            SpecialMemberKind::Constructor {
+                is_complete: true,
+                ..
+            }
+        ));
 
         // Base object constructor
         let result = detector.analyze_symbol("_ZN5ShapeC2Ev");
         assert!(result.is_some());
         let (kind, _) = result.unwrap();
-        assert!(matches!(kind, SpecialMemberKind::Constructor { is_complete: false, .. }));
+        assert!(matches!(
+            kind,
+            SpecialMemberKind::Constructor {
+                is_complete: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -595,19 +645,37 @@ mod tests {
         assert!(result.is_some());
         let (kind, name) = result.unwrap();
         assert_eq!(name, "Shape");
-        assert!(matches!(kind, SpecialMemberKind::Destructor { is_deleting: true, .. }));
+        assert!(matches!(
+            kind,
+            SpecialMemberKind::Destructor {
+                is_deleting: true,
+                ..
+            }
+        ));
 
         // Complete object destructor
         let result = detector.analyze_symbol("_ZN5ShapeD1Ev");
         assert!(result.is_some());
         let (kind, _) = result.unwrap();
-        assert!(matches!(kind, SpecialMemberKind::Destructor { is_complete: true, .. }));
+        assert!(matches!(
+            kind,
+            SpecialMemberKind::Destructor {
+                is_complete: true,
+                ..
+            }
+        ));
 
         // Base object destructor
         let result = detector.analyze_symbol("_ZN5ShapeD2Ev");
         assert!(result.is_some());
         let (kind, _) = result.unwrap();
-        assert!(matches!(kind, SpecialMemberKind::Destructor { is_complete: false, is_deleting: false }));
+        assert!(matches!(
+            kind,
+            SpecialMemberKind::Destructor {
+                is_complete: false,
+                is_deleting: false
+            }
+        ));
     }
 
     #[test]
@@ -637,11 +705,19 @@ mod tests {
     #[test]
     fn test_special_member_kind_description() {
         assert_eq!(
-            SpecialMemberKind::Constructor { is_complete: true, is_allocating: false }.description(),
+            SpecialMemberKind::Constructor {
+                is_complete: true,
+                is_allocating: false
+            }
+            .description(),
             "complete object constructor"
         );
         assert_eq!(
-            SpecialMemberKind::Destructor { is_deleting: true, is_complete: false }.description(),
+            SpecialMemberKind::Destructor {
+                is_deleting: true,
+                is_complete: false
+            }
+            .description(),
             "deleting destructor"
         );
     }

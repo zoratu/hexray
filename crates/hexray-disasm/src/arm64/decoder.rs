@@ -2,14 +2,13 @@
 
 #![allow(unused_variables)]
 
-use crate::{DecodeError, DecodedInstruction, Disassembler};
-use hexray_core::{
-    Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand, Operation,
-    Register, RegisterClass,
-    register::arm64,
-};
 use super::sme::SmeDecoder;
 use super::sve::SveDecoder;
+use crate::{DecodeError, DecodedInstruction, Disassembler};
+use hexray_core::{
+    register::arm64, Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand,
+    Operation, Register, RegisterClass,
+};
 
 /// ARM64 disassembler.
 pub struct Arm64Disassembler {
@@ -231,7 +230,10 @@ impl Arm64Disassembler {
                         Operand::pc_rel(imm - address as i64, imm as u64),
                     ]);
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Add/subtract immediate
@@ -250,18 +252,50 @@ impl Arm64Disassembler {
                     // CMP/CMN (comparing with zero register)
                     // Rn can be SP (register 31 = SP in CMP/CMN)
                     let mnemonic = if is_sub { "cmp" } else { "cmn" };
-                    let reg = if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) };
-                    (mnemonic, vec![Operand::reg(reg), Operand::imm_unsigned(imm, 64)], Operation::Compare)
+                    let reg = if is_64bit {
+                        Self::xreg_sp(rn)
+                    } else {
+                        Self::wreg_sp(rn)
+                    };
+                    (
+                        mnemonic,
+                        vec![Operand::reg(reg), Operand::imm_unsigned(imm, 64)],
+                        Operation::Compare,
+                    )
                 } else if !set_flags && is_sub && rn == 31 {
                     // MOV (from SP) - sub from SP with 0
                     // Without flags, register 31 = SP for both Rd and Rn
-                    let dst = if is_64bit { Self::xreg_sp(rd) } else { Self::wreg_sp(rd) };
-                    let src = if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) };
+                    let dst = if is_64bit {
+                        Self::xreg_sp(rd)
+                    } else {
+                        Self::wreg_sp(rd)
+                    };
+                    let src = if is_64bit {
+                        Self::xreg_sp(rn)
+                    } else {
+                        Self::wreg_sp(rn)
+                    };
                     if imm == 0 {
-                        ("mov", vec![Operand::reg(dst), Operand::reg(src)], Operation::Move)
+                        (
+                            "mov",
+                            vec![Operand::reg(dst), Operand::reg(src)],
+                            Operation::Move,
+                        )
                     } else {
                         let mnemonic = if is_sub { "sub" } else { "add" };
-                        (mnemonic, vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(imm, 64)], if is_sub { Operation::Sub } else { Operation::Add })
+                        (
+                            mnemonic,
+                            vec![
+                                Operand::reg(dst),
+                                Operand::reg(src),
+                                Operand::imm_unsigned(imm, 64),
+                            ],
+                            if is_sub {
+                                Operation::Sub
+                            } else {
+                                Operation::Add
+                            },
+                        )
                     }
                 } else {
                     let mnemonic = match (is_sub, set_flags) {
@@ -274,23 +308,54 @@ impl Arm64Disassembler {
                     // With flags (S=1): Rd uses ZR, Rn uses SP
                     let (dst, src) = if set_flags {
                         (
-                            if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) },
-                            if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) },
+                            if is_64bit {
+                                Self::xreg(rd)
+                            } else {
+                                Self::wreg(rd)
+                            },
+                            if is_64bit {
+                                Self::xreg_sp(rn)
+                            } else {
+                                Self::wreg_sp(rn)
+                            },
                         )
                     } else {
                         (
-                            if is_64bit { Self::xreg_sp(rd) } else { Self::wreg_sp(rd) },
-                            if is_64bit { Self::xreg_sp(rn) } else { Self::wreg_sp(rn) },
+                            if is_64bit {
+                                Self::xreg_sp(rd)
+                            } else {
+                                Self::wreg_sp(rd)
+                            },
+                            if is_64bit {
+                                Self::xreg_sp(rn)
+                            } else {
+                                Self::wreg_sp(rn)
+                            },
                         )
                     };
-                    (mnemonic, vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(imm, 64)], if is_sub { Operation::Sub } else { Operation::Add })
+                    (
+                        mnemonic,
+                        vec![
+                            Operand::reg(dst),
+                            Operand::reg(src),
+                            Operand::imm_unsigned(imm, 64),
+                        ],
+                        if is_sub {
+                            Operation::Sub
+                        } else {
+                            Operation::Add
+                        },
+                    )
                 };
 
                 let inst = Instruction::new(address, 4, bytes, mnemonic)
                     .with_operation(operation)
                     .with_operands(operands);
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Logical immediate
@@ -315,16 +380,36 @@ impl Arm64Disassembler {
 
                 let operands = if set_flags && rd == 31 {
                     // TST alias
-                    let reg = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                    let reg = if is_64bit {
+                        Self::xreg(rn)
+                    } else {
+                        Self::wreg(rn)
+                    };
                     vec![Operand::reg(reg), Operand::imm_unsigned(imm, 64)]
                 } else if opc == 0b01 && rn == 31 {
                     // MOV (bitmask immediate) alias
-                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                    let dst = if is_64bit {
+                        Self::xreg(rd)
+                    } else {
+                        Self::wreg(rd)
+                    };
                     vec![Operand::reg(dst), Operand::imm_unsigned(imm, 64)]
                 } else {
-                    let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
-                    let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
-                    vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(imm, 64)]
+                    let dst = if is_64bit {
+                        Self::xreg(rd)
+                    } else {
+                        Self::wreg(rd)
+                    };
+                    let src = if is_64bit {
+                        Self::xreg(rn)
+                    } else {
+                        Self::wreg(rn)
+                    };
+                    vec![
+                        Operand::reg(dst),
+                        Operand::reg(src),
+                        Operand::imm_unsigned(imm, 64),
+                    ]
                 };
 
                 let final_mnemonic = if set_flags && rd == 31 {
@@ -336,10 +421,19 @@ impl Arm64Disassembler {
                 };
 
                 let inst = Instruction::new(address, 4, bytes, final_mnemonic)
-                    .with_operation(if final_mnemonic == "tst" { Operation::Test } else if final_mnemonic == "mov" { Operation::Move } else { operation })
+                    .with_operation(if final_mnemonic == "tst" {
+                        Operation::Test
+                    } else if final_mnemonic == "mov" {
+                        Operation::Move
+                    } else {
+                        operation
+                    })
                     .with_operands(operands);
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Move wide immediate (MOVN, MOVZ, MOVK)
@@ -360,22 +454,42 @@ impl Arm64Disassembler {
                 // Check for MOV alias (MOVZ with no shift, or MOVN producing simple value)
                 let is_mov_alias = opc == 0b10 && hw == 0;
 
-                let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
+                let dst = if is_64bit {
+                    Self::xreg(rd)
+                } else {
+                    Self::wreg(rd)
+                };
                 let shifted_imm = imm16 << shift;
 
                 let (final_mnemonic, operands) = if is_mov_alias {
-                    ("mov", vec![Operand::reg(dst), Operand::imm_unsigned(imm16, 64)])
+                    (
+                        "mov",
+                        vec![Operand::reg(dst), Operand::imm_unsigned(imm16, 64)],
+                    )
                 } else if shift > 0 {
-                    (mnemonic, vec![Operand::reg(dst), Operand::imm_unsigned(imm16, 16), Operand::imm_unsigned(shift as u64, 8)])
+                    (
+                        mnemonic,
+                        vec![
+                            Operand::reg(dst),
+                            Operand::imm_unsigned(imm16, 16),
+                            Operand::imm_unsigned(shift as u64, 8),
+                        ],
+                    )
                 } else {
-                    (mnemonic, vec![Operand::reg(dst), Operand::imm_unsigned(shifted_imm, 64)])
+                    (
+                        mnemonic,
+                        vec![Operand::reg(dst), Operand::imm_unsigned(shifted_imm, 64)],
+                    )
                 };
 
                 let inst = Instruction::new(address, 4, bytes, final_mnemonic)
                     .with_operation(operation)
                     .with_operands(operands);
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Bitfield (BFM, SBFM, UBFM)
@@ -387,8 +501,16 @@ impl Arm64Disassembler {
                 let opc = (insn >> 29) & 0x3;
 
                 let reg_size = if is_64bit { 64 } else { 32 };
-                let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
-                let src = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
+                let dst = if is_64bit {
+                    Self::xreg(rd)
+                } else {
+                    Self::wreg(rd)
+                };
+                let src = if is_64bit {
+                    Self::xreg(rn)
+                } else {
+                    Self::wreg(rn)
+                };
 
                 // Check for common aliases
                 let (mnemonic, operands) = match opc {
@@ -396,7 +518,14 @@ impl Arm64Disassembler {
                         // SBFM aliases
                         if imms == reg_size - 1 {
                             // ASR
-                            ("asr", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8)])
+                            (
+                                "asr",
+                                vec![
+                                    Operand::reg(dst),
+                                    Operand::reg(src),
+                                    Operand::imm_unsigned(immr as u64, 8),
+                                ],
+                            )
                         } else if immr == 0 && imms == 7 {
                             ("sxtb", vec![Operand::reg(dst), Operand::reg(src)])
                         } else if immr == 0 && imms == 15 {
@@ -404,28 +533,66 @@ impl Arm64Disassembler {
                         } else if immr == 0 && imms == 31 {
                             ("sxtw", vec![Operand::reg(dst), Operand::reg(src)])
                         } else {
-                            ("sbfm", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8), Operand::imm_unsigned(imms as u64, 8)])
+                            (
+                                "sbfm",
+                                vec![
+                                    Operand::reg(dst),
+                                    Operand::reg(src),
+                                    Operand::imm_unsigned(immr as u64, 8),
+                                    Operand::imm_unsigned(imms as u64, 8),
+                                ],
+                            )
                         }
                     }
                     0b01 => {
                         // BFM - bit field move
-                        ("bfm", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8), Operand::imm_unsigned(imms as u64, 8)])
+                        (
+                            "bfm",
+                            vec![
+                                Operand::reg(dst),
+                                Operand::reg(src),
+                                Operand::imm_unsigned(immr as u64, 8),
+                                Operand::imm_unsigned(imms as u64, 8),
+                            ],
+                        )
                     }
                     0b10 => {
                         // UBFM aliases
                         if imms + 1 == immr {
                             // LSL
                             let shift = reg_size.wrapping_sub(immr) & (reg_size - 1);
-                            ("lsl", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(shift as u64, 8)])
+                            (
+                                "lsl",
+                                vec![
+                                    Operand::reg(dst),
+                                    Operand::reg(src),
+                                    Operand::imm_unsigned(shift as u64, 8),
+                                ],
+                            )
                         } else if imms == reg_size - 1 {
                             // LSR
-                            ("lsr", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8)])
+                            (
+                                "lsr",
+                                vec![
+                                    Operand::reg(dst),
+                                    Operand::reg(src),
+                                    Operand::imm_unsigned(immr as u64, 8),
+                                ],
+                            )
                         } else if immr == 0 && imms == 7 {
                             ("uxtb", vec![Operand::reg(dst), Operand::reg(src)])
                         } else if immr == 0 && imms == 15 {
                             ("uxth", vec![Operand::reg(dst), Operand::reg(src)])
                         } else {
-                            ("ubfm", vec![Operand::reg(dst), Operand::reg(src), Operand::imm_unsigned(immr as u64, 8), Operand::imm_unsigned(imms as u64, 8)])
+                            (
+                                "ubfm",
+                                vec![
+                                    Operand::reg(dst),
+                                    Operand::reg(src),
+                                    Operand::imm_unsigned(immr as u64, 8),
+                                    Operand::imm_unsigned(imms as u64, 8),
+                                ],
+                            )
                         }
                     }
                     _ => return self.decode_unknown(insn, address, bytes),
@@ -442,7 +609,10 @@ impl Arm64Disassembler {
                     .with_operation(operation)
                     .with_operands(operands);
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Extract
@@ -452,22 +622,56 @@ impl Arm64Disassembler {
                 let rm = ((insn >> 16) & 0x1F) as u16;
                 let imms = ((insn >> 10) & 0x3F) as u8;
 
-                let dst = if is_64bit { Self::xreg(rd) } else { Self::wreg(rd) };
-                let src1 = if is_64bit { Self::xreg(rn) } else { Self::wreg(rn) };
-                let src2 = if is_64bit { Self::xreg(rm) } else { Self::wreg(rm) };
+                let dst = if is_64bit {
+                    Self::xreg(rd)
+                } else {
+                    Self::wreg(rd)
+                };
+                let src1 = if is_64bit {
+                    Self::xreg(rn)
+                } else {
+                    Self::wreg(rn)
+                };
+                let src2 = if is_64bit {
+                    Self::xreg(rm)
+                } else {
+                    Self::wreg(rm)
+                };
 
                 let (mnemonic, operands) = if rn == rm {
                     // ROR alias
-                    ("ror", vec![Operand::reg(dst), Operand::reg(src1), Operand::imm_unsigned(imms as u64, 8)])
+                    (
+                        "ror",
+                        vec![
+                            Operand::reg(dst),
+                            Operand::reg(src1),
+                            Operand::imm_unsigned(imms as u64, 8),
+                        ],
+                    )
                 } else {
-                    ("extr", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::imm_unsigned(imms as u64, 8)])
+                    (
+                        "extr",
+                        vec![
+                            Operand::reg(dst),
+                            Operand::reg(src1),
+                            Operand::reg(src2),
+                            Operand::imm_unsigned(imms as u64, 8),
+                        ],
+                    )
                 };
 
                 let inst = Instruction::new(address, 4, bytes, mnemonic)
-                    .with_operation(if mnemonic == "ror" { Operation::Ror } else { Operation::Other(0) })
+                    .with_operation(if mnemonic == "ror" {
+                        Operation::Ror
+                    } else {
+                        Operation::Other(0)
+                    })
                     .with_operands(operands);
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             _ => self.decode_unknown(insn, address, bytes),
@@ -494,17 +698,27 @@ impl Arm64Disassembler {
 
                 let mnemonic = if is_bl { "bl" } else { "b" };
                 let cf = if is_bl {
-                    ControlFlow::Call { target, return_addr: address + 4 }
+                    ControlFlow::Call {
+                        target,
+                        return_addr: address + 4,
+                    }
                 } else {
                     ControlFlow::UnconditionalBranch { target }
                 };
 
                 let inst = Instruction::new(address, 4, bytes, mnemonic)
-                    .with_operation(if is_bl { Operation::Call } else { Operation::Jump })
+                    .with_operation(if is_bl {
+                        Operation::Call
+                    } else {
+                        Operation::Jump
+                    })
                     .with_operand(Operand::pc_rel(offset, target))
                     .with_control_flow(cf);
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Compare and branch
@@ -518,7 +732,11 @@ impl Arm64Disassembler {
 
                 let mnemonic = if is_cbnz { "cbnz" } else { "cbz" };
                 let reg = if sf { Self::xreg(rt) } else { Self::wreg(rt) };
-                let condition = if is_cbnz { Condition::NotEqual } else { Condition::Equal };
+                let condition = if is_cbnz {
+                    Condition::NotEqual
+                } else {
+                    Condition::Equal
+                };
 
                 let inst = Instruction::new(address, 4, bytes, mnemonic)
                     .with_operation(Operation::ConditionalJump)
@@ -529,7 +747,10 @@ impl Arm64Disassembler {
                         fallthrough: address + 4,
                     });
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Test and branch
@@ -545,8 +766,16 @@ impl Arm64Disassembler {
 
                 let mnemonic = if is_tbnz { "tbnz" } else { "tbz" };
                 let is_64bit = b5 == 1;
-                let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
-                let condition = if is_tbnz { Condition::NotEqual } else { Condition::Equal };
+                let reg = if is_64bit {
+                    Self::xreg(rt)
+                } else {
+                    Self::wreg(rt)
+                };
+                let condition = if is_tbnz {
+                    Condition::NotEqual
+                } else {
+                    Condition::Equal
+                };
 
                 let inst = Instruction::new(address, 4, bytes, mnemonic)
                     .with_operation(Operation::ConditionalJump)
@@ -561,7 +790,10 @@ impl Arm64Disassembler {
                         fallthrough: address + 4,
                     });
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Conditional branch
@@ -583,7 +815,10 @@ impl Arm64Disassembler {
                         fallthrough: address + 4,
                     });
 
-                Ok(DecodedInstruction { instruction: inst, size: 4 })
+                Ok(DecodedInstruction {
+                    instruction: inst,
+                    size: 4,
+                })
             }
 
             // Misc branches / system instructions
@@ -605,8 +840,20 @@ impl Arm64Disassembler {
                     let rn = ((insn >> 5) & 0x1F) as u16;
 
                     let (mnemonic, operation, cf) = match opc {
-                        0b000 => ("br", Operation::Jump, ControlFlow::IndirectBranch { possible_targets: vec![] }),
-                        0b001 => ("blr", Operation::Call, ControlFlow::IndirectCall { return_addr: address + 4 }),
+                        0b000 => (
+                            "br",
+                            Operation::Jump,
+                            ControlFlow::IndirectBranch {
+                                possible_targets: vec![],
+                            },
+                        ),
+                        0b001 => (
+                            "blr",
+                            Operation::Call,
+                            ControlFlow::IndirectCall {
+                                return_addr: address + 4,
+                            },
+                        ),
                         0b010 => ("ret", Operation::Return, ControlFlow::Return),
                         _ => return self.decode_unknown(insn, address, bytes),
                     };
@@ -623,7 +870,10 @@ impl Arm64Disassembler {
                         .with_operands(operands)
                         .with_control_flow(cf);
 
-                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                    Ok(DecodedInstruction {
+                        instruction: inst,
+                        size: 4,
+                    })
                 } else if bit25 == 0 && bit24 == 0 {
                     // Exception generating: SVC, HVC, SMC, BRK, HLT (0xD4xxxxxx)
                     let opc = (insn >> 21) & 0x7;
@@ -639,11 +889,18 @@ impl Arm64Disassembler {
                     };
 
                     let inst = Instruction::new(address, 4, bytes, mnemonic)
-                        .with_operation(if opc == 0 { Operation::Syscall } else { Operation::Halt })
+                        .with_operation(if opc == 0 {
+                            Operation::Syscall
+                        } else {
+                            Operation::Halt
+                        })
                         .with_operand(Operand::imm_unsigned(imm16, 16))
                         .with_control_flow(cf);
 
-                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                    Ok(DecodedInstruction {
+                        instruction: inst,
+                        size: 4,
+                    })
                 } else if bit25 == 0 && bit24 == 1 && op1_24_21 == 0b0011 {
                     // Hints: NOP, YIELD, WFE, WFI, SEV, SEVL (0xD503xxxx)
                     let crm = (insn >> 8) & 0xF;
@@ -666,7 +923,10 @@ impl Arm64Disassembler {
                     let inst = Instruction::new(address, 4, bytes, mnemonic)
                         .with_operation(Operation::Nop);
 
-                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                    Ok(DecodedInstruction {
+                        instruction: inst,
+                        size: 4,
+                    })
                 } else if bit25 == 0 && bit24 == 1 && op1_24_21 == 0b0100 {
                     // Barriers: DSB, DMB, ISB, CLREX (0xD503xxxx)
                     let op2 = (insn >> 5) & 0x7;
@@ -682,7 +942,10 @@ impl Arm64Disassembler {
                     let inst = Instruction::new(address, 4, bytes, mnemonic)
                         .with_operation(Operation::Other(0));
 
-                    Ok(DecodedInstruction { instruction: inst, size: 4 })
+                    Ok(DecodedInstruction {
+                        instruction: inst,
+                        size: 4,
+                    })
                 } else {
                     // Other system instructions: MSR, MRS, SYS, SYSL
                     self.decode_system_insn(insn, address, bytes)
@@ -719,10 +982,12 @@ impl Arm64Disassembler {
                 _ => return self.decode_unknown(insn, address, bytes),
             };
 
-            let inst = Instruction::new(address, 4, bytes, mnemonic)
-                .with_operation(Operation::Nop);
+            let inst = Instruction::new(address, 4, bytes, mnemonic).with_operation(Operation::Nop);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // MRS (read system register)
@@ -731,7 +996,10 @@ impl Arm64Disassembler {
             let inst = Instruction::new(address, 4, bytes, "mrs")
                 .with_operation(Operation::Move)
                 .with_operand(Operand::reg(Self::xreg(rt)));
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // MSR (write system register)
@@ -739,7 +1007,10 @@ impl Arm64Disassembler {
         let inst = Instruction::new(address, 4, bytes, "msr")
             .with_operation(Operation::Move)
             .with_operand(Operand::reg(Self::xreg(rt)));
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode load/store instructions.
@@ -751,7 +1022,7 @@ impl Arm64Disassembler {
     ) -> Result<DecodedInstruction, DecodeError> {
         // ARM64 load/store encoding (bits 29-27 determine major class)
         let op_29_27 = (insn >> 27) & 0x7;
-        let v = (insn >> 26) & 1;  // SIMD/FP if set
+        let v = (insn >> 26) & 1; // SIMD/FP if set
         let op_25_23 = (insn >> 23) & 0x7;
         let op_21 = (insn >> 21) & 1;
         let op_11_10 = (insn >> 10) & 0x3;
@@ -823,7 +1094,11 @@ impl Arm64Disassembler {
         let v = (insn >> 26) & 1;
         let opc = (insn >> 22) & 0x3;
         let imm9 = ((insn >> 12) & 0x1FF) as i64;
-        let imm9 = if imm9 & 0x100 != 0 { imm9 | !0x1FF } else { imm9 }; // Sign extend
+        let imm9 = if imm9 & 0x100 != 0 {
+            imm9 | !0x1FF
+        } else {
+            imm9
+        }; // Sign extend
         let rn = ((insn >> 5) & 0x1F) as u16;
         let rt = (insn & 0x1F) as u16;
 
@@ -849,11 +1124,36 @@ impl Arm64Disassembler {
             // 00:10 = STUR Qt, 00:11 = LDUR Qt (128-bit)
             let is_load = opc & 1 != 0;
             match (size, opc) {
-                (0, 0) | (0, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 1, Some(0u32)),   // B
-                (0, 2) | (0, 3) => (if is_load { "ldur" } else { "stur" }, is_load, 16, Some(4u32)), // Q
-                (1, 0) | (1, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 2, Some(1u32)),   // H
-                (2, 0) | (2, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 4, Some(2u32)),   // S
-                (3, 0) | (3, 1) => (if is_load { "ldur" } else { "stur" }, is_load, 8, Some(3u32)),   // D
+                (0, 0) | (0, 1) => (
+                    if is_load { "ldur" } else { "stur" },
+                    is_load,
+                    1,
+                    Some(0u32),
+                ), // B
+                (0, 2) | (0, 3) => (
+                    if is_load { "ldur" } else { "stur" },
+                    is_load,
+                    16,
+                    Some(4u32),
+                ), // Q
+                (1, 0) | (1, 1) => (
+                    if is_load { "ldur" } else { "stur" },
+                    is_load,
+                    2,
+                    Some(1u32),
+                ), // H
+                (2, 0) | (2, 1) => (
+                    if is_load { "ldur" } else { "stur" },
+                    is_load,
+                    4,
+                    Some(2u32),
+                ), // S
+                (3, 0) | (3, 1) => (
+                    if is_load { "ldur" } else { "stur" },
+                    is_load,
+                    8,
+                    Some(3u32),
+                ), // D
                 _ => return self.decode_unknown(insn, address, bytes),
             }
         };
@@ -869,16 +1169,23 @@ impl Arm64Disassembler {
             (Self::simd_reg(rt, simd_size.unwrap()), Self::xreg_sp(rn))
         };
 
-        let mem = MemoryRef::base_disp(reg_base.clone(), imm9, data_size as u8);
+        let mem = MemoryRef::base_disp(reg_base, imm9, data_size as u8);
         // Use consistent operand order: [Register, Memory] for both loads and stores
         // This matches the STR/LDR unsigned immediate encoding
         let operands = vec![Operand::reg(reg_rt), Operand::Memory(mem)];
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
-            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operation(if is_load {
+                Operation::Load
+            } else {
+                Operation::Store
+            })
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode LDR/STR with unsigned immediate offset.
@@ -907,9 +1214,9 @@ impl Arm64Disassembler {
             let (mnemonic, simd_size) = match (size, opc) {
                 (0, 0b00) | (0, 0b01) => (if is_load { "ldr" } else { "str" }, 0), // B
                 (0, 0b10) | (0, 0b11) => (if is_load { "ldr" } else { "str" }, 4), // Q
-                (1, _) => (if is_load { "ldr" } else { "str" }, 1), // H
-                (2, _) => (if is_load { "ldr" } else { "str" }, 2), // S
-                (3, _) => (if is_load { "ldr" } else { "str" }, 3), // D
+                (1, _) => (if is_load { "ldr" } else { "str" }, 1),                // H
+                (2, _) => (if is_load { "ldr" } else { "str" }, 2),                // S
+                (3, _) => (if is_load { "ldr" } else { "str" }, 3),                // D
                 _ => return self.decode_unknown(insn, address, bytes),
             };
 
@@ -925,12 +1232,19 @@ impl Arm64Disassembler {
                 MemoryRef::base_disp(base, offset as i64, access_size)
             };
 
-            let operation = if is_load { Operation::Load } else { Operation::Store };
+            let operation = if is_load {
+                Operation::Load
+            } else {
+                Operation::Store
+            };
             let inst = Instruction::new(address, 4, bytes, mnemonic)
                 .with_operation(operation)
                 .with_operands(vec![Operand::reg(reg), Operand::Memory(mem)]);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         let scale = size;
@@ -947,8 +1261,8 @@ impl Arm64Disassembler {
         let (mnemonic, operation) = match (is_load, is_signed, size) {
             (true, false, 0) => ("ldrb", Operation::Load),
             (true, false, 1) => ("ldrh", Operation::Load),
-            (true, false, 2) => ("ldr", Operation::Load),  // 32-bit
-            (true, false, 3) => ("ldr", Operation::Load),  // 64-bit
+            (true, false, 2) => ("ldr", Operation::Load), // 32-bit
+            (true, false, 3) => ("ldr", Operation::Load), // 64-bit
             (true, true, 0) => ("ldrsb", Operation::Load),
             (true, true, 1) => ("ldrsh", Operation::Load),
             (true, true, 2) => ("ldrsw", Operation::Load),
@@ -959,7 +1273,11 @@ impl Arm64Disassembler {
             _ => return self.decode_unknown(insn, address, bytes),
         };
 
-        let reg = if is_64bit || size == 3 { Self::xreg(rt) } else { Self::wreg(rt) };
+        let reg = if is_64bit || size == 3 {
+            Self::xreg(rt)
+        } else {
+            Self::wreg(rt)
+        };
         let base = Self::xreg_sp(rn);
         let mem = if offset == 0 {
             MemoryRef::base(base, access_size)
@@ -973,7 +1291,10 @@ impl Arm64Disassembler {
             .with_operation(operation)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode load/store register pair (LDP, STP).
@@ -1016,12 +1337,23 @@ impl Arm64Disassembler {
                 MemoryRef::base_disp(base, offset, access_size)
             };
 
-            let operation = if is_load { Operation::Load } else { Operation::Store };
+            let operation = if is_load {
+                Operation::Load
+            } else {
+                Operation::Store
+            };
             let inst = Instruction::new(address, 4, bytes, mnemonic)
                 .with_operation(operation)
-                .with_operands(vec![Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)]);
+                .with_operands(vec![
+                    Operand::reg(reg1),
+                    Operand::reg(reg2),
+                    Operand::Memory(mem),
+                ]);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         let is_load = l == 1;
@@ -1030,8 +1362,16 @@ impl Arm64Disassembler {
         let offset = sign_extend((imm7 << scale) as u64, 7 + scale);
 
         let mnemonic = if is_load { "ldp" } else { "stp" };
-        let reg1 = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
-        let reg2 = if is_64bit { Self::xreg(rt2) } else { Self::wreg(rt2) };
+        let reg1 = if is_64bit {
+            Self::xreg(rt)
+        } else {
+            Self::wreg(rt)
+        };
+        let reg2 = if is_64bit {
+            Self::xreg(rt2)
+        } else {
+            Self::wreg(rt2)
+        };
         let base = Self::xreg_sp(rn);
 
         let mem = if offset == 0 {
@@ -1043,10 +1383,17 @@ impl Arm64Disassembler {
         let operands = vec![Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)];
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
-            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operation(if is_load {
+                Operation::Load
+            } else {
+                Operation::Store
+            })
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode load/store with register offset.
@@ -1100,10 +1447,17 @@ impl Arm64Disassembler {
             let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
 
             let inst = Instruction::new(address, 4, bytes, mnemonic)
-                .with_operation(if is_load { Operation::Load } else { Operation::Store })
+                .with_operation(if is_load {
+                    Operation::Load
+                } else {
+                    Operation::Store
+                })
                 .with_operands(operands);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         let access_size = 1u8 << size;
@@ -1125,7 +1479,11 @@ impl Arm64Disassembler {
             }
         };
 
-        let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let reg = if is_64bit {
+            Self::xreg(rt)
+        } else {
+            Self::wreg(rt)
+        };
         let base = Self::xreg_sp(rn);
         let index = if option & 0b011 == 0b011 {
             Self::xreg(rm)
@@ -1139,10 +1497,17 @@ impl Arm64Disassembler {
         let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
-            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operation(if is_load {
+                Operation::Load
+            } else {
+                Operation::Store
+            })
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode load/store with immediate pre/post-indexed.
@@ -1189,10 +1554,17 @@ impl Arm64Disassembler {
             let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
 
             let inst = Instruction::new(address, 4, bytes, mnemonic)
-                .with_operation(if is_load { Operation::Load } else { Operation::Store })
+                .with_operation(if is_load {
+                    Operation::Load
+                } else {
+                    Operation::Store
+                })
                 .with_operands(operands);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         let access_size = 1u8 << size;
@@ -1215,17 +1587,28 @@ impl Arm64Disassembler {
         };
 
         // For display, we'd normally add ! for pre-indexed, but we'll just use the mnemonic
-        let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let reg = if is_64bit {
+            Self::xreg(rt)
+        } else {
+            Self::wreg(rt)
+        };
         let base = Self::xreg_sp(rn);
         let mem = MemoryRef::base_disp(base, offset, access_size);
 
         let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
 
         let inst = Instruction::new(address, 4, bytes, base_mnemonic)
-            .with_operation(if is_load { Operation::Load } else { Operation::Store })
+            .with_operation(if is_load {
+                Operation::Load
+            } else {
+                Operation::Store
+            })
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode LDR (literal) - PC-relative load.
@@ -1247,9 +1630,9 @@ impl Arm64Disassembler {
             // SIMD/FP literal load
             // opc: 00=S(32-bit), 01=D(64-bit), 10=Q(128-bit), 11=reserved
             let reg = match opc {
-                0b00 => Self::sreg(rt),  // LDR S<t>, <label>
-                0b01 => Self::dreg(rt),  // LDR D<t>, <label>
-                0b10 => Self::qreg(rt),  // LDR Q<t>, <label>
+                0b00 => Self::sreg(rt), // LDR S<t>, <label>
+                0b01 => Self::dreg(rt), // LDR D<t>, <label>
+                0b10 => Self::qreg(rt), // LDR Q<t>, <label>
                 _ => return self.decode_unknown(insn, address, bytes),
             };
 
@@ -1257,7 +1640,10 @@ impl Arm64Disassembler {
                 .with_operation(Operation::Load)
                 .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)]);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         let (mnemonic, is_64bit) = match opc {
@@ -1267,13 +1653,20 @@ impl Arm64Disassembler {
             _ => return self.decode_unknown(insn, address, bytes),
         };
 
-        let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let reg = if is_64bit {
+            Self::xreg(rt)
+        } else {
+            Self::wreg(rt)
+        };
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(Operation::Load)
             .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)]);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode load/store exclusive instructions (LDXR, STXR, LDXP, STXP, LDAXR, STLXR, etc.).
@@ -1285,14 +1678,14 @@ impl Arm64Disassembler {
     ) -> Result<DecodedInstruction, DecodeError> {
         // Encoding: size[31:30], 001000, o2, L, o1, Rs, o0, Rt2, Rn, Rt
         let size = (insn >> 30) & 0x3;
-        let o2 = (insn >> 23) & 1;   // 0=exclusive, 1=ordered (LDAPR/STLR)
-        let l = (insn >> 22) & 1;    // Load/store: 1=load, 0=store
-        let o1 = (insn >> 21) & 1;   // Pair: 1=pair
-        let rs = ((insn >> 16) & 0x1F) as u16;  // Status register (for store)
-        let o0 = (insn >> 15) & 1;   // Acquire-release: 1=acquire/release
+        let o2 = (insn >> 23) & 1; // 0=exclusive, 1=ordered (LDAPR/STLR)
+        let l = (insn >> 22) & 1; // Load/store: 1=load, 0=store
+        let o1 = (insn >> 21) & 1; // Pair: 1=pair
+        let rs = ((insn >> 16) & 0x1F) as u16; // Status register (for store)
+        let o0 = (insn >> 15) & 1; // Acquire-release: 1=acquire/release
         let rt2 = ((insn >> 10) & 0x1F) as u16; // Second register (for pair)
-        let rn = ((insn >> 5) & 0x1F) as u16;   // Base register
-        let rt = (insn & 0x1F) as u16;          // Data register
+        let rn = ((insn >> 5) & 0x1F) as u16; // Base register
+        let rt = (insn & 0x1F) as u16; // Data register
 
         let is_pair = o1 == 1;
         let is_load = l == 1;
@@ -1302,10 +1695,10 @@ impl Arm64Disassembler {
         // Determine register size from size field
         let is_64bit = size == 3 || (is_pair && size == 2);
         let access_size = match size {
-            0 => 1u8,  // byte
-            1 => 2,    // halfword
-            2 => 4,    // word
-            3 => 8,    // doubleword
+            0 => 1u8, // byte
+            1 => 2,   // halfword
+            2 => 4,   // word
+            3 => 8,   // doubleword
             _ => 4,
         };
 
@@ -1313,14 +1706,62 @@ impl Arm64Disassembler {
         let mnemonic = if is_ordered && !is_pair {
             // Load-acquire / Store-release (non-exclusive ordered access)
             match (is_load, size) {
-                (true, 0) => if is_acquire_release { "ldarb" } else { "ldlarb" },
-                (true, 1) => if is_acquire_release { "ldarh" } else { "ldlarh" },
-                (true, 2) => if is_acquire_release { "ldar" } else { "ldlar" },
-                (true, 3) => if is_acquire_release { "ldar" } else { "ldlar" },
-                (false, 0) => if is_acquire_release { "stlrb" } else { "stllrb" },
-                (false, 1) => if is_acquire_release { "stlrh" } else { "stllrh" },
-                (false, 2) => if is_acquire_release { "stlr" } else { "stllr" },
-                (false, 3) => if is_acquire_release { "stlr" } else { "stllr" },
+                (true, 0) => {
+                    if is_acquire_release {
+                        "ldarb"
+                    } else {
+                        "ldlarb"
+                    }
+                }
+                (true, 1) => {
+                    if is_acquire_release {
+                        "ldarh"
+                    } else {
+                        "ldlarh"
+                    }
+                }
+                (true, 2) => {
+                    if is_acquire_release {
+                        "ldar"
+                    } else {
+                        "ldlar"
+                    }
+                }
+                (true, 3) => {
+                    if is_acquire_release {
+                        "ldar"
+                    } else {
+                        "ldlar"
+                    }
+                }
+                (false, 0) => {
+                    if is_acquire_release {
+                        "stlrb"
+                    } else {
+                        "stllrb"
+                    }
+                }
+                (false, 1) => {
+                    if is_acquire_release {
+                        "stlrh"
+                    } else {
+                        "stllrh"
+                    }
+                }
+                (false, 2) => {
+                    if is_acquire_release {
+                        "stlr"
+                    } else {
+                        "stllr"
+                    }
+                }
+                (false, 3) => {
+                    if is_acquire_release {
+                        "stlr"
+                    } else {
+                        "stllr"
+                    }
+                }
                 _ => "unknown",
             }
         } else if is_pair {
@@ -1365,37 +1806,82 @@ impl Arm64Disassembler {
         let operands = if is_load {
             if is_pair {
                 // LDXP/LDAXP: Rt, Rt2, [Xn|SP]
-                let reg1 = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
-                let reg2 = if is_64bit { Self::xreg(rt2) } else { Self::wreg(rt2) };
+                let reg1 = if is_64bit {
+                    Self::xreg(rt)
+                } else {
+                    Self::wreg(rt)
+                };
+                let reg2 = if is_64bit {
+                    Self::xreg(rt2)
+                } else {
+                    Self::wreg(rt2)
+                };
                 vec![Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)]
             } else if is_ordered {
                 // LDAR/LDLAR: Rt, [Xn|SP]
-                let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+                let reg = if is_64bit {
+                    Self::xreg(rt)
+                } else {
+                    Self::wreg(rt)
+                };
                 vec![Operand::reg(reg), Operand::Memory(mem)]
             } else {
                 // LDXR/LDAXR: Rt, [Xn|SP]
-                let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+                let reg = if is_64bit {
+                    Self::xreg(rt)
+                } else {
+                    Self::wreg(rt)
+                };
                 vec![Operand::reg(reg), Operand::Memory(mem)]
             }
         } else if is_pair {
             // STXP/STLXP: Ws, Wt, Wt2, [Xn|SP]  (Ws is status)
             let status = Self::wreg(rs);
-            let reg1 = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
-            let reg2 = if is_64bit { Self::xreg(rt2) } else { Self::wreg(rt2) };
-            vec![Operand::reg(status), Operand::reg(reg1), Operand::reg(reg2), Operand::Memory(mem)]
+            let reg1 = if is_64bit {
+                Self::xreg(rt)
+            } else {
+                Self::wreg(rt)
+            };
+            let reg2 = if is_64bit {
+                Self::xreg(rt2)
+            } else {
+                Self::wreg(rt2)
+            };
+            vec![
+                Operand::reg(status),
+                Operand::reg(reg1),
+                Operand::reg(reg2),
+                Operand::Memory(mem),
+            ]
         } else if is_ordered && !is_acquire_release {
             // STLLR: Rt, [Xn|SP] (no status register)
-            let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+            let reg = if is_64bit {
+                Self::xreg(rt)
+            } else {
+                Self::wreg(rt)
+            };
             vec![Operand::reg(reg), Operand::Memory(mem)]
         } else if is_ordered {
             // STLR: Rt, [Xn|SP]
-            let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+            let reg = if is_64bit {
+                Self::xreg(rt)
+            } else {
+                Self::wreg(rt)
+            };
             vec![Operand::reg(reg), Operand::Memory(mem)]
         } else {
             // STXR/STLXR: Ws, Wt, [Xn|SP]  (Ws is status)
             let status = Self::wreg(rs);
-            let reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
-            vec![Operand::reg(status), Operand::reg(reg), Operand::Memory(mem)]
+            let reg = if is_64bit {
+                Self::xreg(rt)
+            } else {
+                Self::wreg(rt)
+            };
+            vec![
+                Operand::reg(status),
+                Operand::reg(reg),
+                Operand::Memory(mem),
+            ]
         };
 
         let operation = if is_load {
@@ -1408,7 +1894,10 @@ impl Arm64Disassembler {
             .with_operation(operation)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode atomic memory operations (ARMv8.1 atomics: LDADD, LDCLR, LDEOR, LDSET, SWP, CAS, etc.).
@@ -1420,13 +1909,13 @@ impl Arm64Disassembler {
     ) -> Result<DecodedInstruction, DecodeError> {
         // Encoding: size[31:30], 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
         let size = (insn >> 30) & 0x3;
-        let a = (insn >> 23) & 1;    // Acquire
-        let r = (insn >> 22) & 1;    // Release
-        let rs = ((insn >> 16) & 0x1F) as u16;  // Source register
-        let o3 = (insn >> 15) & 1;   // 0 for most atomics, 1 for SWP
+        let a = (insn >> 23) & 1; // Acquire
+        let r = (insn >> 22) & 1; // Release
+        let rs = ((insn >> 16) & 0x1F) as u16; // Source register
+        let o3 = (insn >> 15) & 1; // 0 for most atomics, 1 for SWP
         let opc = (insn >> 12) & 0x7; // Operation code
-        let rn = ((insn >> 5) & 0x1F) as u16;   // Base register
-        let rt = (insn & 0x1F) as u16;          // Destination register
+        let rn = ((insn >> 5) & 0x1F) as u16; // Base register
+        let rt = (insn & 0x1F) as u16; // Destination register
 
         let is_64bit = size == 3;
         let access_size = 1u8 << size;
@@ -1434,9 +1923,9 @@ impl Arm64Disassembler {
         // Build acquire-release suffix
         let ar_suffix = match (a, r) {
             (0, 0) => "",
-            (1, 0) => "a",   // Acquire
-            (0, 1) => "l",   // Release
-            (1, 1) => "al",  // Acquire-release
+            (1, 0) => "a",  // Acquire
+            (0, 1) => "l",  // Release
+            (1, 1) => "al", // Acquire-release
             _ => "",
         };
 
@@ -1473,8 +1962,16 @@ impl Arm64Disassembler {
 
         let base = Self::xreg_sp(rn);
         let mem = MemoryRef::base(base, access_size);
-        let src = if is_64bit { Self::xreg(rs) } else { Self::wreg(rs) };
-        let dst = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let src = if is_64bit {
+            Self::xreg(rs)
+        } else {
+            Self::wreg(rs)
+        };
+        let dst = if is_64bit {
+            Self::xreg(rt)
+        } else {
+            Self::wreg(rt)
+        };
 
         // Operands: Rs (source/operand), Rt (destination/old value), [Xn|SP]
         let operands = vec![Operand::reg(src), Operand::reg(dst), Operand::Memory(mem)];
@@ -1483,7 +1980,10 @@ impl Arm64Disassembler {
             .with_operation(operation)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode compare and swap instructions (CAS, CASP - ARMv8.1).
@@ -1497,11 +1997,11 @@ impl Arm64Disassembler {
         // CAS encoding: size[31:30], 0010001, L, 1, Rs, o0, 11111, Rn, Rt
         // CASP encoding: 0, sz, 0010000, L, 1, Rs, o0, 11111, Rn, Rt
         let size = (insn >> 30) & 0x3;
-        let l = (insn >> 22) & 1;    // 1=Acquire
-        let rs = ((insn >> 16) & 0x1F) as u16;  // Compare value register
-        let o0 = (insn >> 15) & 1;   // 1=Release
-        let rn = ((insn >> 5) & 0x1F) as u16;   // Base register
-        let rt = (insn & 0x1F) as u16;          // Destination/swap value register
+        let l = (insn >> 22) & 1; // 1=Acquire
+        let rs = ((insn >> 16) & 0x1F) as u16; // Compare value register
+        let o0 = (insn >> 15) & 1; // 1=Release
+        let rn = ((insn >> 5) & 0x1F) as u16; // Base register
+        let rt = (insn & 0x1F) as u16; // Destination/swap value register
 
         let is_64bit = size == 3;
         let access_size = 1u8 << size;
@@ -1509,9 +2009,9 @@ impl Arm64Disassembler {
         // Build acquire-release suffix
         let ar_suffix = match (l, o0) {
             (0, 0) => "",
-            (1, 0) => "a",   // Acquire
-            (0, 1) => "l",   // Release
-            (1, 1) => "al",  // Acquire-release
+            (1, 0) => "a",  // Acquire
+            (0, 1) => "l",  // Release
+            (1, 1) => "al", // Acquire-release
             _ => "",
         };
 
@@ -1526,17 +2026,32 @@ impl Arm64Disassembler {
 
         let base = Self::xreg_sp(rn);
         let mem = MemoryRef::base(base, access_size);
-        let compare_reg = if is_64bit { Self::xreg(rs) } else { Self::wreg(rs) };
-        let swap_reg = if is_64bit { Self::xreg(rt) } else { Self::wreg(rt) };
+        let compare_reg = if is_64bit {
+            Self::xreg(rs)
+        } else {
+            Self::wreg(rs)
+        };
+        let swap_reg = if is_64bit {
+            Self::xreg(rt)
+        } else {
+            Self::wreg(rt)
+        };
 
         // Operands: Xs (compare), Xt (swap/result), [Xn|SP]
-        let operands = vec![Operand::reg(compare_reg), Operand::reg(swap_reg), Operand::Memory(mem)];
+        let operands = vec![
+            Operand::reg(compare_reg),
+            Operand::reg(swap_reg),
+            Operand::Memory(mem),
+        ];
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(Operation::CompareAndSwap)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode data processing - register instructions.
@@ -1606,11 +2121,11 @@ impl Arm64Disassembler {
 
         let (base_mnemonic, operation, set_flags) = match (opc, n) {
             (0b00, 0) => ("and", Operation::And, false),
-            (0b00, 1) => ("bic", Operation::And, false),  // AND NOT
+            (0b00, 1) => ("bic", Operation::And, false), // AND NOT
             (0b01, 0) => ("orr", Operation::Or, false),
-            (0b01, 1) => ("orn", Operation::Or, false),   // OR NOT
+            (0b01, 1) => ("orn", Operation::Or, false), // OR NOT
             (0b10, 0) => ("eor", Operation::Xor, false),
-            (0b10, 1) => ("eon", Operation::Xor, false),  // XOR NOT
+            (0b10, 1) => ("eon", Operation::Xor, false), // XOR NOT
             (0b11, 0) => ("ands", Operation::And, true),
             (0b11, 1) => ("bics", Operation::And, true),
             _ => unreachable!(),
@@ -1629,7 +2144,10 @@ impl Arm64Disassembler {
             // TST alias
             ("tst", vec![Operand::reg(src1), Operand::reg(src2)])
         } else if imm6 == 0 {
-            (base_mnemonic, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+            (
+                base_mnemonic,
+                vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+            )
         } else {
             let shift_type = match shift {
                 0 => "lsl",
@@ -1639,12 +2157,15 @@ impl Arm64Disassembler {
                 _ => unreachable!(),
             };
             // Include shift in mnemonic for now
-            (base_mnemonic, vec![
-                Operand::reg(dst),
-                Operand::reg(src1),
-                Operand::reg(src2),
-                Operand::imm_unsigned(imm6 as u64, 8),
-            ])
+            (
+                base_mnemonic,
+                vec![
+                    Operand::reg(dst),
+                    Operand::reg(src1),
+                    Operand::reg(src2),
+                    Operand::imm_unsigned(imm6 as u64, 8),
+                ],
+            )
         };
 
         let final_operation = if mnemonic == "mov" || mnemonic == "mvn" {
@@ -1659,7 +2180,10 @@ impl Arm64Disassembler {
             .with_operation(final_operation)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode add/subtract (shifted register).
@@ -1689,13 +2213,29 @@ impl Arm64Disassembler {
         let (mnemonic, operands, operation) = if set_flags && rd == 31 {
             let mnem = if is_sub { "cmp" } else { "cmn" };
             if imm6 == 0 {
-                (mnem, vec![Operand::reg(src1), Operand::reg(src2)], Operation::Compare)
+                (
+                    mnem,
+                    vec![Operand::reg(src1), Operand::reg(src2)],
+                    Operation::Compare,
+                )
             } else {
-                (mnem, vec![Operand::reg(src1), Operand::reg(src2), Operand::imm_unsigned(imm6 as u64, 8)], Operation::Compare)
+                (
+                    mnem,
+                    vec![
+                        Operand::reg(src1),
+                        Operand::reg(src2),
+                        Operand::imm_unsigned(imm6 as u64, 8),
+                    ],
+                    Operation::Compare,
+                )
             }
         } else if !set_flags && is_sub && rn == 31 {
             // NEG alias
-            ("neg", vec![Operand::reg(dst), Operand::reg(src2)], Operation::Neg)
+            (
+                "neg",
+                vec![Operand::reg(dst), Operand::reg(src2)],
+                Operation::Neg,
+            )
         } else {
             let mnem = match (is_sub, set_flags) {
                 (false, false) => "add",
@@ -1703,11 +2243,28 @@ impl Arm64Disassembler {
                 (true, false) => "sub",
                 (true, true) => "subs",
             };
-            let op = if is_sub { Operation::Sub } else { Operation::Add };
-            if imm6 == 0 {
-                (mnem, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)], op)
+            let op = if is_sub {
+                Operation::Sub
             } else {
-                (mnem, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::imm_unsigned(imm6 as u64, 8)], op)
+                Operation::Add
+            };
+            if imm6 == 0 {
+                (
+                    mnem,
+                    vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+                    op,
+                )
+            } else {
+                (
+                    mnem,
+                    vec![
+                        Operand::reg(dst),
+                        Operand::reg(src1),
+                        Operand::reg(src2),
+                        Operand::imm_unsigned(imm6 as u64, 8),
+                    ],
+                    op,
+                )
             }
         };
 
@@ -1715,7 +2272,10 @@ impl Arm64Disassembler {
             .with_operation(operation)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode add/subtract (extended register).
@@ -1755,10 +2315,17 @@ impl Arm64Disassembler {
         let operands = vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)];
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
-            .with_operation(if is_sub { Operation::Sub } else { Operation::Add })
+            .with_operation(if is_sub {
+                Operation::Sub
+            } else {
+                Operation::Add
+            })
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode data processing (2 source) - UDIV, SDIV, LSLV, etc.
@@ -1790,9 +2357,16 @@ impl Arm64Disassembler {
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(operation)
-            .with_operands(vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)]);
+            .with_operands(vec![
+                Operand::reg(dst),
+                Operand::reg(src1),
+                Operand::reg(src2),
+            ]);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode data processing (1 source) - REV, CLZ, etc.
@@ -1810,7 +2384,13 @@ impl Arm64Disassembler {
         let mnemonic = match opcode {
             0b000000 => "rbit",
             0b000001 => "rev16",
-            0b000010 => if sf { "rev32" } else { "rev" },
+            0b000010 => {
+                if sf {
+                    "rev32"
+                } else {
+                    "rev"
+                }
+            }
             0b000011 => "rev",
             0b000100 => "clz",
             0b000101 => "cls",
@@ -1824,7 +2404,10 @@ impl Arm64Disassembler {
             .with_operation(Operation::Other(0))
             .with_operands(vec![Operand::reg(dst), Operand::reg(src)]);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode conditional select (CSEL, CSINC, CSINV, CSNEG).
@@ -1856,7 +2439,8 @@ impl Arm64Disassembler {
         let (cond_str, _) = decode_condition(cond);
 
         // Check for aliases
-        let (final_mnemonic, operands) = if op == 0 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE {
+        let (final_mnemonic, operands) = if op == 0 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE
+        {
             // CINC alias
             if rn == 31 {
                 // CSET
@@ -1875,14 +2459,20 @@ impl Arm64Disassembler {
             // CNEG alias
             ("cneg", vec![Operand::reg(dst), Operand::reg(src1)])
         } else {
-            (mnemonic, vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+            (
+                mnemonic,
+                vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+            )
         };
 
         let inst = Instruction::new(address, 4, bytes, final_mnemonic)
             .with_operation(Operation::Move)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode data processing (3 source) - MADD, MSUB, MUL, etc.
@@ -1909,30 +2499,74 @@ impl Arm64Disassembler {
         let (mnemonic, operands) = match (op54, op31, o0) {
             (0b00, 0b000, 0) => {
                 if ra == 31 {
-                    ("mul", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                    (
+                        "mul",
+                        vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+                    )
                 } else {
-                    ("madd", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::reg(addend)])
+                    (
+                        "madd",
+                        vec![
+                            Operand::reg(dst),
+                            Operand::reg(src1),
+                            Operand::reg(src2),
+                            Operand::reg(addend),
+                        ],
+                    )
                 }
             }
             (0b00, 0b000, 1) => {
                 if ra == 31 {
-                    ("mneg", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                    (
+                        "mneg",
+                        vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+                    )
                 } else {
-                    ("msub", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2), Operand::reg(addend)])
+                    (
+                        "msub",
+                        vec![
+                            Operand::reg(dst),
+                            Operand::reg(src1),
+                            Operand::reg(src2),
+                            Operand::reg(addend),
+                        ],
+                    )
                 }
             }
-            (0b00, 0b001, 0) if sf => ("smaddl", vec![Operand::reg(dst), Operand::reg(Self::wreg(rn)), Operand::reg(Self::wreg(rm)), Operand::reg(addend)]),
+            (0b00, 0b001, 0) if sf => (
+                "smaddl",
+                vec![
+                    Operand::reg(dst),
+                    Operand::reg(Self::wreg(rn)),
+                    Operand::reg(Self::wreg(rm)),
+                    Operand::reg(addend),
+                ],
+            ),
             (0b00, 0b010, 0) if sf => {
                 if ra == 31 {
-                    ("smulh", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                    (
+                        "smulh",
+                        vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+                    )
                 } else {
                     return self.decode_unknown(insn, address, bytes);
                 }
             }
-            (0b00, 0b101, 0) if sf => ("umaddl", vec![Operand::reg(dst), Operand::reg(Self::wreg(rn)), Operand::reg(Self::wreg(rm)), Operand::reg(addend)]),
+            (0b00, 0b101, 0) if sf => (
+                "umaddl",
+                vec![
+                    Operand::reg(dst),
+                    Operand::reg(Self::wreg(rn)),
+                    Operand::reg(Self::wreg(rm)),
+                    Operand::reg(addend),
+                ],
+            ),
             (0b00, 0b110, 0) if sf => {
                 if ra == 31 {
-                    ("umulh", vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)])
+                    (
+                        "umulh",
+                        vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+                    )
                 } else {
                     return self.decode_unknown(insn, address, bytes);
                 }
@@ -1944,7 +2578,10 @@ impl Arm64Disassembler {
             .with_operation(Operation::Mul)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SIMD/FP instructions.
@@ -2016,7 +2653,10 @@ impl Arm64Disassembler {
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(Operation::Other(0))
             .with_operands(operands);
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Check if instruction is a crypto instruction.
@@ -2090,7 +2730,10 @@ impl Arm64Disassembler {
             .with_operation(Operation::Other(0x100)) // Crypto ops
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SIMD three-same register instructions.
@@ -2112,8 +2755,20 @@ impl Arm64Disassembler {
         let elem_size = match size {
             0 => "8b",
             1 => "16b",
-            2 => if q == 1 { "4s" } else { "2s" },
-            3 => if q == 1 { "2d" } else { "1d" },
+            2 => {
+                if q == 1 {
+                    "4s"
+                } else {
+                    "2s"
+                }
+            }
+            3 => {
+                if q == 1 {
+                    "2d"
+                } else {
+                    "1d"
+                }
+            }
             _ => "?",
         };
 
@@ -2206,7 +2861,10 @@ impl Arm64Disassembler {
             .with_operation(operation)
             .with_operands(vec![Operand::reg(vd), Operand::reg(vn), Operand::reg(vm)]);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SIMD two-register misc instructions.
@@ -2234,7 +2892,7 @@ impl Arm64Disassembler {
             (0, 0b00101) => "cnt",
             (0, 0b00110) => "sadalp",
             (0, 0b00111) => "sqabs",
-            (0, 0b01000) => "cmgt",  // compare vs zero
+            (0, 0b01000) => "cmgt", // compare vs zero
             (0, 0b01001) => "cmeq",
             (0, 0b01010) => "cmlt",
             (0, 0b01011) => "abs",
@@ -2248,8 +2906,8 @@ impl Arm64Disassembler {
             (0, 0b11011) if size >= 2 => "fcvtms",
             (0, 0b11100) if size >= 2 => "fcvtas",
             (0, 0b11101) if size >= 2 => "scvtf",
-            (0, 0b11110) if size >= 2 => "fcmgt",  // vs zero
-            (0, 0b11111) if size >= 2 => "fcmeq",  // vs zero
+            (0, 0b11110) if size >= 2 => "fcmgt", // vs zero
+            (0, 0b11111) if size >= 2 => "fcmeq", // vs zero
 
             (1, 0b00000) => "rev32",
             (1, 0b00010) => "uaddlp",
@@ -2258,8 +2916,8 @@ impl Arm64Disassembler {
             (1, 0b00101) => "not",
             (1, 0b00110) => "uadalp",
             (1, 0b00111) => "sqneg",
-            (1, 0b01000) => "cmge",  // vs zero
-            (1, 0b01001) => "cmle",  // vs zero
+            (1, 0b01000) => "cmge", // vs zero
+            (1, 0b01001) => "cmle", // vs zero
             (1, 0b01011) => "neg",
             (1, 0b10010) => "sqxtun",
             (1, 0b10011) => "shll",
@@ -2271,8 +2929,8 @@ impl Arm64Disassembler {
             (1, 0b11011) if size >= 2 => "fcvtmu",
             (1, 0b11100) if size >= 2 => "fcvtau",
             (1, 0b11101) if size >= 2 => "ucvtf",
-            (1, 0b11110) if size >= 2 => "fcmlt",  // vs zero
-            (1, 0b11111) if size >= 2 => "fcmle",  // vs zero
+            (1, 0b11110) if size >= 2 => "fcmlt", // vs zero
+            (1, 0b11111) if size >= 2 => "fcmle", // vs zero
 
             _ => "simd_2reg",
         };
@@ -2284,7 +2942,10 @@ impl Arm64Disassembler {
             .with_operation(Operation::Other(0))
             .with_operands(vec![Operand::reg(vd), Operand::reg(vn)]);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SIMD across lanes instructions.
@@ -2326,7 +2987,10 @@ impl Arm64Disassembler {
             .with_operation(Operation::Other(0))
             .with_operands(vec![Operand::reg(vd), Operand::reg(vn)]);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SIMD copy/duplicate instructions.
@@ -2359,12 +3023,20 @@ impl Arm64Disassembler {
                 ("dup", vec![Operand::reg(vd), Operand::reg(gpr)])
             } else if imm4 == 5 {
                 // SMOV
-                let gpr = if q == 1 { Self::xreg(rd) } else { Self::wreg(rd) };
+                let gpr = if q == 1 {
+                    Self::xreg(rd)
+                } else {
+                    Self::wreg(rd)
+                };
                 let vn = self.vreg(rn, 128);
                 ("smov", vec![Operand::reg(gpr), Operand::reg(vn)])
             } else if imm4 == 7 {
                 // UMOV
-                let gpr = if q == 1 { Self::xreg(rd) } else { Self::wreg(rd) };
+                let gpr = if q == 1 {
+                    Self::xreg(rd)
+                } else {
+                    Self::wreg(rd)
+                };
                 let vn = self.vreg(rn, 128);
                 ("umov", vec![Operand::reg(gpr), Operand::reg(vn)])
             } else {
@@ -2382,7 +3054,10 @@ impl Arm64Disassembler {
             .with_operation(Operation::Move)
             .with_operands(operands);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode scalar floating-point instructions.
@@ -2400,9 +3075,9 @@ impl Arm64Disassembler {
         let rd = (insn & 0x1F) as u16;
 
         let fp_size = match ptype {
-            0 => 32,  // Single
-            1 => 64,  // Double
-            3 => 16,  // Half
+            0 => 32, // Single
+            1 => 64, // Double
+            3 => 16, // Half
             _ => 32,
         };
 
@@ -2440,7 +3115,10 @@ impl Arm64Disassembler {
                 .with_operation(operation)
                 .with_operands(vec![Operand::reg(fd), Operand::reg(fn_), Operand::reg(fm)]);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // Scalar FP data-processing (1-source): bit 21=1, bits 15-10=010000
@@ -2452,8 +3130,8 @@ impl Arm64Disassembler {
                 0b000001 => "fabs",
                 0b000010 => "fneg",
                 0b000011 => "fsqrt",
-                0b000101 => "fcvt",  // to double
-                0b000100 => "fcvt",  // to single
+                0b000101 => "fcvt", // to double
+                0b000100 => "fcvt", // to single
                 0b001000 => "frintn",
                 0b001001 => "frintp",
                 0b001010 => "frintm",
@@ -2477,7 +3155,10 @@ impl Arm64Disassembler {
                 .with_operation(operation)
                 .with_operands(vec![Operand::reg(fd), Operand::reg(fn_)]);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // Scalar FP compare
@@ -2505,7 +3186,10 @@ impl Arm64Disassembler {
                 .with_operation(Operation::Compare)
                 .with_operands(operands);
 
-            return Ok(DecodedInstruction { instruction: inst, size: 4 });
+            return Ok(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // Fallback
@@ -2514,7 +3198,10 @@ impl Arm64Disassembler {
             .with_operation(Operation::Other(0))
             .with_operands(vec![Operand::reg(fd)]);
 
-        Ok(DecodedInstruction { instruction: inst, size: 4 })
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Create a NEON vector register.
@@ -2582,7 +3269,11 @@ impl Default for Arm64Disassembler {
 }
 
 impl Disassembler for Arm64Disassembler {
-    fn decode_instruction(&self, bytes: &[u8], address: u64) -> Result<DecodedInstruction, DecodeError> {
+    fn decode_instruction(
+        &self,
+        bytes: &[u8],
+        address: u64,
+    ) -> Result<DecodedInstruction, DecodeError> {
         self.decode(bytes, address)
     }
 
@@ -2652,12 +3343,20 @@ fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
 
     // Element size: when len=6, size=64 (not 128); element size is capped at 64
     let size = if len >= 6 { 64u64 } else { 1u64 << (len + 1) };
-    let mask = if len >= 6 { 0x3Fu64 } else { (1u64 << (len + 1)) - 1 };
+    let mask = if len >= 6 {
+        0x3Fu64
+    } else {
+        (1u64 << (len + 1)) - 1
+    };
     let s = (imms as u64) & mask;
     let r = (immr as u64) & mask;
 
     // Create base pattern: s+1 ones
-    let ones = if s + 1 >= 64 { !0u64 } else { (1u64 << (s + 1)) - 1 };
+    let ones = if s + 1 >= 64 {
+        !0u64
+    } else {
+        (1u64 << (s + 1)) - 1
+    };
 
     // Rotate right by r within element size
     let rotated = if r == 0 {
@@ -2672,7 +3371,11 @@ fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
     };
 
     // Mask to element size
-    let pattern = if size >= 64 { rotated } else { rotated & ((1u64 << size) - 1) };
+    let pattern = if size >= 64 {
+        rotated
+    } else {
+        rotated & ((1u64 << size) - 1)
+    };
 
     // Replicate pattern across register
     let mut result = 0u64;

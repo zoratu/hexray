@@ -109,7 +109,10 @@ impl CType {
     /// Format this type as a C declaration.
     pub fn to_c_string(&self, name: Option<&str>) -> String {
         match self {
-            CType::Void => format!("void{}", name.map(|n| format!(" {}", n)).unwrap_or_default()),
+            CType::Void => format!(
+                "void{}",
+                name.map(|n| format!(" {}", n)).unwrap_or_default()
+            ),
             CType::Int(i) => {
                 let type_name = match (i.signed, i.size) {
                     (true, 1) => "char",
@@ -122,7 +125,11 @@ impl CType {
                     (false, 8) => "unsigned long long",
                     _ => "int",
                 };
-                format!("{}{}", type_name, name.map(|n| format!(" {}", n)).unwrap_or_default())
+                format!(
+                    "{}{}",
+                    type_name,
+                    name.map(|n| format!(" {}", n)).unwrap_or_default()
+                )
             }
             CType::Float(f) => {
                 let type_name = match f.size {
@@ -131,11 +138,19 @@ impl CType {
                     16 => "long double",
                     _ => "double",
                 };
-                format!("{}{}", type_name, name.map(|n| format!(" {}", n)).unwrap_or_default())
+                format!(
+                    "{}{}",
+                    type_name,
+                    name.map(|n| format!(" {}", n)).unwrap_or_default()
+                )
             }
             CType::Pointer(inner) => {
                 let inner_str = inner.to_c_string(None);
-                format!("{}*{}", inner_str, name.map(|n| format!(" {}", n)).unwrap_or_default())
+                format!(
+                    "{}*{}",
+                    inner_str,
+                    name.map(|n| format!(" {}", n)).unwrap_or_default()
+                )
             }
             CType::Array(a) => {
                 let elem_str = a.element.to_c_string(name);
@@ -145,20 +160,34 @@ impl CType {
                 }
             }
             CType::Struct(s) => {
-                let tag = s.name.as_ref().map(|n| format!("struct {} ", n)).unwrap_or_else(|| "struct ".to_string());
+                let tag = s
+                    .name
+                    .as_ref()
+                    .map(|n| format!("struct {} ", n))
+                    .unwrap_or_else(|| "struct ".to_string());
                 format!("{}{}", tag, name.map(|n| n.to_string()).unwrap_or_default())
             }
             CType::Union(u) => {
-                let tag = u.name.as_ref().map(|n| format!("union {} ", n)).unwrap_or_else(|| "union ".to_string());
+                let tag = u
+                    .name
+                    .as_ref()
+                    .map(|n| format!("union {} ", n))
+                    .unwrap_or_else(|| "union ".to_string());
                 format!("{}{}", tag, name.map(|n| n.to_string()).unwrap_or_default())
             }
             CType::Enum(e) => {
-                let tag = e.name.as_ref().map(|n| format!("enum {} ", n)).unwrap_or_else(|| "enum ".to_string());
+                let tag = e
+                    .name
+                    .as_ref()
+                    .map(|n| format!("enum {} ", n))
+                    .unwrap_or_else(|| "enum ".to_string());
                 format!("{}{}", tag, name.map(|n| n.to_string()).unwrap_or_default())
             }
             CType::Function(f) => {
                 let ret = f.return_type.to_c_string(None);
-                let params: Vec<_> = f.parameters.iter()
+                let params: Vec<_> = f
+                    .parameters
+                    .iter()
                     .map(|p| p.param_type.to_c_string(Some(&p.name)))
                     .collect();
                 let params_str = if params.is_empty() {
@@ -171,10 +200,18 @@ impl CType {
                 format!("{} {}({})", ret, name.unwrap_or(""), params_str)
             }
             CType::Typedef(t) => {
-                format!("{}{}", t.name, name.map(|n| format!(" {}", n)).unwrap_or_default())
+                format!(
+                    "{}{}",
+                    t.name,
+                    name.map(|n| format!(" {}", n)).unwrap_or_default()
+                )
             }
             CType::Named(n) => {
-                format!("{}{}", n, name.map(|nm| format!(" {}", nm)).unwrap_or_default())
+                format!(
+                    "{}{}",
+                    n,
+                    name.map(|nm| format!(" {}", nm)).unwrap_or_default()
+                )
             }
         }
     }
@@ -194,16 +231,36 @@ impl IntType {
         Self { size, signed }
     }
 
-    pub fn char() -> Self { Self::new(1, true) }
-    pub fn uchar() -> Self { Self::new(1, false) }
-    pub fn short() -> Self { Self::new(2, true) }
-    pub fn ushort() -> Self { Self::new(2, false) }
-    pub fn int() -> Self { Self::new(4, true) }
-    pub fn uint() -> Self { Self::new(4, false) }
-    pub fn long() -> Self { Self::new(8, true) }  // 64-bit
-    pub fn ulong() -> Self { Self::new(8, false) }
-    pub fn longlong() -> Self { Self::new(8, true) }
-    pub fn ulonglong() -> Self { Self::new(8, false) }
+    pub fn char() -> Self {
+        Self::new(1, true)
+    }
+    pub fn uchar() -> Self {
+        Self::new(1, false)
+    }
+    pub fn short() -> Self {
+        Self::new(2, true)
+    }
+    pub fn ushort() -> Self {
+        Self::new(2, false)
+    }
+    pub fn int() -> Self {
+        Self::new(4, true)
+    }
+    pub fn uint() -> Self {
+        Self::new(4, false)
+    }
+    pub fn long() -> Self {
+        Self::new(8, true)
+    } // 64-bit
+    pub fn ulong() -> Self {
+        Self::new(8, false)
+    }
+    pub fn longlong() -> Self {
+        Self::new(8, true)
+    }
+    pub fn ulonglong() -> Self {
+        Self::new(8, false)
+    }
 }
 
 /// Floating-point type details.
@@ -218,9 +275,15 @@ impl FloatType {
         Self { size }
     }
 
-    pub fn float() -> Self { Self::new(4) }
-    pub fn double() -> Self { Self::new(8) }
-    pub fn long_double() -> Self { Self::new(16) }
+    pub fn float() -> Self {
+        Self::new(4)
+    }
+    pub fn double() -> Self {
+        Self::new(8)
+    }
+    pub fn long_double() -> Self {
+        Self::new(16)
+    }
 }
 
 /// Array type details.
@@ -361,10 +424,7 @@ impl UnionType {
         let member_size = member_type.size().unwrap_or(0);
         let member_align = member_type.alignment().unwrap_or(1);
 
-        self.members.push(UnionMember {
-            name,
-            member_type,
-        });
+        self.members.push(UnionMember { name, member_type });
 
         self.size = self.size.max(member_size);
         self.alignment = self.alignment.max(member_align);
@@ -419,14 +479,13 @@ impl EnumType {
 
     /// Get value by name.
     pub fn value_of(&self, name: &str) -> Option<i64> {
-        self.values.iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| *v)
+        self.values.iter().find(|(n, _)| n == name).map(|(_, v)| *v)
     }
 
     /// Get name by value.
     pub fn name_of(&self, value: i64) -> Option<&str> {
-        self.values.iter()
+        self.values
+            .iter()
             .find(|(_, v)| *v == value)
             .map(|(n, _)| n.as_str())
     }
@@ -529,7 +588,9 @@ impl FunctionPrototype {
     /// Convert to C declaration string.
     pub fn to_c_string(&self) -> String {
         let ret = self.return_type.to_c_string(None);
-        let params: Vec<_> = self.parameters.iter()
+        let params: Vec<_> = self
+            .parameters
+            .iter()
             .map(|(name, ty)| ty.to_c_string(Some(name)))
             .collect();
         let params_str = if params.is_empty() {
@@ -555,21 +616,49 @@ impl FunctionPrototype {
 
 // Common type constructors for convenience
 impl CType {
-    pub fn void() -> Self { CType::Void }
-    pub fn char() -> Self { CType::Int(IntType::char()) }
-    pub fn uchar() -> Self { CType::Int(IntType::uchar()) }
-    pub fn short() -> Self { CType::Int(IntType::short()) }
-    pub fn ushort() -> Self { CType::Int(IntType::ushort()) }
-    pub fn int() -> Self { CType::Int(IntType::int()) }
-    pub fn uint() -> Self { CType::Int(IntType::uint()) }
-    pub fn long() -> Self { CType::Int(IntType::long()) }
-    pub fn ulong() -> Self { CType::Int(IntType::ulong()) }
-    pub fn longlong() -> Self { CType::Int(IntType::longlong()) }
-    pub fn ulonglong() -> Self { CType::Int(IntType::ulonglong()) }
-    pub fn float() -> Self { CType::Float(FloatType::float()) }
-    pub fn double() -> Self { CType::Float(FloatType::double()) }
+    pub fn void() -> Self {
+        CType::Void
+    }
+    pub fn char() -> Self {
+        CType::Int(IntType::char())
+    }
+    pub fn uchar() -> Self {
+        CType::Int(IntType::uchar())
+    }
+    pub fn short() -> Self {
+        CType::Int(IntType::short())
+    }
+    pub fn ushort() -> Self {
+        CType::Int(IntType::ushort())
+    }
+    pub fn int() -> Self {
+        CType::Int(IntType::int())
+    }
+    pub fn uint() -> Self {
+        CType::Int(IntType::uint())
+    }
+    pub fn long() -> Self {
+        CType::Int(IntType::long())
+    }
+    pub fn ulong() -> Self {
+        CType::Int(IntType::ulong())
+    }
+    pub fn longlong() -> Self {
+        CType::Int(IntType::longlong())
+    }
+    pub fn ulonglong() -> Self {
+        CType::Int(IntType::ulonglong())
+    }
+    pub fn float() -> Self {
+        CType::Float(FloatType::float())
+    }
+    pub fn double() -> Self {
+        CType::Float(FloatType::double())
+    }
 
-    pub fn ptr(inner: CType) -> Self { CType::Pointer(Box::new(inner)) }
+    pub fn ptr(inner: CType) -> Self {
+        CType::Pointer(Box::new(inner))
+    }
     pub fn array(element: CType, length: Option<usize>) -> Self {
         CType::Array(ArrayType::new(element, length))
     }
@@ -601,9 +690,9 @@ mod tests {
     #[test]
     fn test_struct_layout() {
         let mut s = StructType::new(Some("test".to_string()));
-        s.add_field("a".to_string(), CType::char());  // offset 0, size 1
-        s.add_field("b".to_string(), CType::int());   // offset 4 (aligned), size 4
-        s.add_field("c".to_string(), CType::char());  // offset 8, size 1
+        s.add_field("a".to_string(), CType::char()); // offset 0, size 1
+        s.add_field("b".to_string(), CType::int()); // offset 4 (aligned), size 4
+        s.add_field("c".to_string(), CType::char()); // offset 8, size 1
         s.finalize();
 
         assert_eq!(s.fields[0].offset, 0);

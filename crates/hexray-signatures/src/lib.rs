@@ -23,16 +23,16 @@
 //! }
 //! ```
 
-mod pattern;
-mod signature;
+pub mod builtin;
 mod database;
 mod matcher;
-pub mod builtin;
+mod pattern;
+mod signature;
 
-pub use pattern::{BytePattern, PatternByte};
-pub use signature::{FunctionSignature, CallingConvention, Parameter, ParameterType};
 pub use database::SignatureDatabase;
-pub use matcher::{SignatureMatcher, MatchResult};
+pub use matcher::{MatchResult, SignatureMatcher};
+pub use pattern::{BytePattern, PatternByte};
+pub use signature::{CallingConvention, FunctionSignature, Parameter, ParameterType};
 
 /// Error type for signature operations.
 #[derive(Debug, thiserror::Error)]

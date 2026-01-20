@@ -1,7 +1,13 @@
 //! x86_64 instruction decoder.
 
-use super::modrm::{decode_gpr, decode_modrm_reg, decode_modrm_rm, decode_modrm_rm_xmm, decode_modrm_reg_xmm, decode_xmm, decode_tmm, ModRM};
-use super::opcodes::{OperandEncoding, OPCODE_TABLE, OPCODE_TABLE_0F, GROUP1_OPS, GROUP3_OPS, GROUP5_OPS, SseEncoding, lookup_sse_opcode};
+use super::modrm::{
+    decode_gpr, decode_modrm_reg, decode_modrm_reg_xmm, decode_modrm_rm, decode_modrm_rm_xmm,
+    decode_tmm, decode_xmm, ModRM,
+};
+use super::opcodes::{
+    lookup_sse_opcode, OperandEncoding, SseEncoding, GROUP1_OPS, GROUP3_OPS, GROUP5_OPS,
+    OPCODE_TABLE, OPCODE_TABLE_0F,
+};
 use super::prefix::Prefixes;
 use crate::error::DecodeError;
 use crate::traits::{DecodedInstruction, Disassembler};
@@ -53,7 +59,11 @@ impl Default for X86_64Disassembler {
 }
 
 impl Disassembler for X86_64Disassembler {
-    fn decode_instruction(&self, bytes: &[u8], address: u64) -> Result<DecodedInstruction, DecodeError> {
+    fn decode_instruction(
+        &self,
+        bytes: &[u8],
+        address: u64,
+    ) -> Result<DecodedInstruction, DecodeError> {
         if bytes.is_empty() {
             return Err(DecodeError::truncated(address, 1, 0));
         }
@@ -82,7 +92,8 @@ impl Disassembler for X86_64Disassembler {
             // For VEX.mmmmm == 1 (0x0F escape), look up in SSE tables
             if vex.mmmmm == 1 {
                 if let Some(sse) = lookup_sse_opcode(opcode, prefix_66, prefix_f2, prefix_f3) {
-                    return self.decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse);
+                    return self
+                        .decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse);
                 }
             }
             // For VEX.mmmmm == 2 (0x0F 0x38 escape)
@@ -92,17 +103,23 @@ impl Disassembler for X86_64Disassembler {
                     return self.decode_amx_instruction(bytes, address, &prefixes, offset, opcode);
                 }
                 // Check for BMI1/BMI2 instructions (F2-F7 range) which use GPRs
-                if opcode >= 0xF2 && opcode <= 0xF7 {
+                if (0xF2..=0xF7).contains(&opcode) {
                     return self.decode_bmi_instruction(bytes, address, &prefixes, offset, opcode);
                 }
-                if let Some(entry) = super::opcodes_0f38::OPCODE_TABLE_0F38[opcode as usize].as_ref() {
-                    return self.decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
+                if let Some(entry) =
+                    super::opcodes_0f38::OPCODE_TABLE_0F38[opcode as usize].as_ref()
+                {
+                    return self
+                        .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
                 }
             }
             // For VEX.mmmmm == 3 (0x0F 0x3A escape) - instructions with immediate
             if vex.mmmmm == 3 {
-                if let Some(entry) = super::opcodes_0f3a::OPCODE_TABLE_0F3A[opcode as usize].as_ref() {
-                    return self.decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
+                if let Some(entry) =
+                    super::opcodes_0f3a::OPCODE_TABLE_0F3A[opcode as usize].as_ref()
+                {
+                    return self
+                        .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
                 }
             }
             // Unknown VEX opcode
@@ -137,7 +154,9 @@ impl Disassembler for X86_64Disassembler {
                     if !remaining.is_empty() {
                         let modrm_byte = remaining[0];
                         offset += 1;
-                        return self.decode_cet_instruction(bytes, address, &prefixes, offset, opcode, modrm_byte);
+                        return self.decode_cet_instruction(
+                            bytes, address, &prefixes, offset, opcode, modrm_byte,
+                        );
                     }
                 }
                 // F3 0F AE /5: INCSSPD/INCSSPQ
@@ -148,7 +167,9 @@ impl Disassembler for X86_64Disassembler {
                         let modrm = ModRM::parse(modrm_byte, prefixes.rex);
                         if modrm.is_register() && (modrm.reg & 0x7) == 5 {
                             offset += 1;
-                            return self.decode_cet_instruction(bytes, address, &prefixes, offset, opcode, modrm_byte);
+                            return self.decode_cet_instruction(
+                                bytes, address, &prefixes, offset, opcode, modrm_byte,
+                            );
                         }
                     }
                 }
@@ -160,7 +181,8 @@ impl Disassembler for X86_64Disassembler {
                         // Check for SAVEPREVSSP or RSTORSSP
                         if modrm_byte == 0xEA || ((modrm_byte >> 3) & 0x7) == 5 {
                             offset += 1;
-                            return self.decode_cet_0f01(bytes, address, &prefixes, offset, modrm_byte);
+                            return self
+                                .decode_cet_0f01(bytes, address, &prefixes, offset, modrm_byte);
                         }
                     }
                 }
@@ -187,11 +209,11 @@ impl Disassembler for X86_64Disassembler {
             OPCODE_TABLE_0F[opcode as usize].as_ref()
         } else {
             // Handle group 1 (0x80-0x83) specially
-            if opcode >= 0x80 && opcode <= 0x83 {
+            if (0x80..=0x83).contains(&opcode) {
                 return self.decode_group1(bytes, address, &prefixes, offset, opcode);
             }
             // Handle group 2 (shift/rotate: 0xC0-0xC1, 0xD0-0xD3)
-            if opcode == 0xC0 || opcode == 0xC1 || (opcode >= 0xD0 && opcode <= 0xD3) {
+            if opcode == 0xC0 || opcode == 0xC1 || (0xD0..=0xD3).contains(&opcode) {
                 return self.decode_group2(bytes, address, &prefixes, offset, opcode);
             }
             // Handle group 3 (0xF6/0xF7: TEST/NOT/NEG/MUL/DIV)
@@ -226,12 +248,13 @@ impl Disassembler for X86_64Disassembler {
 
             OperandEncoding::OpReg => {
                 // Register encoded in opcode
-                let reg_num = (opcode & 0x07) | (prefixes.rex.map(|r| (r.b as u8) << 3).unwrap_or(0));
+                let reg_num =
+                    (opcode & 0x07) | (prefixes.rex.map(|r| (r.b as u8) << 3).unwrap_or(0));
                 let reg = decode_gpr(reg_num, operand_size);
                 operands.push(Operand::Register(reg));
 
                 // For MOV r, imm variants (B0-BF), also read immediate
-                if opcode >= 0xB0 && opcode <= 0xBF {
+                if (0xB0..=0xBF).contains(&opcode) {
                     let imm_size = if opcode >= 0xB8 {
                         if prefixes.rex.map(|r| r.w).unwrap_or(false) {
                             8 // 64-bit immediate for REX.W
@@ -245,16 +268,31 @@ impl Disassembler for X86_64Disassembler {
                     };
 
                     if remaining.len() < imm_size {
-                        return Err(DecodeError::truncated(address, offset + imm_size, bytes.len()));
+                        return Err(DecodeError::truncated(
+                            address,
+                            offset + imm_size,
+                            bytes.len(),
+                        ));
                     }
 
                     let imm = match imm_size {
                         1 => remaining[0] as i128,
                         2 => i16::from_le_bytes([remaining[0], remaining[1]]) as i128,
-                        4 => i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as i128,
+                        4 => i32::from_le_bytes([
+                            remaining[0],
+                            remaining[1],
+                            remaining[2],
+                            remaining[3],
+                        ]) as i128,
                         8 => i64::from_le_bytes([
-                            remaining[0], remaining[1], remaining[2], remaining[3],
-                            remaining[4], remaining[5], remaining[6], remaining[7],
+                            remaining[0],
+                            remaining[1],
+                            remaining[2],
+                            remaining[3],
+                            remaining[4],
+                            remaining[5],
+                            remaining[6],
+                            remaining[7],
                         ]) as i128,
                         _ => unreachable!(),
                     };
@@ -263,7 +301,9 @@ impl Disassembler for X86_64Disassembler {
                 }
             }
 
-            OperandEncoding::ModRmRm_Reg | OperandEncoding::ModRmReg_Rm | OperandEncoding::ModRmRmOnly => {
+            OperandEncoding::ModRmRm_Reg
+            | OperandEncoding::ModRmReg_Rm
+            | OperandEncoding::ModRmRmOnly => {
                 if remaining.is_empty() {
                     return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
                 }
@@ -271,8 +311,9 @@ impl Disassembler for X86_64Disassembler {
                 offset += 1;
 
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 match entry.encoding {
@@ -292,7 +333,12 @@ impl Disassembler for X86_64Disassembler {
             }
 
             OperandEncoding::Acc_Imm => {
-                let acc = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, operand_size);
+                let acc = Register::new(
+                    Architecture::X86_64,
+                    RegisterClass::General,
+                    x86::RAX,
+                    operand_size,
+                );
                 operands.push(Operand::Register(acc));
 
                 let imm_size = match operand_size {
@@ -303,13 +349,20 @@ impl Disassembler for X86_64Disassembler {
                 };
 
                 if remaining.len() < imm_size {
-                    return Err(DecodeError::truncated(address, offset + imm_size, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset + imm_size,
+                        bytes.len(),
+                    ));
                 }
 
                 let imm = match imm_size {
                     1 => remaining[0] as i8 as i128,
                     2 => i16::from_le_bytes([remaining[0], remaining[1]]) as i128,
-                    4 => i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as i128,
+                    4 => {
+                        i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
+                            as i128
+                    }
                     _ => unreachable!(),
                 };
                 operands.push(Operand::imm(imm, (imm_size * 8) as u8));
@@ -330,7 +383,9 @@ impl Disassembler for X86_64Disassembler {
                 if remaining.len() < 4 {
                     return Err(DecodeError::truncated(address, offset + 4, bytes.len()));
                 }
-                let rel = i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as i64;
+                let rel =
+                    i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
+                        as i64;
                 let target = (address as i64 + offset as i64 + 4 + rel) as u64;
                 operands.push(Operand::pc_rel(rel, target));
                 offset += 4;
@@ -357,7 +412,9 @@ impl Disassembler for X86_64Disassembler {
                 if remaining.len() < 4 {
                     return Err(DecodeError::truncated(address, offset + 4, bytes.len()));
                 }
-                let imm = i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as i128;
+                let imm =
+                    i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
+                        as i128;
                 operands.push(Operand::imm(imm, 32));
                 offset += 4;
             }
@@ -367,8 +424,14 @@ impl Disassembler for X86_64Disassembler {
                     return Err(DecodeError::truncated(address, offset + 8, bytes.len()));
                 }
                 let imm = i64::from_le_bytes([
-                    remaining[0], remaining[1], remaining[2], remaining[3],
-                    remaining[4], remaining[5], remaining[6], remaining[7],
+                    remaining[0],
+                    remaining[1],
+                    remaining[2],
+                    remaining[3],
+                    remaining[4],
+                    remaining[5],
+                    remaining[6],
+                    remaining[7],
                 ]) as i128;
                 operands.push(Operand::imm(imm, 64));
                 offset += 8;
@@ -383,14 +446,17 @@ impl Disassembler for X86_64Disassembler {
                 offset += 1;
 
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 // Decode immediate
                 // For Rm_Imm8 or when entry.default_size is 8, use 8-bit immediate
                 let remaining = &bytes[offset..];
-                let (imm, imm_size) = if matches!(entry.encoding, OperandEncoding::Rm_Imm8) || entry.default_size == 8 {
+                let (imm, imm_size) = if matches!(entry.encoding, OperandEncoding::Rm_Imm8)
+                    || entry.default_size == 8
+                {
                     if remaining.is_empty() {
                         return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
                     }
@@ -404,7 +470,8 @@ impl Disassembler for X86_64Disassembler {
                     let imm = if size == 2 {
                         i16::from_le_bytes([remaining[0], remaining[1]]) as i128
                     } else {
-                        i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as i128
+                        i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
+                            as i128
                     };
                     (imm, size)
                 };
@@ -547,7 +614,10 @@ impl X86_64Disassembler {
             (imm, size)
         } else {
             // 0x82 is not valid in 64-bit mode
-            return Err(DecodeError::invalid_encoding(address, "opcode 0x82 invalid in 64-bit mode"));
+            return Err(DecodeError::invalid_encoding(
+                address,
+                "opcode 0x82 invalid in 64-bit mode",
+            ));
         };
         offset += imm_size;
 
@@ -686,9 +756,17 @@ impl X86_64Disassembler {
         // For TEST (reg field 0 or 1), we need an immediate operand
         let operands = if (modrm.reg & 0x7) <= 1 {
             let imm_remaining = &bytes[offset..];
-            let imm_size = if opcode == 0xF6 { 1 } else { std::cmp::min(operand_size as usize, 4) };
+            let imm_size = if opcode == 0xF6 {
+                1
+            } else {
+                std::cmp::min(operand_size as usize, 4)
+            };
             if imm_remaining.len() < imm_size {
-                return Err(DecodeError::truncated(address, offset + imm_size, bytes.len()));
+                return Err(DecodeError::truncated(
+                    address,
+                    offset + imm_size,
+                    bytes.len(),
+                ));
             }
             let imm = match imm_size {
                 1 => imm_remaining[0] as i8 as i128,
@@ -747,13 +825,16 @@ impl X86_64Disassembler {
 
         // Reserved opcode extension
         if mnemonic.is_empty() {
-            return Err(DecodeError::invalid_encoding(address, "reserved opcode extension in group 5"));
+            return Err(DecodeError::invalid_encoding(
+                address,
+                "reserved opcode extension in group 5",
+            ));
         }
 
         // Operand size: CALL/JMP are always 64-bit in 64-bit mode, others depend on prefix
         let operand_size = match modrm.reg & 0x7 {
-            2 | 3 | 4 | 5 => 64, // CALL/JMP always 64-bit
-            6 => 64,             // PUSH always 64-bit in 64-bit mode
+            2..=5 => 64,                       // CALL/JMP always 64-bit
+            6 => 64,                           // PUSH always 64-bit in 64-bit mode
             _ => prefixes.operand_size(false), // INC/DEC use normal size
         };
 
@@ -837,8 +918,9 @@ impl X86_64Disassembler {
             SseEncoding::XmmRm => {
                 // xmm, xmm/m128
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 // For VEX 3-operand form, add vvvv register
@@ -858,8 +940,9 @@ impl X86_64Disassembler {
             SseEncoding::RmXmm => {
                 // xmm/m128, xmm
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 operands.push(rm_operand);
@@ -869,8 +952,9 @@ impl X86_64Disassembler {
             SseEncoding::XmmRmImm8 => {
                 // xmm, xmm/m128, imm8
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 // For VEX 4-operand form
@@ -896,8 +980,9 @@ impl X86_64Disassembler {
             SseEncoding::XmmXmmRm => {
                 // xmm, xmm, xmm/m128 (VEX 3-operand)
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 if prefixes.is_vex() {
@@ -959,9 +1044,14 @@ impl X86_64Disassembler {
             SseEncoding::XmmGpr => {
                 // xmm, r/m32/64
                 let rm_bytes = &bytes[offset..];
-                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) { 64 } else { 32 };
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) {
+                    64
+                } else {
+                    32
+                };
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 if prefixes.is_vex() {
@@ -978,11 +1068,16 @@ impl X86_64Disassembler {
             SseEncoding::GprXmm => {
                 // r32/64, xmm/m
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
-                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) { 64 } else { 32 };
+                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) {
+                    64
+                } else {
+                    32
+                };
                 operands.push(Operand::Register(decode_gpr(modrm.reg, gpr_size)));
                 operands.push(rm_operand);
             }
@@ -995,9 +1090,14 @@ impl X86_64Disassembler {
             SseEncoding::GprGprRm => {
                 // r, r/m (GPR to GPR, for POPCNT/LZCNT/TZCNT)
                 let rm_bytes = &bytes[offset..];
-                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) { 64 } else { 32 };
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) {
+                    64
+                } else {
+                    32
+                };
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 operands.push(Operand::Register(decode_gpr(modrm.reg, gpr_size)));
@@ -1049,11 +1149,12 @@ impl X86_64Disassembler {
         let vector_size = prefixes.vector_size();
 
         // Add 'v' prefix for VEX-encoded instructions (unless mnemonic already starts with 'v')
-        let mnemonic = if (prefixes.is_vex() || prefixes.is_evex()) && !entry.mnemonic.starts_with('v') {
-            format!("v{}", entry.mnemonic)
-        } else {
-            entry.mnemonic.to_string()
-        };
+        let mnemonic =
+            if (prefixes.is_vex() || prefixes.is_evex()) && !entry.mnemonic.starts_with('v') {
+                format!("v{}", entry.mnemonic)
+            } else {
+                entry.mnemonic.to_string()
+            };
 
         // Decode operands
         let mut operands = Vec::new();
@@ -1121,9 +1222,9 @@ impl X86_64Disassembler {
         prefixes: &Prefixes,
         mut offset: usize,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let evex = prefixes.evex.ok_or_else(|| {
-            DecodeError::invalid_encoding(address, "expected EVEX prefix")
-        })?;
+        let evex = prefixes
+            .evex
+            .ok_or_else(|| DecodeError::invalid_encoding(address, "expected EVEX prefix"))?;
 
         // Read the opcode byte
         if offset >= bytes.len() {
@@ -1149,7 +1250,8 @@ impl X86_64Disassembler {
             2 => self.lookup_evex_opcode_0f38(opcode, &evex),
             3 => self.lookup_evex_opcode_0f3a(opcode, &evex),
             _ => None,
-        }.ok_or_else(|| {
+        }
+        .ok_or_else(|| {
             let end = offset.min(bytes.len());
             DecodeError::unknown_opcode(address, &bytes[..end])
         })?;
@@ -1159,7 +1261,8 @@ impl X86_64Disassembler {
 
         // Decode r/m operand
         let rm_bytes = &bytes[offset..];
-        let (rm_operand, rm_consumed) = self.decode_evex_modrm_rm(rm_bytes, modrm, prefixes, &evex, vector_size)
+        let (rm_operand, rm_consumed) = self
+            .decode_evex_modrm_rm(rm_bytes, modrm, prefixes, &evex, vector_size)
             .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
         offset += rm_consumed;
 
@@ -1201,7 +1304,11 @@ impl X86_64Disassembler {
     }
 
     /// Look up EVEX opcode in map 1 (0F prefix).
-    fn lookup_evex_opcode_0f(&self, opcode: u8, evex: &super::prefix::Evex) -> Option<(String, Operation)> {
+    fn lookup_evex_opcode_0f(
+        &self,
+        opcode: u8,
+        evex: &super::prefix::Evex,
+    ) -> Option<(String, Operation)> {
         // Determine mnemonic based on EVEX.pp (implied prefix)
         // pp=0: no prefix, pp=1: 66, pp=2: F3, pp=3: F2
         match (opcode, evex.pp) {
@@ -1310,7 +1417,11 @@ impl X86_64Disassembler {
     }
 
     /// Look up EVEX opcode in map 2 (0F38 prefix).
-    fn lookup_evex_opcode_0f38(&self, opcode: u8, evex: &super::prefix::Evex) -> Option<(String, Operation)> {
+    fn lookup_evex_opcode_0f38(
+        &self,
+        opcode: u8,
+        evex: &super::prefix::Evex,
+    ) -> Option<(String, Operation)> {
         match (opcode, evex.pp) {
             // VPBROADCASTD zmm, xmm/m32 (EVEX.512.66.0F38.W0 58 /r)
             (0x58, 1) => Some(("vpbroadcastd".to_string(), Operation::Other(0x58))),
@@ -1331,7 +1442,11 @@ impl X86_64Disassembler {
     }
 
     /// Look up EVEX opcode in map 3 (0F3A prefix).
-    fn lookup_evex_opcode_0f3a(&self, opcode: u8, evex: &super::prefix::Evex) -> Option<(String, Operation)> {
+    fn lookup_evex_opcode_0f3a(
+        &self,
+        opcode: u8,
+        evex: &super::prefix::Evex,
+    ) -> Option<(String, Operation)> {
         match (opcode, evex.pp) {
             // VSHUFPS zmm, zmm, zmm/m512, imm8 (EVEX.512.0F3A.W0 C6 /r ib)
             (0xC6, 0) => Some(("vshufps".to_string(), Operation::Other(0xC6))),
@@ -1367,10 +1482,7 @@ impl X86_64Disassembler {
             // For register-register, rm uses B and X bits
             // rm = modrm.rm[2:0] | B << 3 | X << 4
             let rm_reg = (modrm.rm & 0x0F) | ((evex.x as u8) << 4);
-            return Some((
-                Operand::Register(decode_xmm(rm_reg, vector_size)),
-                0,
-            ));
+            return Some((Operand::Register(decode_xmm(rm_reg, vector_size)), 0));
         }
 
         // Memory operand - use standard decoding but potentially with broadcast
@@ -1445,8 +1557,9 @@ impl X86_64Disassembler {
             // 0xF2: ANDN r, vvvv, r/m
             0xF2 => {
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 // ANDN: dest=reg, src1=vvvv (to be inverted), src2=r/m
@@ -1461,8 +1574,9 @@ impl X86_64Disassembler {
             // 0xF3: Group 17 - BLSR/BLSMSK/BLSI vvvv, r/m
             0xF3 => {
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 // Instruction is determined by ModR/M.reg field
@@ -1479,8 +1593,9 @@ impl X86_64Disassembler {
             // 0xF5: BZHI/PDEP/PEXT (prefix-dependent)
             0xF5 => {
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 let (mnemonic, operation) = super::opcodes_0f38::f5_info(vex.pp);
@@ -1509,13 +1624,16 @@ impl X86_64Disassembler {
             // 0xF6: MULX r, vvvv, r/m (requires F2 prefix, pp=3)
             0xF6 => {
                 if vex.pp != 3 {
-                    return Err(DecodeError::invalid_encoding(address,
-                        "MULX requires F2 prefix (VEX.pp=3)"));
+                    return Err(DecodeError::invalid_encoding(
+                        address,
+                        "MULX requires F2 prefix (VEX.pp=3)",
+                    ));
                 }
 
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 // MULX: dest1=reg, dest2=vvvv, src=r/m
@@ -1532,8 +1650,9 @@ impl X86_64Disassembler {
             // 0xF7: BEXTR/SHLX/SARX/SHRX (prefix-dependent)
             0xF7 => {
                 let rm_bytes = &bytes[offset..];
-                let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
                 let (mnemonic, operation) = super::opcodes_0f38::f7_info(vex.pp);
@@ -1624,16 +1743,19 @@ impl X86_64Disassembler {
         let reg = modrm.reg & 0x7;
 
         let (mnemonic, operation, needs_memory_operand) = match reg {
-            0 => ("sgdt", Operation::StoreGdt, true),   // /0: SGDT m
-            1 => ("sidt", Operation::StoreIdt, true),   // /1: SIDT m
-            2 => ("lgdt", Operation::LoadGdt, true),    // /2: LGDT m
-            3 => ("lidt", Operation::LoadIdt, true),    // /3: LIDT m
-            4 => ("smsw", Operation::StoreMsw, false),  // /4: SMSW r/m16 (both reg and mem)
+            0 => ("sgdt", Operation::StoreGdt, true),  // /0: SGDT m
+            1 => ("sidt", Operation::StoreIdt, true),  // /1: SIDT m
+            2 => ("lgdt", Operation::LoadGdt, true),   // /2: LGDT m
+            3 => ("lidt", Operation::LoadIdt, true),   // /3: LIDT m
+            4 => ("smsw", Operation::StoreMsw, false), // /4: SMSW r/m16 (both reg and mem)
             5 => {
                 // /5 is reserved in most contexts, but can be other instructions
-                return Err(DecodeError::invalid_encoding(address, "reserved 0F 01 /5 encoding"));
+                return Err(DecodeError::invalid_encoding(
+                    address,
+                    "reserved 0F 01 /5 encoding",
+                ));
             }
-            6 => ("lmsw", Operation::LoadMsw, false),   // /6: LMSW r/m16 (both reg and mem)
+            6 => ("lmsw", Operation::LoadMsw, false), // /6: LMSW r/m16 (both reg and mem)
             7 => ("invlpg", Operation::InvalidateTlb, true), // /7: INVLPG m (memory only)
             _ => unreachable!(),
         };
@@ -1641,8 +1763,10 @@ impl X86_64Disassembler {
         // For SGDT, SIDT, LGDT, LIDT, INVLPG - must be memory operand
         if needs_memory_operand && modrm.is_register() {
             // Register form for these is invalid (except special cases handled above)
-            return Err(DecodeError::invalid_encoding(address,
-                &format!("{} requires memory operand", mnemonic)));
+            return Err(DecodeError::invalid_encoding(
+                address,
+                format!("{} requires memory operand", mnemonic),
+            ));
         }
 
         // Decode operand
@@ -1657,13 +1781,14 @@ impl X86_64Disassembler {
             // SMSW/LMSW use 16-bit memory
             // INVLPG uses byte granularity
             let operand_size = match reg {
-                0 | 1 | 2 | 3 => 80, // 10 bytes for descriptor table pointers
-                4 | 6 => 16,         // 16 bits for machine status word
-                7 => 8,              // INVLPG technically doesn't have a size, use byte
+                0..=3 => 80, // 10 bytes for descriptor table pointers
+                4 | 6 => 16, // 16 bits for machine status word
+                7 => 8,      // INVLPG technically doesn't have a size, use byte
                 _ => 16,
             };
-            let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+            let (rm_operand, rm_consumed) =
+                decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
             offset += rm_consumed;
             vec![rm_operand]
         };
@@ -1733,7 +1858,9 @@ impl X86_64Disassembler {
             // 0x49: LDTILECFG / STTILECFG / TILERELEASE / TILEZERO
             0x49 => {
                 let (mnemonic, operation) = super::opcodes_0f38::amx_49_info(vex.pp, modrm_byte)
-                    .ok_or_else(|| DecodeError::invalid_encoding(address, "invalid AMX 0x49 encoding"))?;
+                    .ok_or_else(|| {
+                        DecodeError::invalid_encoding(address, "invalid AMX 0x49 encoding")
+                    })?;
 
                 let operands = match operation {
                     // TILERELEASE has no operands
@@ -1745,8 +1872,10 @@ impl X86_64Disassembler {
                     // LDTILECFG/STTILECFG have one memory operand
                     _ => {
                         let rm_bytes = &bytes[offset..];
-                        let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, 512)
-                            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                        let (rm_operand, rm_consumed) =
+                            decode_modrm_rm(rm_bytes, modrm, prefixes, 512).ok_or_else(|| {
+                                DecodeError::truncated(address, offset + 1, bytes.len())
+                            })?;
                         offset += rm_consumed;
                         vec![rm_operand]
                     }
@@ -1772,8 +1901,10 @@ impl X86_64Disassembler {
 
             // 0x4B: TILELOADD / TILELOADDT1 / TILESTORED
             0x4B => {
-                let (mnemonic, operation) = super::opcodes_0f38::amx_4b_info(vex.pp)
-                    .ok_or_else(|| DecodeError::invalid_encoding(address, "invalid AMX 0x4B encoding"))?;
+                let (mnemonic, operation) =
+                    super::opcodes_0f38::amx_4b_info(vex.pp).ok_or_else(|| {
+                        DecodeError::invalid_encoding(address, "invalid AMX 0x4B encoding")
+                    })?;
 
                 // These instructions use SIB addressing for the memory operand
                 let rm_bytes = &bytes[offset..];
@@ -1809,8 +1940,10 @@ impl X86_64Disassembler {
 
             // 0x5C: TDPFP16PS (FP16 matrix multiply)
             0x5C => {
-                let (mnemonic, operation) = super::opcodes_0f38::amx_5c_info(vex.pp)
-                    .ok_or_else(|| DecodeError::invalid_encoding(address, "invalid AMX 0x5C encoding"))?;
+                let (mnemonic, operation) =
+                    super::opcodes_0f38::amx_5c_info(vex.pp).ok_or_else(|| {
+                        DecodeError::invalid_encoding(address, "invalid AMX 0x5C encoding")
+                    })?;
 
                 // TDPFP16PS tmm1, tmm2, tmm3
                 // tmm1 = dest (modrm.reg), tmm2 = vvvv, tmm3 = modrm.rm
@@ -1840,8 +1973,10 @@ impl X86_64Disassembler {
 
             // 0x5E: TDPBSSD / TDPBSUD / TDPBUSD / TDPBUUD (tile dot product)
             0x5E => {
-                let (mnemonic, operation) = super::opcodes_0f38::amx_5e_info(vex.pp)
-                    .ok_or_else(|| DecodeError::invalid_encoding(address, "invalid AMX 0x5E encoding"))?;
+                let (mnemonic, operation) =
+                    super::opcodes_0f38::amx_5e_info(vex.pp).ok_or_else(|| {
+                        DecodeError::invalid_encoding(address, "invalid AMX 0x5E encoding")
+                    })?;
 
                 // TDP* tmm1, tmm2, tmm3
                 // tmm1 = dest/src (modrm.reg), tmm2 = src (vvvv), tmm3 = src (modrm.rm)
@@ -2001,7 +2136,10 @@ impl X86_64Disassembler {
                 })
             }
 
-            _ => Err(DecodeError::invalid_encoding(address, "unrecognized CET instruction")),
+            _ => Err(DecodeError::invalid_encoding(
+                address,
+                "unrecognized CET instruction",
+            )),
         }
     }
 
@@ -2058,7 +2196,10 @@ impl X86_64Disassembler {
                     size: offset,
                 })
             }
-            _ => Err(DecodeError::invalid_encoding(address, "not a CET 0F 01 instruction")),
+            _ => Err(DecodeError::invalid_encoding(
+                address,
+                "not a CET 0F 01 instruction",
+            )),
         }
     }
 }
@@ -2087,7 +2228,9 @@ mod tests {
     fn test_mov_rbp_rsp() {
         let disasm = X86_64Disassembler::new();
         // mov rbp, rsp (48 89 e5)
-        let result = disasm.decode_instruction(&[0x48, 0x89, 0xe5], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x48, 0x89, 0xe5], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "mov");
         assert_eq!(result.size, 3);
     }
@@ -2097,16 +2240,24 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         let result = disasm.decode_instruction(&[0xc3], 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "ret");
-        assert!(matches!(result.instruction.control_flow, ControlFlow::Return));
+        assert!(matches!(
+            result.instruction.control_flow,
+            ControlFlow::Return
+        ));
     }
 
     #[test]
     fn test_call_rel32() {
         let disasm = X86_64Disassembler::new();
         // call +0x100
-        let result = disasm.decode_instruction(&[0xe8, 0x00, 0x01, 0x00, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xe8, 0x00, 0x01, 0x00, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "call");
-        assert!(matches!(result.instruction.control_flow, ControlFlow::Call { target: 0x1105, .. }));
+        assert!(matches!(
+            result.instruction.control_flow,
+            ControlFlow::Call { target: 0x1105, .. }
+        ));
     }
 
     #[test]
@@ -2117,7 +2268,11 @@ mod tests {
         assert_eq!(result.instruction.mnemonic, "jne");
         assert!(matches!(
             result.instruction.control_flow,
-            ControlFlow::ConditionalBranch { target: 0x1012, condition: Condition::NotEqual, .. }
+            ControlFlow::ConditionalBranch {
+                target: 0x1012,
+                condition: Condition::NotEqual,
+                ..
+            }
         ));
     }
 
@@ -2125,7 +2280,9 @@ mod tests {
     fn test_add_rax_imm() {
         let disasm = X86_64Disassembler::new();
         // add eax, 0x42
-        let result = disasm.decode_instruction(&[0x05, 0x42, 0x00, 0x00, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x05, 0x42, 0x00, 0x00, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "add");
         assert_eq!(result.instruction.operands.len(), 2);
     }
@@ -2135,14 +2292,19 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         let result = disasm.decode_instruction(&[0x0f, 0x05], 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "syscall");
-        assert!(matches!(result.instruction.control_flow, ControlFlow::Syscall));
+        assert!(matches!(
+            result.instruction.control_flow,
+            ControlFlow::Syscall
+        ));
     }
 
     #[test]
     fn test_endbr64() {
         let disasm = X86_64Disassembler::new();
         // F3 0F 1E FA = ENDBR64
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0x1e, 0xfa], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0x1e, 0xfa], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "endbr64");
         assert_eq!(result.instruction.operation, Operation::CetEndBranch64);
         assert_eq!(result.size, 4);
@@ -2152,7 +2314,9 @@ mod tests {
     fn test_endbr32() {
         let disasm = X86_64Disassembler::new();
         // F3 0F 1E FB = ENDBR32
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0x1e, 0xfb], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0x1e, 0xfb], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "endbr32");
         assert_eq!(result.instruction.operation, Operation::CetEndBranch32);
         assert_eq!(result.size, 4);
@@ -2162,9 +2326,14 @@ mod tests {
     fn test_indirect_call_rip() {
         let disasm = X86_64Disassembler::new();
         // FF 15 xx xx xx xx = CALL [rip+disp32]
-        let result = disasm.decode_instruction(&[0xff, 0x15, 0x10, 0x00, 0x00, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xff, 0x15, 0x10, 0x00, 0x00, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "call");
-        assert!(matches!(result.instruction.control_flow, ControlFlow::IndirectCall { .. }));
+        assert!(matches!(
+            result.instruction.control_flow,
+            ControlFlow::IndirectCall { .. }
+        ));
     }
 
     #[test]
@@ -2173,14 +2342,19 @@ mod tests {
         // FF E0 = JMP rax
         let result = disasm.decode_instruction(&[0xff, 0xe0], 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "jmp");
-        assert!(matches!(result.instruction.control_flow, ControlFlow::IndirectBranch { .. }));
+        assert!(matches!(
+            result.instruction.control_flow,
+            ControlFlow::IndirectBranch { .. }
+        ));
     }
 
     #[test]
     fn test_movaps_xmm_xmm() {
         let disasm = X86_64Disassembler::new();
         // 0F 28 C1 = movaps xmm0, xmm1
-        let result = disasm.decode_instruction(&[0x0f, 0x28, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x28, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "movaps");
         assert_eq!(result.size, 3);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2190,7 +2364,9 @@ mod tests {
     fn test_xorps_xmm_xmm() {
         let disasm = X86_64Disassembler::new();
         // 0F 57 C0 = xorps xmm0, xmm0
-        let result = disasm.decode_instruction(&[0x0f, 0x57, 0xc0], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x57, 0xc0], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "xorps");
         assert_eq!(result.size, 3);
     }
@@ -2199,7 +2375,9 @@ mod tests {
     fn test_addps_xmm_xmm() {
         let disasm = X86_64Disassembler::new();
         // 0F 58 C1 = addps xmm0, xmm1
-        let result = disasm.decode_instruction(&[0x0f, 0x58, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x58, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "addps");
         assert_eq!(result.size, 3);
     }
@@ -2208,7 +2386,12 @@ mod tests {
     fn test_movsd_xmm_mem() {
         let disasm = X86_64Disassembler::new();
         // F2 0F 10 04 25 00 10 00 00 = movsd xmm0, [0x1000]
-        let result = disasm.decode_instruction(&[0xf2, 0x0f, 0x10, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(
+                &[0xf2, 0x0f, 0x10, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00],
+                0x1000,
+            )
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "movsd");
     }
 
@@ -2216,7 +2399,9 @@ mod tests {
     fn test_movss_xmm_mem() {
         let disasm = X86_64Disassembler::new();
         // F3 0F 10 00 = movss xmm0, [rax]
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0x10, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0x10, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "movss");
     }
 
@@ -2224,7 +2409,9 @@ mod tests {
     fn test_addpd_xmm_xmm() {
         let disasm = X86_64Disassembler::new();
         // 66 0F 58 C1 = addpd xmm0, xmm1
-        let result = disasm.decode_instruction(&[0x66, 0x0f, 0x58, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x66, 0x0f, 0x58, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "addpd");
         assert_eq!(result.size, 4);
     }
@@ -2233,7 +2420,9 @@ mod tests {
     fn test_vex_vmovaps_ymm() {
         let disasm = X86_64Disassembler::new();
         // C5 FC 28 C1 = vmovaps ymm0, ymm1 (VEX.256.0F.WIG 28 /r)
-        let result = disasm.decode_instruction(&[0xc5, 0xfc, 0x28, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xfc, 0x28, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmovaps");
         assert_eq!(result.size, 4);
     }
@@ -2242,7 +2431,9 @@ mod tests {
     fn test_vex_vxorps_ymm() {
         let disasm = X86_64Disassembler::new();
         // C5 FC 57 C0 = vxorps ymm0, ymm0, ymm0
-        let result = disasm.decode_instruction(&[0xc5, 0xfc, 0x57, 0xc0], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xfc, 0x57, 0xc0], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vxorps");
         assert_eq!(result.size, 4);
         // Should have 3 operands for VEX encoding
@@ -2253,7 +2444,9 @@ mod tests {
     fn test_vex_vaddps_xmm() {
         let disasm = X86_64Disassembler::new();
         // C5 F0 58 C2 = vaddps xmm0, xmm1, xmm2
-        let result = disasm.decode_instruction(&[0xc5, 0xf0, 0x58, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xf0, 0x58, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vaddps");
         assert_eq!(result.size, 4);
         assert_eq!(result.instruction.operands.len(), 3);
@@ -2311,7 +2504,9 @@ mod tests {
     fn test_rdtscp() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 F9 = RDTSCP
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0xf9], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0xf9], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "rdtscp");
         assert_eq!(result.instruction.operation, Operation::ReadTscP);
         assert_eq!(result.size, 3);
@@ -2322,7 +2517,9 @@ mod tests {
     fn test_sgdt_mem() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 00 = SGDT [rax]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "sgdt");
         assert_eq!(result.instruction.operation, Operation::StoreGdt);
         assert_eq!(result.size, 3);
@@ -2333,7 +2530,9 @@ mod tests {
     fn test_sidt_mem() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 08 = SIDT [rax]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x08], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x08], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "sidt");
         assert_eq!(result.instruction.operation, Operation::StoreIdt);
         assert_eq!(result.size, 3);
@@ -2344,7 +2543,9 @@ mod tests {
     fn test_lgdt_mem() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 10 = LGDT [rax]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x10], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x10], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "lgdt");
         assert_eq!(result.instruction.operation, Operation::LoadGdt);
         assert_eq!(result.size, 3);
@@ -2355,7 +2556,9 @@ mod tests {
     fn test_lidt_mem() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 18 = LIDT [rax]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x18], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x18], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "lidt");
         assert_eq!(result.instruction.operation, Operation::LoadIdt);
         assert_eq!(result.size, 3);
@@ -2366,7 +2569,9 @@ mod tests {
     fn test_smsw_reg() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 E0 = SMSW eax (mod=11, reg=4, rm=0)
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0xe0], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0xe0], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "smsw");
         assert_eq!(result.instruction.operation, Operation::StoreMsw);
         assert_eq!(result.size, 3);
@@ -2377,7 +2582,9 @@ mod tests {
     fn test_smsw_mem() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 20 = SMSW [rax]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x20], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x20], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "smsw");
         assert_eq!(result.instruction.operation, Operation::StoreMsw);
         assert_eq!(result.size, 3);
@@ -2388,7 +2595,9 @@ mod tests {
     fn test_lmsw_reg() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 F0 = LMSW eax (mod=11, reg=6, rm=0)
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0xf0], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0xf0], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "lmsw");
         assert_eq!(result.instruction.operation, Operation::LoadMsw);
         assert_eq!(result.size, 3);
@@ -2399,7 +2608,9 @@ mod tests {
     fn test_lmsw_mem() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 30 = LMSW [rax]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x30], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x30], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "lmsw");
         assert_eq!(result.instruction.operation, Operation::LoadMsw);
         assert_eq!(result.size, 3);
@@ -2410,7 +2621,9 @@ mod tests {
     fn test_invlpg_mem() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 38 = INVLPG [rax]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x38], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x38], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "invlpg");
         assert_eq!(result.instruction.operation, Operation::InvalidateTlb);
         assert_eq!(result.size, 3);
@@ -2421,7 +2634,9 @@ mod tests {
     fn test_invlpg_with_displacement() {
         let disasm = X86_64Disassembler::new();
         // 0F 01 78 10 = INVLPG [rax+0x10]
-        let result = disasm.decode_instruction(&[0x0f, 0x01, 0x78, 0x10], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0x78, 0x10], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "invlpg");
         assert_eq!(result.instruction.operation, Operation::InvalidateTlb);
         assert_eq!(result.size, 4);
@@ -2436,7 +2651,9 @@ mod tests {
     fn test_popcnt_r32_r32() {
         let disasm = X86_64Disassembler::new();
         // F3 0F B8 C1 = popcnt eax, ecx
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0xb8, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0xb8, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "popcnt");
         assert_eq!(result.size, 4);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2447,7 +2664,9 @@ mod tests {
     fn test_popcnt_r64_r64() {
         let disasm = X86_64Disassembler::new();
         // F3 48 0F B8 C1 = popcnt rax, rcx
-        let result = disasm.decode_instruction(&[0xf3, 0x48, 0x0f, 0xb8, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x48, 0x0f, 0xb8, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "popcnt");
         assert_eq!(result.size, 5);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2458,7 +2677,9 @@ mod tests {
     fn test_lzcnt_r32_r32() {
         let disasm = X86_64Disassembler::new();
         // F3 0F BD C1 = lzcnt eax, ecx
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0xbd, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0xbd, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "lzcnt");
         assert_eq!(result.size, 4);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2469,7 +2690,9 @@ mod tests {
     fn test_lzcnt_r64_r64() {
         let disasm = X86_64Disassembler::new();
         // F3 48 0F BD C1 = lzcnt rax, rcx
-        let result = disasm.decode_instruction(&[0xf3, 0x48, 0x0f, 0xbd, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x48, 0x0f, 0xbd, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "lzcnt");
         assert_eq!(result.size, 5);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2480,7 +2703,9 @@ mod tests {
     fn test_tzcnt_r32_r32() {
         let disasm = X86_64Disassembler::new();
         // F3 0F BC C1 = tzcnt eax, ecx
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0xbc, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0xbc, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "tzcnt");
         assert_eq!(result.size, 4);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2491,7 +2716,9 @@ mod tests {
     fn test_tzcnt_r64_r64() {
         let disasm = X86_64Disassembler::new();
         // F3 48 0F BC C1 = tzcnt rax, rcx
-        let result = disasm.decode_instruction(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x48, 0x0f, 0xbc, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "tzcnt");
         assert_eq!(result.size, 5);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2502,7 +2729,9 @@ mod tests {
     fn test_popcnt_r32_mem() {
         let disasm = X86_64Disassembler::new();
         // F3 0F B8 00 = popcnt eax, [rax]
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0xb8, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0xb8, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "popcnt");
         assert_eq!(result.size, 4);
         assert_eq!(result.instruction.operands.len(), 2);
@@ -2517,7 +2746,9 @@ mod tests {
     fn test_vex_0f38_vpshufb() {
         let disasm = X86_64Disassembler::new();
         // C4 E2 71 00 C2 = vpshufb xmm0, xmm1, xmm2 (VEX.NDS.128.66.0F38.WIG 00 /r)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x71, 0x00, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x71, 0x00, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vpshufb");
         assert_eq!(result.size, 5);
         assert_eq!(result.instruction.operands.len(), 3);
@@ -2527,7 +2758,9 @@ mod tests {
     fn test_vex_0f38_vphaddw() {
         let disasm = X86_64Disassembler::new();
         // C4 E2 71 01 C2 = vphaddw xmm0, xmm1, xmm2
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x71, 0x01, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x71, 0x01, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vphaddw");
         assert_eq!(result.size, 5);
     }
@@ -2536,7 +2769,9 @@ mod tests {
     fn test_vex_0f38_vpmulld() {
         let disasm = X86_64Disassembler::new();
         // C4 E2 71 40 C2 = vpmulld xmm0, xmm1, xmm2 (VEX.NDS.128.66.0F38.WIG 40 /r)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x71, 0x40, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x71, 0x40, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vpmulld");
         assert_eq!(result.size, 5);
     }
@@ -2545,7 +2780,9 @@ mod tests {
     fn test_vex_0f38_vaesenc() {
         let disasm = X86_64Disassembler::new();
         // C4 E2 71 DC C2 = vaesenc xmm0, xmm1, xmm2 (VEX.NDS.128.66.0F38.WIG DC /r)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x71, 0xdc, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x71, 0xdc, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vaesenc");
         assert_eq!(result.size, 5);
     }
@@ -2554,7 +2791,9 @@ mod tests {
     fn test_vex_0f38_vfmadd132ps() {
         let disasm = X86_64Disassembler::new();
         // C4 E2 71 98 C2 = vfmadd132ps xmm0, xmm1, xmm2 (VEX.NDS.128.66.0F38.W0 98 /r)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x71, 0x98, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x71, 0x98, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vfmadd132ps");
         assert_eq!(result.size, 5);
     }
@@ -2563,7 +2802,9 @@ mod tests {
     fn test_vex_0f38_ymm() {
         let disasm = X86_64Disassembler::new();
         // C4 E2 75 00 C2 = vpshufb ymm0, ymm1, ymm2 (VEX.NDS.256.66.0F38.WIG 00 /r)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x75, 0x00, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x75, 0x00, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vpshufb");
         assert_eq!(result.size, 5);
         assert_eq!(result.instruction.operands.len(), 3);
@@ -2577,7 +2818,9 @@ mod tests {
     fn test_vex_0f3a_vpalignr() {
         let disasm = X86_64Disassembler::new();
         // C4 E3 71 0F C2 08 = vpalignr xmm0, xmm1, xmm2, 8 (VEX.NDS.128.66.0F3A.WIG 0F /r ib)
-        let result = disasm.decode_instruction(&[0xc4, 0xe3, 0x71, 0x0f, 0xc2, 0x08], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe3, 0x71, 0x0f, 0xc2, 0x08], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vpalignr");
         assert_eq!(result.size, 6);
         assert_eq!(result.instruction.operands.len(), 4);
@@ -2587,7 +2830,9 @@ mod tests {
     fn test_vex_0f3a_vpclmulqdq() {
         let disasm = X86_64Disassembler::new();
         // C4 E3 71 44 C2 00 = vpclmulqdq xmm0, xmm1, xmm2, 0 (VEX.NDS.128.66.0F3A.WIG 44 /r ib)
-        let result = disasm.decode_instruction(&[0xc4, 0xe3, 0x71, 0x44, 0xc2, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe3, 0x71, 0x44, 0xc2, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vpclmulqdq");
         assert_eq!(result.size, 6);
         assert_eq!(result.instruction.operands.len(), 4);
@@ -2597,7 +2842,9 @@ mod tests {
     fn test_vex_0f3a_vaeskeygenassist() {
         let disasm = X86_64Disassembler::new();
         // C4 E3 79 DF C1 01 = vaeskeygenassist xmm0, xmm1, 1 (VEX.128.66.0F3A.WIG DF /r ib)
-        let result = disasm.decode_instruction(&[0xc4, 0xe3, 0x79, 0xdf, 0xc1, 0x01], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe3, 0x79, 0xdf, 0xc1, 0x01], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vaeskeygenassist");
         assert_eq!(result.size, 6);
     }
@@ -2606,7 +2853,9 @@ mod tests {
     fn test_vex_0f3a_vroundps() {
         let disasm = X86_64Disassembler::new();
         // C4 E3 79 08 C1 00 = vroundps xmm0, xmm1, 0 (VEX.128.66.0F3A.WIG 08 /r ib)
-        let result = disasm.decode_instruction(&[0xc4, 0xe3, 0x79, 0x08, 0xc1, 0x00], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe3, 0x79, 0x08, 0xc1, 0x00], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vroundps");
         assert_eq!(result.size, 6);
     }
@@ -2615,7 +2864,9 @@ mod tests {
     fn test_vex_0f3a_vblendps() {
         let disasm = X86_64Disassembler::new();
         // C4 E3 71 0C C2 0F = vblendps xmm0, xmm1, xmm2, 0xF (VEX.NDS.128.66.0F3A.WIG 0C /r ib)
-        let result = disasm.decode_instruction(&[0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0f], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0f], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vblendps");
         assert_eq!(result.size, 6);
         assert_eq!(result.instruction.operands.len(), 4);
@@ -2625,7 +2876,9 @@ mod tests {
     fn test_vex_0f3a_vpermq_ymm() {
         let disasm = X86_64Disassembler::new();
         // C4 E3 FD 00 C1 E4 = vpermq ymm0, ymm1, 0xE4 (VEX.256.66.0F3A.W1 00 /r ib)
-        let result = disasm.decode_instruction(&[0xc4, 0xe3, 0xfd, 0x00, 0xc1, 0xe4], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe3, 0xfd, 0x00, 0xc1, 0xe4], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vpermq");
         assert_eq!(result.size, 6);
     }
@@ -2642,7 +2895,9 @@ mod tests {
         // 3-byte VEX: C4 [RXB.mmmmm] [W.vvvv.L.pp]
         // E2 = 11100010 -> R=1, X=1, B=1, mmmmm=00010 (0F38)
         // 70 = 01110000 -> W=0, vvvv=~1110=0001 (ecx), L=0, pp=00
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x70, 0xf2, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x70, 0xf2, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "andn");
         assert_eq!(result.instruction.operation, Operation::AndNot);
         assert_eq!(result.size, 5);
@@ -2654,7 +2909,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.0F38.W1 F2 /r
         // C4 E2 F0 F2 C2 = andn rax, rcx, rdx (W=1 for 64-bit)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0xf0, 0xf2, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0xf0, 0xf2, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "andn");
         assert_eq!(result.instruction.operation, Operation::AndNot);
         assert_eq!(result.size, 5);
@@ -2666,7 +2923,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.0F38.W0 F7 /r (pp=0, no prefix)
         // C4 E2 70 F7 C2 = bextr eax, edx, ecx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x70, 0xf7, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x70, 0xf7, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "bextr");
         assert_eq!(result.instruction.operation, Operation::BitExtract);
         assert_eq!(result.size, 5);
@@ -2679,7 +2938,9 @@ mod tests {
         // VEX.NDD.LZ.0F38.W0 F3 /3
         // C4 E2 70 F3 DA = blsi ecx, edx (reg field = 3)
         // ModR/M DA = 11 011 010 = mod=3, reg=3 (blsi), rm=2 (edx)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x70, 0xf3, 0xda], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x70, 0xf3, 0xda], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "blsi");
         assert_eq!(result.instruction.operation, Operation::ExtractLowestBit);
         assert_eq!(result.size, 5);
@@ -2692,7 +2953,9 @@ mod tests {
         // VEX.NDD.LZ.0F38.W0 F3 /2
         // C4 E2 70 F3 D2 = blsmsk ecx, edx (reg field = 2)
         // ModR/M D2 = 11 010 010 = mod=3, reg=2 (blsmsk), rm=2 (edx)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x70, 0xf3, 0xd2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x70, 0xf3, 0xd2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "blsmsk");
         assert_eq!(result.instruction.operation, Operation::MaskUpToLowest);
         assert_eq!(result.size, 5);
@@ -2705,7 +2968,9 @@ mod tests {
         // VEX.NDD.LZ.0F38.W0 F3 /1
         // C4 E2 70 F3 CA = blsr ecx, edx (reg field = 1)
         // ModR/M CA = 11 001 010 = mod=3, reg=1 (blsr), rm=2 (edx)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x70, 0xf3, 0xca], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x70, 0xf3, 0xca], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "blsr");
         assert_eq!(result.instruction.operation, Operation::ResetLowestBit);
         assert_eq!(result.size, 5);
@@ -2721,7 +2986,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.0F38.W0 F5 /r (no prefix, pp=0)
         // C4 E2 70 F5 C2 = bzhi eax, edx, ecx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x70, 0xf5, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x70, 0xf5, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "bzhi");
         assert_eq!(result.instruction.operation, Operation::ZeroHighBits);
         assert_eq!(result.size, 5);
@@ -2733,7 +3000,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.F2.0F38.W0 F5 /r (pp=3 for F2)
         // C4 E2 73 F5 C2 = pdep eax, ecx, edx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x73, 0xf5, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x73, 0xf5, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "pdep");
         assert_eq!(result.instruction.operation, Operation::ParallelDeposit);
         assert_eq!(result.size, 5);
@@ -2745,7 +3014,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.F3.0F38.W0 F5 /r (pp=2 for F3)
         // C4 E2 72 F5 C2 = pext eax, ecx, edx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x72, 0xf5, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x72, 0xf5, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "pext");
         assert_eq!(result.instruction.operation, Operation::ParallelExtract);
         assert_eq!(result.size, 5);
@@ -2757,7 +3028,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDD.LZ.F2.0F38.W0 F6 /r
         // C4 E2 73 F6 C2 = mulx eax, ecx, edx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x73, 0xf6, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x73, 0xf6, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "mulx");
         assert_eq!(result.instruction.operation, Operation::MulNoFlags);
         assert_eq!(result.size, 5);
@@ -2769,7 +3042,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.66.0F38.W0 F7 /r (pp=1 for 66)
         // C4 E2 71 F7 C2 = shlx eax, edx, ecx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x71, 0xf7, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x71, 0xf7, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "shlx");
         assert_eq!(result.instruction.operation, Operation::Shl);
         assert_eq!(result.size, 5);
@@ -2781,7 +3056,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.F2.0F38.W0 F7 /r (pp=3 for F2)
         // C4 E2 73 F7 C2 = shrx eax, edx, ecx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x73, 0xf7, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x73, 0xf7, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "shrx");
         assert_eq!(result.instruction.operation, Operation::Shr);
         assert_eq!(result.size, 5);
@@ -2793,7 +3070,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.F3.0F38.W0 F7 /r (pp=2 for F3)
         // C4 E2 72 F7 C2 = sarx eax, edx, ecx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x72, 0xf7, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x72, 0xf7, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "sarx");
         assert_eq!(result.instruction.operation, Operation::Sar);
         assert_eq!(result.size, 5);
@@ -2805,7 +3084,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDS.LZ.0F38.W1 F5 /r (64-bit version)
         // C4 E2 F0 F5 C2 = bzhi rax, rdx, rcx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0xf0, 0xf5, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0xf0, 0xf5, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "bzhi");
         assert_eq!(result.instruction.operation, Operation::ZeroHighBits);
         assert_eq!(result.size, 5);
@@ -2817,7 +3098,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // VEX.NDD.LZ.F2.0F38.W1 F6 /r (64-bit version)
         // C4 E2 F3 F6 C2 = mulx rax, rcx, rdx
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0xf3, 0xf6, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0xf3, 0xf6, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "mulx");
         assert_eq!(result.instruction.operation, Operation::MulNoFlags);
         assert_eq!(result.size, 5);
@@ -2839,7 +3122,9 @@ mod tests {
         // 48 = P2: z=0, L'L=10 (512-bit), b=0, V'=1, aaa=000
         // 28 = opcode
         // C1 = ModR/M: mod=11, reg=0 (zmm0), rm=1 (zmm1)
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x7c, 0x48, 0x28, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x7c, 0x48, 0x28, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmovaps");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
@@ -2852,7 +3137,9 @@ mod tests {
         // EVEX.512.0F.W0 58 /r = vaddps zmm0, zmm1, zmm2
         // 62 F1 74 48 58 C2
         // vvvv=~0001=1110 (zmm1)
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x74, 0x48, 0x58, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x74, 0x48, 0x58, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vaddps");
         assert_eq!(result.instruction.operation, Operation::Add);
         assert_eq!(result.size, 6);
@@ -2865,7 +3152,9 @@ mod tests {
         // EVEX.512.66.0F.W1 59 /r = vmulpd zmm0, zmm1, zmm2
         // 62 F1 F5 48 59 C2
         // W=1 for double precision, pp=01 for 66 prefix
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0xf5, 0x48, 0x59, 0xc2], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0xf5, 0x48, 0x59, 0xc2], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmulpd");
         assert_eq!(result.instruction.operation, Operation::Mul);
         assert_eq!(result.size, 6);
@@ -2877,7 +3166,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // EVEX.512.0F.W0 57 /r = vxorps zmm0, zmm0, zmm0 (common idiom to zero register)
         // 62 F1 7C 48 57 C0
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x7c, 0x48, 0x57, 0xc0], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x7c, 0x48, 0x57, 0xc0], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vxorps");
         assert_eq!(result.instruction.operation, Operation::Xor);
         assert_eq!(result.size, 6);
@@ -2890,7 +3181,9 @@ mod tests {
         // EVEX.512.0F.W0 28 /r with k1 opmask = vmovaps zmm0 {k1}, zmm1
         // 62 F1 7C 49 28 C1
         // aaa=001 (k1)
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x7c, 0x49, 0x28, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x7c, 0x49, 0x28, 0xc1], 0x1000)
+            .unwrap();
         assert!(result.instruction.mnemonic.contains("{k1}"));
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
@@ -2902,7 +3195,9 @@ mod tests {
         // EVEX.512.0F.W0 28 /r with k1 opmask and zeroing = vmovaps zmm0 {k1}{z}, zmm1
         // 62 F1 7C C9 28 C1
         // z=1, aaa=001 (k1)
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x7c, 0xc9, 0x28, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x7c, 0xc9, 0x28, 0xc1], 0x1000)
+            .unwrap();
         assert!(result.instruction.mnemonic.contains("{k1}"));
         assert!(result.instruction.mnemonic.contains("{z}"));
         assert_eq!(result.instruction.operation, Operation::Move);
@@ -2914,7 +3209,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // EVEX.512.66.0F.W0 6F /r = vmovdqa32 zmm0, zmm1
         // 62 F1 7D 48 6F C1
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x7d, 0x48, 0x6f, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x7d, 0x48, 0x6f, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmovdqa32");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
@@ -2925,7 +3222,9 @@ mod tests {
         let disasm = X86_64Disassembler::new();
         // EVEX.512.66.0F.W1 6F /r = vmovdqa64 zmm0, zmm1
         // 62 F1 FD 48 6F C1
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0xfd, 0x48, 0x6f, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0xfd, 0x48, 0x6f, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmovdqa64");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
@@ -2937,7 +3236,9 @@ mod tests {
         // EVEX.128.0F.W0 28 /r = vmovaps xmm0, xmm1
         // 62 F1 7C 08 28 C1
         // L'L=00 (128-bit)
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x7c, 0x08, 0x28, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x7c, 0x08, 0x28, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmovaps");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
@@ -2949,7 +3250,9 @@ mod tests {
         // EVEX.256.0F.W0 28 /r = vmovaps ymm0, ymm1
         // 62 F1 7C 28 28 C1
         // L'L=01 (256-bit)
-        let result = disasm.decode_instruction(&[0x62, 0xf1, 0x7c, 0x28, 0x28, 0xc1], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x7c, 0x28, 0x28, 0xc1], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmovaps");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
@@ -2969,7 +3272,9 @@ mod tests {
         // 78 = W=0, vvvv=1111, L=0, pp=00 (no prefix)
         // 49 = opcode
         // C0 = ModR/M: mod=11, reg=0, rm=0 (special encoding for TILERELEASE)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x78, 0x49, 0xc0], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x78, 0x49, 0xc0], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "tilerelease");
         assert_eq!(result.instruction.operation, Operation::AmxTileRelease);
         assert_eq!(result.size, 5);
@@ -2982,7 +3287,9 @@ mod tests {
         // VEX.128.F2.0F38.W0 49 /r (mod=11) = tilezero tmm
         // C4 E2 7B 49 C0 = tilezero tmm0
         // pp=11 (F2 prefix)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x7b, 0x49, 0xc0], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x7b, 0x49, 0xc0], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "tilezero");
         assert_eq!(result.instruction.operation, Operation::AmxTileZero);
         assert_eq!(result.size, 5);
@@ -2995,7 +3302,9 @@ mod tests {
         // VEX.128.F2.0F38.W0 5E /r = tdpbssd tmm1, tmm2, tmm3
         // C4 E2 63 5E C9 = tdpbssd tmm1, tmm3, tmm1
         // pp=11 (F2), vvvv=~3=1100
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x63, 0x5e, 0xc9], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x63, 0x5e, 0xc9], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "tdpbssd");
         assert_eq!(result.instruction.operation, Operation::AmxDotProductSS);
         assert_eq!(result.size, 5);
@@ -3008,7 +3317,9 @@ mod tests {
         // VEX.128.NP.0F38.W0 5E /r = tdpbuud tmm1, tmm2, tmm3
         // C4 E2 60 5E C9 = tdpbuud tmm1, tmm3, tmm1
         // pp=00 (no prefix)
-        let result = disasm.decode_instruction(&[0xc4, 0xe2, 0x60, 0x5e, 0xc9], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe2, 0x60, 0x5e, 0xc9], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "tdpbuud");
         assert_eq!(result.instruction.operation, Operation::AmxDotProductUU);
         assert_eq!(result.size, 5);
@@ -3025,7 +3336,9 @@ mod tests {
         // F3 0F AE /5 (mod=11) = incsspd r32
         // F3 0F AE E8 = incsspd eax
         // ModR/M: E8 = mod=11, reg=5, rm=0 (eax)
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0xae, 0xe8], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0xae, 0xe8], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "incsspd");
         assert_eq!(result.instruction.operation, Operation::CetIncSsp);
         assert_eq!(result.size, 4);
@@ -3038,7 +3351,9 @@ mod tests {
         // F3 0F 1E /1 (mod=11) = rdsspd r32
         // F3 0F 1E C8 = rdsspd eax
         // ModR/M: C8 = mod=11, reg=1, rm=0 (eax)
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0x1e, 0xc8], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0x1e, 0xc8], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "rdsspd");
         assert_eq!(result.instruction.operation, Operation::CetReadSsp);
         assert_eq!(result.size, 4);
@@ -3049,7 +3364,9 @@ mod tests {
     fn test_cet_saveprevssp() {
         let disasm = X86_64Disassembler::new();
         // F3 0F 01 EA = saveprevssp
-        let result = disasm.decode_instruction(&[0xf3, 0x0f, 0x01, 0xea], 0x1000).unwrap();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0x01, 0xea], 0x1000)
+            .unwrap();
         assert_eq!(result.instruction.mnemonic, "saveprevssp");
         assert_eq!(result.instruction.operation, Operation::CetSavePrevSsp);
         assert_eq!(result.size, 4);

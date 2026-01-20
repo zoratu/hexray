@@ -281,9 +281,7 @@ impl Emulator {
 
         match &inst.operands[0] {
             hexray_core::Operand::Immediate(imm) => Value::Concrete(imm.as_u64()),
-            hexray_core::Operand::PcRelative { target, .. } => {
-                Value::Concrete(*target)
-            }
+            hexray_core::Operand::PcRelative { target, .. } => Value::Concrete(*target),
             hexray_core::Operand::Register(reg) => self.state.get_register(reg.id),
             hexray_core::Operand::Memory(mem) => {
                 // Indirect call through memory
@@ -302,11 +300,7 @@ impl Emulator {
     }
 
     /// Compute a memory address.
-    fn compute_memory_address(
-        &self,
-        mem: &hexray_core::MemoryRef,
-        inst: &Instruction,
-    ) -> Value {
+    fn compute_memory_address(&self, mem: &hexray_core::MemoryRef, inst: &Instruction) -> Value {
         let mut addr = Value::Concrete(0);
 
         if let Some(ref base) = mem.base {
@@ -368,8 +362,10 @@ impl Emulator {
                 if let StopReason::IndirectBranch(addr) = result.stop_reason {
                     if addr == indirect_addr {
                         // Get the computed target
-                        let inst_map: HashMap<u64, &Instruction> =
-                            instructions.iter().map(|inst| (inst.address, inst)).collect();
+                        let inst_map: HashMap<u64, &Instruction> = instructions
+                            .iter()
+                            .map(|inst| (inst.address, inst))
+                            .collect();
                         if let Some(inst) = inst_map.get(&addr) {
                             let target = self.get_jump_target(inst);
                             if let Value::Concrete(t) = target {
@@ -392,7 +388,7 @@ impl Emulator {
 mod tests {
     use super::*;
     use crate::state::x86_regs;
-    use hexray_core::{Architecture, Operation, Operand, Register, RegisterClass};
+    use hexray_core::{Architecture, Operand, Operation, Register, RegisterClass};
 
     fn make_inst(addr: u64, op: Operation, operands: Vec<Operand>) -> Instruction {
         Instruction {

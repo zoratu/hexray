@@ -2,8 +2,8 @@
 //!
 //! These are signatures for common library functions that ship with hexray.
 
-pub mod libc_x86_64;
 pub mod libc_aarch64;
+pub mod libc_x86_64;
 
 use crate::SignatureDatabase;
 

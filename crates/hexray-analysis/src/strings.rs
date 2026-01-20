@@ -303,11 +303,7 @@ impl StringDetector {
         }
 
         // Sort by address, then by length (descending)
-        strings.sort_by(|a, b| {
-            a.address
-                .cmp(&b.address)
-                .then(b.length.cmp(&a.length))
-        });
+        strings.sort_by(|a, b| a.address.cmp(&b.address).then(b.length.cmp(&a.length)));
 
         let mut result = Vec::new();
         let mut last_end = 0u64;

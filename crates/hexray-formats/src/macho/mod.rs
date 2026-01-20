@@ -14,9 +14,9 @@ mod load_command;
 mod segment;
 mod symbol;
 
-pub use header::{CpuType, FileType, MachHeader, FatArch};
+pub use header::{CpuType, FatArch, FileType, MachHeader};
 pub use load_command::LoadCommand;
-pub use segment::{Segment, Section as MachSection};
+pub use segment::{Section as MachSection, Segment};
 pub use symbol::Nlist;
 
 use crate::{BinaryFormat, ParseError, Section};
@@ -108,7 +108,13 @@ impl<'a> MachO<'a> {
         let mut symtab_count = 0usize;
 
         for lc in &load_commands {
-            if let LoadCommand::Symtab { stroff, strsize, symoff, nsyms } = lc {
+            if let LoadCommand::Symtab {
+                stroff,
+                strsize,
+                symoff,
+                nsyms,
+            } = lc
+            {
                 let str_start = offset + *stroff as usize;
                 let str_end = str_start + *strsize as usize;
                 if str_end <= data.len() {
@@ -128,7 +134,14 @@ impl<'a> MachO<'a> {
 
         // Parse symbols
         let mut symbols = if symtab_count > 0 && symtab_offset > 0 {
-            Self::parse_symbols(data, symtab_offset, symtab_count, is_64, strtab, &all_sections)?
+            Self::parse_symbols(
+                data,
+                symtab_offset,
+                symtab_count,
+                is_64,
+                strtab,
+                &all_sections,
+            )?
         } else {
             Vec::new()
         };
@@ -165,16 +178,20 @@ impl<'a> MachO<'a> {
         let fat_header = header::FatHeader::parse(data)?;
 
         // Prefer x86_64, then arm64, then first available
-        let arch = fat_header.architectures.iter()
+        let arch = fat_header
+            .architectures
+            .iter()
             .find(|a| a.cputype == header::CPU_TYPE_X86_64)
-            .or_else(|| fat_header.architectures.iter()
-                .find(|a| a.cputype == header::CPU_TYPE_ARM64))
+            .or_else(|| {
+                fat_header
+                    .architectures
+                    .iter()
+                    .find(|a| a.cputype == header::CPU_TYPE_ARM64)
+            })
             .or_else(|| fat_header.architectures.first())
-            .ok_or_else(|| ParseError::invalid_structure(
-                "fat header",
-                0,
-                "no architectures in fat binary",
-            ))?;
+            .ok_or_else(|| {
+                ParseError::invalid_structure("fat header", 0, "no architectures in fat binary")
+            })?;
 
         Self::parse_at(data, arch.offset as usize)
     }
@@ -223,6 +240,7 @@ impl<'a> MachO<'a> {
 
     /// Parse stub symbols from the __stubs section.
     /// This maps stub addresses to their corresponding import symbol names.
+    #[allow(clippy::too_many_arguments)]
     fn parse_stub_symbols(
         data: &[u8],
         file_offset: usize,
@@ -236,20 +254,29 @@ impl<'a> MachO<'a> {
         let mut stub_symbols = Vec::new();
 
         // Find indirect symbol table info from LC_DYSYMTAB
-        let (indirect_symoff, _nindirect) = load_commands.iter().find_map(|lc| {
-            if let LoadCommand::Dysymtab { indirectsymoff, nindirectsyms, .. } = lc {
-                Some((*indirectsymoff, *nindirectsyms))
-            } else {
-                None
-            }
-        }).unwrap_or((0, 0));
+        let (indirect_symoff, _nindirect) = load_commands
+            .iter()
+            .find_map(|lc| {
+                if let LoadCommand::Dysymtab {
+                    indirectsymoff,
+                    nindirectsyms,
+                    ..
+                } = lc
+                {
+                    Some((*indirectsymoff, *nindirectsyms))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((0, 0));
 
         if indirect_symoff == 0 || symtab_offset == 0 {
             return stub_symbols;
         }
 
         // Find the __stubs section
-        let stubs_section = segments.iter()
+        let stubs_section = segments
+            .iter()
             .flat_map(|seg| seg.sections.iter())
             .find(|sect| sect.sectname == "__stubs");
 
@@ -264,7 +291,11 @@ impl<'a> MachO<'a> {
             stubs.reserved2 as usize
         } else {
             // Default stub sizes by architecture
-            if is_64 { 12 } else { 6 }
+            if is_64 {
+                12
+            } else {
+                6
+            }
         };
 
         if stub_size == 0 {
@@ -276,7 +307,8 @@ impl<'a> MachO<'a> {
 
         for i in 0..num_stubs {
             // Read the indirect symbol table entry (4 bytes each)
-            let indirect_offset = file_offset + indirect_symoff as usize + (indirect_start_index + i) * 4;
+            let indirect_offset =
+                file_offset + indirect_symoff as usize + (indirect_start_index + i) * 4;
             if indirect_offset + 4 > data.len() {
                 break;
             }
@@ -291,7 +323,8 @@ impl<'a> MachO<'a> {
             // Skip special indirect symbol values
             const INDIRECT_SYMBOL_LOCAL: u32 = 0x80000000;
             const INDIRECT_SYMBOL_ABS: u32 = 0x40000000;
-            if sym_index as u32 == INDIRECT_SYMBOL_LOCAL || sym_index as u32 == INDIRECT_SYMBOL_ABS {
+            if sym_index as u32 == INDIRECT_SYMBOL_LOCAL || sym_index as u32 == INDIRECT_SYMBOL_ABS
+            {
                 continue;
             }
 
@@ -309,7 +342,10 @@ impl<'a> MachO<'a> {
             if let Ok(nlist) = Nlist::parse(&data[sym_offset..], is_64) {
                 let name = if (nlist.n_strx as usize) < strtab.len() {
                     let name_bytes = &strtab[nlist.n_strx as usize..];
-                    let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+                    let end = name_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(name_bytes.len());
                     String::from_utf8_lossy(&name_bytes[..end]).to_string()
                 } else {
                     continue;
@@ -357,7 +393,10 @@ impl<'a> MachO<'a> {
             // Get symbol name from string table
             let name = if (nlist.n_strx as usize) < strtab.len() {
                 let name_bytes = &strtab[nlist.n_strx as usize..];
-                let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+                let end = name_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(name_bytes.len());
                 String::from_utf8_lossy(&name_bytes[..end]).to_string()
             } else {
                 String::new()
@@ -438,8 +477,7 @@ impl<'a> MachO<'a> {
 
             // Look for the next symbol in the same section
             let mut estimated_size = None;
-            for j in (i + 1)..sorted_indices.len() {
-                let next_idx = sorted_indices[j];
+            for &next_idx in &sorted_indices[(i + 1)..] {
                 let next_sym = &symbols[next_idx];
 
                 // Check if next symbol is in the same section

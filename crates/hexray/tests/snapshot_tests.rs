@@ -369,7 +369,7 @@ fn sort_json_arrays(value: serde_json::Value) -> serde_json::Value {
 
 /// Sort DOT output lines for deterministic snapshots.
 fn sort_dot_output(dot: &str) -> String {
-    let mut lines: Vec<&str> = dot.lines().collect();
+    let lines: Vec<&str> = dot.lines().collect();
 
     // Find the start and end of the digraph body
     let mut body_start = 0;
@@ -423,9 +423,7 @@ fn redact_json_addresses(value: serde_json::Value) -> serde_json::Value {
             }
             Value::Object(new_map)
         }
-        Value::Array(arr) => {
-            Value::Array(arr.into_iter().map(redact_json_addresses).collect())
-        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(redact_json_addresses).collect()),
         Value::String(s) => {
             // Redact hex address strings
             if s.starts_with("0x") && s.len() >= 10 {

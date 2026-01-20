@@ -13,8 +13,8 @@
 //! - Function bodies
 //! - Attributes
 
-use crate::types::*;
 use crate::database::TypeDatabase;
+use crate::types::*;
 use thiserror::Error;
 
 /// Errors that can occur during parsing.
@@ -152,17 +152,50 @@ impl<'a> Lexer<'a> {
 
         // Single-character tokens
         let token = match ch {
-            ';' => { self.next_char(); Token::Semicolon }
-            ',' => { self.next_char(); Token::Comma }
-            '*' => { self.next_char(); Token::Star }
-            '{' => { self.next_char(); Token::OpenBrace }
-            '}' => { self.next_char(); Token::CloseBrace }
-            '[' => { self.next_char(); Token::OpenBracket }
-            ']' => { self.next_char(); Token::CloseBracket }
-            '(' => { self.next_char(); Token::OpenParen }
-            ')' => { self.next_char(); Token::CloseParen }
-            '=' => { self.next_char(); Token::Equals }
-            ':' => { self.next_char(); Token::Colon }
+            ';' => {
+                self.next_char();
+                Token::Semicolon
+            }
+            ',' => {
+                self.next_char();
+                Token::Comma
+            }
+            '*' => {
+                self.next_char();
+                Token::Star
+            }
+            '{' => {
+                self.next_char();
+                Token::OpenBrace
+            }
+            '}' => {
+                self.next_char();
+                Token::CloseBrace
+            }
+            '[' => {
+                self.next_char();
+                Token::OpenBracket
+            }
+            ']' => {
+                self.next_char();
+                Token::CloseBracket
+            }
+            '(' => {
+                self.next_char();
+                Token::OpenParen
+            }
+            ')' => {
+                self.next_char();
+                Token::CloseParen
+            }
+            '=' => {
+                self.next_char();
+                Token::Equals
+            }
+            ':' => {
+                self.next_char();
+                Token::Colon
+            }
             '.' => {
                 // Check for ellipsis
                 if self.input[self.pos..].starts_with("...") {
@@ -175,12 +208,8 @@ impl<'a> Lexer<'a> {
                     });
                 }
             }
-            _ if ch.is_ascii_digit() || ch == '-' => {
-                self.parse_number()?
-            }
-            _ if ch.is_ascii_alphabetic() || ch == '_' => {
-                self.parse_ident_or_keyword()
-            }
+            _ if ch.is_ascii_digit() || ch == '-' => self.parse_number()?,
+            _ if ch.is_ascii_alphabetic() || ch == '_' => self.parse_ident_or_keyword(),
             _ => {
                 return Err(ParseError::SyntaxError {
                     pos: self.pos,
@@ -213,11 +242,9 @@ impl<'a> Lexer<'a> {
                 }
             }
             let hex_str = &self.input[hex_start..self.pos];
-            let value = i64::from_str_radix(hex_str, 16).map_err(|_| {
-                ParseError::SyntaxError {
-                    pos: start,
-                    message: "Invalid hex number".to_string(),
-                }
+            let value = i64::from_str_radix(hex_str, 16).map_err(|_| ParseError::SyntaxError {
+                pos: start,
+                message: "Invalid hex number".to_string(),
             })?;
             return Ok(Token::Number(if is_negative { -value } else { value }));
         }
@@ -241,12 +268,10 @@ impl<'a> Lexer<'a> {
         }
 
         let num_str = &self.input[start..self.pos];
-        let num_str = num_str.trim_end_matches(|c: char| c == 'L' || c == 'l' || c == 'U' || c == 'u');
-        let value: i64 = num_str.parse().map_err(|_| {
-            ParseError::SyntaxError {
-                pos: start,
-                message: format!("Invalid number: {}", num_str),
-            }
+        let num_str = num_str.trim_end_matches(['L', 'l', 'U', 'u']);
+        let value: i64 = num_str.parse().map_err(|_| ParseError::SyntaxError {
+            pos: start,
+            message: format!("Invalid number: {}", num_str),
         })?;
 
         Ok(Token::Number(value))
@@ -364,7 +389,8 @@ impl<'a> Parser<'a> {
         let st = self.parse_struct()?;
         if let CType::Struct(ref s) = st {
             if let Some(name) = &s.name {
-                self.database.add_type(format!("struct {}", name), st.clone());
+                self.database
+                    .add_type(format!("struct {}", name), st.clone());
             }
         }
 
@@ -381,7 +407,8 @@ impl<'a> Parser<'a> {
         let un = self.parse_union()?;
         if let CType::Union(ref u) = un {
             if let Some(name) = &u.name {
-                self.database.add_type(format!("union {}", name), un.clone());
+                self.database
+                    .add_type(format!("union {}", name), un.clone());
             }
         }
 

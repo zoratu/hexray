@@ -11,14 +11,14 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
     db.add_function(
         FunctionPrototype::new("strlen", CType::typedef_ref("size_t"))
             .param("s", CType::ptr(CType::char()))
-            .doc("Calculate the length of a string")
+            .doc("Calculate the length of a string"),
     );
 
     db.add_function(
         FunctionPrototype::new("strcpy", CType::ptr(CType::char()))
             .param("dest", CType::ptr(CType::char()))
             .param("src", CType::ptr(CType::char()))
-            .doc("Copy a string")
+            .doc("Copy a string"),
     );
 
     db.add_function(
@@ -26,21 +26,21 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("dest", CType::ptr(CType::char()))
             .param("src", CType::ptr(CType::char()))
             .param("n", CType::typedef_ref("size_t"))
-            .doc("Copy a string with length limit")
+            .doc("Copy a string with length limit"),
     );
 
     db.add_function(
         FunctionPrototype::new("strcat", CType::ptr(CType::char()))
             .param("dest", CType::ptr(CType::char()))
             .param("src", CType::ptr(CType::char()))
-            .doc("Concatenate two strings")
+            .doc("Concatenate two strings"),
     );
 
     db.add_function(
         FunctionPrototype::new("strcmp", CType::int())
             .param("s1", CType::ptr(CType::char()))
             .param("s2", CType::ptr(CType::char()))
-            .doc("Compare two strings")
+            .doc("Compare two strings"),
     );
 
     db.add_function(
@@ -48,34 +48,34 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("s1", CType::ptr(CType::char()))
             .param("s2", CType::ptr(CType::char()))
             .param("n", CType::typedef_ref("size_t"))
-            .doc("Compare two strings with length limit")
+            .doc("Compare two strings with length limit"),
     );
 
     db.add_function(
         FunctionPrototype::new("strchr", CType::ptr(CType::char()))
             .param("s", CType::ptr(CType::char()))
             .param("c", CType::int())
-            .doc("Locate character in string")
+            .doc("Locate character in string"),
     );
 
     db.add_function(
         FunctionPrototype::new("strrchr", CType::ptr(CType::char()))
             .param("s", CType::ptr(CType::char()))
             .param("c", CType::int())
-            .doc("Locate last occurrence of character in string")
+            .doc("Locate last occurrence of character in string"),
     );
 
     db.add_function(
         FunctionPrototype::new("strstr", CType::ptr(CType::char()))
             .param("haystack", CType::ptr(CType::char()))
             .param("needle", CType::ptr(CType::char()))
-            .doc("Locate a substring")
+            .doc("Locate a substring"),
     );
 
     db.add_function(
         FunctionPrototype::new("strdup", CType::ptr(CType::char()))
             .param("s", CType::ptr(CType::char()))
-            .doc("Duplicate a string")
+            .doc("Duplicate a string"),
     );
 
     // Memory functions
@@ -84,7 +84,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("dest", CType::ptr(CType::void()))
             .param("src", CType::ptr(CType::void()))
             .param("n", CType::typedef_ref("size_t"))
-            .doc("Copy memory area")
+            .doc("Copy memory area"),
     );
 
     db.add_function(
@@ -92,7 +92,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("dest", CType::ptr(CType::void()))
             .param("src", CType::ptr(CType::void()))
             .param("n", CType::typedef_ref("size_t"))
-            .doc("Copy memory area (handles overlapping)")
+            .doc("Copy memory area (handles overlapping)"),
     );
 
     db.add_function(
@@ -100,7 +100,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("s", CType::ptr(CType::void()))
             .param("c", CType::int())
             .param("n", CType::typedef_ref("size_t"))
-            .doc("Fill memory with a constant byte")
+            .doc("Fill memory with a constant byte"),
     );
 
     db.add_function(
@@ -108,7 +108,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("s1", CType::ptr(CType::void()))
             .param("s2", CType::ptr(CType::void()))
             .param("n", CType::typedef_ref("size_t"))
-            .doc("Compare memory areas")
+            .doc("Compare memory areas"),
     );
 
     db.add_function(
@@ -116,34 +116,34 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("s", CType::ptr(CType::void()))
             .param("c", CType::int())
             .param("n", CType::typedef_ref("size_t"))
-            .doc("Scan memory for a character")
+            .doc("Scan memory for a character"),
     );
 
     // Memory allocation
     db.add_function(
         FunctionPrototype::new("malloc", CType::ptr(CType::void()))
             .param("size", CType::typedef_ref("size_t"))
-            .doc("Allocate memory")
+            .doc("Allocate memory"),
     );
 
     db.add_function(
         FunctionPrototype::new("calloc", CType::ptr(CType::void()))
             .param("nmemb", CType::typedef_ref("size_t"))
             .param("size", CType::typedef_ref("size_t"))
-            .doc("Allocate and zero-initialize array")
+            .doc("Allocate and zero-initialize array"),
     );
 
     db.add_function(
         FunctionPrototype::new("realloc", CType::ptr(CType::void()))
             .param("ptr", CType::ptr(CType::void()))
             .param("size", CType::typedef_ref("size_t"))
-            .doc("Reallocate memory")
+            .doc("Reallocate memory"),
     );
 
     db.add_function(
         FunctionPrototype::new("free", CType::void())
             .param("ptr", CType::ptr(CType::void()))
-            .doc("Free allocated memory")
+            .doc("Free allocated memory"),
     );
 
     // I/O functions
@@ -151,7 +151,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
         FunctionPrototype::new("printf", CType::int())
             .param("format", CType::ptr(CType::char()))
             .variadic()
-            .doc("Formatted output to stdout")
+            .doc("Formatted output to stdout"),
     );
 
     db.add_function(
@@ -159,7 +159,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
             .param("format", CType::ptr(CType::char()))
             .variadic()
-            .doc("Formatted output to stream")
+            .doc("Formatted output to stream"),
     );
 
     db.add_function(
@@ -167,7 +167,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("str", CType::ptr(CType::char()))
             .param("format", CType::ptr(CType::char()))
             .variadic()
-            .doc("Formatted output to string")
+            .doc("Formatted output to string"),
     );
 
     db.add_function(
@@ -176,31 +176,30 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("size", CType::typedef_ref("size_t"))
             .param("format", CType::ptr(CType::char()))
             .variadic()
-            .doc("Formatted output to string with size limit")
+            .doc("Formatted output to string with size limit"),
     );
 
     db.add_function(
         FunctionPrototype::new("scanf", CType::int())
             .param("format", CType::ptr(CType::char()))
             .variadic()
-            .doc("Formatted input from stdin")
+            .doc("Formatted input from stdin"),
     );
 
     db.add_function(
         FunctionPrototype::new("puts", CType::int())
             .param("s", CType::ptr(CType::char()))
-            .doc("Output a string to stdout")
+            .doc("Output a string to stdout"),
     );
 
     db.add_function(
         FunctionPrototype::new("putchar", CType::int())
             .param("c", CType::int())
-            .doc("Output a character to stdout")
+            .doc("Output a character to stdout"),
     );
 
     db.add_function(
-        FunctionPrototype::new("getchar", CType::int())
-            .doc("Get a character from stdin")
+        FunctionPrototype::new("getchar", CType::int()).doc("Get a character from stdin"),
     );
 
     db.add_function(
@@ -208,14 +207,14 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("s", CType::ptr(CType::char()))
             .param("size", CType::int())
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
-            .doc("Read a line from stream")
+            .doc("Read a line from stream"),
     );
 
     db.add_function(
         FunctionPrototype::new("fputs", CType::int())
             .param("s", CType::ptr(CType::char()))
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
-            .doc("Write a string to stream")
+            .doc("Write a string to stream"),
     );
 
     // File operations
@@ -223,13 +222,13 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
         FunctionPrototype::new("fopen", CType::ptr(CType::typedef_ref("FILE")))
             .param("pathname", CType::ptr(CType::char()))
             .param("mode", CType::ptr(CType::char()))
-            .doc("Open a file")
+            .doc("Open a file"),
     );
 
     db.add_function(
         FunctionPrototype::new("fclose", CType::int())
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
-            .doc("Close a file")
+            .doc("Close a file"),
     );
 
     db.add_function(
@@ -238,7 +237,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("size", CType::typedef_ref("size_t"))
             .param("nmemb", CType::typedef_ref("size_t"))
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
-            .doc("Read from a file")
+            .doc("Read from a file"),
     );
 
     db.add_function(
@@ -247,7 +246,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("size", CType::typedef_ref("size_t"))
             .param("nmemb", CType::typedef_ref("size_t"))
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
-            .doc("Write to a file")
+            .doc("Write to a file"),
     );
 
     db.add_function(
@@ -255,19 +254,19 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
             .param("offset", CType::long())
             .param("whence", CType::int())
-            .doc("Seek in a file")
+            .doc("Seek in a file"),
     );
 
     db.add_function(
         FunctionPrototype::new("ftell", CType::long())
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
-            .doc("Get current file position")
+            .doc("Get current file position"),
     );
 
     db.add_function(
         FunctionPrototype::new("fflush", CType::int())
             .param("stream", CType::ptr(CType::typedef_ref("FILE")))
-            .doc("Flush a stream")
+            .doc("Flush a stream"),
     );
 
     // POSIX file I/O
@@ -276,13 +275,13 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("pathname", CType::ptr(CType::char()))
             .param("flags", CType::int())
             .variadic()
-            .doc("Open a file descriptor")
+            .doc("Open a file descriptor"),
     );
 
     db.add_function(
         FunctionPrototype::new("close", CType::int())
             .param("fd", CType::int())
-            .doc("Close a file descriptor")
+            .doc("Close a file descriptor"),
     );
 
     db.add_function(
@@ -290,7 +289,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("fd", CType::int())
             .param("buf", CType::ptr(CType::void()))
             .param("count", CType::typedef_ref("size_t"))
-            .doc("Read from a file descriptor")
+            .doc("Read from a file descriptor"),
     );
 
     db.add_function(
@@ -298,7 +297,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("fd", CType::int())
             .param("buf", CType::ptr(CType::void()))
             .param("count", CType::typedef_ref("size_t"))
-            .doc("Write to a file descriptor")
+            .doc("Write to a file descriptor"),
     );
 
     db.add_function(
@@ -306,77 +305,72 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("fd", CType::int())
             .param("offset", CType::typedef_ref("off_t"))
             .param("whence", CType::int())
-            .doc("Reposition file offset")
+            .doc("Reposition file offset"),
     );
 
     // Process functions
     db.add_function(
         FunctionPrototype::new("exit", CType::void())
             .param("status", CType::int())
-            .doc("Terminate the process")
+            .doc("Terminate the process"),
     );
 
     db.add_function(
         FunctionPrototype::new("_exit", CType::void())
             .param("status", CType::int())
-            .doc("Terminate the process immediately")
+            .doc("Terminate the process immediately"),
     );
 
     db.add_function(
-        FunctionPrototype::new("fork", CType::typedef_ref("pid_t"))
-            .doc("Create a child process")
+        FunctionPrototype::new("fork", CType::typedef_ref("pid_t")).doc("Create a child process"),
     );
 
     db.add_function(
-        FunctionPrototype::new("getpid", CType::typedef_ref("pid_t"))
-            .doc("Get process ID")
+        FunctionPrototype::new("getpid", CType::typedef_ref("pid_t")).doc("Get process ID"),
     );
 
     db.add_function(
-        FunctionPrototype::new("getppid", CType::typedef_ref("pid_t"))
-            .doc("Get parent process ID")
+        FunctionPrototype::new("getppid", CType::typedef_ref("pid_t")).doc("Get parent process ID"),
     );
 
     db.add_function(
-        FunctionPrototype::new("getuid", CType::typedef_ref("uid_t"))
-            .doc("Get real user ID")
+        FunctionPrototype::new("getuid", CType::typedef_ref("uid_t")).doc("Get real user ID"),
     );
 
     db.add_function(
-        FunctionPrototype::new("getgid", CType::typedef_ref("gid_t"))
-            .doc("Get real group ID")
+        FunctionPrototype::new("getgid", CType::typedef_ref("gid_t")).doc("Get real group ID"),
     );
 
     // Error handling
     db.add_function(
         FunctionPrototype::new("perror", CType::void())
             .param("s", CType::ptr(CType::char()))
-            .doc("Print error message")
+            .doc("Print error message"),
     );
 
     db.add_function(
         FunctionPrototype::new("strerror", CType::ptr(CType::char()))
             .param("errnum", CType::int())
-            .doc("Return string describing error number")
+            .doc("Return string describing error number"),
     );
 
     // Utility functions
     db.add_function(
         FunctionPrototype::new("atoi", CType::int())
             .param("nptr", CType::ptr(CType::char()))
-            .doc("Convert string to integer")
+            .doc("Convert string to integer"),
     );
 
     db.add_function(
         FunctionPrototype::new("atol", CType::long())
             .param("nptr", CType::ptr(CType::char()))
-            .doc("Convert string to long")
+            .doc("Convert string to long"),
     );
 
     db.add_function(
         FunctionPrototype::new("atof", CType::double())
             .param("nptr", CType::ptr(CType::char()))
-            .doc("Convert string to double")
+            .doc("Convert string to double"),
     );
 
     db.add_function(
@@ -384,7 +378,7 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("nptr", CType::ptr(CType::char()))
             .param("endptr", CType::ptr(CType::ptr(CType::char())))
             .param("base", CType::int())
-            .doc("Convert string to long integer")
+            .doc("Convert string to long integer"),
     );
 
     db.add_function(
@@ -392,43 +386,45 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("nptr", CType::ptr(CType::char()))
             .param("endptr", CType::ptr(CType::ptr(CType::char())))
             .param("base", CType::int())
-            .doc("Convert string to unsigned long integer")
+            .doc("Convert string to unsigned long integer"),
     );
 
     db.add_function(
         FunctionPrototype::new("abs", CType::int())
             .param("j", CType::int())
-            .doc("Absolute value of integer")
+            .doc("Absolute value of integer"),
     );
 
     db.add_function(
-        FunctionPrototype::new("rand", CType::int())
-            .doc("Generate pseudo-random number")
+        FunctionPrototype::new("rand", CType::int()).doc("Generate pseudo-random number"),
     );
 
     db.add_function(
         FunctionPrototype::new("srand", CType::void())
             .param("seed", CType::uint())
-            .doc("Seed pseudo-random number generator")
+            .doc("Seed pseudo-random number generator"),
     );
 
     // Time functions
     db.add_function(
         FunctionPrototype::new("time", CType::typedef_ref("time_t"))
             .param("tloc", CType::ptr(CType::typedef_ref("time_t")))
-            .doc("Get time in seconds")
+            .doc("Get time in seconds"),
     );
 
     db.add_function(
-        FunctionPrototype::new("localtime", CType::ptr(CType::Named("struct tm".to_string())))
-            .param("timep", CType::ptr(CType::typedef_ref("time_t")))
-            .doc("Convert time_t to local time")
+        FunctionPrototype::new(
+            "localtime",
+            CType::ptr(CType::Named("struct tm".to_string())),
+        )
+        .param("timep", CType::ptr(CType::typedef_ref("time_t")))
+        .doc("Convert time_t to local time"),
     );
 
     db.add_function(
         FunctionPrototype::new("gmtime", CType::ptr(CType::Named("struct tm".to_string())))
             .param("timep", CType::ptr(CType::typedef_ref("time_t")))
-            .doc("Convert time_t to UTC")
+            .doc("Convert time_t to UTC"),
     );
 
     db.add_function(
@@ -437,19 +433,19 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("max", CType::typedef_ref("size_t"))
             .param("format", CType::ptr(CType::char()))
             .param("tm", CType::ptr(CType::Named("struct tm".to_string())))
-            .doc("Format time as string")
+            .doc("Format time as string"),
     );
 
     db.add_function(
         FunctionPrototype::new("sleep", CType::uint())
             .param("seconds", CType::uint())
-            .doc("Sleep for specified seconds")
+            .doc("Sleep for specified seconds"),
     );
 
     db.add_function(
         FunctionPrototype::new("usleep", CType::int())
             .param("usec", CType::uint())
-            .doc("Sleep for specified microseconds")
+            .doc("Sleep for specified microseconds"),
     );
 }
 

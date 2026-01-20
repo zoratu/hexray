@@ -54,7 +54,10 @@ fn test_help() {
         stdout.contains("multi-architecture disassembler"),
         "Help should mention disassembler"
     );
-    assert!(stdout.contains("--symbol"), "Help should show --symbol option");
+    assert!(
+        stdout.contains("--symbol"),
+        "Help should show --symbol option"
+    );
 }
 
 #[test]
@@ -63,7 +66,10 @@ fn test_version() {
     // Version flag may not be implemented in all versions
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("hexray") || !stdout.is_empty(), "Version output should not be empty");
+        assert!(
+            stdout.contains("hexray") || !stdout.is_empty(),
+            "Version output should not be empty"
+        );
     } else {
         // If not implemented, verify it fails gracefully (not a crash)
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -143,7 +149,10 @@ fn test_symbols_functions_only() {
         "symbols",
         "--functions",
     ]);
-    assert!(output.status.success(), "symbols --functions should succeed");
+    assert!(
+        output.status.success(),
+        "symbols --functions should succeed"
+    );
 }
 
 #[test]
@@ -259,10 +268,7 @@ fn test_disassemble_entry_point() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Should show some disassembly
-    assert!(
-        !stdout.is_empty(),
-        "Should produce disassembly output"
-    );
+    assert!(!stdout.is_empty(), "Should produce disassembly output");
 }
 
 #[test]
@@ -390,10 +396,7 @@ fn test_callgraph_dot() {
     let output = run_hexray(&[&fixture_path("test_decompile"), "callgraph", "--dot"]);
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("digraph"),
-            "DOT output should be a digraph"
-        );
+        assert!(stdout.contains("digraph"), "DOT output should be a digraph");
     }
 }
 
@@ -474,10 +477,7 @@ fn test_types_list() {
 #[test]
 fn test_nonexistent_file() {
     let output = run_hexray(&["nonexistent_file_that_does_not_exist.bin"]);
-    assert!(
-        !output.status.success(),
-        "Should fail for nonexistent file"
-    );
+    assert!(!output.status.success(), "Should fail for nonexistent file");
 }
 
 #[test]
@@ -485,11 +485,7 @@ fn test_invalid_address() {
     skip_if_missing!("elf/simple_x86_64");
 
     // Invalid hex address should be handled gracefully
-    let output = run_hexray(&[
-        &fixture_path("elf/simple_x86_64"),
-        "--address",
-        "not_a_hex",
-    ]);
+    let output = run_hexray(&[&fixture_path("elf/simple_x86_64"), "--address", "not_a_hex"]);
     assert!(!output.status.success(), "Should fail for invalid address");
 }
 

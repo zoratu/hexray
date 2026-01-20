@@ -35,7 +35,12 @@ impl CfgDotExporter {
     }
 
     /// Export the CFG to DOT format, writing to the provided writer.
-    pub fn export<W: Write>(&self, cfg: &ControlFlowGraph, name: &str, mut writer: W) -> io::Result<()> {
+    pub fn export<W: Write>(
+        &self,
+        cfg: &ControlFlowGraph,
+        name: &str,
+        mut writer: W,
+    ) -> io::Result<()> {
         // Write header
         write!(writer, "{}", self.config.header(name))?;
         writeln!(writer)?;
@@ -45,7 +50,12 @@ impl CfgDotExporter {
             if let Some(block) = cfg.block(block_id) {
                 // Build label with block info and instructions
                 let mut label = String::new();
-                write!(label, "{}:\\l[{:#x} - {:#x})\\l\\l", block_id, block.start, block.end).unwrap();
+                write!(
+                    label,
+                    "{}:\\l[{:#x} - {:#x})\\l\\l",
+                    block_id, block.start, block.end
+                )
+                .unwrap();
 
                 for inst in &block.instructions {
                     let inst_str = escape_dot_string(&format!("{}", inst));
@@ -53,11 +63,7 @@ impl CfgDotExporter {
                     label.push_str("\\l");
                 }
 
-                writeln!(
-                    writer,
-                    "    \"{}\" [label=\"{}\"];",
-                    block_id, label
-                )?;
+                writeln!(writer, "    \"{}\" [label=\"{}\"];", block_id, label)?;
             }
         }
 
@@ -66,7 +72,11 @@ impl CfgDotExporter {
         // Create edges for control flow
         for block_id in cfg.reverse_post_order() {
             for succ in cfg.successors(block_id) {
-                write!(writer, "{}", format_edge(&block_id.to_string(), &succ.to_string()))?;
+                write!(
+                    writer,
+                    "{}",
+                    format_edge(&block_id.to_string(), &succ.to_string())
+                )?;
             }
         }
 
@@ -77,7 +87,8 @@ impl CfgDotExporter {
     /// Export the CFG to DOT format, returning it as a String.
     pub fn export_to_string(&self, cfg: &ControlFlowGraph, name: &str) -> String {
         let mut buf = Vec::new();
-        self.export(cfg, name, &mut buf).expect("writing to Vec should not fail");
+        self.export(cfg, name, &mut buf)
+            .expect("writing to Vec should not fail");
         String::from_utf8(buf).expect("DOT output should be valid UTF-8")
     }
 
@@ -158,7 +169,8 @@ impl CallGraphDotExporter {
     /// Export the call graph to DOT format, returning it as a String.
     pub fn export_to_string(&self, callgraph: &CallGraph) -> String {
         let mut buf = Vec::new();
-        self.export(callgraph, &mut buf).expect("writing to Vec should not fail");
+        self.export(callgraph, &mut buf)
+            .expect("writing to Vec should not fail");
         String::from_utf8(buf).expect("DOT output should be valid UTF-8")
     }
 
@@ -181,9 +193,7 @@ mod tests {
             id: BasicBlockId::ENTRY,
             start: 0x1000,
             end: 0x1010,
-            instructions: vec![
-                Instruction::new(0x1000, 4, vec![], "mov"),
-            ],
+            instructions: vec![Instruction::new(0x1000, 4, vec![], "mov")],
             terminator: BlockTerminator::Fallthrough {
                 target: BasicBlockId(1),
             },

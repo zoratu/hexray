@@ -305,9 +305,10 @@ impl CallGraphBuilder {
 
         for (&caller_entry, instructions) in &functions {
             // First, try to resolve indirect calls using the resolver
-            let resolved_indirect_calls = self.indirect_resolver.as_ref().map(|resolver| {
-                resolver.analyze(instructions)
-            });
+            let resolved_indirect_calls = self
+                .indirect_resolver
+                .as_ref()
+                .map(|resolver| resolver.analyze(instructions));
 
             for instr in *instructions {
                 match &instr.control_flow {
@@ -350,11 +351,13 @@ impl CallGraphBuilder {
                                 }
                             } else {
                                 // Record as unresolved
-                                self.call_graph.add_unresolved_call(caller_entry, instr.address);
+                                self.call_graph
+                                    .add_unresolved_call(caller_entry, instr.address);
                             }
                         } else {
                             // No resolver or no resolution found
-                            self.call_graph.add_unresolved_call(caller_entry, instr.address);
+                            self.call_graph
+                                .add_unresolved_call(caller_entry, instr.address);
                         }
                     }
                     _ => {}
@@ -375,7 +378,9 @@ impl Default for CallGraphBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{ControlFlow, Immediate, Instruction, Operand, Operation, Symbol, SymbolKind};
+    use hexray_core::{
+        ControlFlow, Immediate, Instruction, Operand, Operation, Symbol, SymbolKind,
+    };
 
     fn make_call_instruction(addr: u64, target: u64) -> Instruction {
         Instruction {
@@ -694,10 +699,7 @@ mod tests {
         builder.add_function(0x1000, main_instrs);
 
         // foo at 0x2000 is a leaf
-        let foo_instrs = vec![
-            make_nop_instruction(0x2000),
-            make_ret_instruction(0x2001),
-        ];
+        let foo_instrs = vec![make_nop_instruction(0x2000), make_ret_instruction(0x2001)];
         builder.add_function(0x2000, foo_instrs);
 
         let cg = builder.build();
@@ -737,10 +739,7 @@ mod tests {
         let cg = builder.build();
 
         assert_eq!(cg.node_count(), 2);
-        assert_eq!(
-            cg.get_node(0x1000).unwrap().name.as_deref(),
-            Some("main")
-        );
+        assert_eq!(cg.get_node(0x1000).unwrap().name.as_deref(), Some("main"));
         assert!(cg.get_node(0x0).unwrap().is_external);
     }
 }

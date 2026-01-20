@@ -20,10 +20,10 @@ pub mod liveness;
 pub mod queries;
 pub mod reaching_defs;
 
-pub use const_prop::{ConstValue, ConstState, ConstantPropagation};
-pub use def_use::{DefUseChain, DefUseInfo, Definition, Use, DefId};
+pub use const_prop::{ConstState, ConstValue, ConstantPropagation};
+pub use def_use::{DefId, DefUseChain, DefUseInfo, Definition, Use};
 pub use liveness::LivenessAnalysis;
-pub use queries::{DataFlowQuery, DataFlowQueryEngine, DataFlowResult, DataFlowStep, DataFlowRole};
+pub use queries::{DataFlowQuery, DataFlowQueryEngine, DataFlowResult, DataFlowRole, DataFlowStep};
 pub use reaching_defs::ReachingDefinitions;
 
 use hexray_core::{BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation, Register};
@@ -89,9 +89,16 @@ impl InstructionEffects {
             }
 
             // Binary ops: dest = dest op src (or dest = src1 op src2)
-            Operation::Add | Operation::Sub | Operation::Mul | Operation::Div |
-            Operation::And | Operation::Or | Operation::Xor |
-            Operation::Shl | Operation::Shr | Operation::Sar => {
+            Operation::Add
+            | Operation::Sub
+            | Operation::Mul
+            | Operation::Div
+            | Operation::And
+            | Operation::Or
+            | Operation::Xor
+            | Operation::Shl
+            | Operation::Shr
+            | Operation::Sar => {
                 if inst.operands.len() >= 3 {
                     // Three-operand form: dest = src1 op src2
                     effects.add_def(&inst.operands[0]);
@@ -265,7 +272,12 @@ pub trait DataflowAnalysis {
     fn meet(&self, facts: Vec<&Self::Fact>) -> Self::Fact;
 
     /// Transfer function: computes output fact from input fact and block.
-    fn transfer(&self, block_id: BasicBlockId, input: &Self::Fact, cfg: &ControlFlowGraph) -> Self::Fact;
+    fn transfer(
+        &self,
+        block_id: BasicBlockId,
+        input: &Self::Fact,
+        cfg: &ControlFlowGraph,
+    ) -> Self::Fact;
 
     /// Whether this is a forward or backward analysis.
     fn is_forward(&self) -> bool;

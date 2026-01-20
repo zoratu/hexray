@@ -34,8 +34,8 @@
 // Allow DWARF standard naming conventions (DW_CFA_*, DW_EH_PE_*)
 #![allow(non_upper_case_globals)]
 
-use crate::ParseError;
 use super::leb128::{decode_sleb128, decode_uleb128};
+use crate::ParseError;
 
 /// Parsed .eh_frame section data.
 #[derive(Debug, Clone)]
@@ -59,14 +59,16 @@ impl EhFrame {
     ///
     /// Returns an iterator of (start_address, end_address) pairs.
     pub fn function_boundaries(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.fdes.iter().map(|fde| (fde.pc_begin, fde.pc_begin + fde.pc_range))
+        self.fdes
+            .iter()
+            .map(|fde| (fde.pc_begin, fde.pc_begin + fde.pc_range))
     }
 
     /// Find the FDE containing the given address.
     pub fn find_fde(&self, address: u64) -> Option<&Fde> {
-        self.fdes.iter().find(|fde| {
-            address >= fde.pc_begin && address < fde.pc_begin + fde.pc_range
-        })
+        self.fdes
+            .iter()
+            .find(|fde| address >= fde.pc_begin && address < fde.pc_begin + fde.pc_range)
     }
 
     /// Get the CIE for an FDE by its CIE offset.
@@ -196,7 +198,6 @@ impl Fde {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfiInstruction {
     // High 2-bit opcodes (DW_CFA_advance_loc, DW_CFA_offset, DW_CFA_restore)
-
     /// Advance the location counter by delta * code_alignment.
     AdvanceLoc { delta: u8 },
 
@@ -207,7 +208,6 @@ pub enum CfiInstruction {
     Restore { register: u64 },
 
     // Opcodes from 0x00
-
     /// No operation.
     Nop,
 
@@ -278,7 +278,6 @@ pub enum CfiInstruction {
     ValExpression { register: u64, expression: Vec<u8> },
 
     // GNU extensions
-
     /// GNU: arguments size change.
     GnuArgsSize { size: u64 },
 
@@ -556,16 +555,15 @@ impl<'a> EhFrameParser<'a> {
 
         // Parse initial instructions
         if offset < entry_end {
-            cie.initial_instructions = self.parse_cfi_instructions(
-                &self.data[offset..entry_end],
-                &cie,
-            )?;
+            cie.initial_instructions =
+                self.parse_cfi_instructions(&self.data[offset..entry_end], &cie)?;
         }
 
         Ok(cie)
     }
 
     /// Parse an FDE entry.
+    #[allow(clippy::too_many_arguments)]
     fn parse_fde(
         &self,
         entry_start: usize,
@@ -608,7 +606,10 @@ impl<'a> EhFrameParser<'a> {
         offset += bytes;
 
         // Parse augmentation data if CIE has 'z' augmentation
-        if cie.map(|c| c.augmentation.starts_with('z')).unwrap_or(false) {
+        if cie
+            .map(|c| c.augmentation.starts_with('z'))
+            .unwrap_or(false)
+        {
             let (aug_len, bytes) = decode_uleb128(&self.data[offset..])?;
             fde.augmentation_length = Some(aug_len);
             offset += bytes;
@@ -639,10 +640,7 @@ impl<'a> EhFrameParser<'a> {
         // Parse CFI instructions
         if offset < entry_end {
             if let Some(c) = cie {
-                fde.instructions = self.parse_cfi_instructions(
-                    &self.data[offset..entry_end],
-                    c,
-                )?;
+                fde.instructions = self.parse_cfi_instructions(&self.data[offset..entry_end], c)?;
             }
         }
 
@@ -682,7 +680,9 @@ impl<'a> EhFrameParser<'a> {
                 }
                 0x3 => {
                     // DW_CFA_restore
-                    CfiInstruction::Restore { register: low6 as u64 }
+                    CfiInstruction::Restore {
+                        register: low6 as u64,
+                    }
                 }
                 _ => {
                     // Extended opcodes
@@ -727,7 +727,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (factored_offset, bytes) = decode_uleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::OffsetExtended { register, factored_offset }
+                            CfiInstruction::OffsetExtended {
+                                register,
+                                factored_offset,
+                            }
                         }
 
                         DW_CFA_restore_extended => {
@@ -753,7 +756,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (target_register, bytes) = decode_uleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::Register { register, target_register }
+                            CfiInstruction::Register {
+                                register,
+                                target_register,
+                            }
                         }
 
                         DW_CFA_remember_state => CfiInstruction::RememberState,
@@ -765,7 +771,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (cfa_offset, bytes) = decode_uleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::DefCfa { register, offset: cfa_offset }
+                            CfiInstruction::DefCfa {
+                                register,
+                                offset: cfa_offset,
+                            }
                         }
 
                         DW_CFA_def_cfa_register => {
@@ -803,7 +812,10 @@ impl<'a> EhFrameParser<'a> {
                             }
                             let expression = data[offset..expr_end].to_vec();
                             offset = expr_end;
-                            CfiInstruction::Expression { register, expression }
+                            CfiInstruction::Expression {
+                                register,
+                                expression,
+                            }
                         }
 
                         DW_CFA_offset_extended_sf => {
@@ -811,7 +823,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (factored_offset, bytes) = decode_sleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::OffsetExtendedSf { register, factored_offset }
+                            CfiInstruction::OffsetExtendedSf {
+                                register,
+                                factored_offset,
+                            }
                         }
 
                         DW_CFA_def_cfa_sf => {
@@ -819,7 +834,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (factored_offset, bytes) = decode_sleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::DefCfaSf { register, factored_offset }
+                            CfiInstruction::DefCfaSf {
+                                register,
+                                factored_offset,
+                            }
                         }
 
                         DW_CFA_def_cfa_offset_sf => {
@@ -833,7 +851,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (factored_offset, bytes) = decode_uleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::ValOffset { register, factored_offset }
+                            CfiInstruction::ValOffset {
+                                register,
+                                factored_offset,
+                            }
                         }
 
                         DW_CFA_val_offset_sf => {
@@ -841,7 +862,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (factored_offset, bytes) = decode_sleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::ValOffsetSf { register, factored_offset }
+                            CfiInstruction::ValOffsetSf {
+                                register,
+                                factored_offset,
+                            }
                         }
 
                         DW_CFA_val_expression => {
@@ -855,7 +879,10 @@ impl<'a> EhFrameParser<'a> {
                             }
                             let expression = data[offset..expr_end].to_vec();
                             offset = expr_end;
-                            CfiInstruction::ValExpression { register, expression }
+                            CfiInstruction::ValExpression {
+                                register,
+                                expression,
+                            }
                         }
 
                         // GNU extensions
@@ -870,7 +897,10 @@ impl<'a> EhFrameParser<'a> {
                             offset += bytes;
                             let (factored_offset, bytes) = decode_uleb128(&data[offset..])?;
                             offset += bytes;
-                            CfiInstruction::GnuNegOffsetExtended { register, factored_offset }
+                            CfiInstruction::GnuNegOffsetExtended {
+                                register,
+                                factored_offset,
+                            }
                         }
 
                         _ => {
@@ -998,7 +1028,9 @@ impl<'a> EhFrameParser<'a> {
                 context: "u64",
             });
         }
-        let bytes = [data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]];
+        let bytes = [
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ];
         Ok(if self.big_endian {
             u64::from_be_bytes(bytes)
         } else {
@@ -1016,7 +1048,11 @@ impl<'a> EhFrameParser<'a> {
     }
 
     /// Read an encoded pointer value.
-    fn read_encoded_pointer(&self, offset: usize, encoding: u8) -> Result<(u64, usize), ParseError> {
+    fn read_encoded_pointer(
+        &self,
+        offset: usize,
+        encoding: u8,
+    ) -> Result<(u64, usize), ParseError> {
         self.read_encoded_pointer_with_base(offset, encoding, self.section_base + offset as u64)
     }
 
@@ -1201,15 +1237,15 @@ mod tests {
         let data: &[u8] = &[
             0x10, 0x00, 0x00, 0x00, // Length: 16 bytes after this field
             0x00, 0x00, 0x00, 0x00, // CIE ID: 0
-            0x01,                   // Version: 1
-            0x00,                   // Augmentation: ""
-            0x01,                   // Code alignment: 1
-            0x78,                   // Data alignment: -8 (SLEB128)
-            0x10,                   // Return register: 16
+            0x01, // Version: 1
+            0x00, // Augmentation: ""
+            0x01, // Code alignment: 1
+            0x78, // Data alignment: -8 (SLEB128)
+            0x10, // Return register: 16
             // Initial instructions (7 bytes to reach 16)
-            0x0c, 0x07, 0x08,       // DW_CFA_def_cfa r7, 8
-            0x90, 0x01,             // DW_CFA_offset r16, 1
-            0x00, 0x00,             // DW_CFA_nop (padding)
+            0x0c, 0x07, 0x08, // DW_CFA_def_cfa r7, 8
+            0x90, 0x01, // DW_CFA_offset r16, 1
+            0x00, 0x00, // DW_CFA_nop (padding)
         ];
 
         let result = parse_eh_frame(data, 8, false, 0);
@@ -1233,17 +1269,17 @@ mod tests {
         let data: &[u8] = &[
             0x14, 0x00, 0x00, 0x00, // Length: 20 bytes after this field
             0x00, 0x00, 0x00, 0x00, // CIE ID: 0
-            0x01,                   // Version: 1
-            b'z', b'R', 0x00,       // Augmentation: "zR"
-            0x01,                   // Code alignment: 1
-            0x78,                   // Data alignment: -8
-            0x10,                   // Return register: 16
-            0x01,                   // Augmentation length: 1
-            0x1b,                   // FDE pointer encoding: sdata4, pcrel
+            0x01, // Version: 1
+            b'z', b'R', 0x00, // Augmentation: "zR"
+            0x01, // Code alignment: 1
+            0x78, // Data alignment: -8
+            0x10, // Return register: 16
+            0x01, // Augmentation length: 1
+            0x1b, // FDE pointer encoding: sdata4, pcrel
             // Initial instructions (8 bytes to reach 20)
-            0x0c, 0x07, 0x08,       // DW_CFA_def_cfa r7, 8
-            0x90, 0x01,             // DW_CFA_offset r16, 1
-            0x00, 0x00, 0x00,       // padding
+            0x0c, 0x07, 0x08, // DW_CFA_def_cfa r7, 8
+            0x90, 0x01, // DW_CFA_offset r16, 1
+            0x00, 0x00, 0x00, // padding
         ];
 
         let result = parse_eh_frame(data, 8, false, 0);
@@ -1268,7 +1304,10 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         assert!(matches!(
             instructions[0],
-            CfiInstruction::DefCfa { register: 7, offset: 8 }
+            CfiInstruction::DefCfa {
+                register: 7,
+                offset: 8
+            }
         ));
 
         // DW_CFA_advance_loc (high 2 bits = 1, low 6 bits = delta)
@@ -1286,7 +1325,10 @@ mod tests {
         assert_eq!(instructions.len(), 1);
         assert!(matches!(
             instructions[0],
-            CfiInstruction::Offset { register: 6, offset: 2 }
+            CfiInstruction::Offset {
+                register: 6,
+                offset: 2
+            }
         ));
 
         // DW_CFA_restore (high 2 bits = 3, low 6 bits = register)
@@ -1369,13 +1411,13 @@ mod tests {
             0xFF, 0xFF, 0xFF, 0xFF, // 64-bit marker
             0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Length: 16 bytes (64-bit)
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // CIE ID: 0 (64-bit)
-            0x01,                   // Version: 1
-            0x00,                   // Augmentation: ""
-            0x01,                   // Code alignment: 1
-            0x78,                   // Data alignment: -8
-            0x10,                   // Return register: 16
+            0x01, // Version: 1
+            0x00, // Augmentation: ""
+            0x01, // Code alignment: 1
+            0x78, // Data alignment: -8
+            0x10, // Return register: 16
             // Instructions: 3 bytes
-            0x0c, 0x07, 0x08,       // DW_CFA_def_cfa r7, 8
+            0x0c, 0x07, 0x08, // DW_CFA_def_cfa r7, 8
         ];
 
         let result = parse_eh_frame(data, 8, false, 0);

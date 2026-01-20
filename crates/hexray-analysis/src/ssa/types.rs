@@ -129,7 +129,13 @@ impl fmt::Display for SsaOperand {
                     write!(f, "{:#x}", imm)
                 }
             }
-            SsaOperand::Memory { base, index, scale, displacement, size } => {
+            SsaOperand::Memory {
+                base,
+                index,
+                scale,
+                displacement,
+                size,
+            } => {
                 let prefix = match size {
                     1 => "byte",
                     2 => "word",
@@ -267,7 +273,8 @@ impl SsaFunction {
                 if !inst.defs.is_empty() {
                     let defs: Vec<_> = inst.defs.iter().map(|d| d.to_string()).collect();
                     let uses: Vec<_> = inst.uses.iter().map(|u| u.to_string()).collect();
-                    output.push_str(&format!("    {} = {:?}({})\n",
+                    output.push_str(&format!(
+                        "    {} = {:?}({})\n",
                         defs.join(", "),
                         inst.operation,
                         uses.join(", ")

@@ -4,8 +4,8 @@
 //! to verify symbol table parsing accuracy.
 
 use super::{
-    compare_symbols, fixture_path, parse_nm_output, parse_nm_simple, run_nm,
-    run_nm_with_options, SymbolDiffResult, SymbolInfo,
+    compare_symbols, fixture_path, parse_nm_output, parse_nm_simple, run_nm, SymbolDiffResult,
+    SymbolInfo,
 };
 use hexray_formats::elf::Elf;
 use hexray_formats::macho::MachO;
@@ -164,12 +164,7 @@ pub fn compare_function_symbols(binary_path: &str) -> SymbolDiffResult {
 
     let nm_symbols: Vec<(u64, String)> = parse_nm_output(&nm_output)
         .into_iter()
-        .filter(|s| {
-            matches!(
-                s.symbol_type,
-                Some('T') | Some('t') | Some('W') | Some('w')
-            )
-        })
+        .filter(|s| matches!(s.symbol_type, Some('T') | Some('t') | Some('W') | Some('w')))
         .filter(|s| s.address != 0)
         .map(|s| (s.address, s.name))
         .collect();
@@ -493,12 +488,7 @@ mod tests {
         // Filter for function symbols (T, t, W, w)
         let functions: Vec<_> = symbols
             .iter()
-            .filter(|s| {
-                matches!(
-                    s.symbol_type,
-                    Some('T') | Some('t') | Some('W') | Some('w')
-                )
-            })
+            .filter(|s| matches!(s.symbol_type, Some('T') | Some('t') | Some('W') | Some('w')))
             .collect();
 
         assert_eq!(functions.len(), 2);

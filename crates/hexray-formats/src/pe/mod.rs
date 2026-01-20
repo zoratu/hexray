@@ -7,19 +7,18 @@
 //! - Import and export tables
 //! - Symbol extraction from exports
 
-mod header;
-mod section;
-mod imports;
 mod exports;
+mod header;
+mod imports;
+mod section;
 
-pub use header::{
-    DosHeader, CoffHeader, OptionalHeader, DataDirectory,
-    IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
-    PE32_MAGIC, PE32PLUS_MAGIC, PE_SIGNATURE,
-};
-pub use section::SectionHeader;
-pub use imports::{Import, ImportDescriptor};
 pub use exports::{Export, ExportDirectory};
+pub use header::{
+    CoffHeader, DataDirectory, DosHeader, OptionalHeader, IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386, PE32PLUS_MAGIC, PE32_MAGIC, PE_SIGNATURE,
+};
+pub use imports::{Import, ImportDescriptor};
+pub use section::SectionHeader;
 
 use crate::{BinaryFormat, ParseError, Section};
 use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
@@ -65,7 +64,10 @@ impl<'a> Pe<'a> {
         ]);
 
         if pe_sig != PE_SIGNATURE {
-            return Err(ParseError::invalid_magic("PE\\0\\0", &data[pe_offset..pe_offset + 4]));
+            return Err(ParseError::invalid_magic(
+                "PE\\0\\0",
+                &data[pe_offset..pe_offset + 4],
+            ));
         }
 
         // Parse COFF header
@@ -100,7 +102,9 @@ impl<'a> Pe<'a> {
         }
 
         // Parse imports
-        let imports = if let Some(import_dir) = optional_header.data_directory(header::IMAGE_DIRECTORY_ENTRY_IMPORT) {
+        let imports = if let Some(import_dir) =
+            optional_header.data_directory(header::IMAGE_DIRECTORY_ENTRY_IMPORT)
+        {
             if import_dir.virtual_address != 0 && import_dir.size != 0 {
                 imports::parse_imports(
                     data,
@@ -117,14 +121,11 @@ impl<'a> Pe<'a> {
         };
 
         // Parse exports
-        let exports = if let Some(export_dir) = optional_header.data_directory(header::IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        let exports = if let Some(export_dir) =
+            optional_header.data_directory(header::IMAGE_DIRECTORY_ENTRY_EXPORT)
+        {
             if export_dir.virtual_address != 0 && export_dir.size != 0 {
-                exports::parse_exports(
-                    data,
-                    export_dir.virtual_address,
-                    export_dir.size,
-                    &sections,
-                )
+                exports::parse_exports(data, export_dir.virtual_address, export_dir.size, &sections)
             } else {
                 Vec::new()
             }

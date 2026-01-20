@@ -152,8 +152,7 @@ impl LineNumberProgram {
                     });
                 }
                 let len = u64::from_le_bytes([
-                    data[4], data[5], data[6], data[7],
-                    data[8], data[9], data[10], data[11],
+                    data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
                 ]);
                 offset += 8;
                 (len, true)
@@ -180,14 +179,23 @@ impl LineNumberProgram {
         // Header length
         let header_length = if is_64bit {
             let len = u64::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
             ]);
             offset += 8;
             len
         } else {
             let len = u32::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
             ]) as u64;
             offset += 4;
             len
@@ -445,16 +453,24 @@ impl LineNumberProgram {
                         state.address = match header.address_size {
                             4 => {
                                 let addr = u32::from_le_bytes([
-                                    data[offset], data[offset + 1],
-                                    data[offset + 2], data[offset + 3],
+                                    data[offset],
+                                    data[offset + 1],
+                                    data[offset + 2],
+                                    data[offset + 3],
                                 ]) as u64;
                                 offset += 4;
                                 addr
                             }
                             8 => {
                                 let addr = u64::from_le_bytes([
-                                    data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-                                    data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+                                    data[offset],
+                                    data[offset + 1],
+                                    data[offset + 2],
+                                    data[offset + 3],
+                                    data[offset + 4],
+                                    data[offset + 5],
+                                    data[offset + 6],
+                                    data[offset + 7],
                                 ]);
                                 offset += 8;
                                 addr
@@ -524,7 +540,8 @@ impl LineNumberProgram {
                     op if op == DwLns::ConstAddPc as u8 => {
                         let adjusted_opcode = 255 - header.opcode_base;
                         let address_advance = adjusted_opcode / header.line_range;
-                        state.address += address_advance as u64 * header.min_instruction_length as u64;
+                        state.address +=
+                            address_advance as u64 * header.min_instruction_length as u64;
                     }
                     op if op == DwLns::FixedAdvancePc as u8 => {
                         let advance = u16::from_le_bytes([data[offset], data[offset + 1]]) as u64;
@@ -558,7 +575,8 @@ impl LineNumberProgram {
                 // Special opcode
                 let adjusted_opcode = opcode - header.opcode_base;
                 let address_advance = adjusted_opcode / header.line_range;
-                let line_advance = header.line_base as i64 + (adjusted_opcode % header.line_range) as i64;
+                let line_advance =
+                    header.line_base as i64 + (adjusted_opcode % header.line_range) as i64;
 
                 state.address += address_advance as u64 * header.min_instruction_length as u64;
                 state.line = (state.line as i64 + line_advance) as u64;

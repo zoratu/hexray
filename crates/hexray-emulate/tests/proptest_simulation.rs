@@ -8,7 +8,7 @@
 
 use proptest::prelude::*;
 
-use hexray_core::{Architecture, ControlFlow, Operation, Operand, Register, RegisterClass};
+use hexray_core::{Architecture, ControlFlow, Operand, Operation, Register, RegisterClass};
 use hexray_emulate::simulation::{FaultKind, Simulation, SimulationConfig, SimulationSnapshot};
 use hexray_emulate::state::x86_regs;
 use hexray_emulate::value::Value;
@@ -54,7 +54,9 @@ fn imm(val: i64) -> Operand {
 // =============================================================================
 
 /// Generate a sequence of instructions.
-fn arb_instruction_sequence(count: impl Into<proptest::collection::SizeRange>) -> impl Strategy<Value = Vec<hexray_core::Instruction>> {
+fn arb_instruction_sequence(
+    count: impl Into<proptest::collection::SizeRange>,
+) -> impl Strategy<Value = Vec<hexray_core::Instruction>> {
     prop::collection::vec(
         (
             prop::sample::select(vec![

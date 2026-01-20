@@ -91,7 +91,8 @@ impl SsaOptimizer {
         }
 
         // Filter out self-references
-        let non_self: Vec<_> = phi.incoming
+        let non_self: Vec<_> = phi
+            .incoming
             .iter()
             .filter(|(_, v)| v != &phi.result)
             .collect();
@@ -261,8 +262,8 @@ impl SsaOptimizer {
             // Keep instructions that define used values or have side effects
             let original_len = block.instructions.len();
             block.instructions.retain(|inst| {
-                self.has_side_effects(inst) ||
-                inst.defs.iter().any(|d| self.used_values.contains(d))
+                self.has_side_effects(inst)
+                    || inst.defs.iter().any(|d| self.used_values.contains(d))
             });
             if block.instructions.len() != original_len {
                 changed = true;
@@ -270,7 +271,9 @@ impl SsaOptimizer {
 
             // Remove unused phi nodes
             let original_phi_len = block.phis.len();
-            block.phis.retain(|phi| self.used_values.contains(&phi.result));
+            block
+                .phis
+                .retain(|phi| self.used_values.contains(&phi.result));
             if block.phis.len() != original_phi_len {
                 changed = true;
             }
@@ -315,11 +318,11 @@ impl SsaOptimizer {
     fn has_side_effects(&self, inst: &SsaInstruction) -> bool {
         matches!(
             inst.operation,
-            Operation::Store |
-            Operation::Call |
-            Operation::Return |
-            Operation::Jump |
-            Operation::ConditionalJump
+            Operation::Store
+                | Operation::Call
+                | Operation::Return
+                | Operation::Jump
+                | Operation::ConditionalJump
         )
     }
 

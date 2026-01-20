@@ -94,13 +94,13 @@ impl Vex {
         // C5 RvvvvLpp
         Self {
             r: (byte1 & 0x80) == 0, // Inverted
-            x: true,                 // Not encoded in 2-byte, default to 1 (no extension)
-            b: true,                 // Not encoded in 2-byte, default to 1 (no extension)
-            w: false,                // Not encoded in 2-byte, default to 0
+            x: true,                // Not encoded in 2-byte, default to 1 (no extension)
+            b: true,                // Not encoded in 2-byte, default to 1 (no extension)
+            w: false,               // Not encoded in 2-byte, default to 0
             vvvv: (!byte1 >> 3) & 0x0F,
             l: (byte1 & 0x04) != 0,
             pp: byte1 & 0x03,
-            mmmmm: 1,                // 2-byte VEX implies 0x0F escape
+            mmmmm: 1, // 2-byte VEX implies 0x0F escape
         }
     }
 
@@ -121,7 +121,11 @@ impl Vex {
 
     /// Returns the vector length in bits (128 or 256).
     pub fn vector_size(&self) -> u16 {
-        if self.l { 256 } else { 128 }
+        if self.l {
+            256
+        } else {
+            128
+        }
     }
 
     /// Returns the implied legacy prefix byte (0x66, 0xF3, 0xF2, or None).
@@ -190,9 +194,9 @@ impl Evex {
         // Bit 7: ~R, Bit 6: ~X, Bit 5: ~B, Bit 4: ~R'
         // Bits 3-2: must be 00 (distinguishes from BOUND in 32-bit mode)
         // Bits 1-0: mm (opcode map)
-        let r = (p0 & 0x80) == 0;       // Inverted
-        let x = (p0 & 0x40) == 0;       // Inverted
-        let b = (p0 & 0x20) == 0;       // Inverted
+        let r = (p0 & 0x80) == 0; // Inverted
+        let x = (p0 & 0x40) == 0; // Inverted
+        let b = (p0 & 0x20) == 0; // Inverted
         let r_prime = (p0 & 0x10) == 0; // Inverted
         let mm = p0 & 0x03;
 
@@ -218,9 +222,19 @@ impl Evex {
         let aaa = p2 & 0x07;
 
         Self {
-            r, x, b, r_prime, mm,
-            w, vvvv, pp,
-            z, ll, broadcast, v_prime, aaa,
+            r,
+            x,
+            b,
+            r_prime,
+            mm,
+            w,
+            vvvv,
+            pp,
+            z,
+            ll,
+            broadcast,
+            v_prime,
+            aaa,
         }
     }
 

@@ -404,9 +404,9 @@ pub mod arm64 {
     // ... X4-X28 follow the pattern
     pub const X29: u16 = 29; // Frame pointer (FP)
     pub const X30: u16 = 30; // Link register (LR)
-    pub const SP: u16 = 31;  // Stack pointer
+    pub const SP: u16 = 31; // Stack pointer
     pub const XZR: u16 = 32; // Zero register (reads as 0, writes discarded)
-    pub const PC: u16 = 33;  // Program counter
+    pub const PC: u16 = 33; // Program counter
 
     // SIMD/FP vector registers V0-V31
     // These can be accessed as B/H/S/D/Q (8/16/32/64/128 bit) or V (128-bit vector)
@@ -504,14 +504,14 @@ pub mod arm64 {
 
     // SME tile registers (sub-portions of ZA)
     // ZA0-ZA7 for various element sizes
-    pub const ZA0_B: u16 = 193;  // Byte tiles
-    pub const ZA0_H: u16 = 201;  // Halfword tiles (ZA0.H-ZA1.H)
+    pub const ZA0_B: u16 = 193; // Byte tiles
+    pub const ZA0_H: u16 = 201; // Halfword tiles (ZA0.H-ZA1.H)
     pub const ZA1_H: u16 = 202;
-    pub const ZA0_S: u16 = 209;  // Word tiles (ZA0.S-ZA3.S)
+    pub const ZA0_S: u16 = 209; // Word tiles (ZA0.S-ZA3.S)
     pub const ZA1_S: u16 = 210;
     pub const ZA2_S: u16 = 211;
     pub const ZA3_S: u16 = 212;
-    pub const ZA0_D: u16 = 217;  // Doubleword tiles (ZA0.D-ZA7.D)
+    pub const ZA0_D: u16 = 217; // Doubleword tiles (ZA0.D-ZA7.D)
     pub const ZA1_D: u16 = 218;
     pub const ZA2_D: u16 = 219;
     pub const ZA3_D: u16 = 220;
@@ -521,7 +521,7 @@ pub mod arm64 {
     pub const ZA7_D: u16 = 224;
 
     // SME streaming mode control (pseudo-register for tracking mode)
-    pub const SVCR: u16 = 240;  // Streaming Vector Control Register
+    pub const SVCR: u16 = 240; // Streaming Vector Control Register
 }
 
 fn arm64_reg_name(id: u16, size: u16) -> &'static str {
@@ -852,16 +852,16 @@ fn arm64_reg_name(id: u16, size: u16) -> &'static str {
 // RISC-V register IDs
 pub mod riscv {
     // General purpose registers x0-x31
-    pub const X0: u16 = 0;   // zero
-    pub const X1: u16 = 1;   // ra (return address)
-    pub const X2: u16 = 2;   // sp (stack pointer)
-    pub const X3: u16 = 3;   // gp (global pointer)
-    pub const X4: u16 = 4;   // tp (thread pointer)
-    pub const X5: u16 = 5;   // t0
-    pub const X6: u16 = 6;   // t1
-    pub const X7: u16 = 7;   // t2
-    pub const X8: u16 = 8;   // s0/fp (saved/frame pointer)
-    pub const X9: u16 = 9;   // s1
+    pub const X0: u16 = 0; // zero
+    pub const X1: u16 = 1; // ra (return address)
+    pub const X2: u16 = 2; // sp (stack pointer)
+    pub const X3: u16 = 3; // gp (global pointer)
+    pub const X4: u16 = 4; // tp (thread pointer)
+    pub const X5: u16 = 5; // t0
+    pub const X6: u16 = 6; // t1
+    pub const X7: u16 = 7; // t2
+    pub const X8: u16 = 8; // s0/fp (saved/frame pointer)
+    pub const X9: u16 = 9; // s1
     pub const X10: u16 = 10; // a0
     pub const X11: u16 = 11; // a1
     pub const X12: u16 = 12; // a2
@@ -888,38 +888,38 @@ pub mod riscv {
 
     // Floating-point registers f0-f31 (F/D extensions)
     // IDs 64-95 for floating-point registers
-    pub const F0: u16 = 64;   // ft0
-    pub const F1: u16 = 65;   // ft1
-    pub const F2: u16 = 66;   // ft2
-    pub const F3: u16 = 67;   // ft3
-    pub const F4: u16 = 68;   // ft4
-    pub const F5: u16 = 69;   // ft5
-    pub const F6: u16 = 70;   // ft6
-    pub const F7: u16 = 71;   // ft7
-    pub const F8: u16 = 72;   // fs0
-    pub const F9: u16 = 73;   // fs1
-    pub const F10: u16 = 74;  // fa0
-    pub const F11: u16 = 75;  // fa1
-    pub const F12: u16 = 76;  // fa2
-    pub const F13: u16 = 77;  // fa3
-    pub const F14: u16 = 78;  // fa4
-    pub const F15: u16 = 79;  // fa5
-    pub const F16: u16 = 80;  // fa6
-    pub const F17: u16 = 81;  // fa7
-    pub const F18: u16 = 82;  // fs2
-    pub const F19: u16 = 83;  // fs3
-    pub const F20: u16 = 84;  // fs4
-    pub const F21: u16 = 85;  // fs5
-    pub const F22: u16 = 86;  // fs6
-    pub const F23: u16 = 87;  // fs7
-    pub const F24: u16 = 88;  // fs8
-    pub const F25: u16 = 89;  // fs9
-    pub const F26: u16 = 90;  // fs10
-    pub const F27: u16 = 91;  // fs11
-    pub const F28: u16 = 92;  // ft8
-    pub const F29: u16 = 93;  // ft9
-    pub const F30: u16 = 94;  // ft10
-    pub const F31: u16 = 95;  // ft11
+    pub const F0: u16 = 64; // ft0
+    pub const F1: u16 = 65; // ft1
+    pub const F2: u16 = 66; // ft2
+    pub const F3: u16 = 67; // ft3
+    pub const F4: u16 = 68; // ft4
+    pub const F5: u16 = 69; // ft5
+    pub const F6: u16 = 70; // ft6
+    pub const F7: u16 = 71; // ft7
+    pub const F8: u16 = 72; // fs0
+    pub const F9: u16 = 73; // fs1
+    pub const F10: u16 = 74; // fa0
+    pub const F11: u16 = 75; // fa1
+    pub const F12: u16 = 76; // fa2
+    pub const F13: u16 = 77; // fa3
+    pub const F14: u16 = 78; // fa4
+    pub const F15: u16 = 79; // fa5
+    pub const F16: u16 = 80; // fa6
+    pub const F17: u16 = 81; // fa7
+    pub const F18: u16 = 82; // fs2
+    pub const F19: u16 = 83; // fs3
+    pub const F20: u16 = 84; // fs4
+    pub const F21: u16 = 85; // fs5
+    pub const F22: u16 = 86; // fs6
+    pub const F23: u16 = 87; // fs7
+    pub const F24: u16 = 88; // fs8
+    pub const F25: u16 = 89; // fs9
+    pub const F26: u16 = 90; // fs10
+    pub const F27: u16 = 91; // fs11
+    pub const F28: u16 = 92; // ft8
+    pub const F29: u16 = 93; // ft9
+    pub const F30: u16 = 94; // ft10
+    pub const F31: u16 = 95; // ft11
 
     // Vector registers v0-v31 (V extension)
     // IDs 128-159 for vector registers

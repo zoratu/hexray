@@ -80,12 +80,7 @@ impl DefUseChain {
     pub fn uses_of_definition(&self, def_id: DefId) -> Vec<&Use> {
         self.def_to_uses
             .get(&def_id)
-            .map(|indices| {
-                indices
-                    .iter()
-                    .filter_map(|&i| self.uses.get(i))
-                    .collect()
-            })
+            .map(|indices| indices.iter().filter_map(|&i| self.uses.get(i)).collect())
             .unwrap_or_default()
     }
 
@@ -215,10 +210,7 @@ impl DefUseChainBuilder {
                 for &pred_id in preds {
                     if let Some(pred_reaching) = self.compute_block_exit_reaching(cfg, pred_id) {
                         for (loc, defs) in pred_reaching {
-                            new_reaching
-                                .entry(loc)
-                                .or_default()
-                                .extend(defs);
+                            new_reaching.entry(loc).or_default().extend(defs);
                         }
                     }
                 }
@@ -239,7 +231,8 @@ impl DefUseChainBuilder {
         block_id: BasicBlockId,
     ) -> Option<HashMap<Location, HashSet<DefId>>> {
         let block = cfg.block(block_id)?;
-        let mut reaching = self.reaching_at_entry
+        let mut reaching = self
+            .reaching_at_entry
             .get(&block_id)
             .cloned()
             .unwrap_or_default();
@@ -250,12 +243,11 @@ impl DefUseChainBuilder {
 
             for def_loc in effects.defs {
                 // Find the definition ID for this instruction/location
-                let def_id = self.definitions
+                let def_id = self
+                    .definitions
                     .iter()
                     .find(|(_, d)| {
-                        d.block == block_id
-                            && d.inst_index == inst_index
-                            && d.location == def_loc
+                        d.block == block_id && d.inst_index == inst_index && d.location == def_loc
                     })
                     .map(|(id, _)| *id);
 
@@ -272,7 +264,8 @@ impl DefUseChainBuilder {
     fn link_uses_to_definitions(&mut self, cfg: &ControlFlowGraph) {
         for block in cfg.blocks() {
             // Start with reaching definitions at block entry
-            let mut current_reaching = self.reaching_at_entry
+            let mut current_reaching = self
+                .reaching_at_entry
                 .get(&block.id)
                 .cloned()
                 .unwrap_or_default();
@@ -300,16 +293,14 @@ impl DefUseChainBuilder {
 
                     // Link definitions to this use
                     for def_id in reaching_defs {
-                        self.def_to_uses
-                            .entry(def_id)
-                            .or_default()
-                            .push(use_index);
+                        self.def_to_uses.entry(def_id).or_default().push(use_index);
                     }
                 }
 
                 // Update reaching definitions for definitions in this instruction
                 for def_loc in effects.defs {
-                    let def_id = self.definitions
+                    let def_id = self
+                        .definitions
                         .iter()
                         .find(|(_, d)| {
                             d.block == block.id
@@ -327,7 +318,8 @@ impl DefUseChainBuilder {
     }
 
     fn into_chain(self) -> DefUseChain {
-        let use_to_defs: HashMap<usize, Vec<DefId>> = self.uses
+        let use_to_defs: HashMap<usize, Vec<DefId>> = self
+            .uses
             .iter()
             .enumerate()
             .map(|(i, u)| (i, u.reaching_defs.clone()))
@@ -346,7 +338,10 @@ impl DefUseChainBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, ControlFlowGraph, Instruction, Operation, Operand, Register, RegisterClass, Architecture};
+    use hexray_core::{
+        Architecture, BasicBlock, ControlFlowGraph, Instruction, Operand, Operation, Register,
+        RegisterClass,
+    };
 
     fn make_register(id: u16, _name: &str) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, 64)
@@ -362,8 +357,12 @@ mod tests {
         let mut inst1 = Instruction::new(0x1000, 3, vec![0; 3], "mov");
         inst1.operation = Operation::Move;
         inst1.operands = vec![
-            Operand::Register(rax.clone()),
-            Operand::Immediate(hexray_core::Immediate { value: 42, size: 8, signed: false }),
+            Operand::Register(rax),
+            Operand::Immediate(hexray_core::Immediate {
+                value: 42,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst1);
 
@@ -371,8 +370,12 @@ mod tests {
         let mut inst2 = Instruction::new(0x1003, 3, vec![0; 3], "add");
         inst2.operation = Operation::Add;
         inst2.operands = vec![
-            Operand::Register(rax.clone()),
-            Operand::Immediate(hexray_core::Immediate { value: 1, size: 8, signed: false }),
+            Operand::Register(rax),
+            Operand::Immediate(hexray_core::Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst2);
 
@@ -385,6 +388,6 @@ mod tests {
 
         // The first definition of rax should be used by the second instruction
         let rax_defs = chains.definitions_of(&Location::Register(0));
-        assert!(rax_defs.len() >= 1);
+        assert!(!rax_defs.is_empty());
     }
 }

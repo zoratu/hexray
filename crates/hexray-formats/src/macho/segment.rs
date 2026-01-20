@@ -83,20 +83,16 @@ impl Segment {
 
         let segname = parse_name(&data[8..24]);
         let vmaddr = u64::from_le_bytes([
-            data[24], data[25], data[26], data[27],
-            data[28], data[29], data[30], data[31],
+            data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
         ]);
         let vmsize = u64::from_le_bytes([
-            data[32], data[33], data[34], data[35],
-            data[36], data[37], data[38], data[39],
+            data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
         ]);
         let fileoff = u64::from_le_bytes([
-            data[40], data[41], data[42], data[43],
-            data[44], data[45], data[46], data[47],
+            data[40], data[41], data[42], data[43], data[44], data[45], data[46], data[47],
         ]);
         let filesize = u64::from_le_bytes([
-            data[48], data[49], data[50], data[51],
-            data[52], data[53], data[54], data[55],
+            data[48], data[49], data[50], data[51], data[52], data[53], data[54], data[55],
         ]);
         let maxprot = u32::from_le_bytes([data[56], data[57], data[58], data[59]]);
         let initprot = u32::from_le_bytes([data[60], data[61], data[62], data[63]]);
@@ -206,12 +202,10 @@ impl Section {
             sectname: parse_name(&data[0..16]),
             segname: parse_name(&data[16..32]),
             addr: u64::from_le_bytes([
-                data[32], data[33], data[34], data[35],
-                data[36], data[37], data[38], data[39],
+                data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
             ]),
             size: u64::from_le_bytes([
-                data[40], data[41], data[42], data[43],
-                data[44], data[45], data[46], data[47],
+                data[40], data[41], data[42], data[43], data[44], data[45], data[46], data[47],
             ]),
             offset: u32::from_le_bytes([data[48], data[49], data[50], data[51]]),
             align: u32::from_le_bytes([data[52], data[53], data[54], data[55]]),
@@ -258,8 +252,7 @@ impl crate::Section for Section {
     }
 
     fn is_executable(&self) -> bool {
-        self.flags & S_ATTR_PURE_INSTRUCTIONS != 0
-            || self.flags & S_ATTR_SOME_INSTRUCTIONS != 0
+        self.flags & S_ATTR_PURE_INSTRUCTIONS != 0 || self.flags & S_ATTR_SOME_INSTRUCTIONS != 0
     }
 
     fn is_writable(&self) -> bool {

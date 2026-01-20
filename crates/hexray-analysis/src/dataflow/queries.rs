@@ -7,7 +7,7 @@
 //! These queries build on top of def-use chain analysis to provide
 //! human-readable traces of how values flow through a program.
 
-use super::{DefUseChain, Location, Use, DefId, InstructionEffects};
+use super::{DefId, DefUseChain, InstructionEffects, Location, Use};
 use hexray_core::{ControlFlowGraph, Instruction};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -204,18 +204,22 @@ impl<'a> DataFlowQueryEngine<'a> {
     /// Execute a data flow query.
     pub fn query(&self, query: &DataFlowQuery) -> DataFlowResult {
         match query {
-            DataFlowQuery::TraceBackward { address, register_id } => {
-                self.trace_backward(*address, *register_id)
-            }
-            DataFlowQuery::TraceForward { address, register_id } => {
-                self.trace_forward(*address, *register_id)
-            }
-            DataFlowQuery::FindUses { def_address, register_id } => {
-                self.find_uses(*def_address, *register_id)
-            }
-            DataFlowQuery::FindDefs { use_address, register_id } => {
-                self.find_defs(*use_address, *register_id)
-            }
+            DataFlowQuery::TraceBackward {
+                address,
+                register_id,
+            } => self.trace_backward(*address, *register_id),
+            DataFlowQuery::TraceForward {
+                address,
+                register_id,
+            } => self.trace_forward(*address, *register_id),
+            DataFlowQuery::FindUses {
+                def_address,
+                register_id,
+            } => self.find_uses(*def_address, *register_id),
+            DataFlowQuery::FindDefs {
+                use_address,
+                register_id,
+            } => self.find_defs(*use_address, *register_id),
         }
     }
 
@@ -231,7 +235,10 @@ impl<'a> DataFlowQueryEngine<'a> {
         // Find the use at this address
         let use_info = self.find_use_at_address(start_addr, &location);
         if use_info.is_none() {
-            result.truncate(format!("No use of register {} found at {:#x}", register_id, start_addr));
+            result.truncate(format!(
+                "No use of register {} found at {:#x}",
+                register_id, start_addr
+            ));
             return result;
         }
 
@@ -239,12 +246,15 @@ impl<'a> DataFlowQueryEngine<'a> {
 
         // Add the starting use
         if let Some(inst) = self.addr_to_inst.get(&start_addr) {
-            result.add_step(DataFlowStep::new(
-                start_addr,
-                inst.to_string(),
-                DataFlowRole::Use,
-                location.clone(),
-            ).with_description("Starting point"));
+            result.add_step(
+                DataFlowStep::new(
+                    start_addr,
+                    inst.to_string(),
+                    DataFlowRole::Use,
+                    location.clone(),
+                )
+                .with_description("Starting point"),
+            );
         }
 
         // Track visited definitions to avoid cycles
@@ -273,12 +283,15 @@ impl<'a> DataFlowQueryEngine<'a> {
                     let role = self.classify_instruction_role(inst, &def.location);
                     let desc = self.describe_definition(inst, &def.location);
 
-                    result.add_step(DataFlowStep::new(
-                        def.address,
-                        inst.to_string(),
-                        role,
-                        def.location.clone(),
-                    ).with_description(desc));
+                    result.add_step(
+                        DataFlowStep::new(
+                            def.address,
+                            inst.to_string(),
+                            role,
+                            def.location.clone(),
+                        )
+                        .with_description(desc),
+                    );
 
                     // If this is a pass-through (e.g., mov rax, rbx), trace the source
                     if role == DataFlowRole::PassThrough {
@@ -305,9 +318,10 @@ impl<'a> DataFlowQueryEngine<'a> {
         // Check if we found the ultimate source
         if !result.steps.is_empty() {
             let last_step = result.steps.last().unwrap();
-            if last_step.role == DataFlowRole::Source ||
-               last_step.role == DataFlowRole::Parameter ||
-               last_step.role == DataFlowRole::Definition {
+            if last_step.role == DataFlowRole::Source
+                || last_step.role == DataFlowRole::Parameter
+                || last_step.role == DataFlowRole::Definition
+            {
                 result.mark_complete();
             }
         }
@@ -327,7 +341,10 @@ impl<'a> DataFlowQueryEngine<'a> {
         // Find the definition at this address
         let def_id = self.find_def_at_address(start_addr, &location);
         if def_id.is_none() {
-            result.truncate(format!("No definition of register {} found at {:#x}", register_id, start_addr));
+            result.truncate(format!(
+                "No definition of register {} found at {:#x}",
+                register_id, start_addr
+            ));
             return result;
         }
 
@@ -335,12 +352,15 @@ impl<'a> DataFlowQueryEngine<'a> {
 
         // Add the starting definition
         if let Some(inst) = self.addr_to_inst.get(&start_addr) {
-            result.add_step(DataFlowStep::new(
-                start_addr,
-                inst.to_string(),
-                DataFlowRole::Definition,
-                location.clone(),
-            ).with_description("Starting point"));
+            result.add_step(
+                DataFlowStep::new(
+                    start_addr,
+                    inst.to_string(),
+                    DataFlowRole::Definition,
+                    location.clone(),
+                )
+                .with_description("Starting point"),
+            );
         }
 
         // Track visited uses to avoid duplicates
@@ -374,19 +394,24 @@ impl<'a> DataFlowQueryEngine<'a> {
                     let role = self.classify_use_role(inst, &use_info.location);
                     let desc = self.describe_use(inst, &use_info.location);
 
-                    result.add_step(DataFlowStep::new(
-                        use_info.address,
-                        inst.to_string(),
-                        role,
-                        use_info.location.clone(),
-                    ).with_description(desc));
+                    result.add_step(
+                        DataFlowStep::new(
+                            use_info.address,
+                            inst.to_string(),
+                            role,
+                            use_info.location.clone(),
+                        )
+                        .with_description(desc),
+                    );
 
                     // If this instruction also defines a register (pass-through),
                     // follow the definition forward
                     if role == DataFlowRole::PassThrough {
                         let effects = InstructionEffects::from_instruction(inst);
                         for def_loc in &effects.defs {
-                            if let Some(new_def_id) = self.find_def_at_address(use_info.address, def_loc) {
+                            if let Some(new_def_id) =
+                                self.find_def_at_address(use_info.address, def_loc)
+                            {
                                 if !visited_defs.contains(&new_def_id) {
                                     work_queue.push_back((new_def_id, depth + 1));
                                 }
@@ -415,7 +440,10 @@ impl<'a> DataFlowQueryEngine<'a> {
 
         let def_id = self.find_def_at_address(def_address, &location);
         if def_id.is_none() {
-            result.truncate(format!("No definition of register {} found at {:#x}", register_id, def_address));
+            result.truncate(format!(
+                "No definition of register {} found at {:#x}",
+                register_id, def_address
+            ));
             return result;
         }
 
@@ -448,7 +476,10 @@ impl<'a> DataFlowQueryEngine<'a> {
 
         let use_info = self.find_use_at_address(use_address, &location);
         if use_info.is_none() {
-            result.truncate(format!("No use of register {} found at {:#x}", register_id, use_address));
+            result.truncate(format!(
+                "No use of register {} found at {:#x}",
+                register_id, use_address
+            ));
             return result;
         }
 
@@ -474,11 +505,15 @@ impl<'a> DataFlowQueryEngine<'a> {
     // Helper methods
 
     fn find_use_at_address(&self, address: u64, location: &Location) -> Option<&Use> {
-        self.def_use.uses.iter().find(|u| u.address == address && &u.location == location)
+        self.def_use
+            .uses
+            .iter()
+            .find(|u| u.address == address && &u.location == location)
     }
 
     fn find_def_at_address(&self, address: u64, location: &Location) -> Option<DefId> {
-        self.def_use.definitions
+        self.def_use
+            .definitions
             .iter()
             .find(|(_, d)| d.address == address && &d.location == location)
             .map(|(id, _)| *id)
@@ -606,17 +641,41 @@ impl<'a> DataFlowQueryEngine<'a> {
 impl std::fmt::Display for DataFlowResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let query_desc = match &self.query {
-            DataFlowQuery::TraceBackward { address, register_id } => {
-                format!("Tracing backward from {:#x}, register {}", address, register_id)
+            DataFlowQuery::TraceBackward {
+                address,
+                register_id,
+            } => {
+                format!(
+                    "Tracing backward from {:#x}, register {}",
+                    address, register_id
+                )
             }
-            DataFlowQuery::TraceForward { address, register_id } => {
-                format!("Tracing forward from {:#x}, register {}", address, register_id)
+            DataFlowQuery::TraceForward {
+                address,
+                register_id,
+            } => {
+                format!(
+                    "Tracing forward from {:#x}, register {}",
+                    address, register_id
+                )
             }
-            DataFlowQuery::FindUses { def_address, register_id } => {
-                format!("Finding uses of register {} defined at {:#x}", register_id, def_address)
+            DataFlowQuery::FindUses {
+                def_address,
+                register_id,
+            } => {
+                format!(
+                    "Finding uses of register {} defined at {:#x}",
+                    register_id, def_address
+                )
             }
-            DataFlowQuery::FindDefs { use_address, register_id } => {
-                format!("Finding definitions of register {} used at {:#x}", register_id, use_address)
+            DataFlowQuery::FindDefs {
+                use_address,
+                register_id,
+            } => {
+                format!(
+                    "Finding definitions of register {} used at {:#x}",
+                    register_id, use_address
+                )
             }
         };
 
@@ -628,8 +687,11 @@ impl std::fmt::Display for DataFlowResult {
         } else {
             for (i, step) in self.steps.iter().enumerate() {
                 let arrow = if i == 0 { "→" } else { "↓" };
-                write!(f, "{} {:#010x} [{:6}] {}",
-                    arrow, step.address, step.role, step.instruction)?;
+                write!(
+                    f,
+                    "{} {:#010x} [{:6}] {}",
+                    arrow, step.address, step.role, step.instruction
+                )?;
                 if let Some(desc) = &step.description {
                     write!(f, "  ; {}", desc)?;
                 }
@@ -652,7 +714,10 @@ impl std::fmt::Display for DataFlowResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, BasicBlockId, Instruction, Operation, Operand, Register, RegisterClass, Architecture, Immediate};
+    use hexray_core::{
+        Architecture, BasicBlock, BasicBlockId, Immediate, Instruction, Operand, Operation,
+        Register, RegisterClass,
+    };
 
     fn make_register(id: u16, _name: &str) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, 64)
@@ -670,26 +735,31 @@ mod tests {
         let mut inst1 = Instruction::new(0x1000, 3, vec![0; 3], "mov rax, 42");
         inst1.operation = Operation::Move;
         inst1.operands = vec![
-            Operand::Register(rax.clone()),
-            Operand::Immediate(Immediate { value: 42, size: 8, signed: false }),
+            Operand::Register(rax),
+            Operand::Immediate(Immediate {
+                value: 42,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst1);
 
         // mov rbx, rax  (pass-through)
         let mut inst2 = Instruction::new(0x1003, 3, vec![0; 3], "mov rbx, rax");
         inst2.operation = Operation::Move;
-        inst2.operands = vec![
-            Operand::Register(rbx.clone()),
-            Operand::Register(rax.clone()),
-        ];
+        inst2.operands = vec![Operand::Register(rbx), Operand::Register(rax)];
         bb.push_instruction(inst2);
 
         // add rbx, 1  (use rbx)
         let mut inst3 = Instruction::new(0x1006, 3, vec![0; 3], "add rbx, 1");
         inst3.operation = Operation::Add;
         inst3.operands = vec![
-            Operand::Register(rbx.clone()),
-            Operand::Immediate(Immediate { value: 1, size: 8, signed: false }),
+            Operand::Register(rbx),
+            Operand::Immediate(Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst3);
 
@@ -717,8 +787,12 @@ mod tests {
         let mut inst1 = Instruction::new(0x1000, 3, vec![0; 3], "mov rax, 42");
         inst1.operation = Operation::Move;
         inst1.operands = vec![
-            Operand::Register(rax.clone()),
-            Operand::Immediate(Immediate { value: 42, size: 8, signed: false }),
+            Operand::Register(rax),
+            Operand::Immediate(Immediate {
+                value: 42,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst1);
 
@@ -726,8 +800,12 @@ mod tests {
         let mut inst2 = Instruction::new(0x1003, 3, vec![0; 3], "add rax, 1");
         inst2.operation = Operation::Add;
         inst2.operands = vec![
-            Operand::Register(rax.clone()),
-            Operand::Immediate(Immediate { value: 1, size: 8, signed: false }),
+            Operand::Register(rax),
+            Operand::Immediate(Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst2);
 
@@ -754,8 +832,12 @@ mod tests {
         let mut inst1 = Instruction::new(0x1000, 3, vec![0; 3], "mov rax, 42");
         inst1.operation = Operation::Move;
         inst1.operands = vec![
-            Operand::Register(rax.clone()),
-            Operand::Immediate(Immediate { value: 42, size: 8, signed: false }),
+            Operand::Register(rax),
+            Operand::Immediate(Immediate {
+                value: 42,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst1);
 
@@ -763,8 +845,12 @@ mod tests {
         let mut inst2 = Instruction::new(0x1003, 3, vec![0; 3], "add rax, 1");
         inst2.operation = Operation::Add;
         inst2.operands = vec![
-            Operand::Register(rax.clone()),
-            Operand::Immediate(Immediate { value: 1, size: 8, signed: false }),
+            Operand::Register(rax),
+            Operand::Immediate(Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
         ];
         bb.push_instruction(inst2);
 

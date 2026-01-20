@@ -1,6 +1,8 @@
 //! Control flow graph construction.
 
-use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, ControlFlow, ControlFlowGraph, Instruction};
+use hexray_core::{
+    BasicBlock, BasicBlockId, BlockTerminator, ControlFlow, ControlFlowGraph, Instruction,
+};
 use std::collections::BTreeSet;
 
 /// Builds control flow graphs from disassembled instructions.
@@ -78,7 +80,10 @@ impl CfgBuilder {
         }
 
         // Step 3: Build CFG with edges
-        let entry_id = address_to_block.get(&entry).copied().unwrap_or(BasicBlockId::ENTRY);
+        let entry_id = address_to_block
+            .get(&entry)
+            .copied()
+            .unwrap_or(BasicBlockId::ENTRY);
         let mut cfg = ControlFlowGraph::new(entry_id);
 
         for mut block in blocks {
@@ -101,10 +106,10 @@ impl CfgBuilder {
                         // Check if this is an unresolved relocation (jump to next instruction)
                         // In kernel modules, `jmp` with 0 offset (e9 00 00 00 00) is typically
                         // a relocation placeholder for __x86_return_thunk
-                        let is_unresolved_reloc = *target == last_inst.end_address() &&
-                            last_inst.bytes.len() >= 5 &&
-                            last_inst.bytes[0] == 0xe9 &&
-                            last_inst.bytes[1..5] == [0, 0, 0, 0];
+                        let is_unresolved_reloc = *target == last_inst.end_address()
+                            && last_inst.bytes.len() >= 5
+                            && last_inst.bytes[0] == 0xe9
+                            && last_inst.bytes[1..5] == [0, 0, 0, 0];
 
                         if is_unresolved_reloc {
                             // Treat as a return (likely __x86_return_thunk)
@@ -137,12 +142,17 @@ impl CfgBuilder {
                         }
                     }
                     ControlFlow::IndirectBranch { .. } => BlockTerminator::IndirectJump {
-                        target: last_inst.operands.first().cloned().unwrap_or(
-                            hexray_core::Operand::imm(0, 64),
-                        ),
+                        target: last_inst
+                            .operands
+                            .first()
+                            .cloned()
+                            .unwrap_or(hexray_core::Operand::imm(0, 64)),
                         possible_targets: vec![],
                     },
-                    ControlFlow::Call { return_addr, target } => {
+                    ControlFlow::Call {
+                        return_addr,
+                        target,
+                    } => {
                         if let Some(&return_id) = address_to_block.get(return_addr) {
                             cfg.add_edge(block_id, return_id);
                             BlockTerminator::Call {
@@ -158,9 +168,11 @@ impl CfgBuilder {
                             cfg.add_edge(block_id, return_id);
                             BlockTerminator::Call {
                                 target: hexray_core::basic_block::CallTarget::Indirect(
-                                    last_inst.operands.first().cloned().unwrap_or(
-                                        hexray_core::Operand::imm(0, 64),
-                                    ),
+                                    last_inst
+                                        .operands
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or(hexray_core::Operand::imm(0, 64)),
                                 ),
                                 return_block: return_id,
                             }

@@ -6,12 +6,12 @@ use crate::ParseError;
 use hexray_core::Architecture;
 
 // Magic numbers
-pub const MH_MAGIC: u32 = 0xFEEDFACE;    // 32-bit
-pub const MH_CIGAM: u32 = 0xCEFAEDFE;    // 32-bit, byte-swapped
+pub const MH_MAGIC: u32 = 0xFEEDFACE; // 32-bit
+pub const MH_CIGAM: u32 = 0xCEFAEDFE; // 32-bit, byte-swapped
 pub const MH_MAGIC_64: u32 = 0xFEEDFACF; // 64-bit
 pub const MH_CIGAM_64: u32 = 0xCFFAEDFE; // 64-bit, byte-swapped
-pub const FAT_MAGIC: u32 = 0xCAFEBABE;   // Fat binary
-pub const FAT_CIGAM: u32 = 0xBEBAFECA;   // Fat binary, byte-swapped
+pub const FAT_MAGIC: u32 = 0xCAFEBABE; // Fat binary
+pub const FAT_CIGAM: u32 = 0xBEBAFECA; // Fat binary, byte-swapped
 
 // CPU types
 pub const CPU_TYPE_X86: u32 = 7;
@@ -120,10 +120,7 @@ impl MachHeader {
             MH_MAGIC_64 => (true, false),
             MH_CIGAM_64 => (true, true),
             _ => {
-                return Err(ParseError::invalid_magic(
-                    "Mach-O",
-                    &data[0..4],
-                ));
+                return Err(ParseError::invalid_magic("Mach-O", &data[0..4]));
             }
         };
 
@@ -139,7 +136,11 @@ impl MachHeader {
                 data[offset + 2],
                 data[offset + 3],
             ]);
-            if needs_swap { val.swap_bytes() } else { val }
+            if needs_swap {
+                val.swap_bytes()
+            } else {
+                val
+            }
         };
 
         let cputype = read_u32(4);
@@ -169,7 +170,11 @@ impl MachHeader {
 
     /// Returns the size of the header in bytes.
     pub fn header_size(&self) -> usize {
-        if self.is_64bit() { 32 } else { 28 }
+        if self.is_64bit() {
+            32
+        } else {
+            28
+        }
     }
 
     /// Returns the architecture.
@@ -235,13 +240,12 @@ impl FatHeader {
             }
 
             let read_u32 = |o: usize| -> u32 {
-                let val = u32::from_be_bytes([
-                    data[o],
-                    data[o + 1],
-                    data[o + 2],
-                    data[o + 3],
-                ]);
-                if needs_swap { val.swap_bytes() } else { val }
+                let val = u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                if needs_swap {
+                    val.swap_bytes()
+                } else {
+                    val
+                }
             };
 
             architectures.push(FatArch {

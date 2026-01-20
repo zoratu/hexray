@@ -4,15 +4,15 @@
 //! and shows the decompiled output with inferred types.
 
 use hexray_analysis::decompiler::Decompiler;
-use hexray_analysis::types::TypeInference;
 use hexray_analysis::ssa::SsaBuilder;
+use hexray_analysis::types::TypeInference;
 use hexray_analysis::CfgBuilder;
-use hexray_disasm::x86_64::X86_64Disassembler;
+use hexray_core::Architecture;
 use hexray_disasm::arm64::Arm64Disassembler;
+use hexray_disasm::x86_64::X86_64Disassembler;
 use hexray_disasm::Disassembler;
 use hexray_formats::macho::MachO;
 use hexray_formats::BinaryFormat;
-use hexray_core::Architecture;
 use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,14 +27,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded: {} ({:?})", binary_path, macho.architecture());
 
     // Find main function (more interesting for type inference)
-    let target_sym = macho.symbols()
+    let target_sym = macho
+        .symbols()
         .find(|s| s.name.contains("main") || s.name.contains("factorial"))
         .ok_or("main/factorial not found")?;
 
-    println!("\nFunction: {} at {:#x}", target_sym.name, target_sym.address);
+    println!(
+        "\nFunction: {} at {:#x}",
+        target_sym.name, target_sym.address
+    );
 
     // Get function bytes
-    let func_bytes = macho.bytes_at(target_sym.address, 200)
+    let func_bytes = macho
+        .bytes_at(target_sym.address, 200)
         .ok_or("Cannot read bytes")?;
 
     // Disassemble using the correct architecture

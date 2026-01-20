@@ -363,7 +363,7 @@ impl AnalysisProject {
 
         self.annotations
             .entry(address)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(annotation.clone());
 
         self.record_history(
@@ -691,7 +691,7 @@ impl AnalysisProject {
                     serde_json::from_value(entry.redo_data.clone()).unwrap();
                 self.annotations
                     .entry(*address)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(annotation);
             }
             HistoryAction::SetFunctionOverride { address } => {

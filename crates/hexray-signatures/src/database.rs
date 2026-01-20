@@ -166,14 +166,16 @@ impl SignatureDatabase {
 
     /// Filter signatures by library.
     pub fn filter_by_library(&self, library: &str) -> Vec<&FunctionSignature> {
-        self.signatures.iter()
+        self.signatures
+            .iter()
             .filter(|s| s.library == library)
             .collect()
     }
 
     /// Filter signatures by minimum confidence.
     pub fn filter_by_confidence(&self, min_confidence: f32) -> Vec<&FunctionSignature> {
-        self.signatures.iter()
+        self.signatures
+            .iter()
             .filter(|s| s.confidence >= min_confidence)
             .collect()
     }
@@ -201,7 +203,11 @@ impl SignatureDatabase {
         DatabaseStats {
             total_signatures: total,
             libraries,
-            avg_pattern_len: if total > 0 { total_pattern_len as f32 / total as f32 } else { 0.0 },
+            avg_pattern_len: if total > 0 {
+                total_pattern_len as f32 / total as f32
+            } else {
+                0.0
+            },
             min_pattern_len,
             max_pattern_len,
         }
@@ -230,8 +236,11 @@ impl std::fmt::Display for DatabaseStats {
         for (lib, count) in &self.libraries {
             writeln!(f, "  {}: {} signatures", lib, count)?;
         }
-        writeln!(f, "Pattern length: {:.1} avg, {} min, {} max",
-            self.avg_pattern_len, self.min_pattern_len, self.max_pattern_len)?;
+        writeln!(
+            f,
+            "Pattern length: {:.1} avg, {} min, {} max",
+            self.avg_pattern_len, self.min_pattern_len, self.max_pattern_len
+        )?;
         Ok(())
     }
 }
@@ -254,8 +263,11 @@ mod tests {
     fn test_database_alias() {
         let mut db = SignatureDatabase::new();
 
-        db.add(FunctionSignature::from_hex("__strlen_sse2", "55 48 89 E5").unwrap()
-            .with_alias("strlen"));
+        db.add(
+            FunctionSignature::from_hex("__strlen_sse2", "55 48 89 E5")
+                .unwrap()
+                .with_alias("strlen"),
+        );
 
         assert!(db.get("__strlen_sse2").is_some());
         assert!(db.get("strlen").is_some());
@@ -263,7 +275,8 @@ mod tests {
 
     #[test]
     fn test_database_json() {
-        let mut db = SignatureDatabase::with_metadata("test", "1.0", Some("Test database".to_string()));
+        let mut db =
+            SignatureDatabase::with_metadata("test", "1.0", Some("Test database".to_string()));
         db.add(FunctionSignature::from_hex("strlen", "55 48 89 E5").unwrap());
         db.add(FunctionSignature::from_hex("strcpy", "55 48 89 E5 48").unwrap());
 
@@ -292,12 +305,21 @@ mod tests {
     #[test]
     fn test_database_stats() {
         let mut db = SignatureDatabase::new();
-        db.add(FunctionSignature::from_hex("strlen", "55 48 89 E5").unwrap()
-            .with_library("libc"));
-        db.add(FunctionSignature::from_hex("strcpy", "55 48 89 E5 48 89").unwrap()
-            .with_library("libc"));
-        db.add(FunctionSignature::from_hex("malloc", "55 48 89 E5 48").unwrap()
-            .with_library("malloc"));
+        db.add(
+            FunctionSignature::from_hex("strlen", "55 48 89 E5")
+                .unwrap()
+                .with_library("libc"),
+        );
+        db.add(
+            FunctionSignature::from_hex("strcpy", "55 48 89 E5 48 89")
+                .unwrap()
+                .with_library("libc"),
+        );
+        db.add(
+            FunctionSignature::from_hex("malloc", "55 48 89 E5 48")
+                .unwrap()
+                .with_library("malloc"),
+        );
 
         let stats = db.stats();
         assert_eq!(stats.total_signatures, 3);

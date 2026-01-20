@@ -14,7 +14,9 @@
 //!    - Already handled in structurer.rs via `detect_switch_statements`
 //!    - This module focuses on the more complex patterns
 
-use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, ControlFlowGraph, Operand, Operation};
+use hexray_core::{
+    BasicBlock, BasicBlockId, BlockTerminator, ControlFlowGraph, Operand, Operation,
+};
 use std::collections::{HashMap, HashSet};
 
 use super::expression::{BinOpKind, Expr, ExprKind};
@@ -170,6 +172,7 @@ impl<'a> SwitchRecovery<'a> {
     /// Analyzes a block to extract jump table information.
     ///
     /// Returns (switch_variable, (max_value, default_block), jump_table_info)
+    #[allow(clippy::type_complexity)]
     fn analyze_jump_table_block(
         &self,
         block: &BasicBlock,
@@ -189,7 +192,8 @@ impl<'a> SwitchRecovery<'a> {
                         switch_var = Some(Expr::from_operand(&inst.operands[0]));
                         if let Operand::Immediate(imm) = &inst.operands[1] {
                             // The comparison value is the maximum case value
-                            bound_check = Some((imm.value as i64, BasicBlockId::new(0))); // Default block TBD
+                            bound_check = Some((imm.value as i64, BasicBlockId::new(0)));
+                            // Default block TBD
                         }
                     }
                 }
@@ -207,7 +211,7 @@ impl<'a> SwitchRecovery<'a> {
                 Operation::Load | Operation::Move => {
                     if let Some(Operand::Memory(mem)) = inst.operands.get(1) {
                         if mem.index.is_some() && mem.scale > 1 {
-                            entry_size = mem.scale as u8;
+                            entry_size = mem.scale;
                         }
                     }
                 }
@@ -229,11 +233,7 @@ impl<'a> SwitchRecovery<'a> {
             max_value,
         };
 
-        Some((
-            switch_var,
-            Some((max_value, default_block)),
-            table_info,
-        ))
+        Some((switch_var, Some((max_value, default_block)), table_info))
     }
 
     /// Reads case targets from a jump table in binary data.
@@ -462,7 +462,7 @@ impl<'a> SwitchRecovery<'a> {
 
         // Get the value being compared
         let compare_value = match right {
-            Operand::Immediate(imm) => imm.value as i128,
+            Operand::Immediate(imm) => imm.value,
             _ => return None, // Only handle comparisons against constants
         };
 
@@ -585,7 +585,7 @@ pub fn switch_info_to_node(
         })
         .collect();
 
-    let default = switch_info.default.map(|target| structure_region(target));
+    let default = switch_info.default.map(structure_region);
 
     StructuredNode::Switch {
         value: switch_info.switch_value,
@@ -697,7 +697,7 @@ mod tests {
             cases: vec![
                 (vec![0], BasicBlockId::new(1)),
                 (vec![1], BasicBlockId::new(2)),
-                (vec![2, 3], BasicBlockId::new(3)),  // Multiple values to same case
+                (vec![2, 3], BasicBlockId::new(3)), // Multiple values to same case
             ],
             default: Some(BasicBlockId::new(4)),
             kind: SwitchKind::JumpTable,
@@ -732,7 +732,10 @@ mod tests {
         let rbp2 = Expr::var(Variable::reg("rbp", 8));
         let neg_offset = Expr::int(32);
         let local_addr = Expr::binop(BinOpKind::Sub, rbp2, neg_offset);
-        assert_eq!(get_stack_slot_key(&local_addr), Some("stack_-32".to_string()));
+        assert_eq!(
+            get_stack_slot_key(&local_addr),
+            Some("stack_-32".to_string())
+        );
     }
 
     #[test]

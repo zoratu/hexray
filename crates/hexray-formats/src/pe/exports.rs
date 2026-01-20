@@ -95,7 +95,8 @@ pub fn parse_exports(
     let ordinals_offset = rva_to_offset(export_dir.address_of_name_ordinals, sections);
 
     // Build a map of ordinal -> name
-    let mut ordinal_to_name: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+    let mut ordinal_to_name: std::collections::HashMap<u16, String> =
+        std::collections::HashMap::new();
 
     if let (Some(names_off), Some(ords_off)) = (names_offset, ordinals_offset) {
         for i in 0..export_dir.number_of_names as usize {
@@ -112,10 +113,7 @@ pub fn parse_exports(
                 data[name_rva_offset + 2],
                 data[name_rva_offset + 3],
             ]);
-            let ordinal = u16::from_le_bytes([
-                data[ordinal_offset],
-                data[ordinal_offset + 1],
-            ]);
+            let ordinal = u16::from_le_bytes([data[ordinal_offset], data[ordinal_offset + 1]]);
 
             if let Some(name_off) = rva_to_offset(name_rva, sections) {
                 let name = read_cstring(data, name_off);
@@ -189,6 +187,9 @@ fn read_cstring(data: &[u8], offset: usize) -> String {
         return String::new();
     }
     let bytes = &data[offset..];
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len().min(256));
+    let end = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(bytes.len().min(256));
     String::from_utf8_lossy(&bytes[..end]).to_string()
 }

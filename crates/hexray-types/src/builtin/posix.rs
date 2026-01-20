@@ -49,14 +49,14 @@ pub fn load_posix_types(db: &mut TypeDatabase) {
 
     // struct timeval
     let mut timeval = StructType::new(Some("timeval".to_string()));
-    timeval.add_field("tv_sec".to_string(), CType::long());   // time_t is long on LP64
-    timeval.add_field("tv_usec".to_string(), CType::long());  // suseconds_t is long on LP64
+    timeval.add_field("tv_sec".to_string(), CType::long()); // time_t is long on LP64
+    timeval.add_field("tv_usec".to_string(), CType::long()); // suseconds_t is long on LP64
     timeval.finalize();
     db.add_type("struct timeval", CType::Struct(timeval));
 
     // struct timespec
     let mut timespec = StructType::new(Some("timespec".to_string()));
-    timespec.add_field("tv_sec".to_string(), CType::long());  // time_t is long on LP64
+    timespec.add_field("tv_sec".to_string(), CType::long()); // time_t is long on LP64
     timespec.add_field("tv_nsec".to_string(), CType::long());
     timespec.finalize();
     db.add_type("struct timespec", CType::Struct(timespec));

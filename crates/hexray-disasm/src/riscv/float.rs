@@ -11,23 +11,25 @@ use hexray_core::{
 
 // Floating-point opcodes (documented for reference, used in decoder.rs)
 #[allow(dead_code)]
-pub const OP_LOAD_FP: u32 = 0b0000111;   // 0x07 - FLW, FLD
+pub const OP_LOAD_FP: u32 = 0b0000111; // 0x07 - FLW, FLD
 #[allow(dead_code)]
-pub const OP_STORE_FP: u32 = 0b0100111;  // 0x27 - FSW, FSD
+pub const OP_STORE_FP: u32 = 0b0100111; // 0x27 - FSW, FSD
 #[allow(dead_code)]
-pub const OP_MADD: u32 = 0b1000011;      // 0x43 - FMADD.S, FMADD.D
+pub const OP_MADD: u32 = 0b1000011; // 0x43 - FMADD.S, FMADD.D
 #[allow(dead_code)]
-pub const OP_MSUB: u32 = 0b1000111;      // 0x47 - FMSUB.S, FMSUB.D
+pub const OP_MSUB: u32 = 0b1000111; // 0x47 - FMSUB.S, FMSUB.D
 #[allow(dead_code)]
-pub const OP_NMSUB: u32 = 0b1001011;     // 0x4B - FNMSUB.S, FNMSUB.D
+pub const OP_NMSUB: u32 = 0b1001011; // 0x4B - FNMSUB.S, FNMSUB.D
 #[allow(dead_code)]
-pub const OP_NMADD: u32 = 0b1001111;     // 0x4F - FNMADD.S, FNMADD.D
+pub const OP_NMADD: u32 = 0b1001111; // 0x4F - FNMADD.S, FNMADD.D
 #[allow(dead_code)]
-pub const OP_FP: u32 = 0b1010011;        // 0x53 - All other FP ops
+pub const OP_FP: u32 = 0b1010011; // 0x53 - All other FP ops
 
 /// Rounding mode names (for future use in displaying rounding modes)
 #[allow(dead_code)]
-const RM_NAMES: [&str; 8] = ["rne", "rtz", "rdn", "rup", "rmm", "reserved", "reserved", "dyn"];
+const RM_NAMES: [&str; 8] = [
+    "rne", "rtz", "rdn", "rup", "rmm", "reserved", "reserved", "dyn",
+];
 
 /// Floating-point decoder for RISC-V F/D extensions.
 pub struct FloatDecoder {
@@ -128,8 +130,8 @@ impl FloatDecoder {
         let funct3 = Self::funct3(insn);
 
         let (mnemonic, size) = match funct3 {
-            0b010 => ("flw", 4),  // FLW - load 32-bit float
-            0b011 => ("fld", 8),  // FLD - load 64-bit double
+            0b010 => ("flw", 4), // FLW - load 32-bit float
+            0b011 => ("fld", 8), // FLD - load 64-bit double
             _ => return Err(DecodeError::unknown_opcode(address, &bytes)),
         };
 
@@ -162,8 +164,8 @@ impl FloatDecoder {
         let funct3 = Self::funct3(insn);
 
         let (mnemonic, size) = match funct3 {
-            0b010 => ("fsw", 4),  // FSW - store 32-bit float
-            0b011 => ("fsd", 8),  // FSD - store 64-bit double
+            0b010 => ("fsw", 4), // FSW - store 32-bit float
+            0b011 => ("fsd", 8), // FSD - store 64-bit double
             _ => return Err(DecodeError::unknown_opcode(address, &bytes)),
         };
 
@@ -573,7 +575,7 @@ mod tests {
     fn test_flw() {
         let decoder = FloatDecoder::new(true);
         // flw f1, 0(x2): imm=0, rs1=2, funct3=010, rd=1, opcode=0000111
-        let insn: u32 = (0 << 20) | (2 << 15) | (0b010 << 12) | (1 << 7) | 0b0000111;
+        let insn: u32 = (2 << 15) | (0b010 << 12) | (1 << 7) | 0b0000111;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_load(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "flw");
@@ -593,7 +595,7 @@ mod tests {
     fn test_fsw() {
         let decoder = FloatDecoder::new(true);
         // fsw f1, 0(x2): imm=0, rs2=1, rs1=2, funct3=010, opcode=0100111
-        let insn: u32 = (0 << 25) | (1 << 20) | (2 << 15) | (0b010 << 12) | (0 << 7) | 0b0100111;
+        let insn: u32 = ((1 << 20) | (2 << 15) | (0b010 << 12)) | 0b0100111;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_store(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "fsw");
@@ -603,7 +605,7 @@ mod tests {
     fn test_fadd_s() {
         let decoder = FloatDecoder::new(true);
         // fadd.s f3, f1, f2: funct7=0000000, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
-        let insn: u32 = (0b0000000 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let insn: u32 = ((2 << 20) | (1 << 15)) | (3 << 7) | 0b1010011;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_op_fp(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "fadd.s");
@@ -613,7 +615,7 @@ mod tests {
     fn test_fadd_d() {
         let decoder = FloatDecoder::new(true);
         // fadd.d f3, f1, f2: funct7=0000001, rs2=2, rs1=1, rm=000, rd=3, opcode=1010011
-        let insn: u32 = (0b0000001 << 25) | (2 << 20) | (1 << 15) | (0b000 << 12) | (3 << 7) | 0b1010011;
+        let insn: u32 = ((0b0000001 << 25) | (2 << 20) | (1 << 15)) | (3 << 7) | 0b1010011;
         let bytes = insn.to_le_bytes().to_vec();
         let result = decoder.decode_op_fp(insn, 0x1000, bytes).unwrap();
         assert_eq!(result.instruction.mnemonic, "fadd.d");

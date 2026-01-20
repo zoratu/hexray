@@ -91,14 +91,10 @@ pub enum BlockTerminator {
     Unknown,
 
     /// Falls through to next block.
-    Fallthrough {
-        target: BasicBlockId,
-    },
+    Fallthrough { target: BasicBlockId },
 
     /// Unconditional jump.
-    Jump {
-        target: BasicBlockId,
-    },
+    Jump { target: BasicBlockId },
 
     /// Conditional branch.
     ConditionalBranch {
@@ -150,9 +146,7 @@ impl BlockTerminator {
     pub fn can_fall_through(&self) -> bool {
         matches!(
             self,
-            Self::Fallthrough { .. }
-                | Self::ConditionalBranch { .. }
-                | Self::Call { .. }
+            Self::Fallthrough { .. } | Self::ConditionalBranch { .. } | Self::Call { .. }
         )
     }
 }

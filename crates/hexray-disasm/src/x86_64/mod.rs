@@ -15,4 +15,4 @@ mod opcodes_0f3a;
 mod prefix;
 
 pub use decoder::X86_64Disassembler;
-pub use prefix::{Prefixes, Rex, Vex, Evex};
+pub use prefix::{Evex, Prefixes, Rex, Vex};

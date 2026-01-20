@@ -5,8 +5,8 @@
 //! - Wildcards: match any byte
 //! - Masked wildcards: match byte with specific bits
 
+use crate::{Result, SignatureError};
 use serde::{Deserialize, Serialize};
-use crate::{SignatureError, Result};
 
 /// A single byte in a pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,32 +79,31 @@ impl BytePattern {
             let byte = if part == "??" || part == "**" {
                 PatternByte::Wildcard
             } else if part.len() == 2 {
-                let value = u8::from_str_radix(part, 16)
-                    .map_err(|_| SignatureError::InvalidPattern(
-                        format!("Invalid hex byte: {}", part)
-                    ))?;
+                let value = u8::from_str_radix(part, 16).map_err(|_| {
+                    SignatureError::InvalidPattern(format!("Invalid hex byte: {}", part))
+                })?;
                 PatternByte::Concrete(value)
             } else if part.contains('&') {
                 // Masked format: "XX&MM" where XX is value, MM is mask
                 let parts: Vec<&str> = part.split('&').collect();
                 if parts.len() != 2 || parts[0].len() != 2 || parts[1].len() != 2 {
-                    return Err(SignatureError::InvalidPattern(
-                        format!("Invalid masked byte: {} (expected format: XX&MM)", part)
-                    ));
+                    return Err(SignatureError::InvalidPattern(format!(
+                        "Invalid masked byte: {} (expected format: XX&MM)",
+                        part
+                    )));
                 }
-                let value = u8::from_str_radix(parts[0], 16)
-                    .map_err(|_| SignatureError::InvalidPattern(
-                        format!("Invalid masked value: {}", part)
-                    ))?;
-                let mask = u8::from_str_radix(parts[1], 16)
-                    .map_err(|_| SignatureError::InvalidPattern(
-                        format!("Invalid mask: {}", part)
-                    ))?;
+                let value = u8::from_str_radix(parts[0], 16).map_err(|_| {
+                    SignatureError::InvalidPattern(format!("Invalid masked value: {}", part))
+                })?;
+                let mask = u8::from_str_radix(parts[1], 16).map_err(|_| {
+                    SignatureError::InvalidPattern(format!("Invalid mask: {}", part))
+                })?;
                 PatternByte::Masked { value, mask }
             } else {
-                return Err(SignatureError::InvalidPattern(
-                    format!("Invalid pattern part: {}", part)
-                ));
+                return Err(SignatureError::InvalidPattern(format!(
+                    "Invalid pattern part: {}",
+                    part
+                )));
             };
             bytes.push(byte);
         }
@@ -133,7 +132,8 @@ impl BytePattern {
             return false;
         }
 
-        self.bytes.iter()
+        self.bytes
+            .iter()
             .zip(data.iter())
             .all(|(pattern, &byte)| pattern.matches(byte))
     }
@@ -168,14 +168,13 @@ impl BytePattern {
 
     /// Get the number of leading concrete bytes.
     pub fn concrete_prefix_len(&self) -> usize {
-        self.bytes.iter()
-            .take_while(|b| b.is_concrete())
-            .count()
+        self.bytes.iter().take_while(|b| b.is_concrete()).count()
     }
 
     /// Convert to hex string representation.
     pub fn to_hex_string(&self) -> String {
-        self.bytes.iter()
+        self.bytes
+            .iter()
             .map(|b| match b {
                 PatternByte::Concrete(v) => format!("{:02X}", v),
                 PatternByte::Wildcard => "??".to_string(),

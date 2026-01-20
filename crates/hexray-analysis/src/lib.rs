@@ -33,51 +33,52 @@ pub mod types;
 pub mod vtable;
 pub mod xrefs;
 
-pub use strings::{DetectedString, DetectedStringTable, StringConfig, StringDetector, StringEncoding};
-pub use xrefs::{Xref, XrefBuilder, XrefDatabase, XrefType};
 pub use indirect_calls::{
-    CallTarget, Confidence, GotEntry, GotEntryBuilder, IndirectCallInfo,
-    IndirectCallResolver, ResolutionMethod, ResolutionStats,
+    CallTarget, Confidence, GotEntry, GotEntryBuilder, IndirectCallInfo, IndirectCallResolver,
+    ResolutionMethod, ResolutionStats,
 };
+pub use strings::{
+    DetectedString, DetectedStringTable, StringConfig, StringDetector, StringEncoding,
+};
+pub use xrefs::{Xref, XrefBuilder, XrefDatabase, XrefType};
 
 pub use callgraph::{CallGraph, CallGraphBuilder, CallGraphNode, CallSite, CallType};
 pub use cfg_builder::CfgBuilder;
+pub use cpp_special::{
+    BaseCall, CppSpecialDatabase, CppSpecialDetector, SpecialMemberAnalysis, SpecialMemberKind,
+    VtableAssignment,
+};
 pub use dataflow::{
-    ConstValue, ConstState, ConstantPropagation, DefUseChain, LivenessAnalysis,
-    ReachingDefinitions, Location, DataFlowQuery, DataFlowQueryEngine, DataFlowResult,
-    DataFlowStep, DataFlowRole,
+    ConstState, ConstValue, ConstantPropagation, DataFlowQuery, DataFlowQueryEngine,
+    DataFlowResult, DataFlowRole, DataFlowStep, DefUseChain, LivenessAnalysis, Location,
+    ReachingDefinitions,
 };
 pub use decompiler::{
-    Decompiler, StringTable, SymbolTable, RelocationTable,
-    CallingConvention, FunctionSignature, Parameter, ParameterLocation, ParamType, SignatureRecovery,
-    ExceptionInfo, TryBlockInfo, CatchInfo, CleanupInfo,
+    CallingConvention, CatchInfo, CleanupInfo, Decompiler, ExceptionInfo, FunctionSignature,
+    ParamType, Parameter, ParameterLocation, RelocationTable, SignatureRecovery, StringTable,
+    SymbolTable, TryBlockInfo,
 };
 pub use function_finder::FunctionFinder;
 pub use output::{
-    CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter,
-    CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
+    CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CfgDotExporter,
+    CfgHtmlExporter, CfgJsonExporter,
 };
 pub use parallel::{
-    disassemble_functions_parallel, DisassembledFunction, FunctionInfo,
-    ParallelCallGraphBuilder,
+    disassemble_functions_parallel, DisassembledFunction, FunctionInfo, ParallelCallGraphBuilder,
 };
-pub use ssa::{SsaBuilder, SsaFunction, SsaValue, PhiNode, SsaOptimizer, OptimizationStats};
-pub use types::{Type, TypeInference, FunctionSignatures, Constraint};
-pub use vtable::{
-    Vtable, VtableConfig, VtableDatabase, VtableDetector, VtableEntry, VirtualCallSite,
+pub use project::{
+    AnalysisProject, Annotation, AnnotationKind, Bookmark, FunctionOverride, ProjectError,
+    ProjectResult, ProjectStats, SignatureOverride, TypeOverride,
 };
 pub use rtti::{
-    BaseClassFlags, BaseClassInfo, ClassHierarchy, RttiDatabase, RttiParser,
-    TypeInfo, TypeInfoKind, TypeInfoVtableKind, VmiFlags,
+    BaseClassFlags, BaseClassInfo, ClassHierarchy, RttiDatabase, RttiParser, TypeInfo,
+    TypeInfoKind, TypeInfoVtableKind, VmiFlags,
 };
-pub use cpp_special::{
-    BaseCall, CppSpecialDatabase, CppSpecialDetector, SpecialMemberAnalysis,
-    SpecialMemberKind, VtableAssignment,
-};
+pub use ssa::{OptimizationStats, PhiNode, SsaBuilder, SsaFunction, SsaOptimizer, SsaValue};
 pub use stack_canary::{
     CanarySource, SegmentRegister, StackCanaryAnalysis, StackCanaryDetector, StackCanaryInfo,
 };
-pub use project::{
-    AnalysisProject, Annotation, AnnotationKind, Bookmark, FunctionOverride,
-    ProjectError, ProjectResult, ProjectStats, SignatureOverride, TypeOverride,
+pub use types::{Constraint, FunctionSignatures, Type, TypeInference};
+pub use vtable::{
+    VirtualCallSite, Vtable, VtableConfig, VtableDatabase, VtableDetector, VtableEntry,
 };

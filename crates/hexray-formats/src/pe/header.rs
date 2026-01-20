@@ -242,7 +242,9 @@ impl OptionalHeader {
             minor_linker_version: data[3],
             size_of_code: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
             size_of_initialized_data: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            size_of_uninitialized_data: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            size_of_uninitialized_data: u32::from_le_bytes([
+                data[12], data[13], data[14], data[15],
+            ]),
             address_of_entry_point: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
             base_of_code: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
             image_base: u32::from_le_bytes([data[28], data[29], data[30], data[31]]) as u64,
@@ -259,10 +261,14 @@ impl OptionalHeader {
             checksum: u32::from_le_bytes([data[64], data[65], data[66], data[67]]),
             subsystem: u16::from_le_bytes([data[68], data[69]]),
             dll_characteristics: u16::from_le_bytes([data[70], data[71]]),
-            size_of_stack_reserve: u32::from_le_bytes([data[72], data[73], data[74], data[75]]) as u64,
-            size_of_stack_commit: u32::from_le_bytes([data[76], data[77], data[78], data[79]]) as u64,
-            size_of_heap_reserve: u32::from_le_bytes([data[80], data[81], data[82], data[83]]) as u64,
-            size_of_heap_commit: u32::from_le_bytes([data[84], data[85], data[86], data[87]]) as u64,
+            size_of_stack_reserve: u32::from_le_bytes([data[72], data[73], data[74], data[75]])
+                as u64,
+            size_of_stack_commit: u32::from_le_bytes([data[76], data[77], data[78], data[79]])
+                as u64,
+            size_of_heap_reserve: u32::from_le_bytes([data[80], data[81], data[82], data[83]])
+                as u64,
+            size_of_heap_commit: u32::from_le_bytes([data[84], data[85], data[86], data[87]])
+                as u64,
             number_of_rva_and_sizes,
             data_directories,
         })
@@ -279,7 +285,8 @@ impl OptionalHeader {
             return Err(ParseError::invalid_magic("PE32+ (0x20b)", &data[0..2]));
         }
 
-        let number_of_rva_and_sizes = u32::from_le_bytes([data[108], data[109], data[110], data[111]]);
+        let number_of_rva_and_sizes =
+            u32::from_le_bytes([data[108], data[109], data[110], data[111]]);
         let num_dirs = number_of_rva_and_sizes.min(16) as usize;
 
         let mut data_directories = Vec::with_capacity(num_dirs);
@@ -297,12 +304,13 @@ impl OptionalHeader {
             minor_linker_version: data[3],
             size_of_code: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
             size_of_initialized_data: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            size_of_uninitialized_data: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            size_of_uninitialized_data: u32::from_le_bytes([
+                data[12], data[13], data[14], data[15],
+            ]),
             address_of_entry_point: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
             base_of_code: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
             image_base: u64::from_le_bytes([
-                data[24], data[25], data[26], data[27],
-                data[28], data[29], data[30], data[31],
+                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
             ]),
             section_alignment: u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
             file_alignment: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
@@ -318,20 +326,16 @@ impl OptionalHeader {
             subsystem: u16::from_le_bytes([data[68], data[69]]),
             dll_characteristics: u16::from_le_bytes([data[70], data[71]]),
             size_of_stack_reserve: u64::from_le_bytes([
-                data[72], data[73], data[74], data[75],
-                data[76], data[77], data[78], data[79],
+                data[72], data[73], data[74], data[75], data[76], data[77], data[78], data[79],
             ]),
             size_of_stack_commit: u64::from_le_bytes([
-                data[80], data[81], data[82], data[83],
-                data[84], data[85], data[86], data[87],
+                data[80], data[81], data[82], data[83], data[84], data[85], data[86], data[87],
             ]),
             size_of_heap_reserve: u64::from_le_bytes([
-                data[88], data[89], data[90], data[91],
-                data[92], data[93], data[94], data[95],
+                data[88], data[89], data[90], data[91], data[92], data[93], data[94], data[95],
             ]),
             size_of_heap_commit: u64::from_le_bytes([
-                data[96], data[97], data[98], data[99],
-                data[100], data[101], data[102], data[103],
+                data[96], data[97], data[98], data[99], data[100], data[101], data[102], data[103],
             ]),
             number_of_rva_and_sizes,
             data_directories,

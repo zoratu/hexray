@@ -194,6 +194,9 @@ fn read_cstring(data: &[u8], offset: usize) -> String {
         return String::new();
     }
     let bytes = &data[offset..];
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len().min(256));
+    let end = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(bytes.len().min(256));
     String::from_utf8_lossy(&bytes[..end]).to_string()
 }

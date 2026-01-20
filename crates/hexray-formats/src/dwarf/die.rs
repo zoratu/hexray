@@ -236,9 +236,10 @@ impl<'a> DieParser<'a> {
         }
 
         // Look up abbreviation
-        let abbrev = self.abbrev_table.get(abbrev_code).ok_or_else(|| {
-            ParseError::InvalidValue("unknown abbreviation code")
-        })?;
+        let abbrev = self
+            .abbrev_table
+            .get(abbrev_code)
+            .ok_or(ParseError::InvalidValue("unknown abbreviation code"))?;
 
         // Parse attributes
         let mut attributes = Vec::with_capacity(abbrev.attributes.len());
@@ -276,7 +277,10 @@ impl<'a> DieParser<'a> {
     }
 
     /// Parse an attribute value based on its form.
-    fn parse_attribute_value(&mut self, spec: &AttributeSpec) -> Result<AttributeValue, ParseError> {
+    fn parse_attribute_value(
+        &mut self,
+        spec: &AttributeSpec,
+    ) -> Result<AttributeValue, ParseError> {
         match spec.form {
             DwForm::Addr => {
                 let value = self.read_address()?;
@@ -354,9 +358,7 @@ impl<'a> DieParser<'a> {
                 let value = self.read_u8()?;
                 Ok(AttributeValue::Flag(value != 0))
             }
-            DwForm::FlagPresent => {
-                Ok(AttributeValue::Flag(true))
-            }
+            DwForm::FlagPresent => Ok(AttributeValue::Flag(true)),
             DwForm::Ref1 => {
                 let offset = self.read_u8()? as u64;
                 Ok(AttributeValue::Reference(offset))
@@ -435,9 +437,9 @@ impl<'a> DieParser<'a> {
                 Ok(AttributeValue::AddressIndex(index))
             }
             DwForm::ImplicitConst => {
-                let value = spec.implicit_const.ok_or_else(|| {
-                    ParseError::InvalidValue("missing implicit constant value")
-                })?;
+                let value = spec
+                    .implicit_const
+                    .ok_or(ParseError::InvalidValue("missing implicit constant value"))?;
                 Ok(AttributeValue::Signed(value))
             }
             DwForm::Indirect => {
@@ -468,9 +470,7 @@ impl<'a> DieParser<'a> {
                 let offset = self.read_offset()?;
                 Ok(AttributeValue::StringOffset(offset))
             }
-            DwForm::Unknown(_) => {
-                Err(ParseError::InvalidValue("unknown DWARF form"))
-            }
+            DwForm::Unknown(_) => Err(ParseError::InvalidValue("unknown DWARF form")),
         }
     }
 
@@ -495,10 +495,7 @@ impl<'a> DieParser<'a> {
                 context: "u16",
             });
         }
-        let value = u16::from_le_bytes([
-            self.data[self.offset],
-            self.data[self.offset + 1],
-        ]);
+        let value = u16::from_le_bytes([self.data[self.offset], self.data[self.offset + 1]]);
         self.offset += 2;
         Ok(value)
     }

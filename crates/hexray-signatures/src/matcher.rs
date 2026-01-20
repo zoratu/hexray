@@ -153,7 +153,8 @@ impl<'a> SignatureMatcher<'a> {
 
         // Sort by offset, then confidence
         matches.sort_by(|a, b| {
-            a.offset.cmp(&b.offset)
+            a.offset
+                .cmp(&b.offset)
                 .then_with(|| b.confidence.partial_cmp(&a.confidence).unwrap())
         });
 
@@ -176,7 +177,10 @@ impl<'a> SignatureMatcher<'a> {
         }
 
         // Boost confidence for patterns with more concrete bytes
-        let concrete_count = sig.pattern.bytes().iter()
+        let concrete_count = sig
+            .pattern
+            .bytes()
+            .iter()
             .filter(|b| b.is_concrete())
             .count();
         let concrete_ratio = concrete_count as f32 / pattern_len as f32;
@@ -213,12 +217,21 @@ mod tests {
     fn make_test_database() -> SignatureDatabase {
         let mut db = SignatureDatabase::new();
 
-        db.add(FunctionSignature::from_hex("strlen", "55 48 89 E5 48 89 7D F8").unwrap()
-            .with_confidence(0.8));
-        db.add(FunctionSignature::from_hex("strcpy", "55 48 89 E5 48 89 7D E8").unwrap()
-            .with_confidence(0.8));
-        db.add(FunctionSignature::from_hex("memset", "55 48 89 E5 48 89 7D D8").unwrap()
-            .with_confidence(0.8));
+        db.add(
+            FunctionSignature::from_hex("strlen", "55 48 89 E5 48 89 7D F8")
+                .unwrap()
+                .with_confidence(0.8),
+        );
+        db.add(
+            FunctionSignature::from_hex("strcpy", "55 48 89 E5 48 89 7D E8")
+                .unwrap()
+                .with_confidence(0.8),
+        );
+        db.add(
+            FunctionSignature::from_hex("memset", "55 48 89 E5 48 89 7D D8")
+                .unwrap()
+                .with_confidence(0.8),
+        );
 
         db
     }

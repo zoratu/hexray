@@ -44,10 +44,10 @@ mod differential;
 // Include submodules from the differential directory
 #[path = "differential/disasm_compare.rs"]
 pub mod disasm_compare;
-#[path = "differential/symbols_compare.rs"]
-pub mod symbols_compare;
 #[path = "differential/strings_compare.rs"]
 pub mod strings_compare;
+#[path = "differential/symbols_compare.rs"]
+pub mod symbols_compare;
 
 // Re-export utilities for use in test modules
 pub use differential::*;
@@ -249,11 +249,16 @@ fn sanity_test_comparison_functions() {
 
     // Test string comparison
     let hexray_strings: std::collections::HashSet<String> =
-        ["Hello".to_string(), "World".to_string()].into_iter().collect();
-    let ref_strings: std::collections::HashSet<String> =
-        ["Hello".to_string(), "World".to_string(), "Extra".to_string()]
+        ["Hello".to_string(), "World".to_string()]
             .into_iter()
             .collect();
+    let ref_strings: std::collections::HashSet<String> = [
+        "Hello".to_string(),
+        "World".to_string(),
+        "Extra".to_string(),
+    ]
+    .into_iter()
+    .collect();
 
     let str_result = compare_strings(&hexray_strings, &ref_strings);
     assert_eq!(str_result.matching_strings, 2);

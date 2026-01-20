@@ -15,9 +15,8 @@
 
 use crate::DecodedInstruction;
 use hexray_core::{
-    Architecture, Instruction, MemoryRef, Operand, Operation,
-    Register, RegisterClass,
-    register::arm64,
+    register::arm64, Architecture, Instruction, MemoryRef, Operand, Operation, Register,
+    RegisterClass,
 };
 
 /// SME decoder implementation.
@@ -74,12 +73,7 @@ impl SmeDecoder {
     }
 
     /// Decode an SME instruction.
-    pub fn decode(
-        &self,
-        insn: u32,
-        address: u64,
-        bytes: Vec<u8>,
-    ) -> Option<DecodedInstruction> {
+    pub fn decode(&self, insn: u32, address: u64, bytes: Vec<u8>) -> Option<DecodedInstruction> {
         let bits_31_24 = (insn >> 24) & 0xFF;
 
         // Check for SMSTART/SMSTOP first (MSR encoding)
@@ -131,8 +125,8 @@ impl SmeDecoder {
 
         // Determine if SMSTART or SMSTOP based on bit patterns
         let is_start = (bits_7_5 & 0x2) != 0;
-        let sm = (bits_11_8 & 0x1) != 0;  // Streaming mode
-        let za = (bits_11_8 & 0x2) != 0;  // ZA array
+        let sm = (bits_11_8 & 0x1) != 0; // Streaming mode
+        let za = (bits_11_8 & 0x2) != 0; // ZA array
 
         let mnemonic = if is_start {
             match (sm, za) {
@@ -156,10 +150,12 @@ impl SmeDecoder {
             Operation::SmeStop
         };
 
-        let inst = Instruction::new(address, 4, bytes, mnemonic)
-            .with_operation(operation);
+        let inst = Instruction::new(address, 4, bytes, mnemonic).with_operation(operation);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode ZERO {ZA} instruction.
@@ -179,7 +175,10 @@ impl SmeDecoder {
             .with_operation(Operation::SmeZeroZa)
             .with_operands(vec![Operand::reg(za_reg)]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SME MOVA instructions (move to/from ZA).
@@ -192,13 +191,13 @@ impl SmeDecoder {
         // MOVA has various forms for moving between Z registers and ZA tiles
         // Basic encoding: 1100_0000_xxxx_xxxx_xxxx_xxxx_xxxx_xxxx
 
-        let bits_23_22 = (insn >> 22) & 0x3;  // Size
-        let v = ((insn >> 16) & 0x3) as u16;  // Tile vertical slice index register (W12-W15)
+        let bits_23_22 = (insn >> 22) & 0x3; // Size
+        let v = ((insn >> 16) & 0x3) as u16; // Tile vertical slice index register (W12-W15)
         let pg = ((insn >> 10) & 0x7) as u16; // Predicate
         let zn_or_za = ((insn >> 5) & 0x1F) as u16;
         let zd_or_za = (insn & 0x1F) as u16;
 
-        let is_to_za = ((insn >> 15) & 0x1) == 0;  // Direction
+        let is_to_za = ((insn >> 15) & 0x1) == 0; // Direction
 
         let _suffix = Self::sme_size_suffix(bits_23_22);
         let pred = Self::preg(pg);
@@ -207,7 +206,7 @@ impl SmeDecoder {
             // MOVA ZA[Wv, #imm], Pg/M, Zn
             let za_reg = Self::za_tile_reg(bits_23_22, zd_or_za as u32);
             let zn_reg = Self::zreg(zn_or_za);
-            let wv = Self::wreg(12 + v);  // W12-W15
+            let wv = Self::wreg(12 + v); // W12-W15
             (
                 "mova",
                 vec![
@@ -237,7 +236,10 @@ impl SmeDecoder {
             .with_operation(Operation::SmeMova)
             .with_operands(operands);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SME ZA memory operations (LDR/STR ZA).
@@ -254,9 +256,9 @@ impl SmeDecoder {
 
         let is_load = ((insn >> 21) & 0x1) != 0;
         let imm4 = ((insn >> 16) & 0xF) as i64;
-        let rv = ((insn >> 13) & 0x3) as u16;  // W12-W15 selector
+        let rv = ((insn >> 13) & 0x3) as u16; // W12-W15 selector
         let rn = ((insn >> 5) & 0x1F) as u16;
-        let imm_off = (insn & 0xF) as u32;
+        let imm_off = insn & 0xF;
 
         let mnemonic = if is_load { "ldr" } else { "str" };
         let operation = if is_load {
@@ -286,7 +288,10 @@ impl SmeDecoder {
                 Operand::Memory(mem),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SME outer product instructions (FMOPA, FMOPS, BFMOPA, SMOPA, UMOPA, etc.).
@@ -300,19 +305,19 @@ impl SmeDecoder {
         // Various encodings for FP, BF16, and integer outer products
 
         let bits_24 = (insn >> 24) & 0x1;
-        let bits_23_22 = (insn >> 22) & 0x3;  // Size/type
+        let bits_23_22 = (insn >> 22) & 0x3; // Size/type
         let zm = ((insn >> 16) & 0x1F) as u16;
         let pm = ((insn >> 13) & 0x7) as u16;
         let pn = ((insn >> 10) & 0x7) as u16;
         let zn = ((insn >> 5) & 0x1F) as u16;
-        let s = ((insn >> 4) & 0x1) != 0;  // Subtract flag
-        let zad = (insn & 0xF) as u32;
+        let s = ((insn >> 4) & 0x1) != 0; // Subtract flag
+        let zad = insn & 0xF;
 
         // Determine instruction type based on encoding
         let (mnemonic, operation) = if bits_24 == 1 {
             // Integer outer products
-            let u_n = ((insn >> 4) & 0x1) != 0;  // Unsigned Zn
-            let u_m = ((insn >> 3) & 0x1) != 0;  // Unsigned Zm
+            let u_n = ((insn >> 4) & 0x1) != 0; // Unsigned Zn
+            let u_m = ((insn >> 3) & 0x1) != 0; // Unsigned Zm
             match (u_n, u_m, s) {
                 (false, false, false) => ("smopa", Operation::SmeSmop),
                 (false, false, true) => ("smops", Operation::SmeSmop),
@@ -325,11 +330,11 @@ impl SmeDecoder {
         } else {
             // Floating-point outer products
             match (bits_23_22, s) {
-                (0b00, false) => ("bfmopa", Operation::SmeBfmop),  // BFloat16
+                (0b00, false) => ("bfmopa", Operation::SmeBfmop), // BFloat16
                 (0b00, true) => ("bfmops", Operation::SmeBfmop),
-                (0b10, false) => ("fmopa", Operation::SmeFmopa),   // FP32
+                (0b10, false) => ("fmopa", Operation::SmeFmopa), // FP32
                 (0b10, true) => ("fmops", Operation::SmeFmops),
-                (0b11, false) => ("fmopa", Operation::SmeFmopa),   // FP64
+                (0b11, false) => ("fmopa", Operation::SmeFmopa), // FP64
                 (0b11, true) => ("fmops", Operation::SmeFmops),
                 _ => ("sme_fmop", Operation::Other(0x301)),
             }
@@ -352,7 +357,10 @@ impl SmeDecoder {
                 Operand::reg(zm_reg),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     // Helper functions for register creation
@@ -370,18 +378,13 @@ impl SmeDecoder {
     /// Create a ZA tile register based on size.
     fn za_tile_reg(size: u32, tile: u32) -> Register {
         let id = match size {
-            0 => arm64::ZA0_B,                    // Byte tiles (only ZA0.B)
-            1 => arm64::ZA0_H + (tile & 0x1) as u16,  // Halfword tiles (ZA0.H-ZA1.H)
-            2 => arm64::ZA0_S + (tile & 0x3) as u16,  // Word tiles (ZA0.S-ZA3.S)
-            3 => arm64::ZA0_D + (tile & 0x7) as u16,  // Doubleword tiles (ZA0.D-ZA7.D)
+            0 => arm64::ZA0_B,                       // Byte tiles (only ZA0.B)
+            1 => arm64::ZA0_H + (tile & 0x1) as u16, // Halfword tiles (ZA0.H-ZA1.H)
+            2 => arm64::ZA0_S + (tile & 0x3) as u16, // Word tiles (ZA0.S-ZA3.S)
+            3 => arm64::ZA0_D + (tile & 0x7) as u16, // Doubleword tiles (ZA0.D-ZA7.D)
             _ => arm64::ZA,
         };
-        Register::new(
-            Architecture::Arm64,
-            RegisterClass::MatrixArray,
-            id,
-            0,
-        )
+        Register::new(Architecture::Arm64, RegisterClass::MatrixArray, id, 0)
     }
 
     /// Create an SVE Z register.
@@ -517,6 +520,9 @@ mod tests {
         assert!(result.is_some());
         let decoded = result.unwrap();
         // Should decode to some outer product variant
-        assert!(decoded.instruction.mnemonic.contains("mop") || decoded.instruction.mnemonic.contains("sme"));
+        assert!(
+            decoded.instruction.mnemonic.contains("mop")
+                || decoded.instruction.mnemonic.contains("sme")
+        );
     }
 }

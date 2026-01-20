@@ -4,11 +4,11 @@
 
 #![allow(dead_code)]
 
-use super::structurer::{StructuredCfg, StructuredNode};
 use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
 use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
-use super::{StringTable, SymbolTable, RelocationTable};
+use super::structurer::{StructuredCfg, StructuredNode};
+use super::{RelocationTable, StringTable, SymbolTable};
 use hexray_types::TypeDatabase;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -161,7 +161,10 @@ impl PseudoCodeEmitter {
 
     /// Gets the type string for a variable, defaulting to "int".
     fn get_type(&self, var_name: &str) -> &str {
-        self.type_info.get(var_name).map(|s| s.as_str()).unwrap_or("int")
+        self.type_info
+            .get(var_name)
+            .map(|s| s.as_str())
+            .unwrap_or("int")
     }
 
     /// Try to format a dereference as struct field access using the type database.
@@ -171,13 +174,22 @@ impl PseudoCodeEmitter {
     ///
     /// For now, this is opportunistic - it will look at the variable's type hint
     /// in type_info to determine the struct type.
-    fn try_format_struct_field(&self, addr: &Expr, _size: usize, table: &StringTable) -> Option<String> {
+    fn try_format_struct_field(
+        &self,
+        addr: &Expr,
+        _size: usize,
+        table: &StringTable,
+    ) -> Option<String> {
         let type_db = self.type_database.as_ref()?;
 
         // Extract base + offset from the address expression
         // Common patterns: base + offset, base - offset
         let (base, offset) = match &addr.kind {
-            ExprKind::BinOp { op: BinOpKind::Add, left, right } => {
+            ExprKind::BinOp {
+                op: BinOpKind::Add,
+                left,
+                right,
+            } => {
                 // base + offset
                 if let ExprKind::IntLit(off) = right.kind {
                     (left.as_ref(), off as usize)
@@ -187,7 +199,11 @@ impl PseudoCodeEmitter {
                     return None;
                 }
             }
-            ExprKind::BinOp { op: BinOpKind::Sub, left, right } => {
+            ExprKind::BinOp {
+                op: BinOpKind::Sub,
+                left,
+                right,
+            } => {
                 // base - offset (negative offset)
                 if let ExprKind::IntLit(off) = right.kind {
                     // Negative offsets are unusual for struct fields
@@ -214,10 +230,10 @@ impl PseudoCodeEmitter {
 
         // Extract struct name from type string
         // Patterns: "struct foo *", "struct foo*", "struct foo"
-        let struct_name = if type_str.starts_with("struct ") {
-            let rest = &type_str[7..]; // Skip "struct "
+        let struct_name = if let Some(rest) = type_str.strip_prefix("struct ") {
+            // Skip "struct "
             // Find the end of the struct name (before * or space or end)
-            let name_end = rest.find(|c: char| c == '*' || c == ' ').unwrap_or(rest.len());
+            let name_end = rest.find(['*', ' ']).unwrap_or(rest.len());
             let name = rest[..name_end].trim();
             format!("struct {}", name)
         } else {
@@ -263,13 +279,19 @@ impl PseudoCodeEmitter {
                 format_integer(*n)
             }
             ExprKind::BinOp { op, left, right } => {
-                format!("{} {} {}",
+                format!(
+                    "{} {} {}",
                     self.format_expr_with_strings(left, table),
                     op.as_str(),
-                    self.format_expr_with_strings(right, table))
+                    self.format_expr_with_strings(right, table)
+                )
             }
             ExprKind::UnaryOp { op, operand } => {
-                format!("{}{}", op.as_str(), self.format_expr_with_strings(operand, table))
+                format!(
+                    "{}{}",
+                    op.as_str(),
+                    self.format_expr_with_strings(operand, table)
+                )
             }
             ExprKind::Deref { addr, size } => {
                 // Check if this is a stack slot access (rbp + offset or rbp - offset)
@@ -277,7 +299,9 @@ impl PseudoCodeEmitter {
                     return var_name;
                 }
                 // Check if this is a struct field access using the type database
-                if let Some(field_access) = self.try_format_struct_field(addr, *size as usize, table) {
+                if let Some(field_access) =
+                    self.try_format_struct_field(addr, *size as usize, table)
+                {
                     return field_access;
                 }
                 // Check if this is an array access pattern: base + index * size
@@ -306,8 +330,12 @@ impl PseudoCodeEmitter {
                         // Special case: x = x + 1 → x++ and x = x - 1 → x--
                         if let ExprKind::IntLit(1) = right.kind {
                             match op {
-                                super::expression::BinOpKind::Add => return format!("{}++", lhs_str),
-                                super::expression::BinOpKind::Sub => return format!("{}--", lhs_str),
+                                super::expression::BinOpKind::Add => {
+                                    return format!("{}++", lhs_str)
+                                }
+                                super::expression::BinOpKind::Sub => {
+                                    return format!("{}--", lhs_str)
+                                }
                                 _ => {}
                             }
                         }
@@ -318,11 +346,19 @@ impl PseudoCodeEmitter {
                         }
                     }
                 }
-                format!("{} = {}",
+                format!(
+                    "{} = {}",
                     self.format_expr_with_strings(lhs, table),
-                    self.format_expr_with_strings(rhs, table))
+                    self.format_expr_with_strings(rhs, table)
+                )
             }
-            ExprKind::GotRef { address, instruction_address, size, display_expr: _, is_deref } => {
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                size,
+                display_expr: _,
+                is_deref,
+            } => {
                 // Try to resolve using instruction address first (for relocatable objects)
                 // This uses the relocation at the instruction to find the symbol
                 if let Some(ref reloc_table) = self.relocation_table {
@@ -362,7 +398,10 @@ impl PseudoCodeEmitter {
             }
             ExprKind::Call { target, args } => {
                 let target_str = match target {
-                    super::expression::CallTarget::Direct { target: addr, call_site } => {
+                    super::expression::CallTarget::Direct {
+                        target: addr,
+                        call_site,
+                    } => {
                         // First check relocation table (for kernel modules)
                         // This uses the call instruction address to find the target symbol
                         if let Some(ref reloc_table) = self.relocation_table {
@@ -420,7 +459,8 @@ impl PseudoCodeEmitter {
                         }
                     }
                 };
-                let args_str: Vec<_> = args.iter()
+                let args_str: Vec<_> = args
+                    .iter()
                     .map(|a| self.format_expr_with_strings(a, table))
                     .collect();
                 format!("{}({})", target_str, args_str.join(", "))
@@ -455,13 +495,15 @@ impl PseudoCodeEmitter {
             let sig = recovery.analyze(cfg);
 
             // Convert recovered signature to FunctionInfo for compatibility
-            let params: Vec<String> = sig.parameters.iter()
-                .map(|p| p.name.clone())
-                .collect();
+            let params: Vec<String> = sig.parameters.iter().map(|p| p.name.clone()).collect();
 
             let info = self.analyze_function(&cfg.body);
             let merged_info = FunctionInfo {
-                parameters: if params.is_empty() { info.parameters } else { params },
+                parameters: if params.is_empty() {
+                    info.parameters
+                } else {
+                    params
+                },
                 has_return_value: sig.has_return || info.has_return_value,
                 skip_statements: info.skip_statements,
             };
@@ -486,27 +528,58 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
             } else if !sig.parameters.is_empty() {
                 // Use recovered signature with inferred types
-                let params: Vec<_> = sig.parameters.iter()
+                let params: Vec<_> = sig
+                    .parameters
+                    .iter()
                     .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
                     .collect();
-                writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+                writeln!(
+                    output,
+                    "{} {}({})",
+                    return_type,
+                    func_name,
+                    params.join(", ")
+                )
+                .unwrap();
             } else {
                 // Fall back to legacy parameter detection
-                let params: Vec<_> = func_info.parameters.iter()
+                let params: Vec<_> = func_info
+                    .parameters
+                    .iter()
                     .map(|p| format!("{} {}", self.get_type(p), p))
                     .collect();
-                writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+                writeln!(
+                    output,
+                    "{} {}({})",
+                    return_type,
+                    func_name,
+                    params.join(", ")
+                )
+                .unwrap();
             }
         } else {
             // Legacy fallback
-            let return_type = if func_info.has_return_value { "int" } else { "void" };
+            let return_type = if func_info.has_return_value {
+                "int"
+            } else {
+                "void"
+            };
             if func_info.parameters.is_empty() {
                 writeln!(output, "{} {}()", return_type, func_name).unwrap();
             } else {
-                let params: Vec<_> = func_info.parameters.iter()
+                let params: Vec<_> = func_info
+                    .parameters
+                    .iter()
                     .map(|p| format!("{} {}", self.get_type(p), p))
                     .collect();
-                writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+                writeln!(
+                    output,
+                    "{} {}({})",
+                    return_type,
+                    func_name,
+                    params.join(", ")
+                )
+                .unwrap();
             }
         }
         writeln!(output, "{{").unwrap();
@@ -529,7 +602,13 @@ impl PseudoCodeEmitter {
         declared_vars.extend(all_vars);
 
         // Emit body, skipping parameter assignment statements
-        self.emit_nodes_with_skip_and_decls(&cfg.body, &mut output, 1, &func_info.skip_statements, &mut declared_vars);
+        self.emit_nodes_with_skip_and_decls(
+            &cfg.body,
+            &mut output,
+            1,
+            &func_info.skip_statements,
+            &mut declared_vars,
+        );
 
         writeln!(output, "}}").unwrap();
         output
@@ -539,7 +618,12 @@ impl PseudoCodeEmitter {
     ///
     /// This allows providing a pre-computed signature for cases where
     /// additional context (like symbol information) is available.
-    pub fn emit_with_signature(&self, cfg: &StructuredCfg, func_name: &str, signature: &FunctionSignature) -> String {
+    pub fn emit_with_signature(
+        &self,
+        cfg: &StructuredCfg,
+        func_name: &str,
+        signature: &FunctionSignature,
+    ) -> String {
         let mut output = String::new();
 
         // Analyze function body for pattern-based variable naming
@@ -555,10 +639,19 @@ impl PseudoCodeEmitter {
         if signature.parameters.is_empty() {
             writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
         } else {
-            let params: Vec<_> = signature.parameters.iter()
+            let params: Vec<_> = signature
+                .parameters
+                .iter()
                 .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
                 .collect();
-            writeln!(output, "{} {}({})", return_type, func_name, params.join(", ")).unwrap();
+            writeln!(
+                output,
+                "{} {}({})",
+                return_type,
+                func_name,
+                params.join(", ")
+            )
+            .unwrap();
         }
         writeln!(output, "{{").unwrap();
 
@@ -566,7 +659,9 @@ impl PseudoCodeEmitter {
         let func_info = self.analyze_function(&cfg.body);
 
         // Collect parameter names from signature
-        let param_names: Vec<String> = signature.parameters.iter()
+        let param_names: Vec<String> = signature
+            .parameters
+            .iter()
             .map(|p| p.name.clone())
             .collect();
 
@@ -588,7 +683,13 @@ impl PseudoCodeEmitter {
         declared_vars.extend(all_vars);
 
         // Emit body
-        self.emit_nodes_with_skip_and_decls(&cfg.body, &mut output, 1, &func_info.skip_statements, &mut declared_vars);
+        self.emit_nodes_with_skip_and_decls(
+            &cfg.body,
+            &mut output,
+            1,
+            &func_info.skip_statements,
+            &mut declared_vars,
+        );
 
         writeln!(output, "}}").unwrap();
         output
@@ -641,15 +742,19 @@ impl PseudoCodeEmitter {
                     }
                 }
             }
-            StructuredNode::If { then_body, else_body, .. } => {
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 self.collect_vars_from_nodes(then_body, vars);
                 if let Some(else_nodes) = else_body {
                     self.collect_vars_from_nodes(else_nodes, vars);
                 }
             }
-            StructuredNode::While { body, .. } |
-            StructuredNode::DoWhile { body, .. } |
-            StructuredNode::Loop { body } => {
+            StructuredNode::While { body, .. }
+            | StructuredNode::DoWhile { body, .. }
+            | StructuredNode::Loop { body } => {
                 self.collect_vars_from_nodes(body, vars);
             }
             StructuredNode::For { init, body, .. } => {
@@ -733,7 +838,9 @@ impl PseudoCodeEmitter {
         }
 
         // Remove empty parameter slots (non-contiguous parameters)
-        info.parameters = info.parameters.into_iter()
+        info.parameters = info
+            .parameters
+            .into_iter()
             .take_while(|p| !p.is_empty())
             .collect();
 
@@ -748,7 +855,11 @@ impl PseudoCodeEmitter {
         for node in nodes {
             match node {
                 StructuredNode::Return(Some(_)) => return true,
-                StructuredNode::If { then_body, else_body, .. } => {
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     if self.has_return_value(then_body) {
                         return true;
                     }
@@ -758,10 +869,10 @@ impl PseudoCodeEmitter {
                         }
                     }
                 }
-                StructuredNode::While { body, .. } |
-                StructuredNode::DoWhile { body, .. } |
-                StructuredNode::For { body, .. } |
-                StructuredNode::Loop { body } => {
+                StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::For { body, .. }
+                | StructuredNode::Loop { body } => {
                     if self.has_return_value(body) {
                         return true;
                     }
@@ -816,9 +927,14 @@ impl PseudoCodeEmitter {
         declared_vars: &mut HashSet<String>,
     ) {
         match node {
-            StructuredNode::Block { id, statements, address_range } => {
+            StructuredNode::Block {
+                id,
+                statements,
+                address_range,
+            } => {
                 // Filter out skipped statements
-                let filtered: Vec<_> = statements.iter()
+                let filtered: Vec<_> = statements
+                    .iter()
                     .enumerate()
                     .filter(|(stmt_idx, _)| !skip.contains(&(block_idx, *stmt_idx)))
                     .map(|(_, stmt)| stmt)
@@ -826,7 +942,12 @@ impl PseudoCodeEmitter {
 
                 if self.emit_addresses {
                     let indent = self.indent.repeat(depth);
-                    writeln!(output, "{}// bb{} [{:#x}..{:#x}]", indent, id.0, address_range.0, address_range.1).unwrap();
+                    writeln!(
+                        output,
+                        "{}// bb{} [{:#x}..{:#x}]",
+                        indent, id.0, address_range.0, address_range.1
+                    )
+                    .unwrap();
                 }
 
                 // Get data relocations for this block to resolve `reg = 0` assignments
@@ -841,9 +962,18 @@ impl PseudoCodeEmitter {
                     // Check if this is a Call with IntLit(0) arguments and we have relocations
                     if !data_relocs.is_empty() {
                         if let ExprKind::Call { target, args } = &stmt.kind {
-                            let has_zero_arg = args.iter().any(|arg| matches!(arg.kind, ExprKind::IntLit(0)));
+                            let has_zero_arg = args
+                                .iter()
+                                .any(|arg| matches!(arg.kind, ExprKind::IntLit(0)));
                             if has_zero_arg {
-                                self.emit_call_with_relocations(target, args, &data_relocs, &mut reloc_idx, output, depth);
+                                self.emit_call_with_relocations(
+                                    target,
+                                    args,
+                                    &data_relocs,
+                                    &mut reloc_idx,
+                                    output,
+                                    depth,
+                                );
                                 continue;
                             }
                         }
@@ -852,7 +982,11 @@ impl PseudoCodeEmitter {
                 }
             }
             // For control flow structures, recurse with the same declared_vars
-            StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
                 // Skip stack canary check: if (check) { __stack_chk_fail(); }
                 // Check both then and else bodies since compiler may invert the condition
                 if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
@@ -876,21 +1010,36 @@ impl PseudoCodeEmitter {
 
                 // Determine actual condition and bodies
                 let (actual_cond, actual_then, actual_else) = if then_empty && !else_empty {
-                    (condition.clone().negate(), else_body.as_ref().unwrap(), None)
+                    (
+                        condition.clone().negate(),
+                        else_body.as_ref().unwrap(),
+                        None,
+                    )
                 } else if !then_empty && else_empty {
                     (condition.clone(), then_body, None)
                 } else {
                     (condition.clone(), then_body, else_body.as_ref())
                 };
 
-                writeln!(output, "{}if ({}) {{", indent, self.format_expr(&actual_cond)).unwrap();
+                writeln!(
+                    output,
+                    "{}if ({}) {{",
+                    indent,
+                    self.format_expr(&actual_cond)
+                )
+                .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
                 if let Some(else_nodes) = actual_else {
                     if !self.is_body_empty(else_nodes) {
                         if else_nodes.len() == 1 {
                             if let StructuredNode::If { .. } = &else_nodes[0] {
                                 write!(output, "{}}} else ", indent).unwrap();
-                                self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
+                                self.emit_node_with_decls(
+                                    &else_nodes[0],
+                                    output,
+                                    depth,
+                                    declared_vars,
+                                );
                                 return;
                             }
                         }
@@ -902,7 +1051,13 @@ impl PseudoCodeEmitter {
             }
             StructuredNode::While { condition, body } => {
                 let indent = self.indent.repeat(depth);
-                writeln!(output, "{}while ({}) {{", indent, self.format_expr(condition)).unwrap();
+                writeln!(
+                    output,
+                    "{}while ({}) {{",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -910,7 +1065,13 @@ impl PseudoCodeEmitter {
                 let indent = self.indent.repeat(depth);
                 writeln!(output, "{}do {{", indent).unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
-                writeln!(output, "{}}} while ({});", indent, self.format_expr(condition)).unwrap();
+                writeln!(
+                    output,
+                    "{}}} while ({});",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
             }
             StructuredNode::Loop { body } => {
                 let indent = self.indent.repeat(depth);
@@ -947,10 +1108,19 @@ impl PseudoCodeEmitter {
         declared_vars: &mut HashSet<String>,
     ) {
         match node {
-            StructuredNode::Block { id, statements, address_range } => {
+            StructuredNode::Block {
+                id,
+                statements,
+                address_range,
+            } => {
                 if self.emit_addresses {
                     let indent = self.indent.repeat(depth);
-                    writeln!(output, "{}// bb{} [{:#x}..{:#x}]", indent, id.0, address_range.0, address_range.1).unwrap();
+                    writeln!(
+                        output,
+                        "{}// bb{} [{:#x}..{:#x}]",
+                        indent, id.0, address_range.0, address_range.1
+                    )
+                    .unwrap();
                 }
 
                 // Get data relocations for this block to resolve `reg = 0` assignments
@@ -965,9 +1135,18 @@ impl PseudoCodeEmitter {
                     // Check if this is a Call with IntLit(0) arguments and we have relocations
                     if !data_relocs.is_empty() {
                         if let ExprKind::Call { target, args } = &stmt.kind {
-                            let has_zero_arg = args.iter().any(|arg| matches!(arg.kind, ExprKind::IntLit(0)));
+                            let has_zero_arg = args
+                                .iter()
+                                .any(|arg| matches!(arg.kind, ExprKind::IntLit(0)));
                             if has_zero_arg {
-                                self.emit_call_with_relocations(target, args, &data_relocs, &mut reloc_idx, output, depth);
+                                self.emit_call_with_relocations(
+                                    target,
+                                    args,
+                                    &data_relocs,
+                                    &mut reloc_idx,
+                                    output,
+                                    depth,
+                                );
                                 continue;
                             }
                         }
@@ -976,7 +1155,11 @@ impl PseudoCodeEmitter {
                 }
             }
             // For control flow structures, recurse
-            StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
                 // Skip stack canary check: if (check) { __stack_chk_fail(); }
                 // Check both then and else bodies since compiler may invert the condition
                 if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
@@ -1000,21 +1183,36 @@ impl PseudoCodeEmitter {
 
                 // Determine actual condition and bodies
                 let (actual_cond, actual_then, actual_else) = if then_empty && !else_empty {
-                    (condition.clone().negate(), else_body.as_ref().unwrap(), None)
+                    (
+                        condition.clone().negate(),
+                        else_body.as_ref().unwrap(),
+                        None,
+                    )
                 } else if !then_empty && else_empty {
                     (condition.clone(), then_body, None)
                 } else {
                     (condition.clone(), then_body, else_body.as_ref())
                 };
 
-                writeln!(output, "{}if ({}) {{", indent, self.format_expr(&actual_cond)).unwrap();
+                writeln!(
+                    output,
+                    "{}if ({}) {{",
+                    indent,
+                    self.format_expr(&actual_cond)
+                )
+                .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
                 if let Some(else_nodes) = actual_else {
                     if !self.is_body_empty(else_nodes) {
                         if else_nodes.len() == 1 {
                             if let StructuredNode::If { .. } = &else_nodes[0] {
                                 write!(output, "{}}} else ", indent).unwrap();
-                                self.emit_node_with_decls(&else_nodes[0], output, depth, declared_vars);
+                                self.emit_node_with_decls(
+                                    &else_nodes[0],
+                                    output,
+                                    depth,
+                                    declared_vars,
+                                );
                                 return;
                             }
                         }
@@ -1026,7 +1224,13 @@ impl PseudoCodeEmitter {
             }
             StructuredNode::While { condition, body } => {
                 let indent = self.indent.repeat(depth);
-                writeln!(output, "{}while ({}) {{", indent, self.format_expr(condition)).unwrap();
+                writeln!(
+                    output,
+                    "{}while ({}) {{",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -1034,7 +1238,13 @@ impl PseudoCodeEmitter {
                 let indent = self.indent.repeat(depth);
                 writeln!(output, "{}do {{", indent).unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
-                writeln!(output, "{}}} while ({});", indent, self.format_expr(condition)).unwrap();
+                writeln!(
+                    output,
+                    "{}}} while ({});",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
             }
             StructuredNode::Loop { body } => {
                 let indent = self.indent.repeat(depth);
@@ -1060,17 +1270,26 @@ impl PseudoCodeEmitter {
 
         // Format the call target
         let target_str = match target {
-            super::expression::CallTarget::Direct { target: addr, call_site } => {
+            super::expression::CallTarget::Direct {
+                target: addr,
+                call_site,
+            } => {
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get(*call_site) {
                         name.to_string()
                     } else if let Some(ref sym_table) = self.symbol_table {
-                        sym_table.get(*addr).map(|s| s.to_string()).unwrap_or_else(|| format!("sub_{:x}", addr))
+                        sym_table
+                            .get(*addr)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("sub_{:x}", addr))
                     } else {
                         format!("sub_{:x}", addr)
                     }
                 } else if let Some(ref sym_table) = self.symbol_table {
-                    sym_table.get(*addr).map(|s| s.to_string()).unwrap_or_else(|| format!("sub_{:x}", addr))
+                    sym_table
+                        .get(*addr)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("sub_{:x}", addr))
                 } else {
                     format!("sub_{:x}", addr)
                 }
@@ -1109,11 +1328,24 @@ impl PseudoCodeEmitter {
             formatted_args.push(self.format_expr(arg));
         }
 
-        writeln!(output, "{}{}({});", indent, target_str, formatted_args.join(", ")).unwrap();
+        writeln!(
+            output,
+            "{}{}({});",
+            indent,
+            target_str,
+            formatted_args.join(", ")
+        )
+        .unwrap();
     }
 
     /// Emits a statement (variables are declared at function top, so no inline declarations).
-    fn emit_statement_with_decl(&self, expr: &Expr, output: &mut String, depth: usize, _declared_vars: &mut HashSet<String>) {
+    fn emit_statement_with_decl(
+        &self,
+        expr: &Expr,
+        output: &mut String,
+        depth: usize,
+        _declared_vars: &mut HashSet<String>,
+    ) {
         // Skip prologue/epilogue boilerplate
         if self.is_prologue_epilogue(expr) {
             return;
@@ -1157,14 +1389,19 @@ impl PseudoCodeEmitter {
     /// Checks if a node is a control flow exit (goto, return, break, continue).
     fn is_control_exit(&self, node: &StructuredNode) -> bool {
         match node {
-            StructuredNode::Goto(_) |
-            StructuredNode::Return(_) |
-            StructuredNode::Break |
-            StructuredNode::Continue => true,
+            StructuredNode::Goto(_)
+            | StructuredNode::Return(_)
+            | StructuredNode::Break
+            | StructuredNode::Continue => true,
             // Check if an if-else exits on both branches
-            StructuredNode::If { then_body, else_body, .. } => {
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
                 let then_exits = then_body.last().is_some_and(|n| self.is_control_exit(n));
-                let else_exits = else_body.as_ref()
+                let else_exits = else_body
+                    .as_ref()
                     .and_then(|e| e.last())
                     .is_some_and(|n| self.is_control_exit(n));
                 then_exits && else_exits
@@ -1179,14 +1416,12 @@ impl PseudoCodeEmitter {
             return true;
         }
         // Check if all nodes are empty blocks or blocks with only skippable statements
-        nodes.iter().all(|node| {
-            match node {
-                StructuredNode::Block { statements, .. } => {
-                    statements.is_empty() || statements.iter().all(|s| self.is_skippable_statement(s))
-                }
-                StructuredNode::Sequence(inner) => self.is_body_empty(inner),
-                _ => false,
+        nodes.iter().all(|node| match node {
+            StructuredNode::Block { statements, .. } => {
+                statements.is_empty() || statements.iter().all(|s| self.is_skippable_statement(s))
             }
+            StructuredNode::Sequence(inner) => self.is_body_empty(inner),
+            _ => false,
         })
     }
 
@@ -1241,22 +1476,41 @@ impl PseudoCodeEmitter {
         let indent = self.indent.repeat(depth);
 
         match node {
-            StructuredNode::Block { id, statements, address_range } => {
+            StructuredNode::Block {
+                id,
+                statements,
+                address_range,
+            } => {
                 if self.emit_addresses {
-                    writeln!(output, "{}// {} [{:#x} - {:#x}]", indent, id, address_range.0, address_range.1).unwrap();
+                    writeln!(
+                        output,
+                        "{}// {} [{:#x} - {:#x}]",
+                        indent, id, address_range.0, address_range.1
+                    )
+                    .unwrap();
                 }
                 // Get data relocations for this block to resolve `reg = 0` assignments
                 let data_relocs = if let Some(ref reloc_table) = self.relocation_table {
                     // Debug: show which range we're searching
                     if address_range.0 >= 0x98ce0 && address_range.0 < 0x99000 {
-                        eprintln!("DEBUG EMITTER: searching {} [{:#x}..{:#x}]",
-                                  id, address_range.0, address_range.1);
+                        eprintln!(
+                            "DEBUG EMITTER: searching {} [{:#x}..{:#x}]",
+                            id, address_range.0, address_range.1
+                        );
                     }
                     let relocs = reloc_table.get_data_in_range(address_range.0, address_range.1);
                     if !relocs.is_empty() {
-                        eprintln!("DEBUG EMITTER: {} [{:#x}..{:#x}] found {} data relocs: {:?}",
-                                  id, address_range.0, address_range.1, relocs.len(),
-                                  relocs.iter().map(|(a, s)| format!("{:#x}={}", a, s)).collect::<Vec<_>>());
+                        eprintln!(
+                            "DEBUG EMITTER: {} [{:#x}..{:#x}] found {} data relocs: {:?}",
+                            id,
+                            address_range.0,
+                            address_range.1,
+                            relocs.len(),
+                            relocs
+                                .iter()
+                                .map(|(a, s)| format!("{:#x}={}", a, s))
+                                .collect::<Vec<_>>()
+                        );
                     }
                     relocs
                 } else {
@@ -1281,7 +1535,11 @@ impl PseudoCodeEmitter {
                 }
             }
 
-            StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
                 // Skip stack canary check: if (check) { __stack_chk_fail(); }
                 // Check both then and else bodies since compiler may invert the condition
                 if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
@@ -1303,7 +1561,11 @@ impl PseudoCodeEmitter {
 
                 // If then_body is empty but else_body has content, invert the condition
                 let (actual_cond, actual_then, actual_else) = if then_empty && !else_empty {
-                    (condition.clone().negate(), else_body.as_ref().unwrap().clone(), None)
+                    (
+                        condition.clone().negate(),
+                        else_body.as_ref().unwrap().clone(),
+                        None,
+                    )
                 } else if !then_empty && else_empty {
                     // Only then_body has content, no else needed
                     (condition.clone(), then_body.clone(), None)
@@ -1311,7 +1573,13 @@ impl PseudoCodeEmitter {
                     (condition.clone(), then_body.clone(), else_body.clone())
                 };
 
-                writeln!(output, "{}if ({}) {{", indent, self.format_expr(&actual_cond)).unwrap();
+                writeln!(
+                    output,
+                    "{}if ({}) {{",
+                    indent,
+                    self.format_expr(&actual_cond)
+                )
+                .unwrap();
                 self.emit_nodes(&actual_then, output, depth + 1);
 
                 if let Some(else_body) = actual_else {
@@ -1333,7 +1601,13 @@ impl PseudoCodeEmitter {
             }
 
             StructuredNode::While { condition, body } => {
-                writeln!(output, "{}while ({}) {{", indent, self.format_expr(condition)).unwrap();
+                writeln!(
+                    output,
+                    "{}while ({}) {{",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
                 self.emit_nodes(body, output, depth + 1);
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -1341,13 +1615,38 @@ impl PseudoCodeEmitter {
             StructuredNode::DoWhile { body, condition } => {
                 writeln!(output, "{}do {{", indent).unwrap();
                 self.emit_nodes(body, output, depth + 1);
-                writeln!(output, "{}}} while ({});", indent, self.format_expr(condition)).unwrap();
+                writeln!(
+                    output,
+                    "{}}} while ({});",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
             }
 
-            StructuredNode::For { init, condition, update, body } => {
-                let init_str = init.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
-                let update_str = update.as_ref().map(|e| self.format_expr(e)).unwrap_or_default();
-                writeln!(output, "{}for ({}; {}; {}) {{", indent, init_str, self.format_expr(condition), update_str).unwrap();
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                let init_str = init
+                    .as_ref()
+                    .map(|e| self.format_expr(e))
+                    .unwrap_or_default();
+                let update_str = update
+                    .as_ref()
+                    .map(|e| self.format_expr(e))
+                    .unwrap_or_default();
+                writeln!(
+                    output,
+                    "{}for ({}; {}; {}) {{",
+                    indent,
+                    init_str,
+                    self.format_expr(condition),
+                    update_str
+                )
+                .unwrap();
                 self.emit_nodes(body, output, depth + 1);
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -1383,7 +1682,11 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{}:", id).unwrap();
             }
 
-            StructuredNode::Switch { value, cases, default } => {
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
                 writeln!(output, "{}switch ({}) {{", indent, self.format_expr(value)).unwrap();
                 for (values, body) in cases {
                     for v in values {
@@ -1466,7 +1769,12 @@ impl PseudoCodeEmitter {
             ExprKind::Assign { lhs, rhs } => {
                 // ARM64: stur wzr, [x29 - N] - implicit return value initialization
                 if let ExprKind::Deref { addr, .. } = &lhs.kind {
-                    if let ExprKind::BinOp { op: super::expression::BinOpKind::Add, left, right } = &addr.kind {
+                    if let ExprKind::BinOp {
+                        op: super::expression::BinOpKind::Add,
+                        left,
+                        right,
+                    } = &addr.kind
+                    {
                         if let ExprKind::Var(base) = &left.kind {
                             if base.name == "x29" || base.name == "rbp" {
                                 if let ExprKind::IntLit(offset) = &right.kind {
@@ -1528,7 +1836,12 @@ impl PseudoCodeEmitter {
                     // Check if the right operand is an identity value for this operation
                     if let ExprKind::IntLit(n) = &right.kind {
                         match op {
-                            BinOpKind::Add | BinOpKind::Sub | BinOpKind::Or | BinOpKind::Xor | BinOpKind::Shl | BinOpKind::Shr => {
+                            BinOpKind::Add
+                            | BinOpKind::Sub
+                            | BinOpKind::Or
+                            | BinOpKind::Xor
+                            | BinOpKind::Shl
+                            | BinOpKind::Shr => {
                                 if *n == 0 {
                                     return true;
                                 }
@@ -1558,15 +1871,16 @@ impl PseudoCodeEmitter {
     fn try_get_var_name(&self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Var(v) => {
-                if v.name.starts_with("var_") || v.name.starts_with("arg_") || v.name.starts_with("local_") {
+                if v.name.starts_with("var_")
+                    || v.name.starts_with("arg_")
+                    || v.name.starts_with("local_")
+                {
                     Some(v.name.clone())
                 } else {
                     None
                 }
             }
-            ExprKind::Deref { addr, size } => {
-                self.try_format_stack_slot(addr, *size)
-            }
+            ExprKind::Deref { addr, size } => self.try_format_stack_slot(addr, *size),
             _ => None,
         }
     }
@@ -1611,7 +1925,10 @@ impl PseudoCodeEmitter {
                         // Use NamingContext for pattern-based naming (loop indices, type hints, etc.)
                         // This will return names like 'i', 'j', 'k' for loop counters
                         let is_param = is_frame_pointer && actual_offset > 0;
-                        let name = self.naming_ctx.borrow_mut().get_name(actual_offset, is_param);
+                        let name = self
+                            .naming_ctx
+                            .borrow_mut()
+                            .get_name(actual_offset, is_param);
                         return Some(name);
                     }
                 }
@@ -1621,7 +1938,13 @@ impl PseudoCodeEmitter {
     }
 
     /// Emits a statement where the RHS 0 should be replaced with a symbol.
-    fn emit_statement_with_data_symbol(&self, expr: &Expr, symbol: &str, output: &mut String, depth: usize) {
+    fn emit_statement_with_data_symbol(
+        &self,
+        expr: &Expr,
+        symbol: &str,
+        output: &mut String,
+        depth: usize,
+    ) {
         let indent = self.indent.repeat(depth);
 
         if let ExprKind::Assign { lhs, .. } = &expr.kind {
@@ -1671,7 +1994,8 @@ fn looks_like_address(n: i128) -> bool {
 /// Checks if a register name is a callee-saved register.
 /// These are saved/restored in prologue/epilogue and don't need to be shown.
 fn is_callee_saved_register(name: &str) -> bool {
-    matches!(name,
+    matches!(
+        name,
         // x86-64 SysV ABI callee-saved: rbp, rbx, r12-r15
         "rbp" | "rbx" | "r12" | "r13" | "r14" | "r15" |
         // ARM64 AAPCS64 callee-saved: x19-x28, x29 (fp), x30 (lr)
@@ -1711,7 +2035,10 @@ fn get_stack_var_name(expr: &Expr) -> Option<String> {
 
     match &expr.kind {
         ExprKind::Var(v) => {
-            if v.name.starts_with("var_") || v.name.starts_with("arg_") || v.name.starts_with("local_") {
+            if v.name.starts_with("var_")
+                || v.name.starts_with("arg_")
+                || v.name.starts_with("local_")
+            {
                 Some(v.name.clone())
             } else {
                 None
@@ -1789,7 +2116,12 @@ fn is_prologue_statement(expr: &Expr) -> bool {
             // ARM64: stur wzr, [x29 - N] - implicit return value initialization
             // This stores 0 (zero register) to a frame-relative location
             if let ExprKind::Deref { addr, .. } = &lhs.kind {
-                if let ExprKind::BinOp { op: super::expression::BinOpKind::Add, left, right } = &addr.kind {
+                if let ExprKind::BinOp {
+                    op: super::expression::BinOpKind::Add,
+                    left,
+                    right,
+                } = &addr.kind
+                {
                     if let ExprKind::Var(base) = &left.kind {
                         if base.name == "x29" || base.name == "rbp" {
                             if let ExprKind::IntLit(offset) = &right.kind {
@@ -1928,16 +2260,29 @@ fn exprs_equal(a: &Expr, b: &Expr) -> bool {
     match (&a.kind, &b.kind) {
         (ExprKind::Var(va), ExprKind::Var(vb)) => va.name == vb.name,
         (ExprKind::IntLit(na), ExprKind::IntLit(nb)) => na == nb,
-        (ExprKind::BinOp { op: opa, left: la, right: ra },
-         ExprKind::BinOp { op: opb, left: lb, right: rb }) => {
-            opa == opb && exprs_equal(la, lb) && exprs_equal(ra, rb)
-        }
-        (ExprKind::UnaryOp { op: opa, operand: oa },
-         ExprKind::UnaryOp { op: opb, operand: ob }) => {
-            opa == opb && exprs_equal(oa, ob)
-        }
-        (ExprKind::Deref { addr: aa, size: sa },
-         ExprKind::Deref { addr: ab, size: sb }) => {
+        (
+            ExprKind::BinOp {
+                op: opa,
+                left: la,
+                right: ra,
+            },
+            ExprKind::BinOp {
+                op: opb,
+                left: lb,
+                right: rb,
+            },
+        ) => opa == opb && exprs_equal(la, lb) && exprs_equal(ra, rb),
+        (
+            ExprKind::UnaryOp {
+                op: opa,
+                operand: oa,
+            },
+            ExprKind::UnaryOp {
+                op: opb,
+                operand: ob,
+            },
+        ) => opa == opb && exprs_equal(oa, ob),
+        (ExprKind::Deref { addr: aa, size: sa }, ExprKind::Deref { addr: ab, size: sb }) => {
             sa == sb && exprs_equal(aa, ab)
         }
         _ => false,
@@ -1945,7 +2290,10 @@ fn exprs_equal(a: &Expr, b: &Expr) -> bool {
 }
 
 /// Checks if a body contains only a call to __stack_chk_fail.
-fn is_stack_canary_check_body(nodes: &[StructuredNode], symbol_table: Option<&SymbolTable>) -> bool {
+fn is_stack_canary_check_body(
+    nodes: &[StructuredNode],
+    symbol_table: Option<&SymbolTable>,
+) -> bool {
     // Look for a single statement that calls __stack_chk_fail
     for node in nodes {
         match node {
@@ -2011,9 +2359,27 @@ fn is_stack_canary_load(expr: &Expr) -> bool {
 /// These are used for intermediate values during argument setup and don't need to appear
 /// in the output.
 fn is_arm64_temp_register(name: &str) -> bool {
-    matches!(name,
-        "x8" | "x9" | "x10" | "x11" | "x12" | "x13" | "x14" | "x15" | "x16" | "x17" |
-        "w8" | "w9" | "w10" | "w11" | "w12" | "w13" | "w14" | "w15" | "w16" | "w17"
+    matches!(
+        name,
+        "x8" | "x9"
+            | "x10"
+            | "x11"
+            | "x12"
+            | "x13"
+            | "x14"
+            | "x15"
+            | "x16"
+            | "x17"
+            | "w8"
+            | "w9"
+            | "w10"
+            | "w11"
+            | "w12"
+            | "w13"
+            | "w14"
+            | "w15"
+            | "w16"
+            | "w17"
     )
 }
 
@@ -2030,7 +2396,12 @@ fn is_arm64_temp_register_expr(expr: &Expr) -> bool {
 /// Returns `Some((base, index))` if the pattern matches, `None` otherwise.
 fn try_extract_array_access(addr: &Expr, size: u8) -> Option<(Expr, Expr)> {
     // Pattern: base + (index * element_size) or (index * element_size) + base
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
         // Try left as base, right as index * size
         if let Some((index, element_size)) = extract_mul_by_constant(right) {
             if element_size == size as i128 {
@@ -2060,7 +2431,12 @@ fn try_extract_array_access(addr: &Expr, size: u8) -> Option<(Expr, Expr)> {
 
 /// Extracts (operand, constant) from expressions like `operand * constant` or `constant * operand`.
 fn extract_mul_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
-    if let ExprKind::BinOp { op: BinOpKind::Mul, left, right } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Mul,
+        left,
+        right,
+    } = &expr.kind
+    {
         // Try left * constant
         if let ExprKind::IntLit(n) = right.kind {
             return Some(((**left).clone(), n));
@@ -2075,7 +2451,12 @@ fn extract_mul_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
 
 /// Extracts (operand, shift_amount) from expressions like `operand << constant`.
 fn extract_shift_left_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
-    if let ExprKind::BinOp { op: BinOpKind::Shl, left, right } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Shl,
+        left,
+        right,
+    } = &expr.kind
+    {
         if let ExprKind::IntLit(n) = right.kind {
             return Some(((**left).clone(), n));
         }
@@ -2085,19 +2466,21 @@ fn extract_shift_left_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::expression::BinOpKind;
+    use super::*;
     use std::collections::HashMap;
 
     #[test]
     fn test_emit_if_else() {
         let cond = Expr::binop(BinOpKind::Eq, Expr::unknown("x"), Expr::int(0));
-        let then_body = vec![StructuredNode::Expr(
-            Expr::assign(Expr::unknown("y"), Expr::int(1))
-        )];
-        let else_body = Some(vec![StructuredNode::Expr(
-            Expr::assign(Expr::unknown("y"), Expr::int(2))
-        )]);
+        let then_body = vec![StructuredNode::Expr(Expr::assign(
+            Expr::unknown("y"),
+            Expr::int(1),
+        ))];
+        let else_body = Some(vec![StructuredNode::Expr(Expr::assign(
+            Expr::unknown("y"),
+            Expr::int(2),
+        ))]);
 
         let node = StructuredNode::If {
             condition: cond,
@@ -2122,12 +2505,10 @@ mod tests {
     #[test]
     fn test_emit_while() {
         let cond = Expr::binop(BinOpKind::Lt, Expr::unknown("i"), Expr::int(10));
-        let body = vec![
-            StructuredNode::Expr(Expr::assign(
-                Expr::unknown("i"),
-                Expr::binop(BinOpKind::Add, Expr::unknown("i"), Expr::int(1))
-            ))
-        ];
+        let body = vec![StructuredNode::Expr(Expr::assign(
+            Expr::unknown("i"),
+            Expr::binop(BinOpKind::Add, Expr::unknown("i"), Expr::int(1)),
+        ))];
 
         let node = StructuredNode::While {
             condition: cond,
@@ -2142,8 +2523,16 @@ mod tests {
         let emitter = PseudoCodeEmitter::new("    ", false);
         let output = emitter.emit(&cfg, "test");
 
-        assert!(output.contains("while (i < 10)"), "Expected 'while (i < 10)', got: {}", output);
-        assert!(output.contains("i++") || output.contains("i = i + 1"), "Expected increment, got: {}", output);
+        assert!(
+            output.contains("while (i < 10)"),
+            "Expected 'while (i < 10)', got: {}",
+            output
+        );
+        assert!(
+            output.contains("i++") || output.contains("i = i + 1"),
+            "Expected increment, got: {}",
+            output
+        );
     }
 
     #[test]
@@ -2183,23 +2572,31 @@ mod tests {
 
         // Variable declarations should show the local variable names (local_8, local_10)
         // and the statements should use those names
-        assert!(output_no_types.contains("local_8") || output_no_types.contains("local_10"),
-            "Expected local_8/local_10 variables in output:\n{}", output_no_types);
+        assert!(
+            output_no_types.contains("local_8") || output_no_types.contains("local_10"),
+            "Expected local_8/local_10 variables in output:\n{}",
+            output_no_types
+        );
 
         // Test with type info - should use inferred types
         let mut type_info = HashMap::new();
         type_info.insert("local_8".to_string(), "int64_t".to_string());
         type_info.insert("local_10".to_string(), "uint32_t".to_string());
 
-        let emitter_with_types = PseudoCodeEmitter::new("    ", false)
-            .with_type_info(type_info);
+        let emitter_with_types = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
         let output_with_types = emitter_with_types.emit(&cfg, "test_func");
 
         // Variable declarations should use the inferred types
-        assert!(output_with_types.contains("int64_t local_8"),
-            "Expected 'int64_t local_8' in output:\n{}", output_with_types);
-        assert!(output_with_types.contains("uint32_t local_10"),
-            "Expected 'uint32_t local_10' in output:\n{}", output_with_types);
+        assert!(
+            output_with_types.contains("int64_t local_8"),
+            "Expected 'int64_t local_8' in output:\n{}",
+            output_with_types
+        );
+        assert!(
+            output_with_types.contains("uint32_t local_10"),
+            "Expected 'uint32_t local_10' in output:\n{}",
+            output_with_types
+        );
     }
 
     #[test]
@@ -2219,7 +2616,7 @@ mod tests {
         // Some computation using the parameter
         let result = Expr::assign(
             Expr::unknown("result"),
-            Expr::binop(BinOpKind::Mul, local_4.clone(), Expr::int(2))
+            Expr::binop(BinOpKind::Mul, local_4.clone(), Expr::int(2)),
         );
 
         let block = StructuredNode::Block {
@@ -2237,13 +2634,15 @@ mod tests {
         let mut type_info = HashMap::new();
         type_info.insert("local_4".to_string(), "size_t".to_string());
 
-        let emitter = PseudoCodeEmitter::new("    ", false)
-            .with_type_info(type_info);
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
         let output = emitter.emit(&cfg, "compute");
 
         // The parameter should have the inferred type
-        assert!(output.contains("size_t local_4"),
-            "Expected 'size_t local_4' in output:\n{}", output);
+        assert!(
+            output.contains("size_t local_4"),
+            "Expected 'size_t local_4' in output:\n{}",
+            output
+        );
     }
 
     #[test]
@@ -2268,8 +2667,11 @@ mod tests {
         let result = emitter.try_format_stack_slot(&addr, 8);
         assert!(result.is_some(), "Expected Some for rbp + -8, got None");
         let name = result.unwrap();
-        assert!(name.contains("local") || name.contains("var"),
-            "Expected local/var name, got: {}", name);
+        assert!(
+            name.contains("local") || name.contains("var"),
+            "Expected local/var name, got: {}",
+            name
+        );
 
         // Test sp + 16 pattern (stack pointer with positive offset)
         let sp = Expr::var(Variable::reg("sp", 8));
@@ -2285,8 +2687,7 @@ mod tests {
         type_info.insert("local_8".to_string(), "float".to_string());
         type_info.insert("ptr".to_string(), "char*".to_string());
 
-        let emitter = PseudoCodeEmitter::new("    ", false)
-            .with_type_info(type_info);
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
 
         // Should use the provided type info
         assert_eq!(emitter.get_type("var_4"), "uint64_t");

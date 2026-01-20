@@ -133,11 +133,11 @@ pub enum Operation {
     Lzcnt,
     Tzcnt,
     // BMI1 instructions
-    AndNot,          // ANDN: dest = ~src1 & src2
-    BitExtract,      // BEXTR: Bit field extract
-    ExtractLowestBit,// BLSI: Extract lowest set bit
-    MaskUpToLowest,  // BLSMSK: Get mask up to lowest set bit
-    ResetLowestBit,  // BLSR: Reset lowest set bit
+    AndNot,           // ANDN: dest = ~src1 & src2
+    BitExtract,       // BEXTR: Bit field extract
+    ExtractLowestBit, // BLSI: Extract lowest set bit
+    MaskUpToLowest,   // BLSMSK: Get mask up to lowest set bit
+    ResetLowestBit,   // BLSR: Reset lowest set bit
     // BMI2 instructions
     ZeroHighBits,    // BZHI: Zero high bits starting from specified position
     ParallelDeposit, // PDEP: Parallel bits deposit
@@ -656,24 +656,24 @@ pub enum Condition {
     // Unsigned comparisons
     Equal,
     NotEqual,
-    Above,         // CF=0 and ZF=0
-    AboveOrEqual,  // CF=0
-    Below,         // CF=1
-    BelowOrEqual,  // CF=1 or ZF=1
+    Above,        // CF=0 and ZF=0
+    AboveOrEqual, // CF=0
+    Below,        // CF=1
+    BelowOrEqual, // CF=1 or ZF=1
 
     // Signed comparisons
-    Greater,       // ZF=0 and SF=OF
-    GreaterOrEqual,// SF=OF
-    Less,          // SF!=OF
-    LessOrEqual,   // ZF=1 or SF!=OF
+    Greater,        // ZF=0 and SF=OF
+    GreaterOrEqual, // SF=OF
+    Less,           // SF!=OF
+    LessOrEqual,    // ZF=1 or SF!=OF
 
     // Flag-based
-    Sign,          // SF=1
-    NotSign,       // SF=0
-    Overflow,      // OF=1
-    NotOverflow,   // OF=0
-    Parity,        // PF=1
-    NotParity,     // PF=0
+    Sign,        // SF=1
+    NotSign,     // SF=0
+    Overflow,    // OF=1
+    NotOverflow, // OF=0
+    Parity,      // PF=1
+    NotParity,   // PF=0
 
     // Counter-based (x86)
     CounterZero,
@@ -738,9 +738,7 @@ pub enum ControlFlow {
     Sequential,
 
     /// Unconditional branch to a known address.
-    UnconditionalBranch {
-        target: u64,
-    },
+    UnconditionalBranch { target: u64 },
 
     /// Conditional branch - may fall through or jump.
     ConditionalBranch {
@@ -756,15 +754,10 @@ pub enum ControlFlow {
     },
 
     /// Function call to known address.
-    Call {
-        target: u64,
-        return_addr: u64,
-    },
+    Call { target: u64, return_addr: u64 },
 
     /// Indirect call.
-    IndirectCall {
-        return_addr: u64,
-    },
+    IndirectCall { return_addr: u64 },
 
     /// Return from function.
     Return,

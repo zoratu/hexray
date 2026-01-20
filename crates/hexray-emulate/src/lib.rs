@@ -29,23 +29,23 @@
 //! let rax = emu.get_register(0);
 //! ```
 
-pub mod value;
-pub mod memory;
-pub mod flags;
-pub mod state;
 pub mod executor;
-pub mod x86_64;
+pub mod flags;
+pub mod memory;
 pub mod simulation;
+pub mod state;
+pub mod value;
+pub mod x86_64;
 
-pub use value::{Value, SymbolicId};
-pub use memory::SparseMemory;
-pub use flags::Flags;
-pub use state::MachineState;
 pub use executor::{Emulator, EmulatorConfig, ExecutionResult, StopReason};
+pub use flags::Flags;
+pub use memory::SparseMemory;
 pub use simulation::{
-    ExecutionTrace, FaultKind, Simulation, SimulationComparison, SimulationConfig,
-    SimulationSnapshot, TraceStep, compare_simulations,
+    compare_simulations, ExecutionTrace, FaultKind, Simulation, SimulationComparison,
+    SimulationConfig, SimulationSnapshot, TraceStep,
 };
+pub use state::MachineState;
+pub use value::{SymbolicId, Value};
 
 use thiserror::Error;
 

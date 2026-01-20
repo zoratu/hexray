@@ -14,13 +14,13 @@
 //! 2. Insert phi nodes at dominance frontiers where needed
 //! 3. Rename variables to unique versions
 
-pub mod types;
 pub mod builder;
 pub mod optimize;
+pub mod types;
 
-pub use types::{SsaValue, SsaInstruction, SsaBlock, SsaFunction, PhiNode, Version};
 pub use builder::SsaBuilder;
-pub use optimize::{SsaOptimizer, OptimizationStats};
+pub use optimize::{OptimizationStats, SsaOptimizer};
+pub use types::{PhiNode, SsaBlock, SsaFunction, SsaInstruction, SsaValue, Version};
 
 use crate::dataflow::Location;
 use hexray_core::{BasicBlockId, ControlFlowGraph};
@@ -50,9 +50,7 @@ pub fn compute_dominance_frontiers(
             for &pred in preds {
                 // Walk up the dominator tree from pred until we reach block_id's idom
                 let mut runner = pred;
-                while Some(runner) != dom_tree.immediate_dominator(block_id)
-                    && runner != block_id
-                {
+                while Some(runner) != dom_tree.immediate_dominator(block_id) && runner != block_id {
                     // block_id is in runner's dominance frontier
                     frontiers.entry(runner).or_default().insert(block_id);
 
@@ -100,9 +98,7 @@ pub fn find_phi_placements(
 }
 
 /// Collects which blocks define each location.
-pub fn collect_definitions(
-    cfg: &ControlFlowGraph,
-) -> HashMap<Location, HashSet<BasicBlockId>> {
+pub fn collect_definitions(cfg: &ControlFlowGraph) -> HashMap<Location, HashSet<BasicBlockId>> {
     use crate::dataflow::InstructionEffects;
 
     let mut defs: HashMap<Location, HashSet<BasicBlockId>> = HashMap::new();

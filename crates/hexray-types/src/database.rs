@@ -181,7 +181,11 @@ impl TypeDatabase {
     }
 
     /// Resolve field at offset, following typedefs.
-    fn resolve_field_at_offset<'a>(&'a self, ty: &'a CType, offset: usize) -> Option<&'a StructField> {
+    fn resolve_field_at_offset<'a>(
+        &'a self,
+        ty: &'a CType,
+        offset: usize,
+    ) -> Option<&'a StructField> {
         match ty {
             CType::Struct(s) => s.field_at_offset(offset),
             CType::Typedef(t) => self.resolve_field_at_offset(&t.target, offset),
@@ -230,32 +234,40 @@ impl TypeDatabase {
         if let Some(ty) = self.get_type(name) {
             match ty {
                 CType::Struct(s) => {
-                    let mut result = format!("struct {} {{\n", s.name.as_deref().unwrap_or("anonymous"));
+                    let mut result =
+                        format!("struct {} {{\n", s.name.as_deref().unwrap_or("anonymous"));
                     for field in &s.fields {
-                        result.push_str(&format!("    {}; // offset {}\n",
+                        result.push_str(&format!(
+                            "    {}; // offset {}\n",
                             field.field_type.to_c_string(Some(&field.name)),
-                            field.offset));
+                            field.offset
+                        ));
                     }
-                    result.push_str("}");
+                    result.push('}');
                     if s.size > 0 {
                         result.push_str(&format!(" // size: {} bytes", s.size));
                     }
                     result
                 }
                 CType::Union(u) => {
-                    let mut result = format!("union {} {{\n", u.name.as_deref().unwrap_or("anonymous"));
+                    let mut result =
+                        format!("union {} {{\n", u.name.as_deref().unwrap_or("anonymous"));
                     for member in &u.members {
-                        result.push_str(&format!("    {};\n", member.member_type.to_c_string(Some(&member.name))));
+                        result.push_str(&format!(
+                            "    {};\n",
+                            member.member_type.to_c_string(Some(&member.name))
+                        ));
                     }
-                    result.push_str("}");
+                    result.push('}');
                     result
                 }
                 CType::Enum(e) => {
-                    let mut result = format!("enum {} {{\n", e.name.as_deref().unwrap_or("anonymous"));
+                    let mut result =
+                        format!("enum {} {{\n", e.name.as_deref().unwrap_or("anonymous"));
                     for (name, value) in &e.values {
                         result.push_str(&format!("    {} = {},\n", name, value));
                     }
-                    result.push_str("}");
+                    result.push('}');
                     result
                 }
                 CType::Typedef(t) => {
@@ -352,9 +364,9 @@ mod tests {
         let mut db = TypeDatabase::new();
 
         let mut st = StructType::new(Some("test".to_string()));
-        st.add_field("a".to_string(), CType::int());   // offset 0
-        st.add_field("b".to_string(), CType::long());  // offset 8 (aligned)
-        st.add_field("c".to_string(), CType::int());   // offset 16
+        st.add_field("a".to_string(), CType::int()); // offset 0
+        st.add_field("b".to_string(), CType::long()); // offset 8 (aligned)
+        st.add_field("c".to_string(), CType::int()); // offset 16
         st.finalize();
 
         db.add_type("struct test", CType::Struct(st));
@@ -380,16 +392,22 @@ mod tests {
 
         db.add_type("struct point", CType::Struct(st));
 
-        assert_eq!(db.format_field_access("struct point", 0), Some(".x".to_string()));
-        assert_eq!(db.format_field_access("struct point", 4), Some(".y".to_string()));
+        assert_eq!(
+            db.format_field_access("struct point", 0),
+            Some(".x".to_string())
+        );
+        assert_eq!(
+            db.format_field_access("struct point", 4),
+            Some(".y".to_string())
+        );
     }
 
     #[test]
     fn test_function_prototype() {
         let mut db = TypeDatabase::new();
 
-        let proto = FunctionPrototype::new("strlen", CType::ulong())
-            .param("s", CType::ptr(CType::char()));
+        let proto =
+            FunctionPrototype::new("strlen", CType::ulong()).param("s", CType::ptr(CType::char()));
 
         db.add_function(proto);
 

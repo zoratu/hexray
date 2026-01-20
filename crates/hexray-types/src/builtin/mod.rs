@@ -6,12 +6,12 @@
 //! - Linux-specific types
 //! - macOS-specific types
 
-pub mod posix;
 pub mod libc;
 pub mod linux;
 pub mod macos;
+pub mod posix;
 
-pub use posix::load_posix_types;
 pub use libc::load_libc_functions;
 pub use linux::load_linux_types;
 pub use macos::load_macos_types;
+pub use posix::load_posix_types;

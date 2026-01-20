@@ -9,26 +9,24 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
-    AnalysisProject,
-    CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter,
-    CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
-    Decompiler, FunctionInfo, ParallelCallGraphBuilder, StringTable, SymbolTable, RelocationTable,
-    StringDetector, StringConfig, XrefBuilder, XrefType,
-    DataFlowQuery, DataFlowQueryEngine,
+    AnalysisProject, CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter,
+    CallGraphJsonExporter, CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
+    DataFlowQuery, DataFlowQueryEngine, Decompiler, FunctionInfo, ParallelCallGraphBuilder,
+    RelocationTable, StringConfig, StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
-use hexray_disasm::{Disassembler, X86_64Disassembler, Arm64Disassembler, RiscVDisassembler};
-use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
-use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
-use hexray_types::TypeDatabase;
-use hexray_signatures::{SignatureMatcher, builtin as sig_builtin};
+use hexray_disasm::{Arm64Disassembler, Disassembler, RiscVDisassembler, X86_64Disassembler};
 use hexray_emulate::{Emulator, EmulatorConfig};
+use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
+use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
+use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
+use hexray_types::TypeDatabase;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 mod session;
-use session::{Session, Repl, list_sessions, AnnotationKind};
+use session::{list_sessions, AnnotationKind, Repl, Session};
 
 #[derive(Parser)]
 #[command(name = "hexray")]
@@ -519,8 +517,10 @@ fn main() -> Result<()> {
     // Handle signature subcommands that don't require a binary
     if let Some(Commands::Signatures { ref action }) = cli.command {
         match action {
-            SignaturesAction::Builtin | SignaturesAction::Stats { .. } |
-            SignaturesAction::List { .. } | SignaturesAction::Show { .. } => {
+            SignaturesAction::Builtin
+            | SignaturesAction::Stats { .. }
+            | SignaturesAction::List { .. }
+            | SignaturesAction::Show { .. } => {
                 return handle_signatures_command_no_binary(action);
             }
             SignaturesAction::Scan { .. } => {
@@ -541,7 +541,11 @@ fn main() -> Result<()> {
             SessionAction::Resume { session } => {
                 return handle_session_resume(session);
             }
-            SessionAction::Export { session, output, format } => {
+            SessionAction::Export {
+                session,
+                output,
+                format,
+            } => {
                 return handle_session_export(session, output.as_ref(), format);
             }
             SessionAction::New { .. } => {
@@ -551,8 +555,9 @@ fn main() -> Result<()> {
     }
 
     // Get binary path (required for all other commands)
-    let binary_path = cli.binary.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Binary file path is required. Usage: hexray <BINARY> [COMMAND]"))?;
+    let binary_path = cli.binary.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("Binary file path is required. Usage: hexray <BINARY> [COMMAND]")
+    })?;
 
     // Read the binary file
     let data = fs::read(binary_path)
@@ -589,30 +594,70 @@ fn main() -> Result<()> {
         Some(Commands::Info) => {
             print_info(&binary);
         }
-        Some(Commands::Cfg { target, dot, json, html }) => {
+        Some(Commands::Cfg {
+            target,
+            dot,
+            json,
+            html,
+        }) => {
             disassemble_cfg(fmt, &target, dot, json, html)?;
         }
-        Some(Commands::Decompile { target, show_addresses, follow, depth, project, types }) => {
+        Some(Commands::Decompile {
+            target,
+            show_addresses,
+            follow,
+            depth,
+            project,
+            types,
+        }) => {
             let target = resolve_decompile_target(&binary, target)?;
             let project = match project {
-                Some(path) => Some(AnalysisProject::load(&path)
-                    .with_context(|| format!("Failed to load project: {}", path.display()))?),
+                Some(path) => Some(
+                    AnalysisProject::load(&path)
+                        .with_context(|| format!("Failed to load project: {}", path.display()))?,
+                ),
                 None => None,
             };
             let type_db = load_type_database(&binary, types.as_deref())?;
             if follow {
-                decompile_with_follow(&binary, &target, show_addresses, depth, project.as_ref(), type_db.as_ref())?;
+                decompile_with_follow(
+                    &binary,
+                    &target,
+                    show_addresses,
+                    depth,
+                    project.as_ref(),
+                    type_db.as_ref(),
+                )?;
             } else {
-                decompile_function(&binary, &target, show_addresses, project.as_ref(), type_db.as_ref())?;
+                decompile_function(
+                    &binary,
+                    &target,
+                    show_addresses,
+                    project.as_ref(),
+                    type_db.as_ref(),
+                )?;
             }
         }
-        Some(Commands::Callgraph { target, dot, json, html }) => {
+        Some(Commands::Callgraph {
+            target,
+            dot,
+            json,
+            html,
+        }) => {
             build_callgraph(fmt, &target, dot, json, html)?;
         }
-        Some(Commands::Strings { min_length, search, json }) => {
+        Some(Commands::Strings {
+            min_length,
+            search,
+            json,
+        }) => {
             extract_strings(fmt, min_length, search.as_deref(), json)?;
         }
-        Some(Commands::Xrefs { target, calls_only, json }) => {
+        Some(Commands::Xrefs {
+            target,
+            calls_only,
+            json,
+        }) => {
             build_xrefs(fmt, target.as_deref(), calls_only, json)?;
         }
         Some(Commands::Project { action }) => {
@@ -728,8 +773,13 @@ fn print_info(binary: &Binary) {
             // Print segments
             println!("\nSegments:");
             for seg in &macho.segments {
-                println!("  {:<16} {:#016x} - {:#016x} ({} sections)",
-                         seg.segname, seg.vmaddr, seg.vmaddr + seg.vmsize, seg.sections.len());
+                println!(
+                    "  {:<16} {:#016x} - {:#016x} ({} sections)",
+                    seg.segname,
+                    seg.vmaddr,
+                    seg.vmaddr + seg.vmsize,
+                    seg.sections.len()
+                );
             }
         }
         Binary::Pe(pe) => {
@@ -751,36 +801,44 @@ fn print_info(binary: &Binary) {
 }
 
 fn print_sections(binary: &Binary) {
-    println!("{:<4} {:<24} {:<16} {:<16} {:<8}",
-             "Idx", "Name", "Address", "Size", "Flags");
+    println!(
+        "{:<4} {:<24} {:<16} {:<16} {:<8}",
+        "Idx", "Name", "Address", "Size", "Flags"
+    );
     println!("{}", "-".repeat(75));
 
     match binary {
         Binary::Elf(elf) => {
             for (idx, section) in elf.sections.iter().enumerate() {
                 let name = elf.section_name(section).unwrap_or("");
-                let flags = format!("{}{}{}",
+                let flags = format!(
+                    "{}{}{}",
                     if section.is_allocated() { "A" } else { "-" },
                     if section.is_writable() { "W" } else { "-" },
                     if section.is_executable() { "X" } else { "-" },
                 );
 
-                println!("{:<4} {:<24} {:#016x} {:#016x} {:<8}",
-                         idx, name, section.sh_addr, section.sh_size, flags);
+                println!(
+                    "{:<4} {:<24} {:#016x} {:#016x} {:<8}",
+                    idx, name, section.sh_addr, section.sh_size, flags
+                );
             }
         }
         Binary::MachO(macho) => {
             let mut idx = 0;
             for seg in &macho.segments {
                 for section in &seg.sections {
-                    let flags = format!("{}{}",
+                    let flags = format!(
+                        "{}{}",
                         if section.is_allocated() { "A" } else { "-" },
                         if section.is_executable() { "X" } else { "-" },
                     );
                     let full_name = format!("{},{}", seg.segname, section.sectname);
 
-                    println!("{:<4} {:<24} {:#016x} {:#016x} {:<8}",
-                             idx, full_name, section.addr, section.size, flags);
+                    println!(
+                        "{:<4} {:<24} {:#016x} {:#016x} {:<8}",
+                        idx, full_name, section.addr, section.size, flags
+                    );
                     idx += 1;
                 }
             }
@@ -788,19 +846,24 @@ fn print_sections(binary: &Binary) {
         Binary::Pe(pe) => {
             for (idx, section) in pe.sections.iter().enumerate() {
                 let flags = section.flags_string();
-                println!("{:<4} {:<24} {:#016x} {:#016x} {:<8}",
-                         idx, section.name,
-                         pe.image_base() + section.virtual_address as u64,
-                         section.virtual_size,
-                         flags);
+                println!(
+                    "{:<4} {:<24} {:#016x} {:#016x} {:<8}",
+                    idx,
+                    section.name,
+                    pe.image_base() + section.virtual_address as u64,
+                    section.virtual_size,
+                    flags
+                );
             }
         }
     }
 }
 
 fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool) {
-    println!("{:<16} {:<8} {:<8} {:<8} {}",
-             "Address", "Size", "Type", "Bind", "Name");
+    println!(
+        "{:<16} {:<8} {:<8} {:<8} Name",
+        "Address", "Size", "Type", "Bind"
+    );
     println!("{}", "-".repeat(70));
 
     let mut symbols: Vec<_> = fmt.symbols().collect();
@@ -831,8 +894,10 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool) {
 
         let demangled = demangle_or_original(&symbol.name);
 
-        println!("{:#016x} {:<8} {:<8} {:<8} {}",
-                 symbol.address, symbol.size, type_str, bind_str, demangled);
+        println!(
+            "{:#016x} {:<8} {:<8} {:<8} {}",
+            symbol.address, symbol.size, type_str, bind_str, demangled
+        );
     }
 }
 
@@ -867,7 +932,8 @@ fn resolve_decompile_target(binary: &Binary, target: Option<String>) -> Result<S
 /// For function decompilation, we want the most specific match.
 fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
     // Collect symbols into owned values, filtering out undefined/external symbols
-    let symbols: Vec<hexray_core::Symbol> = fmt.symbols()
+    let symbols: Vec<hexray_core::Symbol> = fmt
+        .symbols()
         .filter(|s| s.is_defined() && s.address != 0)
         .cloned()
         .collect();
@@ -878,13 +944,17 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
     }
 
     // 2. Try exact match on demangled name
-    if let Some(sym) = symbols.iter().find(|s| demangle_or_original(&s.name) == name) {
+    if let Some(sym) = symbols
+        .iter()
+        .find(|s| demangle_or_original(&s.name) == name)
+    {
         return Some(sym.clone());
     }
 
     // 3. Try prefix match (e.g., "nfsd_open" matches "nfsd_open.cold")
     //    Prefer function symbols and shorter names
-    let mut prefix_matches: Vec<hexray_core::Symbol> = symbols.iter()
+    let mut prefix_matches: Vec<hexray_core::Symbol> = symbols
+        .iter()
         .filter(|s| s.name.starts_with(name) || demangle_or_original(&s.name).starts_with(name))
         .cloned()
         .collect();
@@ -892,7 +962,8 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
         // Prefer functions over non-functions
         let a_is_func = a.is_function() as u8;
         let b_is_func = b.is_function() as u8;
-        b_is_func.cmp(&a_is_func)
+        b_is_func
+            .cmp(&a_is_func)
             .then_with(|| a.name.len().cmp(&b.name.len())) // Shorter names preferred
     });
     if !prefix_matches.is_empty() {
@@ -901,8 +972,12 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
 
     // 4. Try contains match as last resort (lowest priority)
     //    Only match function symbols, and prefer shorter names
-    let mut contains_matches: Vec<hexray_core::Symbol> = symbols.iter()
-        .filter(|s| s.is_function() && (s.name.contains(name) || demangle_or_original(&s.name).contains(name)))
+    let mut contains_matches: Vec<hexray_core::Symbol> = symbols
+        .iter()
+        .filter(|s| {
+            s.is_function()
+                && (s.name.contains(name) || demangle_or_original(&s.name).contains(name))
+        })
         .cloned()
         .collect();
     contains_matches.sort_by(|a, b| a.name.len().cmp(&b.name.len()));
@@ -915,11 +990,14 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
 
 fn disassemble_symbol(fmt: &dyn BinaryFormat, name: &str, max_count: usize) -> Result<()> {
     // Find the symbol - prefer exact matches, then prefix matches, then contains
-    let symbol = find_symbol(fmt, name)
-        .with_context(|| format!("Symbol '{}' not found", name))?;
+    let symbol = find_symbol(fmt, name).with_context(|| format!("Symbol '{}' not found", name))?;
 
-    println!("Disassembling {} at {:#x} (size: {} bytes)\n",
-             demangle_or_original(&symbol.name), symbol.address, symbol.size);
+    println!(
+        "Disassembling {} at {:#x} (size: {} bytes)\n",
+        demangle_or_original(&symbol.name),
+        symbol.address,
+        symbol.size
+    );
 
     let size = if symbol.size > 0 {
         symbol.size as usize
@@ -996,8 +1074,10 @@ fn disassemble_with<D: Disassembler>(
                 }
             }
             Err(e) => {
-                println!("{:#010x}:  {:02x}                      <decode error: {}>",
-                         addr, remaining[0], e);
+                println!(
+                    "{:#010x}:  {:02x}                      <decode error: {}>",
+                    addr, remaining[0], e
+                );
                 *offset += disasm.min_instruction_size().max(1);
             }
         }
@@ -1006,7 +1086,13 @@ fn disassemble_with<D: Disassembler>(
     Ok(())
 }
 
-fn disassemble_cfg(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, html: bool) -> Result<()> {
+fn disassemble_cfg(
+    fmt: &dyn BinaryFormat,
+    target: &str,
+    dot: bool,
+    json: bool,
+    html: bool,
+) -> Result<()> {
     // Try to parse as address first
     let address = if let Some(stripped) = target.strip_prefix("0x") {
         u64::from_str_radix(stripped, 16).ok()
@@ -1018,8 +1104,8 @@ fn disassemble_cfg(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, 
         (addr, format!("sub_{:x}", addr))
     } else {
         // Find symbol using improved search
-        let symbol = find_symbol(fmt, target)
-            .with_context(|| format!("Symbol '{}' not found", target))?;
+        let symbol =
+            find_symbol(fmt, target).with_context(|| format!("Symbol '{}' not found", target))?;
         (symbol.address, demangle_or_original(&symbol.name))
     };
 
@@ -1124,7 +1210,13 @@ fn disassemble_for_cfg<D: Disassembler>(
     instructions
 }
 
-fn decompile_function(binary: &Binary, target: &str, show_addresses: bool, project: Option<&AnalysisProject>, type_db: Option<&std::sync::Arc<TypeDatabase>>) -> Result<()> {
+fn decompile_function(
+    binary: &Binary,
+    target: &str,
+    show_addresses: bool,
+    project: Option<&AnalysisProject>,
+    type_db: Option<&std::sync::Arc<TypeDatabase>>,
+) -> Result<()> {
     let fmt = binary.as_format();
 
     // Try to parse as address first
@@ -1165,7 +1257,10 @@ fn decompile_function(binary: &Binary, target: &str, show_addresses: bool, proje
         start_addr >= section_start && start_addr < section_end && s.is_executable()
     });
     if !in_executable {
-        bail!("Address {:#x} is not in an executable section - cannot decompile data", start_addr);
+        bail!(
+            "Address {:#x} is not in an executable section - cannot decompile data",
+            start_addr
+        );
     }
 
     println!("Decompiling {} at {:#x}\n", name, start_addr);
@@ -1253,9 +1348,12 @@ fn build_string_table(fmt: &dyn BinaryFormat) -> StringTable {
     for section in fmt.sections() {
         let name = section.name().to_lowercase();
         // Include read-only data sections, string sections, and const sections
-        if name.contains("rodata") || name.contains("cstring") ||
-           name.contains("__const") || name.contains("data") ||
-           name.contains("rdata") {
+        if name.contains("rodata")
+            || name.contains("cstring")
+            || name.contains("__const")
+            || name.contains("data")
+            || name.contains("rdata")
+        {
             // Get section data directly
             let data = section.data();
             let addr = section.virtual_address();
@@ -1294,10 +1392,7 @@ fn read_cstring_from_elf(data: &[u8], offset: usize) -> Option<String> {
 
     // Find the null terminator, with a reasonable max length
     let max_len = 256;
-    let end = data[offset..]
-        .iter()
-        .take(max_len)
-        .position(|&b| b == 0)?;
+    let end = data[offset..].iter().take(max_len).position(|&b| b == 0)?;
 
     // Try to convert to UTF-8 string
     let bytes = &data[offset..offset + end];
@@ -1309,7 +1404,10 @@ fn read_cstring_from_elf(data: &[u8], offset: usize) -> Option<String> {
     }
 
     // Format as a C string literal, escaping if needed
-    Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+    Some(format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
 }
 
 ///
@@ -1369,12 +1467,16 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                         // These sections (e.g., .rodata.str1.1, .rodata.str1.8) contain string literals
                         let sym_name = if symbol.name.starts_with(".rodata.str") {
                             // Find the target section and read the string
-                            if let Some(rodata_section) = elf.sections.iter()
-                                .find(|s| elf.section_name(s).map(|n| n == symbol.name).unwrap_or(false))
-                            {
-                                let string_offset = rodata_section.sh_offset as usize + reloc.addend as usize;
-                                read_cstring_from_elf(elf.data(), string_offset)
-                                    .unwrap_or_else(|| format!("{}+{:#x}", symbol.name, reloc.addend))
+                            if let Some(rodata_section) = elf.sections.iter().find(|s| {
+                                elf.section_name(s)
+                                    .map(|n| n == symbol.name)
+                                    .unwrap_or(false)
+                            }) {
+                                let string_offset =
+                                    rodata_section.sh_offset as usize + reloc.addend as usize;
+                                read_cstring_from_elf(elf.data(), string_offset).unwrap_or_else(
+                                    || format!("{}+{:#x}", symbol.name, reloc.addend),
+                                )
                             } else {
                                 format!("{}+{:#x}", symbol.name, reloc.addend)
                             }
@@ -1417,8 +1519,11 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
 /// Loads a type database based on the specified type library option.
 /// If no option is given, returns None.
 /// If "auto" is specified, selects based on binary format (linux/macos).
-fn load_type_database(binary: &Binary, types_opt: Option<&str>) -> Result<Option<std::sync::Arc<TypeDatabase>>> {
-    use hexray_types::builtin::{posix, linux, macos, libc};
+fn load_type_database(
+    binary: &Binary,
+    types_opt: Option<&str>,
+) -> Result<Option<std::sync::Arc<TypeDatabase>>> {
+    use hexray_types::builtin::{libc, linux, macos, posix};
 
     let types_str = match types_opt {
         Some(s) => s,
@@ -1461,7 +1566,10 @@ fn load_type_database(binary: &Binary, types_opt: Option<&str>) -> Result<Option
                 Binary::Pe(_) => {} // TODO: Windows types
             }
         }
-        _ => bail!("Unknown type library '{}'. Use: posix, linux, macos, libc, all, or auto", types_str),
+        _ => bail!(
+            "Unknown type library '{}'. Use: posix, linux, macos, libc, all, or auto",
+            types_str
+        ),
     }
 
     Ok(Some(std::sync::Arc::new(db)))
@@ -1473,16 +1581,20 @@ fn load_dwarf_info(binary: &Binary) -> Option<DebugInfo> {
     let fmt = binary.as_format();
 
     // Get DWARF sections
-    let debug_info = fmt.sections()
+    let debug_info = fmt
+        .sections()
         .find(|s| s.name() == ".debug_info" || s.name() == "__debug_info")?
         .data();
-    let debug_abbrev = fmt.sections()
+    let debug_abbrev = fmt
+        .sections()
         .find(|s| s.name() == ".debug_abbrev" || s.name() == "__debug_abbrev")?
         .data();
-    let debug_str = fmt.sections()
+    let debug_str = fmt
+        .sections()
         .find(|s| s.name() == ".debug_str" || s.name() == "__debug_str")
         .map(|s| s.data());
-    let debug_line = fmt.sections()
+    let debug_line = fmt
+        .sections()
         .find(|s| s.name() == ".debug_line" || s.name() == "__debug_line")
         .map(|s| s.data());
 
@@ -1493,11 +1605,21 @@ fn load_dwarf_info(binary: &Binary) -> Option<DebugInfo> {
     };
 
     // Parse DWARF info
-    parse_debug_info(debug_info, debug_abbrev, debug_str, debug_line, address_size).ok()
+    parse_debug_info(
+        debug_info,
+        debug_abbrev,
+        debug_str,
+        debug_line,
+        address_size,
+    )
+    .ok()
 }
 
 /// Gets DWARF variable names for a function at the given address.
-fn get_dwarf_variable_names(debug_info: &DebugInfo, func_addr: u64) -> std::collections::HashMap<i128, String> {
+fn get_dwarf_variable_names(
+    debug_info: &DebugInfo,
+    func_addr: u64,
+) -> std::collections::HashMap<i128, String> {
     if let Some(func) = debug_info.find_function(func_addr) {
         func.variable_names()
     } else {
@@ -1541,18 +1663,26 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
     instructions
 }
 
-fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, html: bool) -> Result<()> {
+fn build_callgraph(
+    fmt: &dyn BinaryFormat,
+    target: &str,
+    dot: bool,
+    json: bool,
+    html: bool,
+) -> Result<()> {
     let symbols: Vec<_> = fmt.symbols().cloned().collect();
     let arch = fmt.architecture();
 
     // Determine which functions to analyze (address, name, size)
     // Note: Mach-O symbols don't have size info (nlist doesn't store it),
     // so we use a default size for symbols with size == 0
-    let mut functions_to_analyze: Vec<(u64, String, u64)> = if target == "all" {
+    let functions_to_analyze: Vec<(u64, String, u64)> = if target == "all" {
         // Start with defined internal function symbols
         let mut funcs: Vec<_> = symbols
             .iter()
-            .filter(|s| s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some())
+            .filter(|s| {
+                s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some()
+            })
             .map(|s| {
                 let size = if s.size > 0 { s.size } else { 4096 }; // Larger default for actual code
                 (s.address, demangle_or_original(&s.name), size)
@@ -1605,7 +1735,8 @@ fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, 
     };
 
     // Iteratively discover functions by following calls
-    let mut known_functions: std::collections::HashSet<u64> = functions_to_analyze.iter().map(|(a, _, _)| *a).collect();
+    let mut known_functions: std::collections::HashSet<u64> =
+        functions_to_analyze.iter().map(|(a, _, _)| *a).collect();
     let mut pending_functions: Vec<(u64, String, u64)> = functions_to_analyze.clone();
     let mut all_function_infos: Vec<FunctionInfo> = Vec::new();
 
@@ -1658,7 +1789,8 @@ fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, 
                 if let hexray_core::ControlFlow::Call { target, .. } = instr.control_flow {
                     if !known_functions.contains(&target) && is_internal_code(target) {
                         known_functions.insert(target);
-                        let name = symbols.iter()
+                        let name = symbols
+                            .iter()
                             .find(|s| s.address == target)
                             .map(|s| demangle_or_original(&s.name))
                             .unwrap_or_else(|| format!("sub_{:x}", target));
@@ -1715,7 +1847,10 @@ fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, 
         println!();
 
         for node in callgraph.nodes() {
-            let node_name = node.name.clone().unwrap_or_else(|| format!("sub_{:x}", node.address));
+            let node_name = node
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("sub_{:x}", node.address));
             let callees: Vec<_> = callgraph
                 .callees(node.address)
                 .filter_map(|(addr, _)| callgraph.get_node(addr))
@@ -1724,7 +1859,10 @@ fn build_callgraph(fmt: &dyn BinaryFormat, target: &str, dot: bool, json: bool, 
             if !callees.is_empty() {
                 println!("{} ({:#x}):", node_name, node.address);
                 for callee in callees {
-                    let callee_name = callee.name.clone().unwrap_or_else(|| format!("sub_{:x}", callee.address));
+                    let callee_name = callee
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("sub_{:x}", callee.address));
                     println!("  -> {} ({:#x})", callee_name, callee.address);
                 }
                 println!();
@@ -1772,7 +1910,8 @@ fn extract_strings(
         println!("{{");
         println!("  \"strings\": [");
         for (i, s) in all_strings.iter().enumerate() {
-            let escaped_content = s.content
+            let escaped_content = s
+                .content
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
                 .replace('\n', "\\n")
@@ -1829,8 +1968,10 @@ fn extract_strings(
                 format!(" [{}]", indicators.join(", "))
             };
 
-            println!("{:#016x}{}: \"{}\"{}",
-                     s.address, type_marker, display_content, indicator_str);
+            println!(
+                "{:#016x}{}: \"{}\"{}",
+                s.address, type_marker, display_content, indicator_str
+            );
         }
     }
 
@@ -1838,7 +1979,14 @@ fn extract_strings(
 }
 
 /// Decompile a function and follow internal calls recursively.
-fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, max_depth: usize, project: Option<&AnalysisProject>, type_db: Option<&std::sync::Arc<TypeDatabase>>) -> Result<()> {
+fn decompile_with_follow(
+    binary: &Binary,
+    target: &str,
+    show_addresses: bool,
+    max_depth: usize,
+    project: Option<&AnalysisProject>,
+    type_db: Option<&std::sync::Arc<TypeDatabase>>,
+) -> Result<()> {
     use std::collections::HashSet;
 
     let fmt = binary.as_format();
@@ -1865,8 +2013,8 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
             .unwrap_or_else(|| format!("sub_{:x}", addr));
         (addr, name)
     } else {
-        let symbol = find_symbol(fmt, target)
-            .with_context(|| format!("Symbol '{}' not found", target))?;
+        let symbol =
+            find_symbol(fmt, target).with_context(|| format!("Symbol '{}' not found", target))?;
         // Check if project has a custom name for this address
         let name = project
             .and_then(|p| p.get_function_name(symbol.address))
@@ -1920,7 +2068,10 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
             println!("\n{}\n", "─".repeat(60));
         }
 
-        println!("// Decompiling {} at {:#x} (depth {})\n", func_name, func_addr, depth);
+        println!(
+            "// Decompiling {} at {:#x} (depth {})\n",
+            func_name, func_addr, depth
+        );
 
         // Disassemble
         let bytes = match fmt.bytes_at(func_addr, 4096) {
@@ -1979,7 +2130,9 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
                 if !decompiled.contains(&target_addr) {
                     // Check for special patterns like __libc_start_main
                     // which passes main as first argument
-                    let actual_name = if func_name == "__libc_start_main" || func_name.contains("libc_start_main") {
+                    let actual_name = if func_name == "__libc_start_main"
+                        || func_name.contains("libc_start_main")
+                    {
                         // The first argument to __libc_start_main is typically main
                         if target_name.starts_with("sub_") {
                             "main".to_string()
@@ -2003,8 +2156,11 @@ fn decompile_with_follow(binary: &Binary, target: &str, show_addresses: bool, ma
 /// Extract internal call targets from instructions.
 /// Returns addresses of functions that are called within this function.
 /// Also detects function pointers passed as arguments (e.g., main passed to __libc_start_main).
-fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt: &dyn BinaryFormat) -> Vec<(u64, String)> {
-    use hexray_core::{ControlFlow, Operand, register::x86};
+fn extract_internal_call_targets(
+    instructions: &[hexray_core::Instruction],
+    fmt: &dyn BinaryFormat,
+) -> Vec<(u64, String)> {
+    use hexray_core::{register::x86, ControlFlow, Operand};
 
     let mut targets = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -2027,7 +2183,9 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
     };
 
     // Helper to add a target if it's valid
-    let add_target = |target_addr: u64, seen: &mut std::collections::HashSet<u64>, targets: &mut Vec<(u64, String)>| {
+    let add_target = |target_addr: u64,
+                      seen: &mut std::collections::HashSet<u64>,
+                      targets: &mut Vec<(u64, String)>| {
         if target_addr == 0 || seen.contains(&target_addr) {
             return;
         }
@@ -2083,7 +2241,8 @@ fn extract_internal_call_targets(instructions: &[hexray_core::Instruction], fmt:
                             // For RIP-relative, displacement is relative to the next instruction
                             let effective_addr = (inst.address as i64)
                                 .wrapping_add(inst.size as i64)
-                                .wrapping_add(mem.displacement) as u64;
+                                .wrapping_add(mem.displacement)
+                                as u64;
                             // For RIP-relative LEA, we trust it's a valid function pointer
                             // even without a symbol (common in stripped PIE binaries)
                             if is_internal_addr(effective_addr) {
@@ -2119,7 +2278,11 @@ fn build_xrefs(
         .collect();
 
     for func in &functions {
-        let size = if func.size > 0 { func.size as usize } else { 256 };
+        let size = if func.size > 0 {
+            func.size as usize
+        } else {
+            256
+        };
         if let Some(bytes) = fmt.bytes_at(func.address, size) {
             let instructions = match arch {
                 Architecture::X86_64 | Architecture::X86 => {
@@ -2222,7 +2385,10 @@ fn build_xrefs(
         if json {
             println!("{{");
             println!("  \"total_xrefs\": {},", db.total_xrefs());
-            println!("  \"referenced_addresses\": {}", db.all_referenced().count());
+            println!(
+                "  \"referenced_addresses\": {}",
+                db.all_referenced().count()
+            );
             println!("}}");
         } else {
             println!("Cross-reference Database Summary");
@@ -2231,7 +2397,9 @@ fn build_xrefs(
             println!("Total cross-references: {}", db.total_xrefs());
             println!("Referenced addresses: {}", db.all_referenced().count());
             println!();
-            println!("Use 'xrefs <address>' or 'xrefs <symbol>' to see references to a specific target.");
+            println!(
+                "Use 'xrefs <address>' or 'xrefs <symbol>' to see references to a specific target."
+            );
         }
     }
 
@@ -2242,18 +2410,22 @@ fn build_xrefs(
 fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Result<()> {
     match action {
         ProjectAction::Create { output } => {
-            let project = AnalysisProject::new(binary_path)
-                .with_context(|| format!("Failed to create project for {}", binary_path.display()))?;
+            let project = AnalysisProject::new(binary_path).with_context(|| {
+                format!("Failed to create project for {}", binary_path.display())
+            })?;
 
             let mut project = project;
-            project.save(&output)
+            project
+                .save(&output)
                 .with_context(|| format!("Failed to save project to {}", output.display()))?;
 
             println!("Created project: {}", output.display());
             println!("Binary: {}", binary_path.display());
         }
 
-        ProjectAction::Info { project: project_path } => {
+        ProjectAction::Info {
+            project: project_path,
+        } => {
             let project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2270,7 +2442,11 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
             println!("Bookmarks:           {}", stats.bookmark_count);
         }
 
-        ProjectAction::Comment { project: project_path, address, comment } => {
+        ProjectAction::Comment {
+            project: project_path,
+            address,
+            comment,
+        } => {
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2280,7 +2456,11 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
             println!("Added comment at {:#x}: {}", address, comment);
         }
 
-        ProjectAction::Name { project: project_path, address, name } => {
+        ProjectAction::Name {
+            project: project_path,
+            address,
+            name,
+        } => {
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2290,7 +2470,11 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
             println!("Set function name at {:#x}: {}", address, name);
         }
 
-        ProjectAction::Label { project: project_path, address, label } => {
+        ProjectAction::Label {
+            project: project_path,
+            address,
+            label,
+        } => {
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2300,7 +2484,11 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
             println!("Added label at {:#x}: {}", address, label);
         }
 
-        ProjectAction::Bookmark { project: project_path, address, label } => {
+        ProjectAction::Bookmark {
+            project: project_path,
+            address,
+            label,
+        } => {
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2314,7 +2502,12 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
             }
         }
 
-        ProjectAction::List { project: project_path, comments, functions, bookmarks } => {
+        ProjectAction::List {
+            project: project_path,
+            comments,
+            functions,
+            bookmarks,
+        } => {
             let project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2371,7 +2564,9 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
             }
         }
 
-        ProjectAction::Undo { project: project_path } => {
+        ProjectAction::Undo {
+            project: project_path,
+        } => {
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2386,7 +2581,9 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
             }
         }
 
-        ProjectAction::Redo { project: project_path } => {
+        ProjectAction::Redo {
+            project: project_path,
+        } => {
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
@@ -2407,7 +2604,7 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
 
 /// Handle types management commands
 fn handle_types_command(action: TypesAction) -> Result<()> {
-    use hexray_types::builtin::{posix, linux, macos, libc};
+    use hexray_types::builtin::{libc, linux, macos, posix};
 
     match action {
         TypesAction::Builtin => {
@@ -2419,7 +2616,11 @@ fn handle_types_command(action: TypesAction) -> Result<()> {
             println!("  libc   - Standard C library functions (printf, malloc, etc.)");
         }
 
-        TypesAction::List { category, structs, functions } => {
+        TypesAction::List {
+            category,
+            structs,
+            functions,
+        } => {
             let mut db = TypeDatabase::new();
 
             match category.to_lowercase().as_str() {
@@ -2436,7 +2637,10 @@ fn handle_types_command(action: TypesAction) -> Result<()> {
                     posix::load_posix_types(&mut db);
                     libc::load_libc_functions(&mut db);
                 }
-                _ => bail!("Unknown category '{}'. Use: posix, linux, macos, or libc", category),
+                _ => bail!(
+                    "Unknown category '{}'. Use: posix, linux, macos, or libc",
+                    category
+                ),
             }
 
             println!("Types in '{}' database:", category);
@@ -2477,7 +2681,10 @@ fn handle_types_command(action: TypesAction) -> Result<()> {
                     posix::load_posix_types(&mut db);
                     libc::load_libc_functions(&mut db);
                 }
-                _ => bail!("Unknown category '{}'. Use: posix, linux, macos, or libc", category),
+                _ => bail!(
+                    "Unknown category '{}'. Use: posix, linux, macos, or libc",
+                    category
+                ),
             }
 
             // Try as a type first
@@ -2490,7 +2697,11 @@ fn handle_types_command(action: TypesAction) -> Result<()> {
                 println!("{}", "=".repeat(40));
                 println!("{}", func.format());
             } else {
-                bail!("Type or function '{}' not found in '{}' database", name, category);
+                bail!(
+                    "Type or function '{}' not found in '{}' database",
+                    name,
+                    category
+                );
             }
         }
 
@@ -2500,7 +2711,8 @@ fn handle_types_command(action: TypesAction) -> Result<()> {
 
             let parser = hexray_types::Parser::new(&content)
                 .with_context(|| format!("Failed to parse header: {}", header.display()))?;
-            let db = parser.parse()
+            let db = parser
+                .parse()
                 .with_context(|| format!("Failed to parse header: {}", header.display()))?;
 
             println!("Parsed types from {}:", header.display());
@@ -2524,9 +2736,11 @@ fn handle_types_command(action: TypesAction) -> Result<()> {
             macos::load_macos_types(&mut db);
             libc::load_libc_functions(&mut db);
 
-            println!("All available types ({} types, {} functions):",
-                     db.type_names().count(),
-                     db.function_names().count());
+            println!(
+                "All available types ({} types, {} functions):",
+                db.type_names().count(),
+                db.function_names().count()
+            );
             println!("{}", "=".repeat(50));
 
             println!("\nTypes:");
@@ -2579,15 +2793,20 @@ fn handle_signatures_command_no_binary(action: &SignaturesAction) -> Result<()> 
                 db.signatures().iter().collect()
             };
 
-            println!("{:<24} {:<12} {:<8} {:<12}", "Name", "Library", "Conf", "Pattern Len");
+            println!(
+                "{:<24} {:<12} {:<8} {:<12}",
+                "Name", "Library", "Conf", "Pattern Len"
+            );
             println!("{}", "-".repeat(60));
 
             for sig in signatures {
-                println!("{:<24} {:<12} {:<8.2} {:>4} bytes",
-                         sig.name,
-                         &sig.library,
-                         sig.confidence,
-                         sig.pattern.len());
+                println!(
+                    "{:<24} {:<12} {:<8.2} {:>4} bytes",
+                    sig.name,
+                    &sig.library,
+                    sig.confidence,
+                    sig.pattern.len()
+                );
             }
         }
 
@@ -2655,8 +2874,7 @@ fn handle_signatures_command(binary: &Binary, action: SignaturesAction) -> Resul
             };
 
             let db = sig_builtin::load_for_architecture(arch_str);
-            let matcher = SignatureMatcher::new(&db)
-                .with_min_confidence(confidence);
+            let matcher = SignatureMatcher::new(&db).with_min_confidence(confidence);
 
             // Scan all executable sections for function signatures
             let mut matches = Vec::new();
@@ -2728,15 +2946,17 @@ fn handle_signatures_command(binary: &Binary, action: SignaturesAction) -> Resul
                     println!("  - The binary may use different library versions");
                     println!("  - Functions may be inlined or optimized differently");
                 } else {
-                    println!("{:<16} {:<24} {:<12} {:<8}", "Address", "Function", "Library", "Conf");
+                    println!(
+                        "{:<16} {:<24} {:<12} {:<8}",
+                        "Address", "Function", "Library", "Conf"
+                    );
                     println!("{}", "-".repeat(60));
 
                     for m in &matches {
-                        println!("{:#016x} {:<24} {:<12} {:.2}",
-                                 m.offset,
-                                 &m.signature.name,
-                                 &m.signature.library,
-                                 m.confidence);
+                        println!(
+                            "{:#016x} {:<24} {:<12} {:.2}",
+                            m.offset, &m.signature.name, &m.signature.library, m.confidence
+                        );
                     }
 
                     println!();
@@ -2746,10 +2966,10 @@ fn handle_signatures_command(binary: &Binary, action: SignaturesAction) -> Resul
         }
 
         // These are handled before binary loading
-        SignaturesAction::Builtin |
-        SignaturesAction::Stats { .. } |
-        SignaturesAction::List { .. } |
-        SignaturesAction::Show { .. } => {
+        SignaturesAction::Builtin
+        | SignaturesAction::Stats { .. }
+        | SignaturesAction::List { .. }
+        | SignaturesAction::Show { .. } => {
             unreachable!("These subcommands should have been handled earlier");
         }
     }
@@ -2789,7 +3009,11 @@ fn handle_trace_command(binary: &Binary, action: TraceAction) -> Result<()> {
         // Try as symbol name
         for sym in fmt.symbols() {
             if sym.name == target {
-                let size = if sym.size > 0 { sym.size as usize } else { 4096 };
+                let size = if sym.size > 0 {
+                    sym.size as usize
+                } else {
+                    4096
+                };
                 return Ok((sym.address, size));
             }
         }
@@ -2813,9 +3037,7 @@ fn handle_trace_command(binary: &Binary, action: TraceAction) -> Result<()> {
 
                 // Disassemble the function bytes
                 let results = disassembler.disassemble_block(func_data, start_addr);
-                let instructions: Vec<_> = results.into_iter()
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let instructions: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
 
                 if instructions.is_empty() {
                     bail!("Failed to disassemble function at {:#x}", start_addr);
@@ -2827,11 +3049,19 @@ fn handle_trace_command(binary: &Binary, action: TraceAction) -> Result<()> {
             }
         }
 
-        bail!("Function at {:#x} not found in executable sections", start_addr);
+        bail!(
+            "Function at {:#x} not found in executable sections",
+            start_addr
+        );
     };
 
     match action {
-        TraceAction::Backward { function, address, register, json } => {
+        TraceAction::Backward {
+            function,
+            address,
+            register,
+            json,
+        } => {
             let (func_addr, func_size) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size)?;
 
@@ -2849,7 +3079,12 @@ fn handle_trace_command(binary: &Binary, action: TraceAction) -> Result<()> {
             }
         }
 
-        TraceAction::Forward { function, address, register, json } => {
+        TraceAction::Forward {
+            function,
+            address,
+            register,
+            json,
+        } => {
             let (func_addr, func_size) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size)?;
 
@@ -2867,7 +3102,11 @@ fn handle_trace_command(binary: &Binary, action: TraceAction) -> Result<()> {
             }
         }
 
-        TraceAction::Uses { function, address, register } => {
+        TraceAction::Uses {
+            function,
+            address,
+            register,
+        } => {
             let (func_addr, func_size) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size)?;
 
@@ -2881,7 +3120,11 @@ fn handle_trace_command(binary: &Binary, action: TraceAction) -> Result<()> {
             println!("{}", result);
         }
 
-        TraceAction::Defs { function, address, register } => {
+        TraceAction::Defs {
+            function,
+            address,
+            register,
+        } => {
             let (func_addr, func_size) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size)?;
 
@@ -2907,7 +3150,10 @@ fn print_trace_result_json(result: &hexray_analysis::DataFlowResult) {
         let comma = if i < result.steps.len() - 1 { "," } else { "" };
         println!("    {{");
         println!("      \"address\": \"{:#x}\",", step.address);
-        println!("      \"instruction\": \"{}\",", step.instruction.replace('\"', "\\\""));
+        println!(
+            "      \"instruction\": \"{}\",",
+            step.instruction.replace('\"', "\\\"")
+        );
         println!("      \"role\": \"{}\",", step.role);
         if let Some(desc) = &step.description {
             println!("      \"description\": \"{}\"", desc.replace('\"', "\\\""));
@@ -2957,7 +3203,11 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
         // Try as symbol name
         for sym in fmt.symbols() {
             if sym.name == target {
-                let size = if sym.size > 0 { sym.size as usize } else { 4096 };
+                let size = if sym.size > 0 {
+                    sym.size as usize
+                } else {
+                    4096
+                };
                 return Ok((sym.address, size));
             }
         }
@@ -2966,33 +3216,35 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
     };
 
     // Helper to get instructions for a function
-    let get_instructions = |start_addr: u64, size: usize| -> Result<Vec<hexray_core::Instruction>> {
-        for section in fmt.sections() {
-            let section_start = section.virtual_address();
-            let section_data = section.data();
-            let section_end = section_start + section_data.len() as u64;
+    let get_instructions =
+        |start_addr: u64, size: usize| -> Result<Vec<hexray_core::Instruction>> {
+            for section in fmt.sections() {
+                let section_start = section.virtual_address();
+                let section_data = section.data();
+                let section_end = section_start + section_data.len() as u64;
 
-            if start_addr >= section_start && start_addr < section_end {
-                let offset = (start_addr - section_start) as usize;
-                let available = section_data.len() - offset;
-                let func_size = size.min(available);
-                let func_data = &section_data[offset..offset + func_size];
+                if start_addr >= section_start && start_addr < section_end {
+                    let offset = (start_addr - section_start) as usize;
+                    let available = section_data.len() - offset;
+                    let func_size = size.min(available);
+                    let func_data = &section_data[offset..offset + func_size];
 
-                let results = disassembler.disassemble_block(func_data, start_addr);
-                let instructions: Vec<_> = results.into_iter()
-                    .filter_map(|r| r.ok())
-                    .collect();
+                    let results = disassembler.disassemble_block(func_data, start_addr);
+                    let instructions: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
 
-                if instructions.is_empty() {
-                    bail!("Failed to disassemble function at {:#x}", start_addr);
+                    if instructions.is_empty() {
+                        bail!("Failed to disassemble function at {:#x}", start_addr);
+                    }
+
+                    return Ok(instructions);
                 }
-
-                return Ok(instructions);
             }
-        }
 
-        bail!("Function at {:#x} not found in executable sections", start_addr);
-    };
+            bail!(
+                "Function at {:#x} not found in executable sections",
+                start_addr
+            );
+        };
 
     // Helper to parse register assignment (e.g., "rax=0x1234")
     let parse_reg_assignment = |s: &str| -> Result<(u16, u64)> {
@@ -3026,7 +3278,14 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
     };
 
     match action {
-        EmulateAction::Run { target, stop_at, max_instructions, stop_at_calls, json, reg } => {
+        EmulateAction::Run {
+            target,
+            stop_at,
+            max_instructions,
+            stop_at_calls,
+            json,
+            reg,
+        } => {
             let (func_addr, func_size) = resolve_function(&target)?;
             let instructions = get_instructions(func_addr, func_size)?;
 
@@ -3069,9 +3328,15 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
                 println!("  ],");
                 println!("  \"indirect_targets\": [");
                 for (i, target) in result.indirect_targets.iter().enumerate() {
-                    let comma = if i < result.indirect_targets.len() - 1 { "," } else { "" };
-                    println!("    {{ \"address\": \"{:#x}\", \"targets\": {:?} }}{}",
-                             target.instruction_address, target.targets, comma);
+                    let comma = if i < result.indirect_targets.len() - 1 {
+                        ","
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "    {{ \"address\": \"{:#x}\", \"targets\": {:?} }}{}",
+                        target.instruction_address, target.targets, comma
+                    );
                 }
                 println!("  ]");
                 println!("}}");
@@ -3095,13 +3360,23 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
                 if !result.indirect_targets.is_empty() {
                     println!("\nResolved indirect targets:");
                     for target in &result.indirect_targets {
-                        println!("  {:#x} -> {:?}", target.instruction_address, target.targets);
+                        println!(
+                            "  {:#x} -> {:?}",
+                            target.instruction_address, target.targets
+                        );
                     }
                 }
             }
         }
 
-        EmulateAction::Resolve { function, address, index_register, min_index, max_index, json } => {
+        EmulateAction::Resolve {
+            function,
+            address,
+            index_register,
+            min_index,
+            max_index,
+            json,
+        } => {
             let (func_addr, func_size) = resolve_function(&function)?;
             let instructions = get_instructions(func_addr, func_size)?;
 
@@ -3124,13 +3399,8 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
             }
 
             // Resolve the indirect branch
-            let targets = emu.resolve_indirect(
-                &instructions,
-                address,
-                index_register,
-                min_index,
-                max_index,
-            );
+            let targets =
+                emu.resolve_indirect(&instructions, address, index_register, min_index, max_index);
 
             if json {
                 println!("{{");
@@ -3154,7 +3424,8 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
                 println!("\nResolved targets ({}):", targets.len());
                 for (i, t) in targets.iter().enumerate() {
                     // Try to find symbol for target
-                    let sym_name = fmt.symbols()
+                    let sym_name = fmt
+                        .symbols()
                         .find(|s| s.address == *t)
                         .map(|s| s.name.clone())
                         .unwrap_or_default();
@@ -3167,7 +3438,12 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
             }
         }
 
-        EmulateAction::State { target, stop_at, max_instructions, reg } => {
+        EmulateAction::State {
+            target,
+            stop_at,
+            max_instructions,
+            reg,
+        } => {
             let (func_addr, func_size) = resolve_function(&target)?;
             let instructions = get_instructions(func_addr, func_size)?;
 
@@ -3204,14 +3480,22 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
             println!("Stop reason: {:?}", result.stop_reason);
             println!("\nRegister state:");
             for (name, id) in [
-                ("rax", x86_regs::RAX), ("rcx", x86_regs::RCX),
-                ("rdx", x86_regs::RDX), ("rbx", x86_regs::RBX),
-                ("rsp", x86_regs::RSP), ("rbp", x86_regs::RBP),
-                ("rsi", x86_regs::RSI), ("rdi", x86_regs::RDI),
-                ("r8", x86_regs::R8), ("r9", x86_regs::R9),
-                ("r10", x86_regs::R10), ("r11", x86_regs::R11),
-                ("r12", x86_regs::R12), ("r13", x86_regs::R13),
-                ("r14", x86_regs::R14), ("r15", x86_regs::R15),
+                ("rax", x86_regs::RAX),
+                ("rcx", x86_regs::RCX),
+                ("rdx", x86_regs::RDX),
+                ("rbx", x86_regs::RBX),
+                ("rsp", x86_regs::RSP),
+                ("rbp", x86_regs::RBP),
+                ("rsi", x86_regs::RSI),
+                ("rdi", x86_regs::RDI),
+                ("r8", x86_regs::R8),
+                ("r9", x86_regs::R9),
+                ("r10", x86_regs::R10),
+                ("r11", x86_regs::R11),
+                ("r12", x86_regs::R12),
+                ("r13", x86_regs::R13),
+                ("r14", x86_regs::R14),
+                ("r15", x86_regs::R15),
             ] {
                 let value = result.state.get_register(id);
                 match value {
@@ -3222,8 +3506,14 @@ fn handle_emulate_command(binary: &Binary, action: EmulateAction) -> Result<()> 
             }
             println!("\nFlags:");
             let flags = &result.state.flags;
-            println!("  CF: {:?}  ZF: {:?}  SF: {:?}", flags.cf, flags.zf, flags.sf);
-            println!("  OF: {:?}  PF: {:?}  AF: {:?}", flags.of, flags.pf, flags.af);
+            println!(
+                "  CF: {:?}  ZF: {:?}  SF: {:?}",
+                flags.cf, flags.zf, flags.sf
+            );
+            println!(
+                "  OF: {:?}  PF: {:?}  AF: {:?}",
+                flags.of, flags.pf, flags.af
+            );
         }
     }
 
@@ -3249,7 +3539,8 @@ fn handle_session_list(directory: &Path) -> Result<()> {
     println!("{}", "-".repeat(80));
 
     for (path, meta) in sessions {
-        let filename = path.file_name()
+        let filename = path
+            .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "???".to_string());
         let binary_name = PathBuf::from(&meta.binary_path)
@@ -3274,8 +3565,14 @@ fn handle_session_info(session_path: &Path) -> Result<()> {
     println!("Name:          {}", session.meta.name);
     println!("Binary:        {}", session.meta.binary_path);
     println!("Binary Hash:   {}", &session.meta.binary_hash[..16]);
-    println!("Created:       {}", session.meta.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    println!("Last Accessed: {}", session.meta.last_accessed.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "Created:       {}",
+        session.meta.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    println!(
+        "Last Accessed: {}",
+        session.meta.last_accessed.format("%Y-%m-%d %H:%M:%S UTC")
+    );
     println!();
     println!("Statistics");
     println!("----------");
@@ -3319,7 +3616,8 @@ fn handle_session_new(binary_path: &Path, output: Option<&PathBuf>) -> Result<()
     let session_path = match output {
         Some(p) => p.clone(),
         None => {
-            let stem = binary_path.file_stem()
+            let stem = binary_path
+                .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "session".to_string());
             PathBuf::from(format!("{}.hrp", stem))
@@ -3343,15 +3641,17 @@ fn handle_session_new(binary_path: &Path, output: Option<&PathBuf>) -> Result<()
     Ok(())
 }
 
-fn handle_session_export(session_path: &Path, output: Option<&PathBuf>, format: &str) -> Result<()> {
+fn handle_session_export(
+    session_path: &Path,
+    output: Option<&PathBuf>,
+    format: &str,
+) -> Result<()> {
     let session = Session::resume(session_path)?;
     let history = session.get_history(None)?;
 
     let content = match format {
-        "json" => {
-            serde_json::to_string_pretty(&history)?
-        }
-        "text" | _ => {
+        "json" => serde_json::to_string_pretty(&history)?,
+        _ => {
             let mut s = String::new();
             s.push_str(&format!("# Session: {}\n", session.meta.name));
             s.push_str(&format!("# Binary: {}\n", session.meta.binary_path));
@@ -3376,7 +3676,11 @@ fn handle_session_export(session_path: &Path, output: Option<&PathBuf>, format: 
     match output {
         Some(path) => {
             fs::write(path, &content)?;
-            println!("Exported {} history entries to {}", history.len(), path.display());
+            println!(
+                "Exported {} history entries to {}",
+                history.len(),
+                path.display()
+            );
         }
         None => {
             println!("{}", content);
@@ -3426,8 +3730,10 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
         "symbols" | "syms" => {
             let functions_only = parts.iter().any(|&p| p == "-f" || p == "--functions");
             let mut output = String::new();
-            output.push_str(&format!("{:<16} {:<8} {:<8} {:<8} {}\n",
-                "Address", "Size", "Type", "Bind", "Name"));
+            output.push_str(&format!(
+                "{:<16} {:<8} {:<8} {:<8} {}\n",
+                "Address", "Size", "Type", "Bind", "Name"
+            ));
             output.push_str(&format!("{}\n", "-".repeat(70)));
 
             let mut symbols: Vec<_> = fmt.symbols().collect();
@@ -3441,7 +3747,11 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     continue;
                 }
 
-                let type_str = if symbol.is_function() { "FUNC" } else { "OTHER" };
+                let type_str = if symbol.is_function() {
+                    "FUNC"
+                } else {
+                    "OTHER"
+                };
                 let bind_str = match symbol.binding {
                     hexray_core::SymbolBinding::Local => "LOCAL",
                     hexray_core::SymbolBinding::Global => "GLOBAL",
@@ -3450,25 +3760,36 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 };
 
                 // Check for renames
-                let name = session.get_rename(symbol.address)
+                let name = session
+                    .get_rename(symbol.address)
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| demangle_or_original(&symbol.name));
 
-                output.push_str(&format!("{:#016x} {:<8} {:<8} {:<8} {}\n",
-                    symbol.address, symbol.size, type_str, bind_str, name));
+                output.push_str(&format!(
+                    "{:#016x} {:<8} {:<8} {:<8} {}\n",
+                    symbol.address, symbol.size, type_str, bind_str, name
+                ));
             }
             Ok(output)
         }
 
         "sections" => {
             let mut output = String::new();
-            output.push_str(&format!("{:<4} {:<24} {:<16} {:<16} {:<8}\n",
-                "Idx", "Name", "Address", "Size", "Flags"));
+            output.push_str(&format!(
+                "{:<4} {:<24} {:<16} {:<16} {:<8}\n",
+                "Idx", "Name", "Address", "Size", "Flags"
+            ));
             output.push_str(&format!("{}\n", "-".repeat(75)));
 
             for (idx, section) in fmt.sections().enumerate() {
-                output.push_str(&format!("{:<4} {:<24} {:#016x} {:#016x} {:<8}\n",
-                    idx, section.name(), section.virtual_address(), section.size(), ""));
+                output.push_str(&format!(
+                    "{:<4} {:<24} {:#016x} {:#016x} {:<8}\n",
+                    idx,
+                    section.name(),
+                    section.virtual_address(),
+                    section.size(),
+                    ""
+                ));
             }
             Ok(output)
         }
@@ -3500,7 +3821,10 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 } else {
                     s.content.clone()
                 };
-                output.push_str(&format!("{:#016x} {:<6} {}\n", s.address, s.length, display));
+                output.push_str(&format!(
+                    "{:#016x} {:<6} {}\n",
+                    s.address, s.length, display
+                ));
             }
 
             if all_strings.len() > 100 {
@@ -3523,8 +3847,15 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 (a, count * 10) // Estimate bytes
             } else {
                 // Try to find symbol
-                if let Some(sym) = fmt.symbols().find(|s| s.name == target || demangle_or_original(&s.name) == target) {
-                    let size = if sym.size > 0 { sym.size as usize } else { count * 10 };
+                if let Some(sym) = fmt
+                    .symbols()
+                    .find(|s| s.name == target || demangle_or_original(&s.name) == target)
+                {
+                    let size = if sym.size > 0 {
+                        sym.size as usize
+                    } else {
+                        count * 10
+                    };
                     (sym.address, size)
                 } else {
                     return Ok(format!("Symbol not found: {}", target));
@@ -3540,11 +3871,16 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 for (i, result) in results.into_iter().enumerate().take(count) {
                     match result {
                         Ok(inst) => {
-                            let comment = session.get_comment(inst.address)
+                            let comment = session
+                                .get_comment(inst.address)
                                 .map(|c| format!("  ; {}", c))
                                 .unwrap_or_default();
-                            output.push_str(&format!("{:#010x}  {:<32}{}\n",
-                                inst.address, inst.to_string(), comment));
+                            output.push_str(&format!(
+                                "{:#010x}  {:<32}{}\n",
+                                inst.address,
+                                inst.to_string(),
+                                comment
+                            ));
                         }
                         Err(_) => {
                             let estimated_addr = addr + i as u64;
@@ -3573,19 +3909,25 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 } else {
                     (a, 1000) // Default size
                 }
-            } else {
-                if let Some(sym) = fmt.symbols().find(|s| s.name == target || demangle_or_original(&s.name) == target) {
-                    let size = if sym.size > 0 { sym.size as usize } else { 1000 };
-                    (sym.address, size)
+            } else if let Some(sym) = fmt
+                .symbols()
+                .find(|s| s.name == target || demangle_or_original(&s.name) == target)
+            {
+                let size = if sym.size > 0 {
+                    sym.size as usize
                 } else {
-                    return Ok(format!("Symbol not found: {}", target));
-                }
+                    1000
+                };
+                (sym.address, size)
+            } else {
+                return Ok(format!("Symbol not found: {}", target));
             };
 
             if let Some(bytes) = fmt.bytes_at(addr, size.max(1000)) {
                 // Disassemble the function
                 let results = disassemble_block_for_arch(fmt.architecture(), bytes, addr);
-                let instructions: Vec<_> = results.into_iter()
+                let instructions: Vec<_> = results
+                    .into_iter()
                     .filter_map(|r| r.ok())
                     .take(500)
                     .take_while(|inst| !inst.is_return())
@@ -3595,7 +3937,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                             .into_iter()
                             .filter_map(|r| r.ok())
                             .take(500)
-                            .find(|inst| inst.is_return())
+                            .find(|inst| inst.is_return()),
                     )
                     .collect();
 
@@ -3616,9 +3958,14 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 }
 
                 // Get function name
-                let func_name = session.get_rename(addr)
+                let func_name = session
+                    .get_rename(addr)
                     .map(|s| s.to_string())
-                    .or_else(|| fmt.symbols().find(|s| s.address == addr).map(|s| demangle_or_original(&s.name)))
+                    .or_else(|| {
+                        fmt.symbols()
+                            .find(|s| s.address == addr)
+                            .map(|s| demangle_or_original(&s.name))
+                    })
                     .unwrap_or_else(|| format!("sub_{:x}", addr));
 
                 let decompiler = Decompiler::new()
@@ -3656,11 +4003,10 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 if section.is_executable() {
                     let bytes = section.data();
                     let section_addr = section.virtual_address();
-                    let results = disassemble_block_for_arch(fmt.architecture(), bytes, section_addr);
-                    for result in results {
-                        if let Ok(inst) = result {
-                            builder.analyze_instruction(&inst);
-                        }
+                    let results =
+                        disassemble_block_for_arch(fmt.architecture(), bytes, section_addr);
+                    for inst in results.into_iter().flatten() {
+                        builder.analyze_instruction(&inst);
                     }
                 }
             }
@@ -3690,9 +4036,10 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
             Ok(output)
         }
 
-        _ => {
-            Ok(format!("Unknown command: {}. Type 'help' for available commands.", parts[0]))
-        }
+        _ => Ok(format!(
+            "Unknown command: {}. Type 'help' for available commands.",
+            parts[0]
+        )),
     }
 }
 
@@ -3702,22 +4049,18 @@ fn parse_address_str(s: &str) -> Result<u64> {
 }
 
 /// Helper function to disassemble a block of bytes using the appropriate architecture
-fn disassemble_block_for_arch(arch: Architecture, bytes: &[u8], start_addr: u64) -> Vec<Result<hexray_core::Instruction, hexray_disasm::DecodeError>> {
+fn disassemble_block_for_arch(
+    arch: Architecture,
+    bytes: &[u8],
+    start_addr: u64,
+) -> Vec<Result<hexray_core::Instruction, hexray_disasm::DecodeError>> {
     match arch {
         Architecture::X86_64 | Architecture::X86 => {
             X86_64Disassembler::new().disassemble_block(bytes, start_addr)
         }
-        Architecture::Arm64 => {
-            Arm64Disassembler::new().disassemble_block(bytes, start_addr)
-        }
-        Architecture::RiscV64 => {
-            RiscVDisassembler::new().disassemble_block(bytes, start_addr)
-        }
-        Architecture::RiscV32 => {
-            RiscVDisassembler::new_rv32().disassemble_block(bytes, start_addr)
-        }
-        _ => {
-            X86_64Disassembler::new().disassemble_block(bytes, start_addr)
-        }
+        Architecture::Arm64 => Arm64Disassembler::new().disassemble_block(bytes, start_addr),
+        Architecture::RiscV64 => RiscVDisassembler::new().disassemble_block(bytes, start_addr),
+        Architecture::RiscV32 => RiscVDisassembler::new_rv32().disassemble_block(bytes, start_addr),
+        _ => X86_64Disassembler::new().disassemble_block(bytes, start_addr),
     }
 }

@@ -47,8 +47,8 @@
 //! }
 //! ```
 
-use std::collections::{HashMap, HashSet};
 use hexray_core::Endianness;
+use std::collections::{HashMap, HashSet};
 
 /// Parsed RTTI type information.
 #[derive(Debug, Clone)]
@@ -224,12 +224,10 @@ impl RttiParser {
                 Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64)
             }
             (8, Endianness::Little) => Some(u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ])),
             (8, Endianness::Big) => Some(u64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ])),
             _ => None,
         }
@@ -242,7 +240,9 @@ impl RttiParser {
         }
         let bytes = &data[offset..offset + 4];
         match self.endianness {
-            Endianness::Little => Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+            Endianness::Little => {
+                Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            }
             Endianness::Big => Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
         }
     }
@@ -259,7 +259,9 @@ impl RttiParser {
         }
 
         if end > offset {
-            std::str::from_utf8(&data[offset..end]).ok().map(String::from)
+            std::str::from_utf8(&data[offset..end])
+                .ok()
+                .map(String::from)
         } else {
             None
         }
@@ -306,7 +308,10 @@ impl RttiParser {
     }
 
     /// Parses a single name component (length + chars).
-    fn parse_name_component(&self, chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    fn parse_name_component(
+        &self,
+        chars: &mut std::iter::Peekable<std::str::Chars>,
+    ) -> Option<String> {
         // Read length digits
         let mut length_str = String::new();
         while let Some(&c) = chars.peek() {
@@ -572,13 +577,18 @@ impl ClassHierarchy {
 
         // Extract base relationships
         match &type_info.kind {
-            TypeInfoKind::SingleInheritance { base_typeinfo_addr, .. } => {
+            TypeInfoKind::SingleInheritance {
+                base_typeinfo_addr, ..
+            } => {
                 self.direct_bases.entry(addr).or_default().push((
                     *base_typeinfo_addr,
                     0, // offset is 0 for SI
                     false,
                 ));
-                self.direct_derived.entry(*base_typeinfo_addr).or_default().push(addr);
+                self.direct_derived
+                    .entry(*base_typeinfo_addr)
+                    .or_default()
+                    .push(addr);
             }
             TypeInfoKind::VirtualMultipleInheritance { bases, .. } => {
                 for base in bases {
@@ -587,7 +597,10 @@ impl ClassHierarchy {
                         base.offset,
                         base.flags.is_virtual,
                     ));
-                    self.direct_derived.entry(base.typeinfo_addr).or_default().push(addr);
+                    self.direct_derived
+                        .entry(base.typeinfo_addr)
+                        .or_default()
+                        .push(addr);
                 }
             }
             _ => {}
@@ -617,7 +630,9 @@ impl ClassHierarchy {
                 bases
                     .iter()
                     .filter_map(|(base_addr, offset, is_virtual)| {
-                        self.classes.get(base_addr).map(|ti| (ti, *offset, *is_virtual))
+                        self.classes
+                            .get(base_addr)
+                            .map(|ti| (ti, *offset, *is_virtual))
                     })
                     .collect()
             })
@@ -654,12 +669,7 @@ impl ClassHierarchy {
     pub fn direct_derived(&self, addr: u64) -> Vec<&TypeInfo> {
         self.direct_derived
             .get(&addr)
-            .map(|derived| {
-                derived
-                    .iter()
-                    .filter_map(|d| self.classes.get(d))
-                    .collect()
-            })
+            .map(|derived| derived.iter().filter_map(|d| self.classes.get(d)).collect())
             .unwrap_or_default()
     }
 
@@ -805,7 +815,10 @@ mod tests {
 
         // N<len><name><len><name>E
         assert_eq!(parser.demangle_type_name("N3std6vectorE"), "std::vector");
-        assert_eq!(parser.demangle_type_name("N9namespace5ClassE"), "namespace::Class");
+        assert_eq!(
+            parser.demangle_type_name("N9namespace5ClassE"),
+            "namespace::Class"
+        );
     }
 
     #[test]

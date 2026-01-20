@@ -6,17 +6,17 @@
 //! - Annotations (renames, comments, bookmarks, tags)
 //! - Analysis cache (disassembly, strings, xrefs)
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
-use rustyline::{Editor, Config};
+use rustyline::{Config, Editor};
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Write as IoWrite, BufWriter};
+use std::io::{BufWriter, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -46,6 +46,7 @@ pub struct HistoryEntry {
 
 /// Annotation for an address
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Annotation {
     pub address: u64,
     pub kind: AnnotationKind,
@@ -90,6 +91,7 @@ impl std::str::FromStr for AnnotationKind {
 
 /// An undo/redo action record
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct UndoAction {
     /// Unique ID for this action
     pub id: i64,
@@ -103,6 +105,7 @@ pub struct UndoAction {
 
 /// Type of undo action
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code, clippy::enum_variant_names)]
 pub enum UndoActionType {
     /// Annotation was added
     AnnotationAdd {
@@ -150,8 +153,9 @@ impl Session {
         let binary_hash = compute_hash(&binary_data);
 
         // Create the session database
-        let conn = Connection::open(session_path)
-            .with_context(|| format!("Failed to create session file: {}", session_path.display()))?;
+        let conn = Connection::open(session_path).with_context(|| {
+            format!("Failed to create session file: {}", session_path.display())
+        })?;
 
         // Initialize schema
         Self::init_schema(&conn)?;
@@ -159,10 +163,12 @@ impl Session {
         // Create session metadata
         let meta = SessionMeta {
             id: Uuid::new_v4().to_string(),
-            name: binary_path.file_name()
+            name: binary_path
+                .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unnamed".to_string()),
-            binary_path: binary_path.canonicalize()
+            binary_path: binary_path
+                .canonicalize()
                 .unwrap_or_else(|_| binary_path.to_path_buf())
                 .to_string_lossy()
                 .to_string(),
@@ -231,9 +237,7 @@ impl Session {
         // Load annotations into cache
         let annotations = {
             let mut annotations = HashMap::new();
-            let mut stmt = conn.prepare(
-                "SELECT address, kind, value FROM annotations"
-            )?;
+            let mut stmt = conn.prepare("SELECT address, kind, value FROM annotations")?;
             let rows = stmt.query_map([], |row| {
                 let addr: i64 = row.get(0)?;
                 let kind_str: String = row.get(1)?;
@@ -244,7 +248,8 @@ impl Session {
             for row in rows {
                 let (addr, kind_str, value) = row?;
                 if let Ok(kind) = kind_str.parse::<AnnotationKind>() {
-                    annotations.entry(addr)
+                    annotations
+                        .entry(addr)
                         .or_insert_with(HashMap::new)
                         .insert(kind, value);
                 }
@@ -253,11 +258,14 @@ impl Session {
         };
 
         // Load undo position (max ID that is "done", i.e., not undone)
-        let undo_position: Option<i64> = conn.query_row(
-            "SELECT MAX(id) FROM undo_history WHERE undone = 0",
-            [],
-            |row| row.get(0),
-        ).ok().flatten();
+        let undo_position: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(id) FROM undo_history WHERE undone = 0",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
 
         Ok(Self {
             conn,
@@ -271,7 +279,8 @@ impl Session {
 
     /// Initialize database schema
     fn init_schema(conn: &Connection) -> Result<()> {
-        conn.execute_batch(r#"
+        conn.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS session_meta (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -310,7 +319,8 @@ impl Session {
             CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp);
             CREATE INDEX IF NOT EXISTS idx_annotations_address ON annotations(address);
             CREATE INDEX IF NOT EXISTS idx_undo_history_undone ON undo_history(undone);
-        "#)?;
+        "#,
+        )?;
         Ok(())
     }
 
@@ -323,7 +333,13 @@ impl Session {
     }
 
     /// Record a command and its output to history
-    pub fn record_history(&self, command: &str, output: &str, duration_ms: u64, success: bool) -> Result<()> {
+    pub fn record_history(
+        &self,
+        command: &str,
+        output: &str,
+        duration_ms: u64,
+        success: bool,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO history (timestamp, command, output, duration_ms, success) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -393,9 +409,15 @@ impl Session {
     }
 
     /// Add an annotation (with undo support)
-    pub fn add_annotation(&mut self, address: u64, kind: AnnotationKind, value: &str) -> Result<()> {
+    pub fn add_annotation(
+        &mut self,
+        address: u64,
+        kind: AnnotationKind,
+        value: &str,
+    ) -> Result<()> {
         // Check if there's an existing value (for undo)
-        let old_value = self.annotations
+        let old_value = self
+            .annotations
             .get(&address)
             .and_then(|kinds| kinds.get(&kind))
             .cloned();
@@ -430,8 +452,9 @@ impl Session {
         self.record_undo_action(&format!("{} at 0x{:x}", kind, address), action_type)?;
 
         // Update cache
-        self.annotations.entry(address)
-            .or_insert_with(HashMap::new)
+        self.annotations
+            .entry(address)
+            .or_default()
             .insert(kind, value.to_string());
 
         Ok(())
@@ -440,7 +463,8 @@ impl Session {
     /// Delete an annotation (with undo support)
     pub fn delete_annotation(&mut self, address: u64, kind: AnnotationKind) -> Result<bool> {
         // Check if there's an existing value
-        let old_value = self.annotations
+        let old_value = self
+            .annotations
             .get(&address)
             .and_then(|kinds| kinds.get(&kind))
             .cloned();
@@ -478,10 +502,8 @@ impl Session {
     fn record_undo_action(&mut self, description: &str, action_type: UndoActionType) -> Result<()> {
         // Clear any "redo" actions (actions after current position)
         if let Some(pos) = self.undo_position {
-            self.conn.execute(
-                "DELETE FROM undo_history WHERE id > ?1",
-                params![pos],
-            )?;
+            self.conn
+                .execute("DELETE FROM undo_history WHERE id > ?1", params![pos])?;
         }
 
         // Serialize action type
@@ -533,7 +555,12 @@ impl Session {
                         kinds.remove(&kind);
                     }
                 }
-                UndoActionType::AnnotationModify { address, kind, old_value, .. } => {
+                UndoActionType::AnnotationModify {
+                    address,
+                    kind,
+                    old_value,
+                    ..
+                } => {
                     // Undo modify = restore old value
                     self.conn.execute(
                         "UPDATE annotations SET value = ?1 WHERE address = ?2 AND kind = ?3",
@@ -543,14 +570,19 @@ impl Session {
                         kinds.insert(kind, old_value);
                     }
                 }
-                UndoActionType::AnnotationDelete { address, kind, old_value } => {
+                UndoActionType::AnnotationDelete {
+                    address,
+                    kind,
+                    old_value,
+                } => {
                     // Undo delete = restore
                     self.conn.execute(
                         "INSERT INTO annotations (address, kind, value, created_at) VALUES (?1, ?2, ?3, ?4)",
                         params![address as i64, kind.to_string(), &old_value, Utc::now().to_rfc3339()],
                     )?;
-                    self.annotations.entry(address)
-                        .or_insert_with(HashMap::new)
+                    self.annotations
+                        .entry(address)
+                        .or_default()
                         .insert(kind, old_value);
                 }
             }
@@ -562,11 +594,15 @@ impl Session {
             )?;
 
             // Update undo position
-            self.undo_position = self.conn.query_row(
-                "SELECT MAX(id) FROM undo_history WHERE undone = 0",
-                [],
-                |row| row.get(0),
-            ).ok().flatten();
+            self.undo_position = self
+                .conn
+                .query_row(
+                    "SELECT MAX(id) FROM undo_history WHERE undone = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
 
             Ok(Some(format!("Undone: {}", description)))
         } else {
@@ -588,16 +624,26 @@ impl Session {
 
             // Re-apply the action
             match action_type {
-                UndoActionType::AnnotationAdd { address, kind, new_value } => {
+                UndoActionType::AnnotationAdd {
+                    address,
+                    kind,
+                    new_value,
+                } => {
                     self.conn.execute(
                         "INSERT OR REPLACE INTO annotations (address, kind, value, created_at) VALUES (?1, ?2, ?3, ?4)",
                         params![address as i64, kind.to_string(), &new_value, Utc::now().to_rfc3339()],
                     )?;
-                    self.annotations.entry(address)
-                        .or_insert_with(HashMap::new)
+                    self.annotations
+                        .entry(address)
+                        .or_default()
                         .insert(kind, new_value);
                 }
-                UndoActionType::AnnotationModify { address, kind, new_value, .. } => {
+                UndoActionType::AnnotationModify {
+                    address,
+                    kind,
+                    new_value,
+                    ..
+                } => {
                     self.conn.execute(
                         "UPDATE annotations SET value = ?1 WHERE address = ?2 AND kind = ?3",
                         params![&new_value, address as i64, kind.to_string()],
@@ -633,43 +679,50 @@ impl Session {
     }
 
     /// Check if undo is available
+    #[allow(dead_code)]
     pub fn can_undo(&self) -> bool {
         self.undo_position.is_some()
     }
 
     /// Check if redo is available
+    #[allow(dead_code)]
     pub fn can_redo(&self) -> bool {
-        self.conn.query_row::<i64, _, _>(
-            "SELECT COUNT(*) FROM undo_history WHERE undone = 1",
-            [],
-            |row| row.get(0),
-        ).map(|count| count > 0).unwrap_or(false)
+        self.conn
+            .query_row::<i64, _, _>(
+                "SELECT COUNT(*) FROM undo_history WHERE undone = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map(|count| count > 0)
+            .unwrap_or(false)
     }
 
     /// Get annotations for an address
+    #[allow(dead_code)]
     pub fn get_annotations(&self, address: u64) -> Option<&HashMap<AnnotationKind, String>> {
         self.annotations.get(&address)
     }
 
     /// Get all annotations of a specific kind
     pub fn get_all_annotations(&self, kind: AnnotationKind) -> Vec<(u64, String)> {
-        self.annotations.iter()
-            .filter_map(|(addr, kinds)| {
-                kinds.get(&kind).map(|v| (*addr, v.clone()))
-            })
+        self.annotations
+            .iter()
+            .filter_map(|(addr, kinds)| kinds.get(&kind).map(|v| (*addr, v.clone())))
             .collect()
     }
 
     /// Get a rename for an address, if any
     pub fn get_rename(&self, address: u64) -> Option<&str> {
-        self.annotations.get(&address)
+        self.annotations
+            .get(&address)
             .and_then(|kinds: &HashMap<AnnotationKind, String>| kinds.get(&AnnotationKind::Rename))
             .map(|s: &String| s.as_str())
     }
 
     /// Get a comment for an address, if any
     pub fn get_comment(&self, address: u64) -> Option<&str> {
-        self.annotations.get(&address)
+        self.annotations
+            .get(&address)
             .and_then(|kinds: &HashMap<AnnotationKind, String>| kinds.get(&AnnotationKind::Comment))
             .map(|s: &String| s.as_str())
     }
@@ -708,17 +761,13 @@ impl Session {
 
     /// Get session statistics
     pub fn stats(&self) -> Result<SessionStats> {
-        let history_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM history",
-            [],
-            |row| row.get(0),
-        )?;
+        let history_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
 
-        let annotation_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM annotations",
-            [],
-            |row| row.get(0),
-        )?;
+        let annotation_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM annotations", [], |row| row.get(0))?;
 
         Ok(SessionStats {
             history_entries: history_count as usize,
@@ -794,7 +843,10 @@ impl Repl {
         }
 
         let stats = self.session.stats()?;
-        println!("History: {} commands, {} annotations", stats.history_entries, stats.annotations);
+        println!(
+            "History: {} commands, {} annotations",
+            stats.history_entries, stats.annotations
+        );
         println!();
         println!("Type 'help' for available commands, Ctrl+D to detach");
         println!();
@@ -822,19 +874,23 @@ impl Repl {
 
                     match result {
                         Ok(output) => {
-                            self.session.record_history(line, &output, duration_ms, true)?;
+                            self.session
+                                .record_history(line, &output, duration_ms, true)?;
                             self.session.display_output(&output)?;
                         }
                         Err(e) => {
                             let error_msg = format!("Error: {}", e);
-                            self.session.record_history(line, &error_msg, duration_ms, false)?;
+                            self.session
+                                .record_history(line, &error_msg, duration_ms, false)?;
                             eprintln!("{}", error_msg);
                         }
                     }
                 }
                 Err(ReadlineError::Eof) => {
-                    println!("\nSession detached. Resume with: hexray session resume {}",
-                             self.session.session_path.display());
+                    println!(
+                        "\nSession detached. Resume with: hexray session resume {}",
+                        self.session.session_path.display()
+                    );
                     break;
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -859,9 +915,7 @@ impl Repl {
         }
 
         match parts[0] {
-            "help" | "?" => {
-                Ok(Some(HELP_TEXT.to_string()))
-            }
+            "help" | "?" => Ok(Some(HELP_TEXT.to_string())),
             "history" => {
                 let limit = parts.get(1).and_then(|s| s.parse().ok());
                 let entries = self.session.get_history(limit)?;
@@ -894,7 +948,8 @@ impl Repl {
                 if parts.len() >= 3 {
                     let addr = parse_address(parts[1])?;
                     let name = parts[2..].join(" ");
-                    self.session.add_annotation(addr, AnnotationKind::Rename, &name)?;
+                    self.session
+                        .add_annotation(addr, AnnotationKind::Rename, &name)?;
                     Ok(Some(format!("Renamed 0x{:x} to '{}'", addr, name)))
                 } else {
                     Ok(Some("Usage: rename <address> <name>".to_string()))
@@ -904,7 +959,8 @@ impl Repl {
                 if parts.len() >= 3 {
                     let addr = parse_address(parts[1])?;
                     let comment = parts[2..].join(" ");
-                    self.session.add_annotation(addr, AnnotationKind::Comment, &comment)?;
+                    self.session
+                        .add_annotation(addr, AnnotationKind::Comment, &comment)?;
                     Ok(Some(format!("Added comment at 0x{:x}", addr)))
                 } else {
                     Ok(Some("Usage: comment <address> <text>".to_string()))
@@ -918,7 +974,8 @@ impl Repl {
                     } else {
                         format!("bookmark_{:x}", addr)
                     };
-                    self.session.add_annotation(addr, AnnotationKind::Bookmark, &label)?;
+                    self.session
+                        .add_annotation(addr, AnnotationKind::Bookmark, &label)?;
                     Ok(Some(format!("Bookmarked 0x{:x} as '{}'", addr, label)))
                 } else {
                     Ok(Some("Usage: bookmark <address> [label]".to_string()))
@@ -960,18 +1017,14 @@ impl Repl {
                     Ok(Some(output))
                 }
             }
-            "undo" => {
-                match self.session.undo()? {
-                    Some(msg) => Ok(Some(msg)),
-                    None => Ok(Some("Nothing to undo".to_string())),
-                }
-            }
-            "redo" => {
-                match self.session.redo()? {
-                    Some(msg) => Ok(Some(msg)),
-                    None => Ok(Some("Nothing to redo".to_string())),
-                }
-            }
+            "undo" => match self.session.undo()? {
+                Some(msg) => Ok(Some(msg)),
+                None => Ok(Some("Nothing to undo".to_string())),
+            },
+            "redo" => match self.session.redo()? {
+                Some(msg) => Ok(Some(msg)),
+                None => Ok(Some("Nothing to redo".to_string())),
+            },
             "delete" => {
                 if parts.len() >= 3 {
                     let addr = parse_address(parts[1])?;

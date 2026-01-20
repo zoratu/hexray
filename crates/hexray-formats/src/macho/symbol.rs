@@ -6,17 +6,17 @@ use crate::ParseError;
 use hexray_core::{Symbol, SymbolBinding, SymbolKind};
 
 // Symbol type masks
-const N_STAB: u8 = 0xE0;  // Debugging symbol
-const N_PEXT: u8 = 0x10;  // Private external
-const N_TYPE: u8 = 0x0E;  // Type mask
-const N_EXT: u8 = 0x01;   // External symbol
+const N_STAB: u8 = 0xE0; // Debugging symbol
+const N_PEXT: u8 = 0x10; // Private external
+const N_TYPE: u8 = 0x0E; // Type mask
+const N_EXT: u8 = 0x01; // External symbol
 
 // Symbol types (N_TYPE values)
-const N_UNDF: u8 = 0x0;   // Undefined
-const N_ABS: u8 = 0x2;    // Absolute
-const N_SECT: u8 = 0xE;   // Defined in section
-const N_PBUD: u8 = 0xC;   // Prebound undefined
-const N_INDR: u8 = 0xA;   // Indirect
+const N_UNDF: u8 = 0x0; // Undefined
+const N_ABS: u8 = 0x2; // Absolute
+const N_SECT: u8 = 0xE; // Defined in section
+const N_PBUD: u8 = 0xC; // Prebound undefined
+const N_INDR: u8 = 0xA; // Indirect
 
 /// A Mach-O symbol table entry (nlist).
 #[derive(Debug, Clone)]
@@ -48,8 +48,7 @@ impl Nlist {
 
         let n_value = if is_64 {
             u64::from_le_bytes([
-                data[8], data[9], data[10], data[11],
-                data[12], data[13], data[14], data[15],
+                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
             ])
         } else {
             u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as u64

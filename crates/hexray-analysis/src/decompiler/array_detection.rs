@@ -77,7 +77,10 @@ pub fn detect_array_access(addr: &Expr, deref_size: u8) -> Option<ArrayAccessInf
 /// Matches patterns like:
 /// - `base + index * size` -> `&base[index]`
 /// - `base + constant` -> `&base[constant / size]` (for aligned constants)
-pub fn detect_address_of_array_element(addr: &Expr, hinted_size: Option<usize>) -> Option<ArrayAccessInfo> {
+pub fn detect_address_of_array_element(
+    addr: &Expr,
+    hinted_size: Option<usize>,
+) -> Option<ArrayAccessInfo> {
     // Use hinted size or try common element sizes
     let sizes_to_try: Vec<usize> = if let Some(size) = hinted_size {
         vec![size]
@@ -109,7 +112,12 @@ pub fn detect_address_of_array_element(addr: &Expr, hinted_size: Option<usize>) 
 
 /// Detects `base + index * element_size` pattern.
 fn try_detect_scaled_access(addr: &Expr, expected_size: u8) -> Option<ArrayAccessInfo> {
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
         // Try: base + (index * size)
         if let Some((index, element_size)) = extract_mul_by_constant(right) {
             if element_size > 0 && (expected_size == 0 || element_size == expected_size as i128) {
@@ -140,7 +148,12 @@ fn try_detect_scaled_access(addr: &Expr, expected_size: u8) -> Option<ArrayAcces
 
 /// Detects `base + (index << shift)` pattern where `1 << shift == element_size`.
 fn try_detect_shift_pattern(addr: &Expr, expected_size: u8) -> Option<ArrayAccessInfo> {
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
         // Try: base + (index << shift)
         if let Some((index, shift_amount)) = extract_shift_left_by_constant(right) {
             let element_size = 1i128 << shift_amount;
@@ -173,7 +186,12 @@ fn try_detect_shift_pattern(addr: &Expr, expected_size: u8) -> Option<ArrayAcces
 
 /// Detects `base + constant` pattern where constant is a multiple of element_size.
 fn try_detect_constant_offset(addr: &Expr, expected_size: u8) -> Option<ArrayAccessInfo> {
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
         // Try: base + constant
         if let ExprKind::IntLit(offset) = &right.kind {
             if *offset != 0 {
@@ -190,7 +208,12 @@ fn try_detect_constant_offset(addr: &Expr, expected_size: u8) -> Option<ArrayAcc
     }
 
     // Handle subtraction: base - constant (negative index)
-    if let ExprKind::BinOp { op: BinOpKind::Sub, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Sub,
+        left,
+        right,
+    } = &addr.kind
+    {
         if let ExprKind::IntLit(offset) = &right.kind {
             if *offset != 0 {
                 return try_create_constant_index_access(left, -*offset, expected_size);
@@ -202,7 +225,11 @@ fn try_detect_constant_offset(addr: &Expr, expected_size: u8) -> Option<ArrayAcc
 }
 
 /// Creates an array access with a constant index from `base + offset`.
-fn try_create_constant_index_access(base: &Expr, offset: i128, expected_size: u8) -> Option<ArrayAccessInfo> {
+fn try_create_constant_index_access(
+    base: &Expr,
+    offset: i128,
+    expected_size: u8,
+) -> Option<ArrayAccessInfo> {
     let element_size = if expected_size > 0 {
         expected_size as i128
     } else {
@@ -232,7 +259,12 @@ fn try_detect_struct_array_access(addr: &Expr, deref_size: u8) -> Option<ArrayAc
     // Pattern: (base + index * stride) + field_offset
     // or: base + (index * stride + field_offset)
 
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
         // Try: (scaled_access) + constant
         if let ExprKind::IntLit(field_offset) = &right.kind {
             if let Some(mut info) = try_detect_scaled_access(left, 0) {
@@ -244,11 +276,8 @@ fn try_detect_struct_array_access(addr: &Expr, deref_size: u8) -> Option<ArrayAc
                 if *field_offset % (info.element_size as i128) == 0 {
                     // Aligned: can add to index
                     let additional_index = *field_offset / (info.element_size as i128);
-                    info.index = Expr::binop(
-                        BinOpKind::Add,
-                        info.index,
-                        Expr::int(additional_index),
-                    );
+                    info.index =
+                        Expr::binop(BinOpKind::Add, info.index, Expr::int(additional_index));
                     return Some(info);
                 }
                 // Unaligned: this is likely a struct field access
@@ -261,11 +290,8 @@ fn try_detect_struct_array_access(addr: &Expr, deref_size: u8) -> Option<ArrayAc
             if let Some(mut info) = try_detect_scaled_access(right, 0) {
                 if *field_offset % (info.element_size as i128) == 0 {
                     let additional_index = *field_offset / (info.element_size as i128);
-                    info.index = Expr::binop(
-                        BinOpKind::Add,
-                        Expr::int(additional_index),
-                        info.index,
-                    );
+                    info.index =
+                        Expr::binop(BinOpKind::Add, Expr::int(additional_index), info.index);
                     return Some(info);
                 }
             }
@@ -273,16 +299,18 @@ fn try_detect_struct_array_access(addr: &Expr, deref_size: u8) -> Option<ArrayAc
     }
 
     // Also try for shift patterns
-    if let ExprKind::BinOp { op: BinOpKind::Add, left, right } = &addr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
         if let ExprKind::IntLit(field_offset) = &right.kind {
             if let Some(mut info) = try_detect_shift_pattern(left, 0) {
                 if *field_offset % (info.element_size as i128) == 0 {
                     let additional_index = *field_offset / (info.element_size as i128);
-                    info.index = Expr::binop(
-                        BinOpKind::Add,
-                        info.index,
-                        Expr::int(additional_index),
-                    );
+                    info.index =
+                        Expr::binop(BinOpKind::Add, info.index, Expr::int(additional_index));
                     return Some(info);
                 }
             }
@@ -295,7 +323,12 @@ fn try_detect_struct_array_access(addr: &Expr, deref_size: u8) -> Option<ArrayAc
 
 /// Extracts (operand, constant) from `operand * constant` or `constant * operand`.
 fn extract_mul_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
-    if let ExprKind::BinOp { op: BinOpKind::Mul, left, right } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Mul,
+        left,
+        right,
+    } = &expr.kind
+    {
         // Try: expr * constant
         if let ExprKind::IntLit(n) = &right.kind {
             if *n > 0 && *n <= 1024 {
@@ -315,7 +348,12 @@ fn extract_mul_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
 
 /// Extracts (operand, shift_amount) from `operand << constant`.
 fn extract_shift_left_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
-    if let ExprKind::BinOp { op: BinOpKind::Shl, left, right } = &expr.kind {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Shl,
+        left,
+        right,
+    } = &expr.kind
+    {
         if let ExprKind::IntLit(n) = &right.kind {
             if *n >= 0 && *n <= 6 {
                 // Shift 0-6 = sizes 1-64
@@ -346,9 +384,8 @@ fn infer_element_size(offset: i128) -> i128 {
 ///
 /// This is the main entry point for array detection during expression simplification.
 pub fn try_transform_deref_to_array_access(addr: &Expr, size: u8) -> Option<Expr> {
-    detect_array_access(addr, size).map(|info| {
-        Expr::array_access(info.base, info.index, info.element_size)
-    })
+    detect_array_access(addr, size)
+        .map(|info| Expr::array_access(info.base, info.index, info.element_size))
 }
 
 /// Transforms an address expression into an address-of array element if a pattern is detected.
@@ -365,9 +402,9 @@ pub fn try_transform_to_address_of_array(addr: &Expr, hinted_size: Option<usize>
 pub fn is_likely_array_base(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Var(_) => true,
-        ExprKind::Deref { .. } => true, // Pointer through memory
+        ExprKind::Deref { .. } => true,  // Pointer through memory
         ExprKind::GotRef { .. } => true, // Global array
-        ExprKind::AddressOf(_) => true, // &something
+        ExprKind::AddressOf(_) => true,  // &something
         ExprKind::ArrayAccess { .. } => true, // Multidimensional array
         _ => false,
     }
@@ -413,7 +450,10 @@ mod tests {
         );
 
         let result = detect_array_access(&addr, 8);
-        assert!(result.is_some(), "Expected to detect array access (commutative)");
+        assert!(
+            result.is_some(),
+            "Expected to detect array access (commutative)"
+        );
 
         let info = result.unwrap();
         assert_eq!(info.element_size, 8);
@@ -438,14 +478,13 @@ mod tests {
     #[test]
     fn test_constant_offset_aligned() {
         // rbx + 0x10 (4-byte elements) -> rbx[4]
-        let addr = Expr::binop(
-            BinOpKind::Add,
-            var("rbx"),
-            Expr::int(0x10),
-        );
+        let addr = Expr::binop(BinOpKind::Add, var("rbx"), Expr::int(0x10));
 
         let result = detect_array_access(&addr, 4);
-        assert!(result.is_some(), "Expected to detect constant offset pattern");
+        assert!(
+            result.is_some(),
+            "Expected to detect constant offset pattern"
+        );
 
         let info = result.unwrap();
         assert_eq!(info.element_size, 4);
@@ -461,14 +500,13 @@ mod tests {
     #[test]
     fn test_constant_offset_8byte() {
         // rbx + 0x18 (8-byte elements) -> rbx[3]
-        let addr = Expr::binop(
-            BinOpKind::Add,
-            var("rbx"),
-            Expr::int(0x18),
-        );
+        let addr = Expr::binop(BinOpKind::Add, var("rbx"), Expr::int(0x18));
 
         let result = detect_array_access(&addr, 8);
-        assert!(result.is_some(), "Expected to detect constant offset pattern");
+        assert!(
+            result.is_some(),
+            "Expected to detect constant offset pattern"
+        );
 
         let info = result.unwrap();
         assert_eq!(info.element_size, 8);
@@ -483,14 +521,13 @@ mod tests {
     #[test]
     fn test_negative_constant_offset() {
         // rbx - 0x8 (8-byte elements) -> rbx[-1]
-        let addr = Expr::binop(
-            BinOpKind::Sub,
-            var("rbx"),
-            Expr::int(0x8),
-        );
+        let addr = Expr::binop(BinOpKind::Sub, var("rbx"), Expr::int(0x8));
 
         let result = detect_array_access(&addr, 8);
-        assert!(result.is_some(), "Expected to detect negative offset pattern");
+        assert!(
+            result.is_some(),
+            "Expected to detect negative offset pattern"
+        );
 
         let info = result.unwrap();
         if let ExprKind::IntLit(idx) = &info.index.kind {
@@ -519,8 +556,11 @@ mod tests {
         let info = result.unwrap();
         // Since 8 aligns to the 8-byte offset, we get 8-byte elements
         // with the constant offset handled separately
-        assert!(info.element_size == 8 || info.element_size == 16,
-            "Expected element_size 8 or 16, got {}", info.element_size);
+        assert!(
+            info.element_size == 8 || info.element_size == 16,
+            "Expected element_size 8 or 16, got {}",
+            info.element_size
+        );
     }
 
     #[test]
@@ -547,11 +587,7 @@ mod tests {
     #[test]
     fn test_no_match_unaligned() {
         // rbx + 5 with 4-byte expected size - unaligned, should not match
-        let addr = Expr::binop(
-            BinOpKind::Add,
-            var("rbx"),
-            Expr::int(5),
-        );
+        let addr = Expr::binop(BinOpKind::Add, var("rbx"), Expr::int(5));
 
         let result = detect_array_access(&addr, 4);
         assert!(result.is_none(), "Should not match unaligned offset");

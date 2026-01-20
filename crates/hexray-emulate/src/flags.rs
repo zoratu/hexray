@@ -30,7 +30,11 @@ impl Flags {
 
     /// Create flags from a concrete value (for test/cmp results).
     pub fn from_result(result: u64, size_bits: u32) -> Self {
-        let mask = if size_bits >= 64 { u64::MAX } else { (1u64 << size_bits) - 1 };
+        let mask = if size_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << size_bits) - 1
+        };
         let sign_bit = 1u64 << (size_bits - 1);
         let masked = result & mask;
 
@@ -46,7 +50,11 @@ impl Flags {
 
     /// Update flags for an addition operation.
     pub fn update_add(&mut self, a: u64, b: u64, result: u64, size_bits: u32) {
-        let mask = if size_bits >= 64 { u64::MAX } else { (1u64 << size_bits) - 1 };
+        let mask = if size_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << size_bits) - 1
+        };
         let sign_bit = 1u64 << (size_bits - 1);
 
         let a_masked = a & mask;
@@ -78,7 +86,11 @@ impl Flags {
 
     /// Update flags for a subtraction operation.
     pub fn update_sub(&mut self, a: u64, b: u64, result: u64, size_bits: u32) {
-        let mask = if size_bits >= 64 { u64::MAX } else { (1u64 << size_bits) - 1 };
+        let mask = if size_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << size_bits) - 1
+        };
         let sign_bit = 1u64 << (size_bits - 1);
 
         let a_masked = a & mask;
@@ -110,7 +122,11 @@ impl Flags {
 
     /// Update flags for a logical operation (AND, OR, XOR).
     pub fn update_logic(&mut self, result: u64, size_bits: u32) {
-        let mask = if size_bits >= 64 { u64::MAX } else { (1u64 << size_bits) - 1 };
+        let mask = if size_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << size_bits) - 1
+        };
         let sign_bit = 1u64 << (size_bits - 1);
         let r_masked = result & mask;
 
@@ -124,7 +140,11 @@ impl Flags {
 
     /// Update flags for an increment operation.
     pub fn update_inc(&mut self, value: u64, result: u64, size_bits: u32) {
-        let mask = if size_bits >= 64 { u64::MAX } else { (1u64 << size_bits) - 1 };
+        let mask = if size_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << size_bits) - 1
+        };
         let sign_bit = 1u64 << (size_bits - 1);
 
         let v_masked = value & mask;
@@ -140,7 +160,11 @@ impl Flags {
 
     /// Update flags for a decrement operation.
     pub fn update_dec(&mut self, value: u64, result: u64, size_bits: u32) {
-        let mask = if size_bits >= 64 { u64::MAX } else { (1u64 << size_bits) - 1 };
+        let mask = if size_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << size_bits) - 1
+        };
         let sign_bit = 1u64 << (size_bits - 1);
 
         let v_masked = value & mask;
@@ -163,46 +187,34 @@ impl Flags {
             ConditionCode::AE => self.cf.map(|f| !f),
             ConditionCode::E => self.zf,
             ConditionCode::NE => self.zf.map(|f| !f),
-            ConditionCode::BE => {
-                match (self.cf, self.zf) {
-                    (Some(cf), Some(zf)) => Some(cf || zf),
-                    _ => None,
-                }
-            }
-            ConditionCode::A => {
-                match (self.cf, self.zf) {
-                    (Some(cf), Some(zf)) => Some(!cf && !zf),
-                    _ => None,
-                }
-            }
+            ConditionCode::BE => match (self.cf, self.zf) {
+                (Some(cf), Some(zf)) => Some(cf || zf),
+                _ => None,
+            },
+            ConditionCode::A => match (self.cf, self.zf) {
+                (Some(cf), Some(zf)) => Some(!cf && !zf),
+                _ => None,
+            },
             ConditionCode::S => self.sf,
             ConditionCode::NS => self.sf.map(|f| !f),
             ConditionCode::P => self.pf,
             ConditionCode::NP => self.pf.map(|f| !f),
-            ConditionCode::L => {
-                match (self.sf, self.of) {
-                    (Some(sf), Some(of)) => Some(sf != of),
-                    _ => None,
-                }
-            }
-            ConditionCode::GE => {
-                match (self.sf, self.of) {
-                    (Some(sf), Some(of)) => Some(sf == of),
-                    _ => None,
-                }
-            }
-            ConditionCode::LE => {
-                match (self.zf, self.sf, self.of) {
-                    (Some(zf), Some(sf), Some(of)) => Some(zf || (sf != of)),
-                    _ => None,
-                }
-            }
-            ConditionCode::G => {
-                match (self.zf, self.sf, self.of) {
-                    (Some(zf), Some(sf), Some(of)) => Some(!zf && (sf == of)),
-                    _ => None,
-                }
-            }
+            ConditionCode::L => match (self.sf, self.of) {
+                (Some(sf), Some(of)) => Some(sf != of),
+                _ => None,
+            },
+            ConditionCode::GE => match (self.sf, self.of) {
+                (Some(sf), Some(of)) => Some(sf == of),
+                _ => None,
+            },
+            ConditionCode::LE => match (self.zf, self.sf, self.of) {
+                (Some(zf), Some(sf), Some(of)) => Some(zf || (sf != of)),
+                _ => None,
+            },
+            ConditionCode::G => match (self.zf, self.sf, self.of) {
+                (Some(zf), Some(sf), Some(of)) => Some(!zf && (sf == of)),
+                _ => None,
+            },
         }
     }
 
@@ -221,12 +233,24 @@ impl Flags {
         match (self.cf, self.pf, self.af, self.zf, self.sf, self.of) {
             (Some(cf), Some(pf), Some(af), Some(zf), Some(sf), Some(of)) => {
                 let mut flags = 0u64;
-                if cf { flags |= 1 << 0; }
-                if pf { flags |= 1 << 2; }
-                if af { flags |= 1 << 4; }
-                if zf { flags |= 1 << 6; }
-                if sf { flags |= 1 << 7; }
-                if of { flags |= 1 << 11; }
+                if cf {
+                    flags |= 1 << 0;
+                }
+                if pf {
+                    flags |= 1 << 2;
+                }
+                if af {
+                    flags |= 1 << 4;
+                }
+                if zf {
+                    flags |= 1 << 6;
+                }
+                if sf {
+                    flags |= 1 << 7;
+                }
+                if of {
+                    flags |= 1 << 11;
+                }
                 Value::Concrete(flags)
             }
             _ => Value::Unknown,

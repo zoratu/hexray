@@ -45,6 +45,7 @@ impl CallingConvention {
 /// Parameter type information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ParameterType {
     /// Void (for return type).
     Void,
@@ -61,6 +62,7 @@ pub enum ParameterType {
     /// File pointer (FILE*).
     FilePtr,
     /// Unknown type.
+    #[default]
     Unknown,
 }
 
@@ -93,12 +95,6 @@ impl ParameterType {
     }
 }
 
-impl Default for ParameterType {
-    fn default() -> Self {
-        ParameterType::Unknown
-    }
-}
-
 /// Function parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parameter {
@@ -119,7 +115,13 @@ impl Parameter {
 
     /// Create an int parameter.
     pub fn int(name: impl Into<String>) -> Self {
-        Self::new(name, ParameterType::Int { size: 4, signed: true })
+        Self::new(
+            name,
+            ParameterType::Int {
+                size: 4,
+                signed: true,
+            },
+        )
     }
 
     /// Create a size_t parameter.
@@ -193,7 +195,10 @@ impl FunctionSignature {
             pattern,
             size_hint: None,
             calling_convention: CallingConvention::default(),
-            return_type: ParameterType::Int { size: 4, signed: true },
+            return_type: ParameterType::Int {
+                size: 4,
+                signed: true,
+            },
             parameters: Vec::new(),
             variadic: false,
             library: "libc".to_string(),
@@ -283,7 +288,9 @@ impl FunctionSignature {
     /// Get the C function prototype string.
     pub fn to_c_prototype(&self) -> String {
         let ret = self.return_type.to_c_string();
-        let params: Vec<String> = self.parameters.iter()
+        let params: Vec<String> = self
+            .parameters
+            .iter()
             .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
             .collect();
 
@@ -311,7 +318,8 @@ mod tests {
 
     #[test]
     fn test_signature_create() {
-        let sig = FunctionSignature::from_hex("strlen", "55 48 89 E5").unwrap()
+        let sig = FunctionSignature::from_hex("strlen", "55 48 89 E5")
+            .unwrap()
             .with_param(Parameter::string("s"))
             .with_return_type(ParameterType::Size)
             .with_library("libc")
@@ -333,9 +341,13 @@ mod tests {
 
     #[test]
     fn test_c_prototype() {
-        let sig = FunctionSignature::from_hex("printf", "55 48 89 E5").unwrap()
+        let sig = FunctionSignature::from_hex("printf", "55 48 89 E5")
+            .unwrap()
             .with_param(Parameter::string("format"))
-            .with_return_type(ParameterType::Int { size: 4, signed: true })
+            .with_return_type(ParameterType::Int {
+                size: 4,
+                signed: true,
+            })
             .variadic();
 
         assert_eq!(sig.to_c_prototype(), "int printf(const char* format, ...)");
@@ -343,7 +355,8 @@ mod tests {
 
     #[test]
     fn test_c_prototype_void() {
-        let sig = FunctionSignature::from_hex("abort", "55 48 89 E5").unwrap()
+        let sig = FunctionSignature::from_hex("abort", "55 48 89 E5")
+            .unwrap()
             .with_return_type(ParameterType::Void);
 
         assert_eq!(sig.to_c_prototype(), "void abort(void)");

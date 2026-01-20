@@ -328,9 +328,8 @@ pub fn find_nm() -> Option<String> {
 
 /// Run objdump on a binary file.
 pub fn run_objdump(binary_path: &str, intel_syntax: bool) -> Result<Vec<u8>, std::io::Error> {
-    let objdump_cmd = find_objdump().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "objdump not found")
-    })?;
+    let objdump_cmd = find_objdump()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "objdump not found"))?;
 
     let mut cmd = Command::new(&objdump_cmd);
     cmd.arg("-d");
@@ -352,9 +351,8 @@ pub fn run_objdump(binary_path: &str, intel_syntax: bool) -> Result<Vec<u8>, std
 
 /// Run nm on a binary file.
 pub fn run_nm(binary_path: &str) -> Result<Vec<u8>, std::io::Error> {
-    let nm_cmd = find_nm().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "nm not found")
-    })?;
+    let nm_cmd = find_nm()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "nm not found"))?;
 
     let output = Command::new(nm_cmd).arg(binary_path).output()?;
     Ok(output.stdout)
@@ -362,9 +360,8 @@ pub fn run_nm(binary_path: &str) -> Result<Vec<u8>, std::io::Error> {
 
 /// Run nm with specific options.
 pub fn run_nm_with_options(binary_path: &str, options: &[&str]) -> Result<Vec<u8>, std::io::Error> {
-    let nm_cmd = find_nm().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "nm not found")
-    })?;
+    let nm_cmd = find_nm()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "nm not found"))?;
 
     let mut cmd = Command::new(nm_cmd);
     for opt in options {
@@ -660,15 +657,11 @@ pub fn compare_instructions(
 }
 
 /// Compare two sets of symbols.
-pub fn compare_symbols(
-    hexray: &[(u64, String)],
-    reference: &[(u64, String)],
-) -> SymbolDiffResult {
+pub fn compare_symbols(hexray: &[(u64, String)], reference: &[(u64, String)]) -> SymbolDiffResult {
     let mut result = SymbolDiffResult::new();
 
     // Build lookup maps
-    let hexray_by_name: HashMap<&str, u64> =
-        hexray.iter().map(|(a, n)| (n.as_str(), *a)).collect();
+    let hexray_by_name: HashMap<&str, u64> = hexray.iter().map(|(a, n)| (n.as_str(), *a)).collect();
     let reference_by_name: HashMap<&str, u64> =
         reference.iter().map(|(a, n)| (n.as_str(), *a)).collect();
 
@@ -721,9 +714,13 @@ pub fn compare_strings(hexray: &HashSet<String>, reference: &HashSet<String>) ->
     for s in reference {
         if !hexray.contains(s) {
             // Check for partial matches
-            let partial = hexray.iter().find(|h| h.contains(s.as_str()) || s.contains(h.as_str()));
+            let partial = hexray
+                .iter()
+                .find(|h| h.contains(s.as_str()) || s.contains(h.as_str()));
             if let Some(partial_match) = partial {
-                result.partial_matches.push((partial_match.clone(), s.clone()));
+                result
+                    .partial_matches
+                    .push((partial_match.clone(), s.clone()));
             } else {
                 result.reference_only.push(s.clone());
             }
@@ -834,7 +831,8 @@ Disassembly of section .text:
 
     #[test]
     fn test_parse_nm_output() {
-        let output = b"0000000000401000 T main\n0000000000401050 T helper\n                 U printf\n";
+        let output =
+            b"0000000000401000 T main\n0000000000401050 T helper\n                 U printf\n";
         let symbols = parse_nm_output(output);
         assert_eq!(symbols.len(), 3);
         assert_eq!(symbols[0].name, "main");
@@ -886,10 +884,7 @@ Disassembly of section .text:
 
     #[test]
     fn test_compare_symbols() {
-        let hexray = vec![
-            (0x1000, "main".to_string()),
-            (0x1050, "helper".to_string()),
-        ];
+        let hexray = vec![(0x1000, "main".to_string()), (0x1050, "helper".to_string())];
         let reference = vec![
             (0x1000, "main".to_string()),
             (0x1050, "helper".to_string()),
@@ -907,9 +902,13 @@ Disassembly of section .text:
         let hexray: HashSet<String> = ["Hello".to_string(), "World".to_string()]
             .into_iter()
             .collect();
-        let reference: HashSet<String> = ["Hello".to_string(), "World".to_string(), "Extra".to_string()]
-            .into_iter()
-            .collect();
+        let reference: HashSet<String> = [
+            "Hello".to_string(),
+            "World".to_string(),
+            "Extra".to_string(),
+        ]
+        .into_iter()
+        .collect();
 
         let result = compare_strings(&hexray, &reference);
         assert_eq!(result.total_strings, 3);

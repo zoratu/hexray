@@ -153,9 +153,7 @@ pub fn compare_strings_analyzed(binary_path: &str, min_len: usize) {
         .count();
     let utf16_count = hexray_strings
         .iter()
-        .filter(|s| {
-            s.encoding == StringEncoding::Utf16Le || s.encoding == StringEncoding::Utf16Be
-        })
+        .filter(|s| s.encoding == StringEncoding::Utf16Le || s.encoding == StringEncoding::Utf16Be)
         .count();
 
     println!("\nEncoding distribution:");
@@ -185,7 +183,10 @@ pub fn compare_strings_analyzed(binary_path: &str, min_len: usize) {
 
 /// Compare string detection with different length thresholds.
 pub fn compare_strings_at_thresholds(binary_path: &str) {
-    println!("\n=== String Comparison at Different Thresholds: {} ===", binary_path);
+    println!(
+        "\n=== String Comparison at Different Thresholds: {} ===",
+        binary_path
+    );
 
     for min_len in [4, 6, 8, 10] {
         let result = compare_binary_strings(binary_path, min_len);
@@ -218,9 +219,7 @@ pub fn compare_utf16_strings(binary_path: &str, min_len: usize) -> (usize, usize
     let hexray_utf16: HashSet<String> = detector
         .detect(&data, 0)
         .into_iter()
-        .filter(|s| {
-            s.encoding == StringEncoding::Utf16Le || s.encoding == StringEncoding::Utf16Be
-        })
+        .filter(|s| s.encoding == StringEncoding::Utf16Le || s.encoding == StringEncoding::Utf16Be)
         .map(|s| s.content)
         .collect();
 
@@ -530,7 +529,8 @@ mod tests {
     #[test]
     fn test_string_categories() {
         // Test string categorization
-        let data = b"/usr/bin/test\x00https://example.com\x00Error: failed to open\x00Normal string\x00";
+        let data =
+            b"/usr/bin/test\x00https://example.com\x00Error: failed to open\x00Normal string\x00";
         let detector = StringDetector::with_config(StringConfig {
             min_length: 4,
             ..Default::default()
@@ -539,7 +539,8 @@ mod tests {
 
         let paths: Vec<&DetectedString> = strings.iter().filter(|s| s.is_path()).collect();
         let urls: Vec<&DetectedString> = strings.iter().filter(|s| s.is_url()).collect();
-        let errors: Vec<&DetectedString> = strings.iter().filter(|s| s.is_error_message()).collect();
+        let errors: Vec<&DetectedString> =
+            strings.iter().filter(|s| s.is_error_message()).collect();
 
         assert!(!paths.is_empty(), "Should find path string");
         assert!(!urls.is_empty(), "Should find URL string");

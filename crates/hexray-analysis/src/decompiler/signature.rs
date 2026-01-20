@@ -37,7 +37,7 @@
 //! // Produces: int64_t function(int64_t arg0, int64_t arg1, int32_t arg2)
 //! ```
 
-use super::expression::{Expr, ExprKind, BinOpKind};
+use super::expression::{BinOpKind, Expr, ExprKind};
 use super::structurer::{StructuredCfg, StructuredNode};
 use std::collections::{HashMap, HashSet};
 
@@ -93,7 +93,9 @@ impl CallingConvention {
     /// Returns the list of floating-point argument registers.
     pub fn float_arg_registers(&self) -> &'static [&'static str] {
         match self {
-            CallingConvention::SystemV => &["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"],
+            CallingConvention::SystemV => &[
+                "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+            ],
             CallingConvention::Win64 => &["xmm0", "xmm1", "xmm2", "xmm3"],
             CallingConvention::Aarch64 => &["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"],
             CallingConvention::RiscV => &["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"],
@@ -132,8 +134,12 @@ impl CallingConvention {
         match self {
             CallingConvention::SystemV => &["rbx", "rbp", "r12", "r13", "r14", "r15"],
             CallingConvention::Win64 => &["rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15"],
-            CallingConvention::Aarch64 => &["x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30"],
-            CallingConvention::RiscV => &["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"],
+            CallingConvention::Aarch64 => &[
+                "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
+            ],
+            CallingConvention::RiscV => &[
+                "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+            ],
         }
     }
 
@@ -243,7 +249,11 @@ pub struct Parameter {
 
 impl Parameter {
     /// Creates a new parameter.
-    pub fn new(name: impl Into<String>, param_type: ParamType, location: ParameterLocation) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        param_type: ParamType,
+        location: ParameterLocation,
+    ) -> Self {
         Self {
             name: name.into(),
             param_type,
@@ -315,7 +325,9 @@ impl FunctionSignature {
                 format!("{} {}(void)", return_str, func_name)
             }
         } else {
-            let params: Vec<String> = self.parameters.iter()
+            let params: Vec<String> = self
+                .parameters
+                .iter()
                 .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
                 .collect();
 
@@ -336,7 +348,9 @@ impl FunctionSignature {
                 String::new()
             }
         } else {
-            let params: Vec<String> = self.parameters.iter()
+            let params: Vec<String> = self
+                .parameters
+                .iter()
                 .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
                 .collect();
 
@@ -427,19 +441,34 @@ impl SignatureRecovery {
                     self.analyze_statement(stmt, near_ret);
                 }
             }
-            StructuredNode::If { condition, then_body, else_body, .. } => {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
                 self.analyze_expr_reads(condition);
                 self.analyze_nodes(then_body, in_return_path);
                 if let Some(else_nodes) = else_body {
                     self.analyze_nodes(else_nodes, in_return_path);
                 }
             }
-            StructuredNode::While { condition, body, .. } |
-            StructuredNode::DoWhile { body, condition, .. } => {
+            StructuredNode::While {
+                condition, body, ..
+            }
+            | StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
                 self.analyze_expr_reads(condition);
                 self.analyze_nodes(body, false);
             }
-            StructuredNode::For { init, condition, update, body, .. } => {
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
                 if let Some(init_expr) = init {
                     self.analyze_statement(init_expr, false);
                 }
@@ -452,7 +481,12 @@ impl SignatureRecovery {
             StructuredNode::Loop { body } => {
                 self.analyze_nodes(body, false);
             }
-            StructuredNode::Switch { value, cases, default, .. } => {
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+                ..
+            } => {
                 self.analyze_expr_reads(value);
                 for (_, case_body) in cases {
                     self.analyze_nodes(case_body, in_return_path);
@@ -505,7 +539,8 @@ impl SignatureRecovery {
                             }
                             // Track the parameter name from the stack slot
                             if let Some(idx) = self.arg_register_index(&reg_lower) {
-                                self.param_names.insert(idx, format!("var_{:x}", offset.unsigned_abs()));
+                                self.param_names
+                                    .insert(idx, format!("var_{:x}", offset.unsigned_abs()));
                             }
                         }
                     }
@@ -588,7 +623,11 @@ impl SignatureRecovery {
             ExprKind::Cast { expr: inner, .. } => {
                 self.analyze_expr_reads(inner);
             }
-            ExprKind::Conditional { cond, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
                 self.analyze_expr_reads(cond);
                 self.analyze_expr_reads(then_expr);
                 self.analyze_expr_reads(else_expr);
@@ -631,11 +670,19 @@ impl SignatureRecovery {
     fn is_arg_register(&self, name: &str) -> bool {
         let name_lower = name.to_lowercase();
         // Check both 64-bit and 32-bit variants
-        self.convention.integer_arg_registers().iter()
+        self.convention
+            .integer_arg_registers()
+            .iter()
             .any(|r| r.to_lowercase() == name_lower)
-            || self.convention.integer_arg_registers_32().iter()
+            || self
+                .convention
+                .integer_arg_registers_32()
+                .iter()
                 .any(|r| r.to_lowercase() == name_lower)
-            || self.convention.float_arg_registers().iter()
+            || self
+                .convention
+                .float_arg_registers()
+                .iter()
                 .any(|r| r.to_lowercase() == name_lower)
     }
 
@@ -644,14 +691,22 @@ impl SignatureRecovery {
         let name_lower = name.to_lowercase();
 
         // Check 64-bit integer registers
-        if let Some(idx) = self.convention.integer_arg_registers().iter()
-            .position(|r| r.to_lowercase() == name_lower) {
+        if let Some(idx) = self
+            .convention
+            .integer_arg_registers()
+            .iter()
+            .position(|r| r.to_lowercase() == name_lower)
+        {
             return Some(idx);
         }
 
         // Check 32-bit integer registers
-        if let Some(idx) = self.convention.integer_arg_registers_32().iter()
-            .position(|r| r.to_lowercase() == name_lower) {
+        if let Some(idx) = self
+            .convention
+            .integer_arg_registers_32()
+            .iter()
+            .position(|r| r.to_lowercase() == name_lower)
+        {
             return Some(idx);
         }
 
@@ -712,7 +767,11 @@ impl SignatureRecovery {
         match &expr.kind {
             ExprKind::Var(var) => {
                 let size = self.reg_size_from_name(&var.name);
-                if size > 0 { Some(size) } else { None }
+                if size > 0 {
+                    Some(size)
+                } else {
+                    None
+                }
             }
             ExprKind::IntLit(n) => {
                 if *n >= i8::MIN as i128 && *n <= i8::MAX as i128 {
@@ -784,7 +843,9 @@ impl SignatureRecovery {
                 };
 
                 // Use a custom name if we have one
-                let name = self.param_names.get(&idx)
+                let name = self
+                    .param_names
+                    .get(&idx)
                     .cloned()
                     .unwrap_or_else(|| format!("arg{}", idx));
 
@@ -804,7 +865,8 @@ impl SignatureRecovery {
         for (idx, reg) in float_regs.iter().enumerate() {
             let reg_lower = reg.to_lowercase();
             if self.read_regs.contains(&reg_lower) {
-                sig.parameters.push(Parameter::from_float_register(idx, reg));
+                sig.parameters
+                    .push(Parameter::from_float_register(idx, reg));
             }
         }
 
@@ -831,7 +893,10 @@ impl SignatureRecovery {
 
 /// Checks if a register name is a frame pointer.
 fn is_frame_pointer(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(), "rbp" | "ebp" | "x29" | "fp" | "s0")
+    matches!(
+        name.to_lowercase().as_str(),
+        "rbp" | "ebp" | "x29" | "fp" | "s0"
+    )
 }
 
 #[cfg(test)]
@@ -874,12 +939,18 @@ mod tests {
         sig.parameters.push(Parameter::new(
             "arg0",
             ParamType::SignedInt(64),
-            ParameterLocation::IntegerRegister { name: "rdi".to_string(), index: 0 },
+            ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
         ));
         sig.parameters.push(Parameter::new(
             "arg1",
             ParamType::Pointer,
-            ParameterLocation::IntegerRegister { name: "rsi".to_string(), index: 1 },
+            ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
         ));
 
         let decl = sig.to_c_declaration("my_function");
@@ -906,7 +977,10 @@ mod tests {
         sig.parameters.push(Parameter::new(
             "fmt",
             ParamType::Pointer,
-            ParameterLocation::IntegerRegister { name: "rdi".to_string(), index: 0 },
+            ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
         ));
 
         let decl = sig.to_c_declaration("printf_like");
@@ -939,11 +1013,26 @@ mod tests {
 
     #[test]
     fn test_convention_from_architecture() {
-        assert_eq!(CallingConvention::from_architecture("aarch64"), CallingConvention::Aarch64);
-        assert_eq!(CallingConvention::from_architecture("arm64"), CallingConvention::Aarch64);
-        assert_eq!(CallingConvention::from_architecture("x86_64"), CallingConvention::SystemV);
-        assert_eq!(CallingConvention::from_architecture("x86_64-pc-windows-msvc"), CallingConvention::Win64);
-        assert_eq!(CallingConvention::from_architecture("riscv64"), CallingConvention::RiscV);
+        assert_eq!(
+            CallingConvention::from_architecture("aarch64"),
+            CallingConvention::Aarch64
+        );
+        assert_eq!(
+            CallingConvention::from_architecture("arm64"),
+            CallingConvention::Aarch64
+        );
+        assert_eq!(
+            CallingConvention::from_architecture("x86_64"),
+            CallingConvention::SystemV
+        );
+        assert_eq!(
+            CallingConvention::from_architecture("x86_64-pc-windows-msvc"),
+            CallingConvention::Win64
+        );
+        assert_eq!(
+            CallingConvention::from_architecture("riscv64"),
+            CallingConvention::RiscV
+        );
     }
 
     #[test]
@@ -1046,7 +1135,10 @@ mod tests {
         // Should detect 3 parameters
         assert_eq!(sig.parameters.len(), 3);
         // Third parameter should be 32-bit (from w2)
-        assert!(matches!(sig.parameters[2].param_type, ParamType::SignedInt(32)));
+        assert!(matches!(
+            sig.parameters[2].param_type,
+            ParamType::SignedInt(32)
+        ));
     }
 
     #[test]
@@ -1117,12 +1209,18 @@ mod tests {
         sig.parameters.push(Parameter::new(
             "arg0",
             ParamType::SignedInt(32),
-            ParameterLocation::IntegerRegister { name: "rdi".to_string(), index: 0 },
+            ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
         ));
         sig.parameters.push(Parameter::new(
             "arg1",
             ParamType::SignedInt(64),
-            ParameterLocation::IntegerRegister { name: "rsi".to_string(), index: 1 },
+            ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
         ));
 
         let params = sig.params_string();
@@ -1193,8 +1291,8 @@ mod tests {
         use hexray_core::BasicBlockId;
 
         // Function with mixed register sizes
-        let rdi = Expr::var(Variable::reg("rdi", 8));    // 64-bit
-        let esi = Expr::var(Variable::reg("esi", 4));    // 32-bit
+        let rdi = Expr::var(Variable::reg("rdi", 8)); // 64-bit
+        let esi = Expr::var(Variable::reg("esi", 4)); // 32-bit
 
         let add = Expr::binop(BinOpKind::Add, rdi, esi);
         let stmt = Expr::assign(Expr::var(Variable::reg("rax", 8)), add);
@@ -1215,8 +1313,14 @@ mod tests {
 
         assert_eq!(sig.parameters.len(), 2);
         // First param is 64-bit (from rdi)
-        assert!(matches!(sig.parameters[0].param_type, ParamType::SignedInt(64)));
+        assert!(matches!(
+            sig.parameters[0].param_type,
+            ParamType::SignedInt(64)
+        ));
         // Second param is 32-bit (from esi)
-        assert!(matches!(sig.parameters[1].param_type, ParamType::SignedInt(32)));
+        assert!(matches!(
+            sig.parameters[1].param_type,
+            ParamType::SignedInt(32)
+        ));
     }
 }

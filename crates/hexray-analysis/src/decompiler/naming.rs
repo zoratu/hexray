@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use super::expression::{Expr, ExprKind, BinOpKind};
+use super::expression::{BinOpKind, Expr, ExprKind};
 use super::structurer::StructuredNode;
 
 /// Naming context for tracking variable usage and generating names.
@@ -107,7 +107,13 @@ impl NamingContext {
     fn detect_loop_indices(&mut self, nodes: &[StructuredNode]) {
         for node in nodes {
             match node {
-                StructuredNode::For { init, condition, update, body, .. } => {
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
                     // For loops: the init expression typically initializes the loop var
                     if let Some(init_expr) = init {
                         if let Some(offset) = self.extract_stack_offset(init_expr) {
@@ -132,20 +138,28 @@ impl NamingContext {
                     }
                     self.detect_loop_indices(body);
                 }
-                StructuredNode::While { condition, body, .. } |
-                StructuredNode::DoWhile { body, condition, .. } => {
+                StructuredNode::While {
+                    condition, body, ..
+                }
+                | StructuredNode::DoWhile {
+                    body, condition, ..
+                } => {
                     // While loops: check if condition involves an incrementing variable
                     if let Some(offset) = self.extract_comparison_var(condition) {
                         // Check if this variable is incremented in the body
-                        if self.is_incremented_in_body(offset, body) {
-                            if !self.loop_indices.contains(&offset) {
-                                self.loop_indices.push(offset);
-                            }
+                        if self.is_incremented_in_body(offset, body)
+                            && !self.loop_indices.contains(&offset)
+                        {
+                            self.loop_indices.push(offset);
                         }
                     }
                     self.detect_loop_indices(body);
                 }
-                StructuredNode::If { then_body, else_body, .. } => {
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     self.detect_loop_indices(then_body);
                     if let Some(else_nodes) = else_body {
                         self.detect_loop_indices(else_nodes);
@@ -179,16 +193,20 @@ impl NamingContext {
                         self.analyze_statement_types(stmt);
                     }
                 }
-                StructuredNode::If { then_body, else_body, .. } => {
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
                     self.detect_type_patterns(then_body);
                     if let Some(else_nodes) = else_body {
                         self.detect_type_patterns(else_nodes);
                     }
                 }
-                StructuredNode::While { body, .. } |
-                StructuredNode::DoWhile { body, .. } |
-                StructuredNode::For { body, .. } |
-                StructuredNode::Loop { body } => {
+                StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::For { body, .. }
+                | StructuredNode::Loop { body } => {
                     self.detect_type_patterns(body);
                 }
                 StructuredNode::Switch { cases, default, .. } => {
@@ -235,7 +253,11 @@ impl NamingContext {
             // String literals
             ExprKind::IntLit(_) => TypeHint::Int,
             // Address-of suggests pointer
-            ExprKind::BinOp { op: BinOpKind::Add, left, .. } => {
+            ExprKind::BinOp {
+                op: BinOpKind::Add,
+                left,
+                ..
+            } => {
                 if self.is_likely_pointer(left) {
                     TypeHint::Pointer
                 } else {
@@ -251,10 +273,7 @@ impl NamingContext {
 
     /// Check if an expression looks like a pointer.
     fn is_likely_pointer(&self, expr: &Expr) -> bool {
-        matches!(&expr.kind,
-            ExprKind::Deref { .. } |
-            ExprKind::GotRef { .. }
-        )
+        matches!(&expr.kind, ExprKind::Deref { .. } | ExprKind::GotRef { .. })
     }
 
     /// Extract stack offset from an lvalue expression.
@@ -305,8 +324,15 @@ impl NamingContext {
             ExprKind::Assign { lhs, rhs } => {
                 let lhs_offset = self.extract_stack_offset(lhs)?;
                 // Check if rhs is lhs + constant
-                if let ExprKind::BinOp { op: BinOpKind::Add | BinOpKind::Sub, left, right } = &rhs.kind {
-                    if let (Some(rhs_offset), ExprKind::IntLit(_)) = (self.extract_stack_offset(left), &right.kind) {
+                if let ExprKind::BinOp {
+                    op: BinOpKind::Add | BinOpKind::Sub,
+                    left,
+                    right,
+                } = &rhs.kind
+                {
+                    if let (Some(rhs_offset), ExprKind::IntLit(_)) =
+                        (self.extract_stack_offset(left), &right.kind)
+                    {
                         if lhs_offset == rhs_offset {
                             return Some(lhs_offset);
                         }
@@ -372,15 +398,36 @@ impl NamingContext {
             match hint {
                 TypeHint::StringPtr => {
                     self.str_counter += 1;
-                    return format!("str{}", if self.str_counter == 1 { String::new() } else { self.str_counter.to_string() });
+                    return format!(
+                        "str{}",
+                        if self.str_counter == 1 {
+                            String::new()
+                        } else {
+                            self.str_counter.to_string()
+                        }
+                    );
                 }
                 TypeHint::Pointer => {
                     self.ptr_counter += 1;
-                    return format!("ptr{}", if self.ptr_counter == 1 { String::new() } else { self.ptr_counter.to_string() });
+                    return format!(
+                        "ptr{}",
+                        if self.ptr_counter == 1 {
+                            String::new()
+                        } else {
+                            self.ptr_counter.to_string()
+                        }
+                    );
                 }
                 TypeHint::Buffer => {
                     self.buf_counter += 1;
-                    return format!("buf{}", if self.buf_counter == 1 { String::new() } else { self.buf_counter.to_string() });
+                    return format!(
+                        "buf{}",
+                        if self.buf_counter == 1 {
+                            String::new()
+                        } else {
+                            self.buf_counter.to_string()
+                        }
+                    );
                 }
                 _ => {}
             }
@@ -409,11 +456,25 @@ impl NamingContext {
                 TypeHint::Float => return format!("f_{:x}", offset.unsigned_abs()),
                 TypeHint::StringPtr => {
                     self.str_counter += 1;
-                    return format!("str{}", if self.str_counter == 1 { String::new() } else { self.str_counter.to_string() });
+                    return format!(
+                        "str{}",
+                        if self.str_counter == 1 {
+                            String::new()
+                        } else {
+                            self.str_counter.to_string()
+                        }
+                    );
                 }
                 TypeHint::Pointer => {
                     self.ptr_counter += 1;
-                    return format!("ptr{}", if self.ptr_counter == 1 { String::new() } else { self.ptr_counter.to_string() });
+                    return format!(
+                        "ptr{}",
+                        if self.ptr_counter == 1 {
+                            String::new()
+                        } else {
+                            self.ptr_counter.to_string()
+                        }
+                    );
                 }
                 TypeHint::Counter => {
                     self.loop_counter += 1;
@@ -479,10 +540,14 @@ fn parse_var_offset(name: &str) -> Option<i128> {
 impl BinOpKind {
     /// Check if this is a comparison operator.
     fn is_comparison(&self) -> bool {
-        matches!(self,
-            BinOpKind::Eq | BinOpKind::Ne |
-            BinOpKind::Lt | BinOpKind::Le |
-            BinOpKind::Gt | BinOpKind::Ge
+        matches!(
+            self,
+            BinOpKind::Eq
+                | BinOpKind::Ne
+                | BinOpKind::Lt
+                | BinOpKind::Le
+                | BinOpKind::Gt
+                | BinOpKind::Ge
         )
     }
 }
@@ -574,7 +639,11 @@ mod tests {
 
         // Parameters should use arg_ prefix
         let name = ctx.get_name(8, true);
-        assert!(name.starts_with("arg_"), "Expected arg_ prefix, got: {}", name);
+        assert!(
+            name.starts_with("arg_"),
+            "Expected arg_ prefix, got: {}",
+            name
+        );
     }
 
     #[test]

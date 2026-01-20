@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use super::expression::{Expr, ExprKind, BinOpKind, Variable, VarKind};
+use super::expression::{BinOpKind, Expr, ExprKind, VarKind, Variable};
 use super::structurer::StructuredNode;
 
 /// An inferred struct type.
@@ -106,7 +106,10 @@ impl InferredType {
                 8 => "double".to_string(),
                 _ => format!("float{}", size * 8),
             },
-            InferredType::Array { element_type, count } => {
+            InferredType::Array {
+                element_type,
+                count,
+            } => {
                 if let Some(n) = count {
                     format!("{}[{}]", element_type.to_c_string(), n)
                 } else {
@@ -124,7 +127,10 @@ impl InferredType {
             InferredType::Pointer(_) | InferredType::StructPointer(_) => Some(8), // 64-bit
             InferredType::Bool => Some(1),
             InferredType::Float(s) => Some(*s),
-            InferredType::Array { element_type, count } => {
+            InferredType::Array {
+                element_type,
+                count,
+            } => {
                 let elem_size = element_type.size()?;
                 Some(elem_size * (*count)?)
             }
@@ -140,7 +146,7 @@ impl fmt::Display for InferredType {
 
 /// Tracks memory access information for a single access.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]  // Fields kept for future enhancements
+#[allow(dead_code)] // Fields kept for future enhancements
 struct MemoryAccess {
     /// Offset from base.
     offset: usize,
@@ -160,7 +166,7 @@ struct MemoryAccess {
 
 /// Tracks all accesses through a particular base variable.
 #[derive(Debug)]
-#[allow(dead_code)]  // base_name kept for debugging
+#[allow(dead_code)] // base_name kept for debugging
 struct BasePointerAccesses {
     /// The base variable name (e.g., "rbx", "arg_0").
     base_name: String,
@@ -177,10 +183,7 @@ impl BasePointerAccesses {
     }
 
     fn add_access(&mut self, access: MemoryAccess) {
-        self.accesses
-            .entry(access.offset)
-            .or_default()
-            .push(access);
+        self.accesses.entry(access.offset).or_default().push(access);
     }
 }
 
@@ -242,7 +245,11 @@ impl StructInference {
                     self.collect_accesses_from_expr(stmt);
                 }
             }
-            StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
                 self.collect_accesses_from_expr(condition);
                 for n in then_body {
                     self.collect_accesses_from_node(n);
@@ -265,7 +272,12 @@ impl StructInference {
                 }
                 self.collect_accesses_from_expr(condition);
             }
-            StructuredNode::For { init, condition, update, body } => {
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
                 if let Some(e) = init {
                     self.collect_accesses_from_expr(e);
                 }
@@ -282,7 +294,11 @@ impl StructInference {
                     self.collect_accesses_from_node(n);
                 }
             }
-            StructuredNode::Switch { value, cases, default } => {
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
                 self.collect_accesses_from_expr(value);
                 for (_, case_body) in cases {
                     for n in case_body {
@@ -358,7 +374,8 @@ impl StructInference {
         is_dereferenced: bool,
         is_arithmetic: bool,
     ) {
-        let entry = self.base_accesses
+        let entry = self
+            .base_accesses
             .entry(base.to_string())
             .or_insert_with(|| BasePointerAccesses::new(base.to_string()));
 
@@ -389,7 +406,11 @@ impl StructInference {
     fn extract_field_access_addr(&self, addr: &Expr) -> Option<(String, usize, usize)> {
         match &addr.kind {
             // base + offset
-            ExprKind::BinOp { op: BinOpKind::Add, left, right } => {
+            ExprKind::BinOp {
+                op: BinOpKind::Add,
+                left,
+                right,
+            } => {
                 // Left is base variable, right is offset
                 if let (ExprKind::Var(base), ExprKind::IntLit(offset)) = (&left.kind, &right.kind) {
                     if self.is_valid_base_register(&base.name) && *offset >= 0 {
@@ -404,7 +425,11 @@ impl StructInference {
                 }
             }
             // base - negative_offset (e.g., rbx + -8 is sometimes represented as rbx - 8)
-            ExprKind::BinOp { op: BinOpKind::Sub, left, right } => {
+            ExprKind::BinOp {
+                op: BinOpKind::Sub,
+                left,
+                right,
+            } => {
                 if let (ExprKind::Var(base), ExprKind::IntLit(offset)) = (&left.kind, &right.kind) {
                     // Negative offset means this isn't a forward struct field
                     // but could be a field before the pointer (rare, but possible)
@@ -428,10 +453,11 @@ impl StructInference {
     fn is_valid_base_register(&self, name: &str) -> bool {
         // Exclude stack/frame pointers as they are stack slots, not struct pointers
         // Also exclude temporary/scratch registers that are unlikely to hold struct pointers
-        !matches!(name,
+        !matches!(
+            name,
             "rsp" | "rbp" | "sp" | "x29" | "fp" |  // Stack/frame pointers
             "rip" | "pc" |                          // Instruction pointers
-            "rflags" | "eflags"                     // Flags
+            "rflags" | "eflags" // Flags
         )
     }
 
@@ -443,7 +469,11 @@ impl StructInference {
                     self.analyze_expr_usage(stmt);
                 }
             }
-            StructuredNode::If { condition, then_body, else_body } => {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
                 // Check if condition involves a field access
                 self.mark_comparison_types(condition);
                 self.analyze_usage_patterns_list(then_body);
@@ -451,12 +481,17 @@ impl StructInference {
                     self.analyze_usage_patterns_list(else_nodes);
                 }
             }
-            StructuredNode::While { condition, body } |
-            StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::While { condition, body }
+            | StructuredNode::DoWhile { body, condition } => {
                 self.mark_comparison_types(condition);
                 self.analyze_usage_patterns_list(body);
             }
-            StructuredNode::For { init, condition, update, body } => {
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
                 if let Some(e) = init {
                     self.analyze_expr_usage(e);
                 }
@@ -540,8 +575,14 @@ impl StructInference {
     /// Marks a field as being used in comparison (for signedness).
     fn mark_comparison_types(&mut self, condition: &Expr) {
         if let ExprKind::BinOp { op, left, right } = &condition.kind {
-            let is_signed = matches!(op, BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge);
-            let is_unsigned = matches!(op, BinOpKind::ULt | BinOpKind::ULe | BinOpKind::UGt | BinOpKind::UGe);
+            let is_signed = matches!(
+                op,
+                BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge
+            );
+            let is_unsigned = matches!(
+                op,
+                BinOpKind::ULt | BinOpKind::ULe | BinOpKind::UGt | BinOpKind::UGe
+            );
 
             if let Some((base, offset, size)) = self.extract_field_access(left) {
                 self.mark_field_signedness(&base, offset, size, is_signed, is_unsigned);
@@ -572,7 +613,14 @@ impl StructInference {
         }
     }
 
-    fn mark_field_signedness(&mut self, base: &str, offset: usize, _size: usize, is_signed: bool, is_unsigned: bool) {
+    fn mark_field_signedness(
+        &mut self,
+        base: &str,
+        offset: usize,
+        _size: usize,
+        is_signed: bool,
+        is_unsigned: bool,
+    ) {
         if let Some(accesses) = self.base_accesses.get_mut(base) {
             if let Some(access_list) = accesses.accesses.get_mut(&offset) {
                 for access in access_list.iter_mut() {
@@ -703,44 +751,37 @@ impl StructInference {
                     },
                 }
             }
-            ExprKind::Assign { lhs, rhs } => {
-                Expr {
-                    kind: ExprKind::Assign {
-                        lhs: Box::new(self.transform_expr_inner(lhs, false)),
-                        rhs: Box::new(self.transform_expr_inner(rhs, false)),
-                    },
-                }
-            }
-            ExprKind::BinOp { op, left, right } => {
-                Expr {
-                    kind: ExprKind::BinOp {
-                        op: *op,
-                        left: Box::new(self.transform_expr_inner(left, false)),
-                        right: Box::new(self.transform_expr_inner(right, false)),
-                    },
-                }
-            }
-            ExprKind::UnaryOp { op, operand } => {
-                Expr {
-                    kind: ExprKind::UnaryOp {
-                        op: *op,
-                        operand: Box::new(self.transform_expr_inner(operand, false)),
-                    },
-                }
-            }
-            ExprKind::Call { target, args } => {
-                Expr {
-                    kind: ExprKind::Call {
-                        target: target.clone(),
-                        args: args.iter().map(|a| self.transform_expr_inner(a, false)).collect(),
-                    },
-                }
-            }
-            ExprKind::AddressOf(inner) => {
-                Expr {
-                    kind: ExprKind::AddressOf(Box::new(self.transform_expr_inner(inner, true))),
-                }
-            }
+            ExprKind::Assign { lhs, rhs } => Expr {
+                kind: ExprKind::Assign {
+                    lhs: Box::new(self.transform_expr_inner(lhs, false)),
+                    rhs: Box::new(self.transform_expr_inner(rhs, false)),
+                },
+            },
+            ExprKind::BinOp { op, left, right } => Expr {
+                kind: ExprKind::BinOp {
+                    op: *op,
+                    left: Box::new(self.transform_expr_inner(left, false)),
+                    right: Box::new(self.transform_expr_inner(right, false)),
+                },
+            },
+            ExprKind::UnaryOp { op, operand } => Expr {
+                kind: ExprKind::UnaryOp {
+                    op: *op,
+                    operand: Box::new(self.transform_expr_inner(operand, false)),
+                },
+            },
+            ExprKind::Call { target, args } => Expr {
+                kind: ExprKind::Call {
+                    target: target.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| self.transform_expr_inner(a, false))
+                        .collect(),
+                },
+            },
+            ExprKind::AddressOf(inner) => Expr {
+                kind: ExprKind::AddressOf(Box::new(self.transform_expr_inner(inner, true))),
+            },
             // Other expressions pass through unchanged
             _ => expr.clone(),
         }
@@ -749,67 +790,72 @@ impl StructInference {
     /// Transforms all expressions in a structured node.
     pub fn transform_node(&self, node: &StructuredNode) -> StructuredNode {
         match node {
-            StructuredNode::Block { id, statements, address_range } => {
-                StructuredNode::Block {
-                    id: *id,
-                    statements: statements.iter().map(|s| self.transform_expr(s)).collect(),
-                    address_range: *address_range,
-                }
-            }
-            StructuredNode::If { condition, then_body, else_body } => {
-                StructuredNode::If {
-                    condition: self.transform_expr(condition),
-                    then_body: then_body.iter().map(|n| self.transform_node(n)).collect(),
-                    else_body: else_body.as_ref().map(|nodes| {
-                        nodes.iter().map(|n| self.transform_node(n)).collect()
-                    }),
-                }
-            }
-            StructuredNode::While { condition, body } => {
-                StructuredNode::While {
-                    condition: self.transform_expr(condition),
-                    body: body.iter().map(|n| self.transform_node(n)).collect(),
-                }
-            }
-            StructuredNode::DoWhile { body, condition } => {
-                StructuredNode::DoWhile {
-                    body: body.iter().map(|n| self.transform_node(n)).collect(),
-                    condition: self.transform_expr(condition),
-                }
-            }
-            StructuredNode::For { init, condition, update, body } => {
-                StructuredNode::For {
-                    init: init.as_ref().map(|e| self.transform_expr(e)),
-                    condition: self.transform_expr(condition),
-                    update: update.as_ref().map(|e| self.transform_expr(e)),
-                    body: body.iter().map(|n| self.transform_node(n)).collect(),
-                }
-            }
-            StructuredNode::Loop { body } => {
-                StructuredNode::Loop {
-                    body: body.iter().map(|n| self.transform_node(n)).collect(),
-                }
-            }
-            StructuredNode::Switch { value, cases, default } => {
-                StructuredNode::Switch {
-                    value: self.transform_expr(value),
-                    cases: cases.iter().map(|(vals, body)| {
-                        (vals.clone(), body.iter().map(|n| self.transform_node(n)).collect())
-                    }).collect(),
-                    default: default.as_ref().map(|nodes| {
-                        nodes.iter().map(|n| self.transform_node(n)).collect()
-                    }),
-                }
-            }
+            StructuredNode::Block {
+                id,
+                statements,
+                address_range,
+            } => StructuredNode::Block {
+                id: *id,
+                statements: statements.iter().map(|s| self.transform_expr(s)).collect(),
+                address_range: *address_range,
+            },
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => StructuredNode::If {
+                condition: self.transform_expr(condition),
+                then_body: then_body.iter().map(|n| self.transform_node(n)).collect(),
+                else_body: else_body
+                    .as_ref()
+                    .map(|nodes| nodes.iter().map(|n| self.transform_node(n)).collect()),
+            },
+            StructuredNode::While { condition, body } => StructuredNode::While {
+                condition: self.transform_expr(condition),
+                body: body.iter().map(|n| self.transform_node(n)).collect(),
+            },
+            StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+                body: body.iter().map(|n| self.transform_node(n)).collect(),
+                condition: self.transform_expr(condition),
+            },
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+            } => StructuredNode::For {
+                init: init.as_ref().map(|e| self.transform_expr(e)),
+                condition: self.transform_expr(condition),
+                update: update.as_ref().map(|e| self.transform_expr(e)),
+                body: body.iter().map(|n| self.transform_node(n)).collect(),
+            },
+            StructuredNode::Loop { body } => StructuredNode::Loop {
+                body: body.iter().map(|n| self.transform_node(n)).collect(),
+            },
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => StructuredNode::Switch {
+                value: self.transform_expr(value),
+                cases: cases
+                    .iter()
+                    .map(|(vals, body)| {
+                        (
+                            vals.clone(),
+                            body.iter().map(|n| self.transform_node(n)).collect(),
+                        )
+                    })
+                    .collect(),
+                default: default
+                    .as_ref()
+                    .map(|nodes| nodes.iter().map(|n| self.transform_node(n)).collect()),
+            },
             StructuredNode::Sequence(nodes) => {
                 StructuredNode::Sequence(nodes.iter().map(|n| self.transform_node(n)).collect())
             }
-            StructuredNode::Return(Some(e)) => {
-                StructuredNode::Return(Some(self.transform_expr(e)))
-            }
-            StructuredNode::Expr(e) => {
-                StructuredNode::Expr(self.transform_expr(e))
-            }
+            StructuredNode::Return(Some(e)) => StructuredNode::Return(Some(self.transform_expr(e))),
+            StructuredNode::Expr(e) => StructuredNode::Expr(self.transform_expr(e)),
             // Other nodes pass through unchanged
             _ => node.clone(),
         }
@@ -830,8 +876,12 @@ impl StructInference {
                     output.push_str(&format!("    char _padding_{}[{}];\n", prev_end, padding));
                 }
 
-                output.push_str(&format!("    {} {};  // offset {:#x}\n",
-                    field.field_type.to_c_string(), field.name, field.offset));
+                output.push_str(&format!(
+                    "    {} {};  // offset {:#x}\n",
+                    field.field_type.to_c_string(),
+                    field.name,
+                    field.offset
+                ));
 
                 prev_end = field.offset + field.size;
             }
@@ -851,17 +901,26 @@ impl Default for StructInference {
 
 /// Checks if an operator is an arithmetic operation.
 fn is_arithmetic_op(op: BinOpKind) -> bool {
-    matches!(op,
-        BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div | BinOpKind::Mod |
-        BinOpKind::And | BinOpKind::Or | BinOpKind::Xor |
-        BinOpKind::Shl | BinOpKind::Shr | BinOpKind::Sar
+    matches!(
+        op,
+        BinOpKind::Add
+            | BinOpKind::Sub
+            | BinOpKind::Mul
+            | BinOpKind::Div
+            | BinOpKind::Mod
+            | BinOpKind::And
+            | BinOpKind::Or
+            | BinOpKind::Xor
+            | BinOpKind::Shl
+            | BinOpKind::Shr
+            | BinOpKind::Sar
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompiler::expression::{Variable, VarKind};
+    use crate::decompiler::expression::{VarKind, Variable};
     use hexray_core::BasicBlockId;
 
     fn make_var(name: &str, size: u8) -> Expr {
@@ -948,7 +1007,10 @@ mod tests {
             InferredType::Pointer(Box::new(InferredType::SignedInt(1))).to_c_string(),
             "int8_t*"
         );
-        assert_eq!(InferredType::StructPointer("foo".to_string()).to_c_string(), "struct foo*");
+        assert_eq!(
+            InferredType::StructPointer("foo".to_string()).to_c_string(),
+            "struct foo*"
+        );
     }
 
     #[test]
@@ -992,7 +1054,7 @@ mod tests {
         assert!(output.contains("field_0"));
         assert!(output.contains("field_8"));
         assert!(output.contains("field_10"));
-        assert!(output.contains("unknown*"));  // pointer to unknown
+        assert!(output.contains("unknown*")); // pointer to unknown
         assert!(output.contains("int32_t"));
         assert!(output.contains("uint64_t"));
     }
@@ -1006,9 +1068,7 @@ mod tests {
 
         let block = StructuredNode::Block {
             id: BasicBlockId::new(0),
-            statements: vec![
-                Expr::assign(make_var("rax", 8), access),
-            ],
+            statements: vec![Expr::assign(make_var("rax", 8), access)],
             address_range: (0x1000, 0x1010),
         };
 
@@ -1035,7 +1095,7 @@ mod tests {
             address_range: (0x1000, 0x1020),
         };
 
-        inference.analyze(&[block.clone()]);
+        inference.analyze(std::slice::from_ref(&block));
 
         // Transform the block
         let transformed = inference.transform_node(&block);

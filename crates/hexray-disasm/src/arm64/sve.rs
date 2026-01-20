@@ -18,9 +18,8 @@
 
 use crate::DecodedInstruction;
 use hexray_core::{
-    Architecture, Instruction, MemoryRef, Operand, Operation,
-    Register, RegisterClass,
-    register::arm64,
+    register::arm64, Architecture, Instruction, MemoryRef, Operand, Operation, Register,
+    RegisterClass,
 };
 
 /// SVE decoder implementation.
@@ -96,7 +95,7 @@ impl SveDecoder {
             let bits_15_10 = (insn >> 10) & 0x3F;
             // SQABS/SQNEG: bits[23:22]=size, bits[20:16]=opc, bits[15:10]=opc2
             if bits_23_21 == 0b001 && (bits_15_10 & 0x38) == 0x30 {
-                return true;  // Saturating operations
+                return true; // Saturating operations
             }
         }
 
@@ -113,12 +112,7 @@ impl SveDecoder {
     }
 
     /// Decode an SVE/SVE2 instruction.
-    pub fn decode(
-        &self,
-        insn: u32,
-        address: u64,
-        bytes: Vec<u8>,
-    ) -> Option<DecodedInstruction> {
+    pub fn decode(&self, insn: u32, address: u64, bytes: Vec<u8>) -> Option<DecodedInstruction> {
         let bits_31_24 = (insn >> 24) & 0xFF;
 
         match bits_31_24 {
@@ -132,9 +126,7 @@ impl SveDecoder {
             0x45 => self.decode_sve2_crypto(insn, address, bytes),
 
             // SVE memory operations (loads: 0x84, 0x85, 0xA4, 0xA5; stores: 0xE4, 0xE5)
-            0x84 | 0x85 | 0xA4 | 0xA5 | 0xE4 | 0xE5 => {
-                self.decode_sve_memory(insn, address, bytes)
-            }
+            0x84 | 0x85 | 0xA4 | 0xA5 | 0xE4 | 0xE5 => self.decode_sve_memory(insn, address, bytes),
 
             _ => None,
         }
@@ -236,7 +228,7 @@ impl SveDecoder {
         } else {
             // Binary predicated: Zd.<T>, Pg/M, Zd.<T>, Zm.<T>
             vec![
-                Operand::reg(zd_reg.clone()),
+                Operand::reg(zd_reg),
                 Operand::reg(pred),
                 Operand::reg(zd_reg),
                 Operand::reg(Self::zreg(zn_or_zm)),
@@ -247,7 +239,10 @@ impl SveDecoder {
             .with_operation(operation)
             .with_operands(operands);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE2 integer multiply-add and absolute difference (SABA, UABA, etc.).
@@ -283,7 +278,10 @@ impl SveDecoder {
                 Operand::reg(zm_reg),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE2 bit manipulation operations (BDEP, BEXT, BGRP).
@@ -320,7 +318,10 @@ impl SveDecoder {
                 Operand::reg(zm_reg),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE2 crypto instructions (AESE, AESD, AESMC, AESIMC, SM4E, SM4EKEY, RAX1).
@@ -354,15 +355,12 @@ impl SveDecoder {
 
             let operands = if is_mix_columns {
                 // AESMC/AESIMC: Zdn.B, Zdn.B (in-place)
-                vec![
-                    Operand::reg(zdn_reg.clone()),
-                    Operand::reg(zdn_reg),
-                ]
+                vec![Operand::reg(zdn_reg), Operand::reg(zdn_reg)]
             } else {
                 // AESE/AESD: Zdn.B, Zdn.B, Zm.B
                 let zm_reg = Self::zreg(zm_or_zn);
                 vec![
-                    Operand::reg(zdn_reg.clone()),
+                    Operand::reg(zdn_reg),
                     Operand::reg(zdn_reg),
                     Operand::reg(zm_reg),
                 ]
@@ -372,7 +370,10 @@ impl SveDecoder {
                 .with_operation(Operation::Sve2Aes)
                 .with_operands(operands);
 
-            return Some(DecodedInstruction { instruction: inst, size: 4 });
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // SM4E: 0100_0101_00_10_0011_1110_00_nnnnn_ddddd
@@ -383,12 +384,15 @@ impl SveDecoder {
             let inst = Instruction::new(address, 4, bytes, "sm4e")
                 .with_operation(Operation::Sve2Sm4)
                 .with_operands(vec![
-                    Operand::reg(zdn_reg.clone()),
+                    Operand::reg(zdn_reg),
                     Operand::reg(zdn_reg),
                     Operand::reg(zn_reg),
                 ]);
 
-            return Some(DecodedInstruction { instruction: inst, size: 4 });
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // SM4EKEY: 0100_0101_00_10_0000_1111_00_mmmmm_nnnnn_ddddd
@@ -406,7 +410,10 @@ impl SveDecoder {
                     Operand::reg(zm_reg),
                 ]);
 
-            return Some(DecodedInstruction { instruction: inst, size: 4 });
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // RAX1 (SHA3): 0100_0101_00_1_mmmmm_1111_01_nnnnn_ddddd
@@ -423,7 +430,10 @@ impl SveDecoder {
                     Operand::reg(zm_reg),
                 ]);
 
-            return Some(DecodedInstruction { instruction: inst, size: 4 });
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // Histogram operations (HISTCNT, HISTSEG)
@@ -448,7 +458,10 @@ impl SveDecoder {
                     Operand::reg(zm_reg),
                 ]);
 
-            return Some(DecodedInstruction { instruction: inst, size: 4 });
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // Match operations (MATCH, NMATCH)
@@ -475,7 +488,10 @@ impl SveDecoder {
                     Operand::reg(zm_reg),
                 ]);
 
-            return Some(DecodedInstruction { instruction: inst, size: 4 });
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
         }
 
         // Fallback
@@ -524,7 +540,10 @@ impl SveDecoder {
             .with_operation(Operation::SveCount)
             .with_operands(operands);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE DUP instruction (broadcast scalar to vector).
@@ -539,16 +558,23 @@ impl SveDecoder {
         let zd = (insn & 0x1F) as u16;
 
         let zreg = Self::zreg(zd);
-        let src = if size == 3 { Self::xreg(rn) } else { Self::wreg(rn) };
+        let src = if size == 3 {
+            Self::xreg(rn)
+        } else {
+            Self::wreg(rn)
+        };
 
         let _suffix = Self::sve_size_suffix(size);
-        let mnemonic = format!("dup");
+        let mnemonic = "dup".to_string();
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(Operation::SveDup)
             .with_operands(vec![Operand::reg(zreg), Operand::reg(src)]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE integer arithmetic instructions.
@@ -580,13 +606,16 @@ impl SveDecoder {
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(operation)
             .with_operands(vec![
-                Operand::reg(zd.clone()),
+                Operand::reg(zd),
                 Operand::reg(pred),
                 Operand::reg(zd),
                 Operand::reg(z_src),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE PTRUE instruction.
@@ -610,7 +639,10 @@ impl SveDecoder {
                 Operand::imm_unsigned(pattern as u64, 8),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE predicate operations.
@@ -653,13 +685,13 @@ impl SveDecoder {
 
         // Check for contiguous loads (LD1B, LD1H, LD1W, LD1D)
         // General pattern: 1010_010x for loads
-        if (op_hi & 0b1111_110) == 0b1010_010 {
+        if (op_hi & 0b111_1110) == 0b101_0010 {
             return self.decode_sve_contiguous_load(insn, address, bytes);
         }
 
         // Check for contiguous stores (ST1B, ST1H, ST1W, ST1D)
         // General pattern: 1110_010x for stores
-        if (op_hi & 0b1111_110) == 0b1110_010 {
+        if (op_hi & 0b111_1110) == 0b111_0010 {
             return self.decode_sve_contiguous_store(insn, address, bytes);
         }
 
@@ -678,7 +710,7 @@ impl SveDecoder {
         // LD1W (scalar+immediate): 1010_0101_010_imm4_010_pg_rn_zt (size=10)
         // etc.
 
-        let dtype = (insn >> 21) & 0xF;  // Data type encoding
+        let dtype = (insn >> 21) & 0xF; // Data type encoding
         let imm4 = ((insn >> 16) & 0xF) as i64;
         let pg = ((insn >> 10) & 0x7) as u16;
         let rn = ((insn >> 5) & 0x1F) as u16;
@@ -687,7 +719,7 @@ impl SveDecoder {
         // Decode data type to get element size and signedness
         let (mnemonic, elem_size) = match dtype {
             0b0000 => ("ld1b", 1),
-            0b0001 => ("ld1b", 1),  // ld1b with different size
+            0b0001 => ("ld1b", 1), // ld1b with different size
             0b0010 => ("ld1b", 1),
             0b0011 => ("ld1b", 1),
             0b0100 => ("ld1sw", 4), // sign-extended word
@@ -725,7 +757,10 @@ impl SveDecoder {
                 Operand::Memory(mem),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE contiguous store instructions (ST1B, ST1H, ST1W, ST1D).
@@ -776,7 +811,10 @@ impl SveDecoder {
                 Operand::Memory(mem),
             ]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode a generic SVE instruction (fallback).
@@ -793,7 +831,10 @@ impl SveDecoder {
             .with_operation(Operation::Other(0x200))
             .with_operands(vec![Operand::reg(zreg)]);
 
-        Some(DecodedInstruction { instruction: inst, size: 4 })
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     // Helper functions for register creation
@@ -1008,7 +1049,7 @@ mod tests {
     #[test]
     fn test_sve2_crypto_recognized() {
         // SVE2 crypto instructions use bits[31:24] = 0x45
-        assert!(SveDecoder::is_sve_instruction(0x45228000));  // Example AES encoding
+        assert!(SveDecoder::is_sve_instruction(0x45228000)); // Example AES encoding
     }
 
     #[test]
@@ -1017,7 +1058,7 @@ mod tests {
         assert!(SveDecoder::is_sve2_instruction(0x45000000));
 
         // Regular SVE instruction should not be SVE2-specific
-        assert!(!SveDecoder::is_sve2_instruction(0x04EE0FE0));  // CNTD
+        assert!(!SveDecoder::is_sve2_instruction(0x04EE0FE0)); // CNTD
     }
 
     #[test]

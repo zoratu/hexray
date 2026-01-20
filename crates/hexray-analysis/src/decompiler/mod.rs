@@ -7,25 +7,25 @@
 //! 2. **Expression Recovery** - Convert instructions to high-level expressions
 //! 3. **Pseudo-code Emission** - Generate readable pseudo-code output
 
-mod expression;
-mod structurer;
-mod emitter;
-mod naming;
-mod struct_inference;
-mod switch_recovery;
-mod signature;
 pub mod array_detection;
+mod emitter;
+mod expression;
+mod naming;
+mod signature;
+mod struct_inference;
+mod structurer;
+mod switch_recovery;
 
-pub use expression::{Expr, ExprKind, Variable, BinOpKind, UnaryOpKind};
-pub use structurer::{StructuredCfg, StructuredNode, LoopKind};
-pub use switch_recovery::{SwitchRecovery, SwitchInfo, SwitchKind, JumpTableInfo};
 pub use emitter::PseudoCodeEmitter;
+pub use expression::{BinOpKind, Expr, ExprKind, UnaryOpKind, Variable};
 pub use naming::{NamingContext, TypeHint};
-pub use struct_inference::{StructInference, InferredStruct, InferredField, InferredType};
 pub use signature::{
-    CallingConvention, FunctionSignature, Parameter, ParameterLocation,
-    ParamType, SignatureRecovery,
+    CallingConvention, FunctionSignature, ParamType, Parameter, ParameterLocation,
+    SignatureRecovery,
 };
+pub use struct_inference::{InferredField, InferredStruct, InferredType, StructInference};
+pub use structurer::{LoopKind, StructuredCfg, StructuredNode};
+pub use switch_recovery::{JumpTableInfo, SwitchInfo, SwitchKind, SwitchRecovery};
 
 use hexray_core::ControlFlowGraph;
 use hexray_types::TypeDatabase;
@@ -224,7 +224,8 @@ impl RelocationTable {
 
     /// Gets all data relocations within an address range, sorted by address.
     pub fn get_data_in_range(&self, start: u64, end: u64) -> Vec<(u64, &str)> {
-        let mut results: Vec<_> = self.data_relocations
+        let mut results: Vec<_> = self
+            .data_relocations
             .iter()
             .filter(|(addr, _)| **addr >= start && **addr < end)
             .map(|(addr, name)| (*addr, name.as_str()))
@@ -235,7 +236,9 @@ impl RelocationTable {
 
     /// Returns true if the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.call_relocations.is_empty() && self.data_relocations.is_empty() && self.got_symbols.is_empty()
+        self.call_relocations.is_empty()
+            && self.data_relocations.is_empty()
+            && self.got_symbols.is_empty()
     }
 
     /// Returns the number of data relocations.
@@ -456,7 +459,9 @@ impl Decompiler {
         let structured = if self.enable_struct_inference {
             let mut inference = StructInference::new();
             inference.analyze(&structured.body);
-            let transformed_body: Vec<_> = structured.body.iter()
+            let transformed_body: Vec<_> = structured
+                .body
+                .iter()
                 .map(|n| inference.transform_node(n))
                 .collect();
             StructuredCfg {
@@ -516,7 +521,12 @@ impl Decompiler {
         lines.push("// Exception handling:".to_string());
 
         for (i, try_block) in info.try_blocks.iter().enumerate() {
-            lines.push(format!("//   try block {}: {:#x}-{:#x}", i + 1, try_block.start, try_block.end));
+            lines.push(format!(
+                "//   try block {}: {:#x}-{:#x}",
+                i + 1,
+                try_block.start,
+                try_block.end
+            ));
             for handler in &try_block.handlers {
                 let type_str = if handler.is_catch_all {
                     "catch(...)".to_string()
@@ -525,12 +535,18 @@ impl Decompiler {
                 } else {
                     "catch(?)".to_string()
                 };
-                lines.push(format!("//     {} -> landing pad {:#x}", type_str, handler.landing_pad));
+                lines.push(format!(
+                    "//     {} -> landing pad {:#x}",
+                    type_str, handler.landing_pad
+                ));
             }
         }
 
         if !info.cleanup_handlers.is_empty() {
-            lines.push(format!("//   {} cleanup handler(s)", info.cleanup_handlers.len()));
+            lines.push(format!(
+                "//   {} cleanup handler(s)",
+                info.cleanup_handlers.len()
+            ));
         }
 
         Some(lines.join("\n"))
@@ -554,19 +570,26 @@ impl Decompiler {
         // Add vtable assignments
         if !analysis.vtable_assignments.is_empty() {
             for va in &analysis.vtable_assignments {
-                let class_name = self.rtti_database
+                let class_name = self
+                    .rtti_database
                     .as_ref()
                     .and_then(|db| db.class_name_for_vtable(va.vtable_addr))
                     .unwrap_or("unknown");
-                lines.push(format!("// Vtable at offset {}: {} ({:#x})",
-                    va.object_offset, class_name, va.vtable_addr));
+                lines.push(format!(
+                    "// Vtable at offset {}: {} ({:#x})",
+                    va.object_offset, class_name, va.vtable_addr
+                ));
             }
         }
 
         // Add base class calls
         if !analysis.base_calls.is_empty() {
             for bc in &analysis.base_calls {
-                let kind_str = if bc.is_constructor { "constructor" } else { "destructor" };
+                let kind_str = if bc.is_constructor {
+                    "constructor"
+                } else {
+                    "destructor"
+                };
                 let target = bc.class_name.as_deref().unwrap_or("unknown");
                 lines.push(format!("// Calls base {} of {}", kind_str, target));
             }
@@ -574,7 +597,10 @@ impl Decompiler {
 
         // Add confidence if not high
         if analysis.confidence < 0.8 {
-            lines.push(format!("// Confidence: {:.0}%", analysis.confidence * 100.0));
+            lines.push(format!(
+                "// Confidence: {:.0}%",
+                analysis.confidence * 100.0
+            ));
         }
 
         if lines.is_empty() {
@@ -615,7 +641,11 @@ impl Decompiler {
     ///
     /// This combines `infer_structs` and `decompile` for convenience.
     /// Returns a tuple of (struct_definitions, pseudo_code).
-    pub fn decompile_with_structs(&self, cfg: &ControlFlowGraph, func_name: &str) -> (String, String) {
+    pub fn decompile_with_structs(
+        &self,
+        cfg: &ControlFlowGraph,
+        func_name: &str,
+    ) -> (String, String) {
         let structured = StructuredCfg::from_cfg(cfg);
 
         // Run struct inference
@@ -626,7 +656,9 @@ impl Decompiler {
         let struct_defs = inference.generate_struct_definitions();
 
         // Transform expressions to use field access
-        let transformed_body: Vec<_> = structured.body.iter()
+        let transformed_body: Vec<_> = structured
+            .body
+            .iter()
             .map(|n| inference.transform_node(n))
             .collect();
         let transformed = StructuredCfg {
@@ -655,7 +687,9 @@ impl Decompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, Condition, Instruction, Operation, ControlFlow};
+    use hexray_core::{
+        BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlow, Instruction, Operation,
+    };
 
     fn make_simple_cfg() -> ControlFlowGraph {
         // Simple if/else:
@@ -675,8 +709,7 @@ mod tests {
         // Entry block
         let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
         bb0.push_instruction(
-            Instruction::new(0x1000, 4, vec![0; 4], "cmp")
-                .with_operation(Operation::Compare)
+            Instruction::new(0x1000, 4, vec![0; 4], "cmp").with_operation(Operation::Compare),
         );
         bb0.terminator = BlockTerminator::ConditionalBranch {
             condition: Condition::Equal,
@@ -688,19 +721,21 @@ mod tests {
         // Then block
         let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1004);
         bb1.push_instruction(
-            Instruction::new(0x1004, 4, vec![0; 4], "add")
-                .with_operation(Operation::Add)
+            Instruction::new(0x1004, 4, vec![0; 4], "add").with_operation(Operation::Add),
         );
-        bb1.terminator = BlockTerminator::Jump { target: BasicBlockId::new(3) };
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
         cfg.add_block(bb1);
 
         // Else block
         let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1008);
         bb2.push_instruction(
-            Instruction::new(0x1008, 4, vec![0; 4], "sub")
-                .with_operation(Operation::Sub)
+            Instruction::new(0x1008, 4, vec![0; 4], "sub").with_operation(Operation::Sub),
         );
-        bb2.terminator = BlockTerminator::Fallthrough { target: BasicBlockId::new(3) };
+        bb2.terminator = BlockTerminator::Fallthrough {
+            target: BasicBlockId::new(3),
+        };
         cfg.add_block(bb2);
 
         // Join block
@@ -708,7 +743,7 @@ mod tests {
         bb3.push_instruction(
             Instruction::new(0x100c, 4, vec![0; 4], "ret")
                 .with_operation(Operation::Return)
-                .with_control_flow(ControlFlow::Return)
+                .with_control_flow(ControlFlow::Return),
         );
         bb3.terminator = BlockTerminator::Return;
         cfg.add_block(bb3);
