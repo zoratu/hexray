@@ -29,12 +29,26 @@ pub struct NamingContext {
     /// Counter for result variables.
     #[allow(dead_code)]
     result_counter: usize,
+    /// Counter for size/length variables.
+    size_counter: usize,
+    /// Counter for accumulator/sum variables.
+    sum_counter: usize,
+    /// Counter for error code variables.
+    err_counter: usize,
+    /// Counter for array variables.
+    arr_counter: usize,
     /// DWARF-sourced names (offset -> name).
     dwarf_names: HashMap<i128, String>,
     /// Inferred types (offset -> type hint).
     type_hints: HashMap<i128, TypeHint>,
     /// Loop index variables detected.
     loop_indices: Vec<i128>,
+    /// Size/length variables detected (used in loop bounds).
+    size_vars: Vec<i128>,
+    /// Accumulator variables detected (sum += x patterns).
+    accumulator_vars: Vec<i128>,
+    /// Error code variables detected (from function returns).
+    error_vars: Vec<i128>,
 }
 
 /// Type hint for a variable.
@@ -54,6 +68,14 @@ pub enum TypeHint {
     Buffer,
     /// A counter/index.
     Counter,
+    /// An array base pointer (used with indexing).
+    Array,
+    /// A size/length variable (used in loop bounds).
+    Size,
+    /// An accumulator/sum variable (pattern: sum += x).
+    Sum,
+    /// An error code from function return.
+    ErrorCode,
     /// Unknown type.
     Unknown,
 }
@@ -96,14 +118,24 @@ impl NamingContext {
 
     /// Analyze function body to detect patterns and assign names.
     pub fn analyze(&mut self, body: &[StructuredNode]) {
-        // First pass: detect loop indices
+        // First pass: detect loop indices and size variables
         self.detect_loop_indices(body);
 
-        // Second pass: detect type usage patterns
+        // Second pass: detect accumulator patterns (sum += x)
+        self.detect_accumulators(body);
+
+        // Third pass: detect error code patterns
+        self.detect_error_codes(body);
+
+        // Fourth pass: detect array indexing patterns
+        self.detect_array_patterns(body);
+
+        // Fifth pass: detect other type usage patterns
         self.detect_type_patterns(body);
     }
 
     /// Detect loop index variables from loop patterns.
+    /// Also detects size/bound variables used in loop conditions.
     fn detect_loop_indices(&mut self, nodes: &[StructuredNode]) {
         for node in nodes {
             match node {
@@ -122,10 +154,16 @@ impl NamingContext {
                             }
                         }
                     }
-                    // Also check the condition for the loop variable
+                    // Also check the condition for the loop variable and bound
                     if let Some(offset) = self.extract_comparison_var(condition) {
                         if !self.loop_indices.contains(&offset) {
                             self.loop_indices.push(offset);
+                        }
+                    }
+                    // Extract the size/bound variable from condition (RHS of comparison)
+                    if let Some(size_offset) = self.extract_comparison_bound(condition) {
+                        if !self.size_vars.contains(&size_offset) {
+                            self.size_vars.push(size_offset);
                         }
                     }
                     // Check the update expression
@@ -151,6 +189,12 @@ impl NamingContext {
                             && !self.loop_indices.contains(&offset)
                         {
                             self.loop_indices.push(offset);
+                        }
+                    }
+                    // Extract size/bound from while condition too
+                    if let Some(size_offset) = self.extract_comparison_bound(condition) {
+                        if !self.size_vars.contains(&size_offset) {
+                            self.size_vars.push(size_offset);
                         }
                     }
                     self.detect_loop_indices(body);
@@ -317,6 +361,24 @@ impl NamingContext {
         None
     }
 
+    /// Extract the bound/size variable from comparison (RHS of `i < size`).
+    fn extract_comparison_bound(&self, expr: &Expr) -> Option<i128> {
+        if let ExprKind::BinOp { op, right, .. } = &expr.kind {
+            // Only for < <= > >= comparisons (loop bounds)
+            if matches!(
+                op,
+                BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge
+            ) {
+                // Skip if RHS is a constant (not a size variable)
+                if matches!(right.kind, ExprKind::IntLit(_)) {
+                    return None;
+                }
+                return self.extract_stack_offset(right);
+            }
+        }
+        None
+    }
+
     /// Extract variable from increment expression.
     fn extract_increment_var(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
@@ -368,6 +430,276 @@ impl NamingContext {
         false
     }
 
+    /// Detect accumulator patterns (sum += x, product *= x).
+    fn detect_accumulators(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        if let Some(offset) = self.extract_accumulator_var(stmt) {
+                            if !self.accumulator_vars.contains(&offset) {
+                                self.accumulator_vars.push(offset);
+                            }
+                        }
+                    }
+                }
+                StructuredNode::For { body, .. }
+                | StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body } => {
+                    // Accumulators inside loops are more likely to be actual sums
+                    self.detect_accumulators(body);
+                }
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_accumulators(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_accumulators(else_nodes);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        self.detect_accumulators(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_accumulators(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_accumulators(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Extract an accumulator variable from an expression like `sum += x`.
+    fn extract_accumulator_var(&self, expr: &Expr) -> Option<i128> {
+        if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+            let lhs_offset = self.extract_stack_offset(lhs)?;
+
+            // Check for patterns: x = x + y or x = x * y
+            if let ExprKind::BinOp {
+                op: BinOpKind::Add | BinOpKind::Mul,
+                left,
+                right,
+            } = &rhs.kind
+            {
+                // Check if one operand is the same variable
+                let left_offset = self.extract_stack_offset(left);
+                let right_offset = self.extract_stack_offset(right);
+
+                if left_offset == Some(lhs_offset) || right_offset == Some(lhs_offset) {
+                    // Exclude simple increments (i = i + 1)
+                    let is_constant = matches!(right.kind, ExprKind::IntLit(1))
+                        || matches!(left.kind, ExprKind::IntLit(1));
+                    if !is_constant {
+                        return Some(lhs_offset);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Detect error code patterns (return value checked in conditional).
+    fn detect_error_codes(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for (i, stmt) in statements.iter().enumerate() {
+                        // Look for: err = func_call()
+                        if let Some(offset) = self.extract_error_code_candidate(stmt) {
+                            // Check if the next statement or siblings check this variable
+                            if i + 1 < statements.len()
+                                && self.is_checked_in_condition(offset, &statements[i + 1..])
+                                && !self.error_vars.contains(&offset)
+                            {
+                                self.error_vars.push(offset);
+                            }
+                        }
+                    }
+                }
+                StructuredNode::For { body, .. }
+                | StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body } => {
+                    self.detect_error_codes(body);
+                }
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_error_codes(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_error_codes(else_nodes);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        self.detect_error_codes(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_error_codes(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_error_codes(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Extract a variable assigned from a function call (error code candidate).
+    fn extract_error_code_candidate(&self, expr: &Expr) -> Option<i128> {
+        if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+            // RHS must be a function call
+            if matches!(rhs.kind, ExprKind::Call { .. }) {
+                return self.extract_stack_offset(lhs);
+            }
+        }
+        None
+    }
+
+    /// Check if a variable is tested in a condition following its assignment.
+    fn is_checked_in_condition(&self, offset: i128, remaining: &[Expr]) -> bool {
+        for expr in remaining {
+            if self.expr_tests_offset(expr, offset) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if an expression tests a given offset (for error code detection).
+    fn expr_tests_offset(&self, expr: &Expr, offset: i128) -> bool {
+        match &expr.kind {
+            ExprKind::BinOp { op, left, right } if op.is_comparison() => {
+                // Check if either side references our variable
+                self.extract_stack_offset(left) == Some(offset)
+                    || self.extract_stack_offset(right) == Some(offset)
+            }
+            _ => false,
+        }
+    }
+
+    /// Detect array indexing patterns.
+    fn detect_array_patterns(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.detect_array_usage_in_expr(stmt);
+                    }
+                }
+                StructuredNode::For { body, .. }
+                | StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body } => {
+                    self.detect_array_patterns(body);
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_array_usage_in_expr(condition);
+                    self.detect_array_patterns(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_array_patterns(else_nodes);
+                    }
+                }
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                    ..
+                } => {
+                    self.detect_array_usage_in_expr(value);
+                    for (_, case_body) in cases {
+                        self.detect_array_patterns(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_array_patterns(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_array_patterns(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Detect array base pointers in an expression (looking for ptr[idx] patterns).
+    fn detect_array_usage_in_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            // Dereference of (base + index*scale) is array access
+            ExprKind::Deref { addr, .. } => {
+                if let Some(base_offset) = self.extract_array_base(addr) {
+                    self.type_hints
+                        .entry(base_offset)
+                        .or_insert(TypeHint::Array);
+                }
+                // Recurse into the address expression
+                self.detect_array_usage_in_expr(addr);
+            }
+            ExprKind::Assign { lhs, rhs } => {
+                self.detect_array_usage_in_expr(lhs);
+                self.detect_array_usage_in_expr(rhs);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.detect_array_usage_in_expr(left);
+                self.detect_array_usage_in_expr(right);
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.detect_array_usage_in_expr(arg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract array base from address expression (base + idx * scale).
+    fn extract_array_base(&self, addr: &Expr) -> Option<i128> {
+        if let ExprKind::BinOp {
+            op: BinOpKind::Add,
+            left,
+            right,
+        } = &addr.kind
+        {
+            // Pattern: base + (idx * scale) or (idx * scale) + base
+            // Check if right is multiplication (scaled index)
+            if matches!(
+                right.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::Mul,
+                    ..
+                }
+            ) {
+                return self.extract_stack_offset(left);
+            }
+            // Or left is multiplication
+            if matches!(
+                left.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::Mul,
+                    ..
+                }
+            ) {
+                return self.extract_stack_offset(right);
+            }
+        }
+        None
+    }
+
     /// Get the name for a stack slot, generating one if needed.
     pub fn get_name(&mut self, offset: i128, is_parameter: bool) -> String {
         // Check for DWARF name first
@@ -394,40 +726,47 @@ impl NamingContext {
     /// Generate a name for a parameter.
     fn generate_param_name(&mut self, offset: i128) -> String {
         // Check for type hint
-        if let Some(hint) = self.type_hints.get(&offset) {
+        if let Some(hint) = self.type_hints.get(&offset).copied() {
             match hint {
                 TypeHint::StringPtr => {
                     self.str_counter += 1;
-                    return format!(
-                        "str{}",
-                        if self.str_counter == 1 {
-                            String::new()
-                        } else {
-                            self.str_counter.to_string()
-                        }
-                    );
+                    return if self.str_counter == 1 {
+                        "str".to_string()
+                    } else {
+                        format!("str{}", self.str_counter)
+                    };
                 }
                 TypeHint::Pointer => {
                     self.ptr_counter += 1;
-                    return format!(
-                        "ptr{}",
-                        if self.ptr_counter == 1 {
-                            String::new()
-                        } else {
-                            self.ptr_counter.to_string()
-                        }
-                    );
+                    return if self.ptr_counter == 1 {
+                        "ptr".to_string()
+                    } else {
+                        format!("ptr{}", self.ptr_counter)
+                    };
                 }
                 TypeHint::Buffer => {
                     self.buf_counter += 1;
-                    return format!(
-                        "buf{}",
-                        if self.buf_counter == 1 {
-                            String::new()
-                        } else {
-                            self.buf_counter.to_string()
-                        }
-                    );
+                    return if self.buf_counter == 1 {
+                        "data".to_string()
+                    } else {
+                        format!("data{}", self.buf_counter)
+                    };
+                }
+                TypeHint::Array => {
+                    self.arr_counter += 1;
+                    return if self.arr_counter == 1 {
+                        "arr".to_string()
+                    } else {
+                        format!("arr{}", self.arr_counter)
+                    };
+                }
+                TypeHint::Size => {
+                    self.size_counter += 1;
+                    return if self.size_counter == 1 {
+                        "count".to_string()
+                    } else {
+                        format!("count{}", self.size_counter)
+                    };
                 }
                 _ => {}
             }
@@ -439,7 +778,7 @@ impl NamingContext {
 
     /// Generate a name for a local variable.
     fn generate_local_name(&mut self, offset: i128) -> String {
-        // Check if this is a loop index
+        // Check if this is a loop index (highest priority after DWARF)
         if let Some(idx) = self.loop_indices.iter().position(|&o| o == offset) {
             // Use i, j, k, l, m, n for loop indices
             let names = ['i', 'j', 'k', 'l', 'm', 'n'];
@@ -449,32 +788,56 @@ impl NamingContext {
             return format!("idx{}", idx - names.len());
         }
 
+        // Check if this is a size/length variable (used in loop bounds)
+        if self.size_vars.contains(&offset) {
+            self.size_counter += 1;
+            return if self.size_counter == 1 {
+                "len".to_string()
+            } else {
+                format!("len{}", self.size_counter)
+            };
+        }
+
+        // Check if this is an accumulator variable (sum += x patterns)
+        if self.accumulator_vars.contains(&offset) {
+            self.sum_counter += 1;
+            return if self.sum_counter == 1 {
+                "sum".to_string()
+            } else {
+                format!("sum{}", self.sum_counter)
+            };
+        }
+
+        // Check if this is an error code variable
+        if self.error_vars.contains(&offset) {
+            self.err_counter += 1;
+            return if self.err_counter == 1 {
+                "err".to_string()
+            } else {
+                format!("err{}", self.err_counter)
+            };
+        }
+
         // Check for type hint
-        if let Some(hint) = self.type_hints.get(&offset) {
+        if let Some(hint) = self.type_hints.get(&offset).copied() {
             match hint {
                 TypeHint::Bool => return format!("flag_{:x}", offset.unsigned_abs()),
                 TypeHint::Float => return format!("f_{:x}", offset.unsigned_abs()),
                 TypeHint::StringPtr => {
                     self.str_counter += 1;
-                    return format!(
-                        "str{}",
-                        if self.str_counter == 1 {
-                            String::new()
-                        } else {
-                            self.str_counter.to_string()
-                        }
-                    );
+                    return if self.str_counter == 1 {
+                        "str".to_string()
+                    } else {
+                        format!("str{}", self.str_counter)
+                    };
                 }
                 TypeHint::Pointer => {
                     self.ptr_counter += 1;
-                    return format!(
-                        "ptr{}",
-                        if self.ptr_counter == 1 {
-                            String::new()
-                        } else {
-                            self.ptr_counter.to_string()
-                        }
-                    );
+                    return if self.ptr_counter == 1 {
+                        "ptr".to_string()
+                    } else {
+                        format!("ptr{}", self.ptr_counter)
+                    };
                 }
                 TypeHint::Counter => {
                     self.loop_counter += 1;
@@ -484,7 +847,47 @@ impl NamingContext {
                     }
                     return format!("cnt{}", self.loop_counter - names.len());
                 }
-                _ => {}
+                TypeHint::Array => {
+                    self.arr_counter += 1;
+                    return if self.arr_counter == 1 {
+                        "arr".to_string()
+                    } else {
+                        format!("arr{}", self.arr_counter)
+                    };
+                }
+                TypeHint::Size => {
+                    self.size_counter += 1;
+                    return if self.size_counter == 1 {
+                        "size".to_string()
+                    } else {
+                        format!("size{}", self.size_counter)
+                    };
+                }
+                TypeHint::Sum => {
+                    self.sum_counter += 1;
+                    return if self.sum_counter == 1 {
+                        "total".to_string()
+                    } else {
+                        format!("total{}", self.sum_counter)
+                    };
+                }
+                TypeHint::ErrorCode => {
+                    self.err_counter += 1;
+                    return if self.err_counter == 1 {
+                        "result".to_string()
+                    } else {
+                        format!("result{}", self.err_counter)
+                    };
+                }
+                TypeHint::Buffer => {
+                    self.buf_counter += 1;
+                    return if self.buf_counter == 1 {
+                        "buf".to_string()
+                    } else {
+                        format!("buf{}", self.buf_counter)
+                    };
+                }
+                TypeHint::Int | TypeHint::Unknown => {}
             }
         }
 
@@ -674,5 +1077,144 @@ mod tests {
         // Unnamed variable gets default name
         let unnamed = ctx.get_name(-20, false);
         assert!(unnamed.contains("local") || unnamed.contains("var"));
+    }
+
+    #[test]
+    fn test_size_variable_naming() {
+        let mut ctx = NamingContext::new();
+        // Simulate detection of size variables
+        ctx.size_vars.push(-8);
+        ctx.size_vars.push(-16);
+
+        let name1 = ctx.get_name(-8, false);
+        let name2 = ctx.get_name(-16, false);
+
+        assert_eq!(name1, "len");
+        assert_eq!(name2, "len2");
+    }
+
+    #[test]
+    fn test_accumulator_naming() {
+        let mut ctx = NamingContext::new();
+        // Simulate detection of accumulator variables
+        ctx.accumulator_vars.push(-8);
+        ctx.accumulator_vars.push(-16);
+
+        let name1 = ctx.get_name(-8, false);
+        let name2 = ctx.get_name(-16, false);
+
+        assert_eq!(name1, "sum");
+        assert_eq!(name2, "sum2");
+    }
+
+    #[test]
+    fn test_error_code_naming() {
+        let mut ctx = NamingContext::new();
+        // Simulate detection of error code variables
+        ctx.error_vars.push(-8);
+        ctx.error_vars.push(-16);
+
+        let name1 = ctx.get_name(-8, false);
+        let name2 = ctx.get_name(-16, false);
+
+        assert_eq!(name1, "err");
+        assert_eq!(name2, "err2");
+    }
+
+    #[test]
+    fn test_array_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Array);
+        ctx.add_type_hint(-16, TypeHint::Array);
+
+        let name1 = ctx.get_name(-8, false);
+        let name2 = ctx.get_name(-16, false);
+
+        assert_eq!(name1, "arr");
+        assert_eq!(name2, "arr2");
+    }
+
+    #[test]
+    fn test_size_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Size);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "size");
+    }
+
+    #[test]
+    fn test_sum_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Sum);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "total");
+    }
+
+    #[test]
+    fn test_error_code_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::ErrorCode);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "result");
+    }
+
+    #[test]
+    fn test_parameter_with_array_hint() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(8, TypeHint::Array);
+
+        let name = ctx.get_name(8, true);
+        assert_eq!(name, "arr");
+    }
+
+    #[test]
+    fn test_parameter_with_size_hint() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(8, TypeHint::Size);
+
+        let name = ctx.get_name(8, true);
+        assert_eq!(name, "count");
+    }
+
+    #[test]
+    fn test_naming_priority() {
+        // Test that detected patterns take priority over type hints
+        let mut ctx = NamingContext::new();
+
+        // Add as both loop index and add type hint
+        ctx.loop_indices.push(-4);
+        ctx.add_type_hint(-4, TypeHint::Int);
+
+        // Loop index should win
+        assert_eq!(ctx.get_name(-4, false), "i");
+
+        // Add as both size var and type hint
+        ctx.size_vars.push(-8);
+        ctx.add_type_hint(-8, TypeHint::Int);
+
+        // Size var should win
+        assert_eq!(ctx.get_name(-8, false), "len");
+    }
+
+    #[test]
+    fn test_buffer_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Buffer);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "buf");
+    }
+
+    #[test]
+    fn test_buffer_param_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(8, TypeHint::Buffer);
+
+        // Parameters with buffer hint get "data" prefix
+        let name = ctx.get_name(8, true);
+        assert_eq!(name, "data");
     }
 }
