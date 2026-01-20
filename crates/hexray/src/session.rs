@@ -1094,15 +1094,22 @@ List Annotations:
   bookmarks             List all bookmarks
 
 Analysis Commands:
-  (All hexray commands work here without the 'hexray <binary>' prefix)
-
-  disasm <symbol>       Disassemble a function
-  decompile <symbol>    Decompile to pseudo-code
-  cfg <symbol>          Show control flow graph
-  xrefs <address>       Show cross-references
-  strings               List detected strings
-  symbols               List symbols
   info                  Show binary info
+  sections              List sections
+  symbols | syms        List all symbols
+  functions | funcs     List only functions
+  imports               List imported symbols
+  exports               List exported symbols
+  strings [min_len]     List detected strings
+
+Disassembly & Decompilation:
+  disasm | d <sym> [n]  Disassemble (n instructions, default 50)
+  decompile | dec <sym> Decompile to pseudo-code
+  cfg <symbol>          Show control flow graph
+  hexdump | x <addr> [len]  Show hex dump (default 256 bytes)
+
+Navigation:
+  xrefs <address>       Show cross-references to address
 
 Keyboard:
   Ctrl+D                Detach (session is preserved)

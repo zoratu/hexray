@@ -3835,6 +3835,208 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
             Ok(output)
         }
 
+        "functions" | "funcs" => {
+            let mut output = String::new();
+            output.push_str(&format!("{:<16} {:<8} {}\n", "Address", "Size", "Name"));
+            output.push_str(&format!("{}\n", "-".repeat(60)));
+
+            let mut functions: Vec<_> = fmt
+                .symbols()
+                .filter(|s| s.is_function() && !s.name.is_empty())
+                .collect();
+            functions.sort_by_key(|s| s.address);
+
+            for sym in functions {
+                let name = session
+                    .get_rename(sym.address)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| demangle_or_original(&sym.name));
+                output.push_str(&format!("{:#016x} {:<8} {}\n", sym.address, sym.size, name));
+            }
+            Ok(output)
+        }
+
+        "hexdump" | "hex" | "x" => {
+            if parts.len() < 2 {
+                return Ok("Usage: hexdump <address> [length]".to_string());
+            }
+
+            let addr = match parse_address_str(parts[1]) {
+                Ok(a) => a,
+                Err(_) => {
+                    // Try to find symbol
+                    if let Some(sym) = fmt.symbols().find(|s| s.name == parts[1]) {
+                        sym.address
+                    } else {
+                        return Ok(format!("Invalid address or symbol: {}", parts[1]));
+                    }
+                }
+            };
+
+            let len = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(256);
+
+            if let Some(bytes) = fmt.bytes_at(addr, len) {
+                let mut output = String::new();
+                for (i, chunk) in bytes.chunks(16).enumerate() {
+                    let offset = addr + (i * 16) as u64;
+                    output.push_str(&format!("{:#010x}  ", offset));
+
+                    // Hex bytes
+                    for (j, byte) in chunk.iter().enumerate() {
+                        output.push_str(&format!("{:02x} ", byte));
+                        if j == 7 {
+                            output.push(' ');
+                        }
+                    }
+
+                    // Padding for incomplete lines
+                    for j in chunk.len()..16 {
+                        output.push_str("   ");
+                        if j == 7 {
+                            output.push(' ');
+                        }
+                    }
+
+                    output.push_str(" |");
+
+                    // ASCII representation
+                    for byte in chunk {
+                        if *byte >= 0x20 && *byte < 0x7f {
+                            output.push(*byte as char);
+                        } else {
+                            output.push('.');
+                        }
+                    }
+
+                    output.push_str("|\n");
+                }
+                Ok(output)
+            } else {
+                Ok(format!("No data at address {:#x}", addr))
+            }
+        }
+
+        "cfg" => {
+            if parts.len() < 2 {
+                return Ok("Usage: cfg <symbol|address>".to_string());
+            }
+
+            let target = parts[1];
+
+            // Find function
+            let (addr, size) = if let Ok(a) = parse_address_str(target) {
+                if let Some(sym) = fmt.symbols().find(|s| s.address == a && s.is_function()) {
+                    (a, sym.size as usize)
+                } else {
+                    (a, 1000)
+                }
+            } else if let Some(sym) = fmt
+                .symbols()
+                .find(|s| s.name == target || demangle_or_original(&s.name) == target)
+            {
+                let size = if sym.size > 0 {
+                    sym.size as usize
+                } else {
+                    1000
+                };
+                (sym.address, size)
+            } else {
+                return Ok(format!("Symbol not found: {}", target));
+            };
+
+            if let Some(bytes) = fmt.bytes_at(addr, size.max(1000)) {
+                let results = disassemble_block_for_arch(fmt.architecture(), bytes, addr);
+                let instructions: Vec<_> = results
+                    .into_iter()
+                    .filter_map(|r| r.ok())
+                    .take(500)
+                    .collect();
+
+                if instructions.is_empty() {
+                    return Ok("No instructions decoded".to_string());
+                }
+
+                let cfg = CfgBuilder::build(&instructions, addr);
+
+                // Generate ASCII CFG
+                let mut output = String::new();
+                output.push_str(&format!("Control Flow Graph for {}\n", target));
+                output.push_str(&format!("{}\n\n", "=".repeat(40)));
+
+                let mut block_ids: Vec<_> = cfg.block_ids().collect();
+                block_ids.sort_by_key(|id| id.0);
+
+                for block_id in block_ids {
+                    if let Some(block) = cfg.block(block_id) {
+                        output.push_str(&format!("Block {} @ {:#x}:\n", block_id.0, block.start));
+
+                        // Show first few instructions
+                        for inst in block.instructions.iter().take(5) {
+                            output.push_str(&format!("  {:#x}: {}\n", inst.address, inst));
+                        }
+                        if block.instructions.len() > 5 {
+                            output.push_str(&format!(
+                                "  ... ({} more)\n",
+                                block.instructions.len() - 5
+                            ));
+                        }
+
+                        // Show successors
+                        let succs = cfg.successors(block_id);
+                        if !succs.is_empty() {
+                            let succ_ids: Vec<_> = succs.iter().map(|id| id.0).collect();
+                            output.push_str(&format!("  -> {:?}\n", succ_ids));
+                        }
+                        output.push('\n');
+                    }
+                }
+
+                Ok(output)
+            } else {
+                Ok(format!("No data at address {:#x}", addr))
+            }
+        }
+
+        "imports" => {
+            let mut output = String::new();
+            output.push_str(&format!("{:<16} {}\n", "Address", "Name"));
+            output.push_str(&format!("{}\n", "-".repeat(50)));
+
+            // For PE, imports are in the symbol table with specific characteristics
+            // For ELF, undefined symbols are imports
+            // For Mach-O, look for undefined external symbols
+            for sym in fmt.symbols() {
+                let is_import =
+                    sym.address == 0 || sym.name.starts_with("__imp_") || sym.name.contains("@");
+                if is_import && !sym.name.is_empty() {
+                    output.push_str(&format!(
+                        "{:#016x} {}\n",
+                        sym.address,
+                        demangle_or_original(&sym.name)
+                    ));
+                }
+            }
+            Ok(output)
+        }
+
+        "exports" => {
+            let mut output = String::new();
+            output.push_str(&format!("{:<16} {}\n", "Address", "Name"));
+            output.push_str(&format!("{}\n", "-".repeat(50)));
+
+            // Exported symbols typically have addresses and are global
+            for sym in fmt.symbols() {
+                if sym.address != 0 && sym.is_global() && !sym.name.is_empty() {
+                    output.push_str(&format!(
+                        "{:#016x} {}\n",
+                        sym.address,
+                        demangle_or_original(&sym.name)
+                    ));
+                }
+            }
+            Ok(output)
+        }
+
         "disasm" | "d" => {
             if parts.len() < 2 {
                 return Ok("Usage: disasm <symbol|address> [count]".to_string());
