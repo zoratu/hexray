@@ -1865,6 +1865,36 @@ impl PseudoCodeEmitter {
             StructuredNode::Expr(expr) => {
                 self.emit_statement(expr, output, depth);
             }
+
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                writeln!(output, "{}try {{", indent).unwrap();
+                self.emit_nodes(try_body, output, depth + 1);
+                writeln!(output, "{}}}", indent).unwrap();
+
+                for handler in catch_handlers {
+                    let type_decl = if let Some(ref ex_type) = handler.exception_type {
+                        let var_name = handler.variable_name.as_deref().unwrap_or("e");
+                        format!("{}& {}", ex_type, var_name)
+                    } else {
+                        "...".to_string()
+                    };
+                    if self.emit_addresses {
+                        writeln!(
+                            output,
+                            "{}catch ({}) {{ // landing pad @ {:#x}",
+                            indent, type_decl, handler.landing_pad
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(output, "{}catch ({}) {{", indent, type_decl).unwrap();
+                    }
+                    self.emit_nodes(&handler.body, output, depth + 1);
+                    writeln!(output, "{}}}", indent).unwrap();
+                }
+            }
         }
     }
 

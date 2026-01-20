@@ -267,8 +267,10 @@ proptest! {
     fn demangled_reasonable_length(s in "_Z[0-9]{1,3}[a-z]{1,20}") {
         if let Some(demangled) = demangle(&s) {
             // Demangled name shouldn't be excessively long
+            // Note: type names like "unsigned long long" are 18 chars from a single 'y'
+            // so we allow up to 15x expansion plus a base overhead
             prop_assert!(
-                demangled.len() < s.len() * 10,
+                demangled.len() < s.len() * 15 + 20,
                 "Demangled name is unreasonably long: {} chars for {} char input",
                 demangled.len(),
                 s.len()

@@ -29,6 +29,32 @@ use std::collections::{HashMap, HashSet};
 
 use hexray_core::Endianness;
 
+/// Information about a virtual function thunk.
+///
+/// Thunks are generated for multiple inheritance when a virtual call through
+/// a secondary base pointer needs to adjust `this` before calling the actual
+/// implementation.
+#[derive(Debug, Clone)]
+pub struct ThunkInfo {
+    /// The `this` pointer adjustment (typically negative for secondary bases).
+    pub this_adjustment: i64,
+    /// The address of the actual implementation function.
+    pub target_function: u64,
+    /// Whether this thunk also has a virtual base adjustment (more complex MI).
+    pub has_vcall_adjustment: bool,
+}
+
+impl ThunkInfo {
+    /// Creates a new thunk info with a simple this-adjustment.
+    pub fn new(this_adjustment: i64, target_function: u64) -> Self {
+        Self {
+            this_adjustment,
+            target_function,
+            has_vcall_adjustment: false,
+        }
+    }
+}
+
 /// A virtual function table entry.
 #[derive(Debug, Clone)]
 pub struct VtableEntry {
@@ -40,6 +66,8 @@ pub struct VtableEntry {
     pub name: Option<String>,
     /// Whether this is a pure virtual placeholder (e.g., __cxa_pure_virtual).
     pub is_pure_virtual: bool,
+    /// Thunk information if this entry points to a thunk rather than direct impl.
+    pub thunk: Option<ThunkInfo>,
 }
 
 impl VtableEntry {
@@ -50,6 +78,7 @@ impl VtableEntry {
             target,
             name: None,
             is_pure_virtual: false,
+            thunk: None,
         }
     }
 
@@ -68,6 +97,25 @@ impl VtableEntry {
     /// Returns the virtual method index (0-based).
     pub fn index(&self, pointer_size: usize) -> usize {
         self.offset / pointer_size
+    }
+
+    /// Sets thunk information for this entry.
+    pub fn with_thunk(mut self, thunk: ThunkInfo) -> Self {
+        self.thunk = Some(thunk);
+        self
+    }
+
+    /// Returns true if this entry is a thunk.
+    pub fn is_thunk(&self) -> bool {
+        self.thunk.is_some()
+    }
+
+    /// Returns the actual implementation address (resolving through thunk if present).
+    pub fn resolved_target(&self) -> u64 {
+        self.thunk
+            .as_ref()
+            .map(|t| t.target_function)
+            .unwrap_or(self.target)
     }
 }
 
@@ -88,6 +136,13 @@ pub struct Vtable {
     pub is_primary: bool,
     /// Confidence score (0.0 - 1.0) for this detection.
     pub confidence: f64,
+    /// Offset-to-top value for this vtable (0 for primary, negative for secondary).
+    /// In the Itanium ABI, this is stored at vtable_addr - 2*ptr_size.
+    pub offset_to_top: Option<i64>,
+    /// Address of the associated primary vtable (for secondary vtables).
+    pub primary_vtable: Option<u64>,
+    /// Name of the base class this secondary vtable belongs to (for MI).
+    pub base_class_name: Option<String>,
 }
 
 impl Vtable {
@@ -101,6 +156,9 @@ impl Vtable {
             constructor_refs: Vec::new(),
             is_primary: true,
             confidence: 0.0,
+            offset_to_top: None,
+            primary_vtable: None,
+            base_class_name: None,
         }
     }
 
@@ -258,6 +316,30 @@ impl VtableDetector {
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ])),
             (8, Endianness::Big) => Some(u64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])),
+            _ => None,
+        }
+    }
+
+    /// Reads a pointer-sized signed value from data at the given offset.
+    fn read_signed_pointer(&self, data: &[u8], offset: usize) -> Option<i64> {
+        if offset + self.pointer_size > data.len() {
+            return None;
+        }
+
+        let bytes = &data[offset..offset + self.pointer_size];
+        match (self.pointer_size, self.endianness) {
+            (4, Endianness::Little) => {
+                Some(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64)
+            }
+            (4, Endianness::Big) => {
+                Some(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64)
+            }
+            (8, Endianness::Little) => Some(i64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])),
+            (8, Endianness::Big) => Some(i64::from_be_bytes([
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ])),
             _ => None,
@@ -426,10 +508,23 @@ impl VtableDetector {
         let mut gap_count = 0;
 
         // Check for RTTI at offset -ptr_size (before vtable start)
+        // Itanium C++ ABI layout before vtable:
+        //   -2*ptr_size: offset-to-top (signed, displacement to top of object)
+        //   -1*ptr_size: typeinfo pointer
+        //   0: first virtual function pointer
         let typeinfo_addr = if self.config.detect_rtti && offset >= self.pointer_size {
             let rtti_offset = offset - self.pointer_size;
             self.read_pointer(data, rtti_offset)
                 .filter(|&ptr| ptr != 0 && !self.is_executable(ptr))
+        } else {
+            None
+        };
+
+        // Read offset-to-top at -2*ptr_size (Itanium ABI)
+        // This is 0 for primary vtables, negative for secondary vtables in MI
+        let offset_to_top = if offset >= 2 * self.pointer_size {
+            let ott_offset = offset - 2 * self.pointer_size;
+            self.read_signed_pointer(data, ott_offset)
         } else {
             None
         };
@@ -499,6 +594,13 @@ impl VtableDetector {
         vtable.typeinfo_addr = typeinfo_addr;
         vtable.class_name = class_name;
         vtable.confidence = confidence;
+        vtable.offset_to_top = offset_to_top;
+
+        // Determine if this is a primary or secondary vtable based on offset-to-top
+        // Primary vtables have offset-to-top == 0, secondary have negative values
+        if let Some(ott) = offset_to_top {
+            vtable.is_primary = ott == 0;
+        }
 
         Some(vtable)
     }
@@ -577,6 +679,173 @@ impl VtableDetector {
         vtables.sort_by_key(|v| v.address);
 
         vtables
+    }
+
+    /// Detects if a function at the given address is a thunk.
+    ///
+    /// Thunks are small functions that adjust the `this` pointer before jumping
+    /// to the real implementation. Common patterns:
+    ///
+    /// x86_64:
+    ///   - `add rdi, IMM; jmp TARGET`
+    ///   - `sub rdi, IMM; jmp TARGET`
+    ///   - `lea rdi, [rdi + IMM]; jmp TARGET`
+    ///
+    /// ARM64:
+    ///   - `add x0, x0, #IMM; b TARGET`
+    ///
+    /// Returns `Some(ThunkInfo)` if a thunk pattern is detected, `None` otherwise.
+    pub fn detect_thunk(&self, code: &[u8], func_addr: u64) -> Option<ThunkInfo> {
+        if code.len() < 8 {
+            return None;
+        }
+
+        // Check for x86_64 thunk patterns
+        if self.pointer_size == 8 {
+            // Pattern: REX.W + add rdi, imm8 (48 83 c7 XX) + jmp rel32 (e9 XX XX XX XX)
+            if code.len() >= 9
+                && code[0] == 0x48
+                && code[1] == 0x83
+                && code[2] == 0xc7
+                && code[4] == 0xe9
+            {
+                let adjustment = code[3] as i8 as i64;
+                let rel32 = i32::from_le_bytes([code[5], code[6], code[7], code[8]]) as i64;
+                let target = func_addr.wrapping_add(9).wrapping_add(rel32 as u64);
+                return Some(ThunkInfo::new(adjustment, target));
+            }
+
+            // Pattern: REX.W + sub rdi, imm8 (48 83 ef XX) + jmp rel32 (e9 XX XX XX XX)
+            if code.len() >= 9
+                && code[0] == 0x48
+                && code[1] == 0x83
+                && code[2] == 0xef
+                && code[4] == 0xe9
+            {
+                let adjustment = -(code[3] as i8 as i64);
+                let rel32 = i32::from_le_bytes([code[5], code[6], code[7], code[8]]) as i64;
+                let target = func_addr.wrapping_add(9).wrapping_add(rel32 as u64);
+                return Some(ThunkInfo::new(adjustment, target));
+            }
+
+            // Pattern: REX.W + add rdi, imm32 (48 81 c7 XX XX XX XX) + jmp rel32
+            if code.len() >= 12
+                && code[0] == 0x48
+                && code[1] == 0x81
+                && code[2] == 0xc7
+                && code[7] == 0xe9
+            {
+                let adjustment = i32::from_le_bytes([code[3], code[4], code[5], code[6]]) as i64;
+                let rel32 = i32::from_le_bytes([code[8], code[9], code[10], code[11]]) as i64;
+                let target = func_addr.wrapping_add(12).wrapping_add(rel32 as u64);
+                return Some(ThunkInfo::new(adjustment, target));
+            }
+
+            // Pattern: REX.W + lea rdi, [rdi + imm8] (48 8d 7f XX) + jmp rel32
+            if code.len() >= 9
+                && code[0] == 0x48
+                && code[1] == 0x8d
+                && code[2] == 0x7f
+                && code[4] == 0xe9
+            {
+                let adjustment = code[3] as i8 as i64;
+                let rel32 = i32::from_le_bytes([code[5], code[6], code[7], code[8]]) as i64;
+                let target = func_addr.wrapping_add(9).wrapping_add(rel32 as u64);
+                return Some(ThunkInfo::new(adjustment, target));
+            }
+
+            // Pattern: REX.W + lea rdi, [rdi + imm32] (48 8d bf XX XX XX XX) + jmp rel32
+            if code.len() >= 12
+                && code[0] == 0x48
+                && code[1] == 0x8d
+                && code[2] == 0xbf
+                && code[7] == 0xe9
+            {
+                let adjustment = i32::from_le_bytes([code[3], code[4], code[5], code[6]]) as i64;
+                let rel32 = i32::from_le_bytes([code[8], code[9], code[10], code[11]]) as i64;
+                let target = func_addr.wrapping_add(12).wrapping_add(rel32 as u64);
+                return Some(ThunkInfo::new(adjustment, target));
+            }
+        }
+
+        // Check for ARM64 thunk patterns
+        if self.pointer_size == 8 && self.endianness == Endianness::Little {
+            // ARM64: add x0, x0, #imm12 followed by b target
+            // ADD: 0x91000000 | (imm12 << 10) | (Rn << 5) | Rd
+            // B:   0x14000000 | imm26
+            if code.len() >= 8 {
+                let insn1 = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+                let insn2 = u32::from_le_bytes([code[4], code[5], code[6], code[7]]);
+
+                // Check for ADD x0, x0, #imm
+                let is_add_x0 = (insn1 & 0xFFC003FF) == 0x91000000;
+                // Check for B (unconditional branch)
+                let is_branch = (insn2 & 0xFC000000) == 0x14000000;
+
+                if is_add_x0 && is_branch {
+                    let imm12 = ((insn1 >> 10) & 0xFFF) as i64;
+                    // Check shift bit
+                    let shift = if (insn1 & 0x400000) != 0 { 12 } else { 0 };
+                    let adjustment = imm12 << shift;
+
+                    // B target: PC + (imm26 << 2)
+                    let imm26 = (insn2 & 0x03FFFFFF) as i32;
+                    // Sign extend from 26 bits
+                    let imm26 = if imm26 & 0x02000000 != 0 {
+                        imm26 | !0x03FFFFFF_u32 as i32
+                    } else {
+                        imm26
+                    };
+                    let target = func_addr.wrapping_add(4).wrapping_add((imm26 << 2) as u64);
+
+                    return Some(ThunkInfo::new(adjustment, target));
+                }
+
+                // Check for SUB x0, x0, #imm (negative adjustment)
+                let is_sub_x0 = (insn1 & 0xFFC003FF) == 0xD1000000;
+                if is_sub_x0 && is_branch {
+                    let imm12 = ((insn1 >> 10) & 0xFFF) as i64;
+                    let shift = if (insn1 & 0x400000) != 0 { 12 } else { 0 };
+                    let adjustment = -(imm12 << shift);
+
+                    let imm26 = (insn2 & 0x03FFFFFF) as i32;
+                    let imm26 = if imm26 & 0x02000000 != 0 {
+                        imm26 | !0x03FFFFFF_u32 as i32
+                    } else {
+                        imm26
+                    };
+                    let target = func_addr.wrapping_add(4).wrapping_add((imm26 << 2) as u64);
+
+                    return Some(ThunkInfo::new(adjustment, target));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Analyzes vtable entries to detect and mark thunks.
+    ///
+    /// This requires access to the executable code sections to read function bytes.
+    pub fn detect_thunks_in_vtable(&self, vtable: &mut Vtable, code_sections: &[(u64, &[u8])]) {
+        for entry in &mut vtable.entries {
+            if entry.is_pure_virtual {
+                continue;
+            }
+
+            // Find the code section containing this function
+            for &(section_addr, section_data) in code_sections {
+                let section_end = section_addr + section_data.len() as u64;
+                if entry.target >= section_addr && entry.target < section_end {
+                    let offset = (entry.target - section_addr) as usize;
+                    let remaining = &section_data[offset..];
+                    if let Some(thunk_info) = self.detect_thunk(remaining, entry.target) {
+                        entry.thunk = Some(thunk_info);
+                    }
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -717,6 +986,77 @@ impl VtableDatabase {
             }
         }
         methods
+    }
+
+    /// Identifies secondary vtables in the database.
+    ///
+    /// Secondary vtables are used for multiple inheritance in the Itanium C++ ABI.
+    /// They share the same typeinfo pointer as the primary vtable but are located
+    /// at different addresses (for base class subobjects).
+    ///
+    /// This function marks vtables as secondary if they share a typeinfo pointer
+    /// with another vtable that appears earlier in memory (the primary).
+    pub fn identify_secondary_vtables(&mut self) {
+        // Group vtables by typeinfo address
+        let mut by_typeinfo: HashMap<u64, Vec<usize>> = HashMap::new();
+
+        for (idx, vtable) in self.vtables.iter().enumerate() {
+            if let Some(ti_addr) = vtable.typeinfo_addr {
+                by_typeinfo.entry(ti_addr).or_default().push(idx);
+            }
+        }
+
+        // For each group with multiple vtables, mark all but the first as secondary
+        for (_ti_addr, indices) in by_typeinfo {
+            if indices.len() > 1 {
+                // Sort by address to find the primary (lowest address is typically primary)
+                let mut sorted_indices = indices.clone();
+                sorted_indices.sort_by_key(|&idx| self.vtables[idx].address);
+
+                let primary_idx = sorted_indices[0];
+                let primary_addr = self.vtables[primary_idx].address;
+                let primary_class_name = self.vtables[primary_idx].class_name.clone();
+
+                // Mark the rest as secondary
+                for &idx in &sorted_indices[1..] {
+                    let vtable = &mut self.vtables[idx];
+                    vtable.is_primary = false;
+                    vtable.primary_vtable = Some(primary_addr);
+
+                    // Copy class name from primary if not set
+                    if vtable.class_name.is_none() {
+                        if let Some(ref name) = primary_class_name {
+                            vtable.class_name = Some(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns all primary vtables.
+    pub fn primary_vtables(&self) -> impl Iterator<Item = &Vtable> {
+        self.vtables.iter().filter(|v| v.is_primary)
+    }
+
+    /// Returns all secondary vtables.
+    pub fn secondary_vtables(&self) -> impl Iterator<Item = &Vtable> {
+        self.vtables.iter().filter(|v| !v.is_primary)
+    }
+
+    /// Gets the primary vtable for a secondary vtable.
+    pub fn get_primary_for_secondary(&self, secondary_addr: u64) -> Option<&Vtable> {
+        let secondary = self.get_by_address(secondary_addr)?;
+        let primary_addr = secondary.primary_vtable?;
+        self.get_by_address(primary_addr)
+    }
+
+    /// Gets all secondary vtables for a primary vtable.
+    pub fn get_secondaries_for_primary(&self, primary_addr: u64) -> Vec<&Vtable> {
+        self.vtables
+            .iter()
+            .filter(|v| v.primary_vtable == Some(primary_addr))
+            .collect()
     }
 }
 
@@ -963,5 +1303,81 @@ mod tests {
 
         let implementors = db.find_implementors(0x2000);
         assert_eq!(implementors.len(), 2);
+    }
+
+    #[test]
+    fn test_thunk_detection_x86_64_add() {
+        let detector = make_test_detector();
+
+        // x86_64 thunk: add rdi, -8; jmp 0x1000
+        // 48 83 c7 f8  = add rdi, -8
+        // e9 XX XX XX XX = jmp rel32
+        let mut code = vec![0x48, 0x83, 0xc7, 0xf8]; // add rdi, -8
+        code.push(0xe9); // jmp
+        code.extend_from_slice(&(0x1000i32 - 9).to_le_bytes()); // target at 0x1000
+
+        let thunk = detector.detect_thunk(&code, 0);
+        assert!(thunk.is_some());
+        let thunk = thunk.unwrap();
+        assert_eq!(thunk.this_adjustment, -8);
+        assert_eq!(thunk.target_function, 0x1000);
+    }
+
+    #[test]
+    fn test_thunk_detection_x86_64_sub() {
+        let detector = make_test_detector();
+
+        // x86_64 thunk: sub rdi, 8; jmp 0x2000
+        // 48 83 ef 08  = sub rdi, 8
+        // e9 XX XX XX XX = jmp rel32
+        let mut code = vec![0x48, 0x83, 0xef, 0x08]; // sub rdi, 8
+        code.push(0xe9); // jmp
+        code.extend_from_slice(&(0x2000i32 - 9).to_le_bytes()); // target at 0x2000
+
+        let thunk = detector.detect_thunk(&code, 0);
+        assert!(thunk.is_some());
+        let thunk = thunk.unwrap();
+        assert_eq!(thunk.this_adjustment, -8);
+        assert_eq!(thunk.target_function, 0x2000);
+    }
+
+    #[test]
+    fn test_thunk_detection_x86_64_lea() {
+        let detector = make_test_detector();
+
+        // x86_64 thunk: lea rdi, [rdi-16]; jmp 0x3000
+        // 48 8d 7f f0  = lea rdi, [rdi-16]
+        // e9 XX XX XX XX = jmp rel32
+        let mut code = vec![0x48, 0x8d, 0x7f, 0xf0]; // lea rdi, [rdi-16]
+        code.push(0xe9); // jmp
+        code.extend_from_slice(&(0x3000i32 - 9).to_le_bytes()); // target at 0x3000
+
+        let thunk = detector.detect_thunk(&code, 0);
+        assert!(thunk.is_some());
+        let thunk = thunk.unwrap();
+        assert_eq!(thunk.this_adjustment, -16);
+        assert_eq!(thunk.target_function, 0x3000);
+    }
+
+    #[test]
+    fn test_vtable_entry_thunk() {
+        let thunk_info = ThunkInfo::new(-16, 0x5000);
+        let entry = VtableEntry::new(0, 0x4000).with_thunk(thunk_info);
+
+        assert!(entry.is_thunk());
+        assert_eq!(entry.target, 0x4000);
+        assert_eq!(entry.resolved_target(), 0x5000);
+        assert_eq!(entry.thunk.as_ref().unwrap().this_adjustment, -16);
+    }
+
+    #[test]
+    fn test_not_a_thunk() {
+        let detector = make_test_detector();
+
+        // Regular function prologue, not a thunk
+        let code = vec![0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x10];
+
+        let thunk = detector.detect_thunk(&code, 0);
+        assert!(thunk.is_none());
     }
 }

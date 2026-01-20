@@ -88,6 +88,28 @@ pub enum StructuredNode {
 
     /// Raw expression/statement.
     Expr(Expr),
+
+    /// Try-catch block (C++ exception handling).
+    TryCatch {
+        /// The protected code block.
+        try_body: Vec<StructuredNode>,
+        /// Catch handlers with their type and body.
+        /// The String is the exception type (or None for catch-all).
+        catch_handlers: Vec<CatchHandler>,
+    },
+}
+
+/// A catch handler in a try-catch block.
+#[derive(Debug, Clone)]
+pub struct CatchHandler {
+    /// Exception type being caught (None for catch-all `catch(...)`).
+    pub exception_type: Option<String>,
+    /// Variable name for the caught exception (e.g., "e" in `catch(Exception& e)`).
+    pub variable_name: Option<String>,
+    /// Handler body.
+    pub body: Vec<StructuredNode>,
+    /// Landing pad address (for debugging/comments).
+    pub landing_pad: u64,
 }
 
 /// Loop detection information.

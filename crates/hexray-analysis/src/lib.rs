@@ -85,5 +85,5 @@ pub use stack_canary::{
 };
 pub use types::{Constraint, FunctionSignatures, Type, TypeInference};
 pub use vtable::{
-    VirtualCallSite, Vtable, VtableConfig, VtableDatabase, VtableDetector, VtableEntry,
+    ThunkInfo, VirtualCallSite, Vtable, VtableConfig, VtableDatabase, VtableDetector, VtableEntry,
 };

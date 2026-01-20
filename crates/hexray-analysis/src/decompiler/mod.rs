@@ -24,7 +24,7 @@ pub use signature::{
     SignatureRecovery,
 };
 pub use struct_inference::{InferredField, InferredStruct, InferredType, StructInference};
-pub use structurer::{LoopKind, StructuredCfg, StructuredNode};
+pub use structurer::{CatchHandler, LoopKind, StructuredCfg, StructuredNode};
 pub use switch_recovery::{JumpTableInfo, SwitchInfo, SwitchKind, SwitchRecovery};
 
 use hexray_core::ControlFlowGraph;
@@ -472,10 +472,23 @@ impl Decompiler {
             structured
         };
 
-        // Step 3: Generate C++ header if this is a special member
+        // Step 3: Apply exception handling if available
+        let structured = if let Some(ref eh_info) = self.exception_info {
+            StructuredCfg {
+                body: apply_exception_handling(structured.body, eh_info),
+                cfg_entry: structured.cfg_entry,
+            }
+        } else {
+            structured
+        };
+
+        // Step 4: Generate C++ header if this is a special member
         let cpp_header = self.generate_cpp_header(func_name);
 
-        // Step 4: Emit pseudo-code
+        // Step 5: Format function name for C++ special members
+        let display_name = self.format_cpp_function_name(func_name);
+
+        // Step 6: Emit pseudo-code
         let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
@@ -488,7 +501,7 @@ impl Decompiler {
             emitter = emitter.with_type_database(db.clone());
         }
 
-        let code = emitter.emit(&structured, func_name);
+        let code = emitter.emit(&structured, &display_name);
 
         // Build final output with all headers
         let mut output = String::new();
@@ -610,6 +623,54 @@ impl Decompiler {
         }
     }
 
+    /// Formats a function name for C++ special members.
+    ///
+    /// Converts mangled names or raw names to proper C++ syntax:
+    /// - Constructors: `ClassName::ClassName`
+    /// - Destructors: `ClassName::~ClassName`
+    fn format_cpp_function_name(&self, func_name: &str) -> String {
+        use crate::cpp_special::SpecialMemberKind;
+
+        if let Some(ref analysis) = self.cpp_special_member {
+            if let (Some(ref kind), Some(ref class_name)) = (&analysis.kind, &analysis.class_name) {
+                // Get the simple class name (last component after ::)
+                let simple_name = class_name.rsplit("::").next().unwrap_or(class_name);
+
+                return match kind {
+                    SpecialMemberKind::Constructor { .. } => {
+                        if class_name.contains("::") {
+                            format!("{}::{}", class_name, simple_name)
+                        } else {
+                            format!("{}::{}", class_name, class_name)
+                        }
+                    }
+                    SpecialMemberKind::Destructor { .. } => {
+                        if class_name.contains("::") {
+                            format!("{}::~{}", class_name, simple_name)
+                        } else {
+                            format!("{}::~{}", class_name, class_name)
+                        }
+                    }
+                    SpecialMemberKind::CopyConstructor => {
+                        format!("{}::{}", class_name, simple_name)
+                    }
+                    SpecialMemberKind::MoveConstructor => {
+                        format!("{}::{}", class_name, simple_name)
+                    }
+                    SpecialMemberKind::CopyAssignment => {
+                        format!("{}::operator=", class_name)
+                    }
+                    SpecialMemberKind::MoveAssignment => {
+                        format!("{}::operator=", class_name)
+                    }
+                };
+            }
+        }
+
+        // Not a C++ special member, return original name
+        func_name.to_string()
+    }
+
     /// Recovers the function signature from a CFG.
     ///
     /// This performs signature recovery without generating decompiled code,
@@ -681,6 +742,162 @@ impl Decompiler {
         let code = emitter.emit(&transformed, func_name);
 
         (struct_defs, code)
+    }
+}
+
+/// Applies exception handling information to a structured CFG.
+///
+/// This function wraps code in try/catch blocks based on the exception info.
+/// It identifies which nodes fall within try block address ranges and creates
+/// TryCatch nodes with appropriate catch handlers.
+fn apply_exception_handling(
+    body: Vec<StructuredNode>,
+    exception_info: &ExceptionInfo,
+) -> Vec<StructuredNode> {
+    if exception_info.try_blocks.is_empty() {
+        return body;
+    }
+
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < body.len() {
+        let node = &body[i];
+
+        // Get the address range of this node
+        if let Some((node_start, _node_end)) = get_node_address_range(node) {
+            // Check if this node starts a try block
+            if let Some(try_block) = exception_info
+                .try_blocks
+                .iter()
+                .find(|tb| node_start >= tb.start && node_start < tb.end)
+            {
+                // Collect all nodes that fall within this try block
+                let mut try_body = vec![body[i].clone()];
+                i += 1;
+
+                while i < body.len() {
+                    if let Some((next_start, _)) = get_node_address_range(&body[i]) {
+                        if next_start >= try_block.start && next_start < try_block.end {
+                            try_body.push(body[i].clone());
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                // Create catch handlers
+                let catch_handlers: Vec<structurer::CatchHandler> = try_block
+                    .handlers
+                    .iter()
+                    .map(|h| structurer::CatchHandler {
+                        exception_type: if h.is_catch_all {
+                            None
+                        } else {
+                            h.catch_type.clone()
+                        },
+                        variable_name: Some("e".to_string()),
+                        body: vec![], // Catch body would need landing pad analysis
+                        landing_pad: h.landing_pad,
+                    })
+                    .collect();
+
+                // Create the try-catch node
+                result.push(StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                });
+                continue;
+            }
+        }
+
+        // Not in a try block, add as-is
+        result.push(body[i].clone());
+        i += 1;
+    }
+
+    result
+}
+
+/// Gets the address range of a structured node.
+fn get_node_address_range(node: &StructuredNode) -> Option<(u64, u64)> {
+    match node {
+        StructuredNode::Block { address_range, .. } => Some(*address_range),
+        StructuredNode::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            let start = then_body
+                .first()
+                .and_then(get_node_address_range)
+                .map(|(s, _)| s)?;
+            let end = else_body
+                .as_ref()
+                .and_then(|e| e.last())
+                .or(then_body.last())
+                .and_then(get_node_address_range)
+                .map(|(_, e)| e)?;
+            Some((start, end))
+        }
+        StructuredNode::While { body, .. }
+        | StructuredNode::DoWhile { body, .. }
+        | StructuredNode::Loop { body }
+        | StructuredNode::Sequence(body) => {
+            let start = body
+                .first()
+                .and_then(get_node_address_range)
+                .map(|(s, _)| s)?;
+            let end = body
+                .last()
+                .and_then(get_node_address_range)
+                .map(|(_, e)| e)?;
+            Some((start, end))
+        }
+        StructuredNode::For { body, .. } => {
+            let start = body
+                .first()
+                .and_then(get_node_address_range)
+                .map(|(s, _)| s)?;
+            let end = body
+                .last()
+                .and_then(get_node_address_range)
+                .map(|(_, e)| e)?;
+            Some((start, end))
+        }
+        StructuredNode::Switch { cases, default, .. } => {
+            let mut all_nodes = Vec::new();
+            for (_, body) in cases {
+                all_nodes.extend(body.iter());
+            }
+            if let Some(d) = default {
+                all_nodes.extend(d.iter());
+            }
+            let start = all_nodes
+                .first()
+                .and_then(|n| get_node_address_range(n))
+                .map(|(s, _)| s)?;
+            let end = all_nodes
+                .last()
+                .and_then(|n| get_node_address_range(n))
+                .map(|(_, e)| e)?;
+            Some((start, end))
+        }
+        StructuredNode::TryCatch { try_body, .. } => {
+            let start = try_body
+                .first()
+                .and_then(get_node_address_range)
+                .map(|(s, _)| s)?;
+            let end = try_body
+                .last()
+                .and_then(get_node_address_range)
+                .map(|(_, e)| e)?;
+            Some((start, end))
+        }
+        _ => None,
     }
 }
 
