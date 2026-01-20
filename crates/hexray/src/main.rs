@@ -22,6 +22,7 @@ use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
 use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
 use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
 use hexray_types::TypeDatabase;
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -3691,6 +3692,126 @@ fn handle_session_export(
     Ok(())
 }
 
+// ============================================================================
+// REPL JSON Output Types
+// ============================================================================
+
+/// Check if --json or -j flag is present in command parts
+fn is_json_mode(parts: &[&str]) -> bool {
+    parts.iter().any(|&p| p == "--json" || p == "-j")
+}
+
+/// Binary information for JSON output
+#[derive(Serialize)]
+struct JsonBinaryInfo {
+    format: String,
+    architecture: String,
+    endianness: String,
+    entry_point: Option<String>,
+    symbol_count: usize,
+}
+
+/// Symbol information for JSON output
+#[derive(Serialize)]
+struct JsonSymbol {
+    address: String,
+    size: u64,
+    #[serde(rename = "type")]
+    symbol_type: String,
+    binding: String,
+    name: String,
+    demangled: Option<String>,
+}
+
+/// Instruction for JSON output
+#[derive(Serialize)]
+struct JsonInstruction {
+    address: String,
+    bytes: String,
+    mnemonic: String,
+    operands: String,
+    comment: Option<String>,
+}
+
+/// Disassembly result for JSON output
+#[derive(Serialize)]
+struct JsonDisasm {
+    target: String,
+    start_address: String,
+    instructions: Vec<JsonInstruction>,
+}
+
+/// Decompilation result for JSON output
+#[derive(Serialize)]
+struct JsonDecompile {
+    target: String,
+    address: String,
+    code: String,
+}
+
+/// Cross-reference for JSON output
+#[derive(Serialize)]
+struct JsonXref {
+    from: String,
+    #[serde(rename = "type")]
+    xref_type: String,
+}
+
+/// Xrefs result for JSON output
+#[derive(Serialize)]
+struct JsonXrefs {
+    target: String,
+    refs: Vec<JsonXref>,
+}
+
+/// CFG block for JSON output
+#[derive(Serialize)]
+struct JsonCfgBlock {
+    id: u32,
+    start_address: String,
+    instruction_count: usize,
+    successors: Vec<u32>,
+}
+
+/// CFG result for JSON output
+#[derive(Serialize)]
+struct JsonCfg {
+    target: String,
+    entry_block: u32,
+    blocks: Vec<JsonCfgBlock>,
+}
+
+/// String for JSON output (for future strings command)
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct JsonString {
+    address: String,
+    length: usize,
+    encoding: String,
+    content: String,
+}
+
+/// Hexdump for JSON output (for future hexdump command)
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct JsonHexdump {
+    address: String,
+    length: usize,
+    bytes: Vec<u8>,
+    ascii: String,
+}
+
+/// Section for JSON output (for future sections command)
+#[derive(Serialize)]
+#[allow(dead_code)]
+struct JsonSection {
+    index: usize,
+    name: String,
+    address: String,
+    size: u64,
+    executable: bool,
+}
+
 /// Run the interactive REPL with a session
 fn run_session_repl(session: Session, binary: Binary<'_>) -> Result<()> {
     let mut repl = Repl::new(session)?;
@@ -3714,64 +3835,114 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
 
     match parts[0] {
         "info" => {
-            let mut output = String::new();
-            output.push_str("Binary Information\n");
-            output.push_str("==================\n");
-            output.push_str(&format!("Format:        {}\n", binary.format_name()));
-            output.push_str(&format!("Architecture:  {:?}\n", fmt.architecture()));
-            output.push_str(&format!("Endianness:    {:?}\n", fmt.endianness()));
-            if let Some(entry) = fmt.entry_point() {
-                output.push_str(&format!("Entry Point:   {:#x}\n", entry));
-            }
             let sym_count: usize = fmt.symbols().count();
-            output.push_str(&format!("Symbols:       {}\n", sym_count));
-            Ok(output)
+
+            if is_json_mode(&parts) {
+                let info = JsonBinaryInfo {
+                    format: binary.format_name().to_string(),
+                    architecture: format!("{:?}", fmt.architecture()),
+                    endianness: format!("{:?}", fmt.endianness()),
+                    entry_point: fmt.entry_point().map(|e| format!("{:#x}", e)),
+                    symbol_count: sym_count,
+                };
+                Ok(serde_json::to_string_pretty(&info)?)
+            } else {
+                let mut output = String::new();
+                output.push_str("Binary Information\n");
+                output.push_str("==================\n");
+                output.push_str(&format!("Format:        {}\n", binary.format_name()));
+                output.push_str(&format!("Architecture:  {:?}\n", fmt.architecture()));
+                output.push_str(&format!("Endianness:    {:?}\n", fmt.endianness()));
+                if let Some(entry) = fmt.entry_point() {
+                    output.push_str(&format!("Entry Point:   {:#x}\n", entry));
+                }
+                output.push_str(&format!("Symbols:       {}\n", sym_count));
+                Ok(output)
+            }
         }
 
         "symbols" | "syms" => {
             let functions_only = parts.iter().any(|&p| p == "-f" || p == "--functions");
-            let mut output = String::new();
-            output.push_str(&format!(
-                "{:<16} {:<8} {:<8} {:<8} {}\n",
-                "Address", "Size", "Type", "Bind", "Name"
-            ));
-            output.push_str(&format!("{}\n", "-".repeat(70)));
+            let json_mode = is_json_mode(&parts);
 
             let mut symbols: Vec<_> = fmt.symbols().collect();
             symbols.sort_by_key(|s| s.address);
 
-            for symbol in symbols {
-                if functions_only && !symbol.is_function() {
-                    continue;
-                }
-                if symbol.name.is_empty() {
-                    continue;
-                }
-
-                let type_str = if symbol.is_function() {
-                    "FUNC"
-                } else {
-                    "OTHER"
-                };
-                let bind_str = match symbol.binding {
-                    hexray_core::SymbolBinding::Local => "LOCAL",
-                    hexray_core::SymbolBinding::Global => "GLOBAL",
-                    hexray_core::SymbolBinding::Weak => "WEAK",
-                    _ => "OTHER",
-                };
-
-                // Check for renames
-                let name = session
-                    .get_rename(symbol.address)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| demangle_or_original(&symbol.name));
-
+            if json_mode {
+                let json_symbols: Vec<JsonSymbol> = symbols
+                    .iter()
+                    .filter(|s| !s.name.is_empty())
+                    .filter(|s| !functions_only || s.is_function())
+                    .map(|symbol| {
+                        let demangled = demangle_or_original(&symbol.name);
+                        let display_name = session
+                            .get_rename(symbol.address)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| demangled.clone());
+                        JsonSymbol {
+                            address: format!("{:#x}", symbol.address),
+                            size: symbol.size,
+                            symbol_type: if symbol.is_function() {
+                                "function".to_string()
+                            } else {
+                                "other".to_string()
+                            },
+                            binding: match symbol.binding {
+                                hexray_core::SymbolBinding::Local => "local".to_string(),
+                                hexray_core::SymbolBinding::Global => "global".to_string(),
+                                hexray_core::SymbolBinding::Weak => "weak".to_string(),
+                                _ => "other".to_string(),
+                            },
+                            name: display_name,
+                            demangled: if demangled != symbol.name {
+                                Some(demangled)
+                            } else {
+                                None
+                            },
+                        }
+                    })
+                    .collect();
+                Ok(serde_json::to_string_pretty(&json_symbols)?)
+            } else {
+                let mut output = String::new();
                 output.push_str(&format!(
-                    "{:#016x} {:<8} {:<8} {:<8} {}\n",
-                    symbol.address, symbol.size, type_str, bind_str, name
+                    "{:<16} {:<8} {:<8} {:<8} {}\n",
+                    "Address", "Size", "Type", "Bind", "Name"
                 ));
+                output.push_str(&format!("{}\n", "-".repeat(70)));
+
+                for symbol in symbols {
+                    if functions_only && !symbol.is_function() {
+                        continue;
+                    }
+                    if symbol.name.is_empty() {
+                        continue;
+                    }
+
+                    let type_str = if symbol.is_function() {
+                        "FUNC"
+                    } else {
+                        "OTHER"
+                    };
+                    let bind_str = match symbol.binding {
+                        hexray_core::SymbolBinding::Local => "LOCAL",
+                        hexray_core::SymbolBinding::Global => "GLOBAL",
+                        hexray_core::SymbolBinding::Weak => "WEAK",
+                        _ => "OTHER",
+                    };
+
+                    let name = session
+                        .get_rename(symbol.address)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| demangle_or_original(&symbol.name));
+
+                    output.push_str(&format!(
+                        "{:#016x} {:<8} {:<8} {:<8} {}\n",
+                        symbol.address, symbol.size, type_str, bind_str, name
+                    ));
+                }
+                Ok(output)
             }
-            Ok(output)
         }
 
         "sections" => {
@@ -3917,8 +4088,15 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
         }
 
         "cfg" => {
+            let json_mode = is_json_mode(&parts);
+            let parts: Vec<&str> = parts
+                .iter()
+                .filter(|&&p| p != "--json" && p != "-j")
+                .copied()
+                .collect();
+
             if parts.len() < 2 {
-                return Ok("Usage: cfg <symbol|address>".to_string());
+                return Ok("Usage: cfg <symbol|address> [--json]".to_string());
             }
 
             let target = parts[1];
@@ -3958,40 +4136,66 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
 
                 let cfg = CfgBuilder::build(&instructions, addr);
 
-                // Generate ASCII CFG
-                let mut output = String::new();
-                output.push_str(&format!("Control Flow Graph for {}\n", target));
-                output.push_str(&format!("{}\n\n", "=".repeat(40)));
-
                 let mut block_ids: Vec<_> = cfg.block_ids().collect();
                 block_ids.sort_by_key(|id| id.0);
 
-                for block_id in block_ids {
-                    if let Some(block) = cfg.block(block_id) {
-                        output.push_str(&format!("Block {} @ {:#x}:\n", block_id.0, block.start));
+                if json_mode {
+                    let blocks: Vec<JsonCfgBlock> = block_ids
+                        .iter()
+                        .filter_map(|&block_id| {
+                            cfg.block(block_id).map(|block| {
+                                let succs = cfg.successors(block_id);
+                                JsonCfgBlock {
+                                    id: block_id.0,
+                                    start_address: format!("{:#x}", block.start),
+                                    instruction_count: block.instructions.len(),
+                                    successors: succs.iter().map(|id| id.0).collect(),
+                                }
+                            })
+                        })
+                        .collect();
 
-                        // Show first few instructions
-                        for inst in block.instructions.iter().take(5) {
-                            output.push_str(&format!("  {:#x}: {}\n", inst.address, inst));
-                        }
-                        if block.instructions.len() > 5 {
-                            output.push_str(&format!(
-                                "  ... ({} more)\n",
-                                block.instructions.len() - 5
-                            ));
-                        }
+                    let entry_id = cfg.entry.0;
+                    let result = JsonCfg {
+                        target: target.to_string(),
+                        entry_block: entry_id,
+                        blocks,
+                    };
+                    Ok(serde_json::to_string_pretty(&result)?)
+                } else {
+                    // Generate ASCII CFG
+                    let mut output = String::new();
+                    output.push_str(&format!("Control Flow Graph for {}\n", target));
+                    output.push_str(&format!("{}\n\n", "=".repeat(40)));
 
-                        // Show successors
-                        let succs = cfg.successors(block_id);
-                        if !succs.is_empty() {
-                            let succ_ids: Vec<_> = succs.iter().map(|id| id.0).collect();
-                            output.push_str(&format!("  -> {:?}\n", succ_ids));
+                    for block_id in block_ids {
+                        if let Some(block) = cfg.block(block_id) {
+                            output
+                                .push_str(&format!("Block {} @ {:#x}:\n", block_id.0, block.start));
+
+                            // Show first few instructions
+                            for inst in block.instructions.iter().take(5) {
+                                output.push_str(&format!("  {:#x}: {}\n", inst.address, inst));
+                            }
+                            if block.instructions.len() > 5 {
+                                output.push_str(&format!(
+                                    "  ... ({} more)\n",
+                                    block.instructions.len() - 5
+                                ));
+                            }
+
+                            // Show successors
+                            let succs = cfg.successors(block_id);
+                            if !succs.is_empty() {
+                                let succ_ids: Vec<_> = succs.iter().map(|id| id.0).collect();
+                                output.push_str(&format!("  -> {:?}\n", succ_ids));
+                            }
+                            output.push('\n');
                         }
-                        output.push('\n');
                     }
-                }
 
-                Ok(output)
+                    Ok(output)
+                }
             } else {
                 Ok(format!("No data at address {:#x}", addr))
             }
@@ -4039,11 +4243,17 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
 
         "disasm" | "d" => {
             if parts.len() < 2 {
-                return Ok("Usage: disasm <symbol|address> [count]".to_string());
+                return Ok("Usage: disasm <symbol|address> [count] [--json]".to_string());
             }
 
             let target = parts[1];
-            let count = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
+            let json_mode = is_json_mode(&parts);
+            let count = parts
+                .iter()
+                .filter(|&&p| p != "--json" && p != "-j")
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50);
 
             // Try to parse as address
             let (addr, size) = if let Ok(a) = parse_address_str(target) {
@@ -4066,32 +4276,74 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
             };
 
             if let Some(bytes) = fmt.bytes_at(addr, size) {
-                let mut output = String::new();
-
-                // Disassemble using disassemble_block and take first `count` instructions
                 let results = disassemble_block_for_arch(fmt.architecture(), bytes, addr);
 
-                for (i, result) in results.into_iter().enumerate().take(count) {
-                    match result {
-                        Ok(inst) => {
-                            let comment = session
-                                .get_comment(inst.address)
-                                .map(|c| format!("  ; {}", c))
-                                .unwrap_or_default();
-                            output.push_str(&format!(
-                                "{:#010x}  {:<32}{}\n",
-                                inst.address,
-                                inst.to_string(),
-                                comment
-                            ));
-                        }
-                        Err(_) => {
-                            let estimated_addr = addr + i as u64;
-                            output.push_str(&format!("{:#010x}  <invalid>\n", estimated_addr));
+                if json_mode {
+                    let mut json_instructions = Vec::new();
+                    let mut offset = 0usize;
+
+                    for result in results.into_iter().take(count) {
+                        match result {
+                            Ok(inst) => {
+                                let inst_bytes = &bytes[offset..offset + inst.size];
+                                let bytes_hex = inst_bytes
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<String>();
+
+                                json_instructions.push(JsonInstruction {
+                                    address: format!("{:#x}", inst.address),
+                                    bytes: bytes_hex,
+                                    mnemonic: inst.mnemonic.clone(),
+                                    operands: inst
+                                        .operands
+                                        .iter()
+                                        .map(|o| o.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    comment: session
+                                        .get_comment(inst.address)
+                                        .map(|s| s.to_string()),
+                                });
+                                offset += inst.size;
+                            }
+                            Err(_) => {
+                                offset += 1;
+                            }
                         }
                     }
+
+                    let result = JsonDisasm {
+                        target: target.to_string(),
+                        start_address: format!("{:#x}", addr),
+                        instructions: json_instructions,
+                    };
+                    Ok(serde_json::to_string_pretty(&result)?)
+                } else {
+                    let mut output = String::new();
+
+                    for (i, result) in results.into_iter().enumerate().take(count) {
+                        match result {
+                            Ok(inst) => {
+                                let comment = session
+                                    .get_comment(inst.address)
+                                    .map(|c| format!("  ; {}", c))
+                                    .unwrap_or_default();
+                                output.push_str(&format!(
+                                    "{:#010x}  {:<32}{}\n",
+                                    inst.address,
+                                    inst.to_string(),
+                                    comment
+                                ));
+                            }
+                            Err(_) => {
+                                let estimated_addr = addr + i as u64;
+                                output.push_str(&format!("{:#010x}  <invalid>\n", estimated_addr));
+                            }
+                        }
+                    }
+                    Ok(output)
                 }
-                Ok(output)
             } else {
                 Ok(format!("No data at address {:#x}", addr))
             }
@@ -4099,10 +4351,11 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
 
         "decompile" | "dec" => {
             if parts.len() < 2 {
-                return Ok("Usage: decompile <symbol|address>".to_string());
+                return Ok("Usage: decompile <symbol|address> [--json]".to_string());
             }
 
             let target = parts[1];
+            let json_mode = is_json_mode(&parts);
 
             // Find function
             let (addr, size) = if let Ok(a) = parse_address_str(target) {
@@ -4176,15 +4429,32 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     .with_symbol_table(symbols);
 
                 let pseudo_code = decompiler.decompile(&cfg, &func_name);
-                Ok(pseudo_code)
+
+                if json_mode {
+                    let result = JsonDecompile {
+                        target: target.to_string(),
+                        address: format!("{:#x}", addr),
+                        code: pseudo_code,
+                    };
+                    Ok(serde_json::to_string_pretty(&result)?)
+                } else {
+                    Ok(pseudo_code)
+                }
             } else {
                 Ok(format!("No data at address {:#x}", addr))
             }
         }
 
         "xrefs" => {
+            let json_mode = is_json_mode(&parts);
+            let parts: Vec<&str> = parts
+                .iter()
+                .filter(|&&p| p != "--json" && p != "-j")
+                .copied()
+                .collect();
+
             if parts.len() < 2 {
-                return Ok("Usage: xrefs <address>".to_string());
+                return Ok("Usage: xrefs <address> [--json]".to_string());
             }
 
             let addr = match parse_address_str(parts[1]) {
@@ -4218,25 +4488,57 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
             let refs = xref_db.refs_to(addr);
 
             if refs.is_empty() {
+                if json_mode {
+                    let result = JsonXrefs {
+                        target: format!("{:#x}", addr),
+                        refs: vec![],
+                    };
+                    return Ok(serde_json::to_string_pretty(&result)?);
+                }
                 return Ok(format!("No references to {:#x}", addr));
             }
 
-            let mut output = String::new();
-            output.push_str(&format!("Cross-references to {:#x}:\n", addr));
-            output.push_str(&format!("{}\n", "-".repeat(50)));
+            if json_mode {
+                let json_refs: Vec<JsonXref> = refs
+                    .iter()
+                    .map(|xref| {
+                        let type_str = match xref.xref_type {
+                            XrefType::Call => "call",
+                            XrefType::Jump => "jump",
+                            XrefType::DataRead => "read",
+                            XrefType::DataWrite => "write",
+                            XrefType::Unknown => "unknown",
+                        };
+                        JsonXref {
+                            from: format!("{:#x}", xref.from),
+                            xref_type: type_str.to_string(),
+                        }
+                    })
+                    .collect();
 
-            for xref in refs {
-                let type_str = match xref.xref_type {
-                    XrefType::Call => "CALL",
-                    XrefType::Jump => "JUMP",
-                    XrefType::DataRead => "READ",
-                    XrefType::DataWrite => "WRITE",
-                    XrefType::Unknown => "UNKNOWN",
+                let result = JsonXrefs {
+                    target: format!("{:#x}", addr),
+                    refs: json_refs,
                 };
-                output.push_str(&format!("{:#016x}  {}\n", xref.from, type_str));
-            }
+                Ok(serde_json::to_string_pretty(&result)?)
+            } else {
+                let mut output = String::new();
+                output.push_str(&format!("Cross-references to {:#x}:\n", addr));
+                output.push_str(&format!("{}\n", "-".repeat(50)));
 
-            Ok(output)
+                for xref in refs {
+                    let type_str = match xref.xref_type {
+                        XrefType::Call => "CALL",
+                        XrefType::Jump => "JUMP",
+                        XrefType::DataRead => "READ",
+                        XrefType::DataWrite => "WRITE",
+                        XrefType::Unknown => "UNKNOWN",
+                    };
+                    output.push_str(&format!("{:#016x}  {}\n", xref.from, type_str));
+                }
+
+                Ok(output)
+            }
         }
 
         _ => Ok(format!(
