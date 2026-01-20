@@ -32,6 +32,52 @@ use hexray_types::TypeDatabase;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cpp_special::{CppSpecialDetector, SpecialMemberAnalysis};
+use crate::rtti::RttiDatabase;
+
+/// Exception handling information for a function.
+/// Re-exported from hexray-formats for convenience.
+#[derive(Debug, Clone, Default)]
+pub struct ExceptionInfo {
+    /// Try blocks with their catch handlers.
+    pub try_blocks: Vec<TryBlockInfo>,
+    /// Cleanup handlers (finally/destructors).
+    pub cleanup_handlers: Vec<CleanupInfo>,
+}
+
+/// A try block with associated catch handlers.
+#[derive(Debug, Clone)]
+pub struct TryBlockInfo {
+    /// Start address of the try block.
+    pub start: u64,
+    /// End address of the try block.
+    pub end: u64,
+    /// Catch handlers for this try block.
+    pub handlers: Vec<CatchInfo>,
+}
+
+/// A catch handler.
+#[derive(Debug, Clone)]
+pub struct CatchInfo {
+    /// Landing pad address.
+    pub landing_pad: u64,
+    /// Type being caught (class name if known).
+    pub catch_type: Option<String>,
+    /// Whether this is a catch-all (catch(...)).
+    pub is_catch_all: bool,
+}
+
+/// A cleanup handler.
+#[derive(Debug, Clone)]
+pub struct CleanupInfo {
+    /// Protected region start.
+    pub start: u64,
+    /// Protected region end.
+    pub end: u64,
+    /// Landing pad for cleanup.
+    pub landing_pad: u64,
+}
+
 /// String table for resolving addresses to string literals.
 #[derive(Debug, Clone, Default)]
 pub struct StringTable {
@@ -236,6 +282,12 @@ pub struct Decompiler {
     pub enable_signature_recovery: bool,
     /// Type database for struct field access and function prototypes.
     pub type_database: Option<Arc<TypeDatabase>>,
+    /// RTTI database for C++ class hierarchy information.
+    pub rtti_database: Option<Arc<RttiDatabase>>,
+    /// C++ special member analysis for the current function.
+    pub cpp_special_member: Option<SpecialMemberAnalysis>,
+    /// Exception handling information for the current function.
+    pub exception_info: Option<ExceptionInfo>,
 }
 
 impl Default for Decompiler {
@@ -252,6 +304,9 @@ impl Default for Decompiler {
             calling_convention: CallingConvention::default(),
             enable_signature_recovery: true,
             type_database: None,
+            rtti_database: None,
+            cpp_special_member: None,
+            exception_info: None,
         }
     }
 }
@@ -347,6 +402,51 @@ impl Decompiler {
         self
     }
 
+    /// Sets the RTTI database for C++ class hierarchy information.
+    ///
+    /// When set, the decompiler can resolve vtable addresses to class names
+    /// and understand inheritance relationships.
+    pub fn with_rtti_database(mut self, db: Arc<RttiDatabase>) -> Self {
+        self.rtti_database = Some(db);
+        self
+    }
+
+    /// Sets C++ special member analysis for the current function.
+    ///
+    /// This provides information about whether the function is a constructor,
+    /// destructor, or other special member function.
+    pub fn with_cpp_special_member(mut self, analysis: SpecialMemberAnalysis) -> Self {
+        self.cpp_special_member = Some(analysis);
+        self
+    }
+
+    /// Analyzes a function for C++ special member patterns.
+    ///
+    /// This is a convenience method that runs CppSpecialDetector and stores
+    /// the result for use during decompilation.
+    pub fn analyze_cpp_special(
+        mut self,
+        cfg: &ControlFlowGraph,
+        instructions: &[hexray_core::Instruction],
+        symbol: Option<&str>,
+    ) -> Self {
+        let detector = CppSpecialDetector::new();
+        let analysis = detector.analyze_function(cfg, instructions, symbol);
+        if analysis.kind.is_some() {
+            self.cpp_special_member = Some(analysis);
+        }
+        self
+    }
+
+    /// Sets exception handling information for the current function.
+    ///
+    /// When set, the decompiler will annotate the output with try/catch blocks
+    /// and cleanup handler information.
+    pub fn with_exception_info(mut self, info: ExceptionInfo) -> Self {
+        self.exception_info = Some(info);
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 1: Structure the control flow
@@ -367,7 +467,10 @@ impl Decompiler {
             structured
         };
 
-        // Step 3: Emit pseudo-code
+        // Step 3: Generate C++ header if this is a special member
+        let cpp_header = self.generate_cpp_header(func_name);
+
+        // Step 4: Emit pseudo-code
         let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
@@ -379,7 +482,106 @@ impl Decompiler {
         if let Some(ref db) = self.type_database {
             emitter = emitter.with_type_database(db.clone());
         }
-        emitter.emit(&structured, func_name)
+
+        let code = emitter.emit(&structured, func_name);
+
+        // Build final output with all headers
+        let mut output = String::new();
+
+        // Add C++ header if present
+        if let Some(header) = cpp_header {
+            output.push_str(&header);
+            output.push('\n');
+        }
+
+        // Add exception handling header if present
+        if let Some(eh_header) = self.generate_exception_header() {
+            output.push_str(&eh_header);
+            output.push('\n');
+        }
+
+        output.push_str(&code);
+        output
+    }
+
+    /// Generates exception handling header comments.
+    fn generate_exception_header(&self) -> Option<String> {
+        let info = self.exception_info.as_ref()?;
+
+        if info.try_blocks.is_empty() && info.cleanup_handlers.is_empty() {
+            return None;
+        }
+
+        let mut lines = Vec::new();
+        lines.push("// Exception handling:".to_string());
+
+        for (i, try_block) in info.try_blocks.iter().enumerate() {
+            lines.push(format!("//   try block {}: {:#x}-{:#x}", i + 1, try_block.start, try_block.end));
+            for handler in &try_block.handlers {
+                let type_str = if handler.is_catch_all {
+                    "catch(...)".to_string()
+                } else if let Some(ref t) = handler.catch_type {
+                    format!("catch({})", t)
+                } else {
+                    "catch(?)".to_string()
+                };
+                lines.push(format!("//     {} -> landing pad {:#x}", type_str, handler.landing_pad));
+            }
+        }
+
+        if !info.cleanup_handlers.is_empty() {
+            lines.push(format!("//   {} cleanup handler(s)", info.cleanup_handlers.len()));
+        }
+
+        Some(lines.join("\n"))
+    }
+
+    /// Generates a C++ header comment for special member functions.
+    fn generate_cpp_header(&self, _func_name: &str) -> Option<String> {
+        let analysis = self.cpp_special_member.as_ref()?;
+        let kind = analysis.kind.as_ref()?;
+
+        let mut lines = Vec::new();
+
+        // Add function type comment
+        lines.push(format!("// C++ {}", kind.description()));
+
+        // Add class name if known
+        if let Some(ref class_name) = analysis.class_name {
+            lines.push(format!("// Class: {}", class_name));
+        }
+
+        // Add vtable assignments
+        if !analysis.vtable_assignments.is_empty() {
+            for va in &analysis.vtable_assignments {
+                let class_name = self.rtti_database
+                    .as_ref()
+                    .and_then(|db| db.class_name_for_vtable(va.vtable_addr))
+                    .unwrap_or("unknown");
+                lines.push(format!("// Vtable at offset {}: {} ({:#x})",
+                    va.object_offset, class_name, va.vtable_addr));
+            }
+        }
+
+        // Add base class calls
+        if !analysis.base_calls.is_empty() {
+            for bc in &analysis.base_calls {
+                let kind_str = if bc.is_constructor { "constructor" } else { "destructor" };
+                let target = bc.class_name.as_deref().unwrap_or("unknown");
+                lines.push(format!("// Calls base {} of {}", kind_str, target));
+            }
+        }
+
+        // Add confidence if not high
+        if analysis.confidence < 0.8 {
+            lines.push(format!("// Confidence: {:.0}%", analysis.confidence * 100.0));
+        }
+
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
     }
 
     /// Recovers the function signature from a CFG.

@@ -50,6 +50,7 @@ pub use dataflow::{
 pub use decompiler::{
     Decompiler, StringTable, SymbolTable, RelocationTable,
     CallingConvention, FunctionSignature, Parameter, ParameterLocation, ParamType, SignatureRecovery,
+    ExceptionInfo, TryBlockInfo, CatchInfo, CleanupInfo,
 };
 pub use function_finder::FunctionFinder;
 pub use output::{

@@ -684,6 +684,77 @@ impl Expr {
                 let args = args.into_iter().map(|a| a.simplify()).collect();
                 Self::call(target, args)
             }
+            ExprKind::Cast { expr, to_size, signed } => {
+                let simplified_expr = expr.simplify();
+
+                // Cast of integer literal: evaluate the cast
+                if let ExprKind::IntLit(n) = simplified_expr.kind {
+                    let mask = match to_size {
+                        1 => 0xFF,
+                        2 => 0xFFFF,
+                        4 => 0xFFFFFFFF,
+                        8 => u64::MAX as i128,
+                        _ => return Self { kind: ExprKind::Cast { expr: Box::new(simplified_expr), to_size, signed } },
+                    };
+                    let masked = n & mask;
+                    // Sign extend if needed
+                    let result = if signed {
+                        let sign_bit = 1i128 << (to_size * 8 - 1);
+                        if (masked & sign_bit) != 0 {
+                            masked | !mask // Sign extend
+                        } else {
+                            masked
+                        }
+                    } else {
+                        masked
+                    };
+                    return Self::int(result);
+                }
+
+                // Nested cast elimination: (T1)(T2)x
+                // If outer cast is larger or equal, inner cast may be redundant
+                if let ExprKind::Cast { expr: inner_expr, to_size: inner_size, signed: inner_signed } = &simplified_expr.kind {
+                    // If casting to same size with same signedness, remove redundant cast
+                    if to_size == *inner_size && signed == *inner_signed {
+                        return *inner_expr.clone();
+                    }
+                    // If outer cast is smaller, it dominates (truncation)
+                    if to_size < *inner_size {
+                        return Self { kind: ExprKind::Cast { expr: inner_expr.clone(), to_size, signed } };
+                    }
+                    // If outer cast is larger and same signedness, inner is redundant
+                    if to_size > *inner_size && signed == *inner_signed {
+                        return Self { kind: ExprKind::Cast { expr: inner_expr.clone(), to_size, signed } };
+                    }
+                }
+
+                // Cast of a variable that's already known to be the right size
+                // This would require type info - skip for now
+
+                Self { kind: ExprKind::Cast { expr: Box::new(simplified_expr), to_size, signed } }
+            }
+            ExprKind::Conditional { cond, then_expr, else_expr } => {
+                let cond = cond.simplify();
+                let then_expr = then_expr.simplify();
+                let else_expr = else_expr.simplify();
+
+                // If condition is constant, select the appropriate branch
+                if let ExprKind::IntLit(n) = cond.kind {
+                    if n != 0 {
+                        return then_expr;
+                    } else {
+                        return else_expr;
+                    }
+                }
+
+                Self {
+                    kind: ExprKind::Conditional {
+                        cond: Box::new(cond),
+                        then_expr: Box::new(then_expr),
+                        else_expr: Box::new(else_expr),
+                    }
+                }
+            }
             // Other expression kinds pass through unchanged
             _ => self,
         }
