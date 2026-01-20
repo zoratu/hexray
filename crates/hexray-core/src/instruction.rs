@@ -147,6 +147,8 @@ pub enum Operation {
     ParallelDeposit, // PDEP: Parallel bits deposit
     ParallelExtract, // PEXT: Parallel bits extract
     MulNoFlags,      // MULX: Unsigned multiply without affecting flags
+    // Bit test instructions
+    BitTest, // BT/BTS/BTR/BTC: Bit test (and set/reset/complement)
 
     // Comparison
     Compare,
@@ -502,6 +504,7 @@ impl Operation {
             Self::ParallelDeposit => "parallel_deposit",
             Self::ParallelExtract => "parallel_extract",
             Self::MulNoFlags => "mul_no_flags",
+            Self::BitTest => "bit_test",
             Self::Compare => "compare",
             Self::Test => "test",
             Self::Jump => "jump",

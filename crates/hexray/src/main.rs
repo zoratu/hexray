@@ -509,13 +509,15 @@ fn main() -> Result<()> {
         }
         None => {
             // Default: disassemble
+            // cli.count is instruction count, convert to bytes (max 15 bytes per x86 instruction)
+            let max_bytes = cli.count * 15;
             if let Some(symbol_name) = cli.symbol {
                 disassemble_symbol(fmt, &symbol_name, cli.count)?;
             } else if let Some(addr) = cli.address {
-                disassemble_at(fmt, addr, cli.count)?;
+                disassemble_at(fmt, addr, max_bytes)?;
             } else if let Some(entry) = fmt.entry_point() {
                 println!("Disassembling entry point at {:#x}\n", entry);
-                disassemble_at(fmt, entry, cli.count)?;
+                disassemble_at(fmt, entry, max_bytes)?;
             } else {
                 println!("No entry point found. Use -s <symbol> or -a <address>");
             }

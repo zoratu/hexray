@@ -6,7 +6,7 @@ use super::modrm::{
 };
 use super::opcodes::{
     lookup_sse_opcode, OperandEncoding, SseEncoding, GROUP1_OPS, GROUP3_OPS, GROUP5_OPS,
-    OPCODE_TABLE, OPCODE_TABLE_0F,
+    GROUP8_OPS, OPCODE_TABLE, OPCODE_TABLE_0F,
 };
 use super::prefix::Prefixes;
 use crate::error::DecodeError;
@@ -204,6 +204,11 @@ impl Disassembler for X86_64Disassembler {
             // Handle 0F 01 system instructions (SGDT, SIDT, LGDT, LIDT, SMSW, LMSW, INVLPG, RDTSCP)
             if opcode == 0x01 {
                 return self.decode_0f01_group(bytes, address, &prefixes, offset);
+            }
+
+            // Handle 0F BA group 8 (BT/BTS/BTR/BTC with immediate)
+            if opcode == 0xBA {
+                return self.decode_group8(bytes, address, &prefixes, offset);
             }
 
             OPCODE_TABLE_0F[opcode as usize].as_ref()
@@ -888,6 +893,67 @@ impl X86_64Disassembler {
             mnemonic: mnemonic.to_string(),
             operands: vec![rm_operand],
             control_flow,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    /// Decode group 8 instructions (0x0F BA: BT/BTS/BTR/BTC with immediate).
+    fn decode_group8(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        let modrm = ModRM::parse(remaining[0], prefixes.rex);
+        offset += 1;
+
+        // Determine operation from ModR/M reg field
+        let (mnemonic, operation) = GROUP8_OPS[(modrm.reg & 0x7) as usize];
+
+        // Reserved opcode extension (reg = 0-3 are reserved)
+        if mnemonic.is_empty() {
+            return Err(DecodeError::invalid_encoding(
+                address,
+                "reserved opcode extension in group 8",
+            ));
+        }
+
+        // Operand size depends on prefix
+        let operand_size = prefixes.operand_size(false);
+
+        // Decode r/m operand
+        let rm_bytes = &bytes[offset..];
+        let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+        offset += rm_consumed;
+
+        // Read immediate byte (bit position)
+        if offset >= bytes.len() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+        let imm = bytes[offset];
+        offset += 1;
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands: vec![rm_operand, Operand::imm_unsigned(imm as u64, 8)],
+            control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
         };

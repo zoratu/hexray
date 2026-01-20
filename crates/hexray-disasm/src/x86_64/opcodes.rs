@@ -608,6 +608,13 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::None,
     ));
 
+    // UD2 - Undefined instruction 2 (intentional invalid opcode exception)
+    table[0x0B] = Some(OpcodeEntry::new(
+        "ud2",
+        Operation::Interrupt,
+        OperandEncoding::None,
+    ));
+
     // System instructions
     // 0F 01 - handled specially in decoder (SGDT, SIDT, LGDT, LIDT, SMSW, LMSW, INVLPG, RDTSCP)
     // We mark 0x01 as having ModRM but handle reg field dispatch in decoder
@@ -747,6 +754,33 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
         Operation::Mul,
         OperandEncoding::ModRmReg_Rm,
     ));
+
+    // Bit test instructions (register forms)
+    // BT r/m, r - bit test
+    table[0xA3] = Some(OpcodeEntry::new(
+        "bt",
+        Operation::BitTest,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+    // BTS r/m, r - bit test and set
+    table[0xAB] = Some(OpcodeEntry::new(
+        "bts",
+        Operation::BitTest,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+    // BTR r/m, r - bit test and reset
+    table[0xB3] = Some(OpcodeEntry::new(
+        "btr",
+        Operation::BitTest,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+    // BTC r/m, r - bit test and complement
+    table[0xBB] = Some(OpcodeEntry::new(
+        "btc",
+        Operation::BitTest,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+    // BA = Group 8 (BT/BTS/BTR/BTC with immediate) - handled specially in decoder
 
     // NOP (multi-byte) - 0F 1F is the general multi-byte NOP
     table[0x1F] = Some(OpcodeEntry::new(
@@ -1025,6 +1059,18 @@ pub static GROUP5_OPS: [(&str, Operation); 8] = [
     ("jmp", Operation::Jump),    // /5 JMP m16:64 (far jmp, rare)
     ("push", Operation::Push),   // /6 PUSH r/m64
     ("", Operation::Other(255)), // /7 (reserved)
+];
+
+/// Group 8 operations (for opcode 0x0F BA: bit test with immediate).
+pub static GROUP8_OPS: [(&str, Operation); 8] = [
+    ("", Operation::Other(255)), // /0 (reserved)
+    ("", Operation::Other(255)), // /1 (reserved)
+    ("", Operation::Other(255)), // /2 (reserved)
+    ("", Operation::Other(255)), // /3 (reserved)
+    ("bt", Operation::BitTest),  // /4 BT r/m, imm8
+    ("bts", Operation::BitTest), // /5 BTS r/m, imm8
+    ("btr", Operation::BitTest), // /6 BTR r/m, imm8
+    ("btc", Operation::BitTest), // /7 BTC r/m, imm8
 ];
 
 // ============================================================================

@@ -963,8 +963,8 @@ impl Expr {
                     Self::unknown("/* nop */")
                 }
             }
-            Operation::Compare | Operation::Test => {
-                // Compare and test set flags but don't produce a visible result.
+            Operation::Compare | Operation::Test | Operation::BitTest => {
+                // Compare, test, and bit test set flags but don't produce a visible result.
                 // They're consumed by subsequent conditional branches.
                 // Emit as a no-op comment to avoid cluttering output.
                 Self::unknown("/* nop */")
