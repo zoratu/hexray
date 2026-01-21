@@ -40,6 +40,10 @@ pub enum OperandEncoding {
     OpReg0F,
     /// Two immediates: imm16, imm8 (ENTER instruction)
     Imm16_Imm8,
+    /// ModR/M: reg, r/m, imm16/32 (IMUL r, r/m, imm)
+    ModRmReg_Rm_Imm,
+    /// ModR/M: reg, r/m, imm8 (IMUL r, r/m, imm8)
+    ModRmReg_Rm_Imm8,
 }
 
 /// Opcode table entry.
@@ -328,7 +332,7 @@ pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
     table[0x69] = Some(OpcodeEntry::new(
         "imul",
         Operation::Mul,
-        OperandEncoding::ModRmReg_Rm, // decoder handles the immediate
+        OperandEncoding::ModRmReg_Rm_Imm,
     ));
 
     // PUSH imm8 (sign-extended to 64-bit in long mode)
@@ -339,7 +343,7 @@ pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
     table[0x6B] = Some(OpcodeEntry::new(
         "imul",
         Operation::Mul,
-        OperandEncoding::ModRmReg_Rm, // decoder handles the immediate
+        OperandEncoding::ModRmReg_Rm_Imm8,
     ));
 
     // String I/O instructions (privileged)

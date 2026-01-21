@@ -588,6 +588,77 @@ impl Disassembler for X86_64Disassembler {
                 operands.push(Operand::imm(imm16 as i128, 16));
                 operands.push(Operand::imm(imm8 as i128, 8));
             }
+
+            OperandEncoding::ModRmReg_Rm_Imm => {
+                // IMUL r, r/m, imm16/32
+                let remaining = &bytes[offset..];
+                if remaining.is_empty() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let modrm = ModRM::parse(remaining[0], prefixes.rex);
+                offset += 1;
+
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                // Read immediate (16 or 32 bits depending on operand size)
+                let imm_remaining = &bytes[offset..];
+                let (imm_val, imm_size) = if operand_size == 16 {
+                    if imm_remaining.len() < 2 {
+                        return Err(DecodeError::truncated(address, offset + 2, bytes.len()));
+                    }
+                    let imm = i16::from_le_bytes([imm_remaining[0], imm_remaining[1]]) as i128;
+                    offset += 2;
+                    (imm, 16)
+                } else {
+                    if imm_remaining.len() < 4 {
+                        return Err(DecodeError::truncated(address, offset + 4, bytes.len()));
+                    }
+                    let imm = i32::from_le_bytes([
+                        imm_remaining[0],
+                        imm_remaining[1],
+                        imm_remaining[2],
+                        imm_remaining[3],
+                    ]) as i128;
+                    offset += 4;
+                    (imm, 32)
+                };
+
+                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(rm_operand);
+                operands.push(Operand::imm(imm_val, imm_size));
+            }
+
+            OperandEncoding::ModRmReg_Rm_Imm8 => {
+                // IMUL r, r/m, imm8 (sign-extended)
+                let remaining = &bytes[offset..];
+                if remaining.is_empty() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let modrm = ModRM::parse(remaining[0], prefixes.rex);
+                offset += 1;
+
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                // Read 8-bit immediate (sign-extended)
+                let imm_remaining = &bytes[offset..];
+                if imm_remaining.is_empty() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let imm = imm_remaining[0] as i8 as i128;
+                offset += 1;
+
+                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(rm_operand);
+                operands.push(Operand::imm(imm, 8));
+            }
         }
 
         // Build control flow
