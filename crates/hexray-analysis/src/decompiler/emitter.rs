@@ -603,6 +603,36 @@ impl PseudoCodeEmitter {
                 };
                 format!("({}){}", type_name, inner_str)
             }
+            // Compound assignment: x op= y
+            ExprKind::CompoundAssign { op, lhs, rhs } => {
+                let lhs_str = self.format_expr_with_strings(lhs, table);
+                let rhs_str = self.format_expr_with_strings(rhs, table);
+                format!("{} {}= {}", lhs_str, op.as_str(), rhs_str)
+            }
+            // Conditional: cond ? then : else
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                let cond_str = self.format_expr_with_strings(cond, table);
+                let then_str = self.format_expr_with_strings(then_expr, table);
+                let else_str = self.format_expr_with_strings(else_expr, table);
+                format!("{} ? {} : {}", cond_str, then_str, else_str)
+            }
+            // Address-of: &expr
+            ExprKind::AddressOf(inner) => {
+                let inner_str = self.format_expr_with_strings(inner, table);
+                format!("&{}", inner_str)
+            }
+            // Field access: base->field
+            ExprKind::FieldAccess {
+                base, field_name, ..
+            } => {
+                let base_str = self.format_expr_with_strings(base, table);
+                // Use -> for pointer access (most common in decompiled code)
+                format!("{}->{}", base_str, field_name)
+            }
             // For other cases, use default formatting
             _ => expr.to_string(),
         }
@@ -2379,21 +2409,64 @@ fn is_epilogue_statement(expr: &Expr) -> bool {
 
 /// Renames registers to more meaningful variable names.
 /// Callee-saved registers used for return values/error codes get renamed.
+/// Low-byte registers used as boolean temporaries get renamed to temp_N.
 fn rename_register(name: &str) -> String {
     let name_lower = name.to_lowercase();
     match name_lower.as_str() {
+        // x86-64 return value register
+        "eax" | "rax" => "ret".to_string(),
         // x86-64 callee-saved registers commonly used for error/result
         "ebx" | "rbx" => "err".to_string(),
-        "r12" | "r12d" => "result".to_string(),
-        "r13" | "r13d" => "saved1".to_string(),
-        "r14" | "r14d" => "saved2".to_string(),
-        "r15" | "r15d" => "saved3".to_string(),
+        "r12" | "r12d" | "r12w" | "r12b" => "result".to_string(),
+        "r13" | "r13d" | "r13w" | "r13b" => "saved1".to_string(),
+        "r14" | "r14d" | "r14w" | "r14b" => "saved2".to_string(),
+        "r15" | "r15d" | "r15w" | "r15b" => "saved3".to_string(),
+        // x86-64 argument registers (64-bit only for function args)
+        "rdi" => "arg0".to_string(),
+        "rsi" => "arg1".to_string(),
+        "rdx" => "arg2".to_string(),
+        "rcx" => "arg3".to_string(),
+        "r8" => "arg4".to_string(),
+        "r9" => "arg5".to_string(),
         // ARM64 callee-saved registers
         "x19" | "w19" => "err".to_string(),
         "x20" | "w20" => "result".to_string(),
         "x21" | "w21" => "saved1".to_string(),
         "x22" | "w22" => "saved2".to_string(),
-        // Keep other registers as-is
+        // ARM64 return register
+        "x0" | "w0" => "ret".to_string(),
+        // ARM64 argument registers
+        "x1" | "w1" => "arg1".to_string(),
+        "x2" | "w2" => "arg2".to_string(),
+        "x3" | "w3" => "arg3".to_string(),
+        "x4" | "w4" => "arg4".to_string(),
+        "x5" | "w5" => "arg5".to_string(),
+        "x6" | "w6" => "arg6".to_string(),
+        "x7" | "w7" => "arg7".to_string(),
+        // x86-64 low-byte and partial registers used as temporaries
+        // These are often used for boolean conditions (setcc results)
+        "al" | "ah" => "tmp_a".to_string(),
+        "bl" | "bh" => "tmp_b".to_string(),
+        "cl" | "ch" => "tmp_c".to_string(),
+        "dl" | "dh" => "tmp_d".to_string(),
+        "sil" => "tmp_si".to_string(),
+        "dil" => "tmp_di".to_string(),
+        "spl" => "tmp_sp".to_string(),
+        "bpl" => "tmp_bp".to_string(),
+        "r8b" | "r8w" => "tmp_r8".to_string(),
+        "r9b" | "r9w" => "tmp_r9".to_string(),
+        "r10b" | "r10w" => "tmp_r10".to_string(),
+        "r11b" | "r11w" => "tmp_r11".to_string(),
+        // Caller-saved 32-bit registers often used as temporaries
+        "ecx" => "tmp_ecx".to_string(),
+        "edx" => "tmp_edx".to_string(),
+        "esi" => "tmp_esi".to_string(),
+        "edi" => "tmp_edi".to_string(),
+        "r8d" => "tmp_r8".to_string(),
+        "r9d" => "tmp_r9".to_string(),
+        "r10d" => "tmp_r10".to_string(),
+        "r11d" => "tmp_r11".to_string(),
+        // Keep other registers as-is (rsp, rbp, rip, etc.)
         _ => name.to_string(),
     }
 }
