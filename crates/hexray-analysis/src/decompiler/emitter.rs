@@ -358,6 +358,61 @@ impl PseudoCodeEmitter {
         self.format_expr_with_strings(expr, table)
     }
 
+    /// Formats an expression without resolving addresses to string literals.
+    /// Used for comparisons and other contexts where string resolution doesn't make sense.
+    fn format_expr_no_string_resolve(&self, expr: &Expr) -> String {
+        let empty = super::StringTable::new();
+        self.format_lvalue(expr, &empty)
+    }
+
+    /// Formats an lvalue (left-hand side of assignment).
+    /// This is like format_expr_with_strings but doesn't resolve addresses to string literals,
+    /// since you can't assign to a string literal.
+    fn format_lvalue(&self, expr: &Expr, table: &StringTable) -> String {
+        match &expr.kind {
+            // For GotRef as lvalue, never resolve to string - use data_ naming
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                size,
+                is_deref,
+                ..
+            } => {
+                // Try to resolve using instruction address first (for relocatable objects)
+                if let Some(ref reloc_table) = self.relocation_table {
+                    if let Some(name) = reloc_table.get_got(*instruction_address) {
+                        return name.to_string();
+                    }
+                    if let Some(name) = reloc_table.get_got(*address) {
+                        return name.to_string();
+                    }
+                }
+                // Try symbol table
+                if let Some(ref sym_table) = self.symbol_table {
+                    if let Some(name) = sym_table.get(*address) {
+                        return name.to_string();
+                    }
+                }
+                // Skip string table lookup for lvalues - you can't write to string literals
+                // Fall back to data_XXXX naming
+                if *is_deref {
+                    let prefix = match size {
+                        1 => "*(uint8_t*)",
+                        2 => "*(uint16_t*)",
+                        4 => "*(uint32_t*)",
+                        8 => "*(uint64_t*)",
+                        _ => "*",
+                    };
+                    format!("{}(&data_{:x})", prefix, address)
+                } else {
+                    format!("data_{:x}", address)
+                }
+            }
+            // For other expression types, delegate to format_expr_with_strings
+            _ => self.format_expr_with_strings(expr, table),
+        }
+    }
+
     /// Formats an expression with string resolution.
     fn format_expr_with_strings(&self, expr: &Expr, table: &StringTable) -> String {
         match &expr.kind {
@@ -374,12 +429,22 @@ impl PseudoCodeEmitter {
                 format_integer(*n)
             }
             ExprKind::BinOp { op, left, right } => {
-                format!(
-                    "{} {} {}",
-                    self.format_expr_with_strings(left, table),
-                    op.as_str(),
-                    self.format_expr_with_strings(right, table)
-                )
+                // For comparison operators, don't resolve the operands to strings
+                // because comparisons like `ptr == 0` should show the pointer variable,
+                // not the string it points to (e.g., "hello" == 0 doesn't make sense)
+                if op.is_comparison() {
+                    // Use the non-string-resolving formatter for comparisons
+                    let left_str = self.format_expr_no_string_resolve(left);
+                    let right_str = self.format_expr_no_string_resolve(right);
+                    format!("{} {} {}", left_str, op.as_str(), right_str)
+                } else {
+                    format!(
+                        "{} {} {}",
+                        self.format_expr_with_strings(left, table),
+                        op.as_str(),
+                        self.format_expr_with_strings(right, table)
+                    )
+                }
             }
             ExprKind::UnaryOp { op, operand } => {
                 format!(
@@ -401,8 +466,9 @@ impl PseudoCodeEmitter {
                 }
                 // Check if this is an array access pattern: base + index * size
                 if let Some((base, index)) = try_extract_array_access(addr, *size) {
-                    let base_str = self.format_expr_with_strings(&base, table);
-                    let index_str = self.format_expr_with_strings(&index, table);
+                    // Don't resolve strings in array base/index - those should be pointers
+                    let base_str = self.format_expr_no_string_resolve(&base);
+                    let index_str = self.format_expr_no_string_resolve(&index);
                     return format!("{}[{}]", base_str, index_str);
                 }
                 // Fall back to default deref formatting
@@ -413,13 +479,16 @@ impl PseudoCodeEmitter {
                     8 => "*(uint64_t*)",
                     _ => "*",
                 };
-                format!("{}({})", prefix, self.format_expr_with_strings(addr, table))
+                // Don't resolve strings in deref address - dereferencing a string literal
+                // doesn't make sense. Show the pointer/data variable instead.
+                format!("{}({})", prefix, self.format_expr_no_string_resolve(addr))
             }
             ExprKind::Assign { lhs, rhs } => {
                 // Check for compound assignment patterns: x = x op y → x op= y
                 if let ExprKind::BinOp { op, left, right } = &rhs.kind {
                     if exprs_equal(lhs, left) {
-                        let lhs_str = self.format_expr_with_strings(lhs, table);
+                        // For lhs, don't resolve strings (can't write to string literals)
+                        let lhs_str = self.format_lvalue(lhs, table);
                         let rhs_str = self.format_expr_with_strings(right, table);
 
                         // Special case: x = x + 1 → x++ and x = x - 1 → x--
@@ -443,7 +512,8 @@ impl PseudoCodeEmitter {
                 }
                 format!(
                     "{} = {}",
-                    self.format_expr_with_strings(lhs, table),
+                    // For lhs, don't resolve strings (can't write to string literals)
+                    self.format_lvalue(lhs, table),
                     self.format_expr_with_strings(rhs, table)
                 )
             }
