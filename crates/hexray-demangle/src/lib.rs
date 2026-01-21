@@ -845,7 +845,8 @@ impl<'a> ItaniumDemangler<'a> {
             } else {
                 break;
             };
-            seq_id = seq_id * 36 + digit;
+            // Use checked arithmetic to prevent overflow on malformed input
+            seq_id = seq_id.checked_mul(36)?.checked_add(digit)?;
             self.consume(1);
         }
 
