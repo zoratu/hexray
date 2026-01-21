@@ -22,6 +22,8 @@ pub enum RegisterClass {
     StreamingMode,
     /// AMX tile register (tmm0-tmm7) - x86 specific
     Tile,
+    /// x87 FPU stack register (st0-st7) - x86 specific
+    X87,
     /// Segment register (cs, ds, etc.) - x86 specific
     Segment,
     /// Control register (cr0, etc.)
@@ -184,6 +186,17 @@ pub mod x86 {
     pub const TMM5: u16 = 117;
     pub const TMM6: u16 = 118;
     pub const TMM7: u16 = 119;
+
+    // x87 FPU stack registers (st0-st7)
+    // Note: these use ID 0-7 with the X87 register class
+    pub const ST0: u16 = 0;
+    pub const ST1: u16 = 1;
+    pub const ST2: u16 = 2;
+    pub const ST3: u16 = 3;
+    pub const ST4: u16 = 4;
+    pub const ST5: u16 = 5;
+    pub const ST6: u16 = 6;
+    pub const ST7: u16 = 7;
 }
 
 fn x86_reg_name(id: u16, size: u16) -> &'static str {
@@ -381,6 +394,16 @@ fn x86_reg_name(id: u16, size: u16) -> &'static str {
         (x86::TMM5, _) => "tmm5",
         (x86::TMM6, _) => "tmm6",
         (x86::TMM7, _) => "tmm7",
+
+        // x87 FPU stack registers (80-bit extended precision)
+        (x86::ST0, 80) => "st(0)",
+        (x86::ST1, 80) => "st(1)",
+        (x86::ST2, 80) => "st(2)",
+        (x86::ST3, 80) => "st(3)",
+        (x86::ST4, 80) => "st(4)",
+        (x86::ST5, 80) => "st(5)",
+        (x86::ST6, 80) => "st(6)",
+        (x86::ST7, 80) => "st(7)",
 
         _ => "unknown",
     }

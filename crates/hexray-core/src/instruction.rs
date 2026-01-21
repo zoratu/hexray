@@ -460,6 +460,30 @@ pub enum Operation {
     /// Vector compress (VCOMPRESS)
     VectorCompress,
 
+    // x87 FPU operations (legacy floating-point)
+    /// x87 FPU load (FLD, FILD)
+    X87Load,
+    /// x87 FPU store (FST, FSTP, FIST, FISTP)
+    X87Store,
+    /// x87 FPU add (FADD, FADDP, FIADD)
+    X87Add,
+    /// x87 FPU subtract (FSUB, FSUBP, FSUBR, FSUBRP, FISUB, FISUBR)
+    X87Sub,
+    /// x87 FPU multiply (FMUL, FMULP, FIMUL)
+    X87Mul,
+    /// x87 FPU divide (FDIV, FDIVP, FDIVR, FDIVRP, FIDIV, FIDIVR)
+    X87Div,
+    /// x87 FPU compare (FCOM, FCOMP, FCOMPP, FCOMI, FCOMIP, FUCOMI, FUCOMIP, FTST, FXAM, FICOM, FICOMP)
+    X87Compare,
+    /// x87 FPU transcendental (FSIN, FCOS, FSINCOS, FPTAN, FPATAN, F2XM1, FYL2X, FYL2XP1)
+    X87Transcendental,
+    /// x87 FPU misc (FABS, FCHS, FSQRT, FRNDINT, FSCALE, FXTRACT, FPREM, FPREM1)
+    X87Misc,
+    /// x87 FPU control (FLDCW, FSTCW, FNSTCW, FLDENV, FSTENV, FSAVE, FRSTOR, FINIT, FNINIT, FCLEX, FNCLEX, FWAIT)
+    X87Control,
+    /// x87 FPU stack (FXCH, FFREE, FINCSTP, FDECSTP, FLD1, FLDZ, FLDPI, FLDL2E, FLDL2T, FLDLG2, FLDLN2)
+    X87Stack,
+
     // Other
     Other(u16),
 }
@@ -658,6 +682,18 @@ impl Operation {
             Self::VectorCompress => "vector_compress",
             Self::SetConditional => "set_conditional",
             Self::ConditionalMove => "conditional_move",
+            // x87 FPU operations
+            Self::X87Load => "x87_load",
+            Self::X87Store => "x87_store",
+            Self::X87Add => "x87_add",
+            Self::X87Sub => "x87_sub",
+            Self::X87Mul => "x87_mul",
+            Self::X87Div => "x87_div",
+            Self::X87Compare => "x87_compare",
+            Self::X87Transcendental => "x87_transcendental",
+            Self::X87Misc => "x87_misc",
+            Self::X87Control => "x87_control",
+            Self::X87Stack => "x87_stack",
             Self::Other(_) => "other",
         }
     }

@@ -1098,6 +1098,29 @@ impl Expr {
                 // Jumps are handled by control flow structuring, not as expressions
                 Self::unknown("/* nop */")
             }
+            // x87 FPU operations - emit as function calls with operands
+            Operation::X87Load
+            | Operation::X87Store
+            | Operation::X87Add
+            | Operation::X87Sub
+            | Operation::X87Mul
+            | Operation::X87Div
+            | Operation::X87Compare
+            | Operation::X87Transcendental
+            | Operation::X87Misc
+            | Operation::X87Control
+            | Operation::X87Stack => {
+                // x87 FPU instructions: emit as a function call with the mnemonic
+                if !ops.is_empty() {
+                    Self::call(
+                        CallTarget::Named(inst.mnemonic.clone()),
+                        ops.iter().map(Self::from_operand).collect(),
+                    )
+                } else {
+                    // No operands - just emit as a no-arg call
+                    Self::call(CallTarget::Named(inst.mnemonic.clone()), vec![])
+                }
+            }
             Operation::Other(_) => {
                 // Unknown operation - emit the mnemonic as a function call if it has operands
                 if !ops.is_empty() {

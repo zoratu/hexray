@@ -229,6 +229,10 @@ impl Disassembler for X86_64Disassembler {
             if opcode == 0xFF {
                 return self.decode_group5(bytes, address, &prefixes, offset);
             }
+            // Handle x87 FPU instructions (0xD8-0xDF)
+            if (0xD8..=0xDF).contains(&opcode) {
+                return self.decode_x87(bytes, address, &prefixes, offset, opcode);
+            }
             OPCODE_TABLE[opcode as usize].as_ref()
         };
 
@@ -953,6 +957,104 @@ impl X86_64Disassembler {
             operation,
             mnemonic: mnemonic.to_string(),
             operands: vec![rm_operand, Operand::imm_unsigned(imm as u64, 8)],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    /// Decode x87 FPU instructions (0xD8-0xDF).
+    fn decode_x87(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        escape: u8,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        let modrm_byte = remaining[0];
+        offset += 1;
+
+        // Look up the x87 instruction
+        let entry = super::x87::decode_x87(escape, modrm_byte)
+            .ok_or_else(|| DecodeError::unknown_opcode(address, &bytes[..offset]))?;
+
+        let modrm = ModRM::parse(modrm_byte, prefixes.rex);
+        let is_memory = modrm_byte < 0xC0;
+
+        // Build operands
+        let mut operands = Vec::new();
+
+        if is_memory {
+            // Memory operand
+            let rm_bytes = &bytes[offset..];
+            // Use the mem_size from entry to determine effective size, but decode_modrm_rm
+            // just needs a size for register addressing (not used for memory)
+            let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, 64)
+                .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+            offset += rm_consumed;
+            operands.push(rm_operand);
+        } else {
+            // Register operand - ST(i)
+            let st_idx = modrm_byte & 0x07;
+
+            // Helper to create ST(n) register
+            let st_reg =
+                |n: u8| Register::new(Architecture::X86_64, RegisterClass::X87, n as u16, 80);
+
+            match entry.operand_count {
+                0 => {
+                    // No operands (e.g., FNOP, FSIN, FCOS)
+                }
+                1 => {
+                    // Single ST(i) operand
+                    operands.push(Operand::Register(st_reg(st_idx)));
+                }
+                2 => {
+                    // Two operands: ST(0), ST(i) or ST(i), ST(0)
+                    // For D8: ST(0), ST(i)
+                    // For DC/DE: ST(i), ST(0)
+                    if escape == 0xDC || escape == 0xDE {
+                        operands.push(Operand::Register(st_reg(st_idx)));
+                        operands.push(Operand::Register(st_reg(0)));
+                    } else {
+                        operands.push(Operand::Register(st_reg(0)));
+                        operands.push(Operand::Register(st_reg(st_idx)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Special case: FNSTSW AX (DF E0)
+        if escape == 0xDF && modrm_byte == 0xE0 {
+            operands.clear();
+            // AX is RAX with 16-bit size
+            operands.push(Operand::Register(Register::new(
+                Architecture::X86_64,
+                RegisterClass::General,
+                x86::RAX,
+                16,
+            )));
+        }
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation: entry.operation,
+            mnemonic: entry.mnemonic.to_string(),
+            operands,
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],

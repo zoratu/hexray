@@ -13,6 +13,7 @@ mod opcodes;
 mod opcodes_0f38;
 mod opcodes_0f3a;
 mod prefix;
+mod x87;
 
 pub use decoder::X86_64Disassembler;
 pub use prefix::{Evex, Prefixes, Rex, Vex};
