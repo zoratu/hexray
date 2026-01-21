@@ -42,6 +42,8 @@ pub enum ConstantCategory {
     PollEvents,
     /// epoll_ctl operations
     EpollCtl,
+    /// *at() syscall flags (AT_FDCWD, AT_SYMLINK_NOFOLLOW, etc.)
+    AtFlags,
 }
 
 /// A named constant with its value and category.
@@ -650,6 +652,38 @@ pub fn load_posix_constants(db: &mut ConstantDatabase) {
         category: Errno,
         description: Some("Invalid argument"),
     });
+
+    // *at() syscall constants
+    db.add(NamedConstant {
+        name: "AT_FDCWD",
+        value: -100, // -2 on macOS, -100 on Linux
+        category: AtFlags,
+        description: Some("Use current working directory (Linux)"),
+    });
+    db.add(NamedConstant {
+        name: "AT_SYMLINK_NOFOLLOW",
+        value: 0x100,
+        category: AtFlags,
+        description: Some("Do not follow symlinks"),
+    });
+    db.add(NamedConstant {
+        name: "AT_REMOVEDIR",
+        value: 0x200,
+        category: AtFlags,
+        description: Some("Remove directory instead of file"),
+    });
+    db.add(NamedConstant {
+        name: "AT_SYMLINK_FOLLOW",
+        value: 0x400,
+        category: AtFlags,
+        description: Some("Follow symbolic links"),
+    });
+    db.add(NamedConstant {
+        name: "AT_EACCESS",
+        value: 0x200,
+        category: AtFlags,
+        description: Some("Use effective IDs for access check"),
+    });
 }
 
 /// Load Linux-specific constants.
@@ -966,6 +1000,20 @@ pub fn load_macos_constants(db: &mut ConstantDatabase) {
         category: Signal,
         description: Some("Window resize (macOS)"),
     });
+    db.add(NamedConstant {
+        name: "SIGINFO",
+        value: 29,
+        category: Signal,
+        description: Some("Information request (macOS/BSD)"),
+    });
+
+    // macOS AT_FDCWD is -2, not -100 like Linux
+    db.add(NamedConstant {
+        name: "AT_FDCWD",
+        value: -2,
+        category: AtFlags,
+        description: Some("Use current working directory (macOS)"),
+    });
 }
 
 /// Map function names to argument categories for context-aware constant lookup.
@@ -992,6 +1040,23 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
         "poll" | "_poll" | "ppoll" | "_ppoll" => None, // events are in struct
         "read" | "_read" | "write" | "_write" if arg_index == 0 => Some(ConstantCategory::General),
         "epoll_ctl" | "_epoll_ctl" if arg_index == 1 => Some(ConstantCategory::EpollCtl),
+        // *at() syscalls - first arg is directory fd (AT_FDCWD)
+        "openat" | "_openat" | "fstatat" | "_fstatat" | "fstatat64" | "_fstatat64" | "fchmodat"
+        | "_fchmodat" | "fchownat" | "_fchownat" | "linkat" | "_linkat" | "unlinkat"
+        | "_unlinkat" | "renameat" | "_renameat" | "symlinkat" | "_symlinkat" | "readlinkat"
+        | "_readlinkat" | "faccessat" | "_faccessat" | "mkdirat" | "_mkdirat" | "mknodat"
+        | "_mknodat" | "futimesat" | "_futimesat" | "utimensat" | "_utimensat"
+            if arg_index == 0 =>
+        {
+            Some(ConstantCategory::AtFlags)
+        }
+        // Some *at() functions have flags as last argument
+        "fchmodat" | "_fchmodat" | "fchownat" | "_fchownat" | "faccessat" | "_faccessat"
+        | "linkat" | "_linkat" | "unlinkat" | "_unlinkat"
+            if arg_index == 3 =>
+        {
+            Some(ConstantCategory::AtFlags)
+        }
         _ => None,
     }
 }
