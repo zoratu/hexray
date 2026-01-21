@@ -10,7 +10,7 @@ use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, StringTable, SymbolTable};
-use hexray_types::TypeDatabase;
+use hexray_types::{get_argument_category, ConstantCategory, ConstantDatabase, TypeDatabase};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -46,6 +46,8 @@ pub struct PseudoCodeEmitter {
     use_signature_recovery: bool,
     /// Type database for struct field access and function prototypes.
     type_database: Option<Arc<TypeDatabase>>,
+    /// Constant database for magic number recognition.
+    constant_database: Option<Arc<ConstantDatabase>>,
 }
 
 impl PseudoCodeEmitter {
@@ -63,6 +65,7 @@ impl PseudoCodeEmitter {
             calling_convention: CallingConvention::default(),
             use_signature_recovery: true,
             type_database: None,
+            constant_database: None,
         }
     }
 
@@ -120,6 +123,15 @@ impl PseudoCodeEmitter {
     /// - Look up function prototypes for better call site rendering
     pub fn with_type_database(mut self, db: Arc<TypeDatabase>) -> Self {
         self.type_database = Some(db);
+        self
+    }
+
+    /// Sets the constant database for magic number recognition.
+    ///
+    /// When set, the emitter will recognize and replace magic numbers with
+    /// symbolic names (e.g., TIOCGWINSZ, SIGINT, O_RDONLY).
+    pub fn with_constant_database(mut self, db: Arc<ConstantDatabase>) -> Self {
+        self.constant_database = Some(db);
         self
     }
 
@@ -347,6 +359,45 @@ impl PseudoCodeEmitter {
         } else {
             Some(format!("{}{}", base_str, field_access))
         }
+    }
+
+    /// Formats a function call argument with context-aware constant recognition.
+    ///
+    /// Given the function name and argument index, this tries to recognize magic constants
+    /// (like TIOCGWINSZ for ioctl, SIGINT for signal, etc.) and replace them with symbolic names.
+    fn format_call_arg(
+        &self,
+        arg: &Expr,
+        func_name: &str,
+        arg_index: usize,
+        table: &StringTable,
+    ) -> String {
+        // Try to recognize magic constants based on the function and argument position
+        if let Some(ref const_db) = self.constant_database {
+            // Check if this argument position has a known constant category
+            if let Some(category) = get_argument_category(func_name, arg_index) {
+                // If the argument is an integer literal, try to resolve it
+                if let ExprKind::IntLit(value) = &arg.kind {
+                    // For flag-type arguments, try to format as combined flags
+                    match category {
+                        ConstantCategory::OpenFlags
+                        | ConstantCategory::MmapProt
+                        | ConstantCategory::MmapFlags
+                        | ConstantCategory::PollEvents => {
+                            return const_db.format_flags(*value, category);
+                        }
+                        _ => {
+                            // Single value lookup
+                            if let Some(name) = const_db.lookup(*value, Some(category)) {
+                                return name.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Fall back to normal expression formatting
+        self.format_expr_with_strings(arg, table)
     }
 
     /// Formats an expression, resolving strings from the string table.
@@ -625,9 +676,14 @@ impl PseudoCodeEmitter {
                         }
                     }
                 };
+                // Format arguments with context-aware constant recognition
                 let args_str: Vec<_> = args
                     .iter()
-                    .map(|a| self.format_expr_with_strings(a, table))
+                    .enumerate()
+                    .map(|(idx, a)| {
+                        // Try to resolve argument as a magic constant
+                        self.format_call_arg(a, &target_str, idx, table)
+                    })
                     .collect();
                 format!("{}({})", target_str, args_str.join(", "))
             }

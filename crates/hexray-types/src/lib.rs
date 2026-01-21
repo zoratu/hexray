@@ -30,10 +30,12 @@
 //! ```
 
 pub mod builtin;
+pub mod constants;
 pub mod database;
 pub mod parser;
 pub mod types;
 
+pub use constants::{get_argument_category, ConstantCategory, ConstantDatabase, NamedConstant};
 pub use database::TypeDatabase;
 pub use parser::{ParseError, ParseResult, Parser};
 pub use types::*;

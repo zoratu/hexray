@@ -23,6 +23,7 @@ use hexray_types::TypeDatabase;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod commands;
 mod session;
@@ -1147,12 +1148,16 @@ fn decompile_function(
     };
 
     // Decompile
+    // Create constant database for magic number recognition
+    let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
+
     let mut decompiler = Decompiler::new()
         .with_addresses(show_addresses)
         .with_string_table(string_table)
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
-        .with_dwarf_names(dwarf_names);
+        .with_dwarf_names(dwarf_names)
+        .with_constant_database(const_db);
     if let Some(db) = type_db {
         decompiler = decompiler.with_type_database(db.clone());
     }
@@ -1866,6 +1871,9 @@ fn decompile_with_follow(
     }
     let relocation_table = build_relocation_table(binary);
 
+    // Create constant database for magic number recognition
+    let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
+
     // Try to load DWARF debug info once
     let debug_info = load_dwarf_info(binary);
 
@@ -1943,7 +1951,8 @@ fn decompile_with_follow(
             .with_string_table(string_table.clone())
             .with_symbol_table(symbol_table.clone())
             .with_relocation_table(relocation_table.clone())
-            .with_dwarf_names(dwarf_names);
+            .with_dwarf_names(dwarf_names)
+            .with_constant_database(const_db.clone());
         if let Some(db) = type_db {
             decompiler = decompiler.with_type_database(db.clone());
         }
@@ -3301,9 +3310,11 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     })
                     .unwrap_or_else(|| format!("sub_{:x}", addr));
 
+                let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
                 let decompiler = Decompiler::new()
                     .with_addresses(false)
-                    .with_symbol_table(symbols);
+                    .with_symbol_table(symbols)
+                    .with_constant_database(const_db);
 
                 let pseudo_code = decompiler.decompile(&cfg, &func_name);
 

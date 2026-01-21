@@ -302,6 +302,8 @@ pub struct Decompiler {
     pub cpp_special_member: Option<SpecialMemberAnalysis>,
     /// Exception handling information for the current function.
     pub exception_info: Option<ExceptionInfo>,
+    /// Constant database for magic number recognition.
+    pub constant_database: Option<Arc<hexray_types::ConstantDatabase>>,
 }
 
 impl Default for Decompiler {
@@ -321,6 +323,7 @@ impl Default for Decompiler {
             rtti_database: None,
             cpp_special_member: None,
             exception_info: None,
+            constant_database: None,
         }
     }
 }
@@ -461,6 +464,15 @@ impl Decompiler {
         self
     }
 
+    /// Sets the constant database for magic number recognition.
+    ///
+    /// When set, the decompiler will recognize and replace magic numbers with
+    /// symbolic names (e.g., TIOCGWINSZ for ioctl, SIGINT for signal, O_RDONLY for open).
+    pub fn with_constant_database(mut self, db: Arc<hexray_types::ConstantDatabase>) -> Self {
+        self.constant_database = Some(db);
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 1: Structure the control flow
@@ -510,6 +522,9 @@ impl Decompiler {
             .with_signature_recovery(self.enable_signature_recovery);
         if let Some(ref db) = self.type_database {
             emitter = emitter.with_type_database(db.clone());
+        }
+        if let Some(ref db) = self.constant_database {
+            emitter = emitter.with_constant_database(db.clone());
         }
 
         let code = emitter.emit(&structured, &display_name);
@@ -749,6 +764,9 @@ impl Decompiler {
             .with_signature_recovery(self.enable_signature_recovery);
         if let Some(ref db) = self.type_database {
             emitter = emitter.with_type_database(db.clone());
+        }
+        if let Some(ref db) = self.constant_database {
+            emitter = emitter.with_constant_database(db.clone());
         }
         let code = emitter.emit(&transformed, func_name);
 
