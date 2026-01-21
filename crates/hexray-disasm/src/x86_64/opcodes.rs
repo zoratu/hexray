@@ -32,6 +32,14 @@ pub enum OperandEncoding {
     Imm16,
     Imm32,
     Imm64,
+    /// ModR/M: r/m, reg, imm8 (SHLD/SHRD with immediate)
+    ModRmRm_Reg_Imm8,
+    /// ModR/M: r/m, reg, CL (SHLD/SHRD with CL)
+    ModRmRm_Reg_Cl,
+    /// Register in 0F opcode (BSWAP: 0F C8+rd)
+    OpReg0F,
+    /// Two immediates: imm16, imm8 (ENTER instruction)
+    Imm16_Imm8,
 }
 
 /// Opcode table entry.
@@ -312,6 +320,57 @@ pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::ModRmReg_Rm,
     ));
 
+    // PUSH imm16/32 (sign-extended to 64-bit in long mode)
+    table[0x68] =
+        Some(OpcodeEntry::new("push", Operation::Push, OperandEncoding::Imm32).with_default_64());
+
+    // IMUL r, r/m, imm16/32
+    table[0x69] = Some(OpcodeEntry::new(
+        "imul",
+        Operation::Mul,
+        OperandEncoding::ModRmReg_Rm, // decoder handles the immediate
+    ));
+
+    // PUSH imm8 (sign-extended to 64-bit in long mode)
+    table[0x6A] =
+        Some(OpcodeEntry::new("push", Operation::Push, OperandEncoding::Imm8).with_default_64());
+
+    // IMUL r, r/m, imm8 (sign-extended)
+    table[0x6B] = Some(OpcodeEntry::new(
+        "imul",
+        Operation::Mul,
+        OperandEncoding::ModRmReg_Rm, // decoder handles the immediate
+    ));
+
+    // String I/O instructions (privileged)
+    // INSB - Input from Port to String (byte)
+    table[0x6C] = Some(OpcodeEntry::new(
+        "insb",
+        Operation::Other(0x6C),
+        OperandEncoding::None,
+    ));
+
+    // INSD/INSW - Input from Port to String (dword/word)
+    table[0x6D] = Some(OpcodeEntry::new(
+        "insd",
+        Operation::Other(0x6D),
+        OperandEncoding::None,
+    ));
+
+    // OUTSB - Output String to Port (byte)
+    table[0x6E] = Some(OpcodeEntry::new(
+        "outsb",
+        Operation::Other(0x6E),
+        OperandEncoding::None,
+    ));
+
+    // OUTSD/OUTSW - Output String to Port (dword/word)
+    table[0x6F] = Some(OpcodeEntry::new(
+        "outsd",
+        Operation::Other(0x6F),
+        OperandEncoding::None,
+    ));
+
     // JMP rel8
     table[0xEB] = Some(OpcodeEntry::new(
         "jmp",
@@ -587,6 +646,13 @@ pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
     // Group 1 (0x80-0x83) - immediate operations on r/m
     // These need special handling based on ModR/M reg field
 
+    // ENTER imm16, imm8 - Create stack frame
+    table[0xC8] = Some(OpcodeEntry::new(
+        "enter",
+        Operation::Other(0xC8),
+        OperandEncoding::Imm16_Imm8,
+    ));
+
     // LEAVE
     table[0xC9] = Some(OpcodeEntry::new(
         "leave",
@@ -781,6 +847,75 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::ModRmRm_Reg,
     ));
     // BA = Group 8 (BT/BTS/BTR/BTC with immediate) - handled specially in decoder
+
+    // SHLD - Double precision shift left
+    // 0F A4 /r ib = SHLD r/m, r, imm8
+    table[0xA4] = Some(OpcodeEntry::new(
+        "shld",
+        Operation::Shl,
+        OperandEncoding::ModRmRm_Reg_Imm8,
+    ));
+    // 0F A5 /r = SHLD r/m, r, CL
+    table[0xA5] = Some(OpcodeEntry::new(
+        "shld",
+        Operation::Shl,
+        OperandEncoding::ModRmRm_Reg_Cl,
+    ));
+    // SHRD - Double precision shift right
+    // 0F AC /r ib = SHRD r/m, r, imm8
+    table[0xAC] = Some(OpcodeEntry::new(
+        "shrd",
+        Operation::Shr,
+        OperandEncoding::ModRmRm_Reg_Imm8,
+    ));
+    // 0F AD /r = SHRD r/m, r, CL
+    table[0xAD] = Some(OpcodeEntry::new(
+        "shrd",
+        Operation::Shr,
+        OperandEncoding::ModRmRm_Reg_Cl,
+    ));
+
+    // BSWAP - Byte swap (0F C8+rd)
+    table[0xC8] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
+    table[0xC9] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
+    table[0xCA] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
+    table[0xCB] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
+    table[0xCC] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
+    table[0xCD] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
+    table[0xCE] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
+    table[0xCF] = Some(OpcodeEntry::new(
+        "bswap",
+        Operation::Exchange,
+        OperandEncoding::OpReg0F,
+    ));
 
     // NOP (multi-byte) - 0F 1F is the general multi-byte NOP
     table[0x1F] = Some(OpcodeEntry::new(
@@ -1800,6 +1935,124 @@ pub static SSE2_OPCODE_TABLE_66: [Option<SseOpcodeEntry>; 256] = {
     table[0xC6] = Some(
         SseOpcodeEntry::new("shufpd", Operation::Other(0xC6), SseEncoding::XmmRmImm8)
             .with_vex_mnemonic("vshufpd"),
+    );
+
+    // PSHUFD xmm, xmm/m128, imm8 (66 0F 70)
+    table[0x70] = Some(
+        SseOpcodeEntry::new("pshufd", Operation::Other(0x70), SseEncoding::XmmRmImm8)
+            .with_vex_mnemonic("vpshufd"),
+    );
+
+    // PAND xmm, xmm/m128 (66 0F DB)
+    table[0xDB] = Some(
+        SseOpcodeEntry::new("pand", Operation::And, SseEncoding::XmmRm).with_vex_mnemonic("vpand"),
+    );
+
+    // PANDN xmm, xmm/m128 (66 0F DF)
+    table[0xDF] = Some(
+        SseOpcodeEntry::new("pandn", Operation::Other(0xDF), SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpandn"),
+    );
+
+    // PAVGB xmm, xmm/m128 (66 0F E0)
+    table[0xE0] = Some(
+        SseOpcodeEntry::new("pavgb", Operation::Other(0xE0), SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpavgb"),
+    );
+
+    // PAVGW xmm, xmm/m128 (66 0F E3)
+    table[0xE3] = Some(
+        SseOpcodeEntry::new("pavgw", Operation::Other(0xE3), SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpavgw"),
+    );
+
+    // POR xmm, xmm/m128 (66 0F EB)
+    table[0xEB] = Some(
+        SseOpcodeEntry::new("por", Operation::Or, SseEncoding::XmmRm).with_vex_mnemonic("vpor"),
+    );
+
+    // PXOR xmm, xmm/m128 (66 0F EF)
+    table[0xEF] = Some(
+        SseOpcodeEntry::new("pxor", Operation::Xor, SseEncoding::XmmRm).with_vex_mnemonic("vpxor"),
+    );
+
+    // MOVQ xmm/m64, xmm (66 0F D6) - store form
+    table[0xD6] = Some(
+        SseOpcodeEntry::new("movq", Operation::Store, SseEncoding::RmXmm)
+            .with_vex_mnemonic("vmovq"),
+    );
+
+    // Packed integer arithmetic (66 prefix)
+    // PADDB xmm, xmm/m128 (66 0F FC)
+    table[0xFC] = Some(
+        SseOpcodeEntry::new("paddb", Operation::Add, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpaddb"),
+    );
+
+    // PADDW xmm, xmm/m128 (66 0F FD)
+    table[0xFD] = Some(
+        SseOpcodeEntry::new("paddw", Operation::Add, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpaddw"),
+    );
+
+    // PADDD xmm, xmm/m128 (66 0F FE)
+    table[0xFE] = Some(
+        SseOpcodeEntry::new("paddd", Operation::Add, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpaddd"),
+    );
+
+    // PSUBB xmm, xmm/m128 (66 0F F8)
+    table[0xF8] = Some(
+        SseOpcodeEntry::new("psubb", Operation::Sub, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpsubb"),
+    );
+
+    // PSUBW xmm, xmm/m128 (66 0F F9)
+    table[0xF9] = Some(
+        SseOpcodeEntry::new("psubw", Operation::Sub, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpsubw"),
+    );
+
+    // PSUBD xmm, xmm/m128 (66 0F FA)
+    table[0xFA] = Some(
+        SseOpcodeEntry::new("psubd", Operation::Sub, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpsubd"),
+    );
+
+    // PSUBQ xmm, xmm/m128 (66 0F FB)
+    table[0xFB] = Some(
+        SseOpcodeEntry::new("psubq", Operation::Sub, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpsubq"),
+    );
+
+    // PADDQ xmm, xmm/m128 (66 0F D4)
+    table[0xD4] = Some(
+        SseOpcodeEntry::new("paddq", Operation::Add, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpaddq"),
+    );
+
+    // PMULLW xmm, xmm/m128 (66 0F D5)
+    table[0xD5] = Some(
+        SseOpcodeEntry::new("pmullw", Operation::Mul, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpmullw"),
+    );
+
+    // PMULHW xmm, xmm/m128 (66 0F E5)
+    table[0xE5] = Some(
+        SseOpcodeEntry::new("pmulhw", Operation::Mul, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpmulhw"),
+    );
+
+    // PMULHUW xmm, xmm/m128 (66 0F E4)
+    table[0xE4] = Some(
+        SseOpcodeEntry::new("pmulhuw", Operation::Mul, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpmulhuw"),
+    );
+
+    // PMULUDQ xmm, xmm/m128 (66 0F F4)
+    table[0xF4] = Some(
+        SseOpcodeEntry::new("pmuludq", Operation::Mul, SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpmuludq"),
     );
 
     table

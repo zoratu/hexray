@@ -100,6 +100,28 @@ pub static OPCODE_TABLE_0F38: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::ModRmReg_Rm,
     ));
 
+    // SSE4.1 variable blend instructions (implicit XMM0 mask)
+    // 0x10: PBLENDVB xmm1, xmm2/m128, <XMM0>
+    table[0x10] = Some(OpcodeEntry::new(
+        "pblendvb",
+        Operation::Other(0x38_10),
+        OperandEncoding::ModRmReg_Rm,
+    ));
+
+    // 0x14: BLENDVPS xmm1, xmm2/m128, <XMM0>
+    table[0x14] = Some(OpcodeEntry::new(
+        "blendvps",
+        Operation::Other(0x38_14),
+        OperandEncoding::ModRmReg_Rm,
+    ));
+
+    // 0x15: BLENDVPD xmm1, xmm2/m128, <XMM0>
+    table[0x15] = Some(OpcodeEntry::new(
+        "blendvpd",
+        Operation::Other(0x38_15),
+        OperandEncoding::ModRmReg_Rm,
+    ));
+
     // 0x17: PTEST (SSE4.1)
     table[0x17] = Some(OpcodeEntry::new(
         "ptest",

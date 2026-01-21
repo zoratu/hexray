@@ -188,6 +188,26 @@ impl Disassembler for X86_64Disassembler {
                 }
             }
 
+            // Handle 0F 38 three-byte escape (SSSE3, SSE4.1, SSE4.2)
+            if opcode == 0x38 {
+                if offset >= bytes.len() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let opcode3 = bytes[offset];
+                offset += 1;
+                return self.decode_0f38_instruction(bytes, address, &prefixes, offset, opcode3);
+            }
+
+            // Handle 0F 3A three-byte escape (SSE4.1, SSE4.2 with immediate)
+            if opcode == 0x3A {
+                if offset >= bytes.len() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let opcode3 = bytes[offset];
+                offset += 1;
+                return self.decode_0f3a_instruction(bytes, address, &prefixes, offset, opcode3);
+            }
+
             // First check if this is an SSE instruction
             let sse_entry = lookup_sse_opcode(
                 opcode,
@@ -488,6 +508,85 @@ impl Disassembler for X86_64Disassembler {
 
                 operands.push(rm_operand);
                 operands.push(Operand::imm(imm, (imm_size * 8) as u8));
+            }
+
+            OperandEncoding::ModRmRm_Reg_Imm8 => {
+                // SHLD/SHRD r/m, reg, imm8
+                if remaining.is_empty() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let modrm = ModRM::parse(remaining[0], prefixes.rex);
+                offset += 1;
+
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                // Get immediate
+                let remaining = &bytes[offset..];
+                if remaining.is_empty() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let imm = remaining[0];
+                offset += 1;
+
+                operands.push(rm_operand);
+                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(Operand::imm_unsigned(imm as u64, 8));
+            }
+
+            OperandEncoding::ModRmRm_Reg_Cl => {
+                // SHLD/SHRD r/m, reg, CL
+                if remaining.is_empty() {
+                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                }
+                let modrm = ModRM::parse(remaining[0], prefixes.rex);
+                offset += 1;
+
+                let rm_bytes = &bytes[offset..];
+                let (rm_operand, rm_consumed) =
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
+                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+                offset += rm_consumed;
+
+                operands.push(rm_operand);
+                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(Operand::Register(Register::new(
+                    Architecture::X86_64,
+                    RegisterClass::General,
+                    x86::RCX,
+                    8,
+                ))); // CL
+            }
+
+            OperandEncoding::OpReg0F => {
+                // BSWAP: register encoded in 0F opcode byte (0F C8+rd)
+                // The register number is the lower 3 bits of the second opcode byte
+                // plus REX.B extension
+                let reg_num =
+                    (opcode & 0x07) | (prefixes.rex.map(|r| (r.b as u8) << 3).unwrap_or(0));
+                let reg_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) {
+                    64
+                } else {
+                    32
+                };
+                let reg = decode_gpr(reg_num, reg_size);
+                operands.push(Operand::Register(reg));
+            }
+
+            OperandEncoding::Imm16_Imm8 => {
+                // ENTER imm16, imm8
+                let remaining = &bytes[offset..];
+                if remaining.len() < 3 {
+                    return Err(DecodeError::truncated(address, offset + 3, bytes.len()));
+                }
+                let imm16 = u16::from_le_bytes([remaining[0], remaining[1]]);
+                let imm8 = remaining[2];
+                offset += 3;
+                operands.push(Operand::imm(imm16 as i128, 16));
+                operands.push(Operand::imm(imm8 as i128, 8));
             }
         }
 
@@ -1298,6 +1397,128 @@ impl X86_64Disassembler {
             bytes: bytes[..offset].to_vec(),
             operation: sse.operation,
             mnemonic: mnemonic.to_string(),
+            operands,
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    /// Decode non-VEX 0F 38 three-byte escape instructions (SSSE3, SSE4.1, SSE4.2).
+    fn decode_0f38_instruction(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        opcode: u8,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        // Look up the opcode in the 0F38 table
+        let entry = super::opcodes_0f38::OPCODE_TABLE_0F38[opcode as usize]
+            .as_ref()
+            .ok_or_else(|| DecodeError::unknown_opcode(address, &bytes[..offset]))?;
+
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        // Parse ModR/M
+        let modrm = ModRM::parse(remaining[0], prefixes.rex);
+        offset += 1;
+
+        // Decode operands
+        let mut operands = Vec::new();
+
+        // Get the rm operand
+        let rm_bytes = &bytes[offset..];
+        let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, 128)
+            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+        offset += rm_consumed;
+
+        // For SSE4.1 PBLENDVB and similar, the implicit xmm0 operand is used
+        // Order: dest, src, [implicit xmm0]
+        operands.push(decode_modrm_reg_xmm(modrm, 128));
+        operands.push(rm_operand);
+
+        // PBLENDVB (0x10), BLENDVPS (0x14), BLENDVPD (0x15), PTEST (0x17) have implicit XMM0
+        if opcode == 0x10 || opcode == 0x14 || opcode == 0x15 {
+            operands.push(Operand::Register(decode_xmm(0, 128))); // xmm0
+        }
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation: entry.operation,
+            mnemonic: entry.mnemonic.to_string(),
+            operands,
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    /// Decode non-VEX 0F 3A three-byte escape instructions (SSE4.1, SSE4.2 with immediate).
+    fn decode_0f3a_instruction(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        opcode: u8,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        // Look up the opcode in the 0F3A table
+        let entry = super::opcodes_0f3a::OPCODE_TABLE_0F3A[opcode as usize]
+            .as_ref()
+            .ok_or_else(|| DecodeError::unknown_opcode(address, &bytes[..offset]))?;
+
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        // Parse ModR/M
+        let modrm = ModRM::parse(remaining[0], prefixes.rex);
+        offset += 1;
+
+        // Decode operands
+        let mut operands = Vec::new();
+
+        // Get the rm operand
+        let rm_bytes = &bytes[offset..];
+        let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, 128)
+            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+        offset += rm_consumed;
+
+        // Order: dest (reg), src (rm), imm8
+        operands.push(decode_modrm_reg_xmm(modrm, 128));
+        operands.push(rm_operand);
+
+        // Read immediate byte
+        let imm_remaining = &bytes[offset..];
+        if imm_remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+        operands.push(Operand::imm(imm_remaining[0] as i128, 8));
+        offset += 1;
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation: entry.operation,
+            mnemonic: entry.mnemonic.to_string(),
             operands,
             control_flow: ControlFlow::Sequential,
             reads: vec![],
