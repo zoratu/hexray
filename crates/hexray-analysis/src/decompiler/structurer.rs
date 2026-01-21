@@ -954,7 +954,14 @@ impl<'a> Structurer<'a> {
                 }
                 true
             })
-            .map(|(_, inst)| Expr::from_instruction(inst))
+            .map(|(_, inst)| {
+                // Special handling for SETcc and CMOVcc to use block context
+                match inst.operation {
+                    Operation::SetConditional => lift_setcc_with_context(inst, block),
+                    Operation::ConditionalMove => lift_cmovcc_with_context(inst, block),
+                    _ => Expr::from_instruction(inst),
+                }
+            })
             .collect();
 
         // Resolve ADRP + ADD patterns (ARM64 PC-relative addressing)
@@ -1214,6 +1221,105 @@ fn negate_condition(expr: Expr) -> Expr {
             }
         }
         _ => Expr::unary(super::expression::UnaryOpKind::LogicalNot, expr),
+    }
+}
+
+/// Parses the condition suffix from a SETcc or CMOVcc mnemonic.
+/// Returns None if the mnemonic doesn't have a recognized condition suffix.
+fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
+    // Extract suffix after "set" or "cmov"
+    let suffix = if let Some(s) = mnemonic.strip_prefix("set") {
+        s
+    } else if let Some(s) = mnemonic.strip_prefix("cmov") {
+        s
+    } else {
+        return None;
+    };
+
+    // Map suffix to Condition
+    match suffix {
+        "e" | "z" => Some(Condition::Equal),
+        "ne" | "nz" => Some(Condition::NotEqual),
+        "l" | "nge" => Some(Condition::Less),
+        "le" | "ng" => Some(Condition::LessOrEqual),
+        "g" | "nle" => Some(Condition::Greater),
+        "ge" | "nl" => Some(Condition::GreaterOrEqual),
+        "b" | "c" | "nae" => Some(Condition::Below),
+        "be" | "na" => Some(Condition::BelowOrEqual),
+        "a" | "nbe" => Some(Condition::Above),
+        "ae" | "nc" | "nb" => Some(Condition::AboveOrEqual),
+        "s" => Some(Condition::Sign),
+        "ns" => Some(Condition::NotSign),
+        "o" => Some(Condition::Overflow),
+        "no" => Some(Condition::NotOverflow),
+        "p" | "pe" => Some(Condition::Parity),
+        "np" | "po" => Some(Condition::NotParity),
+        _ => None,
+    }
+}
+
+/// Lifts a SETcc instruction with block context to get the actual comparison.
+/// Returns an expression like: dest = (left op right)
+fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) -> Expr {
+    let dest = if !inst.operands.is_empty() {
+        Expr::from_operand(&inst.operands[0])
+    } else {
+        Expr::unknown(&inst.mnemonic)
+    };
+
+    // Try to parse condition from mnemonic
+    if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+        // Get the comparison expression using the block context
+        let cond_expr = condition_to_expr_with_block(cond, block);
+        // Assign the boolean result to the destination
+        Expr::assign(dest, cond_expr)
+    } else {
+        // Fallback: emit as function call if we can't parse the condition
+        Expr::assign(
+            dest,
+            Expr::call(
+                super::expression::CallTarget::Named(inst.mnemonic.clone()),
+                vec![],
+            ),
+        )
+    }
+}
+
+/// Lifts a CMOVcc instruction with block context.
+/// Returns an expression like: dest = condition ? src : dest
+/// For simplicity, we emit: if (condition) dest = src
+fn lift_cmovcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) -> Expr {
+    if inst.operands.len() < 2 {
+        return Expr::unknown(&inst.mnemonic);
+    }
+
+    let dest = Expr::from_operand(&inst.operands[0]);
+    let src = Expr::from_operand(&inst.operands[1]);
+
+    // Try to parse condition from mnemonic
+    if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+        // Get the comparison expression
+        let cond_expr = condition_to_expr_with_block(cond, block);
+        // Emit as conditional: dest = (cond) ? src : dest
+        Expr::assign(
+            dest.clone(),
+            Expr {
+                kind: super::expression::ExprKind::Conditional {
+                    cond: Box::new(cond_expr),
+                    then_expr: Box::new(src),
+                    else_expr: Box::new(dest),
+                },
+            },
+        )
+    } else {
+        // Fallback: emit as function call
+        Expr::assign(
+            dest,
+            Expr::call(
+                super::expression::CallTarget::Named(inst.mnemonic.clone()),
+                vec![src],
+            ),
+        )
     }
 }
 
