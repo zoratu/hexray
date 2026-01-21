@@ -486,6 +486,9 @@ pub enum Operation {
 
     // Other
     Other(u16),
+
+    /// Invalid instruction (e.g., opcode invalid in 64-bit mode)
+    Invalid,
 }
 
 impl Operation {
@@ -695,6 +698,7 @@ impl Operation {
             Self::X87Control => "x87_control",
             Self::X87Stack => "x87_stack",
             Self::Other(_) => "other",
+            Self::Invalid => "invalid",
         }
     }
 }

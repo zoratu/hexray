@@ -221,6 +221,11 @@ impl Disassembler for X86_64Disassembler {
                 return self.decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse);
             }
 
+            // Handle 0F 00 system instructions (SLDT, STR, LLDT, LTR, VERR, VERW)
+            if opcode == 0x00 {
+                return self.decode_0f00_group(bytes, address, &prefixes, offset);
+            }
+
             // Handle 0F 01 system instructions (SGDT, SIDT, LGDT, LIDT, SMSW, LMSW, INVLPG, RDTSCP)
             if opcode == 0x01 {
                 return self.decode_0f01_group(bytes, address, &prefixes, offset);
@@ -253,6 +258,13 @@ impl Disassembler for X86_64Disassembler {
             if (0xD8..=0xDF).contains(&opcode) {
                 return self.decode_x87(bytes, address, &prefixes, offset, opcode);
             }
+
+            // Handle opcodes that are invalid in 64-bit mode
+            // These were valid in 32-bit mode but repurposed or removed in long mode
+            if is_invalid_64bit_opcode(opcode) {
+                return self.decode_invalid_64bit(bytes, address, offset, opcode);
+            }
+
             OPCODE_TABLE[opcode as usize].as_ref()
         };
 
@@ -756,7 +768,82 @@ impl Disassembler for X86_64Disassembler {
     }
 }
 
+/// Check if an opcode is invalid in 64-bit long mode.
+///
+/// These opcodes were valid in 32-bit mode but are either:
+/// - Repurposed as REX prefixes (0x40-0x4F when used as opcodes after REX)
+/// - Removed entirely (PUSHA/POPA, BCD adjusts, etc.)
+fn is_invalid_64bit_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        // PUSHA/POPA - invalid in 64-bit mode
+        0x60 | 0x61 |
+        // BOUND - invalid in 64-bit mode (now EVEX prefix)
+        0x62 |
+        // BCD adjust instructions - invalid in 64-bit mode
+        0x27 | 0x2F | 0x37 | 0x3F |
+        // AAM, AAD - invalid in 64-bit mode
+        0xD4 | 0xD5 |
+        // SALC (undocumented) - invalid in 64-bit mode
+        0xD6 |
+        // INC/DEC r32 single-byte forms - repurposed as REX prefixes
+        // These are only invalid when they appear as the actual opcode (not prefix)
+        0x40..=0x4F
+    )
+}
+
+/// Get the name of an invalid 64-bit mode opcode for error messages.
+fn invalid_64bit_opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        0x60 => "pusha",
+        0x61 => "popa",
+        0x62 => "bound",
+        0x27 => "daa",
+        0x2F => "das",
+        0x37 => "aaa",
+        0x3F => "aas",
+        0xD4 => "aam",
+        0xD5 => "aad",
+        0xD6 => "salc",
+        0x40..=0x47 => "inc",
+        0x48..=0x4F => "dec",
+        _ => "unknown",
+    }
+}
+
 impl X86_64Disassembler {
+    /// Decode an opcode that is invalid in 64-bit long mode.
+    ///
+    /// Returns an instruction marked as invalid rather than a decode error,
+    /// which is useful when disassembling data sections that contain ASCII.
+    fn decode_invalid_64bit(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        offset: usize,
+        opcode: u8,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let name = invalid_64bit_opcode_name(opcode);
+        let mnemonic = format!("{} (invalid in 64-bit mode)", name);
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation: Operation::Invalid,
+            mnemonic,
+            operands: vec![],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
     /// Decode group 1 instructions (0x80-0x83).
     fn decode_group1(
         &self,
@@ -2268,6 +2355,81 @@ impl X86_64Disassembler {
             let (rm_operand, rm_consumed) =
                 decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
                     .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
+            offset += rm_consumed;
+            vec![rm_operand]
+        };
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes[..offset].to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands,
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    /// Decode 0F 00 group instructions (SLDT, STR, LLDT, LTR, VERR, VERW).
+    ///
+    /// These instructions use the ModRM.reg field to determine the specific operation:
+    /// - /0: SLDT r/m16 - Store Local Descriptor Table Register
+    /// - /1: STR r/m16 - Store Task Register
+    /// - /2: LLDT r/m16 - Load Local Descriptor Table Register
+    /// - /3: LTR r/m16 - Load Task Register
+    /// - /4: VERR r/m16 - Verify a Segment for Reading
+    /// - /5: VERW r/m16 - Verify a Segment for Writing
+    fn decode_0f00_group(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let remaining = &bytes[offset..];
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+        }
+
+        let modrm_byte = remaining[0];
+        let modrm = ModRM::parse(modrm_byte, prefixes.rex);
+        offset += 1;
+
+        // Determine instruction from reg field
+        let reg = modrm.reg & 0x7;
+
+        let (mnemonic, operation) = match reg {
+            0 => ("sldt", Operation::Other(0x0F00)), // /0: SLDT - Store LDT
+            1 => ("str", Operation::Other(0x0F00)),  // /1: STR - Store Task Register
+            2 => ("lldt", Operation::Other(0x0F00)), // /2: LLDT - Load LDT
+            3 => ("ltr", Operation::Other(0x0F00)),  // /3: LTR - Load Task Register
+            4 => ("verr", Operation::Other(0x0F00)), // /4: VERR - Verify Read
+            5 => ("verw", Operation::Other(0x0F00)), // /5: VERW - Verify Write
+            _ => {
+                // /6 and /7 are reserved
+                return Err(DecodeError::invalid_encoding(
+                    address,
+                    format!("reserved 0F 00 /{} encoding", reg),
+                ));
+            }
+        };
+
+        // Decode operand - all these instructions use r/m16 operand
+        let operand_size = 16;
+        let operands = if modrm.is_register() {
+            vec![Operand::Register(decode_gpr(modrm.rm, operand_size))]
+        } else {
+            let rm_bytes = &bytes[offset..];
+            let (rm_operand, rm_consumed) =
+                decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+                    .ok_or_else(|| DecodeError::truncated(address, offset + 4, bytes.len()))?;
             offset += rm_consumed;
             vec![rm_operand]
         };
@@ -3850,5 +4012,89 @@ mod tests {
         assert_eq!(result.instruction.operation, Operation::CetSavePrevSsp);
         assert_eq!(result.size, 4);
         assert_eq!(result.instruction.operands.len(), 0);
+    }
+
+    #[test]
+    fn test_sldt_reg() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 00 C0 = SLDT eax (mod=11, reg=0, rm=0)
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x00, 0xc0], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "sldt");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 1);
+    }
+
+    #[test]
+    fn test_str_reg() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 00 C8 = STR eax (mod=11, reg=1, rm=0)
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x00, 0xc8], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "str");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 1);
+    }
+
+    #[test]
+    fn test_lldt_reg() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 00 D0 = LLDT eax (mod=11, reg=2, rm=0)
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x00, 0xd0], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "lldt");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 1);
+    }
+
+    #[test]
+    fn test_ltr_reg() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 00 D8 = LTR eax (mod=11, reg=3, rm=0)
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x00, 0xd8], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "ltr");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 1);
+    }
+
+    #[test]
+    fn test_verr_reg() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 00 E0 = VERR eax (mod=11, reg=4, rm=0)
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x00, 0xe0], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "verr");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 1);
+    }
+
+    #[test]
+    fn test_verw_reg() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 00 E8 = VERW eax (mod=11, reg=5, rm=0)
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x00, 0xe8], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "verw");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 1);
+    }
+
+    #[test]
+    fn test_sldt_mem() {
+        let disasm = X86_64Disassembler::new();
+        // 0F 00 00 = SLDT [rax]
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x00, 0x00], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "sldt");
+        assert_eq!(result.size, 3);
+        assert_eq!(result.instruction.operands.len(), 1);
     }
 }

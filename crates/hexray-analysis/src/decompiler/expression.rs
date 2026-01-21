@@ -1498,6 +1498,10 @@ impl Expr {
                 // Show as a cast or function call since these have no explicit operands
                 Self::call(CallTarget::Named(inst.mnemonic.clone()), vec![])
             }
+            Operation::Invalid => {
+                // Invalid instruction (e.g., opcode not valid in 64-bit mode)
+                Self::unknown(&inst.mnemonic)
+            }
         }
     }
 
