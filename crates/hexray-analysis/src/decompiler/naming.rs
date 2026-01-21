@@ -27,7 +27,6 @@ pub struct NamingContext {
     /// Counter for buffer/array variables.
     buf_counter: usize,
     /// Counter for result variables.
-    #[allow(dead_code)]
     result_counter: usize,
     /// Counter for size/length variables.
     size_counter: usize,
@@ -37,6 +36,14 @@ pub struct NamingContext {
     err_counter: usize,
     /// Counter for array variables.
     arr_counter: usize,
+    /// Counter for destination variables.
+    dst_counter: usize,
+    /// Counter for source variables.
+    src_counter: usize,
+    /// Counter for offset variables.
+    offset_counter: usize,
+    /// Counter for callback/function pointer variables.
+    callback_counter: usize,
     /// DWARF-sourced names (offset -> name).
     dwarf_names: HashMap<i128, String>,
     /// Inferred types (offset -> type hint).
@@ -49,6 +56,14 @@ pub struct NamingContext {
     accumulator_vars: Vec<i128>,
     /// Error code variables detected (from function returns).
     error_vars: Vec<i128>,
+    /// Function result variables (assigned from non-error-checked calls).
+    result_vars: Vec<i128>,
+    /// Destination variables (used as first arg to memcpy-like functions).
+    dest_vars: Vec<i128>,
+    /// Source variables (used as second arg to memcpy-like functions).
+    source_vars: Vec<i128>,
+    /// Offset variables (used in pointer arithmetic but not as indices).
+    offset_vars: Vec<i128>,
 }
 
 /// Type hint for a variable.
@@ -76,6 +91,16 @@ pub enum TypeHint {
     Sum,
     /// An error code from function return.
     ErrorCode,
+    /// A function result (return value from a call).
+    Result,
+    /// A destination pointer (first arg to memcpy-like functions).
+    Destination,
+    /// A source pointer (second arg to memcpy-like functions).
+    Source,
+    /// An offset used in pointer arithmetic.
+    Offset,
+    /// A function pointer or callback.
+    Callback,
     /// Unknown type.
     Unknown,
 }
@@ -130,7 +155,16 @@ impl NamingContext {
         // Fourth pass: detect array indexing patterns
         self.detect_array_patterns(body);
 
-        // Fifth pass: detect other type usage patterns
+        // Fifth pass: detect function result patterns
+        self.detect_result_vars(body);
+
+        // Sixth pass: detect memcpy-like dest/src patterns
+        self.detect_memcpy_patterns(body);
+
+        // Seventh pass: detect offset variables in pointer arithmetic
+        self.detect_offset_vars(body);
+
+        // Last pass: detect other type usage patterns
         self.detect_type_patterns(body);
     }
 
@@ -700,6 +734,234 @@ impl NamingContext {
         None
     }
 
+    /// Detect function result variables (assigned from calls but not error-checked).
+    fn detect_result_vars(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        // Look for: result = func_call()
+                        if let Some(offset) = self.extract_call_result(stmt) {
+                            // Don't add if already an error var or loop index
+                            if !self.error_vars.contains(&offset)
+                                && !self.loop_indices.contains(&offset)
+                                && !self.result_vars.contains(&offset)
+                            {
+                                self.result_vars.push(offset);
+                            }
+                        }
+                    }
+                }
+                StructuredNode::For { body, .. }
+                | StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body } => {
+                    self.detect_result_vars(body);
+                }
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_result_vars(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_result_vars(else_nodes);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        self.detect_result_vars(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_result_vars(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_result_vars(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Extract a variable assigned from a function call (not error-checked).
+    fn extract_call_result(&self, expr: &Expr) -> Option<i128> {
+        if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+            // RHS must be a function call
+            if matches!(rhs.kind, ExprKind::Call { .. }) {
+                return self.extract_stack_offset(lhs);
+            }
+        }
+        None
+    }
+
+    /// Detect memcpy-like patterns where first arg is dest, second is src.
+    fn detect_memcpy_patterns(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.detect_memcpy_in_expr(stmt);
+                    }
+                }
+                StructuredNode::For { body, .. }
+                | StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body } => {
+                    self.detect_memcpy_patterns(body);
+                }
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_memcpy_patterns(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_memcpy_patterns(else_nodes);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        self.detect_memcpy_patterns(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_memcpy_patterns(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_memcpy_patterns(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Detect dest/src variables in memcpy-like function calls.
+    fn detect_memcpy_in_expr(&mut self, expr: &Expr) {
+        if let ExprKind::Call { target, args } = &expr.kind {
+            // Check if this looks like a memcpy/memmove/strcpy function
+            let is_copy_func = match target {
+                super::expression::CallTarget::Named(name) => {
+                    let lower = name.to_lowercase();
+                    lower.contains("cpy")
+                        || lower.contains("copy")
+                        || lower.contains("move")
+                        || lower.contains("dup")
+                }
+                _ => false,
+            };
+
+            if is_copy_func && args.len() >= 2 {
+                // First arg is typically destination
+                if let Some(offset) = self.extract_stack_offset(&args[0]) {
+                    if !self.dest_vars.contains(&offset) {
+                        self.dest_vars.push(offset);
+                    }
+                }
+                // Second arg is typically source
+                if let Some(offset) = self.extract_stack_offset(&args[1]) {
+                    if !self.source_vars.contains(&offset) {
+                        self.source_vars.push(offset);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detect offset variables used in pointer arithmetic.
+    fn detect_offset_vars(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.detect_offset_in_expr(stmt);
+                    }
+                }
+                StructuredNode::For { body, .. }
+                | StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body } => {
+                    self.detect_offset_vars(body);
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_offset_in_expr(condition);
+                    self.detect_offset_vars(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_offset_vars(else_nodes);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        self.detect_offset_vars(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_offset_vars(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_offset_vars(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Detect offset variables in pointer arithmetic expressions.
+    /// Looks for patterns like *(ptr + offset) where offset is not a loop index.
+    fn detect_offset_in_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            // Dereference of (base + offset)
+            ExprKind::Deref { addr, .. } => {
+                if let ExprKind::BinOp {
+                    op: BinOpKind::Add,
+                    left,
+                    right,
+                } = &addr.kind
+                {
+                    // Check right side for non-index offset
+                    if let Some(offset) = self.extract_stack_offset(right) {
+                        // Not a loop index and not a constant
+                        if !self.loop_indices.contains(&offset)
+                            && !self.offset_vars.contains(&offset)
+                            && !matches!(right.kind, ExprKind::IntLit(_))
+                        {
+                            self.offset_vars.push(offset);
+                        }
+                    }
+                    // Check left side too
+                    if let Some(offset) = self.extract_stack_offset(left) {
+                        if !self.loop_indices.contains(&offset)
+                            && !self.offset_vars.contains(&offset)
+                            && !matches!(left.kind, ExprKind::IntLit(_))
+                        {
+                            self.offset_vars.push(offset);
+                        }
+                    }
+                }
+                self.detect_offset_in_expr(addr);
+            }
+            ExprKind::Assign { lhs, rhs } => {
+                self.detect_offset_in_expr(lhs);
+                self.detect_offset_in_expr(rhs);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.detect_offset_in_expr(left);
+                self.detect_offset_in_expr(right);
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.detect_offset_in_expr(arg);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Get the name for a stack slot, generating one if needed.
     pub fn get_name(&mut self, offset: i128, is_parameter: bool) -> String {
         // Check for DWARF name first
@@ -887,8 +1149,85 @@ impl NamingContext {
                         format!("buf{}", self.buf_counter)
                     };
                 }
+                TypeHint::Result => {
+                    self.result_counter += 1;
+                    return if self.result_counter == 1 {
+                        "result".to_string()
+                    } else {
+                        format!("result{}", self.result_counter)
+                    };
+                }
+                TypeHint::Destination => {
+                    self.dst_counter += 1;
+                    return if self.dst_counter == 1 {
+                        "dst".to_string()
+                    } else {
+                        format!("dst{}", self.dst_counter)
+                    };
+                }
+                TypeHint::Source => {
+                    self.src_counter += 1;
+                    return if self.src_counter == 1 {
+                        "src".to_string()
+                    } else {
+                        format!("src{}", self.src_counter)
+                    };
+                }
+                TypeHint::Offset => {
+                    self.offset_counter += 1;
+                    return if self.offset_counter == 1 {
+                        "offset".to_string()
+                    } else {
+                        format!("offset{}", self.offset_counter)
+                    };
+                }
+                TypeHint::Callback => {
+                    self.callback_counter += 1;
+                    return if self.callback_counter == 1 {
+                        "callback".to_string()
+                    } else {
+                        format!("callback{}", self.callback_counter)
+                    };
+                }
                 TypeHint::Int | TypeHint::Unknown => {}
             }
+        }
+
+        // Check detected pattern variables (not via type hint)
+        if self.result_vars.contains(&offset) {
+            self.result_counter += 1;
+            return if self.result_counter == 1 {
+                "ret".to_string()
+            } else {
+                format!("ret{}", self.result_counter)
+            };
+        }
+
+        if self.dest_vars.contains(&offset) {
+            self.dst_counter += 1;
+            return if self.dst_counter == 1 {
+                "dst".to_string()
+            } else {
+                format!("dst{}", self.dst_counter)
+            };
+        }
+
+        if self.source_vars.contains(&offset) {
+            self.src_counter += 1;
+            return if self.src_counter == 1 {
+                "src".to_string()
+            } else {
+                format!("src{}", self.src_counter)
+            };
+        }
+
+        if self.offset_vars.contains(&offset) {
+            self.offset_counter += 1;
+            return if self.offset_counter == 1 {
+                "off".to_string()
+            } else {
+                format!("off{}", self.offset_counter)
+            };
         }
 
         // Generic local name
@@ -937,21 +1276,6 @@ fn parse_var_offset(name: &str) -> Option<i128> {
         i128::from_str_radix(suffix, 16).ok()
     } else {
         None
-    }
-}
-
-impl BinOpKind {
-    /// Check if this is a comparison operator.
-    fn is_comparison(&self) -> bool {
-        matches!(
-            self,
-            BinOpKind::Eq
-                | BinOpKind::Ne
-                | BinOpKind::Lt
-                | BinOpKind::Le
-                | BinOpKind::Gt
-                | BinOpKind::Ge
-        )
     }
 }
 
@@ -1216,5 +1540,86 @@ mod tests {
         // Parameters with buffer hint get "data" prefix
         let name = ctx.get_name(8, true);
         assert_eq!(name, "data");
+    }
+
+    #[test]
+    fn test_result_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Result);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "result");
+    }
+
+    #[test]
+    fn test_destination_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Destination);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "dst");
+    }
+
+    #[test]
+    fn test_source_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Source);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "src");
+    }
+
+    #[test]
+    fn test_offset_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Offset);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "offset");
+    }
+
+    #[test]
+    fn test_callback_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Callback);
+
+        let name = ctx.get_name(-8, false);
+        assert_eq!(name, "callback");
+    }
+
+    #[test]
+    fn test_result_vars_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.result_vars.push(-8);
+        ctx.result_vars.push(-16);
+
+        assert_eq!(ctx.get_name(-8, false), "ret");
+        assert_eq!(ctx.get_name(-16, false), "ret2");
+    }
+
+    #[test]
+    fn test_dest_vars_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.dest_vars.push(-8);
+
+        assert_eq!(ctx.get_name(-8, false), "dst");
+    }
+
+    #[test]
+    fn test_source_vars_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.source_vars.push(-8);
+
+        assert_eq!(ctx.get_name(-8, false), "src");
+    }
+
+    #[test]
+    fn test_offset_vars_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.offset_vars.push(-8);
+        ctx.offset_vars.push(-16);
+
+        assert_eq!(ctx.get_name(-8, false), "off");
+        assert_eq!(ctx.get_name(-16, false), "off2");
     }
 }

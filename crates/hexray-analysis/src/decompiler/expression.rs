@@ -240,6 +240,23 @@ impl BinOpKind {
             _ => None,
         }
     }
+
+    /// Check if this is a comparison operator.
+    pub fn is_comparison(&self) -> bool {
+        matches!(
+            self,
+            Self::Eq
+                | Self::Ne
+                | Self::Lt
+                | Self::Le
+                | Self::Gt
+                | Self::Ge
+                | Self::ULt
+                | Self::ULe
+                | Self::UGt
+                | Self::UGe
+        )
+    }
 }
 
 /// Unary operation kinds.
@@ -781,8 +798,36 @@ impl Expr {
                     }
                 }
 
-                // Cast of a variable that's already known to be the right size
-                // This would require type info - skip for now
+                // Cast of a variable to its own size: eliminate the cast
+                if let ExprKind::Var(v) = &simplified_expr.kind {
+                    if v.size == to_size {
+                        return simplified_expr;
+                    }
+                }
+
+                // Cast of comparison result (0 or 1) to larger type: preserve as-is
+                // since comparisons naturally produce int-sized results
+                if let ExprKind::BinOp { op, .. } = &simplified_expr.kind {
+                    if op.is_comparison() && to_size >= 4 {
+                        // Comparison results are conceptually 32-bit ints
+                        // No need to explicitly cast them
+                        return simplified_expr;
+                    }
+                }
+
+                // Cast of deref to same size as the deref: eliminate
+                if let ExprKind::Deref { size, .. } = &simplified_expr.kind {
+                    if *size == to_size {
+                        return simplified_expr;
+                    }
+                }
+
+                // Cast of array/field access: the element size determines the type
+                if let ExprKind::ArrayAccess { element_size, .. } = &simplified_expr.kind {
+                    if *element_size == to_size as usize {
+                        return simplified_expr;
+                    }
+                }
 
                 Self {
                     kind: ExprKind::Cast {
@@ -3325,5 +3370,134 @@ mod tests {
         let simplified = assign.simplify();
 
         assert_eq!(simplified.to_string(), "counter -= 0xa");
+    }
+
+    #[test]
+    fn test_cast_elimination_same_size_var() {
+        // Cast of 4-byte variable to 4 bytes should be eliminated
+        let var = Expr::var(Variable {
+            kind: VarKind::Stack(-8),
+            name: "x".to_string(),
+            size: 4,
+        });
+        let cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(var),
+                to_size: 4,
+                signed: false,
+            },
+        };
+        let simplified = cast.simplify();
+
+        // Should be a plain variable, not a cast
+        assert!(matches!(simplified.kind, ExprKind::Var(_)));
+    }
+
+    #[test]
+    fn test_cast_elimination_comparison_result() {
+        // Cast of comparison to int (>= 4 bytes) should be eliminated
+        let cmp = Expr::binop(BinOpKind::Eq, Expr::unknown("x"), Expr::int(0));
+        let cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(cmp),
+                to_size: 4,
+                signed: true,
+            },
+        };
+        let simplified = cast.simplify();
+
+        // Should be a plain comparison, not a cast
+        assert!(matches!(
+            simplified.kind,
+            ExprKind::BinOp {
+                op: BinOpKind::Eq,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_cast_elimination_deref_same_size() {
+        // Cast of 8-byte deref to 8 bytes should be eliminated
+        let deref = Expr::deref(Expr::unknown("ptr"), 8);
+        let cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(deref),
+                to_size: 8,
+                signed: false,
+            },
+        };
+        let simplified = cast.simplify();
+
+        // Should be a plain deref, not a cast
+        assert!(matches!(simplified.kind, ExprKind::Deref { size: 8, .. }));
+    }
+
+    #[test]
+    fn test_cast_elimination_array_access_same_size() {
+        // Cast of array access with 4-byte elements to 4 bytes should be eliminated
+        let access = Expr::array_access(Expr::unknown("arr"), Expr::unknown("i"), 4);
+        let cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(access),
+                to_size: 4,
+                signed: false,
+            },
+        };
+        let simplified = cast.simplify();
+
+        // Should be a plain array access, not a cast
+        assert!(matches!(
+            simplified.kind,
+            ExprKind::ArrayAccess {
+                element_size: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_cast_preserved_when_different_size() {
+        // Cast of 4-byte variable to 8 bytes should NOT be eliminated
+        let var = Expr::var(Variable {
+            kind: VarKind::Stack(-8),
+            name: "x".to_string(),
+            size: 4,
+        });
+        let cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(var),
+                to_size: 8,
+                signed: true,
+            },
+        };
+        let simplified = cast.simplify();
+
+        // Should still be a cast
+        assert!(matches!(
+            simplified.kind,
+            ExprKind::Cast {
+                to_size: 8,
+                signed: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_cast_preserved_comparison_to_small_type() {
+        // Cast of comparison to 1-byte should NOT be eliminated (truncation)
+        let cmp = Expr::binop(BinOpKind::Lt, Expr::unknown("x"), Expr::unknown("y"));
+        let cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(cmp),
+                to_size: 1,
+                signed: false,
+            },
+        };
+        let simplified = cast.simplify();
+
+        // Should still be a cast (truncation to 1 byte)
+        assert!(matches!(simplified.kind, ExprKind::Cast { to_size: 1, .. }));
     }
 }
