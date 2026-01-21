@@ -400,6 +400,75 @@ impl PseudoCodeEmitter {
         self.format_expr_with_strings(arg, table)
     }
 
+    /// Formats comparison operands, converting integers to character literals when appropriate.
+    ///
+    /// This detects patterns like `*ptr == 97` (checking for 'a') and formats them as
+    /// `*ptr == 'a'` for better readability.
+    fn format_char_comparison_operands(
+        &self,
+        left: &Expr,
+        right: &Expr,
+        _table: &StringTable,
+    ) -> (String, String) {
+        // First format both sides normally
+        let left_str = self.format_expr_no_string_resolve(left);
+        let right_str = self.format_expr_no_string_resolve(right);
+
+        // Check if either side is an integer that should be formatted as a character
+        let left_is_char_context = self.is_byte_context(left) || looks_like_char_context(&left_str);
+        let right_is_char_context =
+            self.is_byte_context(right) || looks_like_char_context(&right_str);
+
+        let left_str = if let ExprKind::IntLit(n) = &left.kind {
+            if right_is_char_context && is_printable_char_value(*n) {
+                format_as_char_literal(*n)
+            } else {
+                left_str
+            }
+        } else {
+            left_str
+        };
+
+        let right_str = if let ExprKind::IntLit(n) = &right.kind {
+            if left_is_char_context && is_printable_char_value(*n) {
+                format_as_char_literal(*n)
+            } else {
+                right_str
+            }
+        } else {
+            right_str
+        };
+
+        (left_str, right_str)
+    }
+
+    /// Checks if an expression represents a byte/character context.
+    ///
+    /// Returns true for:
+    /// - 1-byte dereferences
+    /// - Array indexing (which typically accesses bytes)
+    /// - Cast to 1-byte type
+    fn is_byte_context(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // 1-byte dereference: *(uint8_t*)ptr
+            ExprKind::Deref { size, .. } if *size == 1 => true,
+            // Cast to 1-byte type
+            ExprKind::Cast { to_size, .. } if *to_size == 1 => true,
+            // Array indexing with implicit 1-byte element
+            ExprKind::BinOp {
+                op: BinOpKind::Add,
+                left,
+                right,
+            } => {
+                // Check for ptr[index] pattern where the final deref would be 1 byte
+                // This is heuristic - check if one side looks like a base pointer
+                matches!(left.kind, ExprKind::Var(_) | ExprKind::GotRef { .. })
+                    || matches!(right.kind, ExprKind::Var(_) | ExprKind::GotRef { .. })
+            }
+            _ => false,
+        }
+    }
+
     /// Formats an expression, resolving strings from the string table.
     fn format_expr(&self, expr: &Expr) -> String {
         // Always use format_expr_with_strings for stack slot resolution and DWARF names
@@ -484,9 +553,9 @@ impl PseudoCodeEmitter {
                 // because comparisons like `ptr == 0` should show the pointer variable,
                 // not the string it points to (e.g., "hello" == 0 doesn't make sense)
                 if op.is_comparison() {
-                    // Use the non-string-resolving formatter for comparisons
-                    let left_str = self.format_expr_no_string_resolve(left);
-                    let right_str = self.format_expr_no_string_resolve(right);
+                    // Check if this looks like a character comparison and format accordingly
+                    let (left_str, right_str) =
+                        self.format_char_comparison_operands(left, right, table);
                     format!("{} {} {}", left_str, op.as_str(), right_str)
                 } else {
                     format!(
@@ -2320,6 +2389,61 @@ fn escape_string(s: &str) -> String {
         }
     }
     result
+}
+
+/// Checks if a formatted expression string suggests a byte/character context.
+///
+/// This looks for patterns like:
+/// - Array subscript: `x[0]`, `ptr[i]`
+/// - 8-bit dereference: `*(uint8_t*)`
+/// - Char pointer dereference: `*str`
+fn looks_like_char_context(s: &str) -> bool {
+    // Array subscript pattern - often used for string/byte access
+    // e.g., "str[0]", "buf[i]", "rbp[-0x7][1]"
+    if s.ends_with(']') && s.contains('[') {
+        return true;
+    }
+    // Explicit 8-bit dereference
+    if s.contains("uint8_t") || s.contains("int8_t") || s.contains("char") {
+        return true;
+    }
+    false
+}
+
+/// Checks if a value is likely a character value worth displaying as a char literal.
+///
+/// This includes:
+/// - Printable ASCII characters (32-126)
+/// - Common special characters (null, tab, newline, carriage return)
+fn is_printable_char_value(n: i128) -> bool {
+    if !(0..=127).contains(&n) {
+        return false;
+    }
+    let n = n as u8;
+    // Printable ASCII range
+    if (32..=126).contains(&n) {
+        return true;
+    }
+    // Common special characters
+    matches!(n, 0 | 9 | 10 | 13)
+}
+
+/// Formats an integer as a C character literal.
+fn format_as_char_literal(n: i128) -> String {
+    if !(0..=127).contains(&n) {
+        return format!("{}", n);
+    }
+    let c = n as u8;
+    match c {
+        0 => "'\\0'".to_string(),
+        9 => "'\\t'".to_string(),
+        10 => "'\\n'".to_string(),
+        13 => "'\\r'".to_string(),
+        b'\\' => "'\\\\'".to_string(),
+        b'\'' => "'\\''".to_string(),
+        32..=126 => format!("'{}'", c as char),
+        _ => format!("{}", n),
+    }
 }
 
 /// Helper to format a condition nicely.
