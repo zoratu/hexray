@@ -796,6 +796,36 @@ impl Expr {
                             },
                         };
                     }
+
+                    // Sign/zero extension pattern: (signed_larger)(unsigned_smaller)x
+                    // Zero extension preserves value as non-negative, so outer signed cast
+                    // can directly cast from original when inner size is "full width" (>= 4 bytes)
+                    if to_size > *inner_size && signed && !*inner_signed {
+                        // For 4+ byte unsigned values zero-extended to signed, we can
+                        // simplify since the value is guaranteed non-negative
+                        if *inner_size >= 4 {
+                            return Self {
+                                kind: ExprKind::Cast {
+                                    expr: inner_expr.clone(),
+                                    to_size,
+                                    signed,
+                                },
+                            };
+                        }
+                    }
+
+                    // Pattern: (same_size)(different_signedness)x - just change interpretation
+                    // e.g., (uint32_t)(int32_t)x or (int32_t)(uint32_t)x
+                    // Inner cast is redundant, just reinterpret with outer signedness
+                    if to_size == *inner_size && signed != *inner_signed {
+                        return Self {
+                            kind: ExprKind::Cast {
+                                expr: inner_expr.clone(),
+                                to_size,
+                                signed,
+                            },
+                        };
+                    }
                 }
 
                 // Cast of a variable to its own size: eliminate the cast
@@ -3499,5 +3529,116 @@ mod tests {
 
         // Should still be a cast (truncation to 1 byte)
         assert!(matches!(simplified.kind, ExprKind::Cast { to_size: 1, .. }));
+    }
+
+    #[test]
+    fn test_nested_cast_same_size_different_signedness() {
+        // (int32_t)(uint32_t)x -> (int32_t)x
+        // Reinterpret cast: same size, different signedness, inner is redundant
+        let x = Expr::unknown("x");
+        let inner = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(x),
+                to_size: 4,
+                signed: false, // uint32_t
+            },
+        };
+        let outer = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(inner),
+                to_size: 4,
+                signed: true, // int32_t
+            },
+        };
+        let simplified = outer.simplify();
+
+        // Should be single cast with outer signedness
+        match &simplified.kind {
+            ExprKind::Cast {
+                to_size,
+                signed,
+                expr,
+            } => {
+                assert_eq!(*to_size, 4);
+                assert!(*signed); // int32_t
+                                  // Inner should be the original expression, not another cast
+                assert!(matches!(expr.kind, ExprKind::Unknown(_)));
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_nested_cast_signed_larger_unsigned_smaller() {
+        // (int64_t)(uint32_t)x -> (int64_t)x when inner is 4+ bytes
+        // Zero extension is transparent for non-negative values
+        let x = Expr::unknown("x");
+        let inner = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(x),
+                to_size: 4,
+                signed: false, // uint32_t
+            },
+        };
+        let outer = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(inner),
+                to_size: 8,
+                signed: true, // int64_t
+            },
+        };
+        let simplified = outer.simplify();
+
+        // Should be single cast to int64_t
+        match &simplified.kind {
+            ExprKind::Cast {
+                to_size,
+                signed,
+                expr,
+            } => {
+                assert_eq!(*to_size, 8);
+                assert!(*signed); // int64_t
+                                  // Inner should be the original expression
+                assert!(matches!(expr.kind, ExprKind::Unknown(_)));
+            }
+            other => panic!("Expected Cast, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_nested_cast_small_unsigned_preserved() {
+        // (int64_t)(uint8_t)x - should NOT simplify (need zero extension)
+        // Small unsigned types need explicit zero extension
+        let x = Expr::unknown("x");
+        let inner = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(x),
+                to_size: 1,
+                signed: false, // uint8_t
+            },
+        };
+        let outer = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(inner),
+                to_size: 8,
+                signed: true, // int64_t
+            },
+        };
+        let simplified = outer.simplify();
+
+        // Should still be a nested cast (inner is needed for zero extension)
+        match &simplified.kind {
+            ExprKind::Cast {
+                to_size,
+                signed,
+                expr,
+            } => {
+                assert_eq!(*to_size, 8);
+                assert!(*signed);
+                // Inner should still be a cast
+                assert!(matches!(expr.kind, ExprKind::Cast { .. }));
+            }
+            other => panic!("Expected nested Cast, got {:?}", other),
+        }
     }
 }

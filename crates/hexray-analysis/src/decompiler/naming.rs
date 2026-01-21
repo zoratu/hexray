@@ -671,15 +671,23 @@ impl NamingContext {
         }
     }
 
-    /// Detect array base pointers in an expression (looking for ptr[idx] patterns).
+    /// Detect array base pointers and simple pointer dereferences.
     fn detect_array_usage_in_expr(&mut self, expr: &Expr) {
         match &expr.kind {
-            // Dereference of (base + index*scale) is array access
+            // Dereference patterns
             ExprKind::Deref { addr, .. } => {
+                // First check for array pattern: base + index*scale
                 if let Some(base_offset) = self.extract_array_base(addr) {
                     self.type_hints
                         .entry(base_offset)
                         .or_insert(TypeHint::Array);
+                }
+                // Check for simple pointer dereference: *ptr or *(ptr + offset)
+                else if let Some(ptr_offset) = self.extract_pointer_base(addr) {
+                    // Only mark as Pointer if not already Array
+                    self.type_hints
+                        .entry(ptr_offset)
+                        .or_insert(TypeHint::Pointer);
                 }
                 // Recurse into the address expression
                 self.detect_array_usage_in_expr(addr);
@@ -698,6 +706,51 @@ impl NamingContext {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Extract pointer base from a simple dereference address expression.
+    /// Returns the stack offset if addr is a pointer variable (not an array index pattern).
+    fn extract_pointer_base(&self, addr: &Expr) -> Option<i128> {
+        match &addr.kind {
+            // Direct variable dereference: *ptr
+            ExprKind::Var(v) => {
+                if let Some(offset) = parse_var_offset(&v.name) {
+                    return Some(offset);
+                }
+                None
+            }
+            // Stack slot: *(rbp + offset)
+            ExprKind::BinOp { op, left, right } => {
+                if let ExprKind::Var(base) = &left.kind {
+                    if is_frame_or_stack_pointer(&base.name) {
+                        if let ExprKind::IntLit(offset) = &right.kind {
+                            let actual = match op {
+                                BinOpKind::Add => *offset,
+                                BinOpKind::Sub => -*offset,
+                                _ => return None,
+                            };
+                            return Some(actual);
+                        }
+                    }
+                }
+                // Also check for ptr + constant_offset (struct field access)
+                // Don't mark as pointer if it's multiplication (array index)
+                if *op == BinOpKind::Add {
+                    if let ExprKind::IntLit(_) = &right.kind {
+                        // ptr + const -> ptr is a pointer
+                        return self.extract_stack_offset(left);
+                    }
+                    if let ExprKind::IntLit(_) = &left.kind {
+                        // const + ptr -> ptr is a pointer
+                        return self.extract_stack_offset(right);
+                    }
+                }
+                None
+            }
+            // Deref of a deref: **ptr - the inner addr is a pointer
+            ExprKind::Deref { addr: inner, .. } => self.extract_pointer_base(inner),
+            _ => None,
         }
     }
 
