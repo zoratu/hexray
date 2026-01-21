@@ -875,6 +875,34 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::ModRmRm_Reg_Cl,
     ));
 
+    // CMPXCHG - Compare and Exchange (often used with LOCK prefix)
+    // 0F B0 /r = CMPXCHG r/m8, r8
+    table[0xB0] = Some(OpcodeEntry::new(
+        "cmpxchg",
+        Operation::Exchange,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+    // 0F B1 /r = CMPXCHG r/m16/32/64, r16/32/64
+    table[0xB1] = Some(OpcodeEntry::new(
+        "cmpxchg",
+        Operation::Exchange,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+
+    // XADD - Exchange and Add (often used with LOCK prefix)
+    // 0F C0 /r = XADD r/m8, r8
+    table[0xC0] = Some(OpcodeEntry::new(
+        "xadd",
+        Operation::Add,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+    // 0F C1 /r = XADD r/m16/32/64, r16/32/64
+    table[0xC1] = Some(OpcodeEntry::new(
+        "xadd",
+        Operation::Add,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+
     // BSWAP - Byte swap (0F C8+rd)
     table[0xC8] = Some(OpcodeEntry::new(
         "bswap",
