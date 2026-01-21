@@ -487,8 +487,9 @@ impl PseudoCodeEmitter {
                     // Use computed address as data_XXXX instead of showing "rip + offset"
                     format!("{}(&data_{:x})", prefix, address)
                 } else {
-                    // Address-of (LEA) - format as sub_XXXX if it looks like a code address
-                    format!("sub_{:x}", address)
+                    // Address-of (LEA) - these are typically data addresses (strings, constants)
+                    // not function addresses, so use data_ prefix
+                    format!("data_{:x}", address)
                 }
             }
             ExprKind::Call { target, args } => {

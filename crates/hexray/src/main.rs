@@ -1167,15 +1167,20 @@ fn decompile_function(
 fn build_string_table(fmt: &dyn BinaryFormat) -> StringTable {
     let mut table = StringTable::new();
 
-    // Look for common data section names
+    // Look for string-specific section names
+    // Be conservative to avoid false positives from data sections that contain
+    // integers that happen to look like short strings (e.g., value 80 = 'P')
     for section in fmt.sections() {
         let name = section.name().to_lowercase();
-        // Include read-only data sections, string sections, and const sections
+        // Only extract strings from sections specifically meant for strings:
+        // - .rodata, .rodata.str1.1 (ELF read-only data with strings)
+        // - __cstring (Mach-O C strings)
+        // - .rdata (Windows read-only data)
+        // Avoid __data, __const, etc. which may contain mixed data
         if name.contains("rodata")
             || name.contains("cstring")
-            || name.contains("__const")
-            || name.contains("data")
-            || name.contains("rdata")
+            || name == ".rdata"
+            || name == "rdata"
         {
             // Get section data directly
             let data = section.data();

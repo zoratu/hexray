@@ -124,6 +124,14 @@ impl StringTable {
         let mut i = 0;
 
         while i < data.len() {
+            // Check for empty string: null byte followed by printable ASCII
+            // This captures "" which is used in setlocale(LC_ALL, "")
+            if data[i] == 0 && i + 1 < data.len() && is_printable_ascii(data[i + 1]) {
+                table.insert(base_address + i as u64, String::new());
+                i += 1;
+                continue;
+            }
+
             // Look for potential string starts (printable ASCII)
             if is_printable_ascii(data[i]) {
                 let start = i;
@@ -138,8 +146,8 @@ impl StringTable {
                 }
 
                 // Check if we found a null-terminated string of reasonable length
-                // Allow shorter strings (min 2 chars) for format strings like "%s"
-                if end < data.len() && data[end] == 0 && end - start >= 2 {
+                // Allow single-character strings (min 1 char) for locale strings like "C"
+                if end < data.len() && data[end] == 0 && end - start >= 1 {
                     if let Ok(s) = std::str::from_utf8(&data[start..end]) {
                         table.insert(base_address + start as u64, s.to_string());
                     }

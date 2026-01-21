@@ -908,6 +908,17 @@ impl Expr {
         }
     }
 
+    /// Converts an operand to an expression with instruction context.
+    /// This properly handles RIP-relative memory accesses by computing the absolute address.
+    pub fn from_operand_with_inst(op: &Operand, inst: &Instruction) -> Self {
+        match op {
+            Operand::Register(reg) => Self::var(Variable::from_register(reg)),
+            Operand::Immediate(imm) => Self::int(imm.value),
+            Operand::Memory(mem) => Self::from_memory_with_context(mem, inst, false),
+            Operand::PcRelative { target, .. } => Self::int(*target as i128),
+        }
+    }
+
     /// Converts a memory reference to an expression.
     fn from_memory_ref(mem: &MemoryRef) -> Self {
         let mut addr_expr: Option<Expr> = None;
@@ -943,6 +954,26 @@ impl Expr {
         Self::deref(addr, mem.size)
     }
 
+    /// Converts a memory operand with instruction context to handle RIP-relative addressing.
+    /// Returns a GotRef for RIP-relative addresses with computed absolute address,
+    /// or a regular Deref for other memory accesses.
+    fn from_memory_with_context(mem: &MemoryRef, inst: &Instruction, is_dest: bool) -> Self {
+        let base_name = mem.base.as_ref().map(|r| r.name()).unwrap_or("");
+        if base_name == "rip" && mem.index.is_none() {
+            // Compute absolute address: inst.address + inst.size + displacement
+            let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+            let display_expr = Self::from_memory_ref(mem);
+            if is_dest {
+                // For stores, we want to return a GotRef that can be assigned to
+                Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
+            } else {
+                Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
+            }
+        } else {
+            Self::from_memory_ref(mem)
+        }
+    }
+
     /// Converts an instruction to an expression/statement.
     pub fn from_instruction(inst: &Instruction) -> Self {
         let ops = &inst.operands;
@@ -950,22 +981,18 @@ impl Expr {
         match inst.operation {
             Operation::Move => {
                 if ops.len() >= 2 {
-                    // Check for RIP-relative memory load (e.g., mov rdi, [rip + offset])
+                    // Check for RIP-relative memory on both sides
+                    let lhs = if let Operand::Memory(mem) = &ops[0] {
+                        Self::from_memory_with_context(mem, inst, true)
+                    } else {
+                        Self::from_operand(&ops[0])
+                    };
                     let rhs = if let Operand::Memory(mem) = &ops[1] {
-                        let base_name = mem.base.as_ref().map(|r| r.name()).unwrap_or("");
-                        if base_name == "rip" && mem.index.is_none() {
-                            // Compute absolute address: inst.address + inst.size + displacement
-                            let abs_addr =
-                                (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
-                            let display_expr = Self::from_memory_ref(mem);
-                            Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
-                        } else {
-                            Self::from_operand(&ops[1])
-                        }
+                        Self::from_memory_with_context(mem, inst, false)
                     } else {
                         Self::from_operand(&ops[1])
                     };
-                    Self::assign(Self::from_operand(&ops[0]), rhs)
+                    Self::assign(lhs, rhs)
                 } else if ops.len() == 1 {
                     Self::from_operand(&ops[0])
                 } else {

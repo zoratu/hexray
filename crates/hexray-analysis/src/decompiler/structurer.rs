@@ -316,7 +316,7 @@ impl<'a> Structurer<'a> {
                 if let hexray_core::Operand::Register(dst) = &inst.operands[0] {
                     let dst_name = dst.name().to_lowercase();
                     if matches!(dst_name.as_str(), "eax" | "rax" | "x0" | "w0" | "a0") {
-                        return_value = Some(Expr::from_operand(&inst.operands[1]));
+                        return_value = Some(Expr::from_operand_with_inst(&inst.operands[1], inst));
                     }
                 }
             }
@@ -1001,17 +1001,25 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
         // For SUB/SUBS instructions (ARM64), operands are [dst, src1, src2]
         // The comparison is between src1 and src2
         if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Sub) {
-            let left =
-                substitute_register_in_expr(Expr::from_operand(&inst.operands[1]), &reg_values);
-            let right =
-                substitute_register_in_expr(Expr::from_operand(&inst.operands[2]), &reg_values);
+            let left = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[1], inst),
+                &reg_values,
+            );
+            let right = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[2], inst),
+                &reg_values,
+            );
             return Expr::binop(op, left, right);
         } else if inst.operands.len() >= 2 {
             // For CMP/TEST instructions, operands are [src1, src2]
-            let left =
-                substitute_register_in_expr(Expr::from_operand(&inst.operands[0]), &reg_values);
-            let right =
-                substitute_register_in_expr(Expr::from_operand(&inst.operands[1]), &reg_values);
+            let left = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[0], inst),
+                &reg_values,
+            );
+            let right = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[1], inst),
+                &reg_values,
+            );
 
             // Special case: TEST reg, reg (same register) is a zero check
             // test eax, eax; je → jump if eax == 0
@@ -1023,8 +1031,10 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
             return Expr::binop(op, left, right);
         } else if inst.operands.len() == 1 {
             // Compare against zero (common for test/cmp with single operand)
-            let left =
-                substitute_register_in_expr(Expr::from_operand(&inst.operands[0]), &reg_values);
+            let left = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[0], inst),
+                &reg_values,
+            );
             return Expr::binop(op, left, Expr::int(0));
         }
     }
@@ -1073,9 +1083,9 @@ fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
             if let Operand::Register(dst_reg) = &inst.operands[0] {
                 let dst_name = dst_reg.name().to_lowercase();
 
-                // Check if source is a memory operand (stack variable)
+                // Check if source is a memory operand (stack variable or global)
                 if let Operand::Memory { .. } = &inst.operands[1] {
-                    let value = Expr::from_operand(&inst.operands[1]);
+                    let value = Expr::from_operand_with_inst(&inst.operands[1], inst);
                     reg_values.insert(dst_name, value);
                     at_block_start = false;
                 }
@@ -1114,9 +1124,9 @@ fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
             // First operand is destination (register), second is source (memory)
             if let Operand::Register(reg) = &inst.operands[0] {
                 let reg_name = reg.name().to_lowercase();
-                // Track if source is a memory operand (stack variable)
+                // Track if source is a memory operand (stack variable or global)
                 if let Operand::Memory { .. } = &inst.operands[1] {
-                    let value = Expr::from_operand(&inst.operands[1]);
+                    let value = Expr::from_operand_with_inst(&inst.operands[1], inst);
                     reg_values.insert(reg_name, value);
                 }
             }
@@ -1262,7 +1272,7 @@ fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
 /// Returns an expression like: dest = (left op right)
 fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) -> Expr {
     let dest = if !inst.operands.is_empty() {
-        Expr::from_operand(&inst.operands[0])
+        Expr::from_operand_with_inst(&inst.operands[0], inst)
     } else {
         Expr::unknown(&inst.mnemonic)
     };
@@ -1293,8 +1303,8 @@ fn lift_cmovcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock)
         return Expr::unknown(&inst.mnemonic);
     }
 
-    let dest = Expr::from_operand(&inst.operands[0]);
-    let src = Expr::from_operand(&inst.operands[1]);
+    let dest = Expr::from_operand_with_inst(&inst.operands[0], inst);
+    let src = Expr::from_operand_with_inst(&inst.operands[1], inst);
 
     // Try to parse condition from mnemonic
     if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {

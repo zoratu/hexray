@@ -96,9 +96,12 @@ impl<'a> MachO<'a> {
             .collect();
 
         // Populate section data caches
+        // For fat binaries, section offsets are relative to the slice, not the whole file
+        // So we need to pass the slice starting at 'offset'
+        let slice_data = &data[offset..];
         for segment in &mut segments {
             for section in &mut segment.sections {
-                section.populate_data(data);
+                section.populate_data(slice_data);
             }
         }
 
