@@ -87,9 +87,12 @@ impl<'a> ItaniumDemangler<'a> {
 
     fn consume(&mut self, n: usize) {
         let new_pos = self.pos + n;
-        // Ensure we don't advance past the end or to an invalid position
-        if new_pos <= self.input.len() {
+        // Ensure we don't advance past the end or to an invalid char boundary
+        if new_pos <= self.input.len() && self.input.is_char_boundary(new_pos) {
             self.pos = new_pos;
+        } else if new_pos <= self.input.len() {
+            // Find the next valid char boundary
+            self.pos = self.input.len();
         } else {
             self.pos = self.input.len();
         }
@@ -132,7 +135,8 @@ impl<'a> ItaniumDemangler<'a> {
     fn parse_source_name(&mut self) -> Option<String> {
         let length = self.parse_number()?;
         let remaining = self.remaining();
-        if remaining.len() >= length {
+        // Check both length and that it's a valid UTF-8 char boundary
+        if remaining.len() >= length && remaining.is_char_boundary(length) {
             let name = remaining[..length].to_string();
             self.consume(length);
             Some(name)
