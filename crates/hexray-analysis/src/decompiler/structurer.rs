@@ -167,6 +167,9 @@ impl StructuredCfg {
         // Post-process to convert gotos to break/continue where applicable
         let body = convert_gotos_to_break_continue(body, None);
 
+        // Post-process to flatten nested if-else into guard clauses
+        let body = flatten_guard_clauses(body);
+
         // Post-process to simplify expressions (constant folding, algebraic simplifications)
         let body = simplify_expressions(body);
 
@@ -2564,4 +2567,252 @@ fn simplify_expressions_in_node(node: StructuredNode) -> StructuredNode {
         // Other nodes pass through unchanged
         other => other,
     }
+}
+
+/// Flattens deeply nested if-else structures into guard clause style.
+///
+/// Transforms patterns like:
+/// ```text
+/// if (cond1) {
+///     if (cond2) {
+///         // actual work
+///     } else {
+///         return;
+///     }
+/// } else {
+///     return;
+/// }
+/// ```
+/// Into:
+/// ```text
+/// if (!cond1) {
+///     return;
+/// }
+/// if (!cond2) {
+///     return;
+/// }
+/// // actual work
+/// ```
+///
+/// This significantly reduces nesting depth and improves readability.
+pub fn flatten_guard_clauses(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut result = Vec::new();
+
+    for node in nodes {
+        flatten_node_into(&mut result, node);
+    }
+
+    result
+}
+
+/// Flattens a single node and appends results to the output vector.
+fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            // First, recursively flatten both branches
+            let then_body = flatten_guard_clauses(then_body);
+            let else_body = else_body.map(flatten_guard_clauses);
+
+            // Check if then_body terminates (ends with return/break/continue/goto)
+            let then_terminates = body_terminates(&then_body);
+            let else_terminates = else_body.as_ref().is_some_and(|e| body_terminates(e));
+            let else_non_empty = else_body.as_ref().is_some_and(|e| !e.is_empty());
+
+            // Case 1: then terminates, else has non-empty content that continues
+            // Transform: if (cond) { return; } else { stuff } -> if (cond) { return; } stuff
+            if then_terminates && else_non_empty && !else_terminates {
+                let else_nodes = else_body.unwrap();
+                // Emit the guard clause (if with terminating body, no else)
+                output.push(StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body: None,
+                });
+                // Flatten and append the else content as siblings
+                for node in else_nodes {
+                    flatten_node_into(output, node);
+                }
+            }
+            // Case 2: else terminates, then has content that continues
+            // Transform: if (cond) { stuff } else { return; } -> if (!cond) { return; } stuff
+            else if else_terminates && !then_terminates && !then_body.is_empty() {
+                let else_nodes = else_body.unwrap();
+                // Emit the guard clause with negated condition
+                output.push(StructuredNode::If {
+                    condition: condition.negate(),
+                    then_body: else_nodes,
+                    else_body: None,
+                });
+                // Flatten and append the then content as siblings
+                for node in then_body {
+                    flatten_node_into(output, node);
+                }
+            }
+            // Case 3: Neither case applies, keep the if structure but with flattened bodies
+            else {
+                output.push(StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                });
+            }
+        }
+
+        // Recursively process other compound nodes
+        StructuredNode::While { condition, body } => {
+            output.push(StructuredNode::While {
+                condition,
+                body: flatten_guard_clauses(body),
+            });
+        }
+
+        StructuredNode::DoWhile { body, condition } => {
+            output.push(StructuredNode::DoWhile {
+                body: flatten_guard_clauses(body),
+                condition,
+            });
+        }
+
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            output.push(StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: flatten_guard_clauses(body),
+            });
+        }
+
+        StructuredNode::Loop { body } => {
+            output.push(StructuredNode::Loop {
+                body: flatten_guard_clauses(body),
+            });
+        }
+
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            output.push(StructuredNode::Switch {
+                value,
+                cases: cases
+                    .into_iter()
+                    .map(|(vals, body)| (vals, flatten_guard_clauses(body)))
+                    .collect(),
+                default: default.map(flatten_guard_clauses),
+            });
+        }
+
+        StructuredNode::Sequence(nodes) => {
+            // Flatten the sequence contents directly into output
+            for node in flatten_guard_clauses(nodes) {
+                output.push(node);
+            }
+        }
+
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            output.push(StructuredNode::TryCatch {
+                try_body: flatten_guard_clauses(try_body),
+                catch_handlers: catch_handlers
+                    .into_iter()
+                    .map(|h| CatchHandler {
+                        body: flatten_guard_clauses(h.body),
+                        ..h
+                    })
+                    .collect(),
+            });
+        }
+
+        // Pass through simple nodes unchanged
+        other => output.push(other),
+    }
+}
+
+/// Checks if a body of statements terminates (ends with return/break/continue/goto/noreturn call).
+fn body_terminates(body: &[StructuredNode]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+
+    // Check the last node
+    match body.last() {
+        Some(StructuredNode::Return(_)) => true,
+        Some(StructuredNode::Break) => true,
+        Some(StructuredNode::Continue) => true,
+        Some(StructuredNode::Goto(_)) => true,
+        // An if terminates if BOTH branches terminate
+        Some(StructuredNode::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        }) => body_terminates(then_body) && body_terminates(else_body),
+        // A sequence terminates if its contents terminate
+        Some(StructuredNode::Sequence(nodes)) => body_terminates(nodes),
+        // Check for noreturn function calls (exit, abort, etc.)
+        Some(StructuredNode::Expr(expr)) => is_noreturn_call(expr),
+        Some(StructuredNode::Block { statements, .. }) => {
+            // Check if block ends with a noreturn call
+            statements.last().is_some_and(is_noreturn_call)
+        }
+        _ => false,
+    }
+}
+
+/// Checks if an expression is a call to a noreturn function.
+fn is_noreturn_call(expr: &Expr) -> bool {
+    use super::expression::{CallTarget, ExprKind};
+
+    match &expr.kind {
+        ExprKind::Call {
+            target: CallTarget::Named(name),
+            ..
+        } => is_noreturn_function(name),
+        ExprKind::Assign { rhs, .. } => {
+            // Check if RHS is a noreturn call (shouldn't normally happen, but be safe)
+            is_noreturn_call(rhs)
+        }
+        _ => false,
+    }
+}
+
+/// Checks if a function name is a known noreturn function.
+fn is_noreturn_function(name: &str) -> bool {
+    // Strip leading underscore(s) for comparison
+    let name = name.trim_start_matches('_');
+
+    matches!(
+        name,
+        "exit"
+            | "Exit"
+            | "abort"
+            | "err"
+            | "errx"
+            | "verr"
+            | "verrx"
+            | "assert_fail"
+            | "cxa_throw"
+            | "cxa_rethrow"
+            | "cxa_bad_cast"
+            | "cxa_bad_typeid"
+            | "Unwind_Resume"
+            | "longjmp"
+            | "siglongjmp"
+            | "pthread_exit"
+            | "thrd_exit"
+            | "quick_exit"
+            | "stack_chk_fail"
+            | "fortify_fail"
+    )
 }
