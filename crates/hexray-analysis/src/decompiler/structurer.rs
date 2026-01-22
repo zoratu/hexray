@@ -2228,20 +2228,32 @@ fn detect_switch_in_node(node: StructuredNode) -> StructuredNode {
 
 /// Try to extract a switch statement from an if-else chain.
 /// Returns Some(Switch) if successful, None if the pattern doesn't match.
+///
+/// Handles two patterns:
+/// 1. `if (x == A) { caseA } else if (x == B) { caseB } ...` (== pattern)
+/// 2. `if (x != A) { if (x != B) { ... } else { caseB } } else { caseA }` (!= pattern)
 fn try_extract_switch(
     condition: &Expr,
     then_body: &[StructuredNode],
     else_body: &Option<Vec<StructuredNode>>,
 ) -> Option<StructuredNode> {
-    // Check if condition is a comparison against a literal: var == N
-    let (first_var_key, first_var_expr, first_value) = extract_switch_case(condition)?;
+    // Check if condition is a comparison against a literal
+    let first_info = extract_switch_case_info(condition)?;
 
+    // Determine if we're dealing with == or != patterns
+    if first_info.negated {
+        // != pattern: case body is in else, rest of chain is in then
+        return try_extract_switch_negated(&first_info, then_body, else_body);
+    }
+
+    // == pattern: case body is in then, rest of chain is in else
     // Start collecting cases
     let mut cases: Vec<(Vec<i128>, Vec<StructuredNode>)> =
-        vec![(vec![first_value], then_body.to_vec())];
+        vec![(vec![first_info.value], then_body.to_vec())];
     let mut current_else = else_body.clone();
-    let mut switch_var_key = first_var_key.clone();
-    let mut switch_var_expr = first_var_expr.clone();
+    let mut switch_var_key = first_info.var_key.clone();
+    let mut switch_var_expr = first_info.var_expr.clone();
+    let first_var_expr = first_info.var_expr.clone(); // Save original for mismatch case
     let mut first_var_mismatch = false;
 
     // Walk down the else chain
@@ -2332,33 +2344,145 @@ fn try_extract_switch(
     }
 }
 
-/// Extract switch case from a condition: var == N
-/// Returns (variable_key, variable_expr, value) if it matches the pattern.
-fn extract_switch_case(condition: &Expr) -> Option<(String, Expr, i128)> {
+/// Try to extract a switch statement from a != pattern if-else chain.
+///
+/// Pattern: `if (x != A) { if (x != B) { default } else { caseB } } else { caseA }`
+/// This is the inverted form where case bodies are in the else branches.
+fn try_extract_switch_negated(
+    first_info: &SwitchCaseInfo,
+    then_body: &[StructuredNode],
+    else_body: &Option<Vec<StructuredNode>>,
+) -> Option<StructuredNode> {
+    // For != pattern, the case body is in the else branch
+    let first_case_body = else_body.as_ref()?.clone();
+
+    let mut cases: Vec<(Vec<i128>, Vec<StructuredNode>)> =
+        vec![(vec![first_info.value], first_case_body)];
+    let switch_var_key = first_info.var_key.clone();
+    let switch_var_expr = first_info.var_expr.clone();
+
+    // The then_body contains the rest of the chain
+    let mut current_then = then_body.to_vec();
+
+    // Walk down the then chain (which is nested != comparisons)
+    loop {
+        // Find an If node in the then body
+        let mut found_if = false;
+
+        // Look for a single If node (possibly with some preceding statements)
+        for node in &current_then {
+            if let StructuredNode::If {
+                condition: inner_cond,
+                then_body: inner_then,
+                else_body: inner_else,
+            } = node
+            {
+                // Check if this condition is a != comparison on our switch variable
+                if let Some(info) = extract_switch_case_info(inner_cond) {
+                    if info.negated && info.var_key == switch_var_key {
+                        // Case body is in else
+                        if let Some(case_body) = inner_else {
+                            cases.push((vec![info.value], case_body.clone()));
+                            current_then = inner_then.clone();
+                            found_if = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found_if {
+            // No more matching != patterns - current_then becomes the default
+            break;
+        }
+    }
+
+    // Need at least 3 cases to be worth converting to switch
+    if cases.len() < 3 {
+        return None;
+    }
+
+    // The remaining then_body is the default case (when none of the values matched)
+    let default = if current_then.is_empty() {
+        None
+    } else {
+        Some(detect_switch_statements(current_then))
+    };
+
+    // Recursively process case bodies
+    let final_cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = cases
+        .into_iter()
+        .map(|(vals, body)| (vals, detect_switch_statements(body)))
+        .collect();
+
+    Some(StructuredNode::Switch {
+        value: switch_var_expr,
+        cases: final_cases,
+        default,
+    })
+}
+
+/// Result of extracting a switch case condition.
+/// Contains the variable key, variable expression, comparison value, and whether it's negated.
+struct SwitchCaseInfo {
+    var_key: String,
+    var_expr: Expr,
+    value: i128,
+    /// If true, condition is `var != N`, case body is in else branch.
+    negated: bool,
+}
+
+/// Extract switch case from a condition: var == N or var != N
+/// Returns the case info if it matches the pattern.
+fn extract_switch_case_info(condition: &Expr) -> Option<SwitchCaseInfo> {
     use super::expression::BinOpKind;
     use super::expression::ExprKind;
 
-    if let ExprKind::BinOp {
-        op: BinOpKind::Eq,
-        left,
-        right,
-    } = &condition.kind
-    {
-        // var == N
+    if let ExprKind::BinOp { op, left, right } = &condition.kind {
+        let negated = match op {
+            BinOpKind::Eq => false,
+            BinOpKind::Ne => true,
+            _ => return None,
+        };
+
+        // var == N or var != N
         if let Some(key) = get_expr_var_key(left) {
             if let ExprKind::IntLit(n) = right.kind {
-                return Some((key, (**left).clone(), n));
+                return Some(SwitchCaseInfo {
+                    var_key: key,
+                    var_expr: (**left).clone(),
+                    value: n,
+                    negated,
+                });
             }
         }
-        // N == var (reversed)
+        // N == var or N != var (reversed)
         if let Some(key) = get_expr_var_key(right) {
             if let ExprKind::IntLit(n) = left.kind {
-                return Some((key, (**right).clone(), n));
+                return Some(SwitchCaseInfo {
+                    var_key: key,
+                    var_expr: (**right).clone(),
+                    value: n,
+                    negated,
+                });
             }
         }
     }
 
     None
+}
+
+/// Extract switch case from a condition: var == N (legacy wrapper)
+/// Returns (variable_key, variable_expr, value) if it matches the pattern.
+fn extract_switch_case(condition: &Expr) -> Option<(String, Expr, i128)> {
+    let info = extract_switch_case_info(condition)?;
+    // Only return for == patterns (legacy behavior)
+    if !info.negated {
+        Some((info.var_key, info.var_expr, info.value))
+    } else {
+        None
+    }
 }
 
 /// Create a switch value expression from a variable key.
