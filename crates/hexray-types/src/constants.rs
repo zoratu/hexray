@@ -44,6 +44,10 @@ pub enum ConstantCategory {
     EpollCtl,
     /// *at() syscall flags (AT_FDCWD, AT_SYMLINK_NOFOLLOW, etc.)
     AtFlags,
+    /// Signal handler values (SIG_IGN, SIG_DFL)
+    SignalHandler,
+    /// File permission modes (0644, 0755, etc.)
+    FileMode,
 }
 
 /// A named constant with its value and category.
@@ -361,6 +365,58 @@ pub fn load_posix_constants(db: &mut ConstantDatabase) {
         value: 15,
         category: Signal,
         description: Some("Terminate"),
+    });
+
+    // Signal handlers
+    db.add(NamedConstant {
+        name: "SIG_DFL",
+        value: 0,
+        category: SignalHandler,
+        description: Some("Default signal handler"),
+    });
+    db.add(NamedConstant {
+        name: "SIG_IGN",
+        value: 1,
+        category: SignalHandler,
+        description: Some("Ignore signal"),
+    });
+
+    // Common file permission modes (octal)
+    db.add(NamedConstant {
+        name: "0644",
+        value: 0o644,
+        category: FileMode,
+        description: Some("rw-r--r--"),
+    });
+    db.add(NamedConstant {
+        name: "0755",
+        value: 0o755,
+        category: FileMode,
+        description: Some("rwxr-xr-x"),
+    });
+    db.add(NamedConstant {
+        name: "0777",
+        value: 0o777,
+        category: FileMode,
+        description: Some("rwxrwxrwx"),
+    });
+    db.add(NamedConstant {
+        name: "0666",
+        value: 0o666,
+        category: FileMode,
+        description: Some("rw-rw-rw-"),
+    });
+    db.add(NamedConstant {
+        name: "0600",
+        value: 0o600,
+        category: FileMode,
+        description: Some("rw-------"),
+    });
+    db.add(NamedConstant {
+        name: "0700",
+        value: 0o700,
+        category: FileMode,
+        description: Some("rwx------"),
     });
 
     // mmap protection flags
@@ -934,6 +990,66 @@ pub fn load_macos_constants(db: &mut ConstantDatabase) {
         category: OpenFlags,
         description: Some("Non-blocking (macOS)"),
     });
+    db.add(NamedConstant {
+        name: "O_APPEND",
+        value: 0x0008,
+        category: OpenFlags,
+        description: Some("Append mode (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_SHLOCK",
+        value: 0x0010,
+        category: OpenFlags,
+        description: Some("Shared lock (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_EXLOCK",
+        value: 0x0020,
+        category: OpenFlags,
+        description: Some("Exclusive lock (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_ASYNC",
+        value: 0x0040,
+        category: OpenFlags,
+        description: Some("Async I/O (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_NOFOLLOW",
+        value: 0x0100,
+        category: OpenFlags,
+        description: Some("Don't follow symlinks (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_EVTONLY",
+        value: 0x8000,
+        category: OpenFlags,
+        description: Some("Event notifications only (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_NOCTTY",
+        value: 0x20000,
+        category: OpenFlags,
+        description: Some("Don't assign controlling terminal (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_DIRECTORY",
+        value: 0x100000,
+        category: OpenFlags,
+        description: Some("Must be a directory (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_SYMLINK",
+        value: 0x200000,
+        category: OpenFlags,
+        description: Some("Allow open of symlink (macOS)"),
+    });
+    db.add(NamedConstant {
+        name: "O_CLOEXEC",
+        value: 0x1000000,
+        category: OpenFlags,
+        description: Some("Close on exec (macOS)"),
+    });
 
     // macOS-specific mmap flag
     db.add(NamedConstant {
@@ -1021,14 +1137,20 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
     match func_name {
         "ioctl" | "_ioctl" if arg_index == 1 => Some(ConstantCategory::Ioctl),
         "signal" | "_signal" if arg_index == 0 => Some(ConstantCategory::Signal),
+        "signal" | "_signal" if arg_index == 1 => Some(ConstantCategory::SignalHandler),
         "kill" | "_kill" if arg_index == 1 => Some(ConstantCategory::Signal),
         "raise" | "_raise" if arg_index == 0 => Some(ConstantCategory::Signal),
         "sigaction" | "_sigaction" if arg_index == 0 => Some(ConstantCategory::Signal),
-        "open" | "_open" | "openat" | "_openat" if arg_index == 1 => {
-            Some(ConstantCategory::OpenFlags)
+        "open" | "_open" if arg_index == 1 => Some(ConstantCategory::OpenFlags),
+        "open" | "_open" if arg_index == 2 => Some(ConstantCategory::FileMode),
+        "openat" | "_openat" if arg_index == 2 => Some(ConstantCategory::OpenFlags),
+        "openat" | "_openat" if arg_index == 3 => Some(ConstantCategory::FileMode),
+        "creat" | "_creat" if arg_index == 1 => Some(ConstantCategory::FileMode),
+        "mkdir" | "_mkdir" | "mkdirat" | "_mkdirat" if arg_index == 1 => {
+            Some(ConstantCategory::FileMode)
         }
-        "open" | "_open" | "openat" | "_openat" if arg_index == 2 => {
-            Some(ConstantCategory::OpenFlags)
+        "chmod" | "_chmod" | "fchmod" | "_fchmod" if arg_index == 1 => {
+            Some(ConstantCategory::FileMode)
         }
         "mmap" | "_mmap" if arg_index == 2 => Some(ConstantCategory::MmapProt),
         "mmap" | "_mmap" if arg_index == 3 => Some(ConstantCategory::MmapFlags),

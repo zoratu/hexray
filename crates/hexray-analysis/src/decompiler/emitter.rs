@@ -386,6 +386,12 @@ impl PseudoCodeEmitter {
                         | ConstantCategory::PollEvents => {
                             return const_db.format_flags(*value, category);
                         }
+                        ConstantCategory::FileMode => {
+                            // Format file modes as octal (e.g., 0644)
+                            if *value >= 0 && *value <= 0o7777 {
+                                return format!("0{:o}", value);
+                            }
+                        }
                         _ => {
                             // Single value lookup
                             if let Some(name) = const_db.lookup(*value, Some(category)) {
