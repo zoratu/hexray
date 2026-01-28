@@ -195,6 +195,9 @@ struct Structurer<'a> {
     processed: HashSet<BasicBlockId>,
     /// Blocks with multiple predecessors that should be emitted with labels.
     multi_pred_blocks: HashSet<BasicBlockId>,
+    /// Blocks that are allowed to be inlined even if they have multiple predecessors.
+    /// This is used for join points after if-else structures.
+    inline_allowed: HashSet<BasicBlockId>,
 }
 
 impl<'a> Structurer<'a> {
@@ -259,6 +262,7 @@ impl<'a> Structurer<'a> {
             visited: HashSet::new(),
             processed: HashSet::new(),
             multi_pred_blocks,
+            inline_allowed: HashSet::new(),
         }
     }
 
@@ -314,32 +318,52 @@ impl<'a> Structurer<'a> {
         let mut return_value: Option<Expr> = None;
 
         for inst in &block.instructions {
-            // Check for return value setup: eax/rax = something
-            if matches!(inst.operation, Operation::Move) && inst.operands.len() >= 2 {
+            // Check for return value setup: eax/rax/x0/w0 = something (Move or Load)
+            if matches!(inst.operation, Operation::Move | Operation::Load)
+                && inst.operands.len() >= 2
+            {
                 if let hexray_core::Operand::Register(dst) = &inst.operands[0] {
                     let dst_name = dst.name().to_lowercase();
                     if matches!(dst_name.as_str(), "eax" | "rax" | "x0" | "w0" | "a0") {
                         return_value = Some(Expr::from_operand_with_inst(&inst.operands[1], inst));
+                        continue;
                     }
                 }
             }
             // Skip epilogue instructions and jump/ret
-            else if !matches!(
+            if matches!(
                 inst.operation,
                 Operation::Pop | Operation::Push | Operation::Jump | Operation::Return
-            ) && !inst.mnemonic.starts_with("nop")
-                && !inst.mnemonic.starts_with("endbr")
-            {
-                return None;
+            ) {
+                continue;
             }
+            // Skip nop and endbr
+            if inst.mnemonic.starts_with("nop") || inst.mnemonic.starts_with("endbr") {
+                continue;
+            }
+            // Skip ARM64 stack cleanup: add sp, sp, #imm
+            if matches!(inst.operation, Operation::Add) && inst.operands.len() >= 2 {
+                if let hexray_core::Operand::Register(dst) = &inst.operands[0] {
+                    let dst_name = dst.name().to_lowercase();
+                    if dst_name == "sp" || dst_name == "rsp" {
+                        continue;
+                    }
+                }
+            }
+            // Skip ARM64 ldp for callee-saved registers (x29, x30, etc.)
+            if inst.mnemonic.to_lowercase() == "ldp" {
+                continue;
+            }
+            // Any other instruction means not a simple return block
+            return None;
         }
 
-        // Return the captured value, or default to ebx (common for kernel error paths)
+        // Return the captured value, or default to the return register
         Some(return_value.unwrap_or_else(|| {
             Expr::var(super::expression::Variable {
-                name: "ebx".to_string(),
-                kind: super::expression::VarKind::Register(3),
-                size: 4,
+                name: "x0".to_string(),
+                kind: super::expression::VarKind::Register(0),
+                size: 8,
             })
         }))
     }
@@ -455,8 +479,13 @@ impl<'a> Structurer<'a> {
             }
 
             // If this is a multi-predecessor block (shared target) and not the first block,
-            // emit a goto and let it be handled as a labeled block later
-            if self.multi_pred_blocks.contains(&block_id) && block_id != start {
+            // emit a goto and let it be handled as a labeled block later.
+            // However, skip this if the block is marked as "inline allowed" (e.g., join points
+            // after if-else structures that should be processed inline).
+            if self.multi_pred_blocks.contains(&block_id)
+                && block_id != start
+                && !self.inline_allowed.contains(&block_id)
+            {
                 // Check if target is a pure return block - if so, emit return instead of goto
                 if let Some(ret_expr) = self.get_return_expr_if_pure_return(block_id) {
                     result.push(StructuredNode::Return(Some(ret_expr)));
@@ -566,6 +595,13 @@ impl<'a> Structurer<'a> {
 
                     // Find join point and continue
                     let join = self.find_join_point(*true_target, *false_target, end);
+
+                    // Mark the join point as inline-allowed so we don't emit a goto to it.
+                    // This is the natural continuation after the if-else structure.
+                    if let Some(join_id) = join {
+                        self.inline_allowed.insert(join_id);
+                    }
+
                     current = join;
                 }
 
@@ -972,6 +1008,65 @@ impl<'a> Structurer<'a> {
     }
 }
 
+/// Try to extract condition from ARM64 CBZ/CBNZ/TBZ/TBNZ instructions.
+///
+/// These instructions have the comparison built into the branch:
+/// - CBZ reg, target: branch if reg == 0
+/// - CBNZ reg, target: branch if reg != 0
+/// - TBZ reg, #bit, target: branch if bit is clear
+/// - TBNZ reg, #bit, target: branch if bit is set
+fn try_extract_arm64_branch_condition(
+    block: &BasicBlock,
+    op: BinOpKind,
+    reg_values: &HashMap<String, Expr>,
+) -> Option<Expr> {
+    // Find the last ConditionalJump instruction (CBZ/CBNZ/TBZ/TBNZ)
+    let branch_inst = block
+        .instructions
+        .iter()
+        .rev()
+        .find(|inst| matches!(inst.operation, Operation::ConditionalJump))?;
+
+    let mnemonic = branch_inst.mnemonic.to_lowercase();
+
+    // Check for CBZ/CBNZ (Compare and Branch if Zero/Not Zero)
+    if mnemonic == "cbz" || mnemonic == "cbnz" {
+        // Operands: [reg, pc_rel_target]
+        if !branch_inst.operands.is_empty() {
+            let reg_expr = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&branch_inst.operands[0], branch_inst),
+                reg_values,
+            );
+            // CBZ: reg == 0, CBNZ: reg != 0
+            // The condition (Equal/NotEqual) is already encoded, so just use op
+            return Some(Expr::binop(op, reg_expr, Expr::int(0)));
+        }
+    }
+
+    // Check for TBZ/TBNZ (Test and Branch if Zero/Not Zero)
+    if mnemonic == "tbz" || mnemonic == "tbnz" {
+        // Operands: [reg, bit_pos, pc_rel_target]
+        if branch_inst.operands.len() >= 2 {
+            let reg_expr = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&branch_inst.operands[0], branch_inst),
+                reg_values,
+            );
+
+            // Extract bit position
+            if let hexray_core::Operand::Immediate(imm) = &branch_inst.operands[1] {
+                let bit_pos = imm.value;
+                // Create bit test expression: (reg >> bit_pos) & 1
+                let shifted = Expr::binop(BinOpKind::Shr, reg_expr, Expr::int(bit_pos));
+                let masked = Expr::binop(BinOpKind::And, shifted, Expr::int(1));
+                // TBZ: bit == 0, TBNZ: bit != 0
+                return Some(Expr::binop(op, masked, Expr::int(0)));
+            }
+        }
+    }
+
+    None
+}
+
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
 /// Also substitutes register names with their values from preceding MOV instructions.
 fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
@@ -991,6 +1086,12 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
 
     // Build a map of register values from MOV instructions before the compare
     let reg_values = build_register_value_map(block);
+
+    // Check for ARM64 CBZ/CBNZ/TBZ/TBNZ instructions first
+    // These have the comparison built into the branch instruction itself
+    if let Some(cond_expr) = try_extract_arm64_branch_condition(block, op, &reg_values) {
+        return cond_expr;
+    }
 
     // Find the last compare instruction in the block
     let compare_inst = block.instructions.iter().rev().find(|inst| {
