@@ -1626,11 +1626,68 @@ impl Expr {
     }
 }
 
+/// Checks if an integer value should be displayed as a character literal.
+/// Returns Some(char) if it's a printable ASCII character or common escape sequence.
+fn as_char_literal(n: i128) -> Option<String> {
+    if !(0..=127).contains(&n) {
+        return None;
+    }
+    let c = n as u8;
+    match c {
+        // Common escape sequences
+        0 => Some("'\\0'".to_string()),
+        b'\t' => Some("'\\t'".to_string()),
+        b'\n' => Some("'\\n'".to_string()),
+        b'\r' => Some("'\\r'".to_string()),
+        b'\\' => Some("'\\\\'".to_string()),
+        b'\'' => Some("'\\''".to_string()),
+        // Printable ASCII (space through tilde)
+        32..=126 => Some(format!("'{}'", c as char)),
+        _ => None,
+    }
+}
+
+/// Checks if a binary operation is a comparison that might involve character values.
+fn is_comparison_op(op: &BinOpKind) -> bool {
+    matches!(
+        op,
+        BinOpKind::Eq
+            | BinOpKind::Ne
+            | BinOpKind::Lt
+            | BinOpKind::Le
+            | BinOpKind::Gt
+            | BinOpKind::Ge
+            | BinOpKind::ULt
+            | BinOpKind::ULe
+            | BinOpKind::UGt
+            | BinOpKind::UGe
+    )
+}
+
+/// Formats an integer, optionally as a character literal if in a comparison context.
+fn format_int_maybe_char(n: i128, in_comparison: bool) -> String {
+    // In comparison context, prefer character literals for ASCII values
+    if in_comparison {
+        if let Some(char_lit) = as_char_literal(n) {
+            return char_lit;
+        }
+    }
+    // Default integer formatting
+    if (0..10).contains(&n) {
+        format!("{}", n)
+    } else if n < 0 {
+        format!("-{:#x}", -n)
+    } else {
+        format!("{:#x}", n)
+    }
+}
+
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             ExprKind::Var(v) => write!(f, "{}", v.name),
             ExprKind::IntLit(n) => {
+                // Format integers: small values as decimal, others as hex
                 if *n >= 0 && *n < 10 {
                     write!(f, "{}", n)
                 } else if *n < 0 {
@@ -1640,7 +1697,22 @@ impl fmt::Display for Expr {
                 }
             }
             ExprKind::BinOp { op, left, right } => {
-                write!(f, "{} {} {}", left, op.as_str(), right)
+                // For comparisons, try to display integer operands as character literals
+                if is_comparison_op(op) {
+                    let left_str = if let ExprKind::IntLit(n) = &left.kind {
+                        format_int_maybe_char(*n, true)
+                    } else {
+                        format!("{}", left)
+                    };
+                    let right_str = if let ExprKind::IntLit(n) = &right.kind {
+                        format_int_maybe_char(*n, true)
+                    } else {
+                        format!("{}", right)
+                    };
+                    write!(f, "{} {} {}", left_str, op.as_str(), right_str)
+                } else {
+                    write!(f, "{} {} {}", left, op.as_str(), right)
+                }
             }
             ExprKind::UnaryOp { op, operand } => {
                 write!(f, "{}{}", op.as_str(), operand)

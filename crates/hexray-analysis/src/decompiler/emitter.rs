@@ -425,8 +425,18 @@ impl PseudoCodeEmitter {
         let right_is_char_context =
             self.is_byte_context(right) || looks_like_char_context(&right_str);
 
+        // Check if either side is a variable (register) that might hold a character
+        let left_is_var = matches!(left.kind, ExprKind::Var(_));
+        let right_is_var = matches!(right.kind, ExprKind::Var(_));
+
         let left_str = if let ExprKind::IntLit(n) = &left.kind {
-            if right_is_char_context && is_printable_char_value(*n) {
+            // Show as char literal if:
+            // 1. The other side is a byte context, OR
+            // 2. The other side is a variable and this value is a common char (letter/digit)
+            if (right_is_char_context || right_is_var) && is_printable_char_value(*n) {
+                format_as_char_literal(*n)
+            } else if is_likely_character_constant(*n) {
+                // For very likely character values (letters, digits), always show as char
                 format_as_char_literal(*n)
             } else {
                 left_str
@@ -436,7 +446,13 @@ impl PseudoCodeEmitter {
         };
 
         let right_str = if let ExprKind::IntLit(n) = &right.kind {
-            if left_is_char_context && is_printable_char_value(*n) {
+            // Show as char literal if:
+            // 1. The other side is a byte context, OR
+            // 2. The other side is a variable and this value is a common char (letter/digit)
+            if (left_is_char_context || left_is_var) && is_printable_char_value(*n) {
+                format_as_char_literal(*n)
+            } else if is_likely_character_constant(*n) {
+                // For very likely character values (letters, digits), always show as char
                 format_as_char_literal(*n)
             } else {
                 right_str
@@ -2047,7 +2063,13 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{}switch ({}) {{", indent, self.format_expr(value)).unwrap();
                 for (values, body) in cases {
                     for v in values {
-                        writeln!(output, "{}case {}:", indent, v).unwrap();
+                        // Format case value, using character literal if appropriate
+                        let case_str = if is_likely_character_constant(*v) {
+                            format_as_char_literal(*v)
+                        } else {
+                            format!("{}", v)
+                        };
+                        writeln!(output, "{}case {}:", indent, case_str).unwrap();
                     }
                     self.emit_nodes(body, output, depth + 1);
                     writeln!(output, "{}    break;", indent).unwrap();
@@ -2432,6 +2454,22 @@ fn is_printable_char_value(n: i128) -> bool {
     }
     // Common special characters
     matches!(n, 0 | 9 | 10 | 13)
+}
+
+/// Checks if a value is very likely to be a character constant.
+/// These are values that almost certainly represent characters in comparisons:
+/// - Letters (a-z, A-Z)
+/// - Digits ('0'-'9')
+///
+/// Note: We don't include 0 (null) here because 0 is commonly used as a regular
+/// integer (false, count, etc.). Null comparisons like `str[i] == 0` are handled
+/// by the byte-context detection instead.
+fn is_likely_character_constant(n: i128) -> bool {
+    if !(0..=127).contains(&n) {
+        return false;
+    }
+    let c = n as u8;
+    matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9')
 }
 
 /// Formats an integer as a C character literal.
