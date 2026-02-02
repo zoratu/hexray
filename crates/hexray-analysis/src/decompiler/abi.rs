@@ -136,9 +136,15 @@ pub fn is_temp_register(name: &str) -> bool {
         name,
         // x86-64 caller-saved registers (SysV ABI)
         // Note: rbx, rbp, r12-r15 are callee-saved and should NOT be temps
-        "eax" | "rax" | "ecx" | "rcx" | "edx" | "rdx" |
-        "esi" | "rsi" | "edi" | "rdi" | "r8" | "r8d" | "r9" | "r9d" |
-        "r10" | "r10d" | "r11" | "r11d" |
+        // 64-bit
+        "rax" | "rcx" | "rdx" | "rsi" | "rdi" | "r8" | "r9" | "r10" | "r11" |
+        // 32-bit
+        "eax" | "ecx" | "edx" | "esi" | "edi" | "r8d" | "r9d" | "r10d" | "r11d" |
+        // 16-bit
+        "ax" | "cx" | "dx" | "si" | "di" | "r8w" | "r9w" | "r10w" | "r11w" |
+        // 8-bit
+        "al" | "ah" | "cl" | "ch" | "dl" | "dh" | "sil" | "dil" |
+        "r8b" | "r9b" | "r10b" | "r11b" |
         // ARM64 registers (x0-x18 and w0-w18 are caller-saved/temp)
         // Note: x19-x28 are callee-saved
         "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7" |

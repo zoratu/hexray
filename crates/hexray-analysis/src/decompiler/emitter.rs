@@ -1811,7 +1811,7 @@ impl PseudoCodeEmitter {
         }
     }
 
-    /// Checks if a node is a control flow exit (goto, return, break, continue).
+    /// Checks if a node is a control flow exit (goto, return, break, continue, noreturn call).
     fn is_control_exit(&self, node: &StructuredNode) -> bool {
         match node {
             StructuredNode::Goto(_)
@@ -1831,8 +1831,53 @@ impl PseudoCodeEmitter {
                     .is_some_and(|n| self.is_control_exit(n));
                 then_exits && else_exits
             }
+            // Check for noreturn function calls
+            StructuredNode::Expr(expr) => Self::is_noreturn_call(expr),
+            StructuredNode::Block { statements, .. } => {
+                statements.last().is_some_and(Self::is_noreturn_call)
+            }
             _ => false,
         }
+    }
+
+    /// Checks if an expression is a call to a noreturn function.
+    fn is_noreturn_call(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Call {
+                target: CallTarget::Named(name),
+                ..
+            } => Self::is_noreturn_function(name),
+            ExprKind::Assign { rhs, .. } => Self::is_noreturn_call(rhs),
+            _ => false,
+        }
+    }
+
+    /// Checks if a function name is a known noreturn function.
+    fn is_noreturn_function(name: &str) -> bool {
+        // Strip leading underscore(s) for Mach-O symbols
+        let name = name.trim_start_matches('_');
+        matches!(
+            name,
+            "exit"
+                | "_exit"
+                | "_Exit"
+                | "abort"
+                | "__assert_fail"
+                | "__assert_rtn"
+                | "__assert"
+                | "panic"
+                | "longjmp"
+                | "siglongjmp"
+                | "__cxa_throw"
+                | "__cxa_rethrow"
+                | "err"
+                | "errx"
+                | "verr"
+                | "verrx"
+                | "pthread_exit"
+                | "thrd_exit"
+                | "quick_exit"
+        )
     }
 
     /// Checks if a body (list of nodes) is empty or contains only empty/skippable blocks.
@@ -2518,16 +2563,30 @@ fn is_special_char_value(n: i128) -> bool {
 /// These are values that almost certainly represent characters in comparisons:
 /// - Letters (a-z, A-Z)
 /// - Digits ('0'-'9')
+/// - Common punctuation that would be meaningless as raw numbers
+///   (backslash, quotes)
 ///
 /// Note: We don't include 0 (null) here because 0 is commonly used as a regular
 /// integer (false, count, etc.). Null comparisons like `str[i] == 0` are handled
 /// by the byte-context detection instead.
+///
+/// We intentionally exclude less-common control characters (7=\a, 8=\b, 11=\v, 12=\f)
+/// because comparisons like `x > 8` are often numeric bounds checks, not character
+/// comparisons. Those are still formatted as escape sequences in byte contexts.
 fn is_likely_character_constant(n: i128) -> bool {
     if !(0..=127).contains(&n) {
         return false;
     }
     let c = n as u8;
-    matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9')
+    matches!(
+        c,
+        b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'\\'  // Backslash - 92
+            | b'\''  // Single quote - 39
+            | b'"'   // Double quote - 34
+    )
 }
 
 /// Formats an integer as a C character literal.
@@ -2538,9 +2597,13 @@ fn format_as_char_literal(n: i128) -> String {
     let c = n as u8;
     match c {
         0 => "'\\0'".to_string(),
-        9 => "'\\t'".to_string(),
-        10 => "'\\n'".to_string(),
-        13 => "'\\r'".to_string(),
+        7 => "'\\a'".to_string(),  // Bell
+        8 => "'\\b'".to_string(),  // Backspace
+        9 => "'\\t'".to_string(),  // Tab
+        10 => "'\\n'".to_string(), // Newline
+        11 => "'\\v'".to_string(), // Vertical tab
+        12 => "'\\f'".to_string(), // Form feed
+        13 => "'\\r'".to_string(), // Carriage return
         b'\\' => "'\\\\'".to_string(),
         b'\'' => "'\\''".to_string(),
         32..=126 => format!("'{}'", c as char),
