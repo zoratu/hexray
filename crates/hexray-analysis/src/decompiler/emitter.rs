@@ -430,13 +430,18 @@ impl PseudoCodeEmitter {
         let right_is_var = matches!(right.kind, ExprKind::Var(_));
 
         let left_str = if let ExprKind::IntLit(n) = &left.kind {
-            // Show as char literal if:
-            // 1. The other side is a byte context, OR
-            // 2. The other side is a variable and this value is a common char (letter/digit)
-            if (right_is_char_context || right_is_var) && is_printable_char_value(*n) {
-                format_as_char_literal(*n)
-            } else if is_likely_character_constant(*n) {
+            if is_likely_character_constant(*n) {
                 // For very likely character values (letters, digits), always show as char
+                format_as_char_literal(*n)
+            } else if is_special_char_value(*n) {
+                // Special characters (null, tab, newline, CR) only in byte contexts
+                if right_is_char_context {
+                    format_as_char_literal(*n)
+                } else {
+                    left_str
+                }
+            } else if (right_is_char_context || right_is_var) && is_printable_char_value(*n) {
+                // Other printable chars when comparing with byte context or variable
                 format_as_char_literal(*n)
             } else {
                 left_str
@@ -446,13 +451,18 @@ impl PseudoCodeEmitter {
         };
 
         let right_str = if let ExprKind::IntLit(n) = &right.kind {
-            // Show as char literal if:
-            // 1. The other side is a byte context, OR
-            // 2. The other side is a variable and this value is a common char (letter/digit)
-            if (left_is_char_context || left_is_var) && is_printable_char_value(*n) {
-                format_as_char_literal(*n)
-            } else if is_likely_character_constant(*n) {
+            if is_likely_character_constant(*n) {
                 // For very likely character values (letters, digits), always show as char
+                format_as_char_literal(*n)
+            } else if is_special_char_value(*n) {
+                // Special characters (null, tab, newline, CR) only in byte contexts
+                if left_is_char_context {
+                    format_as_char_literal(*n)
+                } else {
+                    right_str
+                }
+            } else if (left_is_char_context || left_is_var) && is_printable_char_value(*n) {
+                // Other printable chars when comparing with byte context or variable
                 format_as_char_literal(*n)
             } else {
                 right_str
@@ -849,6 +859,48 @@ impl PseudoCodeEmitter {
                 let base_str = self.format_expr_with_strings(base, table);
                 // Use -> for pointer access (most common in decompiled code)
                 format!("{}->{}", base_str, field_name)
+            }
+            // Array access: check if this is a stack slot (sp[N] or x29[N])
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                // Check if base is a stack/frame pointer
+                if let ExprKind::Var(v) = &base.kind {
+                    let is_stack_ptr = v.name == "sp" || v.name == "rsp";
+                    let is_frame_ptr = v.name == "rbp" || v.name == "x29";
+
+                    if is_stack_ptr || is_frame_ptr {
+                        // Check if index is a constant
+                        if let ExprKind::IntLit(idx) = &index.kind {
+                            // Calculate actual byte offset
+                            let byte_offset = *idx * (*element_size as i128);
+                            let actual_offset = if is_frame_ptr {
+                                -byte_offset // Frame pointer uses negative offsets for locals
+                            } else {
+                                byte_offset
+                            };
+
+                            // Check for DWARF name first
+                            if let Some(name) = self.get_dwarf_name(actual_offset) {
+                                return name.to_string();
+                            }
+
+                            // Use NamingContext for pattern-based naming
+                            let is_param = is_frame_ptr && actual_offset > 0;
+                            let name = self
+                                .naming_ctx
+                                .borrow_mut()
+                                .get_name(actual_offset, is_param);
+                            return name;
+                        }
+                    }
+                }
+                // Default array access formatting
+                let base_str = self.format_expr_with_strings(base, table);
+                let index_str = self.format_expr_with_strings(index, table);
+                format!("{}[{}]", base_str, index_str)
             }
             // For other cases, use default formatting
             _ => expr.to_string(),
@@ -2448,12 +2500,18 @@ fn is_printable_char_value(n: i128) -> bool {
         return false;
     }
     let n = n as u8;
-    // Printable ASCII range
-    if (32..=126).contains(&n) {
-        return true;
+    // Printable ASCII range only (not special characters like 0, 9, 10, 13)
+    // Those special characters should only be shown as char literals in byte contexts
+    (32..=126).contains(&n)
+}
+
+/// Checks if a value is a special character (null, tab, newline, CR).
+/// These should only be shown as character literals in explicit byte contexts.
+fn is_special_char_value(n: i128) -> bool {
+    if !(0..=127).contains(&n) {
+        return false;
     }
-    // Common special characters
-    matches!(n, 0 | 9 | 10 | 13)
+    matches!(n as u8, 0 | 9 | 10 | 13)
 }
 
 /// Checks if a value is very likely to be a character constant.
@@ -2610,6 +2668,33 @@ fn is_prologue_statement(expr: &Expr) -> bool {
                 }
             }
 
+            // ARM64: x29[-N] = 0 (ArrayAccess form of frame-relative zero initialization)
+            if let ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size: _,
+            } = &lhs.kind
+            {
+                if let ExprKind::Var(base_var) = &base.kind {
+                    if base_var.name == "x29" || base_var.name == "rbp" {
+                        if let ExprKind::IntLit(idx) = &index.kind {
+                            // Negative index (or negative offset)
+                            if *idx < 0 {
+                                // Check for IntLit(0) or zero register
+                                let is_zero = match &rhs.kind {
+                                    ExprKind::IntLit(0) => true,
+                                    ExprKind::Var(v) => v.name == "wzr" || v.name == "xzr",
+                                    _ => false,
+                                };
+                                if is_zero {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 // x86-64: rbp = rsp (frame pointer setup)
                 if lhs_var.name == "rbp" {
@@ -2642,6 +2727,20 @@ fn is_prologue_statement(expr: &Expr) -> bool {
                         if rhs_var.name == "x29" {
                             return true;
                         }
+                    }
+                }
+            }
+            false
+        }
+        // Compound assignment: rsp -= N or sp -= N (stack allocation)
+        ExprKind::CompoundAssign { op, lhs, rhs } => {
+            if let ExprKind::Var(lhs_var) = &lhs.kind {
+                if lhs_var.name == "rsp" || lhs_var.name == "sp" {
+                    // rsp -= N (stack allocation)
+                    if matches!(op, super::expression::BinOpKind::Sub)
+                        && matches!(rhs.kind, ExprKind::IntLit(_))
+                    {
+                        return true;
                     }
                 }
             }
@@ -2692,6 +2791,20 @@ fn is_epilogue_statement(expr: &Expr) -> bool {
                         if rhs_var.name == "x30" {
                             return true;
                         }
+                    }
+                }
+            }
+            false
+        }
+        // Compound assignment: rsp += N or sp += N (stack deallocation)
+        ExprKind::CompoundAssign { op, lhs, rhs } => {
+            if let ExprKind::Var(lhs_var) = &lhs.kind {
+                if lhs_var.name == "rsp" || lhs_var.name == "sp" {
+                    // rsp += N (stack deallocation)
+                    if matches!(op, super::expression::BinOpKind::Add)
+                        && matches!(rhs.kind, ExprKind::IntLit(_))
+                    {
+                        return true;
                     }
                 }
             }

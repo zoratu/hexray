@@ -10,9 +10,8 @@ int32_t _main(void)
 {
     int var_0;
 
-    x29[-0x1] = 0;
-    sp[2] = _factorial(5);
-    sp[1] = _sum_while(10);
+    ret = _factorial(5);
+    ret2 = _sum_while(10);
     var_0 = _conditional(7);
-    return sp[2] + sp[1] + var_0;
+    return ret + ret2 + var_0;
 }

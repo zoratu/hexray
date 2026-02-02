@@ -783,9 +783,13 @@ impl SignatureRecovery {
     fn infer_expr_size(&self, expr: &Expr) -> Option<u8> {
         match &expr.kind {
             ExprKind::Var(var) => {
+                // First try to infer from register name (w0 = 4, x0 = 8, etc.)
                 let size = self.reg_size_from_name(&var.name);
                 if size > 0 {
                     Some(size)
+                } else if var.size > 0 {
+                    // Fall back to variable's stored size (for stack variables, etc.)
+                    Some(var.size)
                 } else {
                     None
                 }
@@ -802,6 +806,7 @@ impl SignatureRecovery {
                 }
             }
             ExprKind::Deref { size, .. } => Some(*size),
+            ExprKind::ArrayAccess { element_size, .. } => Some(*element_size as u8),
             ExprKind::Cast { to_size, .. } => Some(*to_size),
             ExprKind::BinOp { left, right, .. } => {
                 let left_size = self.infer_expr_size(left);

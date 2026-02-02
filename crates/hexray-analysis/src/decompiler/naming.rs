@@ -587,6 +587,29 @@ impl NamingContext {
                 }
                 None
             }
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                // Handle sp[N] or x29[N] patterns
+                if let ExprKind::Var(v) = &base.kind {
+                    if is_frame_or_stack_pointer(&v.name) {
+                        if let ExprKind::IntLit(idx) = &index.kind {
+                            let byte_offset = *idx * (*element_size as i128);
+                            // Frame pointer (rbp/x29) uses negative offsets for locals
+                            let is_frame_ptr = v.name == "rbp" || v.name == "x29";
+                            let actual = if is_frame_ptr {
+                                -byte_offset
+                            } else {
+                                byte_offset
+                            };
+                            return Some(actual);
+                        }
+                    }
+                }
+                None
+            }
             ExprKind::Var(v) => {
                 // Check for named stack variables (var_N format)
                 if let Some(offset) = parse_var_offset(&v.name) {
@@ -725,6 +748,18 @@ impl NamingContext {
 
     /// Extract an accumulator variable from an expression like `sum += x`.
     fn extract_accumulator_var(&self, expr: &Expr) -> Option<i128> {
+        // Handle compound assignment: sum += x or sum *= x
+        if let ExprKind::CompoundAssign { op, lhs, rhs } = &expr.kind {
+            if matches!(op, BinOpKind::Add | BinOpKind::Mul) {
+                let lhs_offset = self.extract_stack_offset(lhs)?;
+                // Exclude simple increments (i += 1)
+                if !matches!(rhs.kind, ExprKind::IntLit(1)) {
+                    return Some(lhs_offset);
+                }
+            }
+        }
+
+        // Handle expanded form: x = x + y or x = x * y
         if let ExprKind::Assign { lhs, rhs } = &expr.kind {
             let lhs_offset = self.extract_stack_offset(lhs)?;
 
