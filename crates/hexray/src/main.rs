@@ -1151,13 +1151,21 @@ fn decompile_function(
     // Create constant database for magic number recognition
     let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
 
+    // Determine calling convention from architecture
+    let calling_convention = match arch {
+        Architecture::Arm64 => hexray_analysis::CallingConvention::Aarch64,
+        Architecture::RiscV64 | Architecture::RiscV32 => hexray_analysis::CallingConvention::RiscV,
+        _ => hexray_analysis::CallingConvention::SystemV,
+    };
+
     let mut decompiler = Decompiler::new()
         .with_addresses(show_addresses)
         .with_string_table(string_table)
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
         .with_dwarf_names(dwarf_names)
-        .with_constant_database(const_db);
+        .with_constant_database(const_db)
+        .with_calling_convention(calling_convention);
     if let Some(db) = type_db {
         decompiler = decompiler.with_type_database(db.clone());
     }
@@ -1946,13 +1954,21 @@ fn decompile_with_follow(
         };
 
         // Decompile
+        let calling_convention = match arch {
+            Architecture::Arm64 => hexray_analysis::CallingConvention::Aarch64,
+            Architecture::RiscV64 | Architecture::RiscV32 => {
+                hexray_analysis::CallingConvention::RiscV
+            }
+            _ => hexray_analysis::CallingConvention::SystemV,
+        };
         let mut decompiler = Decompiler::new()
             .with_addresses(show_addresses)
             .with_string_table(string_table.clone())
             .with_symbol_table(symbol_table.clone())
             .with_relocation_table(relocation_table.clone())
             .with_dwarf_names(dwarf_names)
-            .with_constant_database(const_db.clone());
+            .with_constant_database(const_db.clone())
+            .with_calling_convention(calling_convention);
         if let Some(db) = type_db {
             decompiler = decompiler.with_type_database(db.clone());
         }
@@ -3311,10 +3327,18 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     .unwrap_or_else(|| format!("sub_{:x}", addr));
 
                 let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
+                let calling_convention = match fmt.architecture() {
+                    Architecture::Arm64 => hexray_analysis::CallingConvention::Aarch64,
+                    Architecture::RiscV64 | Architecture::RiscV32 => {
+                        hexray_analysis::CallingConvention::RiscV
+                    }
+                    _ => hexray_analysis::CallingConvention::SystemV,
+                };
                 let decompiler = Decompiler::new()
                     .with_addresses(false)
                     .with_symbol_table(symbols)
-                    .with_constant_database(const_db);
+                    .with_constant_database(const_db)
+                    .with_calling_convention(calling_convention);
 
                 let pseudo_code = decompiler.decompile(&cfg, &func_name);
 

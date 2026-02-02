@@ -669,7 +669,17 @@ impl SignatureRecovery {
     /// Checks if a register name is an argument register.
     fn is_arg_register(&self, name: &str) -> bool {
         let name_lower = name.to_lowercase();
-        // Check both 64-bit and 32-bit variants
+
+        // Check for renamed argument variables (arg0, arg1, etc.)
+        if name_lower.starts_with("arg") {
+            if let Some(suffix) = name_lower.strip_prefix("arg") {
+                if suffix.parse::<usize>().is_ok() {
+                    return true;
+                }
+            }
+        }
+
+        // Check both 64-bit and 32-bit register variants
         self.convention
             .integer_arg_registers()
             .iter()
@@ -689,6 +699,13 @@ impl SignatureRecovery {
     /// Returns the argument index for a register, or None.
     fn arg_register_index(&self, name: &str) -> Option<usize> {
         let name_lower = name.to_lowercase();
+
+        // Check for renamed argument variables (arg0, arg1, etc.)
+        if let Some(suffix) = name_lower.strip_prefix("arg") {
+            if let Ok(idx) = suffix.parse::<usize>() {
+                return Some(idx);
+            }
+        }
 
         // Check 64-bit integer registers
         if let Some(idx) = self

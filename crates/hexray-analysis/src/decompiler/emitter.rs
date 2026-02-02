@@ -2727,9 +2727,9 @@ fn rename_register(name: &str) -> String {
         "x20" | "w20" => "result".to_string(),
         "x21" | "w21" => "saved1".to_string(),
         "x22" | "w22" => "saved2".to_string(),
-        // ARM64 return register
-        "x0" | "w0" => "ret".to_string(),
-        // ARM64 argument registers
+        // ARM64 argument registers (x0 is both arg0 and return value - treat as arg0 here,
+        // return value handling is done separately by the return statement)
+        "x0" | "w0" => "arg0".to_string(),
         "x1" | "w1" => "arg1".to_string(),
         "x2" | "w2" => "arg2".to_string(),
         "x3" | "w3" => "arg3".to_string(),

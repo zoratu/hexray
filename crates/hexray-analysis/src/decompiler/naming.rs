@@ -1298,8 +1298,12 @@ impl NamingContext {
         match name_lower.as_str() {
             // Zero registers
             "wzr" | "xzr" => "0".to_string(),
-            // Return value registers
-            "eax" | "rax" | "x0" | "w0" | "a0" => "ret".to_string(),
+            // Return value registers (x86-64)
+            "eax" | "rax" => "ret".to_string(),
+            // ARM64 argument registers (x0 is both arg0 and return - treat as arg0)
+            "x0" | "w0" => "arg0".to_string(),
+            // RISC-V return value
+            "a0" => "ret".to_string(),
             // Callee-saved commonly used for error codes
             "ebx" | "rbx" | "x19" | "w19" => "err".to_string(),
             // Callee-saved commonly used for saved results
