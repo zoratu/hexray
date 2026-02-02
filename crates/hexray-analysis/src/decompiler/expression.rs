@@ -602,6 +602,10 @@ impl Expr {
                         if exprs_structurally_equal(&left, &right) {
                             return left;
                         }
+                        // (cmp1) | (cmp2) → (cmp1) || (cmp2) for better readability
+                        if is_comparison_expr(&left) && is_comparison_expr(&right) {
+                            return Self::binop(BinOpKind::LogicalOr, left, right);
+                        }
                     }
                     // x & 0 = 0, 0 & x = 0
                     BinOpKind::And => {
@@ -613,6 +617,10 @@ impl Expr {
                         // x & x = x
                         if exprs_structurally_equal(&left, &right) {
                             return left;
+                        }
+                        // (cmp1) & (cmp2) → (cmp1) && (cmp2) for better readability
+                        if is_comparison_expr(&left) && is_comparison_expr(&right) {
+                            return Self::binop(BinOpKind::LogicalAnd, left, right);
                         }
                     }
                     // x ^ 0 = x, 0 ^ x = x
@@ -653,6 +661,13 @@ impl Expr {
                 // becomes BITS(x, start, width) where width = popcount(mask)
                 if let Some(bitfield) = try_match_bitfield_extraction(&left, op, &right) {
                     return bitfield;
+                }
+
+                // Boolean simplification: (cmp) == 1 → cmp, (cmp) != 1 → !(cmp)
+                // and (cmp) == 0 → !(cmp), (cmp) != 0 → cmp
+                // where cmp is a comparison expression
+                if let Some(simplified) = try_simplify_boolean_comparison(&left, op, &right) {
+                    return simplified;
                 }
 
                 Self::binop(op, left, right)
@@ -2019,6 +2034,21 @@ fn fold_binary_constants(op: BinOpKind, left: i128, right: i128) -> Option<i128>
     }
 }
 
+/// Checks if an expression is a comparison (produces a boolean result).
+/// This includes comparison operators and logical operators.
+fn is_comparison_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::BinOp { op, .. } => {
+            op.is_comparison() || *op == BinOpKind::LogicalAnd || *op == BinOpKind::LogicalOr
+        }
+        ExprKind::UnaryOp {
+            op: UnaryOpKind::LogicalNot,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
 /// Checks if two expressions are structurally equal.
 /// Used for simplifications like `x - x = 0` and `x ^ x = 0`.
 fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
@@ -2347,6 +2377,80 @@ fn mask_to_width(mask: i128) -> Option<u8> {
     if mask_plus_one > 0 && (mask_plus_one & (mask_plus_one - 1)) == 0 {
         // Count trailing zeros to get the width
         Some(mask_plus_one.trailing_zeros() as u8)
+    } else {
+        None
+    }
+}
+
+/// Simplifies boolean comparison patterns.
+///
+/// Handles patterns where a comparison result is compared to 0 or 1:
+/// - `(x == y) == 1` → `x == y` (identity)
+/// - `(x == y) != 1` → `x != y` (negate)
+/// - `(x == y) == 0` → `x != y` (negate)
+/// - `(x == y) != 0` → `x == y` (identity)
+///
+/// This also works with chained comparisons, which get simplified step by step:
+/// - `((x == 1) != 1) != 1` first simplifies inner `(x == 1) != 1` to `x != 1`,
+///   then `(x != 1) != 1` simplifies to `x == 1`.
+fn try_simplify_boolean_comparison(left: &Expr, op: BinOpKind, right: &Expr) -> Option<Expr> {
+    // Must be == or != comparison
+    if op != BinOpKind::Eq && op != BinOpKind::Ne {
+        return None;
+    }
+
+    // One side must be 0 or 1, the other side must be a comparison
+    let (cmp_expr, const_val) = if let ExprKind::IntLit(n) = &right.kind {
+        if *n == 0 || *n == 1 {
+            (left, *n)
+        } else {
+            return None;
+        }
+    } else if let ExprKind::IntLit(n) = &left.kind {
+        if *n == 0 || *n == 1 {
+            (right, *n)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    // The comparison expression must be a comparison operator
+    if let ExprKind::BinOp {
+        op: inner_op,
+        left: inner_left,
+        right: inner_right,
+    } = &cmp_expr.kind
+    {
+        if !inner_op.is_comparison() {
+            return None;
+        }
+
+        // Determine if we should negate:
+        // - (cmp) == 1 → identity (don't negate)
+        // - (cmp) != 1 → negate
+        // - (cmp) == 0 → negate
+        // - (cmp) != 0 → identity (don't negate)
+        let should_negate =
+            (op == BinOpKind::Eq && const_val == 0) || (op == BinOpKind::Ne && const_val == 1);
+
+        if should_negate {
+            // Negate the comparison
+            let negated_op = inner_op.negate()?;
+            Some(Expr::binop(
+                negated_op,
+                (**inner_left).clone(),
+                (**inner_right).clone(),
+            ))
+        } else {
+            // Return the comparison unchanged
+            Some(Expr::binop(
+                *inner_op,
+                (**inner_left).clone(),
+                (**inner_right).clone(),
+            ))
+        }
     } else {
         None
     }
@@ -2730,6 +2834,96 @@ mod tests {
         let expr = Expr::binop(BinOpKind::And, Expr::int(0xFF), Expr::int(0x0F));
         let simplified = expr.simplify();
         assert!(matches!(simplified.kind, ExprKind::IntLit(0x0F)));
+
+        // (cmp1) | (cmp2) → (cmp1) || (cmp2)
+        let cmp1 = Expr::binop(BinOpKind::Eq, Expr::unknown("x"), Expr::int(1));
+        let cmp2 = Expr::binop(BinOpKind::Eq, Expr::unknown("y"), Expr::int(2));
+        let expr = Expr::binop(BinOpKind::Or, cmp1, cmp2);
+        let simplified = expr.simplify();
+        assert!(
+            matches!(
+                simplified.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::LogicalOr,
+                    ..
+                }
+            ),
+            "Expected LogicalOr, got {:?}",
+            simplified.kind
+        );
+
+        // (cmp1) & (cmp2) → (cmp1) && (cmp2)
+        let cmp1 = Expr::binop(BinOpKind::Lt, Expr::unknown("a"), Expr::int(10));
+        let cmp2 = Expr::binop(BinOpKind::Gt, Expr::unknown("b"), Expr::int(0));
+        let expr = Expr::binop(BinOpKind::And, cmp1, cmp2);
+        let simplified = expr.simplify();
+        assert!(
+            matches!(
+                simplified.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::LogicalAnd,
+                    ..
+                }
+            ),
+            "Expected LogicalAnd, got {:?}",
+            simplified.kind
+        );
+    }
+
+    #[test]
+    fn test_boolean_comparison_simplification() {
+        // (x == 1) != 1 → x != 1
+        let inner = Expr::binop(BinOpKind::Eq, Expr::unknown("x"), Expr::int(1));
+        let expr = Expr::binop(BinOpKind::Ne, inner, Expr::int(1));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BinOp { op, left, right } => {
+                assert_eq!(*op, BinOpKind::Ne);
+                assert!(matches!(left.kind, ExprKind::Unknown(ref s) if s == "x"));
+                assert!(matches!(right.kind, ExprKind::IntLit(1)));
+            }
+            _ => panic!("Expected BinOp, got {:?}", simplified.kind),
+        }
+
+        // (x == 1) == 1 → x == 1 (identity)
+        let inner = Expr::binop(BinOpKind::Eq, Expr::unknown("x"), Expr::int(1));
+        let expr = Expr::binop(BinOpKind::Eq, inner, Expr::int(1));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BinOp { op, left, right } => {
+                assert_eq!(*op, BinOpKind::Eq);
+                assert!(matches!(left.kind, ExprKind::Unknown(ref s) if s == "x"));
+                assert!(matches!(right.kind, ExprKind::IntLit(1)));
+            }
+            _ => panic!("Expected BinOp, got {:?}", simplified.kind),
+        }
+
+        // (x < 5) == 0 → x >= 5 (negate)
+        let inner = Expr::binop(BinOpKind::Lt, Expr::unknown("x"), Expr::int(5));
+        let expr = Expr::binop(BinOpKind::Eq, inner, Expr::int(0));
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BinOp { op, left, right } => {
+                assert_eq!(*op, BinOpKind::Ge);
+                assert!(matches!(left.kind, ExprKind::Unknown(ref s) if s == "x"));
+                assert!(matches!(right.kind, ExprKind::IntLit(5)));
+            }
+            _ => panic!("Expected BinOp, got {:?}", simplified.kind),
+        }
+
+        // Chained: ((x == 1) != 1) != 1 → x == 1
+        let inner1 = Expr::binop(BinOpKind::Eq, Expr::unknown("x"), Expr::int(1));
+        let inner2 = Expr::binop(BinOpKind::Ne, inner1, Expr::int(1)); // x != 1
+        let expr = Expr::binop(BinOpKind::Ne, inner2, Expr::int(1)); // back to x == 1
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BinOp { op, left, right } => {
+                assert_eq!(*op, BinOpKind::Eq);
+                assert!(matches!(left.kind, ExprKind::Unknown(ref s) if s == "x"));
+                assert!(matches!(right.kind, ExprKind::IntLit(1)));
+            }
+            _ => panic!("Expected BinOp, got {:?}", simplified.kind),
+        }
     }
 
     #[test]

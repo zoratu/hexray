@@ -1544,14 +1544,393 @@ fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     // First pass: collect all GotRef assignments
     let global_refs = collect_global_refs(&nodes);
 
-    // Second pass: copy propagation per-block
+    // Second pass: copy propagation per-block (keeps temp assignments for now)
     let nodes: Vec<_> = nodes.into_iter().map(simplify_node_copies).collect();
 
-    // Third pass: substitute global refs everywhere (including conditions)
-    nodes
+    // Third pass: propagate temp register values into conditions
+    let nodes = propagate_temps_to_conditions(nodes);
+
+    // Fourth pass: remove temp register assignments that have been propagated
+    let nodes = remove_temp_assignments(nodes);
+
+    // Fifth pass: substitute global refs everywhere (including conditions)
+    let nodes: Vec<_> = nodes
         .into_iter()
         .map(|node| substitute_globals_in_node(node, &global_refs))
+        .collect();
+
+    // Sixth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
+    nodes.into_iter().map(simplify_conditions_in_node).collect()
+}
+
+/// Simplifies conditions in all nodes (convert | to ||, & to && for comparisons, etc.)
+fn simplify_conditions_in_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition: condition.simplify(),
+            then_body: then_body
+                .into_iter()
+                .map(simplify_conditions_in_node)
+                .collect(),
+            else_body: else_body.map(|e| e.into_iter().map(simplify_conditions_in_node).collect()),
+        },
+        StructuredNode::While { condition, body } => StructuredNode::While {
+            condition: condition.simplify(),
+            body: body.into_iter().map(simplify_conditions_in_node).collect(),
+        },
+        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+            body: body.into_iter().map(simplify_conditions_in_node).collect(),
+            condition: condition.simplify(),
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+        } => StructuredNode::For {
+            init: init.map(|e| e.simplify()),
+            condition: condition.simplify(),
+            update: update.map(|e| e.simplify()),
+            body: body.into_iter().map(simplify_conditions_in_node).collect(),
+        },
+        StructuredNode::Loop { body } => StructuredNode::Loop {
+            body: body.into_iter().map(simplify_conditions_in_node).collect(),
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value: value.simplify(),
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| {
+                    (
+                        vals,
+                        body.into_iter().map(simplify_conditions_in_node).collect(),
+                    )
+                })
+                .collect(),
+            default: default.map(|d| d.into_iter().map(simplify_conditions_in_node).collect()),
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(nodes.into_iter().map(simplify_conditions_in_node).collect())
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: try_body
+                .into_iter()
+                .map(simplify_conditions_in_node)
+                .collect(),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| CatchHandler {
+                    body: h
+                        .body
+                        .into_iter()
+                        .map(simplify_conditions_in_node)
+                        .collect(),
+                    ..h
+                })
+                .collect(),
+        },
+        // Other nodes don't have conditions to simplify
+        other => other,
+    }
+}
+
+/// Removes temp register assignments from all blocks.
+fn remove_temp_assignments(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .map(remove_temp_assignments_in_node)
         .collect()
+}
+
+/// Removes temp register assignments from a single node.
+fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
+    use super::expression::ExprKind;
+
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => {
+            let statements: Vec<_> = statements
+                .into_iter()
+                .filter(|stmt| {
+                    if let ExprKind::Assign { lhs, .. } = &stmt.kind {
+                        if let ExprKind::Var(v) = &lhs.kind {
+                            if is_temp_register(&v.name) {
+                                return false; // Remove temp assignment
+                            }
+                        }
+                    }
+                    true
+                })
+                .collect();
+            StructuredNode::Block {
+                id,
+                statements,
+                address_range,
+            }
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: remove_temp_assignments(then_body),
+            else_body: else_body.map(remove_temp_assignments),
+        },
+        StructuredNode::While { condition, body } => StructuredNode::While {
+            condition,
+            body: remove_temp_assignments(body),
+        },
+        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+            body: remove_temp_assignments(body),
+            condition,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: remove_temp_assignments(body),
+        },
+        StructuredNode::Loop { body } => StructuredNode::Loop {
+            body: remove_temp_assignments(body),
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| (vals, remove_temp_assignments(body)))
+                .collect(),
+            default: default.map(remove_temp_assignments),
+        },
+        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(remove_temp_assignments(nodes)),
+        other => other,
+    }
+}
+
+/// Propagates temp register values from blocks into conditions of following control structures.
+/// This handles patterns like:
+///   tmp_a = x == 1;
+///   if (tmp_a) { ... }
+/// Transforming them to:
+///   if (x == 1) { ... }
+fn propagate_temps_to_conditions(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    // Treat the node list like a Sequence: propagate temps forward
+    propagate_temps_in_node_list(nodes)
+}
+
+/// Propagates temps through a list of nodes, carrying temp values forward.
+fn propagate_temps_in_node_list(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut result = Vec::with_capacity(nodes.len());
+    let mut temps: HashMap<String, Expr> = HashMap::new();
+
+    for node in nodes {
+        // First, recursively process the node
+        let node = propagate_temps_in_node(node);
+
+        // Substitute current temps into conditions of this node
+        let node = substitute_temps_in_conditions(node, &temps);
+
+        // Collect temps from this node for subsequent nodes
+        collect_temps_from_node(&node, &mut temps);
+
+        result.push(node);
+    }
+
+    result
+}
+
+/// Propagates temp register values in a single node (without carrying forward temps).
+/// This is used by the sequential propagation to recursively process nested structures.
+fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        // For DoWhile, the body executes before the condition, so we can propagate
+        // temp values from the body into the condition
+        StructuredNode::DoWhile { body, condition } => {
+            let body = propagate_temps_to_conditions(body);
+            // Collect temp values from the body
+            let temps = collect_temps_from_nodes(&body);
+            // Substitute in condition
+            let condition = substitute_vars(&condition, &temps);
+            StructuredNode::DoWhile { body, condition }
+        }
+        // For Sequences, use the sequential propagation
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(propagate_temps_in_node_list(nodes))
+        }
+        // Recursively process children for other structures
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: propagate_temps_to_conditions(then_body),
+            else_body: else_body.map(propagate_temps_to_conditions),
+        },
+        StructuredNode::While { condition, body } => StructuredNode::While {
+            condition,
+            body: propagate_temps_to_conditions(body),
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: propagate_temps_to_conditions(body),
+        },
+        StructuredNode::Loop { body } => StructuredNode::Loop {
+            body: propagate_temps_to_conditions(body),
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| (vals, propagate_temps_to_conditions(body)))
+                .collect(),
+            default: default.map(propagate_temps_to_conditions),
+        },
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        },
+        // Pass through other nodes unchanged
+        other => other,
+    }
+}
+
+/// Collects temp register values from a list of nodes.
+fn collect_temps_from_nodes(nodes: &[StructuredNode]) -> HashMap<String, Expr> {
+    let mut temps = HashMap::new();
+    for node in nodes {
+        collect_temps_from_node(node, &mut temps);
+    }
+    temps
+}
+
+/// Collects temp register values from a single node.
+fn collect_temps_from_node(node: &StructuredNode, temps: &mut HashMap<String, Expr>) {
+    use super::expression::ExprKind;
+
+    if let StructuredNode::Block { statements, .. } = node {
+        for stmt in statements {
+            match &stmt.kind {
+                ExprKind::Assign { lhs, rhs } => {
+                    if let ExprKind::Var(v) = &lhs.kind {
+                        if is_temp_register(&v.name) {
+                            // Substitute existing temps in the RHS
+                            let rhs_substituted = substitute_vars(rhs, temps);
+                            temps.insert(v.name.clone(), rhs_substituted);
+                        }
+                    }
+                }
+                ExprKind::CompoundAssign { op, lhs, rhs } => {
+                    // Handle x |= y as x = x | y, etc.
+                    if let ExprKind::Var(v) = &lhs.kind {
+                        if is_temp_register(&v.name) {
+                            // Get current value (or use the var itself if not tracked)
+                            let lhs_val = temps
+                                .get(&v.name)
+                                .cloned()
+                                .unwrap_or_else(|| (**lhs).clone());
+                            let rhs_substituted = substitute_vars(rhs, temps);
+                            // Build the compound expression
+                            let new_val = Expr::binop(*op, lhs_val, rhs_substituted);
+                            temps.insert(v.name.clone(), new_val);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Substitutes temp values into conditions of a node.
+fn substitute_temps_in_conditions(
+    node: StructuredNode,
+    temps: &HashMap<String, Expr>,
+) -> StructuredNode {
+    if temps.is_empty() {
+        return node;
+    }
+
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition: substitute_vars(&condition, temps),
+            then_body,
+            else_body,
+        },
+        StructuredNode::While { condition, body } => StructuredNode::While {
+            condition: substitute_vars(&condition, temps),
+            body,
+        },
+        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+            body,
+            condition: substitute_vars(&condition, temps),
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+        } => StructuredNode::For {
+            init: init.map(|e| substitute_vars(&e, temps)),
+            condition: substitute_vars(&condition, temps),
+            update: update.map(|e| substitute_vars(&e, temps)),
+            body,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value: substitute_vars(&value, temps),
+            cases,
+            default,
+        },
+        // Other nodes don't have conditions to substitute
+        other => other,
+    }
 }
 
 /// Collect GotRef assignments from all blocks.
@@ -1778,14 +2157,14 @@ fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
 }
 
 /// Performs copy propagation on a list of statements.
-/// Transforms patterns like `eax = x; y = eax;` into `y = x;` and removes the temp assignment.
+/// Transforms patterns like `eax = x; y = eax;` into `y = x;`.
+/// Note: Temp register assignments are kept for now so that propagate_temps_to_conditions
+/// can use them for substituting into conditions. They will be removed later.
 fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
     use super::expression::ExprKind;
 
     // Track the last value assigned to each temp register
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
-    // Track which temp register assignments can be removed
-    let mut can_remove: HashSet<String> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for stmt in statements.into_iter() {
@@ -1798,8 +2177,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                 if is_temp_register(&lhs_var.name) {
                     // Track this assignment for future substitution
                     reg_values.insert(lhs_var.name.clone(), new_rhs.clone());
-                    can_remove.insert(lhs_var.name.clone());
-                    // Emit with substituted RHS
+                    // Emit with substituted RHS (keep the assignment for now)
                     result.push(Expr::assign((**lhs).clone(), new_rhs));
                     continue;
                 }
@@ -1813,20 +2191,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         result.push(stmt);
     }
 
-    // Second pass: remove temp register assignments that were fully propagated
     result
-        .into_iter()
-        .filter(|stmt| {
-            if let ExprKind::Assign { lhs, .. } = &stmt.kind {
-                if let ExprKind::Var(v) = &lhs.kind {
-                    if is_temp_register(&v.name) && can_remove.contains(&v.name) {
-                        return false; // Remove this temp assignment
-                    }
-                }
-            }
-            true
-        })
-        .collect()
 }
 
 /// Substitute variable references with their GotRef values.
@@ -1885,11 +2250,11 @@ fn substitute_global_refs(expr: &Expr, global_refs: &HashMap<String, Expr>) -> E
     }
 }
 
-/// Substitute variable references with their known values
+/// Substitute variable references with their known values and simplify.
 fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
     use super::expression::ExprKind;
 
-    match &expr.kind {
+    let result = match &expr.kind {
         ExprKind::Var(v) => {
             if let Some(value) = reg_values.get(&v.name) {
                 value.clone()
@@ -1909,7 +2274,9 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
         ),
         ExprKind::Deref { addr, size } => Expr::deref(substitute_vars(addr, reg_values), *size),
         _ => expr.clone(),
-    }
+    };
+    // Simplify after substitution to handle boolean patterns like (x == 1) != 1 → x != 1
+    result.simplify()
 }
 
 /// Recursively propagates function call arguments through structured nodes.
