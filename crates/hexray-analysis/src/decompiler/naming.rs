@@ -186,7 +186,7 @@ impl NamingContext {
                 StructuredNode::For { body, .. }
                 | StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     self.detect_call_arg_types(body);
                 }
                 StructuredNode::If {
@@ -456,7 +456,7 @@ impl NamingContext {
                         self.detect_loop_indices(else_nodes);
                     }
                 }
-                StructuredNode::Loop { body } => {
+                StructuredNode::Loop { body, .. } => {
                     self.detect_loop_indices(body);
                 }
                 StructuredNode::Switch { cases, default, .. } => {
@@ -497,7 +497,7 @@ impl NamingContext {
                 StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
                 | StructuredNode::For { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     self.detect_type_patterns(body);
                 }
                 StructuredNode::Switch { cases, default, .. } => {
@@ -716,7 +716,7 @@ impl NamingContext {
                 StructuredNode::For { body, .. }
                 | StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     // Accumulators inside loops are more likely to be actual sums
                     self.detect_accumulators(body);
                 }
@@ -808,7 +808,7 @@ impl NamingContext {
                 StructuredNode::For { body, .. }
                 | StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     self.detect_error_codes(body);
                 }
                 StructuredNode::If {
@@ -882,7 +882,7 @@ impl NamingContext {
                 StructuredNode::For { body, .. }
                 | StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     self.detect_array_patterns(body);
                 }
                 StructuredNode::If {
@@ -1056,7 +1056,7 @@ impl NamingContext {
                 StructuredNode::For { body, .. }
                 | StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     self.detect_result_vars(body);
                 }
                 StructuredNode::If {
@@ -1108,7 +1108,7 @@ impl NamingContext {
                 StructuredNode::For { body, .. }
                 | StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     self.detect_memcpy_patterns(body);
                 }
                 StructuredNode::If {
@@ -1181,7 +1181,7 @@ impl NamingContext {
                 StructuredNode::For { body, .. }
                 | StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     self.detect_offset_vars(body);
                 }
                 StructuredNode::If {

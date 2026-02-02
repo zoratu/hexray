@@ -478,7 +478,7 @@ impl SignatureRecovery {
                 }
                 self.analyze_nodes(body, false);
             }
-            StructuredNode::Loop { body } => {
+            StructuredNode::Loop { body, .. } => {
                 self.analyze_nodes(body, false);
             }
             StructuredNode::Switch {

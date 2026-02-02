@@ -64,27 +64,40 @@ fn detect_short_circuit_in_node(node: StructuredNode) -> StructuredNode {
                 else_body,
             }
         }
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition,
             body: detect_short_circuit(body),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: detect_short_circuit(body),
             condition,
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: detect_short_circuit(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: detect_short_circuit(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -573,6 +586,7 @@ mod tests {
         let while_loop = StructuredNode::While {
             condition: make_condition("x"),
             body: vec![outer_if],
+            header: None,
         };
 
         let result = detect_short_circuit(vec![while_loop]);

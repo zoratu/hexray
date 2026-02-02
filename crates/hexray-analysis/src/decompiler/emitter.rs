@@ -1179,7 +1179,7 @@ impl PseudoCodeEmitter {
             }
             StructuredNode::While { body, .. }
             | StructuredNode::DoWhile { body, .. }
-            | StructuredNode::Loop { body } => {
+            | StructuredNode::Loop { body, .. } => {
                 self.collect_vars_from_nodes(body, vars);
             }
             StructuredNode::For { init, body, .. } => {
@@ -1297,7 +1297,7 @@ impl PseudoCodeEmitter {
                 StructuredNode::While { body, .. }
                 | StructuredNode::DoWhile { body, .. }
                 | StructuredNode::For { body, .. }
-                | StructuredNode::Loop { body } => {
+                | StructuredNode::Loop { body, .. } => {
                     if self.has_return_value(body) {
                         return true;
                     }
@@ -1474,7 +1474,9 @@ impl PseudoCodeEmitter {
                 }
                 writeln!(output, "{}}}", indent).unwrap();
             }
-            StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition, body, ..
+            } => {
                 let indent = self.indent.repeat(depth);
                 writeln!(
                     output,
@@ -1486,7 +1488,9 @@ impl PseudoCodeEmitter {
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
                 writeln!(output, "{}}}", indent).unwrap();
             }
-            StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
                 let indent = self.indent.repeat(depth);
                 writeln!(output, "{}do {{", indent).unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
@@ -1498,7 +1502,7 @@ impl PseudoCodeEmitter {
                 )
                 .unwrap();
             }
-            StructuredNode::Loop { body } => {
+            StructuredNode::Loop { body, .. } => {
                 let indent = self.indent.repeat(depth);
                 writeln!(output, "{}while (1) {{", indent).unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
@@ -1647,7 +1651,9 @@ impl PseudoCodeEmitter {
                 }
                 writeln!(output, "{}}}", indent).unwrap();
             }
-            StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition, body, ..
+            } => {
                 let indent = self.indent.repeat(depth);
                 writeln!(
                     output,
@@ -1659,7 +1665,9 @@ impl PseudoCodeEmitter {
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
                 writeln!(output, "{}}}", indent).unwrap();
             }
-            StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
                 let indent = self.indent.repeat(depth);
                 writeln!(output, "{}do {{", indent).unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
@@ -1671,7 +1679,7 @@ impl PseudoCodeEmitter {
                 )
                 .unwrap();
             }
-            StructuredNode::Loop { body } => {
+            StructuredNode::Loop { body, .. } => {
                 let indent = self.indent.repeat(depth);
                 writeln!(output, "{}while (1) {{", indent).unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
@@ -2070,7 +2078,9 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{}}}", indent).unwrap();
             }
 
-            StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition, body, ..
+            } => {
                 writeln!(
                     output,
                     "{}while ({}) {{",
@@ -2082,7 +2092,9 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{}}}", indent).unwrap();
             }
 
-            StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
                 writeln!(output, "{}do {{", indent).unwrap();
                 self.emit_nodes(body, output, depth + 1);
                 writeln!(
@@ -2099,6 +2111,7 @@ impl PseudoCodeEmitter {
                 condition,
                 update,
                 body,
+                ..
             } => {
                 let init_str = init
                     .as_ref()
@@ -2121,7 +2134,7 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{}}}", indent).unwrap();
             }
 
-            StructuredNode::Loop { body } => {
+            StructuredNode::Loop { body, .. } => {
                 writeln!(output, "{}while (1) {{", indent).unwrap();
                 self.emit_nodes(body, output, depth + 1);
                 writeln!(output, "{}}}", indent).unwrap();
@@ -3199,6 +3212,7 @@ mod tests {
         let node = StructuredNode::While {
             condition: cond,
             body,
+            header: None,
         };
 
         let cfg = StructuredCfg {

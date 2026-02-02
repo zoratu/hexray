@@ -47,12 +47,16 @@ pub enum StructuredNode {
     While {
         condition: Expr,
         body: Vec<StructuredNode>,
+        /// Loop header block ID (for break/continue detection).
+        header: Option<BasicBlockId>,
     },
 
     /// Do-while loop.
     DoWhile {
         body: Vec<StructuredNode>,
         condition: Expr,
+        /// Loop header block ID (for break/continue detection).
+        header: Option<BasicBlockId>,
     },
 
     /// For loop (recognized from while with init/update).
@@ -61,10 +65,16 @@ pub enum StructuredNode {
         condition: Expr,
         update: Option<Expr>,
         body: Vec<StructuredNode>,
+        /// Loop header block ID (for break/continue detection).
+        header: Option<BasicBlockId>,
     },
 
     /// Infinite loop.
-    Loop { body: Vec<StructuredNode> },
+    Loop {
+        body: Vec<StructuredNode>,
+        /// Loop header block ID (for break/continue detection).
+        header: Option<BasicBlockId>,
+    },
 
     /// Break statement.
     Break,
@@ -710,7 +720,11 @@ impl<'a> Structurer<'a> {
                     vec![]
                 };
 
-                StructuredNode::While { condition, body }
+                StructuredNode::While {
+                    condition,
+                    body,
+                    header: Some(header),
+                }
             }
 
             LoopKind::DoWhile => {
@@ -718,12 +732,19 @@ impl<'a> Structurer<'a> {
                 let (condition, _) = self.get_dowhile_condition(&info);
                 let body = self.structure_loop_body(header, &info);
 
-                StructuredNode::DoWhile { body, condition }
+                StructuredNode::DoWhile {
+                    body,
+                    condition,
+                    header: Some(header),
+                }
             }
 
             LoopKind::Infinite => {
                 let body = self.structure_loop_body(header, &info);
-                StructuredNode::Loop { body }
+                StructuredNode::Loop {
+                    body,
+                    header: Some(header),
+                }
             }
 
             LoopKind::For => {
@@ -736,7 +757,11 @@ impl<'a> Structurer<'a> {
                 };
 
                 // For simplicity, emit as while (init/update detection is complex)
-                StructuredNode::While { condition, body }
+                StructuredNode::While {
+                    condition,
+                    body,
+                    header: Some(header),
+                }
             }
         }
     }
@@ -1578,27 +1603,40 @@ fn simplify_conditions_in_node(node: StructuredNode) -> StructuredNode {
                 .collect(),
             else_body: else_body.map(|e| e.into_iter().map(simplify_conditions_in_node).collect()),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition: condition.simplify(),
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
             condition: condition.simplify(),
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init: init.map(|e| e.simplify()),
             condition: condition.simplify(),
             update: update.map(|e| e.simplify()),
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -1691,27 +1729,40 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             then_body: remove_temp_assignments(then_body),
             else_body: else_body.map(remove_temp_assignments),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition,
             body: remove_temp_assignments(body),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: remove_temp_assignments(body),
             condition,
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: remove_temp_assignments(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: remove_temp_assignments(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -1768,13 +1819,21 @@ fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
     match node {
         // For DoWhile, the body executes before the condition, so we can propagate
         // temp values from the body into the condition
-        StructuredNode::DoWhile { body, condition } => {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => {
             let body = propagate_temps_to_conditions(body);
             // Collect temp values from the body
             let temps = collect_temps_from_nodes(&body);
             // Substitute in condition
             let condition = substitute_vars(&condition, &temps);
-            StructuredNode::DoWhile { body, condition }
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+            }
         }
         // For Sequences, use the sequential propagation
         StructuredNode::Sequence(nodes) => {
@@ -1790,23 +1849,31 @@ fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
             then_body: propagate_temps_to_conditions(then_body),
             else_body: else_body.map(propagate_temps_to_conditions),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition,
             body: propagate_temps_to_conditions(body),
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: propagate_temps_to_conditions(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: propagate_temps_to_conditions(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -1900,24 +1967,36 @@ fn substitute_temps_in_conditions(
             then_body,
             else_body,
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition: substitute_vars(&condition, temps),
             body,
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body,
             condition: substitute_vars(&condition, temps),
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init: init.map(|e| substitute_vars(&e, temps)),
             condition: substitute_vars(&condition, temps),
             update: update.map(|e| substitute_vars(&e, temps)),
             body,
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -1975,7 +2054,7 @@ fn collect_global_refs_from_node(node: &StructuredNode, global_refs: &mut HashMa
         }
         StructuredNode::While { body, .. }
         | StructuredNode::DoWhile { body, .. }
-        | StructuredNode::Loop { body } => {
+        | StructuredNode::Loop { body, .. } => {
             for n in body {
                 collect_global_refs_from_node(n, global_refs);
             }
@@ -2044,25 +2123,36 @@ fn substitute_globals_in_node(
                     .collect()
             }),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition: substitute_global_refs(&condition, global_refs),
             body: body
                 .into_iter()
                 .map(|n| substitute_globals_in_node(n, global_refs))
                 .collect(),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: body
                 .into_iter()
                 .map(|n| substitute_globals_in_node(n, global_refs))
                 .collect(),
             condition: substitute_global_refs(&condition, global_refs),
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init: init.map(|e| substitute_global_refs(&e, global_refs)),
             condition: substitute_global_refs(&condition, global_refs),
@@ -2071,12 +2161,14 @@ fn substitute_globals_in_node(
                 .into_iter()
                 .map(|n| substitute_globals_in_node(n, global_refs))
                 .collect(),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: body
                 .into_iter()
                 .map(|n| substitute_globals_in_node(n, global_refs))
                 .collect(),
+            header,
         },
         StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
             nodes
@@ -2114,27 +2206,40 @@ fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
             then_body: then_body.into_iter().map(simplify_node_copies).collect(),
             else_body: else_body.map(|nodes| nodes.into_iter().map(simplify_node_copies).collect()),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition,
             body: body.into_iter().map(simplify_node_copies).collect(),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: body.into_iter().map(simplify_node_copies).collect(),
             condition,
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: body.into_iter().map(simplify_node_copies).collect(),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: body.into_iter().map(simplify_node_copies).collect(),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -2307,27 +2412,40 @@ fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             then_body: propagate_call_args(then_body),
             else_body: else_body.map(propagate_call_args),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition,
             body: propagate_call_args(body),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: propagate_call_args(body),
             condition,
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: propagate_call_args(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: propagate_call_args(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -2580,27 +2698,40 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             then_body: merge_return_value_captures(then_body),
             else_body: else_body.map(merge_return_value_captures),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition,
             body: merge_return_value_captures(body),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: merge_return_value_captures(body),
             condition,
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: merge_return_value_captures(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: merge_return_value_captures(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -2653,27 +2784,40 @@ fn detect_switch_in_node(node: StructuredNode) -> StructuredNode {
                 else_body: else_body.map(detect_switch_statements),
             }
         }
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition,
             body: detect_switch_statements(body),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: detect_switch_statements(body),
             condition,
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: detect_switch_statements(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: detect_switch_statements(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -3004,34 +3148,59 @@ fn convert_gotos_in_node(
     current_loop: Option<&LoopContext>,
 ) -> StructuredNode {
     match node {
-        // For loops, create a new loop context for the body
-        StructuredNode::While { condition, body } => {
-            // For while loops, we can detect the loop header from the structured form
-            // The condition block is implicitly the header, but we don't have the block ID here
-            // So we pass the current context through
+        // For loops, create a new loop context for the body using the stored header
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => {
+            // Create a loop context from the stored header, or use the parent context
+            let loop_ctx = header.map(|h| LoopContext { header: h });
+            let ctx = loop_ctx.as_ref().or(current_loop);
             StructuredNode::While {
                 condition,
-                body: convert_gotos_in_loop_body(body, current_loop),
+                body: convert_gotos_in_loop_body(body, ctx),
+                header,
             }
         }
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
-            body: convert_gotos_in_loop_body(body, current_loop),
+        StructuredNode::DoWhile {
+            body,
             condition,
-        },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
-            body: convert_gotos_in_loop_body(body, current_loop),
-        },
+            header,
+        } => {
+            let loop_ctx = header.map(|h| LoopContext { header: h });
+            let ctx = loop_ctx.as_ref().or(current_loop);
+            StructuredNode::DoWhile {
+                body: convert_gotos_in_loop_body(body, ctx),
+                condition,
+                header,
+            }
+        }
+        StructuredNode::Loop { body, header } => {
+            let loop_ctx = header.map(|h| LoopContext { header: h });
+            let ctx = loop_ctx.as_ref().or(current_loop);
+            StructuredNode::Loop {
+                body: convert_gotos_in_loop_body(body, ctx),
+                header,
+            }
+        }
         StructuredNode::For {
             init,
             condition,
             update,
             body,
-        } => StructuredNode::For {
-            init,
-            condition,
-            update,
-            body: convert_gotos_in_loop_body(body, current_loop),
-        },
+            header,
+        } => {
+            let loop_ctx = header.map(|h| LoopContext { header: h });
+            let ctx = loop_ctx.as_ref().or(current_loop);
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: convert_gotos_in_loop_body(body, ctx),
+                header,
+            }
+        }
         StructuredNode::If {
             condition,
             then_body,
@@ -3119,27 +3288,40 @@ fn simplify_expressions_in_node(node: StructuredNode) -> StructuredNode {
             then_body: simplify_expressions(then_body),
             else_body: else_body.map(simplify_expressions),
         },
-        StructuredNode::While { condition, body } => StructuredNode::While {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => StructuredNode::While {
             condition: condition.simplify(),
             body: simplify_expressions(body),
+            header,
         },
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: simplify_expressions(body),
             condition: condition.simplify(),
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init: init.map(|e| e.simplify()),
             condition: condition.simplify(),
             update: update.map(|e| e.simplify()),
             body: simplify_expressions(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: simplify_expressions(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -3255,17 +3437,27 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
         }
 
         // Recursively process other compound nodes
-        StructuredNode::While { condition, body } => {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => {
             output.push(StructuredNode::While {
                 condition,
                 body: flatten_guard_clauses(body),
+                header,
             });
         }
 
-        StructuredNode::DoWhile { body, condition } => {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => {
             output.push(StructuredNode::DoWhile {
                 body: flatten_guard_clauses(body),
                 condition,
+                header,
             });
         }
 
@@ -3274,18 +3466,21 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
             condition,
             update,
             body,
+            header,
         } => {
             output.push(StructuredNode::For {
                 init,
                 condition,
                 update,
                 body: flatten_guard_clauses(body),
+                header,
             });
         }
 
-        StructuredNode::Loop { body } => {
+        StructuredNode::Loop { body, header } => {
             output.push(StructuredNode::Loop {
                 body: flatten_guard_clauses(body),
+                header,
             });
         }
 

@@ -919,7 +919,7 @@ fn get_node_address_range(node: &StructuredNode) -> Option<(u64, u64)> {
         }
         StructuredNode::While { body, .. }
         | StructuredNode::DoWhile { body, .. }
-        | StructuredNode::Loop { body }
+        | StructuredNode::Loop { body, .. }
         | StructuredNode::Sequence(body) => {
             let start = body
                 .first()

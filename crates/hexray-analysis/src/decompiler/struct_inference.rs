@@ -260,13 +260,17 @@ impl StructInference {
                     }
                 }
             }
-            StructuredNode::While { condition, body } => {
+            StructuredNode::While {
+                condition, body, ..
+            } => {
                 self.collect_accesses_from_expr(condition);
                 for n in body {
                     self.collect_accesses_from_node(n);
                 }
             }
-            StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
                 for n in body {
                     self.collect_accesses_from_node(n);
                 }
@@ -277,6 +281,7 @@ impl StructInference {
                 condition,
                 update,
                 body,
+                ..
             } => {
                 if let Some(e) = init {
                     self.collect_accesses_from_expr(e);
@@ -289,7 +294,7 @@ impl StructInference {
                     self.collect_accesses_from_node(n);
                 }
             }
-            StructuredNode::Loop { body } => {
+            StructuredNode::Loop { body, .. } => {
                 for n in body {
                     self.collect_accesses_from_node(n);
                 }
@@ -481,8 +486,12 @@ impl StructInference {
                     self.analyze_usage_patterns_list(else_nodes);
                 }
             }
-            StructuredNode::While { condition, body }
-            | StructuredNode::DoWhile { body, condition } => {
+            StructuredNode::While {
+                condition, body, ..
+            }
+            | StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
                 self.mark_comparison_types(condition);
                 self.analyze_usage_patterns_list(body);
             }
@@ -491,6 +500,7 @@ impl StructInference {
                 condition,
                 update,
                 body,
+                ..
             } => {
                 if let Some(e) = init {
                     self.analyze_expr_usage(e);
@@ -501,7 +511,7 @@ impl StructInference {
                 }
                 self.analyze_usage_patterns_list(body);
             }
-            StructuredNode::Loop { body } => {
+            StructuredNode::Loop { body, .. } => {
                 self.analyze_usage_patterns_list(body);
             }
             StructuredNode::Switch { cases, default, .. } => {
@@ -810,27 +820,40 @@ impl StructInference {
                     .as_ref()
                     .map(|nodes| nodes.iter().map(|n| self.transform_node(n)).collect()),
             },
-            StructuredNode::While { condition, body } => StructuredNode::While {
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+            } => StructuredNode::While {
                 condition: self.transform_expr(condition),
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
+                header: *header,
             },
-            StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+            } => StructuredNode::DoWhile {
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
                 condition: self.transform_expr(condition),
+                header: *header,
             },
             StructuredNode::For {
                 init,
                 condition,
                 update,
                 body,
+                header,
             } => StructuredNode::For {
                 init: init.as_ref().map(|e| self.transform_expr(e)),
                 condition: self.transform_expr(condition),
                 update: update.as_ref().map(|e| self.transform_expr(e)),
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
+                header: *header,
             },
-            StructuredNode::Loop { body } => StructuredNode::Loop {
+            StructuredNode::Loop { body, header } => StructuredNode::Loop {
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
+                header: *header,
             },
             StructuredNode::Switch {
                 value,

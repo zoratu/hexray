@@ -22,7 +22,9 @@ pub fn detect_for_loops(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
                     statements,
                     address_range,
                 },
-                StructuredNode::While { condition, body },
+                StructuredNode::While {
+                    condition, body, ..
+                },
             ) = (&nodes[i], &nodes[i + 1])
             {
                 // Try to extract a for loop
@@ -44,6 +46,7 @@ pub fn detect_for_loops(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
                         condition: updated_condition,
                         update: Some(update),
                         body: detect_for_loops(new_body),
+                        header: None,
                     });
 
                     i += 2;
@@ -72,30 +75,43 @@ fn detect_for_loops_in_node(node: StructuredNode) -> StructuredNode {
             then_body: detect_for_loops(then_body),
             else_body: else_body.map(detect_for_loops),
         },
-        StructuredNode::While { condition, body } => {
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+        } => {
             // Check if the while body itself has init/update pattern (rare but possible)
             StructuredNode::While {
                 condition,
                 body: detect_for_loops(body),
+                header,
             }
         }
-        StructuredNode::DoWhile { body, condition } => StructuredNode::DoWhile {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+        } => StructuredNode::DoWhile {
             body: detect_for_loops(body),
             condition,
+            header,
         },
         StructuredNode::For {
             init,
             condition,
             update,
             body,
+            header,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: detect_for_loops(body),
+            header,
         },
-        StructuredNode::Loop { body } => StructuredNode::Loop {
+        StructuredNode::Loop { body, header } => StructuredNode::Loop {
             body: detect_for_loops(body),
+            header,
         },
         StructuredNode::Switch {
             value,
@@ -389,6 +405,7 @@ mod tests {
         let while_loop = StructuredNode::While {
             condition,
             body: vec![body_block],
+            header: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -396,12 +413,7 @@ mod tests {
         // Should produce a For loop
         assert_eq!(result.len(), 1);
         match &result[0] {
-            StructuredNode::For {
-                init,
-                condition: _,
-                update,
-                body: _,
-            } => {
+            StructuredNode::For { init, update, .. } => {
                 assert!(init.is_some());
                 assert!(update.is_some());
             }
@@ -421,6 +433,7 @@ mod tests {
         let while_loop = StructuredNode::While {
             condition,
             body: vec![body_block],
+            header: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -445,6 +458,7 @@ mod tests {
         let while_loop = StructuredNode::While {
             condition,
             body: vec![body_block],
+            header: None,
         };
 
         let result = detect_for_loops(vec![while_loop]);
@@ -468,6 +482,7 @@ mod tests {
         let while_loop = StructuredNode::While {
             condition,
             body: vec![body_block],
+            header: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -498,6 +513,7 @@ mod tests {
         let while_loop = StructuredNode::While {
             condition,
             body: vec![body_block],
+            header: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -527,6 +543,7 @@ mod tests {
         let while_loop = StructuredNode::While {
             condition,
             body: vec![body_block],
+            header: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -561,6 +578,7 @@ mod tests {
         let inner_while = StructuredNode::While {
             condition: inner_cond,
             body: vec![inner_body],
+            header: None,
         };
 
         let outer_init = Expr::assign(make_var("i"), Expr::int(0));
@@ -576,6 +594,7 @@ mod tests {
         let outer_while = StructuredNode::While {
             condition: outer_cond,
             body: outer_body,
+            header: None,
         };
 
         let result = detect_for_loops(vec![outer_init_block, outer_while]);
