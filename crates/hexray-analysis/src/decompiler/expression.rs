@@ -859,6 +859,39 @@ impl Expr {
                     }
                 }
 
+                // Cast of field access: the field offset implies a type size
+                if let ExprKind::FieldAccess { .. } = &simplified_expr.kind {
+                    // Field accesses typically have well-defined types from struct layout
+                    // For now, allow casting to pointer size (8) or int size (4) without explicit cast
+                    if to_size >= 4 {
+                        return simplified_expr;
+                    }
+                }
+
+                // Cast of address-of expression: addresses are always pointer-sized (8 bytes)
+                if let ExprKind::AddressOf(_) = &simplified_expr.kind {
+                    if to_size == 8 {
+                        return simplified_expr;
+                    }
+                }
+
+                // Cast of function call result to standard int/pointer size
+                // Function returns are typically already the correct size
+                if let ExprKind::Call { .. } = &simplified_expr.kind {
+                    // Most functions return int (4 bytes) or pointer (8 bytes)
+                    // Casting to 4 or 8 bytes is usually redundant
+                    if to_size >= 4 {
+                        return simplified_expr;
+                    }
+                }
+
+                // Cast of GotRef (PLT/GOT reference) - these are pointer-sized
+                if let ExprKind::GotRef { .. } = &simplified_expr.kind {
+                    if to_size == 8 {
+                        return simplified_expr;
+                    }
+                }
+
                 Self {
                     kind: ExprKind::Cast {
                         expr: Box::new(simplified_expr),

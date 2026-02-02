@@ -164,8 +164,221 @@ impl NamingContext {
         // Seventh pass: detect offset variables in pointer arithmetic
         self.detect_offset_vars(body);
 
+        // Eighth pass: detect function call argument types
+        self.detect_call_arg_types(body);
+
+        // Ninth pass: detect counter variables (standalone increments)
+        self.detect_counter_vars(body);
+
         // Last pass: detect other type usage patterns
         self.detect_type_patterns(body);
+    }
+
+    /// Detect types from function call arguments (e.g., printf format string).
+    fn detect_call_arg_types(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.detect_call_arg_types_in_expr(stmt);
+                    }
+                }
+                StructuredNode::For { body, .. }
+                | StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body } => {
+                    self.detect_call_arg_types(body);
+                }
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_call_arg_types(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_call_arg_types(else_nodes);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        self.detect_call_arg_types(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_call_arg_types(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_call_arg_types(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Detect types from function call arguments.
+    fn detect_call_arg_types_in_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Call { target, args } => {
+                let func_name = match target {
+                    super::expression::CallTarget::Named(name) => name.to_lowercase(),
+                    _ => String::new(),
+                };
+
+                // Printf family: first arg is format string
+                if func_name.contains("printf")
+                    || func_name.contains("sprintf")
+                    || func_name.contains("snprintf")
+                    || func_name.contains("fprintf")
+                {
+                    // Skip fprintf's file handle arg
+                    let fmt_idx = if func_name.contains("fprintf") { 1 } else { 0 };
+                    if let Some(fmt_arg) = args.get(fmt_idx) {
+                        if let Some(offset) = self.extract_stack_offset(fmt_arg) {
+                            self.type_hints.entry(offset).or_insert(TypeHint::StringPtr);
+                        }
+                    }
+                }
+
+                // String functions: args are typically strings or pointers
+                if func_name.contains("str")
+                    && (func_name.contains("cmp")
+                        || func_name.contains("cat")
+                        || func_name.contains("chr")
+                        || func_name.contains("len"))
+                {
+                    for arg in args {
+                        if let Some(offset) = self.extract_stack_offset(arg) {
+                            self.type_hints.entry(offset).or_insert(TypeHint::StringPtr);
+                        }
+                    }
+                }
+
+                // File operations: fopen returns FILE*, first arg is filename
+                if func_name == "fopen" || func_name == "_fopen" {
+                    if let Some(first_arg) = args.first() {
+                        if let Some(offset) = self.extract_stack_offset(first_arg) {
+                            self.type_hints.entry(offset).or_insert(TypeHint::StringPtr);
+                        }
+                    }
+                }
+
+                // Read/write: first arg is file handle, second is buffer
+                if func_name.contains("fread")
+                    || func_name.contains("fwrite")
+                    || func_name.contains("read")
+                    || func_name.contains("write")
+                {
+                    if let Some(buf_arg) = args.first() {
+                        if let Some(offset) = self.extract_stack_offset(buf_arg) {
+                            self.type_hints.entry(offset).or_insert(TypeHint::Buffer);
+                        }
+                    }
+                }
+
+                // Recurse into args
+                for arg in args {
+                    self.detect_call_arg_types_in_expr(arg);
+                }
+            }
+            ExprKind::Assign { lhs, rhs } => {
+                // Check for fopen result
+                if let ExprKind::Call {
+                    target: super::expression::CallTarget::Named(name),
+                    ..
+                } = &rhs.kind
+                {
+                    let lower = name.to_lowercase();
+                    if lower == "fopen" || lower == "_fopen" {
+                        if let Some(offset) = self.extract_stack_offset(lhs) {
+                            self.type_hints.entry(offset).or_insert(TypeHint::Pointer);
+                        }
+                    }
+                    // malloc/calloc returns a pointer
+                    if lower.contains("alloc") {
+                        if let Some(offset) = self.extract_stack_offset(lhs) {
+                            self.type_hints.entry(offset).or_insert(TypeHint::Pointer);
+                        }
+                    }
+                }
+                self.detect_call_arg_types_in_expr(lhs);
+                self.detect_call_arg_types_in_expr(rhs);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.detect_call_arg_types_in_expr(left);
+                self.detect_call_arg_types_in_expr(right);
+            }
+            _ => {}
+        }
+    }
+
+    /// Detect counter variables from standalone increments (not loop indices).
+    fn detect_counter_vars(&mut self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        if let Some(offset) = self.extract_standalone_increment(stmt) {
+                            // Only mark as counter if not already a loop index
+                            if !self.loop_indices.contains(&offset)
+                                && !self.accumulator_vars.contains(&offset)
+                            {
+                                self.type_hints.entry(offset).or_insert(TypeHint::Counter);
+                            }
+                        }
+                    }
+                }
+                // Don't recurse into loops - those are loop indices
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.detect_counter_vars(then_body);
+                    if let Some(else_nodes) = else_body {
+                        self.detect_counter_vars(else_nodes);
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, case_body) in cases {
+                        self.detect_counter_vars(case_body);
+                    }
+                    if let Some(def) = default {
+                        self.detect_counter_vars(def);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.detect_counter_vars(inner);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Extract a variable from a standalone increment (x++ or x += 1).
+    fn extract_standalone_increment(&self, expr: &Expr) -> Option<i128> {
+        if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+            let lhs_offset = self.extract_stack_offset(lhs)?;
+
+            // Check for x = x + 1 or x = x - 1
+            if let ExprKind::BinOp {
+                op: BinOpKind::Add | BinOpKind::Sub,
+                left,
+                right,
+            } = &rhs.kind
+            {
+                // Must be increment by 1
+                let is_inc_by_one =
+                    matches!(right.kind, ExprKind::IntLit(1) | ExprKind::IntLit(-1));
+                if is_inc_by_one {
+                    if let Some(rhs_offset) = self.extract_stack_offset(left) {
+                        if lhs_offset == rhs_offset {
+                            return Some(lhs_offset);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Detect loop index variables from loop patterns.

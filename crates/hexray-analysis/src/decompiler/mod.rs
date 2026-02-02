@@ -304,6 +304,10 @@ pub struct Decompiler {
     pub exception_info: Option<ExceptionInfo>,
     /// Constant database for magic number recognition.
     pub constant_database: Option<Arc<hexray_types::ConstantDatabase>>,
+    /// Whether to automatically run type inference on the CFG.
+    /// When enabled, SSA form is built and type inference is run to
+    /// automatically populate type_info.
+    pub enable_auto_type_inference: bool,
 }
 
 impl Default for Decompiler {
@@ -324,9 +328,13 @@ impl Default for Decompiler {
             cpp_special_member: None,
             exception_info: None,
             constant_database: None,
+            enable_auto_type_inference: false,
         }
     }
 }
+
+use crate::ssa::SsaBuilder;
+use crate::types::TypeInference;
 
 impl Decompiler {
     /// Creates a new decompiler with default settings.
@@ -473,8 +481,45 @@ impl Decompiler {
         self
     }
 
+    /// Enables or disables automatic type inference.
+    ///
+    /// When enabled, the decompiler will:
+    /// 1. Build SSA form from the CFG
+    /// 2. Run type inference analysis
+    /// 3. Automatically populate type_info with inferred types
+    ///
+    /// This improves variable type annotations in the output without requiring
+    /// manual type specification.
+    pub fn with_auto_type_inference(mut self, enable: bool) -> Self {
+        self.enable_auto_type_inference = enable;
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
+        // Step 0: Run type inference if enabled
+        let inferred_types = if self.enable_auto_type_inference {
+            // Build SSA form from CFG
+            let mut builder = SsaBuilder::new(cfg);
+            let ssa = builder.build(func_name);
+
+            // Run type inference with libc signatures
+            let mut inference = TypeInference::with_libc();
+            inference.infer(&ssa);
+
+            // Export inferred types for the emitter
+            inference.export_for_decompiler()
+        } else {
+            HashMap::new()
+        };
+
+        // Merge inferred types with explicitly provided types
+        // (explicit types take precedence)
+        let mut merged_types = inferred_types;
+        for (k, v) in &self.type_info {
+            merged_types.insert(k.clone(), v.clone());
+        }
+
         // Step 1: Structure the control flow
         let structured = StructuredCfg::from_cfg(cfg);
 
@@ -516,7 +561,7 @@ impl Decompiler {
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_relocation_table(self.relocation_table.clone())
-            .with_type_info(self.type_info.clone())
+            .with_type_info(merged_types)
             .with_dwarf_names(self.dwarf_names.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
