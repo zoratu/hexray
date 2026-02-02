@@ -23,3 +23,7 @@ Thumbs.db
 # Build artifacts
 *.pdb
 *.proptest-regressions
+
+# Test binaries
+ls
+nfsd.ko
