@@ -460,7 +460,7 @@ impl<'a> MachO<'a> {
         let section_bounds: Vec<(u64, u64)> = segments
             .iter()
             .flat_map(|seg| seg.sections.iter())
-            .map(|sect| (sect.addr, sect.addr + sect.size))
+            .map(|sect| (sect.addr, sect.addr.saturating_add(sect.size)))
             .collect();
 
         // Sort symbols by address for efficient neighbor lookup
