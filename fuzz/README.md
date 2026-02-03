@@ -2,11 +2,38 @@
 
 This directory contains fuzz targets for testing the hexray disassembler project using [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) and [libFuzzer](https://llvm.org/docs/LibFuzzer.html).
 
-## Prerequisites
+## Quick Start (Docker - Recommended)
 
-Install cargo-fuzz (requires nightly Rust):
+Run all fuzzers in Docker containers:
 
 ```bash
+cd fuzz
+./run-fuzzers.sh              # Run all fuzzers for 1 hour each
+./run-fuzzers.sh --hours 8    # Run all fuzzers for 8 hours each
+./run-fuzzers.sh x86_64       # Run only x86_64 decoder fuzzer
+```
+
+Or use docker-compose:
+
+```bash
+cd fuzz
+docker-compose up --build     # Run all fuzzers in parallel
+docker-compose up fuzz-x86_64 # Run only x86_64 fuzzer
+```
+
+Monitor and stop:
+
+```bash
+docker logs -f hexray-fuzz-x86_64
+docker stop $(docker ps -q --filter name=hexray-fuzz)
+```
+
+## Manual Setup (Native)
+
+If you prefer not to use Docker, install cargo-fuzz (requires nightly Rust):
+
+```bash
+rustup install nightly
 cargo install cargo-fuzz
 ```
 

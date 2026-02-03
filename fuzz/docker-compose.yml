@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  fuzz-x86_64:
+    build:
+      context: ..
+      dockerfile: fuzz/Dockerfile
+    command: cargo fuzz run x86_64_decoder -- -max_total_time=3600
+    volumes:
+      - ./corpus/x86_64_decoder:/hexray/fuzz/corpus/x86_64_decoder
+      - ./artifacts:/hexray/fuzz/artifacts
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  fuzz-arm64:
+    build:
+      context: ..
+      dockerfile: fuzz/Dockerfile
+    command: cargo fuzz run arm64_decoder -- -max_total_time=3600
+    volumes:
+      - ./corpus/arm64_decoder:/hexray/fuzz/corpus/arm64_decoder
+      - ./artifacts:/hexray/fuzz/artifacts
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  fuzz-riscv:
+    build:
+      context: ..
+      dockerfile: fuzz/Dockerfile
+    command: cargo fuzz run riscv_decoder -- -max_total_time=3600
+    volumes:
+      - ./corpus/riscv_decoder:/hexray/fuzz/corpus/riscv_decoder
+      - ./artifacts:/hexray/fuzz/artifacts
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  fuzz-elf:
+    build:
+      context: ..
+      dockerfile: fuzz/Dockerfile
+    command: cargo fuzz run elf_parser -- -max_total_time=3600
+    volumes:
+      - ./corpus/elf_parser:/hexray/fuzz/corpus/elf_parser
+      - ./artifacts:/hexray/fuzz/artifacts
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  fuzz-macho:
+    build:
+      context: ..
+      dockerfile: fuzz/Dockerfile
+    command: cargo fuzz run macho_parser -- -max_total_time=3600
+    volumes:
+      - ./corpus/macho_parser:/hexray/fuzz/corpus/macho_parser
+      - ./artifacts:/hexray/fuzz/artifacts
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
