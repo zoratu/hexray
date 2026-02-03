@@ -52,8 +52,17 @@ impl<'a> MachO<'a> {
 
     /// Parse a Mach-O file at a specific offset.
     pub fn parse_at(data: &'a [u8], offset: usize) -> Result<Self, ParseError> {
-        if data.len() < offset + 4 {
-            return Err(ParseError::too_short(4, data.len() - offset));
+        Self::parse_at_internal(data, offset, true)
+    }
+
+    /// Internal parse function with recursion control.
+    fn parse_at_internal(
+        data: &'a [u8],
+        offset: usize,
+        allow_fat: bool,
+    ) -> Result<Self, ParseError> {
+        if data.len() < offset.saturating_add(4) {
+            return Err(ParseError::too_short(4, data.len().saturating_sub(offset)));
         }
 
         let magic = u32::from_ne_bytes([
@@ -63,8 +72,8 @@ impl<'a> MachO<'a> {
             data[offset + 3],
         ]);
 
-        // Check for fat binary
-        if magic == header::FAT_MAGIC || magic == header::FAT_CIGAM {
+        // Check for fat binary (only at top level)
+        if allow_fat && (magic == header::FAT_MAGIC || magic == header::FAT_CIGAM) {
             return Self::parse_fat(data);
         }
 
@@ -196,7 +205,8 @@ impl<'a> MachO<'a> {
                 ParseError::invalid_structure("fat header", 0, "no architectures in fat binary")
             })?;
 
-        Self::parse_at(data, arch.offset as usize)
+        // Don't allow nested fat binaries (prevent infinite recursion)
+        Self::parse_at_internal(data, arch.offset as usize, false)
     }
 
     fn parse_load_commands(
@@ -205,11 +215,11 @@ impl<'a> MachO<'a> {
         total_size: usize,
         is_64: bool,
     ) -> Result<Vec<LoadCommand>, ParseError> {
-        let mut commands = Vec::with_capacity(ncmds);
-        let mut offset = 0;
+        let mut commands = Vec::with_capacity(ncmds.min(1000));
+        let mut offset: usize = 0;
 
         for _ in 0..ncmds {
-            if offset + 8 > data.len() || offset >= total_size {
+            if offset.saturating_add(8) > data.len() || offset >= total_size {
                 break;
             }
 
@@ -226,7 +236,7 @@ impl<'a> MachO<'a> {
                 data[offset + 7],
             ]) as usize;
 
-            if cmdsize < 8 || offset + cmdsize > data.len() {
+            if cmdsize < 8 || offset.saturating_add(cmdsize) > data.len() {
                 break;
             }
 
@@ -310,9 +320,10 @@ impl<'a> MachO<'a> {
 
         for i in 0..num_stubs {
             // Read the indirect symbol table entry (4 bytes each)
-            let indirect_offset =
-                file_offset + indirect_symoff as usize + (indirect_start_index + i) * 4;
-            if indirect_offset + 4 > data.len() {
+            let indirect_offset = file_offset
+                .saturating_add(indirect_symoff as usize)
+                .saturating_add((indirect_start_index + i).saturating_mul(4));
+            if indirect_offset.saturating_add(4) > data.len() {
                 break;
             }
 
@@ -336,8 +347,8 @@ impl<'a> MachO<'a> {
                 continue;
             }
 
-            let sym_offset = symtab_offset + sym_index * entry_size;
-            if sym_offset + entry_size > data.len() {
+            let sym_offset = symtab_offset.saturating_add(sym_index.saturating_mul(entry_size));
+            if sym_offset.saturating_add(entry_size) > data.len() {
                 continue;
             }
 
@@ -383,11 +394,11 @@ impl<'a> MachO<'a> {
         sections: &[&MachSection],
     ) -> Result<Vec<Symbol>, ParseError> {
         let entry_size = if is_64 { 16 } else { 12 };
-        let mut symbols = Vec::with_capacity(count);
+        let mut symbols = Vec::with_capacity(count.min(100_000));
 
         for i in 0..count {
-            let entry_offset = offset + i * entry_size;
-            if entry_offset + entry_size > data.len() {
+            let entry_offset = offset.saturating_add(i.saturating_mul(entry_size));
+            if entry_offset.saturating_add(entry_size) > data.len() {
                 break;
             }
 

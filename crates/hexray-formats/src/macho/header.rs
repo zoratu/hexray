@@ -231,11 +231,11 @@ impl FatHeader {
             u32::from_be_bytes([data[4], data[5], data[6], data[7]])
         };
 
-        let mut architectures = Vec::with_capacity(nfat_arch as usize);
-        let mut offset = 8;
+        let mut architectures = Vec::with_capacity(nfat_arch.min(100) as usize);
+        let mut offset: usize = 8;
 
         for _ in 0..nfat_arch {
-            if offset + 20 > data.len() {
+            if offset.saturating_add(20) > data.len() {
                 break;
             }
 
@@ -256,7 +256,7 @@ impl FatHeader {
                 align: read_u32(offset + 16),
             });
 
-            offset += 20;
+            offset = offset.saturating_add(20);
         }
 
         Ok(Self { architectures })

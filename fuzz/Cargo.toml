@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-hexray-disasm = { path = "../crates/hexray-disasm" }
+hexray-disasm = { path = "../crates/hexray-disasm", features = ["all-archs"] }
 hexray-formats = { path = "../crates/hexray-formats" }
 arbitrary = { version = "1", features = ["derive"] }
 

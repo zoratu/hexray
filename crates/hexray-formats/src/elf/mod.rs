@@ -146,20 +146,19 @@ impl<'a> Elf<'a> {
         data: &[u8],
         header: &ElfHeader,
     ) -> Result<Vec<SectionHeader>, ParseError> {
-        let mut sections = Vec::with_capacity(header.e_shnum as usize);
+        let mut sections = Vec::with_capacity((header.e_shnum as usize).min(10_000));
         let mut offset = header.e_shoff as usize;
+        let entry_size = header.e_shentsize as usize;
 
         for _i in 0..header.e_shnum {
-            if offset + header.e_shentsize as usize > data.len() {
-                return Err(ParseError::too_short(
-                    offset + header.e_shentsize as usize,
-                    data.len(),
-                ));
+            let end = offset.saturating_add(entry_size);
+            if end > data.len() || end < offset {
+                return Err(ParseError::too_short(end, data.len()));
             }
 
             let section = SectionHeader::parse(&data[offset..], header.class, header.endianness)?;
             sections.push(section);
-            offset += header.e_shentsize as usize;
+            offset = end;
         }
 
         Ok(sections)
@@ -169,20 +168,19 @@ impl<'a> Elf<'a> {
         data: &[u8],
         header: &ElfHeader,
     ) -> Result<Vec<ProgramHeader>, ParseError> {
-        let mut segments = Vec::with_capacity(header.e_phnum as usize);
+        let mut segments = Vec::with_capacity((header.e_phnum as usize).min(1000));
         let mut offset = header.e_phoff as usize;
+        let entry_size = header.e_phentsize as usize;
 
         for _ in 0..header.e_phnum {
-            if offset + header.e_phentsize as usize > data.len() {
-                return Err(ParseError::too_short(
-                    offset + header.e_phentsize as usize,
-                    data.len(),
-                ));
+            let end = offset.saturating_add(entry_size);
+            if end > data.len() || end < offset {
+                return Err(ParseError::too_short(end, data.len()));
             }
 
             let segment = ProgramHeader::parse(&data[offset..], header.class, header.endianness)?;
             segments.push(segment);
-            offset += header.e_phentsize as usize;
+            offset = end;
         }
 
         Ok(segments)
@@ -229,7 +227,7 @@ impl<'a> Elf<'a> {
             }
 
             let mut offset = sym_start;
-            while offset + entry_size <= sym_end {
+            while offset.saturating_add(entry_size) <= sym_end && offset < sym_end {
                 let entry = SymbolEntry::parse(&data[offset..], header.class, header.endianness)?;
 
                 let mut name = strtab.get(entry.st_name as usize).unwrap_or("").to_string();

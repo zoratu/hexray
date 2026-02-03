@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use hexray_disasm::riscv::{RiscVDisassembler, RiscVVariant};
+use hexray_disasm::riscv::RiscVDisassembler;
 use hexray_disasm::traits::Disassembler;
 
 fuzz_target!(|data: &[u8]| {
@@ -9,9 +9,9 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    // Test both RV32 and RV64 variants
-    let disasm_rv64 = RiscVDisassembler::new(RiscVVariant::RV64);
-    let disasm_rv32 = RiscVDisassembler::new(RiscVVariant::RV32);
+    // Test both RV64 and RV32 variants
+    let disasm_rv64 = RiscVDisassembler::new();
+    let disasm_rv32 = RiscVDisassembler::new_rv32();
 
     // Decode single instruction with RV64
     let _ = disasm_rv64.decode_instruction(data, 0x1000);

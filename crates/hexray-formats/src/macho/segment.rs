@@ -52,14 +52,14 @@ impl Segment {
         let flags = u32::from_le_bytes([data[52], data[53], data[54], data[55]]);
 
         // Parse sections
-        let mut sections = Vec::with_capacity(nsects as usize);
-        let mut offset = 56;
+        let mut sections = Vec::with_capacity(nsects.min(1000) as usize);
+        let mut offset: usize = 56;
         for _ in 0..nsects {
-            if offset + 68 > data.len() {
+            if offset.saturating_add(68) > data.len() {
                 break;
             }
             sections.push(Section::parse_32(&data[offset..])?);
-            offset += 68;
+            offset = offset.saturating_add(68);
         }
 
         Ok(Self {
@@ -100,14 +100,14 @@ impl Segment {
         let flags = u32::from_le_bytes([data[68], data[69], data[70], data[71]]);
 
         // Parse sections
-        let mut sections = Vec::with_capacity(nsects as usize);
-        let mut offset = 72;
+        let mut sections = Vec::with_capacity(nsects.min(1000) as usize);
+        let mut offset: usize = 72;
         for _ in 0..nsects {
-            if offset + 80 > data.len() {
+            if offset.saturating_add(80) > data.len() {
                 break;
             }
             sections.push(Section::parse_64(&data[offset..])?);
-            offset += 80;
+            offset = offset.saturating_add(80);
         }
 
         Ok(Self {
