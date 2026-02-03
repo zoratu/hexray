@@ -127,12 +127,12 @@ impl<'a> MachO<'a> {
                 nsyms,
             } = lc
             {
-                let str_start = offset + *stroff as usize;
-                let str_end = str_start + *strsize as usize;
-                if str_end <= data.len() {
+                let str_start = offset.saturating_add(*stroff as usize);
+                let str_end = str_start.saturating_add(*strsize as usize);
+                if str_end <= data.len() && str_end > str_start {
                     strtab = &data[str_start..str_end];
                 }
-                symtab_offset = offset + *symoff as usize;
+                symtab_offset = offset.saturating_add(*symoff as usize);
                 symtab_count = *nsyms as usize;
             }
         }
@@ -601,14 +601,17 @@ impl BinaryFormat for MachO<'_> {
     fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
         // Find the segment containing this address
         for segment in &self.segments {
-            if addr >= segment.vmaddr && addr < segment.vmaddr + segment.vmsize {
+            if addr >= segment.vmaddr && addr < segment.vmaddr.saturating_add(segment.vmsize) {
                 let offset_in_seg = (addr - segment.vmaddr) as usize;
                 if offset_in_seg < segment.filesize as usize {
-                    let file_offset = self.offset + segment.fileoff as usize + offset_in_seg;
+                    let file_offset = self
+                        .offset
+                        .saturating_add(segment.fileoff as usize)
+                        .saturating_add(offset_in_seg);
                     let available = (segment.filesize as usize).saturating_sub(offset_in_seg);
                     let to_read = len.min(available);
-                    let end = file_offset + to_read;
-                    if end <= self.data.len() {
+                    let end = file_offset.saturating_add(to_read);
+                    if end <= self.data.len() && end > file_offset {
                         return Some(&self.data[file_offset..end]);
                     }
                 }

@@ -227,8 +227,8 @@ impl Section {
     /// Populates the section data cache from the file data.
     pub fn populate_data(&mut self, file_data: &[u8]) {
         let start = self.offset as usize;
-        let end = start + self.size as usize;
-        if end <= file_data.len() {
+        let end = start.saturating_add(self.size as usize);
+        if end <= file_data.len() && end > start {
             self.data_cache = file_data[start..end].to_vec();
         }
     }

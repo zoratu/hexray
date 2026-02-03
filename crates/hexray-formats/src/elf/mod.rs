@@ -87,8 +87,8 @@ impl<'a> Elf<'a> {
             if header.e_shstrndx > 0 && (header.e_shstrndx as usize) < sections.len() {
                 let shstrtab = &sections[header.e_shstrndx as usize];
                 let start = shstrtab.sh_offset as usize;
-                let end = start + shstrtab.sh_size as usize;
-                if end <= data.len() {
+                let end = start.saturating_add(shstrtab.sh_size as usize);
+                if end <= data.len() && end > start {
                     StringTable::new(&data[start..end])
                 } else {
                     StringTable::empty()
@@ -112,8 +112,8 @@ impl<'a> Elf<'a> {
             // (skip NOBITS sections like .bss which have no file data)
             if section.sh_type != section::SHT_NOBITS && section.sh_size > 0 {
                 let start = section.sh_offset as usize;
-                let end = start + section.sh_size as usize;
-                if end <= data.len() {
+                let end = start.saturating_add(section.sh_size as usize);
+                if end <= data.len() && end > start {
                     section.set_data(data[start..end].to_vec());
                 }
             }
@@ -208,16 +208,16 @@ impl<'a> Elf<'a> {
             }
             let strtab_section = &sections[strtab_idx];
             let strtab_start = strtab_section.sh_offset as usize;
-            let strtab_end = strtab_start + strtab_section.sh_size as usize;
-            if strtab_end > data.len() {
+            let strtab_end = strtab_start.saturating_add(strtab_section.sh_size as usize);
+            if strtab_end > data.len() || strtab_end <= strtab_start {
                 continue;
             }
             let strtab = StringTable::new(&data[strtab_start..strtab_end]);
 
             // Parse symbol entries
             let sym_start = section.sh_offset as usize;
-            let sym_end = sym_start + section.sh_size as usize;
-            if sym_end > data.len() {
+            let sym_end = sym_start.saturating_add(section.sh_size as usize);
+            if sym_end > data.len() || sym_end <= sym_start {
                 continue;
             }
 
@@ -277,8 +277,8 @@ impl<'a> Elf<'a> {
             // RELA sections have an explicit addend
             if section.sh_type == section::SHT_RELA {
                 let start = section.sh_offset as usize;
-                let end = start + section.sh_size as usize;
-                if end <= data.len() {
+                let end = start.saturating_add(section.sh_size as usize);
+                if end <= data.len() && end > start {
                     // sh_info tells us which section these relocations apply to
                     let target_section = section.sh_info as usize;
                     let relocs = Relocation::parse_rela(
@@ -295,8 +295,8 @@ impl<'a> Elf<'a> {
             // REL sections have implicit addend (stored in the target location)
             else if section.sh_type == section::SHT_REL {
                 let start = section.sh_offset as usize;
-                let end = start + section.sh_size as usize;
-                if end <= data.len() {
+                let end = start.saturating_add(section.sh_size as usize);
+                if end <= data.len() && end > start {
                     let target_section = section.sh_info as usize;
                     let relocs = Relocation::parse_rel(
                         &data[start..end],
@@ -328,8 +328,8 @@ impl<'a> Elf<'a> {
         })?;
 
         let start = modinfo_section.sh_offset as usize;
-        let end = start + modinfo_section.sh_size as usize;
-        if end > data.len() {
+        let end = start.saturating_add(modinfo_section.sh_size as usize);
+        if end > data.len() || end <= start {
             return None;
         }
 
@@ -458,8 +458,8 @@ impl<'a> Elf<'a> {
     /// Returns the data for a section.
     pub fn section_data(&self, section: &SectionHeader) -> Option<&[u8]> {
         let start = section.sh_offset as usize;
-        let end = start + section.sh_size as usize;
-        if end <= self.data.len() {
+        let end = start.saturating_add(section.sh_size as usize);
+        if end <= self.data.len() && end > start {
             Some(&self.data[start..end])
         } else {
             None
