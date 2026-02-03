@@ -559,7 +559,7 @@ impl BinaryFormat for MachO<'_> {
                 LoadCommand::Main { entryoff, .. } => {
                     // entryoff is relative to __TEXT segment
                     if let Some(text) = self.text_segment() {
-                        return Some(text.vmaddr + *entryoff);
+                        return Some(text.vmaddr.saturating_add(*entryoff));
                     }
                 }
                 LoadCommand::UnixThread { entry_point, .. } => {
