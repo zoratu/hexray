@@ -282,28 +282,24 @@ Def-Use Chains:
 
 ---
 
-### 8. Output Format Tests
+### 8. Output Format Tests ✅ COMPLETE
 
-**Files:**
-- Various output modules for JSON, HTML, DOT
+**Phase 8 complete: 110 tests added across output format modules.**
 
-**Tests needed:**
+- `hexray-core/src/output/dot.rs` - 27 tests for escape_dot_string, DotConfig, format_node, format_edge, format_edge_labeled, integration
+- `hexray-analysis/src/output/dot.rs` - 20 tests for CfgDotExporter and CallGraphDotExporter (config, empty, escaping, branching, external)
+- `hexray-analysis/src/output/json.rs` - 22 tests for CfgJsonExporter and CallGraphJsonExporter (valid JSON, pretty/compact, addresses, call types)
+- `hexray-analysis/src/output/html.rs` - 41 tests for CfgHtmlExporter and CallGraphHtmlExporter (structure, XSS prevention, escaping, styling)
 
-```
-JSON Output:
-- test_json_cfg_valid_structure
-- test_json_decompile_valid_structure
-- test_json_special_character_escaping
-
-DOT Output:
-- test_dot_graph_syntax_valid
-- test_dot_node_labels_escaped
-- test_dot_edge_attributes
-
-HTML Output:
-- test_html_syntax_highlighting
-- test_html_xss_prevention
-```
+**Tests cover:**
+- DOT format escaping (backslash, quotes, angle brackets)
+- DOT graph structure and configuration
+- JSON validity and serialization
+- HTML structure and XSS prevention
+- Empty input handling
+- Special character escaping
+- Entry/exit block styling
+- External function display
 
 **Estimated effort:** 20-30 tests, 1 day
 
@@ -357,10 +353,10 @@ End-to-End:
 | 5 | Signatures integration | 116 | ✅ Complete |
 | 6 | Error paths & edge cases | 100 | ✅ Complete |
 | 7 | C header parsing | 147 | ✅ Complete |
-| 8 | Output formats | 20-30 | Pending |
+| 8 | Output formats | 110 | ✅ Complete |
 | 9 | Cross-crate integration | 20-30 | Pending |
 
-**Progress:** 687 tests added (Phase 1-7 complete)
+**Progress:** 797 tests added (Phase 1-8 complete)
 
 ---
 

@@ -251,4 +251,288 @@ mod tests {
         assert!(dot.contains("helper"));
         assert!(dot.contains("->"));
     }
+
+    // --- CfgDotExporter Tests ---
+
+    #[test]
+    fn test_cfg_dot_exporter_default() {
+        let exporter = CfgDotExporter::default();
+        let cfg = make_test_cfg();
+        let dot = exporter.export_to_string(&cfg, "test");
+        assert!(dot.contains("digraph"));
+    }
+
+    #[test]
+    fn test_cfg_dot_exporter_with_config() {
+        let config = DotConfig {
+            font_name: "Arial".to_string(),
+            node_font_size: 12,
+            edge_font_size: 10,
+            rankdir: "LR".to_string(),
+            node_shape: "ellipse".to_string(),
+        };
+        let exporter = CfgDotExporter::with_config(config);
+        let cfg = make_test_cfg();
+        let dot = exporter.export_to_string(&cfg, "test");
+
+        assert!(dot.contains("rankdir=LR"));
+        assert!(dot.contains("shape=ellipse"));
+        assert!(dot.contains("fontname=\"Arial\""));
+    }
+
+    #[test]
+    fn test_cfg_dot_exporter_contains_addresses() {
+        let cfg = make_test_cfg();
+        let exporter = CfgDotExporter::new();
+        let dot = exporter.export_to_string(&cfg, "test");
+
+        assert!(dot.contains("0x1000"));
+        assert!(dot.contains("0x1010"));
+    }
+
+    #[test]
+    fn test_cfg_dot_exporter_contains_instructions() {
+        let cfg = make_test_cfg();
+        let exporter = CfgDotExporter::new();
+        let dot = exporter.export_to_string(&cfg, "test");
+
+        assert!(dot.contains("mov"));
+    }
+
+    #[test]
+    fn test_cfg_dot_exporter_contains_edges() {
+        let cfg = make_test_cfg();
+        let exporter = CfgDotExporter::new();
+        let dot = exporter.export_to_string(&cfg, "test");
+
+        assert!(dot.contains("bb0"));
+        assert!(dot.contains("bb1"));
+        assert!(dot.contains("->"));
+    }
+
+    #[test]
+    fn test_cfg_dot_exporter_escapes_name() {
+        let cfg = make_test_cfg();
+        let exporter = CfgDotExporter::new();
+        let dot = exporter.export_to_string(&cfg, "func<test>");
+
+        assert!(dot.contains("digraph \"func\\<test\\>\""));
+    }
+
+    #[test]
+    fn test_cfg_dot_exporter_export_to_writer() {
+        let cfg = make_test_cfg();
+        let exporter = CfgDotExporter::new();
+        let mut buf = Vec::new();
+        exporter.export(&cfg, "test", &mut buf).unwrap();
+
+        let dot = String::from_utf8(buf).unwrap();
+        assert!(dot.contains("digraph"));
+    }
+
+    #[test]
+    fn test_cfg_dot_exporter_empty_cfg() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::ENTRY);
+        let exporter = CfgDotExporter::new();
+        let dot = exporter.export_to_string(&cfg, "empty");
+
+        assert!(dot.contains("digraph \"empty\""));
+        assert!(dot.contains("}"));
+    }
+
+    // --- CallGraphDotExporter Tests ---
+
+    #[test]
+    fn test_callgraph_dot_exporter_default() {
+        let exporter = CallGraphDotExporter::default();
+        let callgraph = CallGraph::new();
+        let dot = exporter.export_to_string(&callgraph);
+        assert!(dot.contains("digraph"));
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_with_config() {
+        let config = DotConfig {
+            font_name: "Arial".to_string(),
+            node_font_size: 14,
+            edge_font_size: 12,
+            rankdir: "TB".to_string(),
+            node_shape: "circle".to_string(),
+        };
+        let exporter = CallGraphDotExporter::with_config(config);
+        let callgraph = CallGraph::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        assert!(dot.contains("rankdir=TB"));
+        assert!(dot.contains("shape=circle"));
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_empty() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphDotExporter::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        assert!(dot.contains("digraph \"callgraph\""));
+        assert!(dot.contains("}"));
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_single_node() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+
+        let exporter = CallGraphDotExporter::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        assert!(dot.contains("main"));
+        assert!(!dot.contains("->")); // No edges
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_no_name() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, None, false);
+
+        let exporter = CallGraphDotExporter::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        assert!(dot.contains("sub_1000"));
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_external_node() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+        callgraph.add_node(0x2000, Some("printf".to_string()), true);
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1008,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphDotExporter::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        assert!(dot.contains("main"));
+        assert!(dot.contains("printf"));
+        assert!(dot.contains("->"));
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_multiple_callees() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+        callgraph.add_node(0x2000, Some("foo".to_string()), false);
+        callgraph.add_node(0x3000, Some("bar".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1008,
+                call_type: crate::CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x1000,
+            0x3000,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphDotExporter::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        assert!(dot.contains("main"));
+        assert!(dot.contains("foo"));
+        assert!(dot.contains("bar"));
+        // Should have two edges
+        let edge_count = dot.matches("->").count();
+        assert_eq!(edge_count, 2);
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_export_to_writer() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+
+        let exporter = CallGraphDotExporter::new();
+        let mut buf = Vec::new();
+        exporter.export(&callgraph, &mut buf).unwrap();
+
+        let dot = String::from_utf8(buf).unwrap();
+        assert!(dot.contains("digraph"));
+        assert!(dot.contains("main"));
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_special_chars_in_name() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("operator<".to_string()), false);
+
+        let exporter = CallGraphDotExporter::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        // Name should be escaped
+        assert!(dot.contains("operator\\<"));
+    }
+
+    // --- CFG with Multiple Blocks and Branches ---
+
+    #[test]
+    fn test_cfg_dot_exporter_branching() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::ENTRY);
+
+        // Entry block with conditional branch
+        let entry = BasicBlock {
+            id: BasicBlockId::ENTRY,
+            start: 0x1000,
+            end: 0x1010,
+            instructions: vec![Instruction::new(0x1000, 2, vec![], "cmp")],
+            terminator: BlockTerminator::ConditionalBranch {
+                condition: hexray_core::Condition::Equal,
+                true_target: BasicBlockId(1),
+                false_target: BasicBlockId(2),
+            },
+        };
+        cfg.add_block(entry);
+
+        // True branch
+        let block1 = BasicBlock {
+            id: BasicBlockId(1),
+            start: 0x1010,
+            end: 0x1020,
+            instructions: vec![],
+            terminator: BlockTerminator::Return,
+        };
+        cfg.add_block(block1);
+
+        // False branch
+        let block2 = BasicBlock {
+            id: BasicBlockId(2),
+            start: 0x1020,
+            end: 0x1030,
+            instructions: vec![],
+            terminator: BlockTerminator::Return,
+        };
+        cfg.add_block(block2);
+
+        cfg.add_edge(BasicBlockId::ENTRY, BasicBlockId(1));
+        cfg.add_edge(BasicBlockId::ENTRY, BasicBlockId(2));
+
+        let exporter = CfgDotExporter::new();
+        let dot = exporter.export_to_string(&cfg, "branching");
+
+        assert!(dot.contains("bb0"));
+        assert!(dot.contains("bb1"));
+        assert!(dot.contains("bb2"));
+        // Should have two edges from entry
+        let edge_count = dot.matches("->").count();
+        assert_eq!(edge_count, 2);
+    }
 }

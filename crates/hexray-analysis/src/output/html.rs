@@ -894,4 +894,566 @@ mod tests {
         assert_eq!(escape_html("a & b"), "a &amp; b");
         assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
     }
+
+    // --- Additional escape_html Tests ---
+
+    #[test]
+    fn test_escape_html_empty() {
+        assert_eq!(escape_html(""), "");
+    }
+
+    #[test]
+    fn test_escape_html_single_quote() {
+        assert_eq!(escape_html("it's"), "it&#39;s");
+        assert_eq!(escape_html("'quoted'"), "&#39;quoted&#39;");
+    }
+
+    #[test]
+    fn test_escape_html_multiple_chars() {
+        assert_eq!(
+            escape_html("<a href=\"test\">"),
+            "&lt;a href=&quot;test&quot;&gt;"
+        );
+        assert_eq!(
+            escape_html("Tom & Jerry's <show>"),
+            "Tom &amp; Jerry&#39;s &lt;show&gt;"
+        );
+    }
+
+    #[test]
+    fn test_escape_html_all_special() {
+        assert_eq!(escape_html("&<>\"'"), "&amp;&lt;&gt;&quot;&#39;");
+    }
+
+    #[test]
+    fn test_escape_html_script_injection() {
+        let xss = "<script>alert('xss')</script>";
+        let escaped = escape_html(xss);
+        assert!(!escaped.contains("<script>"));
+        assert!(escaped.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_escape_html_preserves_safe_chars() {
+        // Should not escape: letters, numbers, spaces, newlines
+        assert_eq!(escape_html("hello world 123\n"), "hello world 123\n");
+        assert_eq!(escape_html("abc123_-.!@#$%^*()"), "abc123_-.!@#$%^*()");
+    }
+
+    // --- CfgHtmlExporter Tests ---
+
+    #[test]
+    fn test_cfg_html_exporter_default() {
+        let exporter = CfgHtmlExporter::new();
+        let cfg = make_test_cfg();
+        let html = exporter.export_to_string(&cfg, "test");
+        assert!(html.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_empty_cfg() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::ENTRY);
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "empty");
+
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("<title>CFG: empty</title>"));
+        assert!(html.contains("0 blocks"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_escapes_name() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "<script>alert('xss')</script>");
+
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>alert"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_entry_styling() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("class=\"block entry\""));
+        assert!(html.contains("(entry)"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_exit_styling() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("class=\"block exit\""));
+        assert!(html.contains("(exit)"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_sidebar_list() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("block-list"));
+        assert!(html.contains("scrollToBlock"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_instruction_display() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("class=\"inst\""));
+        assert!(html.contains("class=\"mnemonic\""));
+        assert!(html.contains("nop"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_successor_links() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("class=\"successors\""));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_multiple_blocks() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::ENTRY);
+
+        let entry = BasicBlock {
+            id: BasicBlockId::ENTRY,
+            start: 0x1000,
+            end: 0x1010,
+            instructions: vec![],
+            terminator: BlockTerminator::Jump {
+                target: BasicBlockId(1),
+            },
+        };
+        cfg.add_block(entry);
+
+        let block1 = BasicBlock {
+            id: BasicBlockId(1),
+            start: 0x1010,
+            end: 0x1020,
+            instructions: vec![],
+            terminator: BlockTerminator::ConditionalBranch {
+                condition: hexray_core::Condition::Equal,
+                true_target: BasicBlockId(2),
+                false_target: BasicBlockId(3),
+            },
+        };
+        cfg.add_block(block1);
+
+        let block2 = BasicBlock {
+            id: BasicBlockId(2),
+            start: 0x1020,
+            end: 0x1030,
+            instructions: vec![],
+            terminator: BlockTerminator::Return,
+        };
+        cfg.add_block(block2);
+
+        let block3 = BasicBlock {
+            id: BasicBlockId(3),
+            start: 0x1030,
+            end: 0x1040,
+            instructions: vec![],
+            terminator: BlockTerminator::Return,
+        };
+        cfg.add_block(block3);
+
+        cfg.add_edge(BasicBlockId::ENTRY, BasicBlockId(1));
+        cfg.add_edge(BasicBlockId(1), BasicBlockId(2));
+        cfg.add_edge(BasicBlockId(1), BasicBlockId(3));
+
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "multi_block");
+
+        assert!(html.contains("4 blocks"));
+        assert!(html.contains("bb0"));
+        assert!(html.contains("bb1"));
+        assert!(html.contains("bb2"));
+        assert!(html.contains("bb3"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_address_ranges() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("0x1000 - 0x1010"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_is_valid_html_structure() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        // Basic HTML structure validation
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("<html"));
+        assert!(html.contains("</html>"));
+        assert!(html.contains("<head>"));
+        assert!(html.contains("</head>"));
+        assert!(html.contains("<body>"));
+        assert!(html.contains("</body>"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_contains_css() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("<style>"));
+        assert!(html.contains("</style>"));
+        assert!(html.contains("font-family:"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_contains_javascript() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("<script>"));
+        assert!(html.contains("</script>"));
+        assert!(html.contains("scrollToBlock"));
+        assert!(html.contains("clearHighlight"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_search_functionality() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let html = exporter.export_to_string(&cfg, "test");
+
+        assert!(html.contains("id=\"search\""));
+        assert!(html.contains("Search instructions"));
+    }
+
+    #[test]
+    fn test_cfg_html_exporter_write_to_vec() {
+        let cfg = make_test_cfg();
+        let exporter = CfgHtmlExporter::new();
+        let mut buf = Vec::new();
+
+        let result = exporter.export(&cfg, "test", &mut buf);
+        assert!(result.is_ok());
+
+        let html = String::from_utf8(buf).unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+    }
+
+    // --- CallGraphHtmlExporter Tests ---
+
+    #[test]
+    fn test_callgraph_html_exporter_default() {
+        let exporter = CallGraphHtmlExporter::new();
+        let callgraph = CallGraph::new();
+        let html = exporter.export_to_string(&callgraph);
+        assert!(html.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_empty() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("0 functions"));
+        assert!(html.contains("0 calls"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_external_functions() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+        callgraph.add_node(0x0, Some("printf".to_string()), true);
+        callgraph.add_call(
+            0x1000,
+            0x0,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("external"));
+        assert!(html.contains("External"));
+        assert!(html.contains("printf"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_escapes_names() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("<script>alert(1)</script>".to_string()), false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>alert"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_unnamed_function() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1234, None, false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("sub_1234"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_caller_callee_display() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("caller".to_string()), false);
+        callgraph.add_node(0x2000, Some("callee".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("Calls ("));
+        assert!(html.contains("Called by ("));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_multiple_callsites() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+        callgraph.add_node(0x2000, Some("helper".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1020,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        // Should show both call sites
+        assert!(html.contains("0x1010"));
+        assert!(html.contains("0x1020"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_sorted_by_name() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x3000, Some("zebra".to_string()), false);
+        callgraph.add_node(0x1000, Some("apple".to_string()), false);
+        callgraph.add_node(0x2000, Some("mango".to_string()), false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        // Find positions of function names
+        let apple_pos = html.find("apple").unwrap();
+        let mango_pos = html.find("mango").unwrap();
+        let zebra_pos = html.find("zebra").unwrap();
+
+        // Should be sorted alphabetically in the sidebar
+        assert!(apple_pos < mango_pos);
+        assert!(mango_pos < zebra_pos);
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_no_outgoing_calls() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("leaf".to_string()), false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("No outgoing calls"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_no_incoming_calls() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("root".to_string()), false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("No incoming calls"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_contains_css() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("<style>"));
+        assert!(html.contains("</style>"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_contains_javascript() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("<script>"));
+        assert!(html.contains("showFunc"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_search_functionality() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("id=\"search\""));
+        assert!(html.contains("Search functions"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_is_valid_html_structure() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("<html"));
+        assert!(html.contains("</html>"));
+        assert!(html.contains("<head>"));
+        assert!(html.contains("</head>"));
+        assert!(html.contains("<body>"));
+        assert!(html.contains("</body>"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_node_count_accuracy() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("a".to_string()), false);
+        callgraph.add_node(0x2000, Some("b".to_string()), false);
+        callgraph.add_node(0x3000, Some("c".to_string()), false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("3 functions"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_edge_count_accuracy() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("a".to_string()), false);
+        callgraph.add_node(0x2000, Some("b".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("1 calls"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_write_to_vec() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphHtmlExporter::new();
+        let mut buf = Vec::new();
+
+        let result = exporter.export(&callgraph, &mut buf);
+        assert!(result.is_ok());
+
+        let html = String::from_utf8(buf).unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_special_chars_in_name() {
+        let mut callgraph = CallGraph::new();
+        // C++ templates, operators
+        callgraph.add_node(0x1000, Some("std::vector<int>".to_string()), false);
+        callgraph.add_node(0x2000, Some("operator<<".to_string()), false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("std::vector&lt;int&gt;"));
+        assert!(html.contains("operator&lt;&lt;"));
+    }
+
+    #[test]
+    fn test_callgraph_html_exporter_address_display() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0xdeadbeef, Some("test".to_string()), false);
+
+        let exporter = CallGraphHtmlExporter::new();
+        let html = exporter.export_to_string(&callgraph);
+
+        assert!(html.contains("0xdeadbeef"));
+    }
+
+    #[test]
+    fn test_node_display_name_with_name() {
+        let node = crate::CallGraphNode {
+            address: 0x1000,
+            name: Some("my_func".to_string()),
+            is_external: false,
+        };
+        assert_eq!(CallGraphHtmlExporter::node_display_name(&node), "my_func");
+    }
+
+    #[test]
+    fn test_node_display_name_without_name() {
+        let node = crate::CallGraphNode {
+            address: 0x1234,
+            name: None,
+            is_external: false,
+        };
+        assert_eq!(CallGraphHtmlExporter::node_display_name(&node), "sub_1234");
+    }
+
+    #[test]
+    fn test_node_display_name_hex_format() {
+        let node = crate::CallGraphNode {
+            address: 0xabcd,
+            name: None,
+            is_external: false,
+        };
+        assert_eq!(CallGraphHtmlExporter::node_display_name(&node), "sub_abcd");
+    }
 }

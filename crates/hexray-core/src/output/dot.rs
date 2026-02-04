@@ -114,6 +114,8 @@ pub fn format_edge_labeled(from: &str, to: &str, label: &str) -> String {
 mod tests {
     use super::*;
 
+    // --- escape_dot_string Tests ---
+
     #[test]
     fn test_escape_dot_string() {
         assert_eq!(escape_dot_string("hello"), "hello");
@@ -121,6 +123,64 @@ mod tests {
         assert_eq!(escape_dot_string("a\"b"), "a\\\"b");
         assert_eq!(escape_dot_string("a<b>c"), "a\\<b\\>c");
         assert_eq!(escape_dot_string("\\\"<>"), "\\\\\\\"\\<\\>");
+    }
+
+    #[test]
+    fn test_escape_dot_string_empty() {
+        assert_eq!(escape_dot_string(""), "");
+    }
+
+    #[test]
+    fn test_escape_dot_string_no_special() {
+        assert_eq!(escape_dot_string("mov rax, rbx"), "mov rax, rbx");
+        assert_eq!(escape_dot_string("0x1234"), "0x1234");
+    }
+
+    #[test]
+    fn test_escape_dot_string_multiple_escapes() {
+        assert_eq!(escape_dot_string("a\\b\\c"), "a\\\\b\\\\c");
+        assert_eq!(escape_dot_string("\"\"\""), "\\\"\\\"\\\"");
+    }
+
+    #[test]
+    fn test_escape_dot_string_mixed() {
+        assert_eq!(escape_dot_string("call <func@plt>"), "call \\<func@plt\\>");
+        assert_eq!(
+            escape_dot_string("mov rax, \"string\""),
+            "mov rax, \\\"string\\\""
+        );
+    }
+
+    #[test]
+    fn test_escape_dot_string_newlines_preserved() {
+        // Newlines are not escaped by DOT escaping
+        assert_eq!(escape_dot_string("line1\nline2"), "line1\nline2");
+    }
+
+    // --- DotConfig Tests ---
+
+    #[test]
+    fn test_dot_config_default() {
+        let cfg = DotConfig::default();
+        assert_eq!(cfg.font_name, "Courier");
+        assert_eq!(cfg.node_font_size, 10);
+        assert_eq!(cfg.edge_font_size, 9);
+        assert_eq!(cfg.rankdir, "TB");
+        assert_eq!(cfg.node_shape, "box");
+    }
+
+    #[test]
+    fn test_dot_config_cfg() {
+        let cfg = DotConfig::cfg();
+        assert_eq!(cfg.rankdir, "TB");
+        assert_eq!(cfg.node_shape, "box");
+    }
+
+    #[test]
+    fn test_dot_config_callgraph() {
+        let cfg = DotConfig::callgraph();
+        assert_eq!(cfg.rankdir, "LR");
+        assert_eq!(cfg.node_shape, "box");
     }
 
     #[test]
@@ -133,14 +193,143 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_config_header_escapes_name() {
+        let cfg = DotConfig::cfg();
+        let header = cfg.header("func<test>");
+        assert!(header.contains("digraph \"func\\<test\\>\""));
+    }
+
+    #[test]
+    fn test_dot_config_header_contains_font() {
+        let cfg = DotConfig::default();
+        let header = cfg.header("test");
+        assert!(header.contains("fontname=\"Courier\""));
+        assert!(header.contains("fontsize=10"));
+        assert!(header.contains("fontsize=9"));
+    }
+
+    #[test]
+    fn test_dot_config_footer() {
+        let cfg = DotConfig::default();
+        assert_eq!(cfg.footer(), "}\n");
+    }
+
+    #[test]
+    fn test_dot_config_clone() {
+        let cfg1 = DotConfig::cfg();
+        let cfg2 = cfg1.clone();
+        assert_eq!(cfg1.rankdir, cfg2.rankdir);
+        assert_eq!(cfg1.node_shape, cfg2.node_shape);
+    }
+
+    #[test]
+    fn test_dot_config_debug() {
+        let cfg = DotConfig::default();
+        let debug = format!("{:?}", cfg);
+        assert!(debug.contains("DotConfig"));
+        assert!(debug.contains("Courier"));
+    }
+
+    // --- format_node Tests ---
+
+    #[test]
     fn test_format_node() {
         let node = format_node("block0", "entry:\\l");
         assert_eq!(node, "    \"block0\" [label=\"entry:\\l\"];\n");
     }
 
     #[test]
+    fn test_format_node_escapes_id() {
+        let node = format_node("block<0>", "label");
+        assert!(node.contains("\"block\\<0\\>\""));
+    }
+
+    #[test]
+    fn test_format_node_empty_label() {
+        let node = format_node("id", "");
+        assert_eq!(node, "    \"id\" [label=\"\"];\n");
+    }
+
+    #[test]
+    fn test_format_node_multiline_label() {
+        let node = format_node("block", "line1\\lline2\\l");
+        assert!(node.contains("line1\\lline2\\l"));
+    }
+
+    // --- format_edge Tests ---
+
+    #[test]
     fn test_format_edge() {
         let edge = format_edge("block0", "block1");
         assert_eq!(edge, "    \"block0\" -> \"block1\";\n");
+    }
+
+    #[test]
+    fn test_format_edge_escapes_ids() {
+        let edge = format_edge("from<>", "to\"");
+        assert!(edge.contains("\"from\\<\\>\""));
+        assert!(edge.contains("\"to\\\"\""));
+    }
+
+    #[test]
+    fn test_format_edge_same_node() {
+        let edge = format_edge("block", "block");
+        assert_eq!(edge, "    \"block\" -> \"block\";\n");
+    }
+
+    // --- format_edge_labeled Tests ---
+
+    #[test]
+    fn test_format_edge_labeled() {
+        let edge = format_edge_labeled("from", "to", "true");
+        assert_eq!(edge, "    \"from\" -> \"to\" [label=\"true\"];\n");
+    }
+
+    #[test]
+    fn test_format_edge_labeled_escapes_label() {
+        let edge = format_edge_labeled("from", "to", "label<with>special");
+        assert!(edge.contains("[label=\"label\\<with\\>special\"]"));
+    }
+
+    #[test]
+    fn test_format_edge_labeled_empty_label() {
+        let edge = format_edge_labeled("from", "to", "");
+        assert!(edge.contains("[label=\"\"]"));
+    }
+
+    // --- Integration Tests ---
+
+    #[test]
+    fn test_complete_dot_graph() {
+        let cfg = DotConfig::cfg();
+        let mut output = String::new();
+
+        output.push_str(&cfg.header("test"));
+        output.push_str(&format_node("entry", "Entry Block\\l"));
+        output.push_str(&format_node("exit", "Exit Block\\l"));
+        output.push_str(&format_edge("entry", "exit"));
+        output.push_str(cfg.footer());
+
+        assert!(output.contains("digraph \"test\""));
+        assert!(output.contains("\"entry\""));
+        assert!(output.contains("\"exit\""));
+        assert!(output.contains("->"));
+        assert!(output.ends_with("}\n"));
+    }
+
+    #[test]
+    fn test_dot_graph_with_special_chars() {
+        let cfg = DotConfig::cfg();
+        let mut output = String::new();
+
+        output.push_str(&cfg.header("func<main>"));
+        output.push_str(&format_node("bb0", "mov rax, \"str\"\\l"));
+        output.push_str(&format_edge_labeled("bb0", "bb1", "fallthrough"));
+        output.push_str(cfg.footer());
+
+        // Verify it's valid-looking DOT
+        assert!(output.contains("digraph"));
+        assert!(output.contains("->"));
+        assert!(output.contains("}"));
     }
 }

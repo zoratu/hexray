@@ -333,4 +333,292 @@ mod tests {
         assert!(json.contains("\"name\":\"helper\""));
         assert!(json.contains("\"call_type\":\"Direct\""));
     }
+
+    // --- CfgJsonExporter Tests ---
+
+    #[test]
+    fn test_cfg_json_exporter_default() {
+        let exporter = CfgJsonExporter::default();
+        let cfg = make_test_cfg();
+        let json = exporter.export_to_string(&cfg, "test");
+        assert!(json.contains("\"name\":\"test\""));
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_is_valid_json() {
+        let cfg = make_test_cfg();
+        let exporter = CfgJsonExporter::new();
+        let json = exporter.export_to_string(&cfg, "test");
+
+        // Should be parseable JSON
+        let result: Result<serde_json::Value, _> = serde_json::from_str(&json);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_blocks_array() {
+        let cfg = make_test_cfg();
+        let exporter = CfgJsonExporter::new();
+        let json = exporter.export_to_string(&cfg, "test");
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let blocks = value.get("blocks").unwrap().as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_instruction_bytes() {
+        let cfg = make_test_cfg();
+        let exporter = CfgJsonExporter::new();
+        let json = exporter.export_to_string(&cfg, "test");
+
+        // Bytes should be hex encoded
+        assert!(json.contains("\"bytes\":\"90\""));
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_successors() {
+        let cfg = make_test_cfg();
+        let exporter = CfgJsonExporter::new();
+        let json = exporter.export_to_string(&cfg, "test");
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let blocks = value.get("blocks").unwrap().as_array().unwrap();
+
+        // First block should have bb1 as successor
+        let entry = &blocks[0];
+        let successors = entry.get("successors").unwrap().as_array().unwrap();
+        assert!(!successors.is_empty());
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_empty_cfg() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::ENTRY);
+        let exporter = CfgJsonExporter::new();
+        let json = exporter.export_to_string(&cfg, "empty");
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let blocks = value.get("blocks").unwrap().as_array().unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_export_to_writer() {
+        let cfg = make_test_cfg();
+        let exporter = CfgJsonExporter::new();
+        let mut buf = Vec::new();
+        exporter.export(&cfg, "test", &mut buf).unwrap();
+
+        let json = String::from_utf8(buf).unwrap();
+        assert!(json.contains("\"name\":\"test\""));
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_special_chars_in_name() {
+        let cfg = make_test_cfg();
+        let exporter = CfgJsonExporter::new();
+        let json = exporter.export_to_string(&cfg, "func<test>");
+
+        // Should be valid JSON even with special chars
+        let result: Result<serde_json::Value, _> = serde_json::from_str(&json);
+        assert!(result.is_ok());
+        assert!(json.contains("func<test>"));
+    }
+
+    #[test]
+    fn test_cfg_json_exporter_address_values() {
+        let cfg = make_test_cfg();
+        let exporter = CfgJsonExporter::new();
+        let json = exporter.export_to_string(&cfg, "test");
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let blocks = value.get("blocks").unwrap().as_array().unwrap();
+        let entry = &blocks[0];
+
+        // Check address fields are numbers
+        assert_eq!(entry.get("start").unwrap().as_u64().unwrap(), 0x1000);
+        assert_eq!(entry.get("end").unwrap().as_u64().unwrap(), 0x1010);
+    }
+
+    // --- CallGraphJsonExporter Tests ---
+
+    #[test]
+    fn test_callgraph_json_exporter_default() {
+        let exporter = CallGraphJsonExporter::default();
+        let callgraph = CallGraph::new();
+        let json = exporter.export_to_string(&callgraph);
+        assert!(json.contains("\"node_count\":0"));
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_pretty() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+
+        let exporter = CallGraphJsonExporter::pretty();
+        let json = exporter.export_to_string(&callgraph);
+
+        // Pretty output has newlines and indentation
+        assert!(json.contains('\n'));
+        assert!(json.contains("  ")); // Indentation
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_is_valid_json() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        let result: Result<serde_json::Value, _> = serde_json::from_str(&json);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_empty() {
+        let callgraph = CallGraph::new();
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value.get("node_count").unwrap().as_u64().unwrap(), 0);
+        assert_eq!(value.get("edge_count").unwrap().as_u64().unwrap(), 0);
+        assert!(value.get("nodes").unwrap().as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_single_node() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let nodes = value.get("nodes").unwrap().as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].get("name").unwrap().as_str().unwrap(), "main");
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_no_name() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, None, false);
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        assert!(json.contains("sub_1000"));
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_external_flag() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("printf".to_string()), true);
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let nodes = value.get("nodes").unwrap().as_array().unwrap();
+        assert!(nodes[0].get("is_external").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_call_address() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+        callgraph.add_node(0x2000, Some("helper".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1008,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let nodes = value.get("nodes").unwrap().as_array().unwrap();
+
+        // Find main node and check callees
+        let main = nodes
+            .iter()
+            .find(|n| n.get("name").unwrap() == "main")
+            .unwrap();
+        let callees = main.get("callees").unwrap().as_array().unwrap();
+        assert_eq!(callees.len(), 1);
+        assert_eq!(
+            callees[0].get("call_address").unwrap().as_u64().unwrap(),
+            0x1008
+        );
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_indirect_call() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+        callgraph.add_node(0x2000, Some("callback".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Indirect,
+            },
+        );
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        assert!(json.contains("\"call_type\":\"Indirect\""));
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_export_to_writer() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("main".to_string()), false);
+
+        let exporter = CallGraphJsonExporter::new();
+        let mut buf = Vec::new();
+        exporter.export(&callgraph, &mut buf).unwrap();
+
+        let json = String::from_utf8(buf).unwrap();
+        assert!(json.contains("\"name\":\"main\""));
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_multiple_callers() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x1000, Some("foo".to_string()), false);
+        callgraph.add_node(0x2000, Some("bar".to_string()), false);
+        callgraph.add_node(0x3000, Some("common".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x3000,
+            crate::CallSite {
+                call_address: 0x1008,
+                call_type: crate::CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x2000,
+            0x3000,
+            crate::CallSite {
+                call_address: 0x2008,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value.get("node_count").unwrap().as_u64().unwrap(), 3);
+        assert_eq!(value.get("edge_count").unwrap().as_u64().unwrap(), 2);
+    }
 }
