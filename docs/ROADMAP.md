@@ -170,6 +170,29 @@ This document outlines the development roadmap, competitive analysis, and featur
 - Section handling with RVA conversion
 - Architecture detection (x86, x64, ARM64)
 
+#### Phase 13.5: Testing Infrastructure ✅
+
+**CI/CD Pipeline** ✅
+- Location: `.github/workflows/`
+- GitHub Actions with multi-OS testing (Ubuntu, macOS)
+- MSRV verification (Rust 1.70)
+- Code coverage with cargo-llvm-cov and Codecov
+- Clippy linting and format checking
+
+**Benchmarking** ✅
+- Location: `crates/*/benches/`
+- Criterion benchmarks for disassembly throughput
+- CFG construction and decompilation benchmarks
+- Regression detection with `scripts/bench-regression.sh`
+- PR benchmark comparison workflow
+
+**Test Coverage** ✅
+- Unit tests across all crates (800+ tests)
+- Property-based testing with proptest
+- Differential testing against system tools (objdump, nm, strings)
+- Snapshot testing for CLI output stability
+- Cross-crate integration tests
+
 #### Phase 11.5: Interactive Analysis Database ✅
 
 **Location:** `crates/hexray/src/session.rs`

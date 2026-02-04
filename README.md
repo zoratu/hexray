@@ -191,9 +191,25 @@ cargo test --workspace
 # Run with debug output
 RUST_LOG=debug cargo run -- ./binary decompile main
 
+# Run benchmarks
+cargo bench --workspace
+
+# Benchmark regression testing
+./scripts/bench-regression.sh baseline  # Save baseline
+./scripts/bench-regression.sh compare   # Compare to baseline
+
 # Fuzz testing
 cd fuzz && cargo +nightly fuzz run x86_64_decoder
 ```
+
+### CI Pipeline
+
+The project uses GitHub Actions for continuous integration:
+- **Testing**: Multi-OS (Ubuntu, macOS) with stable Rust and MSRV (1.70)
+- **Coverage**: cargo-llvm-cov with Codecov integration
+- **Linting**: Clippy with `-D warnings`
+- **Formatting**: cargo fmt verification
+- **Benchmarks**: Criterion benchmarks with PR comparison
 
 ## Use Cases
 
