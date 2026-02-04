@@ -335,6 +335,12 @@ fn operand_to_location(operand: &Operand) -> Option<Location> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hexray_core::{
+        Architecture, BasicBlock, BasicBlockId, BlockTerminator, ControlFlowGraph, Immediate,
+        Instruction, Operand, Operation, Register, RegisterClass,
+    };
+
+    // --- ConstValue Tests ---
 
     #[test]
     fn test_const_value_meet() {
@@ -368,6 +374,75 @@ mod tests {
     }
 
     #[test]
+    fn test_const_value_meet_unknown_unknown() {
+        assert_eq!(
+            ConstValue::Unknown.meet(&ConstValue::Unknown),
+            ConstValue::Unknown
+        );
+    }
+
+    #[test]
+    fn test_const_value_meet_not_constant() {
+        assert_eq!(
+            ConstValue::NotConstant.meet(&ConstValue::NotConstant),
+            ConstValue::NotConstant
+        );
+        assert_eq!(
+            ConstValue::NotConstant.meet(&ConstValue::Unknown),
+            ConstValue::NotConstant
+        );
+    }
+
+    #[test]
+    fn test_const_value_is_constant() {
+        assert!(ConstValue::Constant(5).is_constant());
+        assert!(ConstValue::Constant(0).is_constant());
+        assert!(ConstValue::Constant(-1).is_constant());
+        assert!(!ConstValue::Unknown.is_constant());
+        assert!(!ConstValue::NotConstant.is_constant());
+    }
+
+    #[test]
+    fn test_const_value_as_constant() {
+        assert_eq!(ConstValue::Constant(42).as_constant(), Some(42));
+        assert_eq!(ConstValue::Constant(-1).as_constant(), Some(-1));
+        assert_eq!(ConstValue::Unknown.as_constant(), None);
+        assert_eq!(ConstValue::NotConstant.as_constant(), None);
+    }
+
+    #[test]
+    fn test_const_value_debug() {
+        assert!(format!("{:?}", ConstValue::Unknown).contains("Unknown"));
+        assert!(format!("{:?}", ConstValue::Constant(5)).contains("5"));
+        assert!(format!("{:?}", ConstValue::NotConstant).contains("NotConstant"));
+    }
+
+    #[test]
+    fn test_const_value_equality() {
+        assert_eq!(ConstValue::Unknown, ConstValue::Unknown);
+        assert_eq!(ConstValue::NotConstant, ConstValue::NotConstant);
+        assert_eq!(ConstValue::Constant(5), ConstValue::Constant(5));
+        assert_ne!(ConstValue::Constant(5), ConstValue::Constant(6));
+        assert_ne!(ConstValue::Unknown, ConstValue::NotConstant);
+    }
+
+    // --- ConstState Tests ---
+
+    #[test]
+    fn test_const_state_new() {
+        let state = ConstState::new();
+        // Unknown for any location
+        assert_eq!(state.get(&Location::Register(0)), ConstValue::Unknown);
+    }
+
+    #[test]
+    fn test_const_state_set_get() {
+        let mut state = ConstState::new();
+        state.set(Location::Register(0), ConstValue::Constant(42));
+        assert_eq!(state.get(&Location::Register(0)), ConstValue::Constant(42));
+    }
+
+    #[test]
     fn test_const_state_merge() {
         let mut state1 = ConstState::new();
         state1.set(Location::Register(0), ConstValue::Constant(5));
@@ -383,5 +458,294 @@ mod tests {
         assert_eq!(state1.get(&Location::Register(0)), ConstValue::Constant(5));
         // Different constants become NotConstant
         assert_eq!(state1.get(&Location::Register(1)), ConstValue::NotConstant);
+    }
+
+    #[test]
+    fn test_const_state_merge_asymmetric() {
+        let mut state1 = ConstState::new();
+        state1.set(Location::Register(0), ConstValue::Constant(5));
+
+        let mut state2 = ConstState::new();
+        state2.set(Location::Register(1), ConstValue::Constant(10));
+
+        state1.merge(&state2);
+
+        // Location in both becomes meet with Unknown
+        assert_eq!(state1.get(&Location::Register(0)), ConstValue::Constant(5));
+        assert_eq!(state1.get(&Location::Register(1)), ConstValue::Constant(10));
+    }
+
+    #[test]
+    fn test_const_state_equals() {
+        let mut state1 = ConstState::new();
+        state1.set(Location::Register(0), ConstValue::Constant(5));
+
+        let mut state2 = ConstState::new();
+        state2.set(Location::Register(0), ConstValue::Constant(5));
+
+        assert!(state1.equals(&state2));
+
+        state2.set(Location::Register(0), ConstValue::Constant(6));
+        assert!(!state1.equals(&state2));
+    }
+
+    #[test]
+    fn test_const_state_equals_different_sizes() {
+        let mut state1 = ConstState::new();
+        state1.set(Location::Register(0), ConstValue::Constant(5));
+
+        let mut state2 = ConstState::new();
+        state2.set(Location::Register(0), ConstValue::Constant(5));
+        state2.set(Location::Register(1), ConstValue::Constant(6));
+
+        assert!(!state1.equals(&state2));
+    }
+
+    #[test]
+    fn test_const_state_constants_iterator() {
+        let mut state = ConstState::new();
+        state.set(Location::Register(0), ConstValue::Constant(5));
+        state.set(Location::Register(1), ConstValue::NotConstant);
+        state.set(Location::Register(2), ConstValue::Constant(10));
+
+        let constants: Vec<_> = state.constants().collect();
+        assert_eq!(constants.len(), 2);
+    }
+
+    // --- ConstantPropagation Tests ---
+
+    fn make_register(id: u16) -> Register {
+        Register::new(Architecture::X86_64, RegisterClass::General, id, 64)
+    }
+
+    fn make_mov_reg_imm(addr: u64, reg_id: u16, value: i128) -> Instruction {
+        let mut inst = Instruction::new(addr, 3, vec![0; 3], "mov");
+        inst.operation = Operation::Move;
+        inst.operands = vec![
+            Operand::Register(make_register(reg_id)),
+            Operand::Immediate(Immediate {
+                value,
+                size: 8,
+                signed: false,
+            }),
+        ];
+        inst
+    }
+
+    fn make_add_reg_imm(addr: u64, reg_id: u16, value: i128) -> Instruction {
+        let mut inst = Instruction::new(addr, 3, vec![0; 3], "add");
+        inst.operation = Operation::Add;
+        inst.operands = vec![
+            Operand::Register(make_register(reg_id)),
+            Operand::Immediate(Immediate {
+                value,
+                size: 8,
+                signed: false,
+            }),
+        ];
+        inst
+    }
+
+    #[test]
+    fn test_constant_propagation_simple() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        bb.push_instruction(make_mov_reg_imm(0x1000, 0, 42));
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        // rax should be 42 at exit
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(0)),
+            ConstValue::Constant(42)
+        );
+    }
+
+    #[test]
+    fn test_constant_propagation_add() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        bb.push_instruction(make_mov_reg_imm(0x1000, 0, 10));
+        bb.push_instruction(make_add_reg_imm(0x1003, 0, 5));
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        // rax should be 15 at exit
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(0)),
+            ConstValue::Constant(15)
+        );
+    }
+
+    #[test]
+    fn test_constant_propagation_branch() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.push_instruction(make_mov_reg_imm(0x1010, 0, 5));
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.push_instruction(make_mov_reg_imm(0x1020, 0, 10));
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        // At bb3 entry, rax has different values from different paths -> NotConstant
+        assert_eq!(
+            analysis.get_at_entry(BasicBlockId::new(3), &Location::Register(0)),
+            ConstValue::NotConstant
+        );
+    }
+
+    #[test]
+    fn test_constant_propagation_same_value_branch() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.push_instruction(make_mov_reg_imm(0x1010, 0, 42)); // same value
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.push_instruction(make_mov_reg_imm(0x1020, 0, 42)); // same value
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        // At bb3 entry, rax has same value from both paths -> still Constant
+        assert_eq!(
+            analysis.get_at_entry(BasicBlockId::new(3), &Location::Register(0)),
+            ConstValue::Constant(42)
+        );
+    }
+
+    #[test]
+    fn test_constant_propagation_constants_at_entry() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        bb.push_instruction(make_mov_reg_imm(0x1000, 0, 1));
+        bb.push_instruction(make_mov_reg_imm(0x1003, 1, 2));
+        bb.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        let constants = analysis.constants_at_entry(BasicBlockId::new(1));
+        assert!(constants
+            .iter()
+            .any(|(loc, val)| *loc == Location::Register(0) && *val == 1));
+        assert!(constants
+            .iter()
+            .any(|(loc, val)| *loc == Location::Register(1) && *val == 2));
+    }
+
+    #[test]
+    fn test_constant_propagation_call_clobbers() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        bb.push_instruction(make_mov_reg_imm(0x1000, 0, 42));
+
+        // Call instruction
+        let mut call_inst = Instruction::new(0x1003, 5, vec![0; 5], "call");
+        call_inst.operation = Operation::Call;
+        call_inst.operands = vec![Operand::Immediate(Immediate {
+            value: 0x2000,
+            size: 8,
+            signed: false,
+        })];
+        bb.push_instruction(call_inst);
+
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        // rax should be NotConstant after call (return value register)
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(0)),
+            ConstValue::NotConstant
+        );
+    }
+
+    // --- operand_to_location Tests ---
+
+    #[test]
+    fn test_operand_to_location_register() {
+        let reg = make_register(5);
+        let loc = operand_to_location(&Operand::Register(reg));
+        assert_eq!(loc, Some(Location::Register(5)));
+    }
+
+    #[test]
+    fn test_operand_to_location_immediate() {
+        let imm = Immediate {
+            value: 42,
+            size: 8,
+            signed: false,
+        };
+        let loc = operand_to_location(&Operand::Immediate(imm));
+        assert_eq!(loc, None);
     }
 }
