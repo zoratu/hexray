@@ -864,4 +864,349 @@ mod tests {
 
         assert!(result.complete);
     }
+
+    // --- DataFlowRole Tests ---
+
+    #[test]
+    fn test_dataflow_role_display() {
+        assert_eq!(format!("{}", DataFlowRole::Definition), "DEF");
+        assert_eq!(format!("{}", DataFlowRole::Use), "USE");
+        assert_eq!(format!("{}", DataFlowRole::PassThrough), "PASS");
+        assert_eq!(format!("{}", DataFlowRole::Parameter), "PARAM");
+        assert_eq!(format!("{}", DataFlowRole::Source), "SOURCE");
+    }
+
+    #[test]
+    fn test_dataflow_role_equality() {
+        assert_eq!(DataFlowRole::Definition, DataFlowRole::Definition);
+        assert_ne!(DataFlowRole::Definition, DataFlowRole::Use);
+        assert_ne!(DataFlowRole::PassThrough, DataFlowRole::Parameter);
+    }
+
+    #[test]
+    fn test_dataflow_role_debug() {
+        assert!(format!("{:?}", DataFlowRole::Definition).contains("Definition"));
+        assert!(format!("{:?}", DataFlowRole::Source).contains("Source"));
+    }
+
+    // --- DataFlowStep Tests ---
+
+    #[test]
+    fn test_dataflow_step_new() {
+        let step = DataFlowStep::new(
+            0x1000,
+            "mov rax, rbx".to_string(),
+            DataFlowRole::PassThrough,
+            Location::Register(0),
+        );
+
+        assert_eq!(step.address, 0x1000);
+        assert_eq!(step.instruction, "mov rax, rbx");
+        assert_eq!(step.role, DataFlowRole::PassThrough);
+        assert!(step.description.is_none());
+    }
+
+    #[test]
+    fn test_dataflow_step_with_description() {
+        let step = DataFlowStep::new(
+            0x1000,
+            "mov rax, 42".to_string(),
+            DataFlowRole::Source,
+            Location::Register(0),
+        )
+        .with_description("Constant value assignment");
+
+        assert!(step.description.is_some());
+        assert_eq!(step.description.unwrap(), "Constant value assignment");
+    }
+
+    #[test]
+    fn test_dataflow_step_with_stack_location() {
+        let step = DataFlowStep::new(
+            0x1000,
+            "mov [rbp-8], rax".to_string(),
+            DataFlowRole::Use,
+            Location::Stack(-8),
+        );
+
+        assert!(matches!(step.location, Location::Stack(-8)));
+    }
+
+    #[test]
+    fn test_dataflow_step_with_flags_location() {
+        let step = DataFlowStep::new(
+            0x1000,
+            "cmp rax, rbx".to_string(),
+            DataFlowRole::Definition,
+            Location::Flags,
+        );
+
+        assert!(matches!(step.location, Location::Flags));
+    }
+
+    // --- DataFlowResult Tests ---
+
+    #[test]
+    fn test_dataflow_result_new() {
+        let query = DataFlowQuery::TraceBackward {
+            address: 0x1000,
+            register_id: 0,
+        };
+        let result = DataFlowResult::new(query);
+
+        assert!(!result.complete);
+        assert!(result.truncation_reason.is_none());
+        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
+        assert!(!result.has_results());
+    }
+
+    #[test]
+    fn test_dataflow_result_add_step() {
+        let query = DataFlowQuery::TraceForward {
+            address: 0x1000,
+            register_id: 0,
+        };
+        let mut result = DataFlowResult::new(query);
+
+        let step = DataFlowStep::new(
+            0x1000,
+            "mov rax, 42".to_string(),
+            DataFlowRole::Source,
+            Location::Register(0),
+        );
+        result.add_step(step);
+
+        assert_eq!(result.len(), 1);
+        assert!(result.has_results());
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_dataflow_result_mark_complete() {
+        let query = DataFlowQuery::FindUses {
+            def_address: 0x1000,
+            register_id: 0,
+        };
+        let mut result = DataFlowResult::new(query);
+        assert!(!result.complete);
+
+        result.mark_complete();
+        assert!(result.complete);
+    }
+
+    #[test]
+    fn test_dataflow_result_truncate() {
+        let query = DataFlowQuery::FindDefs {
+            use_address: 0x1000,
+            register_id: 0,
+        };
+        let mut result = DataFlowResult::new(query);
+
+        result.truncate("Maximum depth reached");
+        assert!(result.truncation_reason.is_some());
+        assert!(result.truncation_reason.unwrap().contains("Maximum depth"));
+    }
+
+    #[test]
+    fn test_dataflow_result_display_empty() {
+        let query = DataFlowQuery::TraceBackward {
+            address: 0x1000,
+            register_id: 0,
+        };
+        let result = DataFlowResult::new(query);
+
+        let output = format!("{}", result);
+        assert!(output.contains("no results"));
+        assert!(output.contains("Tracing backward"));
+    }
+
+    #[test]
+    fn test_dataflow_result_display_with_steps() {
+        let query = DataFlowQuery::TraceForward {
+            address: 0x1000,
+            register_id: 0,
+        };
+        let mut result = DataFlowResult::new(query);
+
+        let step = DataFlowStep::new(
+            0x1000,
+            "mov rax, 42".to_string(),
+            DataFlowRole::Source,
+            Location::Register(0),
+        )
+        .with_description("test desc");
+        result.add_step(step);
+        result.mark_complete();
+
+        let output = format!("{}", result);
+        assert!(output.contains("Tracing forward"));
+        assert!(output.contains("0x00001000"));
+        assert!(output.contains("SOURCE"));
+        assert!(output.contains("test desc"));
+        assert!(output.contains("Trace complete"));
+    }
+
+    #[test]
+    fn test_dataflow_result_display_truncated() {
+        let query = DataFlowQuery::FindUses {
+            def_address: 0x1000,
+            register_id: 5,
+        };
+        let mut result = DataFlowResult::new(query);
+        result.truncate("Test truncation reason");
+
+        let output = format!("{}", result);
+        assert!(output.contains("Truncated"));
+        assert!(output.contains("Test truncation reason"));
+    }
+
+    #[test]
+    fn test_dataflow_result_display_find_defs() {
+        let query = DataFlowQuery::FindDefs {
+            use_address: 0x2000,
+            register_id: 3,
+        };
+        let result = DataFlowResult::new(query);
+
+        let output = format!("{}", result);
+        assert!(output.contains("Finding definitions"));
+        assert!(output.contains("register 3"));
+        assert!(output.contains("0x2000"));
+    }
+
+    // --- DataFlowQuery Tests ---
+
+    #[test]
+    fn test_dataflow_query_debug() {
+        let query = DataFlowQuery::TraceBackward {
+            address: 0x1000,
+            register_id: 0,
+        };
+        let debug = format!("{:?}", query);
+        assert!(debug.contains("TraceBackward"));
+        assert!(debug.contains("4096")); // 0x1000 in decimal
+    }
+
+    #[test]
+    fn test_dataflow_query_clone() {
+        let query = DataFlowQuery::TraceForward {
+            address: 0x2000,
+            register_id: 5,
+        };
+        let cloned = query.clone();
+
+        if let DataFlowQuery::TraceForward {
+            address,
+            register_id,
+        } = cloned
+        {
+            assert_eq!(address, 0x2000);
+            assert_eq!(register_id, 5);
+        } else {
+            panic!("Clone didn't preserve variant");
+        }
+    }
+
+    // --- Edge Case Tests ---
+
+    #[test]
+    fn test_trace_backward_nonexistent_address() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg);
+        let result = engine.query(&DataFlowQuery::TraceBackward {
+            address: 0x9999, // Non-existent
+            register_id: 0,
+        });
+
+        assert!(!result.has_results());
+        assert!(result.truncation_reason.is_some());
+        assert!(result.truncation_reason.unwrap().contains("No use"));
+    }
+
+    #[test]
+    fn test_trace_forward_nonexistent_address() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg);
+        let result = engine.query(&DataFlowQuery::TraceForward {
+            address: 0x9999,
+            register_id: 0,
+        });
+
+        assert!(!result.has_results());
+        assert!(result.truncation_reason.is_some());
+        assert!(result.truncation_reason.unwrap().contains("No definition"));
+    }
+
+    #[test]
+    fn test_find_uses_nonexistent_def() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg);
+        let result = engine.query(&DataFlowQuery::FindUses {
+            def_address: 0x9999,
+            register_id: 0,
+        });
+
+        assert!(result.truncation_reason.is_some());
+    }
+
+    #[test]
+    fn test_find_defs_nonexistent_use() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg);
+        let result = engine.query(&DataFlowQuery::FindDefs {
+            use_address: 0x9999,
+            register_id: 0,
+        });
+
+        assert!(result.truncation_reason.is_some());
+        assert!(result.truncation_reason.unwrap().contains("No use"));
+    }
+
+    #[test]
+    fn test_engine_with_max_depth() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg).with_max_depth(10);
+
+        // Just verify the engine was created with custom depth
+        // (can't easily test max depth without complex CFG)
+        let result = engine.query(&DataFlowQuery::TraceBackward {
+            address: 0x9999,
+            register_id: 0,
+        });
+        assert!(result.truncation_reason.is_some());
+    }
+
+    #[test]
+    fn test_empty_cfg_query() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg);
+
+        // Query on empty block
+        let result = engine.query(&DataFlowQuery::TraceBackward {
+            address: 0x1000,
+            register_id: 0,
+        });
+
+        // Should handle gracefully
+        assert!(!result.has_results() || result.truncation_reason.is_some());
+    }
 }

@@ -353,4 +353,236 @@ mod tests {
         let (_, live_out) = &facts[&BasicBlockId::new(0)];
         assert!(!live_out.is_live(&Location::Register(0)));
     }
+
+    // --- LivenessFact Tests ---
+
+    #[test]
+    fn test_liveness_fact_default() {
+        let fact = LivenessFact::default();
+        assert!(fact.live.is_empty());
+        assert!(!fact.is_live(&Location::Register(0)));
+    }
+
+    #[test]
+    fn test_liveness_fact_is_live() {
+        let mut fact = LivenessFact::default();
+        fact.live.insert(Location::Register(5));
+        fact.live.insert(Location::Stack(-8));
+
+        assert!(fact.is_live(&Location::Register(5)));
+        assert!(fact.is_live(&Location::Stack(-8)));
+        assert!(!fact.is_live(&Location::Register(0)));
+        assert!(!fact.is_live(&Location::Flags));
+    }
+
+    #[test]
+    fn test_liveness_fact_iter() {
+        let mut fact = LivenessFact::default();
+        fact.live.insert(Location::Register(0));
+        fact.live.insert(Location::Register(1));
+        fact.live.insert(Location::Flags);
+
+        let live_locs: Vec<_> = fact.iter().collect();
+        assert_eq!(live_locs.len(), 3);
+    }
+
+    #[test]
+    fn test_liveness_fact_equality() {
+        let mut fact1 = LivenessFact::default();
+        fact1.live.insert(Location::Register(0));
+
+        let mut fact2 = LivenessFact::default();
+        fact2.live.insert(Location::Register(0));
+
+        let mut fact3 = LivenessFact::default();
+        fact3.live.insert(Location::Register(1));
+
+        assert_eq!(fact1, fact2);
+        assert_ne!(fact1, fact3);
+    }
+
+    #[test]
+    fn test_liveness_fact_debug() {
+        let mut fact = LivenessFact::default();
+        fact.live.insert(Location::Register(0));
+
+        let debug = format!("{:?}", fact);
+        assert!(debug.contains("LivenessFact"));
+    }
+
+    // --- LivenessAnalysis Methods Tests ---
+
+    #[test]
+    fn test_at_instruction_empty_block() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let facts = LivenessAnalysis::analyze(&cfg);
+        let live_at = LivenessAnalysis::at_instruction(&facts, &cfg, BasicBlockId::new(0), 0);
+
+        // Empty block has no live variables at any position
+        assert!(live_at.live.is_empty());
+    }
+
+    #[test]
+    fn test_at_instruction_nonexistent_block() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let facts = LivenessAnalysis::analyze(&cfg);
+        let live_at = LivenessAnalysis::at_instruction(&facts, &cfg, BasicBlockId::new(99), 0);
+
+        // Non-existent block returns empty fact
+        assert!(live_at.live.is_empty());
+    }
+
+    #[test]
+    fn test_at_instruction_within_block() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        // rax = rbx (uses rbx, defs rax)
+        bb.push_instruction(make_mov(0x1000, 0, "rax", 1, "rbx"));
+        // rcx = rax (uses rax, defs rcx)
+        bb.push_instruction(make_mov(0x1003, 2, "rcx", 0, "rax"));
+        bb.terminator = BlockTerminator::Return;
+
+        cfg.add_block(bb);
+
+        let facts = LivenessAnalysis::analyze(&cfg);
+
+        // At instruction 0, rbx is live (about to be used)
+        let live_at_0 = LivenessAnalysis::at_instruction(&facts, &cfg, BasicBlockId::new(0), 0);
+        assert!(live_at_0.is_live(&Location::Register(1))); // rbx
+
+        // At instruction 1, rax is live (about to be used by mov rcx, rax)
+        let live_at_1 = LivenessAnalysis::at_instruction(&facts, &cfg, BasicBlockId::new(0), 1);
+        assert!(live_at_1.is_live(&Location::Register(0))); // rax
+    }
+
+    #[test]
+    fn test_always_live_empty_facts() {
+        let facts: HashMap<BasicBlockId, (LivenessFact, LivenessFact)> = HashMap::new();
+        let always = LivenessAnalysis::always_live(&facts);
+        assert!(always.is_empty());
+    }
+
+    #[test]
+    fn test_always_live_single_block() {
+        let mut facts = HashMap::new();
+        let mut live_in = LivenessFact::default();
+        live_in.live.insert(Location::Register(0));
+        let mut live_out = LivenessFact::default();
+        live_out.live.insert(Location::Register(0));
+        facts.insert(BasicBlockId::new(0), (live_in, live_out));
+
+        let always = LivenessAnalysis::always_live(&facts);
+        assert!(always.contains(&Location::Register(0)));
+    }
+
+    #[test]
+    fn test_always_live_multiple_blocks() {
+        let mut facts = HashMap::new();
+
+        // Block 0: r0 and r1 live
+        let mut live_in_0 = LivenessFact::default();
+        live_in_0.live.insert(Location::Register(0));
+        live_in_0.live.insert(Location::Register(1));
+        let mut live_out_0 = LivenessFact::default();
+        live_out_0.live.insert(Location::Register(0));
+        facts.insert(BasicBlockId::new(0), (live_in_0, live_out_0));
+
+        // Block 1: only r0 live
+        let mut live_in_1 = LivenessFact::default();
+        live_in_1.live.insert(Location::Register(0));
+        let mut live_out_1 = LivenessFact::default();
+        live_out_1.live.insert(Location::Register(0));
+        facts.insert(BasicBlockId::new(1), (live_in_1, live_out_1));
+
+        let always = LivenessAnalysis::always_live(&facts);
+        // Only r0 is live in all blocks
+        assert!(always.contains(&Location::Register(0)));
+        assert!(!always.contains(&Location::Register(1)));
+    }
+
+    #[test]
+    fn test_live_ranges_empty_cfg() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        cfg.add_block(bb);
+
+        let facts = LivenessAnalysis::analyze(&cfg);
+        let ranges = LivenessAnalysis::live_ranges(&facts, &cfg);
+
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn test_live_ranges_with_instructions() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        bb.push_instruction(make_mov(0x1000, 0, "rax", 1, "rbx"));
+        bb.push_instruction(make_mov(0x1003, 2, "rcx", 0, "rax"));
+        bb.terminator = BlockTerminator::Return;
+
+        cfg.add_block(bb);
+
+        let facts = LivenessAnalysis::analyze(&cfg);
+        let ranges = LivenessAnalysis::live_ranges(&facts, &cfg);
+
+        // rbx should be live at instruction 0
+        if let Some(rbx_ranges) = ranges.get(&Location::Register(1)) {
+            assert!(rbx_ranges.iter().any(|(_, idx)| *idx == 0));
+        }
+    }
+
+    // --- DataflowAnalysis trait implementation tests ---
+
+    #[test]
+    fn test_liveness_initial_fact() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let analysis = LivenessAnalysis::new(&cfg);
+        let initial = analysis.initial_fact();
+        assert!(initial.live.is_empty());
+    }
+
+    #[test]
+    fn test_liveness_meet() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let analysis = LivenessAnalysis::new(&cfg);
+
+        let mut fact1 = LivenessFact::default();
+        fact1.live.insert(Location::Register(0));
+        fact1.live.insert(Location::Register(1));
+
+        let mut fact2 = LivenessFact::default();
+        fact2.live.insert(Location::Register(1));
+        fact2.live.insert(Location::Register(2));
+
+        let meet = analysis.meet(vec![&fact1, &fact2]);
+
+        // Meet is union
+        assert!(meet.is_live(&Location::Register(0)));
+        assert!(meet.is_live(&Location::Register(1)));
+        assert!(meet.is_live(&Location::Register(2)));
+    }
+
+    #[test]
+    fn test_liveness_meet_empty() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let analysis = LivenessAnalysis::new(&cfg);
+
+        let meet = analysis.meet(vec![]);
+        assert!(meet.live.is_empty());
+    }
+
+    #[test]
+    fn test_liveness_is_forward() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let analysis = LivenessAnalysis::new(&cfg);
+        assert!(!analysis.is_forward()); // Liveness is backward
+    }
 }

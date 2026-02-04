@@ -910,4 +910,311 @@ mod tests {
         assert_eq!(loaded.get_function_name(0x2000), Some("my_func"));
         assert!(loaded.is_bookmarked(0x3000));
     }
+
+    // ==================== Error Path Tests ====================
+
+    #[test]
+    fn test_new_project_binary_not_found() {
+        let result = AnalysisProject::new("/nonexistent/path/to/binary");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::BinaryNotFound(path) => {
+                assert!(path.to_str().unwrap().contains("nonexistent"));
+            }
+            e => panic!("Expected BinaryNotFound, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_load_nonexistent_project() {
+        let result = AnalysisProject::load("/nonexistent/project.hrp");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::Io(_) => {}
+            e => panic!("Expected Io error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_load_invalid_json() {
+        let project_file = NamedTempFile::new().unwrap();
+        std::fs::write(project_file.path(), "not valid json {{{").unwrap();
+
+        let result = AnalysisProject::load(project_file.path());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::Json(_) => {}
+            e => panic!("Expected Json error, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_load_future_version() {
+        let project_file = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "version": 999,
+            "binary_path": "/tmp/test",
+            "binary_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "annotations": {},
+            "function_overrides": {},
+            "type_overrides": {},
+            "bookmarks": []
+        }"#;
+        std::fs::write(project_file.path(), json).unwrap();
+
+        let result = AnalysisProject::load(project_file.path());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::UnsupportedVersion(v) => assert_eq!(v, 999),
+            e => panic!("Expected UnsupportedVersion, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_undo_nothing() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        let result = project.undo();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::NothingToUndo => {}
+            e => panic!("Expected NothingToUndo, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_redo_nothing() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        let result = project.redo();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::NothingToRedo => {}
+            e => panic!("Expected NothingToRedo, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_undo_after_multiple_operations() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        // Do multiple operations
+        project.set_comment(0x1000, "comment1");
+        project.set_comment(0x2000, "comment2");
+        project.set_function_name(0x3000, "func");
+
+        // Undo all of them
+        assert!(project.undo().is_ok());
+        assert!(project.undo().is_ok());
+        assert!(project.undo().is_ok());
+
+        // Next undo should fail
+        assert!(matches!(project.undo(), Err(ProjectError::NothingToUndo)));
+    }
+
+    #[test]
+    fn test_redo_after_new_operation() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        project.set_comment(0x1000, "comment1");
+        project.undo().unwrap();
+
+        // New operation should clear redo history
+        project.set_comment(0x2000, "comment2");
+
+        // Redo should fail (history was cleared)
+        assert!(matches!(project.redo(), Err(ProjectError::NothingToRedo)));
+    }
+
+    #[test]
+    fn test_can_undo_can_redo_consistency() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        assert!(!project.can_undo());
+        assert!(!project.can_redo());
+
+        project.set_comment(0x1000, "test");
+        assert!(project.can_undo());
+        assert!(!project.can_redo());
+
+        project.undo().unwrap();
+        assert!(!project.can_undo());
+        assert!(project.can_redo());
+
+        project.redo().unwrap();
+        assert!(project.can_undo());
+        assert!(!project.can_redo());
+    }
+
+    #[test]
+    fn test_load_and_verify_hash_mismatch() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        // Save the project
+        let project_file = NamedTempFile::new().unwrap();
+        project.save(project_file.path()).unwrap();
+
+        // Modify the binary file to cause hash mismatch
+        std::fs::write(binary.path(), b"modified content").unwrap();
+
+        let result = AnalysisProject::load_and_verify(project_file.path());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::HashMismatch { expected, actual } => {
+                assert_ne!(expected, actual);
+            }
+            e => panic!("Expected HashMismatch, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_load_missing_fields() {
+        let project_file = NamedTempFile::new().unwrap();
+        // JSON with missing required fields
+        let json = r#"{"version": 1}"#;
+        std::fs::write(project_file.path(), json).unwrap();
+
+        let result = AnalysisProject::load(project_file.path());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::Json(_) => {}
+            e => panic!("Expected Json error for missing fields, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_load_invalid_hash_format() {
+        let project_file = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "version": 1,
+            "binary_path": "/tmp/test",
+            "binary_hash": "not_a_valid_hex_hash",
+            "annotations": {},
+            "function_overrides": {},
+            "type_overrides": {},
+            "bookmarks": []
+        }"#;
+        std::fs::write(project_file.path(), json).unwrap();
+
+        let result = AnalysisProject::load(project_file.path());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ProjectError::Json(_) => {}
+            e => panic!("Expected Json error for invalid hash, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_project_error_display() {
+        let err = ProjectError::BinaryNotFound(PathBuf::from("/test/path"));
+        assert!(err.to_string().contains("Binary not found"));
+
+        let err = ProjectError::NothingToUndo;
+        assert!(err.to_string().contains("Nothing to undo"));
+
+        let err = ProjectError::NothingToRedo;
+        assert!(err.to_string().contains("Nothing to redo"));
+
+        let err = ProjectError::UnsupportedVersion(42);
+        assert!(err.to_string().contains("42"));
+
+        let err = ProjectError::HashMismatch {
+            expected: "aaa".to_string(),
+            actual: "bbb".to_string(),
+        };
+        assert!(err.to_string().contains("aaa"));
+        assert!(err.to_string().contains("bbb"));
+
+        let err = ProjectError::InvalidProject("test reason".to_string());
+        assert!(err.to_string().contains("test reason"));
+    }
+
+    #[test]
+    fn test_stats_empty_project() {
+        let binary = create_test_binary();
+        let project = AnalysisProject::new(binary.path()).unwrap();
+
+        let stats = project.stats();
+        assert_eq!(stats.annotation_count, 0);
+        assert_eq!(stats.comment_count, 0);
+        assert_eq!(stats.label_count, 0);
+        assert_eq!(stats.function_override_count, 0);
+        assert_eq!(stats.type_override_count, 0);
+        assert_eq!(stats.bookmark_count, 0);
+        assert_eq!(stats.history_size, 0);
+    }
+
+    #[test]
+    fn test_stats_populated_project() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        project.set_comment(0x1000, "comment1");
+        project.set_comment(0x2000, "comment2");
+        project.set_label(0x3000, "label1");
+        project.set_function_name(0x4000, "func");
+        project.add_bookmark(0x5000, None);
+
+        let stats = project.stats();
+        assert_eq!(stats.comment_count, 2);
+        assert_eq!(stats.label_count, 1);
+        assert_eq!(stats.function_override_count, 1);
+        assert_eq!(stats.bookmark_count, 1);
+    }
+
+    #[test]
+    fn test_overwrite_comment() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        project.set_comment(0x1000, "first comment");
+        assert_eq!(project.get_comment(0x1000), Some("first comment"));
+
+        project.set_comment(0x1000, "second comment");
+        assert_eq!(project.get_comment(0x1000), Some("second comment"));
+
+        // Should only have one comment
+        let annotations = project.annotations.get(&0x1000).unwrap();
+        let comment_count = annotations
+            .iter()
+            .filter(|a| a.kind == AnnotationKind::Comment)
+            .count();
+        assert_eq!(comment_count, 1);
+    }
+
+    #[test]
+    fn test_empty_function_name() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        project.set_function_name(0x1000, "");
+        assert_eq!(project.get_function_name(0x1000), Some(""));
+    }
+
+    #[test]
+    fn test_unicode_annotations() {
+        let binary = create_test_binary();
+        let mut project = AnalysisProject::new(binary.path()).unwrap();
+
+        project.set_comment(0x1000, "日本語コメント");
+        project.set_label(0x2000, "函数名称");
+        project.set_function_name(0x3000, "функция");
+
+        assert_eq!(project.get_comment(0x1000), Some("日本語コメント"));
+        assert_eq!(project.get_label(0x2000), Some("函数名称"));
+        assert_eq!(project.get_function_name(0x3000), Some("функция"));
+
+        // Test save/load with unicode
+        let project_file = NamedTempFile::new().unwrap();
+        project.save(project_file.path()).unwrap();
+
+        let loaded = AnalysisProject::load(project_file.path()).unwrap();
+        assert_eq!(loaded.get_comment(0x1000), Some("日本語コメント"));
+    }
 }

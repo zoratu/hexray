@@ -1927,4 +1927,196 @@ mod tests {
         assert_eq!(ctx.get_name(-8, false), "off");
         assert_eq!(ctx.get_name(-16, false), "off2");
     }
+
+    // --- Helper Function Tests ---
+
+    #[test]
+    fn test_is_frame_or_stack_pointer() {
+        assert!(is_frame_or_stack_pointer("rbp"));
+        assert!(is_frame_or_stack_pointer("rsp"));
+        assert!(is_frame_or_stack_pointer("x29"));
+        assert!(is_frame_or_stack_pointer("sp"));
+        assert!(is_frame_or_stack_pointer("fp"));
+        assert!(!is_frame_or_stack_pointer("rax"));
+        assert!(!is_frame_or_stack_pointer("x0"));
+        assert!(!is_frame_or_stack_pointer(""));
+    }
+
+    #[test]
+    fn test_parse_var_offset_var() {
+        assert_eq!(parse_var_offset("var_8"), Some(8));
+        assert_eq!(parse_var_offset("var_10"), Some(16)); // hex
+        assert_eq!(parse_var_offset("var_ff"), Some(255));
+    }
+
+    #[test]
+    fn test_parse_var_offset_local() {
+        assert_eq!(parse_var_offset("local_8"), Some(-8));
+        assert_eq!(parse_var_offset("local_10"), Some(-16));
+    }
+
+    #[test]
+    fn test_parse_var_offset_arg() {
+        assert_eq!(parse_var_offset("arg_8"), Some(8));
+        assert_eq!(parse_var_offset("arg_10"), Some(16));
+    }
+
+    #[test]
+    fn test_parse_var_offset_invalid() {
+        assert_eq!(parse_var_offset("rax"), None);
+        assert_eq!(parse_var_offset("foo_8"), None);
+        assert_eq!(parse_var_offset(""), None);
+        assert_eq!(parse_var_offset("var_"), None); // empty hex
+        assert_eq!(parse_var_offset("var_xyz"), None); // invalid hex
+    }
+
+    // --- TypeHint Tests ---
+
+    #[test]
+    fn test_type_hint_equality() {
+        assert_eq!(TypeHint::Int, TypeHint::Int);
+        assert_ne!(TypeHint::Int, TypeHint::Pointer);
+        assert_eq!(TypeHint::StringPtr, TypeHint::StringPtr);
+    }
+
+    #[test]
+    fn test_type_hint_debug() {
+        let hint = TypeHint::Array;
+        let debug = format!("{:?}", hint);
+        assert!(debug.contains("Array"));
+    }
+
+    #[test]
+    fn test_type_hint_clone() {
+        let hint = TypeHint::Callback;
+        let cloned = hint;
+        assert_eq!(hint, cloned);
+    }
+
+    // --- NamingContext Method Tests ---
+
+    #[test]
+    fn test_naming_context_default() {
+        let ctx = NamingContext::default();
+        assert!(!ctx.has_dwarf_names());
+    }
+
+    #[test]
+    fn test_naming_context_with_dwarf_names() {
+        let mut names = HashMap::new();
+        names.insert(-8, "count".to_string());
+        let ctx = NamingContext::with_dwarf_names(names);
+
+        assert!(ctx.has_dwarf_names());
+    }
+
+    #[test]
+    fn test_add_dwarf_names() {
+        let mut ctx = NamingContext::new();
+        assert!(!ctx.has_dwarf_names());
+
+        let mut names = HashMap::new();
+        names.insert(-8, "x".to_string());
+        names.insert(-16, "y".to_string());
+        ctx.add_dwarf_names(names);
+
+        assert!(ctx.has_dwarf_names());
+        assert_eq!(ctx.get_name(-8, false), "x");
+        assert_eq!(ctx.get_name(-16, false), "y");
+    }
+
+    #[test]
+    fn test_rename_register_zero() {
+        let ctx = NamingContext::new();
+        assert_eq!(ctx.rename_register("wzr"), "0");
+        assert_eq!(ctx.rename_register("xzr"), "0");
+    }
+
+    #[test]
+    fn test_rename_register_return() {
+        let ctx = NamingContext::new();
+        assert_eq!(ctx.rename_register("eax"), "ret");
+        assert_eq!(ctx.rename_register("rax"), "ret");
+    }
+
+    #[test]
+    fn test_rename_register_arm64_arg() {
+        let ctx = NamingContext::new();
+        assert_eq!(ctx.rename_register("x0"), "arg0");
+        assert_eq!(ctx.rename_register("w0"), "arg0");
+    }
+
+    #[test]
+    fn test_rename_register_error() {
+        let ctx = NamingContext::new();
+        assert_eq!(ctx.rename_register("ebx"), "err");
+        assert_eq!(ctx.rename_register("rbx"), "err");
+        assert_eq!(ctx.rename_register("x19"), "err");
+    }
+
+    #[test]
+    fn test_rename_register_saved() {
+        let ctx = NamingContext::new();
+        assert_eq!(ctx.rename_register("r12"), "result");
+        assert_eq!(ctx.rename_register("r13"), "saved1");
+        assert_eq!(ctx.rename_register("r14"), "saved2");
+        assert_eq!(ctx.rename_register("r15"), "saved3");
+    }
+
+    #[test]
+    fn test_rename_register_unknown() {
+        let ctx = NamingContext::new();
+        // Unknown registers should be returned as-is
+        assert_eq!(ctx.rename_register("rcx"), "rcx");
+        assert_eq!(ctx.rename_register("rdx"), "rdx");
+    }
+
+    #[test]
+    fn test_counter_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-4, TypeHint::Counter);
+        ctx.add_type_hint(-8, TypeHint::Counter);
+        ctx.add_type_hint(-12, TypeHint::Counter);
+        ctx.add_type_hint(-16, TypeHint::Counter);
+
+        // Counter type hint should use i, j, k, then cnt
+        assert_eq!(ctx.get_name(-4, false), "i");
+        assert_eq!(ctx.get_name(-8, false), "j");
+        assert_eq!(ctx.get_name(-12, false), "k");
+        assert_eq!(ctx.get_name(-16, false), "cnt1");
+    }
+
+    #[test]
+    fn test_bool_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Bool);
+
+        let name = ctx.get_name(-8, false);
+        assert!(name.starts_with("flag_"));
+    }
+
+    #[test]
+    fn test_float_type_hint_naming() {
+        let mut ctx = NamingContext::new();
+        ctx.add_type_hint(-8, TypeHint::Float);
+
+        let name = ctx.get_name(-8, false);
+        assert!(name.starts_with("f_"));
+    }
+
+    #[test]
+    fn test_positive_offset_naming() {
+        let mut ctx = NamingContext::new();
+
+        // Positive offsets without type hints get var_ prefix
+        let name = ctx.get_name(8, false);
+        assert!(name.starts_with("var_"));
+    }
+
+    #[test]
+    fn test_naming_context_debug() {
+        let ctx = NamingContext::new();
+        let debug = format!("{:?}", ctx);
+        assert!(debug.contains("NamingContext"));
+    }
 }

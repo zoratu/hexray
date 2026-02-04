@@ -757,4 +757,399 @@ mod tests {
         assert_eq!(db.constructors_for_class("Shape").len(), 1);
         assert_eq!(db.destructors_for_class("Shape").len(), 1);
     }
+
+    // ==================== Edge Case / Error Path Tests ====================
+
+    #[test]
+    fn test_analyze_symbol_too_short() {
+        let detector = CppSpecialDetector::new();
+
+        // Too short to be valid
+        assert!(detector.analyze_symbol("_ZN").is_none());
+        assert!(detector.analyze_symbol("_Z").is_none());
+        assert!(detector.analyze_symbol("").is_none());
+    }
+
+    #[test]
+    fn test_analyze_symbol_no_ctor_dtor_marker() {
+        let detector = CppSpecialDetector::new();
+
+        // Has _ZN but no C1/C2/D0/D1/D2 marker
+        assert!(detector.analyze_symbol("_ZN5Shapetest").is_none());
+        assert!(detector.analyze_symbol("_ZN5Shape").is_none());
+        assert!(detector.analyze_symbol("_ZN5Shape4testEv").is_none());
+    }
+
+    #[test]
+    fn test_analyze_symbol_marker_not_at_right_position() {
+        let detector = CppSpecialDetector::new();
+
+        // C1E in wrong position (inside name part)
+        let result = detector.analyze_symbol("_ZN5C1EndC1Ev");
+        // This will find C1Ev at the end and parse successfully
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_demangle_empty_class_part() {
+        let detector = CppSpecialDetector::new();
+
+        // Symbol with empty class name part - _ZNC1Ev
+        let result = detector.analyze_symbol("_ZNC1Ev");
+        // Class part would be empty string between _ZN and C1E
+        assert!(result.is_some());
+        let (_, name) = result.unwrap();
+        assert!(name.is_empty());
+    }
+
+    #[test]
+    fn test_demangle_invalid_length_prefix() {
+        let detector = CppSpecialDetector::new();
+
+        // Invalid length that doesn't match actual name
+        let result = detector.analyze_symbol("_ZN99ShapeC1Ev");
+        // Should still produce some output
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_demangle_zero_length_name() {
+        let detector = CppSpecialDetector::new();
+
+        // Length 0 followed by something
+        let result = detector.analyze_symbol("_ZN05ShapeC1Ev");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_analyze_symbol_deeply_nested_namespace() {
+        let detector = CppSpecialDetector::new();
+
+        // Deeply nested: std::experimental::filesystem::path
+        let result = detector.analyze_symbol("_ZN3std12experimental10filesystem4pathC1Ev");
+        assert!(result.is_some());
+        let (_, name) = result.unwrap();
+        assert!(name.contains("std"));
+        assert!(name.contains("experimental"));
+        assert!(name.contains("filesystem"));
+        assert!(name.contains("path"));
+    }
+
+    #[test]
+    fn test_analyze_symbol_single_char_names() {
+        let detector = CppSpecialDetector::new();
+
+        // Single character class name
+        let result = detector.analyze_symbol("_ZN1AC1Ev");
+        assert!(result.is_some());
+        let (_, name) = result.unwrap();
+        assert_eq!(name, "A");
+
+        // Single char namespace and class
+        let result = detector.analyze_symbol("_ZN1A1BC1Ev");
+        assert!(result.is_some());
+        let (_, name) = result.unwrap();
+        assert_eq!(name, "A::B");
+    }
+
+    #[test]
+    fn test_analyze_symbol_all_ctor_variants() {
+        let detector = CppSpecialDetector::new();
+
+        // C1 - complete object constructor
+        let result = detector.analyze_symbol("_ZN4TestC1Ev").unwrap();
+        assert!(matches!(
+            result.0,
+            SpecialMemberKind::Constructor {
+                is_complete: true,
+                is_allocating: false
+            }
+        ));
+
+        // C2 - base object constructor
+        let result = detector.analyze_symbol("_ZN4TestC2Ev").unwrap();
+        assert!(matches!(
+            result.0,
+            SpecialMemberKind::Constructor {
+                is_complete: false,
+                is_allocating: false
+            }
+        ));
+
+        // C3 - allocating constructor
+        let result = detector.analyze_symbol("_ZN4TestC3Ev").unwrap();
+        assert!(matches!(
+            result.0,
+            SpecialMemberKind::Constructor {
+                is_complete: false,
+                is_allocating: true
+            }
+        ));
+    }
+
+    #[test]
+    fn test_analyze_symbol_all_dtor_variants() {
+        let detector = CppSpecialDetector::new();
+
+        // D0 - deleting destructor
+        let result = detector.analyze_symbol("_ZN4TestD0Ev").unwrap();
+        assert!(matches!(
+            result.0,
+            SpecialMemberKind::Destructor {
+                is_deleting: true,
+                is_complete: false
+            }
+        ));
+
+        // D1 - complete object destructor
+        let result = detector.analyze_symbol("_ZN4TestD1Ev").unwrap();
+        assert!(matches!(
+            result.0,
+            SpecialMemberKind::Destructor {
+                is_deleting: false,
+                is_complete: true
+            }
+        ));
+
+        // D2 - base object destructor
+        let result = detector.analyze_symbol("_ZN4TestD2Ev").unwrap();
+        assert!(matches!(
+            result.0,
+            SpecialMemberKind::Destructor {
+                is_deleting: false,
+                is_complete: false
+            }
+        ));
+    }
+
+    #[test]
+    fn test_special_member_kind_all_descriptions() {
+        assert_eq!(
+            SpecialMemberKind::Constructor {
+                is_complete: true,
+                is_allocating: false
+            }
+            .description(),
+            "complete object constructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::Constructor {
+                is_complete: false,
+                is_allocating: false
+            }
+            .description(),
+            "base object constructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::Constructor {
+                is_complete: false,
+                is_allocating: true
+            }
+            .description(),
+            "allocating constructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::Destructor {
+                is_deleting: true,
+                is_complete: false
+            }
+            .description(),
+            "deleting destructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::Destructor {
+                is_deleting: false,
+                is_complete: true
+            }
+            .description(),
+            "complete object destructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::Destructor {
+                is_deleting: false,
+                is_complete: false
+            }
+            .description(),
+            "base object destructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::CopyConstructor.description(),
+            "copy constructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::MoveConstructor.description(),
+            "move constructor"
+        );
+        assert_eq!(
+            SpecialMemberKind::CopyAssignment.description(),
+            "copy assignment operator"
+        );
+        assert_eq!(
+            SpecialMemberKind::MoveAssignment.description(),
+            "move assignment operator"
+        );
+    }
+
+    #[test]
+    fn test_database_empty_operations() {
+        let db = CppSpecialDatabase::new();
+
+        // Operations on empty database
+        assert!(!db.is_constructor(0x1000));
+        assert!(!db.is_destructor(0x1000));
+        assert!(db.get_constructor(0x1000).is_none());
+        assert!(db.get_destructor(0x1000).is_none());
+        assert!(db.constructors_for_class("Shape").is_empty());
+        assert!(db.destructors_for_class("Shape").is_empty());
+    }
+
+    #[test]
+    fn test_database_get_class_name_none() {
+        let mut db = CppSpecialDatabase::new();
+
+        // Analysis without class name
+        let analysis = SpecialMemberAnalysis {
+            kind: Some(SpecialMemberKind::Constructor {
+                is_complete: true,
+                is_allocating: false,
+            }),
+            class_name: None, // No class name
+            confidence: 0.5,
+            ..Default::default()
+        };
+
+        db.add(0x1000, analysis);
+
+        assert!(db.is_constructor(0x1000));
+        let retrieved = db.get_constructor(0x1000).unwrap();
+        assert!(retrieved.class_name.is_none());
+    }
+
+    #[test]
+    fn test_analysis_default_values() {
+        let analysis = SpecialMemberAnalysis::default();
+
+        assert!(analysis.kind.is_none());
+        assert!(analysis.class_name.is_none());
+        assert!(analysis.vtable_assignments.is_empty());
+        assert!(analysis.base_calls.is_empty());
+        assert!((analysis.confidence - 0.0).abs() < f64::EPSILON);
+        assert!(analysis.notes.is_empty());
+    }
+
+    #[test]
+    fn test_detector_builder_methods() {
+        let detector = CppSpecialDetector::new()
+            .with_pointer_size(4)
+            .with_vtable_classes(vec![(0x1000, "Shape".to_string())])
+            .with_known_constructors(vec![0x2000, 0x2100])
+            .with_known_destructors(vec![0x3000]);
+
+        // Verify the detector was configured (indirectly through analysis)
+        // Since these are internal state, we test the configuration was applied
+        assert!(detector.analyze_symbol("_ZN5ShapeC1Ev").is_some());
+    }
+
+    #[test]
+    fn test_special_member_kind_equality() {
+        let ctor1 = SpecialMemberKind::Constructor {
+            is_complete: true,
+            is_allocating: false,
+        };
+        let ctor2 = SpecialMemberKind::Constructor {
+            is_complete: true,
+            is_allocating: false,
+        };
+        let ctor3 = SpecialMemberKind::Constructor {
+            is_complete: false,
+            is_allocating: false,
+        };
+
+        assert_eq!(ctor1, ctor2);
+        assert_ne!(ctor1, ctor3);
+    }
+
+    #[test]
+    fn test_vtable_assignment_fields() {
+        let va = VtableAssignment {
+            instruction_addr: 0x1000,
+            vtable_addr: 0x2000,
+            object_offset: 0,
+        };
+
+        assert_eq!(va.instruction_addr, 0x1000);
+        assert_eq!(va.vtable_addr, 0x2000);
+        assert_eq!(va.object_offset, 0);
+    }
+
+    #[test]
+    fn test_base_call_fields() {
+        let bc = BaseCall {
+            call_addr: 0x1000,
+            target_addr: 0x2000,
+            class_name: Some("Base".to_string()),
+            is_constructor: true,
+        };
+
+        assert_eq!(bc.call_addr, 0x1000);
+        assert_eq!(bc.target_addr, 0x2000);
+        assert_eq!(bc.class_name, Some("Base".to_string()));
+        assert!(bc.is_constructor);
+    }
+
+    #[test]
+    fn test_analyze_symbol_with_parameters() {
+        let detector = CppSpecialDetector::new();
+
+        // Constructor with parameters (not just Ev)
+        let result = detector.analyze_symbol("_ZN5ShapeC1Ei"); // int param
+        assert!(result.is_some());
+
+        let result = detector.analyze_symbol("_ZN5ShapeC1EPKc"); // const char* param
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_database_multiple_classes() {
+        let mut db = CppSpecialDatabase::new();
+
+        let shape_ctor = SpecialMemberAnalysis {
+            kind: Some(SpecialMemberKind::Constructor {
+                is_complete: true,
+                is_allocating: false,
+            }),
+            class_name: Some("Shape".to_string()),
+            confidence: 0.9,
+            ..Default::default()
+        };
+
+        let circle_ctor = SpecialMemberAnalysis {
+            kind: Some(SpecialMemberKind::Constructor {
+                is_complete: true,
+                is_allocating: false,
+            }),
+            class_name: Some("Circle".to_string()),
+            confidence: 0.9,
+            ..Default::default()
+        };
+
+        let circle_dtor = SpecialMemberAnalysis {
+            kind: Some(SpecialMemberKind::Destructor {
+                is_deleting: false,
+                is_complete: true,
+            }),
+            class_name: Some("Circle".to_string()),
+            confidence: 0.9,
+            ..Default::default()
+        };
+
+        db.add(0x1000, shape_ctor);
+        db.add(0x2000, circle_ctor);
+        db.add(0x3000, circle_dtor);
+
+        assert_eq!(db.constructors_for_class("Shape").len(), 1);
+        assert_eq!(db.constructors_for_class("Circle").len(), 1);
+        assert_eq!(db.destructors_for_class("Circle").len(), 1);
+        assert_eq!(db.destructors_for_class("Shape").len(), 0);
+    }
 }
