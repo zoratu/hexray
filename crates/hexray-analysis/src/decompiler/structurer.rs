@@ -3603,3 +3603,1085 @@ fn is_noreturn_function(name: &str) -> bool {
             | "fortify_fail"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hexray_core::{BasicBlock, BlockTerminator, Condition};
+
+    // --- Helper functions to create test CFGs ---
+
+    fn make_diamond_cfg() -> ControlFlowGraph {
+        //     bb0
+        //    /   \
+        //  bb1   bb2
+        //    \   /
+        //     bb3
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        cfg
+    }
+
+    fn make_while_loop_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 (loop header with condition)
+        //        bb1 -> bb2 (loop body) -> bb1 (back edge)
+        //        bb1 -> bb3 (exit)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1));
+
+        cfg
+    }
+
+    fn make_dowhile_loop_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 (loop body)
+        //        bb1 -> bb2 (condition at bottom)
+        //        bb2 -> bb1 (back edge if true)
+        //        bb2 -> bb3 (exit if false)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        cfg
+    }
+
+    fn make_infinite_loop_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 (loop header)
+        //        bb1 -> bb1 (unconditional back edge)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb1);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(1));
+
+        cfg
+    }
+
+    fn make_nested_if_cfg() -> ControlFlowGraph {
+        // bb0 (if cond1)
+        //   -> bb1 (then: if cond2)
+        //        -> bb2 (then-then)
+        //        -> bb3 (then-else)
+        //        both -> bb4
+        //   -> bb5 (else)
+        //   bb4 -> bb6, bb5 -> bb6 (exit)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(5),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Less,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb3);
+
+        let mut bb4 = BasicBlock::new(BasicBlockId::new(4), 0x1040);
+        bb4.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(6),
+        };
+        cfg.add_block(bb4);
+
+        let mut bb5 = BasicBlock::new(BasicBlockId::new(5), 0x1050);
+        bb5.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(6),
+        };
+        cfg.add_block(bb5);
+
+        let mut bb6 = BasicBlock::new(BasicBlockId::new(6), 0x1060);
+        bb6.terminator = BlockTerminator::Return;
+        cfg.add_block(bb6);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(5));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(4), BasicBlockId::new(6));
+        cfg.add_edge(BasicBlockId::new(5), BasicBlockId::new(6));
+
+        cfg
+    }
+
+    fn make_simple_return_cfg() -> ControlFlowGraph {
+        // bb0 -> return
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Return;
+        cfg.add_block(bb0);
+        cfg
+    }
+
+    fn make_nested_loop_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 (outer header) -> bb2 (inner header) -> bb3 (inner body)
+        //                                                      -> bb2 (inner back)
+        //                              bb2 -> bb4 (between loops) -> bb1 (outer back)
+        //        bb1 -> bb5 (exit)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(5),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(3),
+            false_target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb3);
+
+        let mut bb4 = BasicBlock::new(BasicBlockId::new(4), 0x1040);
+        bb4.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb4);
+
+        let mut bb5 = BasicBlock::new(BasicBlockId::new(5), 0x1050);
+        bb5.terminator = BlockTerminator::Return;
+        cfg.add_block(bb5);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(5));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(4), BasicBlockId::new(1));
+
+        cfg
+    }
+
+    // --- LoopKind Tests ---
+
+    #[test]
+    fn test_loop_kind_equality() {
+        assert_eq!(LoopKind::While, LoopKind::While);
+        assert_eq!(LoopKind::DoWhile, LoopKind::DoWhile);
+        assert_eq!(LoopKind::Infinite, LoopKind::Infinite);
+        assert_eq!(LoopKind::For, LoopKind::For);
+        assert_ne!(LoopKind::While, LoopKind::DoWhile);
+    }
+
+    #[test]
+    fn test_loop_kind_debug() {
+        assert_eq!(format!("{:?}", LoopKind::While), "While");
+        assert_eq!(format!("{:?}", LoopKind::DoWhile), "DoWhile");
+        assert_eq!(format!("{:?}", LoopKind::Infinite), "Infinite");
+        assert_eq!(format!("{:?}", LoopKind::For), "For");
+    }
+
+    #[test]
+    fn test_loop_kind_copy() {
+        let kind = LoopKind::While;
+        let kind_copy = kind;
+        assert_eq!(kind, kind_copy);
+    }
+
+    // --- LoopInfo Tests ---
+
+    #[test]
+    fn test_loop_info_creation() {
+        let info = LoopInfo {
+            header: BasicBlockId::new(1),
+            back_edges: vec![BasicBlockId::new(2)],
+            body: [BasicBlockId::new(1), BasicBlockId::new(2)]
+                .into_iter()
+                .collect(),
+            kind: LoopKind::While,
+            exit_blocks: vec![BasicBlockId::new(3)],
+        };
+
+        assert_eq!(info.header, BasicBlockId::new(1));
+        assert_eq!(info.back_edges.len(), 1);
+        assert_eq!(info.body.len(), 2);
+        assert_eq!(info.kind, LoopKind::While);
+        assert_eq!(info.exit_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_loop_info_debug() {
+        let info = LoopInfo {
+            header: BasicBlockId::new(0),
+            back_edges: vec![],
+            body: HashSet::new(),
+            kind: LoopKind::Infinite,
+            exit_blocks: vec![],
+        };
+        let debug_str = format!("{:?}", info);
+        assert!(debug_str.contains("LoopInfo"));
+        assert!(debug_str.contains("Infinite"));
+    }
+
+    // --- StructuredNode Tests ---
+
+    #[test]
+    fn test_structured_node_block() {
+        let node = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![],
+            address_range: (0x1000, 0x1010),
+        };
+
+        if let StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } = node
+        {
+            assert_eq!(id, BasicBlockId::new(0));
+            assert!(statements.is_empty());
+            assert_eq!(address_range, (0x1000, 0x1010));
+        } else {
+            panic!("Expected Block node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_if() {
+        let node = StructuredNode::If {
+            condition: Expr::int(1),
+            then_body: vec![StructuredNode::Break],
+            else_body: Some(vec![StructuredNode::Continue]),
+        };
+
+        if let StructuredNode::If {
+            then_body,
+            else_body,
+            ..
+        } = node
+        {
+            assert_eq!(then_body.len(), 1);
+            assert!(else_body.is_some());
+            assert_eq!(else_body.unwrap().len(), 1);
+        } else {
+            panic!("Expected If node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_while() {
+        let node = StructuredNode::While {
+            condition: Expr::int(1),
+            body: vec![],
+            header: Some(BasicBlockId::new(1)),
+        };
+
+        if let StructuredNode::While {
+            condition, header, ..
+        } = node
+        {
+            assert!(matches!(
+                condition.kind,
+                super::super::expression::ExprKind::IntLit(1)
+            ));
+            assert_eq!(header, Some(BasicBlockId::new(1)));
+        } else {
+            panic!("Expected While node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_dowhile() {
+        let node = StructuredNode::DoWhile {
+            body: vec![StructuredNode::Break],
+            condition: Expr::int(0),
+            header: Some(BasicBlockId::new(2)),
+        };
+
+        if let StructuredNode::DoWhile { body, header, .. } = node {
+            assert_eq!(body.len(), 1);
+            assert_eq!(header, Some(BasicBlockId::new(2)));
+        } else {
+            panic!("Expected DoWhile node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_for() {
+        let node = StructuredNode::For {
+            init: Some(Expr::int(0)),
+            condition: Expr::int(1),
+            update: Some(Expr::int(1)),
+            body: vec![],
+            header: None,
+        };
+
+        if let StructuredNode::For { init, update, .. } = node {
+            assert!(init.is_some());
+            assert!(update.is_some());
+        } else {
+            panic!("Expected For node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_loop() {
+        let node = StructuredNode::Loop {
+            body: vec![StructuredNode::Continue],
+            header: Some(BasicBlockId::new(0)),
+        };
+
+        if let StructuredNode::Loop { body, header } = node {
+            assert_eq!(body.len(), 1);
+            assert!(header.is_some());
+        } else {
+            panic!("Expected Loop node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_break_continue() {
+        assert!(matches!(StructuredNode::Break, StructuredNode::Break));
+        assert!(matches!(StructuredNode::Continue, StructuredNode::Continue));
+    }
+
+    #[test]
+    fn test_structured_node_return() {
+        let ret_none = StructuredNode::Return(None);
+        let ret_some = StructuredNode::Return(Some(Expr::int(42)));
+
+        if let StructuredNode::Return(val) = ret_none {
+            assert!(val.is_none());
+        }
+
+        if let StructuredNode::Return(val) = ret_some {
+            assert!(val.is_some());
+        }
+    }
+
+    #[test]
+    fn test_structured_node_goto_label() {
+        let goto = StructuredNode::Goto(BasicBlockId::new(5));
+        let label = StructuredNode::Label(BasicBlockId::new(5));
+
+        if let StructuredNode::Goto(target) = goto {
+            assert_eq!(target, BasicBlockId::new(5));
+        }
+
+        if let StructuredNode::Label(target) = label {
+            assert_eq!(target, BasicBlockId::new(5));
+        }
+    }
+
+    #[test]
+    fn test_structured_node_switch() {
+        let node = StructuredNode::Switch {
+            value: Expr::int(0),
+            cases: vec![
+                (vec![1], vec![StructuredNode::Break]),
+                (vec![2, 3], vec![StructuredNode::Continue]),
+            ],
+            default: Some(vec![StructuredNode::Return(None)]),
+        };
+
+        if let StructuredNode::Switch { cases, default, .. } = node {
+            assert_eq!(cases.len(), 2);
+            assert_eq!(cases[0].0, vec![1]);
+            assert_eq!(cases[1].0, vec![2, 3]);
+            assert!(default.is_some());
+        } else {
+            panic!("Expected Switch node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_sequence() {
+        let node = StructuredNode::Sequence(vec![
+            StructuredNode::Break,
+            StructuredNode::Continue,
+            StructuredNode::Return(None),
+        ]);
+
+        if let StructuredNode::Sequence(nodes) = node {
+            assert_eq!(nodes.len(), 3);
+        } else {
+            panic!("Expected Sequence node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_expr() {
+        let node = StructuredNode::Expr(Expr::int(123));
+
+        if let StructuredNode::Expr(expr) = node {
+            assert!(matches!(
+                expr.kind,
+                super::super::expression::ExprKind::IntLit(123)
+            ));
+        } else {
+            panic!("Expected Expr node");
+        }
+    }
+
+    #[test]
+    fn test_structured_node_try_catch() {
+        let handler = CatchHandler {
+            exception_type: Some("std::exception".to_string()),
+            variable_name: Some("e".to_string()),
+            body: vec![StructuredNode::Return(None)],
+            landing_pad: 0x2000,
+        };
+
+        let node = StructuredNode::TryCatch {
+            try_body: vec![StructuredNode::Break],
+            catch_handlers: vec![handler],
+        };
+
+        if let StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } = node
+        {
+            assert_eq!(try_body.len(), 1);
+            assert_eq!(catch_handlers.len(), 1);
+            assert_eq!(
+                catch_handlers[0].exception_type,
+                Some("std::exception".to_string())
+            );
+        } else {
+            panic!("Expected TryCatch node");
+        }
+    }
+
+    // --- CatchHandler Tests ---
+
+    #[test]
+    fn test_catch_handler_creation() {
+        let handler = CatchHandler {
+            exception_type: None,
+            variable_name: None,
+            body: vec![],
+            landing_pad: 0x3000,
+        };
+
+        assert!(handler.exception_type.is_none());
+        assert!(handler.variable_name.is_none());
+        assert!(handler.body.is_empty());
+        assert_eq!(handler.landing_pad, 0x3000);
+    }
+
+    #[test]
+    fn test_catch_handler_with_type() {
+        let handler = CatchHandler {
+            exception_type: Some("int".to_string()),
+            variable_name: Some("x".to_string()),
+            body: vec![StructuredNode::Break],
+            landing_pad: 0x4000,
+        };
+
+        assert_eq!(handler.exception_type, Some("int".to_string()));
+        assert_eq!(handler.variable_name, Some("x".to_string()));
+    }
+
+    // --- body_terminates Tests ---
+
+    #[test]
+    fn test_body_terminates_empty() {
+        assert!(!body_terminates(&[]));
+    }
+
+    #[test]
+    fn test_body_terminates_return() {
+        assert!(body_terminates(&[StructuredNode::Return(None)]));
+        assert!(body_terminates(&[StructuredNode::Return(Some(Expr::int(
+            0
+        )))]));
+    }
+
+    #[test]
+    fn test_body_terminates_break_continue() {
+        assert!(body_terminates(&[StructuredNode::Break]));
+        assert!(body_terminates(&[StructuredNode::Continue]));
+    }
+
+    #[test]
+    fn test_body_terminates_goto() {
+        assert!(body_terminates(&[StructuredNode::Goto(BasicBlockId::new(
+            0
+        ))]));
+    }
+
+    #[test]
+    fn test_body_terminates_if_both_branches() {
+        // If both branches terminate, the if terminates
+        let if_node = StructuredNode::If {
+            condition: Expr::int(1),
+            then_body: vec![StructuredNode::Return(None)],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        assert!(body_terminates(&[if_node]));
+    }
+
+    #[test]
+    fn test_body_terminates_if_one_branch() {
+        // If only one branch terminates, the if does not terminate
+        let if_node = StructuredNode::If {
+            condition: Expr::int(1),
+            then_body: vec![StructuredNode::Return(None)],
+            else_body: Some(vec![]), // else doesn't terminate
+        };
+        assert!(!body_terminates(&[if_node]));
+    }
+
+    #[test]
+    fn test_body_terminates_if_no_else() {
+        // If without else does not terminate
+        let if_node = StructuredNode::If {
+            condition: Expr::int(1),
+            then_body: vec![StructuredNode::Return(None)],
+            else_body: None,
+        };
+        assert!(!body_terminates(&[if_node]));
+    }
+
+    #[test]
+    fn test_body_terminates_sequence() {
+        let seq = StructuredNode::Sequence(vec![
+            StructuredNode::Expr(Expr::int(1)),
+            StructuredNode::Return(None),
+        ]);
+        assert!(body_terminates(&[seq]));
+    }
+
+    #[test]
+    fn test_body_terminates_non_terminating() {
+        // Block with just expressions doesn't terminate
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::int(1)],
+            address_range: (0, 0),
+        };
+        assert!(!body_terminates(&[block]));
+    }
+
+    // --- is_noreturn_function Tests ---
+
+    #[test]
+    fn test_is_noreturn_function_exit() {
+        assert!(is_noreturn_function("exit"));
+        assert!(is_noreturn_function("_exit"));
+        assert!(is_noreturn_function("__exit"));
+        assert!(is_noreturn_function("Exit"));
+    }
+
+    #[test]
+    fn test_is_noreturn_function_abort() {
+        assert!(is_noreturn_function("abort"));
+        assert!(is_noreturn_function("_abort"));
+    }
+
+    #[test]
+    fn test_is_noreturn_function_err_family() {
+        assert!(is_noreturn_function("err"));
+        assert!(is_noreturn_function("errx"));
+        assert!(is_noreturn_function("verr"));
+        assert!(is_noreturn_function("verrx"));
+    }
+
+    #[test]
+    fn test_is_noreturn_function_cxx() {
+        assert!(is_noreturn_function("__cxa_throw"));
+        assert!(is_noreturn_function("__cxa_rethrow"));
+        assert!(is_noreturn_function("__cxa_bad_cast"));
+        assert!(is_noreturn_function("__cxa_bad_typeid"));
+    }
+
+    #[test]
+    fn test_is_noreturn_function_longjmp() {
+        assert!(is_noreturn_function("longjmp"));
+        assert!(is_noreturn_function("siglongjmp"));
+    }
+
+    #[test]
+    fn test_is_noreturn_function_thread() {
+        assert!(is_noreturn_function("pthread_exit"));
+        assert!(is_noreturn_function("thrd_exit"));
+    }
+
+    #[test]
+    fn test_is_noreturn_function_security() {
+        assert!(is_noreturn_function("__stack_chk_fail"));
+        assert!(is_noreturn_function("__fortify_fail"));
+    }
+
+    #[test]
+    fn test_is_noreturn_function_false() {
+        assert!(!is_noreturn_function("printf"));
+        assert!(!is_noreturn_function("malloc"));
+        assert!(!is_noreturn_function("main"));
+        assert!(!is_noreturn_function(""));
+    }
+
+    // --- Structurer Integration Tests ---
+
+    #[test]
+    fn test_structurer_simple_return() {
+        let cfg = make_simple_return_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        assert_eq!(structured.cfg_entry, BasicBlockId::new(0));
+        // Should produce at least a return node
+        let has_return = structured
+            .body()
+            .iter()
+            .any(|n| matches!(n, StructuredNode::Return(_)));
+        assert!(has_return, "Should contain a return node");
+    }
+
+    #[test]
+    fn test_structurer_diamond_if_else() {
+        let cfg = make_diamond_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        // Should produce an if-else structure
+        let has_if = structured
+            .body()
+            .iter()
+            .any(|n| matches!(n, StructuredNode::If { .. }));
+        assert!(has_if, "Diamond CFG should produce if-else structure");
+    }
+
+    #[test]
+    fn test_structurer_while_loop() {
+        let cfg = make_while_loop_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        // Should produce a while loop
+        let has_while = structured
+            .body()
+            .iter()
+            .any(|n| matches!(n, StructuredNode::While { .. } | StructuredNode::For { .. }));
+        assert!(
+            has_while,
+            "While loop CFG should produce while/for structure"
+        );
+    }
+
+    #[test]
+    fn test_structurer_dowhile_loop() {
+        let cfg = make_dowhile_loop_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        // Should produce a do-while loop
+        let has_dowhile = structured.body().iter().any(|n| {
+            matches!(
+                n,
+                StructuredNode::DoWhile { .. }
+                    | StructuredNode::While { .. }
+                    | StructuredNode::Loop { .. }
+            )
+        });
+        assert!(
+            has_dowhile,
+            "Do-while loop CFG should produce loop structure"
+        );
+    }
+
+    #[test]
+    fn test_structurer_infinite_loop() {
+        let cfg = make_infinite_loop_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        // Should produce an infinite loop or while(1)
+        let has_loop = structured.body().iter().any(|n| {
+            matches!(
+                n,
+                StructuredNode::Loop { .. } | StructuredNode::While { .. }
+            )
+        });
+        assert!(
+            has_loop,
+            "Infinite loop CFG should produce loop/while structure"
+        );
+    }
+
+    #[test]
+    fn test_structurer_nested_if() {
+        let cfg = make_nested_if_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        // Should contain at least one if structure
+        let has_if = structured
+            .body()
+            .iter()
+            .any(|n| matches!(n, StructuredNode::If { .. }));
+        assert!(has_if, "Nested if CFG should produce if structure");
+    }
+
+    #[test]
+    fn test_structurer_nested_loop() {
+        let cfg = make_nested_loop_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        // Should produce nested loops - count loop structures
+        fn count_loops(nodes: &[StructuredNode]) -> usize {
+            let mut count = 0;
+            for node in nodes {
+                match node {
+                    StructuredNode::While { body, .. }
+                    | StructuredNode::DoWhile { body, .. }
+                    | StructuredNode::For { body, .. }
+                    | StructuredNode::Loop { body, .. } => {
+                        count += 1;
+                        count += count_loops(body);
+                    }
+                    StructuredNode::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        count += count_loops(then_body);
+                        if let Some(eb) = else_body {
+                            count += count_loops(eb);
+                        }
+                    }
+                    StructuredNode::Sequence(nodes) => {
+                        count += count_loops(nodes);
+                    }
+                    _ => {}
+                }
+            }
+            count
+        }
+
+        let loop_count = count_loops(structured.body());
+        assert!(
+            loop_count >= 1,
+            "Nested loop CFG should produce at least 1 loop structure, got {}",
+            loop_count
+        );
+    }
+
+    // --- flatten_guard_clauses Tests ---
+
+    #[test]
+    fn test_flatten_guard_clauses_simple_return() {
+        let nodes = vec![StructuredNode::Return(None)];
+        let flattened = flatten_guard_clauses(nodes);
+        assert_eq!(flattened.len(), 1);
+        assert!(matches!(flattened[0], StructuredNode::Return(_)));
+    }
+
+    #[test]
+    fn test_flatten_guard_clauses_if_with_return() {
+        // if (cond) { work } else { return }
+        // Should become: if (!cond) { return }; work
+        let nodes = vec![StructuredNode::If {
+            condition: Expr::int(1),
+            then_body: vec![StructuredNode::Expr(Expr::int(42))],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        }];
+
+        let flattened = flatten_guard_clauses(nodes);
+        // The flattening transforms this pattern
+        assert!(!flattened.is_empty());
+    }
+
+    #[test]
+    fn test_flatten_guard_clauses_nested_sequence() {
+        let nodes = vec![StructuredNode::Sequence(vec![
+            StructuredNode::Expr(Expr::int(1)),
+            StructuredNode::Sequence(vec![StructuredNode::Return(None)]),
+        ])];
+
+        let flattened = flatten_guard_clauses(nodes);
+        // Sequences should be flattened
+        assert!(!flattened.is_empty());
+    }
+
+    #[test]
+    fn test_flatten_guard_clauses_preserves_loops() {
+        let nodes = vec![StructuredNode::While {
+            condition: Expr::int(1),
+            body: vec![StructuredNode::Break],
+            header: None,
+        }];
+
+        let flattened = flatten_guard_clauses(nodes);
+        assert_eq!(flattened.len(), 1);
+        assert!(matches!(flattened[0], StructuredNode::While { .. }));
+    }
+
+    // --- Loop Classification Tests ---
+
+    #[test]
+    fn test_classify_loop_while() {
+        let cfg = make_while_loop_cfg();
+        let loops = cfg.find_loops();
+
+        assert!(!loops.is_empty(), "Should detect a loop");
+
+        // The loop should be classified as While (condition at header)
+        let body_set: HashSet<_> = loops[0].body.iter().copied().collect();
+        let kind = Structurer::classify_loop(&cfg, &loops[0], &body_set);
+        assert_eq!(kind, LoopKind::While);
+    }
+
+    #[test]
+    fn test_classify_loop_dowhile() {
+        let cfg = make_dowhile_loop_cfg();
+        let loops = cfg.find_loops();
+
+        assert!(!loops.is_empty(), "Should detect a loop");
+
+        // Find the actual back edge block for do-while classification
+        let body_set: HashSet<_> = loops[0].body.iter().copied().collect();
+        let kind = Structurer::classify_loop(&cfg, &loops[0], &body_set);
+        // Do-while has condition at the back edge block
+        assert!(
+            kind == LoopKind::DoWhile || kind == LoopKind::While,
+            "Should be DoWhile or While, got {:?}",
+            kind
+        );
+    }
+
+    // --- Find Loop Exits Tests ---
+
+    #[test]
+    fn test_find_loop_exits_while() {
+        let cfg = make_while_loop_cfg();
+        let loops = cfg.find_loops();
+
+        assert!(!loops.is_empty());
+
+        let body_set: HashSet<_> = loops[0].body.iter().copied().collect();
+        let exits = Structurer::find_loop_exits(&cfg, &body_set);
+
+        assert!(
+            exits.contains(&BasicBlockId::new(3)),
+            "Loop exit should be bb3"
+        );
+    }
+
+    #[test]
+    fn test_find_loop_exits_infinite() {
+        let cfg = make_infinite_loop_cfg();
+        let loops = cfg.find_loops();
+
+        assert!(!loops.is_empty());
+
+        let body_set: HashSet<_> = loops[0].body.iter().copied().collect();
+        let exits = Structurer::find_loop_exits(&cfg, &body_set);
+
+        // Infinite loop has no exits
+        assert!(exits.is_empty(), "Infinite loop should have no exits");
+    }
+
+    // --- StructuredCfg body() Tests ---
+
+    #[test]
+    fn test_structured_cfg_body() {
+        let cfg = make_simple_return_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        let body = structured.body();
+        assert!(!body.is_empty());
+    }
+
+    // --- simplify_expressions Tests ---
+
+    #[test]
+    fn test_simplify_expressions_block() {
+        let nodes = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::int(1)],
+            address_range: (0, 0),
+        }];
+
+        let simplified = simplify_expressions(nodes);
+        assert_eq!(simplified.len(), 1);
+    }
+
+    #[test]
+    fn test_simplify_expressions_nested_if() {
+        let nodes = vec![StructuredNode::If {
+            condition: Expr::int(1),
+            then_body: vec![StructuredNode::Expr(Expr::int(2))],
+            else_body: Some(vec![StructuredNode::Expr(Expr::int(3))]),
+        }];
+
+        let simplified = simplify_expressions(nodes);
+        assert_eq!(simplified.len(), 1);
+    }
+
+    #[test]
+    fn test_simplify_expressions_for_loop() {
+        let nodes = vec![StructuredNode::For {
+            init: Some(Expr::int(0)),
+            condition: Expr::int(1),
+            update: Some(Expr::int(1)),
+            body: vec![],
+            header: None,
+        }];
+
+        let simplified = simplify_expressions(nodes);
+        assert_eq!(simplified.len(), 1);
+    }
+
+    // --- convert_gotos_to_break_continue Tests ---
+
+    #[test]
+    fn test_convert_gotos_no_loop_context() {
+        let nodes = vec![StructuredNode::Goto(BasicBlockId::new(5))];
+        let converted = convert_gotos_to_break_continue(nodes, None);
+
+        // Without loop context, goto remains a goto
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(converted[0], StructuredNode::Goto(_)));
+    }
+
+    #[test]
+    fn test_convert_gotos_to_continue() {
+        let ctx = LoopContext {
+            header: BasicBlockId::new(1),
+        };
+
+        let nodes = vec![StructuredNode::Goto(BasicBlockId::new(1))];
+        let converted = convert_gotos_to_break_continue(nodes, Some(&ctx));
+
+        // Goto to header becomes continue
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(converted[0], StructuredNode::Continue));
+    }
+
+    #[test]
+    fn test_convert_gotos_preserves_other() {
+        let nodes = vec![StructuredNode::Return(None), StructuredNode::Break];
+        let converted = convert_gotos_to_break_continue(nodes, None);
+
+        assert_eq!(converted.len(), 2);
+        assert!(matches!(converted[0], StructuredNode::Return(_)));
+        assert!(matches!(converted[1], StructuredNode::Break));
+    }
+}
