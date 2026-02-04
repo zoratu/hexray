@@ -361,4 +361,330 @@ mod tests {
 
         assert_eq!(sig.to_c_prototype(), "void abort(void)");
     }
+
+    // ==================== CallingConvention Tests ====================
+
+    #[test]
+    fn test_calling_convention_names() {
+        assert_eq!(CallingConvention::SystemV.name(), "System V");
+        assert_eq!(CallingConvention::Win64.name(), "Win64");
+        assert_eq!(CallingConvention::Aarch64.name(), "AAPCS64");
+        assert_eq!(CallingConvention::RiscV.name(), "RISC-V");
+        assert_eq!(CallingConvention::Cdecl.name(), "cdecl");
+        assert_eq!(CallingConvention::Stdcall.name(), "stdcall");
+        assert_eq!(CallingConvention::Unknown.name(), "unknown");
+    }
+
+    #[test]
+    fn test_calling_convention_default() {
+        assert_eq!(CallingConvention::default(), CallingConvention::SystemV);
+    }
+
+    // ==================== ParameterType Tests ====================
+
+    #[test]
+    fn test_parameter_type_to_c_string_int_sizes() {
+        assert_eq!(
+            ParameterType::Int {
+                size: 1,
+                signed: true
+            }
+            .to_c_string(),
+            "int8_t"
+        );
+        assert_eq!(
+            ParameterType::Int {
+                size: 1,
+                signed: false
+            }
+            .to_c_string(),
+            "uint8_t"
+        );
+        assert_eq!(
+            ParameterType::Int {
+                size: 2,
+                signed: true
+            }
+            .to_c_string(),
+            "int16_t"
+        );
+        assert_eq!(
+            ParameterType::Int {
+                size: 2,
+                signed: false
+            }
+            .to_c_string(),
+            "uint16_t"
+        );
+        assert_eq!(
+            ParameterType::Int {
+                size: 4,
+                signed: true
+            }
+            .to_c_string(),
+            "int"
+        );
+        assert_eq!(
+            ParameterType::Int {
+                size: 4,
+                signed: false
+            }
+            .to_c_string(),
+            "unsigned int"
+        );
+        assert_eq!(
+            ParameterType::Int {
+                size: 8,
+                signed: true
+            }
+            .to_c_string(),
+            "int64_t"
+        );
+        assert_eq!(
+            ParameterType::Int {
+                size: 8,
+                signed: false
+            }
+            .to_c_string(),
+            "uint64_t"
+        );
+    }
+
+    #[test]
+    fn test_parameter_type_to_c_string_special() {
+        assert_eq!(ParameterType::Void.to_c_string(), "void");
+        assert_eq!(ParameterType::String.to_c_string(), "const char*");
+        assert_eq!(ParameterType::OpaquePtr.to_c_string(), "void*");
+        assert_eq!(ParameterType::Size.to_c_string(), "size_t");
+        assert_eq!(ParameterType::FilePtr.to_c_string(), "FILE*");
+        assert_eq!(ParameterType::Unknown.to_c_string(), "...");
+    }
+
+    #[test]
+    fn test_parameter_type_pointer() {
+        let ptr_int = ParameterType::Pointer(Box::new(ParameterType::Int {
+            size: 4,
+            signed: true,
+        }));
+        assert_eq!(ptr_int.to_c_string(), "int*");
+
+        let ptr_ptr = ParameterType::Pointer(Box::new(ParameterType::OpaquePtr));
+        assert_eq!(ptr_ptr.to_c_string(), "void**");
+    }
+
+    #[test]
+    fn test_parameter_type_default() {
+        assert_eq!(ParameterType::default(), ParameterType::Unknown);
+    }
+
+    // ==================== Parameter Tests ====================
+
+    #[test]
+    fn test_parameter_new() {
+        let param = Parameter::new(
+            "x",
+            ParameterType::Int {
+                size: 4,
+                signed: true,
+            },
+        );
+        assert_eq!(param.name, "x");
+        assert_eq!(
+            param.param_type,
+            ParameterType::Int {
+                size: 4,
+                signed: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_parameter_helpers() {
+        let int_param = Parameter::int("n");
+        assert_eq!(int_param.name, "n");
+        assert_eq!(
+            int_param.param_type,
+            ParameterType::Int {
+                size: 4,
+                signed: true
+            }
+        );
+
+        let size_param = Parameter::size("len");
+        assert_eq!(size_param.name, "len");
+        assert_eq!(size_param.param_type, ParameterType::Size);
+
+        let str_param = Parameter::string("s");
+        assert_eq!(str_param.name, "s");
+        assert_eq!(str_param.param_type, ParameterType::String);
+
+        let ptr_param = Parameter::ptr("buf");
+        assert_eq!(ptr_param.name, "buf");
+        assert_eq!(ptr_param.param_type, ParameterType::OpaquePtr);
+
+        let file_param = Parameter::file("stream");
+        assert_eq!(file_param.name, "stream");
+        assert_eq!(file_param.param_type, ParameterType::FilePtr);
+    }
+
+    // ==================== FunctionSignature Tests ====================
+
+    #[test]
+    fn test_signature_builder_chain() {
+        let sig = FunctionSignature::from_hex("memcpy", "55 48 89 E5")
+            .unwrap()
+            .with_size_hint(64)
+            .with_convention(CallingConvention::SystemV)
+            .with_return_type(ParameterType::OpaquePtr)
+            .with_param(Parameter::ptr("dest"))
+            .with_param(Parameter::ptr("src"))
+            .with_param(Parameter::size("n"))
+            .with_library("libc")
+            .with_version("glibc-2.31")
+            .with_doc("Copy memory area")
+            .with_confidence(0.85)
+            .with_alias("__memcpy_sse2");
+
+        assert_eq!(sig.name, "memcpy");
+        assert_eq!(sig.size_hint, Some(64));
+        assert_eq!(sig.calling_convention, CallingConvention::SystemV);
+        assert_eq!(sig.return_type, ParameterType::OpaquePtr);
+        assert_eq!(sig.parameters.len(), 3);
+        assert_eq!(sig.library, "libc");
+        assert_eq!(sig.version, Some("glibc-2.31".to_string()));
+        assert!(sig.doc.is_some());
+        assert!((sig.confidence - 0.85).abs() < 0.001);
+        assert_eq!(sig.aliases, vec!["__memcpy_sse2"]);
+    }
+
+    #[test]
+    fn test_signature_variadic() {
+        let sig = FunctionSignature::from_hex("sprintf", "55 48 89 E5")
+            .unwrap()
+            .with_param(Parameter::string("str"))
+            .with_param(Parameter::string("format"))
+            .variadic();
+
+        assert!(sig.variadic);
+        assert_eq!(
+            sig.to_c_prototype(),
+            "int sprintf(const char* str, const char* format, ...)"
+        );
+    }
+
+    #[test]
+    fn test_signature_confidence_clamp() {
+        let sig1 = FunctionSignature::from_hex("test", "55")
+            .unwrap()
+            .with_confidence(1.5);
+        assert!((sig1.confidence - 1.0).abs() < 0.001);
+
+        let sig2 = FunctionSignature::from_hex("test", "55")
+            .unwrap()
+            .with_confidence(-0.5);
+        assert!(sig2.confidence.abs() < 0.001);
+    }
+
+    #[test]
+    fn test_signature_multiple_aliases() {
+        let sig = FunctionSignature::from_hex("strlen", "55 48")
+            .unwrap()
+            .with_alias("__strlen_sse2")
+            .with_alias("__strlen_avx2")
+            .with_alias("__strlen_evex");
+
+        assert_eq!(sig.aliases.len(), 3);
+        assert!(sig.aliases.contains(&"__strlen_sse2".to_string()));
+        assert!(sig.aliases.contains(&"__strlen_avx2".to_string()));
+        assert!(sig.aliases.contains(&"__strlen_evex".to_string()));
+    }
+
+    #[test]
+    fn test_signature_pattern_len() {
+        let sig = FunctionSignature::from_hex("test", "55 48 89 E5 48 83 EC 20").unwrap();
+        assert_eq!(sig.pattern_len(), 8);
+    }
+
+    #[test]
+    fn test_signature_matches_with_wildcard() {
+        let sig = FunctionSignature::from_hex("test", "55 ?? 89 ?? 48").unwrap();
+        assert!(sig.matches(&[0x55, 0x00, 0x89, 0xFF, 0x48]));
+        assert!(sig.matches(&[0x55, 0xFF, 0x89, 0x00, 0x48]));
+        assert!(!sig.matches(&[0x55, 0x00, 0x89, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn test_signature_display() {
+        let sig = FunctionSignature::from_hex("malloc", "55 48")
+            .unwrap()
+            .with_param(Parameter::size("size"))
+            .with_return_type(ParameterType::OpaquePtr);
+
+        let display = format!("{}", sig);
+        assert_eq!(display, "void* malloc(size_t size)");
+    }
+
+    #[test]
+    fn test_c_prototype_multiple_params() {
+        let sig = FunctionSignature::from_hex("memmove", "55 48")
+            .unwrap()
+            .with_return_type(ParameterType::OpaquePtr)
+            .with_param(Parameter::ptr("dest"))
+            .with_param(Parameter::ptr("src"))
+            .with_param(Parameter::size("n"));
+
+        assert_eq!(
+            sig.to_c_prototype(),
+            "void* memmove(void* dest, void* src, size_t n)"
+        );
+    }
+
+    #[test]
+    fn test_c_prototype_with_pointer_types() {
+        let sig = FunctionSignature::from_hex("strtol", "55 48")
+            .unwrap()
+            .with_return_type(ParameterType::Int {
+                size: 8,
+                signed: true,
+            })
+            .with_param(Parameter::string("nptr"))
+            .with_param(Parameter::new(
+                "endptr",
+                ParameterType::Pointer(Box::new(ParameterType::String)),
+            ))
+            .with_param(Parameter::int("base"));
+
+        assert_eq!(
+            sig.to_c_prototype(),
+            "int64_t strtol(const char* nptr, const char** endptr, int base)"
+        );
+    }
+
+    #[test]
+    fn test_signature_default_values() {
+        let sig = FunctionSignature::from_hex("test", "55 48").unwrap();
+
+        assert_eq!(sig.calling_convention, CallingConvention::SystemV);
+        assert_eq!(
+            sig.return_type,
+            ParameterType::Int {
+                size: 4,
+                signed: true
+            }
+        );
+        assert!(sig.parameters.is_empty());
+        assert!(!sig.variadic);
+        assert_eq!(sig.library, "libc");
+        assert!(sig.version.is_none());
+        assert!(sig.doc.is_none());
+        assert!((sig.confidence - 0.5).abs() < 0.001);
+        assert!(sig.aliases.is_empty());
+        assert!(sig.size_hint.is_none());
+    }
+
+    #[test]
+    fn test_signature_from_hex_error() {
+        let result = FunctionSignature::from_hex("test", "55 GG 89");
+        assert!(result.is_err());
+    }
 }

@@ -268,4 +268,268 @@ mod tests {
         let pattern = BytePattern::parse("55 ?? 89 E5").unwrap();
         assert_eq!(pattern.to_hex_string(), "55 ?? 89 E5");
     }
+
+    // ==================== PatternByte Tests ====================
+
+    #[test]
+    fn test_pattern_byte_concrete_matches() {
+        let byte = PatternByte::Concrete(0x55);
+        assert!(byte.matches(0x55));
+        assert!(!byte.matches(0x00));
+        assert!(!byte.matches(0xFF));
+    }
+
+    #[test]
+    fn test_pattern_byte_wildcard_matches_all() {
+        let byte = PatternByte::Wildcard;
+        for i in 0..=255 {
+            assert!(byte.matches(i));
+        }
+    }
+
+    #[test]
+    fn test_pattern_byte_masked_lower_nibble() {
+        // Match only lower nibble = 5
+        let byte = PatternByte::Masked {
+            value: 0x05,
+            mask: 0x0F,
+        };
+        assert!(byte.matches(0x05));
+        assert!(byte.matches(0x15));
+        assert!(byte.matches(0xF5));
+        assert!(!byte.matches(0x04));
+        assert!(!byte.matches(0x06));
+    }
+
+    #[test]
+    fn test_pattern_byte_masked_upper_nibble() {
+        // Match only upper nibble = 0xA0
+        let byte = PatternByte::Masked {
+            value: 0xA0,
+            mask: 0xF0,
+        };
+        assert!(byte.matches(0xA0));
+        assert!(byte.matches(0xA5));
+        assert!(byte.matches(0xAF));
+        assert!(!byte.matches(0xB0));
+        assert!(!byte.matches(0x0A));
+    }
+
+    #[test]
+    fn test_pattern_byte_masked_single_bit() {
+        // Match if bit 0 is set
+        let byte = PatternByte::Masked {
+            value: 0x01,
+            mask: 0x01,
+        };
+        assert!(byte.matches(0x01));
+        assert!(byte.matches(0xFF));
+        assert!(byte.matches(0x03));
+        assert!(!byte.matches(0x00));
+        assert!(!byte.matches(0xFE));
+    }
+
+    #[test]
+    fn test_pattern_byte_is_wildcard() {
+        assert!(PatternByte::Wildcard.is_wildcard());
+        assert!(PatternByte::Masked {
+            value: 0,
+            mask: 0x0F
+        }
+        .is_wildcard());
+        assert!(!PatternByte::Concrete(0x55).is_wildcard());
+    }
+
+    #[test]
+    fn test_pattern_byte_is_concrete() {
+        assert!(PatternByte::Concrete(0x55).is_concrete());
+        assert!(!PatternByte::Wildcard.is_concrete());
+        assert!(!PatternByte::Masked {
+            value: 0,
+            mask: 0x0F
+        }
+        .is_concrete());
+    }
+
+    // ==================== Pattern Parse Error Tests ====================
+
+    #[test]
+    fn test_pattern_parse_invalid_hex() {
+        let result = BytePattern::parse("55 GG 89");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pattern_parse_invalid_length() {
+        let result = BytePattern::parse("55 ABC 89");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pattern_parse_invalid_masked_format() {
+        // Missing mask value
+        let result = BytePattern::parse("55 00& 89");
+        assert!(result.is_err());
+
+        // Invalid mask hex
+        let result = BytePattern::parse("55 00&GG 89");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pattern_parse_empty() {
+        let pattern = BytePattern::parse("").unwrap();
+        assert!(pattern.is_empty());
+        assert_eq!(pattern.len(), 0);
+    }
+
+    #[test]
+    fn test_pattern_parse_alternate_wildcard() {
+        // ** is also valid wildcard syntax
+        let pattern = BytePattern::parse("55 ** 89 E5").unwrap();
+        assert_eq!(pattern.bytes()[1], PatternByte::Wildcard);
+    }
+
+    // ==================== Pattern Matching Edge Cases ====================
+
+    #[test]
+    fn test_pattern_matches_exact_length() {
+        let pattern = BytePattern::parse("55 48 89 E5").unwrap();
+        assert!(pattern.matches(&[0x55, 0x48, 0x89, 0xE5]));
+    }
+
+    #[test]
+    fn test_pattern_matches_too_short() {
+        let pattern = BytePattern::parse("55 48 89 E5").unwrap();
+        assert!(!pattern.matches(&[0x55, 0x48, 0x89]));
+        assert!(!pattern.matches(&[]));
+    }
+
+    #[test]
+    fn test_pattern_matches_at_offset() {
+        let pattern = BytePattern::parse("55 48").unwrap();
+        let data = [0x00, 0x00, 0x55, 0x48, 0x00];
+        assert!(!pattern.matches_at(&data, 0));
+        assert!(pattern.matches_at(&data, 2));
+        assert!(!pattern.matches_at(&data, 4)); // Would go past end
+    }
+
+    #[test]
+    fn test_pattern_matches_at_boundary() {
+        let pattern = BytePattern::parse("55 48").unwrap();
+        let data = [0x55, 0x48];
+        assert!(pattern.matches_at(&data, 0));
+        assert!(!pattern.matches_at(&data, 1)); // Past end
+    }
+
+    #[test]
+    fn test_pattern_all_wildcards() {
+        let pattern = BytePattern::parse("?? ?? ?? ??").unwrap();
+        assert!(pattern.matches(&[0x00, 0x00, 0x00, 0x00]));
+        assert!(pattern.matches(&[0xFF, 0xFF, 0xFF, 0xFF]));
+        assert!(pattern.matches(&[0x12, 0x34, 0x56, 0x78]));
+    }
+
+    #[test]
+    fn test_pattern_all_masked() {
+        let pattern = BytePattern::parse("00&F0 00&F0 00&F0").unwrap();
+        // All bytes must have upper nibble = 0
+        assert!(pattern.matches(&[0x00, 0x01, 0x0F]));
+        assert!(!pattern.matches(&[0x10, 0x00, 0x00]));
+    }
+
+    // ==================== Prefix Extraction Tests ====================
+
+    #[test]
+    fn test_prefix_bytes_all_concrete() {
+        let pattern = BytePattern::parse("55 48 89 E5 48 83").unwrap();
+        assert_eq!(pattern.prefix_bytes(1), Some(vec![0x55]));
+        assert_eq!(pattern.prefix_bytes(4), Some(vec![0x55, 0x48, 0x89, 0xE5]));
+        assert_eq!(
+            pattern.prefix_bytes(6),
+            Some(vec![0x55, 0x48, 0x89, 0xE5, 0x48, 0x83])
+        );
+    }
+
+    #[test]
+    fn test_prefix_bytes_with_wildcards_at_end() {
+        let pattern = BytePattern::parse("55 48 89 ?? ??").unwrap();
+        assert_eq!(pattern.prefix_bytes(3), Some(vec![0x55, 0x48, 0x89]));
+        assert_eq!(pattern.prefix_bytes(4), None);
+    }
+
+    #[test]
+    fn test_prefix_bytes_wildcards_interspersed() {
+        // Concrete bytes: 55, 89, E5 (skipping wildcards)
+        let pattern = BytePattern::parse("55 ?? 89 ?? E5").unwrap();
+        assert_eq!(pattern.prefix_bytes(3), Some(vec![0x55, 0x89, 0xE5]));
+        assert_eq!(pattern.prefix_bytes(4), None);
+    }
+
+    #[test]
+    fn test_prefix_bytes_starts_with_wildcard() {
+        let pattern = BytePattern::parse("?? 55 48 89").unwrap();
+        assert_eq!(pattern.prefix_bytes(3), Some(vec![0x55, 0x48, 0x89]));
+    }
+
+    #[test]
+    fn test_concrete_prefix_len_none() {
+        let pattern = BytePattern::parse("?? ?? 55 48").unwrap();
+        assert_eq!(pattern.concrete_prefix_len(), 0);
+    }
+
+    #[test]
+    fn test_concrete_prefix_len_mixed() {
+        let pattern = BytePattern::parse("55 48 ?? 89 E5").unwrap();
+        assert_eq!(pattern.concrete_prefix_len(), 2);
+    }
+
+    // ==================== Construction Tests ====================
+
+    #[test]
+    fn test_pattern_from_bytes() {
+        let pattern = BytePattern::from_bytes(&[0x55, 0x48, 0x89, 0xE5]);
+        assert_eq!(pattern.len(), 4);
+        assert!(pattern
+            .bytes()
+            .iter()
+            .all(|b| matches!(b, PatternByte::Concrete(_))));
+    }
+
+    #[test]
+    fn test_pattern_from_pattern_bytes() {
+        let bytes = vec![
+            PatternByte::Concrete(0x55),
+            PatternByte::Wildcard,
+            PatternByte::Masked {
+                value: 0x80,
+                mask: 0x80,
+            },
+        ];
+        let pattern = BytePattern::from_pattern_bytes(bytes);
+        assert_eq!(pattern.len(), 3);
+    }
+
+    #[test]
+    fn test_pattern_default() {
+        let pattern = BytePattern::default();
+        assert!(pattern.is_empty());
+    }
+
+    // ==================== Display Tests ====================
+
+    #[test]
+    fn test_pattern_display() {
+        let pattern = BytePattern::parse("55 ?? 89&F0 E5").unwrap();
+        assert_eq!(format!("{}", pattern), "55 ?? 89&F0 E5");
+    }
+
+    #[test]
+    fn test_hex_string_roundtrip() {
+        let original = "55 48 ?? E5 00&0F";
+        let pattern = BytePattern::parse(original).unwrap();
+        let hex_str = pattern.to_hex_string();
+        let reparsed = BytePattern::parse(&hex_str).unwrap();
+        assert_eq!(pattern, reparsed);
+    }
 }

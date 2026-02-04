@@ -19,7 +19,7 @@ This document outlines the testing gaps and prioritized work for improving test 
 | hexray-analysis | 34 | 453 | Good coverage (+86 SSA, +59 structurer, +42 dataflow tests) |
 | hexray-disasm | 7 | 231 | Good coverage |
 | hexray-types | 8 | 26 | Moderate |
-| hexray-signatures | 6 | 25 | Inline only, no integration |
+| hexray-signatures | 6 | 141 | Good coverage (+116 tests) |
 | hexray-emulate | 6 | 24 | Moderate |
 | hexray-formats | 7 | 26 | Moderate |
 | hexray-core | 1 | 141 | Good coverage (+137 tests) |
@@ -240,34 +240,15 @@ Def-Use Chains:
 
 ---
 
-### 5. Signature Integration Tests
+### 5. Signature Integration Tests ✅ COMPLETE
 
-**Current state:** 25 inline unit tests, no integration tests
+**Phase 5 complete: 116 tests added across all signature modules.**
 
-**Missing test directory:** `crates/hexray-signatures/tests/`
-
-**Tests needed:**
-
-```
-Pattern Matching:
-- test_match_libc_strlen
-- test_match_libc_memcpy
-- test_match_libc_malloc
-- test_match_with_wildcard_bytes
-- test_no_false_positive_on_similar_code
-
-Database Operations:
-- test_load_builtin_signatures
-- test_signature_database_merge
-- test_signature_serialization_roundtrip
-- test_duplicate_signature_handling
-
-Integration:
-- test_recognize_functions_in_elf_binary
-- test_recognize_functions_in_macho_binary
-- test_signature_match_with_relocations
-- test_signature_match_stripped_binary
-```
+- `pattern.rs` - 31 tests for PatternByte, BytePattern parsing, matching, wildcards
+- `signature.rs` - 24 tests for CallingConvention, ParameterType, Parameter, FunctionSignature
+- `database.rs` - 31 tests for SignatureDatabase CRUD, merge, filtering, JSON serialization
+- `matcher.rs` - 30 tests for SignatureMatcher prefix indexing, confidence, scanning
+- `builtin/mod.rs` - 26 tests for builtin signature loading, architecture aliases
 
 **Estimated effort:** 30-50 tests, 1-2 days
 
@@ -396,13 +377,13 @@ End-to-End:
 | 2 | SSA construction | 86 | ✅ Complete |
 | 3 | Structurer | 59 | ✅ Complete |
 | 4 | Dataflow passes | 42 | ✅ Complete |
-| 5 | Signatures integration | 30-50 | Pending |
+| 5 | Signatures integration | 116 | ✅ Complete |
 | 6 | Error paths | 30-50 | Pending |
 | 7 | C header parsing | 30-40 | Pending |
 | 8 | Output formats | 20-30 | Pending |
 | 9 | Cross-crate integration | 20-30 | Pending |
 
-**Progress:** 324 tests added (Phase 1-4 complete)
+**Progress:** 440 tests added (Phase 1-5 complete)
 
 ---
 
