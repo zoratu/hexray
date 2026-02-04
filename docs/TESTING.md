@@ -16,7 +16,7 @@ This document outlines the testing gaps and prioritized work for improving test 
 **Coverage by Crate:**
 | Crate | Test Files | Unit Tests | Status |
 |-------|------------|------------|--------|
-| hexray-analysis | 34 | 453 | Good coverage (+86 SSA, +59 structurer, +42 dataflow tests) |
+| hexray-analysis | 34 | 553 | Good coverage (+86 SSA, +59 structurer, +42 dataflow, +100 error paths tests) |
 | hexray-disasm | 7 | 231 | Good coverage |
 | hexray-types | 8 | 26 | Moderate |
 | hexray-signatures | 6 | 141 | Good coverage (+116 tests) |
@@ -254,24 +254,15 @@ Def-Use Chains:
 
 ---
 
-### 6. Decompiler Error Paths
+### 6. Error Paths and Edge Cases ✅ COMPLETE
 
-**Problem:** 312 instances of `unwrap`/`panic`/`expect` in hexray-analysis
+**Phase 6 complete: 100 tests added across error handling and edge cases.**
 
-**Approach:** Add tests that exercise error conditions
-
-```
-Error Handling Tests:
-- test_decompile_empty_function
-- test_decompile_single_instruction
-- test_decompile_unreachable_code
-- test_decompile_malformed_cfg
-- test_decompile_with_unknown_instruction
-- test_decompile_recursive_function
-- test_decompile_very_large_function
-- test_expression_simplify_deep_nesting
-- test_type_inference_conflicting_constraints
-```
+- `project.rs` - Tests for BinaryNotFound, InvalidJson, UnsupportedVersion, NothingToUndo/Redo, HashMismatch, unicode handling
+- `cpp_special.rs` - Tests for malformed symbols, C++ ABI edge cases, all constructor/destructor variants, database operations
+- `dataflow/queries.rs` - Tests for DataFlowRole, DataFlowStep, DataFlowResult, nonexistent addresses, truncation handling
+- `dataflow/liveness.rs` - Tests for LivenessFact methods, at_instruction edge cases, always_live, live_ranges
+- `decompiler/naming.rs` - Tests for helper functions, TypeHint variants, register renaming, DWARF integration
 
 **Estimated effort:** 30-50 tests, 1-2 days
 
@@ -378,12 +369,12 @@ End-to-End:
 | 3 | Structurer | 59 | ✅ Complete |
 | 4 | Dataflow passes | 42 | ✅ Complete |
 | 5 | Signatures integration | 116 | ✅ Complete |
-| 6 | Error paths | 30-50 | Pending |
+| 6 | Error paths & edge cases | 100 | ✅ Complete |
 | 7 | C header parsing | 30-40 | Pending |
 | 8 | Output formats | 20-30 | Pending |
 | 9 | Cross-crate integration | 20-30 | Pending |
 
-**Progress:** 440 tests added (Phase 1-5 complete)
+**Progress:** 540 tests added (Phase 1-6 complete)
 
 ---
 
