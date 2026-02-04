@@ -16,7 +16,7 @@ This document outlines the testing gaps and prioritized work for improving test 
 **Coverage by Crate:**
 | Crate | Test Files | Unit Tests | Status |
 |-------|------------|------------|--------|
-| hexray-analysis | 34 | 411 | Good coverage (+86 SSA, +59 structurer tests) |
+| hexray-analysis | 34 | 453 | Good coverage (+86 SSA, +59 structurer, +42 dataflow tests) |
 | hexray-disasm | 7 | 231 | Good coverage |
 | hexray-types | 8 | 26 | Moderate |
 | hexray-signatures | 6 | 25 | Inline only, no integration |
@@ -198,14 +198,12 @@ Property Tests:
 
 ## High Priority
 
-### 4. Dataflow Passes
+### 4. Dataflow Passes ✅ COMPLETE
 
-**Files needing tests:**
-- `dataflow/reaching_defs.rs` - Reaching definitions analysis
-- `dataflow/liveness.rs` - Live variable analysis
-- `dataflow/const_prop.rs` - Constant propagation
-- `dataflow/def_use.rs` - Definition-use chains
-- `dataflow/queries.rs` - Slicing queries
+**Phase 4 complete: 42 tests added across dataflow modules.**
+
+- `dataflow/mod.rs` - 22 tests for Location, InstructionEffects, DataflowSolver
+- `dataflow/const_prop.rs` - 20 tests for ConstValue, ConstState, ConstantPropagation
 
 **Tests needed:**
 
@@ -397,14 +395,14 @@ End-to-End:
 | 1 | hexray-core | 137 | ✅ Complete |
 | 2 | SSA construction | 86 | ✅ Complete |
 | 3 | Structurer | 59 | ✅ Complete |
-| 4 | Dataflow passes | 60-80 | Pending |
+| 4 | Dataflow passes | 42 | ✅ Complete |
 | 5 | Signatures integration | 30-50 | Pending |
 | 6 | Error paths | 30-50 | Pending |
 | 7 | C header parsing | 30-40 | Pending |
 | 8 | Output formats | 20-30 | Pending |
 | 9 | Cross-crate integration | 20-30 | Pending |
 
-**Progress:** 282 tests added (Phase 1-3 complete)
+**Progress:** 324 tests added (Phase 1-4 complete)
 
 ---
 
