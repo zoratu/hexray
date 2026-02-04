@@ -160,6 +160,122 @@ mod tests {
         cfg
     }
 
+    fn make_linear_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 -> bb2 -> bb3
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        for i in 0..4u32 {
+            let mut bb = BasicBlock::new(BasicBlockId::new(i), 0x1000 + i as u64 * 0x10);
+            if i < 3 {
+                bb.terminator = BlockTerminator::Jump {
+                    target: BasicBlockId::new(i + 1),
+                };
+                cfg.add_edge(BasicBlockId::new(i), BasicBlockId::new(i + 1));
+            } else {
+                bb.terminator = BlockTerminator::Return;
+            }
+            cfg.add_block(bb);
+        }
+
+        cfg
+    }
+
+    fn make_loop_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 (loop header)
+        //        bb1 -> bb2 (loop body) -> bb1 (back edge)
+        //        bb1 -> bb3 (exit)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1)); // back edge
+
+        cfg
+    }
+
+    fn make_nested_loop_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 (outer header) -> bb2 (inner header) -> bb3 (inner body)
+        //                                                      -> bb2 (inner back)
+        //                              bb2 -> bb4 (between loops) -> bb1 (outer back)
+        //        bb1 -> bb5 (exit)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(5),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(3),
+            false_target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb3);
+
+        let mut bb4 = BasicBlock::new(BasicBlockId::new(4), 0x1040);
+        bb4.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb4);
+
+        let mut bb5 = BasicBlock::new(BasicBlockId::new(5), 0x1050);
+        bb5.terminator = BlockTerminator::Return;
+        cfg.add_block(bb5);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(5));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(4), BasicBlockId::new(1));
+
+        cfg
+    }
+
+    // --- Dominance Frontier Tests ---
+
     #[test]
     fn test_dominance_frontiers() {
         let cfg = make_diamond_cfg();
@@ -176,6 +292,73 @@ mod tests {
     }
 
     #[test]
+    fn test_dominance_frontiers_linear() {
+        let cfg = make_linear_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // In a linear CFG, no block has a dominance frontier
+        // (no join points)
+        for block_id in cfg.block_ids() {
+            assert!(
+                frontiers[&block_id].is_empty(),
+                "Block {} should have empty frontier",
+                block_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_dominance_frontiers_loop() {
+        let cfg = make_loop_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // bb2's frontier should include bb1 (the loop header)
+        // because bb1 has multiple predecessors (bb0, bb2) and bb2 doesn't dominate bb1
+        assert!(
+            frontiers[&BasicBlockId::new(2)].contains(&BasicBlockId::new(1)),
+            "bb2's frontier should contain bb1"
+        );
+
+        // bb0's frontier should be empty because bb0 dominates bb1
+        // (bb0 is bb1's immediate dominator)
+        assert!(
+            frontiers[&BasicBlockId::new(0)].is_empty(),
+            "bb0's frontier should be empty (dominates all reachable blocks)"
+        );
+    }
+
+    #[test]
+    fn test_dominance_frontiers_nested_loop() {
+        let cfg = make_nested_loop_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // Inner loop back edge: bb3's frontier should include bb2
+        assert!(
+            frontiers[&BasicBlockId::new(3)].contains(&BasicBlockId::new(2)),
+            "bb3's frontier should contain bb2 (inner loop header)"
+        );
+
+        // Outer loop back edge: bb4's frontier should include bb1
+        assert!(
+            frontiers[&BasicBlockId::new(4)].contains(&BasicBlockId::new(1)),
+            "bb4's frontier should contain bb1 (outer loop header)"
+        );
+    }
+
+    #[test]
+    fn test_dominance_frontiers_single_block() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let frontiers = compute_dominance_frontiers(&cfg);
+        assert!(frontiers[&BasicBlockId::new(0)].is_empty());
+    }
+
+    // --- Phi Placement Tests ---
+
+    #[test]
     fn test_phi_placement() {
         let cfg = make_diamond_cfg();
         let frontiers = compute_dominance_frontiers(&cfg);
@@ -189,5 +372,134 @@ mod tests {
 
         // A phi should be placed at bb3
         assert!(phi_blocks.contains(&BasicBlockId::new(3)));
+    }
+
+    #[test]
+    fn test_phi_placement_single_def() {
+        let cfg = make_diamond_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // Single definition in bb0 - dominates everything, no phi needed
+        let def_blocks: HashSet<BasicBlockId> = [BasicBlockId::new(0)].into_iter().collect();
+
+        let phi_blocks = find_phi_placements(&cfg, &frontiers, &def_blocks);
+        assert!(phi_blocks.is_empty());
+    }
+
+    #[test]
+    fn test_phi_placement_loop() {
+        let cfg = make_loop_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // Variable defined in bb0 (before loop) and bb2 (in loop)
+        let def_blocks: HashSet<BasicBlockId> = [BasicBlockId::new(0), BasicBlockId::new(2)]
+            .into_iter()
+            .collect();
+
+        let phi_blocks = find_phi_placements(&cfg, &frontiers, &def_blocks);
+
+        // Phi should be placed at bb1 (loop header)
+        assert!(
+            phi_blocks.contains(&BasicBlockId::new(1)),
+            "Phi should be placed at loop header"
+        );
+    }
+
+    #[test]
+    fn test_phi_placement_iterated() {
+        // Test that phi placement is iterated - placing a phi creates a new def
+        // which may require more phis
+        let cfg = make_diamond_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // Definition only in bb1
+        let def_blocks: HashSet<BasicBlockId> = [BasicBlockId::new(1)].into_iter().collect();
+
+        let phi_blocks = find_phi_placements(&cfg, &frontiers, &def_blocks);
+
+        // bb1's frontier is bb3, so phi at bb3
+        assert!(phi_blocks.contains(&BasicBlockId::new(3)));
+    }
+
+    #[test]
+    fn test_phi_placement_nested_loop() {
+        let cfg = make_nested_loop_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // Variable defined in inner loop body
+        let def_blocks: HashSet<BasicBlockId> = [BasicBlockId::new(3)].into_iter().collect();
+
+        let phi_blocks = find_phi_placements(&cfg, &frontiers, &def_blocks);
+
+        // Should need phi at bb2 (inner loop header)
+        assert!(
+            phi_blocks.contains(&BasicBlockId::new(2)),
+            "Phi should be placed at inner loop header"
+        );
+    }
+
+    #[test]
+    fn test_phi_placement_empty_defs() {
+        let cfg = make_diamond_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        let def_blocks: HashSet<BasicBlockId> = HashSet::new();
+        let phi_blocks = find_phi_placements(&cfg, &frontiers, &def_blocks);
+
+        assert!(phi_blocks.is_empty());
+    }
+
+    // --- collect_definitions Tests ---
+
+    #[test]
+    fn test_collect_definitions_empty_cfg() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let defs = collect_definitions(&cfg);
+        // No instructions, so no definitions
+        assert!(defs.is_empty());
+    }
+
+    // --- Integration Tests ---
+
+    #[test]
+    fn test_frontiers_and_phi_placement_consistency() {
+        let cfg = make_diamond_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        // All frontiers should contain valid block IDs
+        for (block_id, frontier) in &frontiers {
+            assert!(
+                cfg.block(*block_id).is_some(),
+                "Block {} should exist",
+                block_id
+            );
+            for df_block in frontier {
+                assert!(
+                    cfg.block(*df_block).is_some(),
+                    "Frontier block {} should exist",
+                    df_block
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_phi_placement_idempotent() {
+        let cfg = make_diamond_cfg();
+        let frontiers = compute_dominance_frontiers(&cfg);
+
+        let def_blocks: HashSet<BasicBlockId> = [BasicBlockId::new(1), BasicBlockId::new(2)]
+            .into_iter()
+            .collect();
+
+        // Running phi placement twice should give same result
+        let phi_blocks1 = find_phi_placements(&cfg, &frontiers, &def_blocks);
+        let phi_blocks2 = find_phi_placements(&cfg, &frontiers, &def_blocks);
+
+        assert_eq!(phi_blocks1, phi_blocks2);
     }
 }

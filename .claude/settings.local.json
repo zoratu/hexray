@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit --no-verify -m \"$\\(cat <<''EOF''\nAdd comprehensive testing plan document\n\nDocument testing gaps across the codebase with prioritized work items:\n- Critical: hexray-core, SSA construction, structurer \\(phases 1-3\\)\n- High: dataflow passes, signatures, error paths \\(phases 4-6\\)\n- Medium: parsing, output formats, integration \\(phases 7-9\\)\n\nIdentifies 360-540 new tests needed with specific test names and estimates.\nEOF\n\\)\")",
+      "Bash(cd:*)"
+    ]
+  }
+}

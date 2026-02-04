@@ -254,8 +254,8 @@ impl<'a> SsaBuilder<'a> {
 mod tests {
     use super::*;
     use hexray_core::{
-        Architecture, BasicBlock, BlockTerminator, Condition, Immediate, Instruction, Operation,
-        Register, RegisterClass,
+        Architecture, BasicBlock, BlockTerminator, Condition, Immediate, Instruction, MemoryRef,
+        Operation, Register, RegisterClass,
     };
 
     fn make_register(id: u16, _name: &str) -> Register {
@@ -272,6 +272,40 @@ mod tests {
                 size: 8,
                 signed: false,
             }),
+        ];
+        inst
+    }
+
+    fn make_mov_reg(addr: u64, dst_id: u16, src_id: u16) -> Instruction {
+        let mut inst = Instruction::new(addr, 3, vec![0; 3], "mov");
+        inst.operation = Operation::Move;
+        inst.operands = vec![
+            Operand::Register(make_register(dst_id, "dst")),
+            Operand::Register(make_register(src_id, "src")),
+        ];
+        inst
+    }
+
+    fn make_add_reg(addr: u64, dst_id: u16, src_id: u16) -> Instruction {
+        let mut inst = Instruction::new(addr, 3, vec![0; 3], "add");
+        inst.operation = Operation::Add;
+        inst.operands = vec![
+            Operand::Register(make_register(dst_id, "dst")),
+            Operand::Register(make_register(src_id, "src")),
+        ];
+        inst
+    }
+
+    fn make_load(addr: u64, dst_id: u16, base_id: u16, disp: i64) -> Instruction {
+        let mut inst = Instruction::new(addr, 4, vec![0; 4], "mov");
+        inst.operation = Operation::Load;
+        inst.operands = vec![
+            Operand::Register(make_register(dst_id, "dst")),
+            Operand::Memory(MemoryRef::base_disp(
+                make_register(base_id, "base"),
+                disp,
+                8,
+            )),
         ];
         inst
     }
@@ -355,5 +389,371 @@ mod tests {
 
         let phi = &block3.phis[0];
         assert_eq!(phi.incoming.len(), 2, "phi should have 2 incoming edges");
+    }
+
+    #[test]
+    fn test_ssa_empty_function() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("empty");
+
+        assert_eq!(ssa.name, "empty");
+        assert_eq!(ssa.blocks.len(), 1);
+
+        let block = ssa.block(BasicBlockId::new(0)).unwrap();
+        assert!(block.phis.is_empty());
+        assert!(block.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_ssa_multiple_registers() {
+        // mov rax, 1
+        // mov rbx, 2
+        // mov rcx, 3
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.push_instruction(make_mov_imm(0x1000, 0, "rax", 1));
+        bb.push_instruction(make_mov_imm(0x1003, 3, "rbx", 2));
+        bb.push_instruction(make_mov_imm(0x1006, 1, "rcx", 3));
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("multi_reg");
+
+        let block = ssa.block(BasicBlockId::new(0)).unwrap();
+        assert_eq!(block.instructions.len(), 3);
+
+        // Each should define a different register
+        let def0 = &block.instructions[0].defs[0];
+        let def1 = &block.instructions[1].defs[0];
+        let def2 = &block.instructions[2].defs[0];
+
+        assert_ne!(def0.location, def1.location);
+        assert_ne!(def1.location, def2.location);
+    }
+
+    #[test]
+    fn test_ssa_loop_phi() {
+        // Proper loop structure with separate body block:
+        // bb0: rax = 0 -> bb1 (header)
+        // bb1: check condition -> bb2 (body) or bb3 (exit)
+        // bb2: rax = rax + 1 -> bb1 (back edge)
+        // bb3: return
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        // Entry: initialize rax
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.push_instruction(make_mov_imm(0x1000, 0, "rax", 0));
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        // Loop header: check condition
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),  // continue loop
+            false_target: BasicBlockId::new(3), // exit
+        };
+        cfg.add_block(bb1);
+
+        // Loop body: increment rax
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.push_instruction(make_add_reg(0x1020, 0, 0)); // rax = rax + 1
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1), // back to header
+        };
+        cfg.add_block(bb2);
+
+        // Exit
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1)); // back edge
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("loop");
+
+        // bb1 should have a phi node for rax
+        // (rax comes from bb0 on first iteration, from bb2 on subsequent iterations)
+        let block1 = ssa.block(BasicBlockId::new(1)).unwrap();
+        assert!(!block1.phis.is_empty(), "Loop header should have phi nodes");
+    }
+
+    #[test]
+    fn test_ssa_use_def_chain() {
+        // rax = 1
+        // rbx = rax (use of rax_0)
+        // rax = 2
+        // rcx = rax (use of rax_1)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.push_instruction(make_mov_imm(0x1000, 0, "rax", 1));
+        bb.push_instruction(make_mov_reg(0x1003, 3, 0)); // rbx = rax
+        bb.push_instruction(make_mov_imm(0x1006, 0, "rax", 2));
+        bb.push_instruction(make_mov_reg(0x1009, 1, 0)); // rcx = rax
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("use_def");
+
+        let block = ssa.block(BasicBlockId::new(0)).unwrap();
+        assert_eq!(block.instructions.len(), 4);
+
+        // First mov rax, 1 defines rax_0
+        // Second mov rbx, rax uses rax_0
+        // Third mov rax, 2 defines rax_1
+        // Fourth mov rcx, rax uses rax_1
+
+        let rax_v0 = &block.instructions[0].defs[0];
+        let rax_v1 = &block.instructions[2].defs[0];
+
+        assert_eq!(rax_v0.version, 0);
+        assert_eq!(rax_v1.version, 1);
+    }
+
+    #[test]
+    fn test_ssa_memory_operand() {
+        // mov rax, [rbx + 8]
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.push_instruction(make_load(0x1000, 0, 3, 8));
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("memory");
+
+        let block = ssa.block(BasicBlockId::new(0)).unwrap();
+        assert_eq!(block.instructions.len(), 1);
+
+        // The load should have a memory operand with an SSA value for base
+        let uses = &block.instructions[0].uses;
+        assert!(!uses.is_empty());
+
+        // Check that one of the uses is a memory operand
+        let has_memory = uses.iter().any(|u| matches!(u, SsaOperand::Memory { .. }));
+        assert!(has_memory, "Should have a memory operand");
+    }
+
+    #[test]
+    fn test_ssa_phi_incoming_blocks() {
+        // Diamond pattern - verify phi incoming blocks are correct
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.push_instruction(make_mov_imm(0x1010, 0, "rax", 10));
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.push_instruction(make_mov_imm(0x1020, 0, "rax", 20));
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("phi_blocks");
+
+        let block3 = ssa.block(BasicBlockId::new(3)).unwrap();
+        assert!(!block3.phis.is_empty());
+
+        let phi = &block3.phis[0];
+
+        // Verify incoming blocks are bb1 and bb2
+        let incoming_blocks: HashSet<_> = phi.incoming.iter().map(|(b, _)| *b).collect();
+        assert!(incoming_blocks.contains(&BasicBlockId::new(1)));
+        assert!(incoming_blocks.contains(&BasicBlockId::new(2)));
+    }
+
+    #[test]
+    fn test_ssa_version_counter() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.push_instruction(make_mov_imm(0x1000, 0, "rax", 1));
+        bb.push_instruction(make_mov_imm(0x1003, 0, "rax", 2));
+        bb.push_instruction(make_mov_imm(0x1006, 0, "rax", 3));
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("versions");
+
+        // Version counter for register 0 should be 3 (0, 1, 2)
+        let loc = Location::Register(0);
+        assert!(ssa.version_counters.contains_key(&loc));
+        assert_eq!(ssa.version_counters[&loc], 3);
+    }
+
+    #[test]
+    fn test_ssa_function_display() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.push_instruction(make_mov_imm(0x1000, 0, "rax", 42));
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("display_test");
+
+        let output = ssa.display();
+
+        assert!(output.contains("function display_test:"));
+        assert!(output.contains("bb0:"));
+        assert!(output.contains("mov"));
+    }
+
+    #[test]
+    fn test_ssa_nested_diamond() {
+        // More complex control flow: nested diamonds
+        //       bb0
+        //      /   \
+        //    bb1   bb2
+        //   / \   / \
+        // bb3 bb4 bb5 bb6
+        //   \ /   \ /
+        //   bb7   bb8
+        //     \   /
+        //      bb9
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        // Entry block
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        // Second level
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Less,
+            true_target: BasicBlockId::new(3),
+            false_target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Less,
+            true_target: BasicBlockId::new(5),
+            false_target: BasicBlockId::new(6),
+        };
+        cfg.add_block(bb2);
+
+        // Third level - leaves with definitions
+        for (i, addr) in [(3, 0x1030), (4, 0x1040), (5, 0x1050), (6, 0x1060)] {
+            let mut bb = BasicBlock::new(BasicBlockId::new(i), addr);
+            bb.push_instruction(make_mov_imm(addr, 0, "rax", i as i128));
+            let target = if i <= 4 { 7 } else { 8 };
+            bb.terminator = BlockTerminator::Jump {
+                target: BasicBlockId::new(target),
+            };
+            cfg.add_block(bb);
+        }
+
+        // Fourth level - joins
+        let mut bb7 = BasicBlock::new(BasicBlockId::new(7), 0x1070);
+        bb7.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(9),
+        };
+        cfg.add_block(bb7);
+
+        let mut bb8 = BasicBlock::new(BasicBlockId::new(8), 0x1080);
+        bb8.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(9),
+        };
+        cfg.add_block(bb8);
+
+        // Exit
+        let mut bb9 = BasicBlock::new(BasicBlockId::new(9), 0x1090);
+        bb9.terminator = BlockTerminator::Return;
+        cfg.add_block(bb9);
+
+        // Add edges
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(5));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(6));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(7));
+        cfg.add_edge(BasicBlockId::new(4), BasicBlockId::new(7));
+        cfg.add_edge(BasicBlockId::new(5), BasicBlockId::new(8));
+        cfg.add_edge(BasicBlockId::new(6), BasicBlockId::new(8));
+        cfg.add_edge(BasicBlockId::new(7), BasicBlockId::new(9));
+        cfg.add_edge(BasicBlockId::new(8), BasicBlockId::new(9));
+
+        let mut builder = SsaBuilder::new(&cfg);
+        let ssa = builder.build("nested");
+
+        // bb7 and bb8 should have phi nodes
+        assert!(
+            !ssa.block(BasicBlockId::new(7)).unwrap().phis.is_empty(),
+            "bb7 should have phi"
+        );
+        assert!(
+            !ssa.block(BasicBlockId::new(8)).unwrap().phis.is_empty(),
+            "bb8 should have phi"
+        );
+
+        // bb9 should also have a phi node
+        assert!(
+            !ssa.block(BasicBlockId::new(9)).unwrap().phis.is_empty(),
+            "bb9 should have phi"
+        );
+    }
+
+    #[test]
+    fn test_ssa_builder_deterministic() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb.push_instruction(make_mov_imm(0x1000, 0, "rax", 1));
+        bb.push_instruction(make_mov_imm(0x1003, 0, "rax", 2));
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        // Build twice and compare
+        let mut builder1 = SsaBuilder::new(&cfg);
+        let ssa1 = builder1.build("test");
+
+        let mut builder2 = SsaBuilder::new(&cfg);
+        let ssa2 = builder2.build("test");
+
+        // Should produce identical results
+        assert_eq!(ssa1.display(), ssa2.display());
     }
 }

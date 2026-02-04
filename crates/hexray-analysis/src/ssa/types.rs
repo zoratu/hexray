@@ -216,6 +216,12 @@ pub struct SsaFunction {
     pub version_counters: HashMap<Location, Version>,
 }
 
+impl Default for SsaFunction {
+    fn default() -> Self {
+        Self::new("unnamed", BasicBlockId::new(0))
+    }
+}
+
 impl SsaFunction {
     /// Creates a new SSA function.
     pub fn new(name: impl Into<String>, entry: BasicBlockId) -> Self {
@@ -284,5 +290,447 @@ impl SsaFunction {
         }
 
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- SsaValue Tests ---
+
+    #[test]
+    fn test_ssa_value_new() {
+        let val = SsaValue::new(Location::Register(0), 5);
+        assert_eq!(val.location, Location::Register(0));
+        assert_eq!(val.version, 5);
+    }
+
+    #[test]
+    fn test_ssa_value_base_name_register() {
+        let val = SsaValue::new(Location::Register(5), 0);
+        assert_eq!(val.base_name(), "r5");
+    }
+
+    #[test]
+    fn test_ssa_value_base_name_stack_local() {
+        // Negative offset = local variable
+        let val = SsaValue::new(Location::Stack(-8), 0);
+        assert_eq!(val.base_name(), "var_8");
+    }
+
+    #[test]
+    fn test_ssa_value_base_name_stack_arg() {
+        // Positive offset = argument
+        let val = SsaValue::new(Location::Stack(16), 0);
+        assert_eq!(val.base_name(), "arg_10");
+    }
+
+    #[test]
+    fn test_ssa_value_base_name_memory() {
+        let val = SsaValue::new(Location::Memory(0x601000), 0);
+        assert_eq!(val.base_name(), "mem_601000");
+    }
+
+    #[test]
+    fn test_ssa_value_base_name_flags() {
+        let val = SsaValue::new(Location::Flags, 0);
+        assert_eq!(val.base_name(), "flags");
+    }
+
+    #[test]
+    fn test_ssa_value_display() {
+        let val = SsaValue::new(Location::Register(0), 3);
+        assert_eq!(format!("{}", val), "r0_3");
+    }
+
+    #[test]
+    fn test_ssa_value_equality() {
+        let val1 = SsaValue::new(Location::Register(0), 1);
+        let val2 = SsaValue::new(Location::Register(0), 1);
+        let val3 = SsaValue::new(Location::Register(0), 2);
+        let val4 = SsaValue::new(Location::Register(1), 1);
+
+        assert_eq!(val1, val2);
+        assert_ne!(val1, val3); // Different version
+        assert_ne!(val1, val4); // Different register
+    }
+
+    #[test]
+    fn test_ssa_value_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+
+        set.insert(SsaValue::new(Location::Register(0), 0));
+        set.insert(SsaValue::new(Location::Register(0), 1));
+        set.insert(SsaValue::new(Location::Register(0), 0)); // duplicate
+
+        assert_eq!(set.len(), 2);
+    }
+
+    // --- PhiNode Tests ---
+
+    #[test]
+    fn test_phi_node_new() {
+        let result = SsaValue::new(Location::Register(0), 2);
+        let phi = PhiNode::new(result.clone());
+
+        assert_eq!(phi.result, result);
+        assert!(phi.incoming.is_empty());
+    }
+
+    #[test]
+    fn test_phi_node_add_incoming() {
+        let result = SsaValue::new(Location::Register(0), 2);
+        let mut phi = PhiNode::new(result);
+
+        let val1 = SsaValue::new(Location::Register(0), 0);
+        let val2 = SsaValue::new(Location::Register(0), 1);
+
+        phi.add_incoming(BasicBlockId::new(1), val1.clone());
+        phi.add_incoming(BasicBlockId::new(2), val2.clone());
+
+        assert_eq!(phi.incoming.len(), 2);
+        assert_eq!(phi.incoming[0], (BasicBlockId::new(1), val1));
+        assert_eq!(phi.incoming[1], (BasicBlockId::new(2), val2));
+    }
+
+    #[test]
+    fn test_phi_node_display() {
+        let result = SsaValue::new(Location::Register(0), 2);
+        let mut phi = PhiNode::new(result);
+
+        phi.add_incoming(
+            BasicBlockId::new(1),
+            SsaValue::new(Location::Register(0), 0),
+        );
+        phi.add_incoming(
+            BasicBlockId::new(2),
+            SsaValue::new(Location::Register(0), 1),
+        );
+
+        let display = format!("{}", phi);
+        assert!(display.contains("r0_2 = φ("));
+        assert!(display.contains("bb1: r0_0"));
+        assert!(display.contains("bb2: r0_1"));
+    }
+
+    #[test]
+    fn test_phi_node_display_empty() {
+        let result = SsaValue::new(Location::Register(5), 0);
+        let phi = PhiNode::new(result);
+        assert_eq!(format!("{}", phi), "r5_0 = φ()");
+    }
+
+    // --- SsaOperand Tests ---
+
+    #[test]
+    fn test_ssa_operand_value_display() {
+        let val = SsaValue::new(Location::Register(1), 3);
+        let op = SsaOperand::Value(val);
+        assert_eq!(format!("{}", op), "r1_3");
+    }
+
+    #[test]
+    fn test_ssa_operand_immediate_small() {
+        let op = SsaOperand::Immediate(5);
+        assert_eq!(format!("{}", op), "5");
+    }
+
+    #[test]
+    fn test_ssa_operand_immediate_large() {
+        let op = SsaOperand::Immediate(255);
+        assert_eq!(format!("{}", op), "0xff");
+    }
+
+    #[test]
+    fn test_ssa_operand_immediate_negative() {
+        let op = SsaOperand::Immediate(-1);
+        // Negative numbers print as hex
+        let display = format!("{}", op);
+        assert!(display.starts_with("0x") || display.starts_with("-"));
+    }
+
+    #[test]
+    fn test_ssa_operand_memory_base_only() {
+        let op = SsaOperand::Memory {
+            base: Some(SsaValue::new(Location::Register(0), 0)),
+            index: None,
+            scale: 1,
+            displacement: 0,
+            size: 8,
+        };
+        let display = format!("{}", op);
+        assert!(display.contains("qword"));
+        assert!(display.contains("r0_0"));
+    }
+
+    #[test]
+    fn test_ssa_operand_memory_base_disp() {
+        let op = SsaOperand::Memory {
+            base: Some(SsaValue::new(Location::Register(5), 0)),
+            index: None,
+            scale: 1,
+            displacement: -8,
+            size: 4,
+        };
+        let display = format!("{}", op);
+        assert!(display.contains("dword"));
+        assert!(display.contains("r5_0"));
+        assert!(display.contains("-0x8"));
+    }
+
+    #[test]
+    fn test_ssa_operand_memory_scaled_index() {
+        let op = SsaOperand::Memory {
+            base: Some(SsaValue::new(Location::Register(0), 0)),
+            index: Some(SsaValue::new(Location::Register(1), 0)),
+            scale: 4,
+            displacement: 0,
+            size: 4,
+        };
+        let display = format!("{}", op);
+        assert!(display.contains("r1_0*4"));
+    }
+
+    #[test]
+    fn test_ssa_operand_memory_full_sib() {
+        let op = SsaOperand::Memory {
+            base: Some(SsaValue::new(Location::Register(0), 1)),
+            index: Some(SsaValue::new(Location::Register(1), 2)),
+            scale: 8,
+            displacement: 0x100,
+            size: 8,
+        };
+        let display = format!("{}", op);
+        assert!(display.contains("qword"));
+        assert!(display.contains("r0_1"));
+        assert!(display.contains("r1_2*8"));
+        assert!(display.contains("0x100"));
+    }
+
+    #[test]
+    fn test_ssa_operand_memory_sizes() {
+        let byte_op = SsaOperand::Memory {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0x1000,
+            size: 1,
+        };
+        assert!(format!("{}", byte_op).contains("byte"));
+
+        let word_op = SsaOperand::Memory {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0x1000,
+            size: 2,
+        };
+        assert!(format!("{}", word_op).contains("word"));
+    }
+
+    // --- SsaBlock Tests ---
+
+    #[test]
+    fn test_ssa_block_new() {
+        let block = SsaBlock::new(BasicBlockId::new(5), 0x1000);
+        assert_eq!(block.id, BasicBlockId::new(5));
+        assert_eq!(block.start, 0x1000);
+        assert!(block.phis.is_empty());
+        assert!(block.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_ssa_block_add_phi() {
+        let mut block = SsaBlock::new(BasicBlockId::new(0), 0x1000);
+        let phi = PhiNode::new(SsaValue::new(Location::Register(0), 0));
+
+        block.add_phi(phi);
+        assert_eq!(block.phis.len(), 1);
+    }
+
+    #[test]
+    fn test_ssa_block_add_instruction() {
+        let mut block = SsaBlock::new(BasicBlockId::new(0), 0x1000);
+        let inst = SsaInstruction {
+            address: 0x1000,
+            operation: Operation::Move,
+            defs: vec![SsaValue::new(Location::Register(0), 0)],
+            uses: vec![SsaOperand::Immediate(42)],
+            mnemonic: "mov".to_string(),
+        };
+
+        block.add_instruction(inst);
+        assert_eq!(block.instructions.len(), 1);
+    }
+
+    #[test]
+    fn test_ssa_block_multiple_phis() {
+        let mut block = SsaBlock::new(BasicBlockId::new(0), 0x1000);
+
+        block.add_phi(PhiNode::new(SsaValue::new(Location::Register(0), 0)));
+        block.add_phi(PhiNode::new(SsaValue::new(Location::Register(1), 0)));
+        block.add_phi(PhiNode::new(SsaValue::new(Location::Register(2), 0)));
+
+        assert_eq!(block.phis.len(), 3);
+    }
+
+    // --- SsaFunction Tests ---
+
+    #[test]
+    fn test_ssa_function_new() {
+        let func = SsaFunction::new("test_func", BasicBlockId::new(0));
+        assert_eq!(func.name, "test_func");
+        assert_eq!(func.entry, BasicBlockId::new(0));
+        assert!(func.blocks.is_empty());
+    }
+
+    #[test]
+    fn test_ssa_function_default() {
+        let func = SsaFunction::default();
+        assert_eq!(func.name, "unnamed");
+        assert_eq!(func.entry, BasicBlockId::new(0));
+    }
+
+    #[test]
+    fn test_ssa_function_next_version() {
+        let mut func = SsaFunction::new("test", BasicBlockId::new(0));
+
+        let loc = Location::Register(0);
+        assert_eq!(func.next_version(&loc), 0);
+        assert_eq!(func.next_version(&loc), 1);
+        assert_eq!(func.next_version(&loc), 2);
+
+        // Different location starts at 0
+        let loc2 = Location::Register(1);
+        assert_eq!(func.next_version(&loc2), 0);
+    }
+
+    #[test]
+    fn test_ssa_function_add_block() {
+        let mut func = SsaFunction::new("test", BasicBlockId::new(0));
+        let block = SsaBlock::new(BasicBlockId::new(0), 0x1000);
+
+        func.add_block(block);
+        assert_eq!(func.blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_ssa_function_block() {
+        let mut func = SsaFunction::new("test", BasicBlockId::new(0));
+        func.add_block(SsaBlock::new(BasicBlockId::new(0), 0x1000));
+        func.add_block(SsaBlock::new(BasicBlockId::new(1), 0x1010));
+
+        assert!(func.block(BasicBlockId::new(0)).is_some());
+        assert!(func.block(BasicBlockId::new(1)).is_some());
+        assert!(func.block(BasicBlockId::new(99)).is_none());
+    }
+
+    #[test]
+    fn test_ssa_function_block_mut() {
+        let mut func = SsaFunction::new("test", BasicBlockId::new(0));
+        func.add_block(SsaBlock::new(BasicBlockId::new(0), 0x1000));
+
+        let block = func.block_mut(BasicBlockId::new(0)).unwrap();
+        block.add_phi(PhiNode::new(SsaValue::new(Location::Register(0), 0)));
+
+        assert_eq!(func.block(BasicBlockId::new(0)).unwrap().phis.len(), 1);
+    }
+
+    #[test]
+    fn test_ssa_function_display() {
+        let mut func = SsaFunction::new("my_func", BasicBlockId::new(0));
+
+        let mut block = SsaBlock::new(BasicBlockId::new(0), 0x1000);
+        let mut phi = PhiNode::new(SsaValue::new(Location::Register(0), 1));
+        phi.add_incoming(
+            BasicBlockId::new(1),
+            SsaValue::new(Location::Register(0), 0),
+        );
+        block.add_phi(phi);
+
+        let inst = SsaInstruction {
+            address: 0x1000,
+            operation: Operation::Move,
+            defs: vec![SsaValue::new(Location::Register(1), 0)],
+            uses: vec![SsaOperand::Immediate(42)],
+            mnemonic: "mov".to_string(),
+        };
+        block.add_instruction(inst);
+
+        func.add_block(block);
+
+        let display = func.display();
+        assert!(display.contains("function my_func:"));
+        assert!(display.contains("bb0:"));
+        assert!(display.contains("0x1000"));
+        assert!(display.contains("φ("));
+        assert!(display.contains("mov"));
+    }
+
+    #[test]
+    fn test_ssa_function_display_sorted_blocks() {
+        let mut func = SsaFunction::new("test", BasicBlockId::new(0));
+
+        // Add blocks out of order
+        func.add_block(SsaBlock::new(BasicBlockId::new(2), 0x1020));
+        func.add_block(SsaBlock::new(BasicBlockId::new(0), 0x1000));
+        func.add_block(SsaBlock::new(BasicBlockId::new(1), 0x1010));
+
+        let display = func.display();
+
+        // Blocks should appear in sorted order
+        let bb0_pos = display.find("bb0:").unwrap();
+        let bb1_pos = display.find("bb1:").unwrap();
+        let bb2_pos = display.find("bb2:").unwrap();
+
+        assert!(bb0_pos < bb1_pos);
+        assert!(bb1_pos < bb2_pos);
+    }
+
+    // --- SsaInstruction Tests ---
+
+    #[test]
+    fn test_ssa_instruction_multiple_defs() {
+        let inst = SsaInstruction {
+            address: 0x1000,
+            operation: Operation::Mul,
+            defs: vec![
+                SsaValue::new(Location::Register(0), 0), // low result
+                SsaValue::new(Location::Register(2), 0), // high result (rdx)
+            ],
+            uses: vec![
+                SsaOperand::Value(SsaValue::new(Location::Register(0), 0)),
+                SsaOperand::Value(SsaValue::new(Location::Register(1), 0)),
+            ],
+            mnemonic: "mul".to_string(),
+        };
+
+        assert_eq!(inst.defs.len(), 2);
+        assert_eq!(inst.uses.len(), 2);
+    }
+
+    #[test]
+    fn test_ssa_instruction_no_defs() {
+        let inst = SsaInstruction {
+            address: 0x1000,
+            operation: Operation::Store,
+            defs: vec![],
+            uses: vec![
+                SsaOperand::Value(SsaValue::new(Location::Register(0), 0)),
+                SsaOperand::Memory {
+                    base: Some(SsaValue::new(Location::Register(5), 0)),
+                    index: None,
+                    scale: 1,
+                    displacement: -8,
+                    size: 8,
+                },
+            ],
+            mnemonic: "mov".to_string(),
+        };
+
+        assert!(inst.defs.is_empty());
+        assert_eq!(inst.uses.len(), 2);
     }
 }
