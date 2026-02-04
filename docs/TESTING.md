@@ -305,21 +305,29 @@ Def-Use Chains:
 
 ---
 
-### 9. Cross-Crate Integration Tests
+### 9. Cross-Crate Integration Tests ✅ COMPLETE
 
-**Tests that exercise the full pipeline:**
+**Phase 9 complete: 33 tests added in integration_tests.rs.**
 
-```
-End-to-End:
-- test_elf_to_decompiled_c_x86_64
-- test_elf_to_decompiled_c_arm64
-- test_macho_to_decompiled_c
-- test_pe_to_decompiled_c
-- test_stripped_binary_analysis
-- test_binary_with_debug_info
-- test_static_linked_binary
-- test_dynamic_linked_binary
-```
+Tests exercise the full decompilation pipeline from binary parsing through
+disassembly, CFG construction, and decompilation across all supported formats.
+
+**Test Categories:**
+
+- Binary format detection (ELF, Mach-O, PE, ARM64)
+- Binary parsing (ELF x86_64, Mach-O x86_64/ARM64, PE x64)
+- Disassembly (x86_64, ARM64 instruction decoding)
+- CFG construction (ELF, Mach-O pipelines)
+- Call graph construction
+- End-to-end decompilation (valid C syntax validation)
+- Debug info handling (DWARF)
+- Stripped binary analysis
+- Relocatable object parsing
+- Signature recovery
+- Output format integration (DOT, JSON export)
+- Error handling (invalid/truncated/empty data)
+- Architecture consistency across pipeline
+- Full pipeline tests (x86_64 ELF, x86_64 Mach-O, ARM64 Mach-O)
 
 **Estimated effort:** 20-30 tests, 1-2 days
 
@@ -354,9 +362,9 @@ End-to-End:
 | 6 | Error paths & edge cases | 100 | ✅ Complete |
 | 7 | C header parsing | 147 | ✅ Complete |
 | 8 | Output formats | 110 | ✅ Complete |
-| 9 | Cross-crate integration | 20-30 | Pending |
+| 9 | Cross-crate integration | 33 | ✅ Complete |
 
-**Progress:** 797 tests added (Phase 1-8 complete)
+**Progress:** 830 tests added (All phases complete)
 
 ---
 
