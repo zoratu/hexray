@@ -16,13 +16,13 @@ This document outlines the testing gaps and prioritized work for improving test 
 **Coverage by Crate:**
 | Crate | Test Files | Unit Tests | Status |
 |-------|------------|------------|--------|
-| hexray-analysis | 34 | 266 | Good coverage |
+| hexray-analysis | 34 | 352 | Good coverage (+86 SSA tests) |
 | hexray-disasm | 7 | 231 | Good coverage |
 | hexray-types | 8 | 26 | Moderate |
 | hexray-signatures | 6 | 25 | Inline only, no integration |
 | hexray-emulate | 6 | 24 | Moderate |
 | hexray-formats | 7 | 26 | Moderate |
-| hexray-core | 1 | 4 | **Severely undertested** |
+| hexray-core | 1 | 141 | Good coverage (+137 tests) |
 | hexray-demangle | 1 | 11 | Light |
 | hexray (CLI) | 0 | 0 | Integration tests only |
 
@@ -30,9 +30,9 @@ This document outlines the testing gaps and prioritized work for improving test 
 
 ## Critical Priority
 
-### 1. hexray-core (3,007 lines, 4 tests)
+### 1. hexray-core (3,007 lines, 141 tests) ✅ COMPLETE
 
-The core crate defines foundational types used everywhere. Current coverage is dangerously low.
+The core crate defines foundational types used everywhere. **Phase 1 complete: 137 tests added.**
 
 **Modules with NO tests:**
 
@@ -106,9 +106,9 @@ register.rs (has 4 tests, needs more):
 
 ---
 
-### 2. SSA Construction (1,250 lines, ~3 tests)
+### 2. SSA Construction (1,250 lines, 93 tests) ✅ COMPLETE
 
-SSA form is fundamental to all analysis passes. The algorithm must be correct.
+SSA form is fundamental to all analysis passes. **Phase 2 complete: 86 tests added.**
 
 **Files:**
 - `ssa/builder.rs` (359 lines) - SSA construction with phi placement
@@ -392,19 +392,19 @@ End-to-End:
 
 ## Execution Order
 
-| Phase | Focus | Tests | Days |
-|-------|-------|-------|------|
-| 1 | hexray-core | 50-80 | 2-3 |
-| 2 | SSA construction | 40-60 | 2 |
-| 3 | Structurer | 80-120 | 3-4 |
-| 4 | Dataflow passes | 60-80 | 2-3 |
-| 5 | Signatures integration | 30-50 | 1-2 |
-| 6 | Error paths | 30-50 | 1-2 |
-| 7 | C header parsing | 30-40 | 1-2 |
-| 8 | Output formats | 20-30 | 1 |
-| 9 | Cross-crate integration | 20-30 | 1-2 |
+| Phase | Focus | Tests | Status |
+|-------|-------|-------|--------|
+| 1 | hexray-core | 137 | ✅ Complete |
+| 2 | SSA construction | 86 | ✅ Complete |
+| 3 | Structurer | 80-120 | Pending |
+| 4 | Dataflow passes | 60-80 | Pending |
+| 5 | Signatures integration | 30-50 | Pending |
+| 6 | Error paths | 30-50 | Pending |
+| 7 | C header parsing | 30-40 | Pending |
+| 8 | Output formats | 20-30 | Pending |
+| 9 | Cross-crate integration | 20-30 | Pending |
 
-**Total:** 360-540 new tests
+**Progress:** 223 tests added (Phase 1-2 complete)
 
 ---
 
