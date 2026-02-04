@@ -18,7 +18,7 @@ This document outlines the testing gaps and prioritized work for improving test 
 |-------|------------|------------|--------|
 | hexray-analysis | 34 | 553 | Good coverage (+86 SSA, +59 structurer, +42 dataflow, +100 error paths tests) |
 | hexray-disasm | 7 | 231 | Good coverage |
-| hexray-types | 8 | 26 | Moderate |
+| hexray-types | 8 | 173 | Good coverage (+147 tests) |
 | hexray-signatures | 6 | 141 | Good coverage (+116 tests) |
 | hexray-emulate | 6 | 24 | Moderate |
 | hexray-formats | 7 | 26 | Moderate |
@@ -270,27 +270,13 @@ Def-Use Chains:
 
 ## Medium Priority
 
-### 7. C Header Parsing Integration
+### 7. C Header Parsing Integration ✅ COMPLETE
 
-**Files:**
-- `hexray-types/src/parser.rs` (25,158 lines)
-- `hexray-types/src/types.rs` (20,331 lines)
+**Phase 7 complete: 147 tests added across hexray-types crate.**
 
-**Tests needed:**
-
-```
-Real Header Parsing:
-- test_parse_stdio_h_subset
-- test_parse_stdint_h
-- test_parse_struct_with_bitfields
-- test_parse_nested_structs
-- test_parse_function_pointers
-- test_parse_typedef_chains
-- test_parse_anonymous_unions
-- test_parse_flexible_array_member
-- test_parse_attributes_packed
-- test_parse_forward_declarations
-```
+- `parser.rs` - 43 tests for typedef variants, struct/union/enum parsing, functions, comments, error handling
+- `types.rs` - 68 tests for IntType, FloatType, CType methods, size/alignment, to_c_string, ArrayType, StructType, UnionType, EnumType, FunctionType, FunctionPrototype
+- `database.rs` - 39 tests for ArchInfo, type lookup, iterators, field access, merge, JSON serialization, format_type
 
 **Estimated effort:** 30-40 tests, 1-2 days
 
@@ -370,11 +356,11 @@ End-to-End:
 | 4 | Dataflow passes | 42 | ✅ Complete |
 | 5 | Signatures integration | 116 | ✅ Complete |
 | 6 | Error paths & edge cases | 100 | ✅ Complete |
-| 7 | C header parsing | 30-40 | Pending |
+| 7 | C header parsing | 147 | ✅ Complete |
 | 8 | Output formats | 20-30 | Pending |
 | 9 | Cross-crate integration | 20-30 | Pending |
 
-**Progress:** 540 tests added (Phase 1-6 complete)
+**Progress:** 687 tests added (Phase 1-7 complete)
 
 ---
 
