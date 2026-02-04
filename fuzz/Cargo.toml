@@ -47,3 +47,17 @@ path = "fuzz_targets/macho_parser.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "elf_structured"
+path = "fuzz_targets/elf_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macho_structured"
+path = "fuzz_targets/macho_structured.rs"
+test = false
+doc = false
+bench = false

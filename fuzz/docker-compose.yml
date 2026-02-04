@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   fuzz-x86_64:
     build:
@@ -70,3 +68,34 @@ services:
         limits:
           cpus: '1'
           memory: 2G
+
+  # Targeted structure-aware fuzzers for overnight runs
+  fuzz-elf-structured:
+    build:
+      context: ..
+      dockerfile: fuzz/Dockerfile
+    command: cargo fuzz run elf_structured -- -max_total_time=36000 -dict=/hexray/fuzz/dictionaries/elf.dict
+    volumes:
+      - ./corpus/elf_structured:/hexray/fuzz/corpus/elf_structured
+      - ./artifacts:/hexray/fuzz/artifacts
+      - ./dictionaries:/hexray/fuzz/dictionaries:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  fuzz-macho-structured:
+    build:
+      context: ..
+      dockerfile: fuzz/Dockerfile
+    command: cargo fuzz run macho_structured -- -max_total_time=36000 -dict=/hexray/fuzz/dictionaries/macho.dict
+    volumes:
+      - ./corpus/macho_structured:/hexray/fuzz/corpus/macho_structured
+      - ./artifacts:/hexray/fuzz/artifacts
+      - ./dictionaries:/hexray/fuzz/dictionaries:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
