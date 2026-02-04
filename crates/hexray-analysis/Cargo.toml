@@ -21,3 +21,8 @@ rayon.workspace = true
 pretty_assertions.workspace = true
 tempfile = "3.24.0"
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "analysis"
+harness = false

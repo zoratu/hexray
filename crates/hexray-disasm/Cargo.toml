@@ -21,3 +21,8 @@ all-archs = ["x86_64", "arm64", "riscv"]
 [dev-dependencies]
 pretty_assertions.workspace = true
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "disassembly"
+harness = false
