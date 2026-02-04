@@ -16,7 +16,7 @@ This document outlines the testing gaps and prioritized work for improving test 
 **Coverage by Crate:**
 | Crate | Test Files | Unit Tests | Status |
 |-------|------------|------------|--------|
-| hexray-analysis | 34 | 352 | Good coverage (+86 SSA tests) |
+| hexray-analysis | 34 | 411 | Good coverage (+86 SSA, +59 structurer tests) |
 | hexray-disasm | 7 | 231 | Good coverage |
 | hexray-types | 8 | 26 | Moderate |
 | hexray-signatures | 6 | 25 | Inline only, no integration |
@@ -151,9 +151,9 @@ SSA Optimizations:
 
 ---
 
-### 3. Structurer (3,605 lines, 0 tests)
+### 3. Structurer (3,605 lines, 59 tests) ✅ COMPLETE
 
-The largest untested module. Transforms CFG to structured control flow.
+The largest module. Transforms CFG to structured control flow. **Phase 3 complete: 59 tests added.**
 
 **Key functions to test:**
 
@@ -396,7 +396,7 @@ End-to-End:
 |-------|-------|-------|--------|
 | 1 | hexray-core | 137 | ✅ Complete |
 | 2 | SSA construction | 86 | ✅ Complete |
-| 3 | Structurer | 80-120 | Pending |
+| 3 | Structurer | 59 | ✅ Complete |
 | 4 | Dataflow passes | 60-80 | Pending |
 | 5 | Signatures integration | 30-50 | Pending |
 | 6 | Error paths | 30-50 | Pending |
@@ -404,7 +404,7 @@ End-to-End:
 | 8 | Output formats | 20-30 | Pending |
 | 9 | Cross-crate integration | 20-30 | Pending |
 
-**Progress:** 223 tests added (Phase 1-2 complete)
+**Progress:** 282 tests added (Phase 1-3 complete)
 
 ---
 
