@@ -874,4 +874,613 @@ mod tests {
             panic!("Expected struct type");
         }
     }
+
+    // --- Extended Typedef Tests ---
+
+    #[test]
+    fn test_parse_typedef_signed() {
+        let input = "typedef signed int ssize_t;";
+        let db = parse_header(input).unwrap();
+        assert!(db.has_type("ssize_t"));
+
+        let ty = db.get_type("ssize_t").unwrap();
+        if let CType::Int(i) = ty {
+            assert!(i.signed);
+            assert_eq!(i.size, 4);
+        } else {
+            panic!("Expected int type");
+        }
+    }
+
+    #[test]
+    fn test_parse_typedef_unsigned() {
+        let input = "typedef unsigned int uint32_t;";
+        let db = parse_header(input).unwrap();
+        assert!(db.has_type("uint32_t"));
+
+        let ty = db.get_type("uint32_t").unwrap();
+        if let CType::Int(i) = ty {
+            assert!(!i.signed);
+            assert_eq!(i.size, 4);
+        } else {
+            panic!("Expected int type");
+        }
+    }
+
+    #[test]
+    fn test_parse_typedef_long_long() {
+        let input = "typedef long long int64_t;";
+        let db = parse_header(input).unwrap();
+        assert!(db.has_type("int64_t"));
+
+        let ty = db.get_type("int64_t").unwrap();
+        if let CType::Int(i) = ty {
+            assert_eq!(i.size, 8);
+        } else {
+            panic!("Expected int type");
+        }
+    }
+
+    #[test]
+    fn test_parse_typedef_unsigned_long_long() {
+        let input = "typedef unsigned long long uint64_t;";
+        let db = parse_header(input).unwrap();
+        assert!(db.has_type("uint64_t"));
+
+        let ty = db.get_type("uint64_t").unwrap();
+        if let CType::Int(i) = ty {
+            assert!(!i.signed);
+            assert_eq!(i.size, 8);
+        } else {
+            panic!("Expected int type");
+        }
+    }
+
+    #[test]
+    fn test_parse_typedef_short() {
+        let input = "typedef short int16_t;";
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("int16_t").unwrap();
+        if let CType::Int(i) = ty {
+            assert_eq!(i.size, 2);
+        } else {
+            panic!("Expected int type");
+        }
+    }
+
+    #[test]
+    fn test_parse_typedef_pointer_to_pointer() {
+        let input = "typedef char **string_array;";
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("string_array").unwrap();
+        if let CType::Pointer(inner) = ty {
+            assert!(inner.is_pointer());
+        } else {
+            panic!("Expected pointer type");
+        }
+    }
+
+    #[test]
+    fn test_parse_typedef_void_pointer() {
+        let input = "typedef void *ptr_t;";
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("ptr_t").unwrap();
+        if let CType::Pointer(inner) = ty {
+            assert!(inner.is_void());
+        } else {
+            panic!("Expected pointer type");
+        }
+    }
+
+    #[test]
+    fn test_parse_typedef_const_pointer() {
+        let input = "typedef const char *cstring;";
+        let db = parse_header(input).unwrap();
+
+        assert!(db.has_type("cstring"));
+        let ty = db.get_type("cstring").unwrap();
+        assert!(ty.is_pointer());
+    }
+
+    // --- Extended Struct Tests ---
+
+    #[test]
+    fn test_parse_struct_with_pointers() {
+        let input = r#"
+            struct node {
+                int value;
+                struct node *next;
+                struct node *prev;
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("struct node").unwrap();
+        if let CType::Struct(s) = ty {
+            assert_eq!(s.fields.len(), 3);
+            assert_eq!(s.fields[0].name, "value");
+            assert!(s.fields[1].field_type.is_pointer());
+            assert!(s.fields[2].field_type.is_pointer());
+        } else {
+            panic!("Expected struct type");
+        }
+    }
+
+    #[test]
+    fn test_parse_struct_empty() {
+        let input = "struct empty {};";
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("struct empty").unwrap();
+        if let CType::Struct(s) = ty {
+            assert!(s.fields.is_empty());
+        } else {
+            panic!("Expected struct type");
+        }
+    }
+
+    #[test]
+    fn test_parse_struct_with_array_and_pointer() {
+        let input = r#"
+            struct complex {
+                char name[64];
+                int *values;
+                unsigned int count;
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("struct complex").unwrap();
+        if let CType::Struct(s) = ty {
+            assert_eq!(s.fields.len(), 3);
+            assert!(matches!(&s.fields[0].field_type, CType::Array(_)));
+            assert!(s.fields[1].field_type.is_pointer());
+            assert!(s.fields[2].field_type.is_integer());
+        } else {
+            panic!("Expected struct type");
+        }
+    }
+
+    #[test]
+    fn test_parse_struct_with_nested_array() {
+        let input = r#"
+            struct matrix {
+                int data[3][3];
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("struct matrix").unwrap();
+        if let CType::Struct(s) = ty {
+            assert_eq!(s.fields.len(), 1);
+            // First level should be array
+            if let CType::Array(outer) = &s.fields[0].field_type {
+                assert_eq!(outer.length, Some(3));
+                // Inner level should also be array
+                if let CType::Array(inner) = outer.element.as_ref() {
+                    assert_eq!(inner.length, Some(3));
+                } else {
+                    panic!("Expected inner array");
+                }
+            } else {
+                panic!("Expected outer array");
+            }
+        } else {
+            panic!("Expected struct type");
+        }
+    }
+
+    // --- Union Tests ---
+
+    #[test]
+    fn test_parse_union() {
+        let input = r#"
+            union value {
+                int i;
+                float f;
+                char *s;
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("union value").unwrap();
+        if let CType::Union(u) = ty {
+            assert_eq!(u.members.len(), 3);
+            assert_eq!(u.members[0].name, "i");
+            assert_eq!(u.members[1].name, "f");
+            assert_eq!(u.members[2].name, "s");
+        } else {
+            panic!("Expected union type");
+        }
+    }
+
+    #[test]
+    fn test_parse_union_empty() {
+        let input = "union empty {};";
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("union empty").unwrap();
+        if let CType::Union(u) = ty {
+            assert!(u.members.is_empty());
+        } else {
+            panic!("Expected union type");
+        }
+    }
+
+    // --- Extended Enum Tests ---
+
+    #[test]
+    fn test_parse_enum_all_explicit() {
+        let input = r#"
+            enum values {
+                A = 10,
+                B = 20,
+                C = 30
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("enum values").unwrap();
+        if let CType::Enum(e) = ty {
+            assert_eq!(e.value_of("A"), Some(10));
+            assert_eq!(e.value_of("B"), Some(20));
+            assert_eq!(e.value_of("C"), Some(30));
+        } else {
+            panic!("Expected enum type");
+        }
+    }
+
+    #[test]
+    fn test_parse_enum_mixed_values() {
+        let input = r#"
+            enum mixed {
+                FIRST,
+                SECOND = 100,
+                THIRD,
+                FOURTH = 200,
+                FIFTH
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("enum mixed").unwrap();
+        if let CType::Enum(e) = ty {
+            assert_eq!(e.value_of("FIRST"), Some(0));
+            assert_eq!(e.value_of("SECOND"), Some(100));
+            assert_eq!(e.value_of("THIRD"), Some(101));
+            assert_eq!(e.value_of("FOURTH"), Some(200));
+            assert_eq!(e.value_of("FIFTH"), Some(201));
+        } else {
+            panic!("Expected enum type");
+        }
+    }
+
+    #[test]
+    fn test_parse_enum_negative_values() {
+        let input = r#"
+            enum negative {
+                ERROR = -1,
+                OK = 0,
+                WARNING = 1
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("enum negative").unwrap();
+        if let CType::Enum(e) = ty {
+            assert_eq!(e.value_of("ERROR"), Some(-1));
+            assert_eq!(e.value_of("OK"), Some(0));
+            assert_eq!(e.value_of("WARNING"), Some(1));
+        } else {
+            panic!("Expected enum type");
+        }
+    }
+
+    #[test]
+    fn test_parse_enum_single_value() {
+        let input = "enum single { ONLY = 42 };";
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("enum single").unwrap();
+        if let CType::Enum(e) = ty {
+            assert_eq!(e.values.len(), 1);
+            assert_eq!(e.value_of("ONLY"), Some(42));
+        } else {
+            panic!("Expected enum type");
+        }
+    }
+
+    // --- Extended Function Tests ---
+
+    #[test]
+    fn test_parse_function_void_return() {
+        let input = "void exit(int status);";
+        let db = parse_header(input).unwrap();
+
+        let func = db.get_function("exit").unwrap();
+        assert!(func.return_type.is_void());
+        assert_eq!(func.parameters.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_function_no_params() {
+        let input = "int getchar(void);";
+        let db = parse_header(input).unwrap();
+
+        let func = db.get_function("getchar").unwrap();
+        assert!(func.return_type.is_integer());
+        assert!(func.parameters.is_empty());
+        assert!(!func.variadic);
+    }
+
+    #[test]
+    fn test_parse_function_multiple_params() {
+        let input = "int memcmp(const void *s1, const void *s2, unsigned long n);";
+        let db = parse_header(input).unwrap();
+
+        let func = db.get_function("memcmp").unwrap();
+        assert!(func.return_type.is_integer());
+        assert_eq!(func.parameters.len(), 3);
+        assert!(!func.variadic);
+    }
+
+    #[test]
+    fn test_parse_function_pointer_return() {
+        let input = "char *strcpy(char *dest, const char *src);";
+        let db = parse_header(input).unwrap();
+
+        let func = db.get_function("strcpy").unwrap();
+        assert!(func.return_type.is_pointer());
+        assert_eq!(func.parameters.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_function_double_return() {
+        let input = "double sin(double x);";
+        let db = parse_header(input).unwrap();
+
+        let func = db.get_function("sin").unwrap();
+        assert!(func.return_type.is_float());
+        assert_eq!(func.parameters.len(), 1);
+    }
+
+    // --- Comment Tests ---
+
+    #[test]
+    fn test_parse_with_line_comments() {
+        let input = r#"
+            // This is a comment
+            typedef int myint; // inline comment
+            // Another comment
+        "#;
+        let db = parse_header(input).unwrap();
+        assert!(db.has_type("myint"));
+    }
+
+    #[test]
+    fn test_parse_with_block_comments() {
+        let input = r#"
+            /* Block comment */
+            typedef int myint;
+            /*
+             * Multi-line
+             * block comment
+             */
+        "#;
+        let db = parse_header(input).unwrap();
+        assert!(db.has_type("myint"));
+    }
+
+    #[test]
+    fn test_parse_with_comment_inside_struct() {
+        let input = r#"
+            struct test {
+                int a; // first field
+                /* padding */ int b;
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("struct test").unwrap();
+        if let CType::Struct(s) = ty {
+            assert_eq!(s.fields.len(), 2);
+        } else {
+            panic!("Expected struct type");
+        }
+    }
+
+    // --- Multiple Declarations Tests ---
+
+    #[test]
+    fn test_parse_multiple_declarations() {
+        let input = r#"
+            typedef int int32_t;
+            typedef unsigned int uint32_t;
+            struct point { int x; int y; };
+            int abs(int x);
+        "#;
+        let db = parse_header(input).unwrap();
+
+        assert!(db.has_type("int32_t"));
+        assert!(db.has_type("uint32_t"));
+        assert!(db.has_type("struct point"));
+        assert!(db.has_function("abs"));
+    }
+
+    #[test]
+    fn test_parse_struct_and_typedef() {
+        let input = r#"
+            struct _point { int x; int y; };
+            typedef struct _point point_t;
+        "#;
+        let db = parse_header(input).unwrap();
+
+        assert!(db.has_type("struct _point"));
+        assert!(db.has_type("point_t"));
+    }
+
+    // --- Edge Cases ---
+
+    #[test]
+    fn test_parse_empty_input() {
+        let input = "";
+        let db = parse_header(input).unwrap();
+        assert_eq!(db.stats().type_count, 0);
+        assert_eq!(db.stats().typedef_count, 0);
+        assert_eq!(db.stats().function_count, 0);
+    }
+
+    #[test]
+    fn test_parse_whitespace_only() {
+        let input = "   \n\t\n   ";
+        let db = parse_header(input).unwrap();
+        assert_eq!(db.stats().type_count, 0);
+    }
+
+    #[test]
+    fn test_parse_comments_only() {
+        let input = "// just comments\n/* more comments */";
+        let db = parse_header(input).unwrap();
+        assert_eq!(db.stats().type_count, 0);
+    }
+
+    #[test]
+    fn test_parse_hex_number() {
+        let input = r#"
+            enum flags {
+                FLAG_A = 0x01,
+                FLAG_B = 0x02,
+                FLAG_ALL = 0xff
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("enum flags").unwrap();
+        if let CType::Enum(e) = ty {
+            assert_eq!(e.value_of("FLAG_A"), Some(1));
+            assert_eq!(e.value_of("FLAG_B"), Some(2));
+            assert_eq!(e.value_of("FLAG_ALL"), Some(255));
+        } else {
+            panic!("Expected enum type");
+        }
+    }
+
+    #[test]
+    fn test_parse_extern_declaration() {
+        let input = "extern int errno;";
+        // Should not crash - extern declarations might be parsed or skipped
+        let _ = parse_header(input);
+    }
+
+    #[test]
+    fn test_parse_static_declaration() {
+        let input = "static int global_count;";
+        // Should not crash - static declarations might be parsed or skipped
+        let _ = parse_header(input);
+    }
+
+    // --- Error Handling Tests ---
+
+    #[test]
+    fn test_parse_missing_semicolon() {
+        let input = "typedef int myint";
+        let result = parse_header(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_missing_brace() {
+        let input = "struct test { int x;";
+        let result = parse_header(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_error_unexpected_token() {
+        let err = ParseError::UnexpectedToken {
+            expected: "Semicolon".to_string(),
+            got: "OpenBrace".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("Unexpected token"));
+        assert!(msg.contains("Semicolon"));
+    }
+
+    #[test]
+    fn test_parse_error_unexpected_eof() {
+        let err = ParseError::UnexpectedEof;
+        let msg = format!("{}", err);
+        assert!(msg.contains("Unexpected end"));
+    }
+
+    #[test]
+    fn test_parse_error_invalid_type() {
+        let err = ParseError::InvalidType("badtype".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("Invalid type"));
+        assert!(msg.contains("badtype"));
+    }
+
+    #[test]
+    fn test_parse_error_syntax_error() {
+        let err = ParseError::SyntaxError {
+            pos: 42,
+            message: "test error".to_string(),
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("Syntax error"));
+        assert!(msg.contains("42"));
+        assert!(msg.contains("test error"));
+    }
+
+    // --- Token Tests ---
+
+    #[test]
+    fn test_token_equality() {
+        assert_eq!(Token::Struct, Token::Struct);
+        assert_ne!(Token::Struct, Token::Union);
+        assert_eq!(
+            Token::Ident("foo".to_string()),
+            Token::Ident("foo".to_string())
+        );
+        assert_ne!(
+            Token::Ident("foo".to_string()),
+            Token::Ident("bar".to_string())
+        );
+        assert_eq!(Token::Number(42), Token::Number(42));
+    }
+
+    #[test]
+    fn test_token_debug() {
+        let token = Token::Struct;
+        assert!(format!("{:?}", token).contains("Struct"));
+
+        let token = Token::Ident("test".to_string());
+        assert!(format!("{:?}", token).contains("test"));
+    }
+
+    // --- Float Type Tests ---
+
+    #[test]
+    fn test_parse_float_field() {
+        let input = r#"
+            struct floats {
+                float f;
+                double d;
+            };
+        "#;
+        let db = parse_header(input).unwrap();
+
+        let ty = db.get_type("struct floats").unwrap();
+        if let CType::Struct(s) = ty {
+            assert_eq!(s.fields.len(), 2);
+            assert!(s.fields[0].field_type.is_float());
+            assert!(s.fields[1].field_type.is_float());
+        } else {
+            panic!("Expected struct type");
+        }
+    }
 }

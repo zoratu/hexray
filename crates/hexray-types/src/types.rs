@@ -717,4 +717,589 @@ mod tests {
 
         assert_eq!(proto.to_c_string(), "int printf(char* format, ...)");
     }
+
+    // --- IntType Tests ---
+
+    #[test]
+    fn test_int_type_constructors() {
+        assert_eq!(IntType::char().size, 1);
+        assert!(IntType::char().signed);
+
+        assert_eq!(IntType::uchar().size, 1);
+        assert!(!IntType::uchar().signed);
+
+        assert_eq!(IntType::short().size, 2);
+        assert!(IntType::short().signed);
+
+        assert_eq!(IntType::ushort().size, 2);
+        assert!(!IntType::ushort().signed);
+
+        assert_eq!(IntType::int().size, 4);
+        assert!(IntType::int().signed);
+
+        assert_eq!(IntType::uint().size, 4);
+        assert!(!IntType::uint().signed);
+
+        assert_eq!(IntType::long().size, 8);
+        assert!(IntType::long().signed);
+
+        assert_eq!(IntType::ulong().size, 8);
+        assert!(!IntType::ulong().signed);
+
+        assert_eq!(IntType::longlong().size, 8);
+        assert!(IntType::longlong().signed);
+
+        assert_eq!(IntType::ulonglong().size, 8);
+        assert!(!IntType::ulonglong().signed);
+    }
+
+    #[test]
+    fn test_int_type_new() {
+        let ty = IntType::new(16, true);
+        assert_eq!(ty.size, 16);
+        assert!(ty.signed);
+    }
+
+    #[test]
+    fn test_int_type_equality() {
+        assert_eq!(IntType::int(), IntType::int());
+        assert_ne!(IntType::int(), IntType::uint());
+        assert_ne!(IntType::int(), IntType::long());
+    }
+
+    // --- FloatType Tests ---
+
+    #[test]
+    fn test_float_type_constructors() {
+        assert_eq!(FloatType::float().size, 4);
+        assert_eq!(FloatType::double().size, 8);
+        assert_eq!(FloatType::long_double().size, 16);
+    }
+
+    #[test]
+    fn test_float_type_new() {
+        let ty = FloatType::new(10);
+        assert_eq!(ty.size, 10);
+    }
+
+    #[test]
+    fn test_float_type_equality() {
+        assert_eq!(FloatType::float(), FloatType::float());
+        assert_ne!(FloatType::float(), FloatType::double());
+    }
+
+    // --- CType Helper Constructors Tests ---
+
+    #[test]
+    fn test_ctype_helper_constructors() {
+        assert!(CType::void().is_void());
+        assert!(CType::char().is_integer());
+        assert!(CType::short().is_integer());
+        assert!(CType::int().is_integer());
+        assert!(CType::long().is_integer());
+        assert!(CType::uchar().is_integer());
+        assert!(CType::ushort().is_integer());
+        assert!(CType::uint().is_integer());
+        assert!(CType::ulong().is_integer());
+        assert!(CType::float().is_float());
+        assert!(CType::double().is_float());
+    }
+
+    #[test]
+    fn test_ctype_ptr() {
+        let ptr = CType::ptr(CType::int());
+        assert!(ptr.is_pointer());
+        assert_eq!(ptr.size(), Some(8));
+    }
+
+    #[test]
+    fn test_ctype_array() {
+        let arr = CType::array(CType::int(), Some(10));
+        assert!(matches!(arr, CType::Array(_)));
+        assert_eq!(arr.size(), Some(40)); // 10 * 4
+    }
+
+    // --- CType Size Tests ---
+
+    #[test]
+    fn test_ctype_size_void() {
+        assert_eq!(CType::void().size(), None);
+    }
+
+    #[test]
+    fn test_ctype_size_array_unsized() {
+        let arr = CType::Array(ArrayType::new(CType::int(), None));
+        assert_eq!(arr.size(), None);
+    }
+
+    #[test]
+    fn test_ctype_size_function() {
+        let func = CType::Function(FunctionType::new(CType::int()));
+        assert_eq!(func.size(), None);
+    }
+
+    #[test]
+    fn test_ctype_size_named() {
+        let named = CType::Named("unknown".to_string());
+        assert_eq!(named.size(), None);
+    }
+
+    #[test]
+    fn test_ctype_size_typedef() {
+        let typedef = CType::Typedef(TypedefType::new("myint".to_string(), CType::int()));
+        assert_eq!(typedef.size(), Some(4));
+    }
+
+    #[test]
+    fn test_ctype_size_union() {
+        let mut u = UnionType::new(Some("test".to_string()));
+        u.add_member("a".to_string(), CType::char());
+        u.add_member("b".to_string(), CType::int());
+        u.finalize();
+
+        let union_type = CType::Union(u);
+        assert_eq!(union_type.size(), Some(4)); // Size of largest member
+    }
+
+    #[test]
+    fn test_ctype_size_enum() {
+        let mut e = EnumType::new(Some("test".to_string()));
+        e.add_value("A".to_string(), 0);
+
+        let enum_type = CType::Enum(e);
+        assert_eq!(enum_type.size(), Some(4)); // Default underlying type
+    }
+
+    // --- CType Alignment Tests ---
+
+    #[test]
+    fn test_ctype_alignment_int() {
+        assert_eq!(CType::int().alignment(), Some(4));
+        assert_eq!(CType::char().alignment(), Some(1));
+        assert_eq!(CType::short().alignment(), Some(2));
+        assert_eq!(CType::long().alignment(), Some(8));
+    }
+
+    #[test]
+    fn test_ctype_alignment_pointer() {
+        assert_eq!(CType::ptr(CType::char()).alignment(), Some(8));
+    }
+
+    #[test]
+    fn test_ctype_alignment_array() {
+        let arr = CType::array(CType::int(), Some(10));
+        assert_eq!(arr.alignment(), Some(4)); // Element alignment
+    }
+
+    #[test]
+    fn test_ctype_alignment_void() {
+        assert_eq!(CType::void().alignment(), None);
+    }
+
+    #[test]
+    fn test_ctype_alignment_function() {
+        let func = CType::Function(FunctionType::new(CType::int()));
+        assert_eq!(func.alignment(), None);
+    }
+
+    // --- CType Predicates Tests ---
+
+    #[test]
+    fn test_ctype_is_void() {
+        assert!(CType::void().is_void());
+        assert!(!CType::int().is_void());
+    }
+
+    #[test]
+    fn test_ctype_is_integer() {
+        assert!(CType::int().is_integer());
+        assert!(CType::char().is_integer());
+        assert!(!CType::void().is_integer());
+        assert!(!CType::double().is_integer());
+    }
+
+    #[test]
+    fn test_ctype_is_float() {
+        assert!(CType::float().is_float());
+        assert!(CType::double().is_float());
+        assert!(!CType::int().is_float());
+    }
+
+    #[test]
+    fn test_ctype_is_pointer() {
+        assert!(CType::ptr(CType::int()).is_pointer());
+        assert!(!CType::int().is_pointer());
+    }
+
+    #[test]
+    fn test_ctype_is_struct() {
+        let st = CType::Struct(StructType::new(Some("test".to_string())));
+        assert!(st.is_struct());
+        assert!(!CType::int().is_struct());
+    }
+
+    // --- to_c_string Tests ---
+
+    #[test]
+    fn test_to_c_string_void() {
+        assert_eq!(CType::void().to_c_string(None), "void");
+        assert_eq!(CType::void().to_c_string(Some("x")), "void x");
+    }
+
+    #[test]
+    fn test_to_c_string_unsigned_types() {
+        assert_eq!(CType::uchar().to_c_string(Some("x")), "unsigned char x");
+        assert_eq!(CType::ushort().to_c_string(Some("x")), "unsigned short x");
+        assert_eq!(CType::uint().to_c_string(Some("x")), "unsigned int x");
+        assert_eq!(
+            CType::ulong().to_c_string(Some("x")),
+            "unsigned long long x"
+        );
+    }
+
+    #[test]
+    fn test_to_c_string_float_types() {
+        assert_eq!(CType::float().to_c_string(Some("x")), "float x");
+        assert_eq!(CType::double().to_c_string(Some("x")), "double x");
+
+        let long_double = CType::Float(FloatType::long_double());
+        assert_eq!(long_double.to_c_string(Some("x")), "long double x");
+    }
+
+    #[test]
+    fn test_to_c_string_pointer_to_pointer() {
+        let pp = CType::ptr(CType::ptr(CType::char()));
+        assert_eq!(pp.to_c_string(Some("x")), "char** x");
+    }
+
+    #[test]
+    fn test_to_c_string_array() {
+        let arr = CType::array(CType::int(), Some(10));
+        let s = arr.to_c_string(Some("x"));
+        assert!(s.contains("int"));
+        assert!(s.contains("[10]"));
+    }
+
+    #[test]
+    fn test_to_c_string_array_unsized() {
+        let arr = CType::Array(ArrayType::new(CType::int(), None));
+        let s = arr.to_c_string(Some("x"));
+        assert!(s.contains("[]"));
+    }
+
+    #[test]
+    fn test_to_c_string_struct() {
+        let st = CType::Struct(StructType::new(Some("point".to_string())));
+        // Note: to_c_string adds trailing space when name is None for composite types
+        assert!(st.to_c_string(None).contains("struct point"));
+        assert_eq!(st.to_c_string(Some("p")), "struct point p");
+    }
+
+    #[test]
+    fn test_to_c_string_union() {
+        let u = CType::Union(UnionType::new(Some("value".to_string())));
+        assert!(u.to_c_string(None).contains("union value"));
+    }
+
+    #[test]
+    fn test_to_c_string_enum() {
+        let e = CType::Enum(EnumType::new(Some("color".to_string())));
+        assert!(e.to_c_string(None).contains("enum color"));
+    }
+
+    #[test]
+    fn test_to_c_string_typedef() {
+        let t = CType::Typedef(TypedefType::new("myint".to_string(), CType::int()));
+        assert_eq!(t.to_c_string(None), "myint");
+        assert_eq!(t.to_c_string(Some("x")), "myint x");
+    }
+
+    #[test]
+    fn test_to_c_string_named() {
+        let n = CType::Named("custom_type".to_string());
+        assert_eq!(n.to_c_string(None), "custom_type");
+        assert_eq!(n.to_c_string(Some("x")), "custom_type x");
+    }
+
+    // --- ArrayType Tests ---
+
+    #[test]
+    fn test_array_type_new() {
+        let arr = ArrayType::new(CType::int(), Some(10));
+        assert_eq!(arr.length, Some(10));
+        assert!(arr.element.is_integer());
+    }
+
+    #[test]
+    fn test_array_type_flexible() {
+        let arr = ArrayType::new(CType::char(), None);
+        assert_eq!(arr.length, None);
+    }
+
+    // --- StructType Tests ---
+
+    #[test]
+    fn test_struct_type_new() {
+        let st = StructType::new(Some("test".to_string()));
+        assert_eq!(st.name, Some("test".to_string()));
+        assert!(st.fields.is_empty());
+        assert_eq!(st.size, 0);
+        assert_eq!(st.alignment, 1);
+        assert!(!st.packed);
+    }
+
+    #[test]
+    fn test_struct_type_add_field() {
+        let mut st = StructType::new(Some("test".to_string()));
+        st.add_field("x".to_string(), CType::int());
+
+        assert_eq!(st.fields.len(), 1);
+        assert_eq!(st.fields[0].name, "x");
+        assert_eq!(st.fields[0].offset, 0);
+    }
+
+    #[test]
+    fn test_struct_type_alignment() {
+        let mut st = StructType::new(Some("test".to_string()));
+        st.add_field("a".to_string(), CType::char()); // offset 0
+        st.add_field("b".to_string(), CType::long()); // offset 8 (aligned)
+        st.finalize();
+
+        assert_eq!(st.fields[0].offset, 0);
+        assert_eq!(st.fields[1].offset, 8);
+        assert_eq!(st.alignment, 8);
+    }
+
+    #[test]
+    fn test_struct_type_field_at_offset() {
+        let mut st = StructType::new(Some("test".to_string()));
+        st.add_field("a".to_string(), CType::int()); // offset 0, size 4
+        st.add_field("b".to_string(), CType::int()); // offset 4, size 4
+        st.finalize();
+
+        assert_eq!(
+            st.field_at_offset(0).map(|f| &f.name),
+            Some(&"a".to_string())
+        );
+        assert_eq!(
+            st.field_at_offset(2).map(|f| &f.name),
+            Some(&"a".to_string())
+        ); // Within field a
+        assert_eq!(
+            st.field_at_offset(4).map(|f| &f.name),
+            Some(&"b".to_string())
+        );
+        assert!(st.field_at_offset(100).is_none());
+    }
+
+    #[test]
+    fn test_struct_type_field_by_name() {
+        let mut st = StructType::new(Some("test".to_string()));
+        st.add_field("x".to_string(), CType::int());
+        st.add_field("y".to_string(), CType::int());
+        st.finalize();
+
+        assert!(st.field_by_name("x").is_some());
+        assert!(st.field_by_name("y").is_some());
+        assert!(st.field_by_name("z").is_none());
+    }
+
+    // --- UnionType Tests ---
+
+    #[test]
+    fn test_union_type_new() {
+        let u = UnionType::new(Some("value".to_string()));
+        assert_eq!(u.name, Some("value".to_string()));
+        assert!(u.members.is_empty());
+        assert_eq!(u.size, 0);
+        assert_eq!(u.alignment, 1);
+    }
+
+    #[test]
+    fn test_union_type_add_member() {
+        let mut u = UnionType::new(Some("value".to_string()));
+        u.add_member("i".to_string(), CType::int());
+        u.add_member("d".to_string(), CType::double());
+        u.finalize();
+
+        assert_eq!(u.members.len(), 2);
+        assert_eq!(u.size, 8); // Size of largest member (double)
+        assert_eq!(u.alignment, 8);
+    }
+
+    #[test]
+    fn test_union_type_finalize() {
+        let mut u = UnionType::new(None);
+        u.add_member("a".to_string(), CType::char());
+        u.add_member("b".to_string(), CType::int());
+        u.finalize();
+
+        // Size should be padded to alignment
+        assert_eq!(u.size, 4);
+        assert_eq!(u.alignment, 4);
+    }
+
+    // --- EnumType Tests ---
+
+    #[test]
+    fn test_enum_type_new() {
+        let e = EnumType::new(Some("color".to_string()));
+        assert_eq!(e.name, Some("color".to_string()));
+        assert!(e.values.is_empty());
+        assert_eq!(e.underlying_size, 4);
+    }
+
+    #[test]
+    fn test_enum_type_add_value() {
+        let mut e = EnumType::new(Some("test".to_string()));
+        e.add_value("A".to_string(), 0);
+        e.add_value("B".to_string(), 1);
+        e.add_value("C".to_string(), 2);
+
+        assert_eq!(e.values.len(), 3);
+    }
+
+    #[test]
+    fn test_enum_type_value_of() {
+        let mut e = EnumType::new(Some("test".to_string()));
+        e.add_value("A".to_string(), 10);
+        e.add_value("B".to_string(), 20);
+
+        assert_eq!(e.value_of("A"), Some(10));
+        assert_eq!(e.value_of("B"), Some(20));
+        assert_eq!(e.value_of("C"), None);
+    }
+
+    #[test]
+    fn test_enum_type_name_of() {
+        let mut e = EnumType::new(Some("test".to_string()));
+        e.add_value("A".to_string(), 10);
+        e.add_value("B".to_string(), 20);
+
+        assert_eq!(e.name_of(10), Some("A"));
+        assert_eq!(e.name_of(20), Some("B"));
+        assert_eq!(e.name_of(30), None);
+    }
+
+    #[test]
+    fn test_enum_type_large_value() {
+        let mut e = EnumType::new(Some("test".to_string()));
+        e.add_value("LARGE".to_string(), i64::MAX);
+
+        assert_eq!(e.underlying_size, 8); // Should expand to 8 bytes
+    }
+
+    #[test]
+    fn test_enum_type_negative_value() {
+        let mut e = EnumType::new(Some("test".to_string()));
+        e.add_value("NEG".to_string(), i64::MIN);
+
+        assert_eq!(e.underlying_size, 8);
+    }
+
+    // --- FunctionType Tests ---
+
+    #[test]
+    fn test_function_type_new() {
+        let f = FunctionType::new(CType::int());
+        assert!(f.return_type.is_integer());
+        assert!(f.parameters.is_empty());
+        assert!(!f.variadic);
+    }
+
+    #[test]
+    fn test_function_type_add_param() {
+        let mut f = FunctionType::new(CType::void());
+        f.add_param("x".to_string(), CType::int());
+        f.add_param("y".to_string(), CType::int());
+
+        assert_eq!(f.parameters.len(), 2);
+        assert_eq!(f.parameters[0].name, "x");
+        assert_eq!(f.parameters[1].name, "y");
+    }
+
+    // --- TypedefType Tests ---
+
+    #[test]
+    fn test_typedef_type_new() {
+        let t = TypedefType::new("myint".to_string(), CType::int());
+        assert_eq!(t.name, "myint");
+        assert!(t.target.is_integer());
+    }
+
+    // --- FunctionPrototype Tests ---
+
+    #[test]
+    fn test_function_prototype_new() {
+        let proto = FunctionPrototype::new("test", CType::void());
+        assert_eq!(proto.name, "test");
+        assert!(proto.return_type.is_void());
+        assert!(proto.parameters.is_empty());
+        assert!(!proto.variadic);
+    }
+
+    #[test]
+    fn test_function_prototype_param() {
+        let proto = FunctionPrototype::new("test", CType::int())
+            .param("x", CType::int())
+            .param("y", CType::int());
+
+        assert_eq!(proto.parameters.len(), 2);
+    }
+
+    #[test]
+    fn test_function_prototype_variadic() {
+        let proto = FunctionPrototype::new("test", CType::int()).variadic();
+        assert!(proto.variadic);
+    }
+
+    #[test]
+    fn test_function_prototype_to_c_string_void() {
+        let proto = FunctionPrototype::new("getchar", CType::int());
+        assert_eq!(proto.to_c_string(), "int getchar(void)");
+    }
+
+    #[test]
+    fn test_function_prototype_to_c_string_params() {
+        let proto = FunctionPrototype::new("add", CType::int())
+            .param("a", CType::int())
+            .param("b", CType::int());
+
+        assert_eq!(proto.to_c_string(), "int add(int a, int b)");
+    }
+
+    // --- BitFieldInfo Tests ---
+
+    #[test]
+    fn test_bitfield_info() {
+        let bf = BitFieldInfo {
+            bit_offset: 0,
+            bit_width: 3,
+        };
+        assert_eq!(bf.bit_offset, 0);
+        assert_eq!(bf.bit_width, 3);
+    }
+
+    // --- CType Debug/Equality Tests ---
+
+    #[test]
+    fn test_ctype_debug() {
+        let ty = CType::int();
+        let debug = format!("{:?}", ty);
+        assert!(debug.contains("Int"));
+    }
+
+    #[test]
+    fn test_ctype_equality() {
+        assert_eq!(CType::int(), CType::int());
+        assert_ne!(CType::int(), CType::long());
+        assert_eq!(CType::ptr(CType::char()), CType::ptr(CType::char()));
+    }
+
+    #[test]
+    fn test_ctype_clone() {
+        let ty = CType::ptr(CType::int());
+        let cloned = ty.clone();
+        assert_eq!(ty, cloned);
+    }
 }
