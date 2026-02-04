@@ -1,7 +1,7 @@
 //! DWARF type definitions and constants.
 //!
 //! This module defines the constants and types used in DWARF debugging information.
-//! Reference: DWARF Version 5 Standard (http://dwarfstd.org/)
+//! Reference: DWARF Version 5 Standard (<http://dwarfstd.org/>)
 
 /// DWARF tag values (DW_TAG_*).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

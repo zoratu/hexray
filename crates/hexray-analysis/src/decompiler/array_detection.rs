@@ -6,16 +6,16 @@
 //! # Patterns Detected
 //!
 //! ## Simple Array Access
-//! `*(base + index * element_size)` -> `base[index]`
+//! `*(base + index * element_size)` → `base\[index\]`
 //!
 //! ## Struct Array Access
-//! `*(base + index * stride + offset)` -> `arr[index].field`
+//! `*(base + index * stride + offset)` → `arr\[index\].field`
 //!
 //! ## Fixed Index Access
-//! `*(base + constant)` -> `base[constant / element_size]`
+//! `*(base + constant)` → `base\[constant / element_size\]`
 //!
 //! ## Address-of Array Element
-//! `base + index * element_size` -> `&base[index]`
+//! `base + index * element_size` → `&base\[index\]`
 //!
 //! # Common Addressing Modes
 //!
@@ -75,8 +75,8 @@ pub fn detect_array_access(addr: &Expr, deref_size: u8) -> Option<ArrayAccessInf
 /// Detects address-of array element pattern (for LEA instruction results).
 ///
 /// Matches patterns like:
-/// - `base + index * size` -> `&base[index]`
-/// - `base + constant` -> `&base[constant / size]` (for aligned constants)
+/// - `base + index * size` → `&base\[index\]`
+/// - `base + constant` → `&base\[constant / size\]` (for aligned constants)
 pub fn detect_address_of_array_element(
     addr: &Expr,
     hinted_size: Option<usize>,

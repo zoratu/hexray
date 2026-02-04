@@ -30,7 +30,7 @@ pub enum ExprKind {
     /// Unary operation: op expr.
     UnaryOp { op: UnaryOpKind, operand: Box<Expr> },
 
-    /// Memory dereference: *expr or expr[index].
+    /// Memory dereference: `*expr` or `expr\[index\]`.
     Deref { addr: Box<Expr>, size: u8 },
 
     /// GOT/data reference: RIP-relative memory access with computed absolute address.
@@ -51,7 +51,7 @@ pub enum ExprKind {
     /// Address-of: &expr.
     AddressOf(Box<Expr>),
 
-    /// Array access: base[index].
+    /// Array access: `base\[index\]`.
     /// Represents pointer arithmetic patterns like `*(base + index * element_size)`.
     ArrayAccess {
         /// The base pointer or array.
@@ -2532,9 +2532,9 @@ fn is_commutative(op: BinOpKind) -> bool {
 /// Attempts to detect array access patterns in a dereference address.
 ///
 /// This function analyzes address expressions like:
-/// - `base + index * element_size` -> `base[index]`
-/// - `base + constant` -> `base[constant / size]` (when aligned)
-/// - `base + (index << shift)` -> `base[index]` (where 1 << shift == size)
+/// - `base + index * element_size` → `base\[index\]`
+/// - `base + constant` → `base\[constant / size\]` (when aligned)
+/// - `base + (index << shift)` → `base\[index\]` (where 1 << shift == size)
 ///
 /// Returns `Some(Expr::ArrayAccess { ... })` if a pattern is detected.
 fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {

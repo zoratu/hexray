@@ -1,10 +1,13 @@
 //! hexray - A multi-architecture disassembler
 //!
-//! Usage:
-//!   hexray <binary>              Disassemble the entry point
-//!   hexray <binary> -s <symbol>  Disassemble a specific symbol/function
-//!   hexray <binary> --sections   List sections
-//!   hexray <binary> --symbols    List symbols
+//! # Usage
+//!
+//! ```text
+//! hexray <binary>              Disassemble the entry point
+//! hexray <binary> -s <symbol>  Disassemble a specific symbol/function
+//! hexray <binary> --sections   List sections
+//! hexray <binary> --symbols    List symbols
+//! ```
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
