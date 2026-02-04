@@ -853,3 +853,303 @@ impl std::fmt::Display for Instruction {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Architecture, Register, RegisterClass};
+
+    fn make_reg(id: u16) -> Register {
+        Register::new(Architecture::X86_64, RegisterClass::General, id, 64)
+    }
+
+    // --- Instruction Construction Tests ---
+
+    #[test]
+    fn test_instruction_new() {
+        let inst = Instruction::new(0x1000, 4, vec![0x48, 0x89, 0xe5, 0x90], "mov");
+
+        assert_eq!(inst.address, 0x1000);
+        assert_eq!(inst.size, 4);
+        assert_eq!(inst.bytes.len(), 4);
+        assert_eq!(inst.mnemonic, "mov");
+        assert!(inst.operands.is_empty());
+        assert_eq!(inst.control_flow, ControlFlow::Sequential);
+    }
+
+    #[test]
+    fn test_instruction_with_operation() {
+        let inst = Instruction::new(0x1000, 1, vec![0x90], "nop").with_operation(Operation::Nop);
+
+        assert_eq!(inst.operation, Operation::Nop);
+    }
+
+    #[test]
+    fn test_instruction_with_operand() {
+        let inst = Instruction::new(0x1000, 3, vec![0x48, 0x89, 0xc0], "mov")
+            .with_operand(Operand::reg(make_reg(0)))
+            .with_operand(Operand::reg(make_reg(0)));
+
+        assert_eq!(inst.operands.len(), 2);
+    }
+
+    #[test]
+    fn test_instruction_with_operands() {
+        let ops = vec![Operand::reg(make_reg(0)), Operand::imm(42, 32)];
+        let inst = Instruction::new(0x1000, 5, vec![0x48, 0xc7, 0xc0, 0x2a, 0x00], "mov")
+            .with_operands(ops);
+
+        assert_eq!(inst.operands.len(), 2);
+    }
+
+    #[test]
+    fn test_instruction_with_control_flow() {
+        let inst = Instruction::new(0x1000, 5, vec![0xe9, 0x00, 0x10, 0x00, 0x00], "jmp")
+            .with_control_flow(ControlFlow::UnconditionalBranch { target: 0x2000 });
+
+        assert_eq!(
+            inst.control_flow,
+            ControlFlow::UnconditionalBranch { target: 0x2000 }
+        );
+    }
+
+    #[test]
+    fn test_instruction_end_address() {
+        let inst = Instruction::new(0x1000, 5, vec![0; 5], "nop");
+        assert_eq!(inst.end_address(), 0x1005);
+    }
+
+    // --- Control Flow Detection Tests ---
+
+    #[test]
+    fn test_is_branch_sequential() {
+        let inst = Instruction::new(0x1000, 1, vec![0x90], "nop");
+        assert!(!inst.is_branch());
+    }
+
+    #[test]
+    fn test_is_branch_unconditional() {
+        let inst = Instruction::new(0x1000, 5, vec![0xe9, 0, 0, 0, 0], "jmp")
+            .with_control_flow(ControlFlow::UnconditionalBranch { target: 0x2000 });
+        assert!(inst.is_branch());
+    }
+
+    #[test]
+    fn test_is_branch_conditional() {
+        let inst = Instruction::new(0x1000, 2, vec![0x74, 0x10], "je").with_control_flow(
+            ControlFlow::ConditionalBranch {
+                target: 0x1012,
+                condition: Condition::Equal,
+                fallthrough: 0x1002,
+            },
+        );
+        assert!(inst.is_branch());
+    }
+
+    #[test]
+    fn test_is_call_direct() {
+        let inst = Instruction::new(0x1000, 5, vec![0xe8, 0, 0, 0, 0], "call").with_control_flow(
+            ControlFlow::Call {
+                target: 0x2000,
+                return_addr: 0x1005,
+            },
+        );
+        assert!(inst.is_call());
+    }
+
+    #[test]
+    fn test_is_call_indirect() {
+        let inst = Instruction::new(0x1000, 2, vec![0xff, 0xd0], "call").with_control_flow(
+            ControlFlow::IndirectCall {
+                return_addr: 0x1002,
+            },
+        );
+        assert!(inst.is_call());
+    }
+
+    #[test]
+    fn test_is_call_not_call() {
+        let inst = Instruction::new(0x1000, 5, vec![0xe9, 0, 0, 0, 0], "jmp")
+            .with_control_flow(ControlFlow::UnconditionalBranch { target: 0x2000 });
+        assert!(!inst.is_call());
+    }
+
+    #[test]
+    fn test_is_return() {
+        let inst =
+            Instruction::new(0x1000, 1, vec![0xc3], "ret").with_control_flow(ControlFlow::Return);
+        assert!(inst.is_return());
+    }
+
+    #[test]
+    fn test_is_return_not_return() {
+        let inst = Instruction::new(0x1000, 1, vec![0x90], "nop");
+        assert!(!inst.is_return());
+    }
+
+    #[test]
+    fn test_is_terminator() {
+        // Sequential is not a terminator
+        let nop = Instruction::new(0x1000, 1, vec![0x90], "nop");
+        assert!(!nop.is_terminator());
+
+        // Branches are terminators
+        let jmp = Instruction::new(0x1000, 5, vec![0xe9, 0, 0, 0, 0], "jmp")
+            .with_control_flow(ControlFlow::UnconditionalBranch { target: 0x2000 });
+        assert!(jmp.is_terminator());
+
+        // Returns are terminators
+        let ret =
+            Instruction::new(0x1000, 1, vec![0xc3], "ret").with_control_flow(ControlFlow::Return);
+        assert!(ret.is_terminator());
+
+        // Calls are terminators
+        let call = Instruction::new(0x1000, 5, vec![0xe8, 0, 0, 0, 0], "call").with_control_flow(
+            ControlFlow::Call {
+                target: 0x2000,
+                return_addr: 0x1005,
+            },
+        );
+        assert!(call.is_terminator());
+    }
+
+    // --- Operation Tests ---
+
+    #[test]
+    fn test_operation_name() {
+        assert_eq!(Operation::Move.name(), "move");
+        assert_eq!(Operation::Add.name(), "add");
+        assert_eq!(Operation::Sub.name(), "sub");
+        assert_eq!(Operation::Mul.name(), "mul");
+        assert_eq!(Operation::Div.name(), "div");
+        assert_eq!(Operation::And.name(), "and");
+        assert_eq!(Operation::Or.name(), "or");
+        assert_eq!(Operation::Xor.name(), "xor");
+        assert_eq!(Operation::Shl.name(), "shl");
+        assert_eq!(Operation::Shr.name(), "shr");
+        assert_eq!(Operation::Jump.name(), "jump");
+        assert_eq!(Operation::Call.name(), "call");
+        assert_eq!(Operation::Return.name(), "return");
+        assert_eq!(Operation::Nop.name(), "nop");
+        assert_eq!(Operation::Other(42).name(), "other");
+        assert_eq!(Operation::Invalid.name(), "invalid");
+    }
+
+    #[test]
+    fn test_operation_advanced() {
+        assert_eq!(Operation::LoadEffectiveAddress.name(), "lea");
+        assert_eq!(Operation::Compare.name(), "compare");
+        assert_eq!(Operation::Test.name(), "test");
+        assert_eq!(Operation::Popcnt.name(), "popcnt");
+        assert_eq!(Operation::Lzcnt.name(), "lzcnt");
+        assert_eq!(Operation::Tzcnt.name(), "tzcnt");
+    }
+
+    #[test]
+    fn test_operation_vector() {
+        assert_eq!(Operation::VectorAdd.name(), "vector_add");
+        assert_eq!(Operation::VectorSub.name(), "vector_sub");
+        assert_eq!(Operation::VectorMul.name(), "vector_mul");
+        assert_eq!(Operation::VectorLoad.name(), "vector_load");
+        assert_eq!(Operation::VectorStore.name(), "vector_store");
+    }
+
+    #[test]
+    fn test_operation_float() {
+        assert_eq!(Operation::FloatAdd.name(), "float_add");
+        assert_eq!(Operation::FloatSub.name(), "float_sub");
+        assert_eq!(Operation::FloatMul.name(), "float_mul");
+        assert_eq!(Operation::FloatDiv.name(), "float_div");
+        assert_eq!(Operation::FloatSqrt.name(), "float_sqrt");
+    }
+
+    #[test]
+    fn test_operation_atomic() {
+        assert_eq!(Operation::LoadExclusive.name(), "load_exclusive");
+        assert_eq!(Operation::StoreExclusive.name(), "store_exclusive");
+        assert_eq!(Operation::AtomicAdd.name(), "atomic_add");
+        assert_eq!(Operation::CompareAndSwap.name(), "compare_and_swap");
+    }
+
+    #[test]
+    fn test_operation_system() {
+        assert_eq!(Operation::Syscall.name(), "syscall");
+        assert_eq!(Operation::CpuId.name(), "cpuid");
+        assert_eq!(Operation::ReadTsc.name(), "read_tsc");
+        assert_eq!(Operation::ReadMsr.name(), "read_msr");
+        assert_eq!(Operation::WriteMsr.name(), "write_msr");
+    }
+
+    // --- ControlFlow Tests ---
+
+    #[test]
+    fn test_control_flow_equality() {
+        assert_eq!(ControlFlow::Sequential, ControlFlow::Sequential);
+        assert_eq!(ControlFlow::Return, ControlFlow::Return);
+        assert_eq!(
+            ControlFlow::UnconditionalBranch { target: 0x1000 },
+            ControlFlow::UnconditionalBranch { target: 0x1000 }
+        );
+        assert_ne!(
+            ControlFlow::UnconditionalBranch { target: 0x1000 },
+            ControlFlow::UnconditionalBranch { target: 0x2000 }
+        );
+    }
+
+    #[test]
+    fn test_control_flow_conditional_branch() {
+        let cf = ControlFlow::ConditionalBranch {
+            target: 0x1020,
+            condition: Condition::Equal,
+            fallthrough: 0x1010,
+        };
+
+        match cf {
+            ControlFlow::ConditionalBranch {
+                target,
+                condition,
+                fallthrough,
+            } => {
+                assert_eq!(target, 0x1020);
+                assert_eq!(condition, Condition::Equal);
+                assert_eq!(fallthrough, 0x1010);
+            }
+            _ => panic!("Expected ConditionalBranch"),
+        }
+    }
+
+    #[test]
+    fn test_control_flow_indirect_branch() {
+        let cf = ControlFlow::IndirectBranch {
+            possible_targets: vec![0x1000, 0x2000, 0x3000],
+        };
+
+        match cf {
+            ControlFlow::IndirectBranch { possible_targets } => {
+                assert_eq!(possible_targets.len(), 3);
+            }
+            _ => panic!("Expected IndirectBranch"),
+        }
+    }
+
+    // --- Display Tests ---
+
+    #[test]
+    fn test_instruction_display() {
+        let inst = Instruction::new(0x1000, 3, vec![0x48, 0x89, 0xe5], "mov")
+            .with_operand(Operand::reg(make_reg(5))) // rbp
+            .with_operand(Operand::reg(make_reg(4))); // rsp
+
+        let display = format!("{}", inst);
+        assert!(display.contains("0x00001000"));
+        assert!(display.contains("48 89 e5"));
+        assert!(display.contains("mov"));
+    }
+
+    #[test]
+    fn test_instruction_display_no_operands() {
+        let inst = Instruction::new(0x1000, 1, vec![0xc3], "ret");
+        let display = format!("{}", inst);
+        assert!(display.contains("ret"));
+    }
+}

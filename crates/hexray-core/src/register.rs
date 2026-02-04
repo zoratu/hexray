@@ -1098,3 +1098,531 @@ fn riscv_reg_name(id: u16) -> &'static str {
         _ => "unknown",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Register Construction Tests ---
+
+    #[test]
+    fn test_register_new() {
+        let reg = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        assert_eq!(reg.arch, Architecture::X86_64);
+        assert_eq!(reg.class, RegisterClass::General);
+        assert_eq!(reg.id, x86::RAX);
+        assert_eq!(reg.size, 64);
+    }
+
+    #[test]
+    fn test_register_equality() {
+        let reg1 = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        let reg2 = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        let reg3 = Register::new(Architecture::X86_64, RegisterClass::General, x86::RCX, 64);
+
+        assert_eq!(reg1, reg2);
+        assert_ne!(reg1, reg3);
+    }
+
+    #[test]
+    fn test_register_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, x86::RCX, 64);
+
+        set.insert(rax);
+        set.insert(rcx);
+        set.insert(rax); // duplicate
+
+        assert_eq!(set.len(), 2);
+    }
+
+    // --- x86-64 Register Name Tests ---
+
+    #[test]
+    fn test_x86_64_gpr_64bit() {
+        let names = [
+            (x86::RAX, "rax"),
+            (x86::RCX, "rcx"),
+            (x86::RDX, "rdx"),
+            (x86::RBX, "rbx"),
+            (x86::RSP, "rsp"),
+            (x86::RBP, "rbp"),
+            (x86::RSI, "rsi"),
+            (x86::RDI, "rdi"),
+            (x86::R8, "r8"),
+            (x86::R9, "r9"),
+            (x86::R10, "r10"),
+            (x86::R11, "r11"),
+            (x86::R12, "r12"),
+            (x86::R13, "r13"),
+            (x86::R14, "r14"),
+            (x86::R15, "r15"),
+        ];
+
+        for (id, expected) in names {
+            let reg = Register::new(Architecture::X86_64, RegisterClass::General, id, 64);
+            assert_eq!(reg.name(), expected, "Failed for register id {}", id);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_gpr_32bit() {
+        let names = [
+            (x86::RAX, "eax"),
+            (x86::RCX, "ecx"),
+            (x86::RDX, "edx"),
+            (x86::RBX, "ebx"),
+            (x86::RSP, "esp"),
+            (x86::RBP, "ebp"),
+            (x86::RSI, "esi"),
+            (x86::RDI, "edi"),
+            (x86::R8, "r8d"),
+            (x86::R9, "r9d"),
+            (x86::R10, "r10d"),
+            (x86::R11, "r11d"),
+            (x86::R12, "r12d"),
+            (x86::R13, "r13d"),
+            (x86::R14, "r14d"),
+            (x86::R15, "r15d"),
+        ];
+
+        for (id, expected) in names {
+            let reg = Register::new(Architecture::X86_64, RegisterClass::General, id, 32);
+            assert_eq!(reg.name(), expected, "Failed for register id {}", id);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_gpr_16bit() {
+        let names = [
+            (x86::RAX, "ax"),
+            (x86::RCX, "cx"),
+            (x86::RDX, "dx"),
+            (x86::RBX, "bx"),
+            (x86::RSP, "sp"),
+            (x86::RBP, "bp"),
+            (x86::RSI, "si"),
+            (x86::RDI, "di"),
+            (x86::R8, "r8w"),
+            (x86::R9, "r9w"),
+        ];
+
+        for (id, expected) in names {
+            let reg = Register::new(Architecture::X86_64, RegisterClass::General, id, 16);
+            assert_eq!(reg.name(), expected, "Failed for register id {}", id);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_gpr_8bit() {
+        let names = [
+            (x86::RAX, "al"),
+            (x86::RCX, "cl"),
+            (x86::RDX, "dl"),
+            (x86::RBX, "bl"),
+            (x86::RSP, "spl"),
+            (x86::RBP, "bpl"),
+            (x86::RSI, "sil"),
+            (x86::RDI, "dil"),
+            (x86::R8, "r8b"),
+            (x86::R9, "r9b"),
+        ];
+
+        for (id, expected) in names {
+            let reg = Register::new(Architecture::X86_64, RegisterClass::General, id, 8);
+            assert_eq!(reg.name(), expected, "Failed for register id {}", id);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_special_registers() {
+        let rip = Register::new(
+            Architecture::X86_64,
+            RegisterClass::ProgramCounter,
+            x86::RIP,
+            64,
+        );
+        assert_eq!(rip.name(), "rip");
+
+        let rflags = Register::new(Architecture::X86_64, RegisterClass::Flags, x86::RFLAGS, 64);
+        assert_eq!(rflags.name(), "rflags");
+    }
+
+    #[test]
+    fn test_x86_64_segment_registers() {
+        let segments = [
+            (x86::CS, "cs"),
+            (x86::DS, "ds"),
+            (x86::ES, "es"),
+            (x86::FS, "fs"),
+            (x86::GS, "gs"),
+            (x86::SS, "ss"),
+        ];
+
+        for (id, expected) in segments {
+            let reg = Register::new(Architecture::X86_64, RegisterClass::Segment, id, 16);
+            assert_eq!(reg.name(), expected, "Failed for segment {}", expected);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_xmm_registers() {
+        for i in 0..16u16 {
+            let reg = Register::new(
+                Architecture::X86_64,
+                RegisterClass::Vector,
+                x86::XMM0 + i,
+                128,
+            );
+            let expected = format!("xmm{}", i);
+            assert_eq!(reg.name(), expected, "Failed for xmm{}", i);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_ymm_registers() {
+        for i in 0..16u16 {
+            let reg = Register::new(
+                Architecture::X86_64,
+                RegisterClass::Vector,
+                x86::YMM0 + i,
+                256,
+            );
+            let expected = format!("ymm{}", i);
+            assert_eq!(reg.name(), expected, "Failed for ymm{}", i);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_zmm_registers() {
+        for i in 0..16u16 {
+            let reg = Register::new(
+                Architecture::X86_64,
+                RegisterClass::Vector,
+                x86::XMM0 + i,
+                512,
+            );
+            let expected = format!("zmm{}", i);
+            assert_eq!(reg.name(), expected, "Failed for zmm{}", i);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_opmask_registers() {
+        for i in 0..8u16 {
+            let reg = Register::new(
+                Architecture::X86_64,
+                RegisterClass::Predicate,
+                x86::K0 + i,
+                64,
+            );
+            let expected = format!("k{}", i);
+            assert_eq!(reg.name(), expected, "Failed for k{}", i);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_tmm_registers() {
+        for i in 0..8u16 {
+            let reg = Register::new(
+                Architecture::X86_64,
+                RegisterClass::Tile,
+                x86::TMM0 + i,
+                8192,
+            );
+            let expected = format!("tmm{}", i);
+            assert_eq!(reg.name(), expected, "Failed for tmm{}", i);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_x87_registers() {
+        for i in 0..8u16 {
+            let reg = Register::new(Architecture::X86_64, RegisterClass::X87, i, 80);
+            let expected = format!("st({})", i);
+            assert_eq!(reg.name(), expected, "Failed for st({})", i);
+        }
+    }
+
+    // --- ARM64 Register Name Tests ---
+
+    #[test]
+    fn test_arm64_x_registers() {
+        for i in 0..=30u16 {
+            let reg = Register::new(Architecture::Arm64, RegisterClass::General, i, 64);
+            let expected = format!("x{}", i);
+            assert_eq!(reg.name(), expected, "Failed for x{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_w_registers() {
+        for i in 0..=30u16 {
+            let reg = Register::new(Architecture::Arm64, RegisterClass::General, i, 32);
+            let expected = format!("w{}", i);
+            assert_eq!(reg.name(), expected, "Failed for w{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_special_registers() {
+        let sp = Register::new(
+            Architecture::Arm64,
+            RegisterClass::StackPointer,
+            arm64::SP,
+            64,
+        );
+        assert_eq!(sp.name(), "sp");
+
+        let xzr = Register::new(Architecture::Arm64, RegisterClass::General, arm64::XZR, 64);
+        assert_eq!(xzr.name(), "xzr");
+
+        let wzr = Register::new(Architecture::Arm64, RegisterClass::General, arm64::XZR, 32);
+        assert_eq!(wzr.name(), "wzr");
+
+        let pc = Register::new(
+            Architecture::Arm64,
+            RegisterClass::ProgramCounter,
+            arm64::PC,
+            64,
+        );
+        assert_eq!(pc.name(), "pc");
+    }
+
+    #[test]
+    fn test_arm64_v_registers() {
+        for i in 0..32u16 {
+            let reg = Register::new(
+                Architecture::Arm64,
+                RegisterClass::Vector,
+                arm64::V0 + i,
+                128,
+            );
+            let expected = format!("v{}", i);
+            assert_eq!(reg.name(), expected, "Failed for v{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_d_registers() {
+        for i in 0..32u16 {
+            let reg = Register::new(
+                Architecture::Arm64,
+                RegisterClass::FloatingPoint,
+                arm64::V0 + i,
+                64,
+            );
+            let expected = format!("d{}", i);
+            assert_eq!(reg.name(), expected, "Failed for d{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_s_registers() {
+        for i in 0..32u16 {
+            let reg = Register::new(
+                Architecture::Arm64,
+                RegisterClass::FloatingPoint,
+                arm64::V0 + i,
+                32,
+            );
+            let expected = format!("s{}", i);
+            assert_eq!(reg.name(), expected, "Failed for s{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_h_registers() {
+        for i in 0..32u16 {
+            let reg = Register::new(
+                Architecture::Arm64,
+                RegisterClass::FloatingPoint,
+                arm64::V0 + i,
+                16,
+            );
+            let expected = format!("h{}", i);
+            assert_eq!(reg.name(), expected, "Failed for h{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_b_registers() {
+        for i in 0..32u16 {
+            let reg = Register::new(
+                Architecture::Arm64,
+                RegisterClass::FloatingPoint,
+                arm64::V0 + i,
+                8,
+            );
+            let expected = format!("b{}", i);
+            assert_eq!(reg.name(), expected, "Failed for b{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_z_registers() {
+        for i in 0..32u16 {
+            let reg = Register::new(
+                Architecture::Arm64,
+                RegisterClass::ScalableVector,
+                arm64::Z0 + i,
+                2048,
+            );
+            let expected = format!("z{}", i);
+            assert_eq!(reg.name(), expected, "Failed for z{}", i);
+        }
+    }
+
+    #[test]
+    fn test_arm64_p_registers() {
+        for i in 0..16u16 {
+            let reg = Register::new(
+                Architecture::Arm64,
+                RegisterClass::Predicate,
+                arm64::P0 + i,
+                256,
+            );
+            let expected = format!("p{}", i);
+            assert_eq!(reg.name(), expected, "Failed for p{}", i);
+        }
+    }
+
+    // --- RISC-V Register Name Tests ---
+
+    #[test]
+    fn test_riscv_gpr() {
+        let names = [
+            (0, "zero"),
+            (1, "ra"),
+            (2, "sp"),
+            (3, "gp"),
+            (4, "tp"),
+            (5, "t0"),
+            (6, "t1"),
+            (7, "t2"),
+            (8, "s0"),
+            (9, "s1"),
+            (10, "a0"),
+            (11, "a1"),
+            (12, "a2"),
+            (13, "a3"),
+            (14, "a4"),
+            (15, "a5"),
+            (16, "a6"),
+            (17, "a7"),
+            (18, "s2"),
+            (19, "s3"),
+            (20, "s4"),
+            (21, "s5"),
+            (22, "s6"),
+            (23, "s7"),
+            (24, "s8"),
+            (25, "s9"),
+            (26, "s10"),
+            (27, "s11"),
+            (28, "t3"),
+            (29, "t4"),
+            (30, "t5"),
+            (31, "t6"),
+        ];
+
+        for (id, expected) in names {
+            let reg = Register::new(Architecture::RiscV64, RegisterClass::General, id, 64);
+            assert_eq!(reg.name(), expected, "Failed for x{}", id);
+        }
+    }
+
+    #[test]
+    fn test_riscv_pc() {
+        let pc = Register::new(
+            Architecture::RiscV64,
+            RegisterClass::ProgramCounter,
+            riscv::PC,
+            64,
+        );
+        assert_eq!(pc.name(), "pc");
+    }
+
+    #[test]
+    fn test_riscv_fpr() {
+        let names = [
+            (riscv::F0, "ft0"),
+            (riscv::F1, "ft1"),
+            (riscv::F8, "fs0"),
+            (riscv::F9, "fs1"),
+            (riscv::F10, "fa0"),
+            (riscv::F11, "fa1"),
+            (riscv::F28, "ft8"),
+            (riscv::F31, "ft11"),
+        ];
+
+        for (id, expected) in names {
+            let reg = Register::new(Architecture::RiscV64, RegisterClass::FloatingPoint, id, 64);
+            assert_eq!(reg.name(), expected, "Failed for f{}", id - riscv::F0);
+        }
+    }
+
+    #[test]
+    fn test_riscv_vector_registers() {
+        for i in 0..32u16 {
+            let reg = Register::new(
+                Architecture::RiscV64,
+                RegisterClass::Vector,
+                riscv::V0 + i,
+                256,
+            );
+            let expected = format!("v{}", i);
+            assert_eq!(reg.name(), expected, "Failed for v{}", i);
+        }
+    }
+
+    // --- Unknown Register Tests ---
+
+    #[test]
+    fn test_unknown_register() {
+        let reg = Register::new(Architecture::X86_64, RegisterClass::General, 999, 64);
+        assert_eq!(reg.name(), "unknown");
+    }
+
+    #[test]
+    fn test_unknown_architecture() {
+        let reg = Register::new(Architecture::Unknown(99), RegisterClass::General, 0, 64);
+        assert_eq!(reg.name(), "unknown");
+    }
+
+    // --- RegisterClass Tests ---
+
+    #[test]
+    fn test_register_class_equality() {
+        assert_eq!(RegisterClass::General, RegisterClass::General);
+        assert_ne!(RegisterClass::General, RegisterClass::FloatingPoint);
+    }
+
+    #[test]
+    fn test_register_class_variants() {
+        // Ensure all variants exist
+        let classes = [
+            RegisterClass::General,
+            RegisterClass::FloatingPoint,
+            RegisterClass::Vector,
+            RegisterClass::ScalableVector,
+            RegisterClass::Predicate,
+            RegisterClass::MatrixArray,
+            RegisterClass::StreamingMode,
+            RegisterClass::Tile,
+            RegisterClass::X87,
+            RegisterClass::Segment,
+            RegisterClass::Control,
+            RegisterClass::Debug,
+            RegisterClass::StackPointer,
+            RegisterClass::ProgramCounter,
+            RegisterClass::Flags,
+            RegisterClass::Other,
+        ];
+
+        assert_eq!(classes.len(), 16);
+    }
+}

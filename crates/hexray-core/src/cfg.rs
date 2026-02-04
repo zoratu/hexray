@@ -311,3 +311,467 @@ impl DominatorTree {
         self.idom.get(&block).copied().filter(|&d| d != block)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BasicBlock;
+
+    fn make_block(id: u32, start: u64) -> BasicBlock {
+        BasicBlock::new(BasicBlockId::new(id), start)
+    }
+
+    #[test]
+    fn test_new_cfg_has_entry() {
+        let entry = BasicBlockId::new(0);
+        let cfg = ControlFlowGraph::new(entry);
+        assert_eq!(cfg.entry, entry);
+        assert_eq!(cfg.num_blocks(), 0);
+    }
+
+    #[test]
+    fn test_add_block() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        let block = make_block(0, 0x1000);
+        cfg.add_block(block);
+
+        assert_eq!(cfg.num_blocks(), 1);
+        assert!(cfg.block(BasicBlockId::new(0)).is_some());
+    }
+
+    #[test]
+    fn test_add_multiple_blocks() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        assert_eq!(cfg.num_blocks(), 3);
+    }
+
+    #[test]
+    fn test_add_edge_creates_successor() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+
+        let bb0 = BasicBlockId::new(0);
+        let bb1 = BasicBlockId::new(1);
+        cfg.add_edge(bb0, bb1);
+
+        assert_eq!(cfg.successors(bb0), &[bb1]);
+    }
+
+    #[test]
+    fn test_add_edge_creates_predecessor() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+
+        let bb0 = BasicBlockId::new(0);
+        let bb1 = BasicBlockId::new(1);
+        cfg.add_edge(bb0, bb1);
+
+        assert_eq!(cfg.predecessors(bb1), &[bb0]);
+    }
+
+    #[test]
+    fn test_successor_predecessor_symmetry() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        let bb0 = BasicBlockId::new(0);
+        let bb1 = BasicBlockId::new(1);
+        let bb2 = BasicBlockId::new(2);
+
+        // bb0 -> bb1, bb0 -> bb2
+        cfg.add_edge(bb0, bb1);
+        cfg.add_edge(bb0, bb2);
+
+        // Check successors of bb0
+        let succs = cfg.successors(bb0);
+        assert!(succs.contains(&bb1));
+        assert!(succs.contains(&bb2));
+
+        // Check predecessors - should be symmetric
+        assert!(cfg.predecessors(bb1).contains(&bb0));
+        assert!(cfg.predecessors(bb2).contains(&bb0));
+    }
+
+    #[test]
+    fn test_entry_block() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        let mut block = make_block(0, 0x1000);
+        block.end = 0x1010;
+        cfg.add_block(block);
+
+        let entry_block = cfg.entry_block().unwrap();
+        assert_eq!(entry_block.id, entry);
+        assert_eq!(entry_block.start, 0x1000);
+    }
+
+    #[test]
+    fn test_block_not_found() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        assert!(cfg.block(BasicBlockId::new(99)).is_none());
+    }
+
+    #[test]
+    fn test_block_mut() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+
+        let block = cfg.block_mut(BasicBlockId::new(0)).unwrap();
+        block.end = 0x2000;
+
+        assert_eq!(cfg.block(BasicBlockId::new(0)).unwrap().end, 0x2000);
+    }
+
+    #[test]
+    fn test_block_ids_iteration() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        let ids: Vec<_> = cfg.block_ids().collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn test_blocks_iteration() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+
+        let blocks: Vec<_> = cfg.blocks().collect();
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_block_containing_address() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        let mut block0 = make_block(0, 0x1000);
+        block0.end = 0x1010;
+        let mut block1 = make_block(1, 0x1010);
+        block1.end = 0x1020;
+
+        cfg.add_block(block0);
+        cfg.add_block(block1);
+
+        // Address in first block
+        let found = cfg.block_containing(0x1005).unwrap();
+        assert_eq!(found.id, BasicBlockId::new(0));
+
+        // Address in second block
+        let found = cfg.block_containing(0x1015).unwrap();
+        assert_eq!(found.id, BasicBlockId::new(1));
+
+        // Address not in any block
+        assert!(cfg.block_containing(0x2000).is_none());
+    }
+
+    #[test]
+    fn test_block_containing_boundary() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        let mut block = make_block(0, 0x1000);
+        block.end = 0x1010;
+        cfg.add_block(block);
+
+        // Start address is inclusive
+        assert!(cfg.block_containing(0x1000).is_some());
+
+        // End address is exclusive
+        assert!(cfg.block_containing(0x1010).is_none());
+    }
+
+    #[test]
+    fn test_successors_empty_for_unknown_block() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        assert!(cfg.successors(BasicBlockId::new(99)).is_empty());
+    }
+
+    #[test]
+    fn test_predecessors_empty_for_unknown_block() {
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        assert!(cfg.predecessors(BasicBlockId::new(99)).is_empty());
+    }
+
+    // --- Reverse Post Order Tests ---
+
+    #[test]
+    fn test_reverse_post_order_single_block() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+        cfg.add_block(make_block(0, 0x1000));
+
+        let rpo = cfg.reverse_post_order();
+        assert_eq!(rpo, vec![BasicBlockId::new(0)]);
+    }
+
+    #[test]
+    fn test_reverse_post_order_linear() {
+        // bb0 -> bb1 -> bb2
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        let rpo = cfg.reverse_post_order();
+        assert_eq!(rpo[0], BasicBlockId::new(0)); // Entry first
+        assert_eq!(rpo[1], BasicBlockId::new(1));
+        assert_eq!(rpo[2], BasicBlockId::new(2));
+    }
+
+    #[test]
+    fn test_reverse_post_order_diamond() {
+        //     bb0
+        //    /   \
+        //  bb1   bb2
+        //    \   /
+        //     bb3
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+        cfg.add_block(make_block(3, 0x1030));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        let rpo = cfg.reverse_post_order();
+        assert_eq!(rpo[0], BasicBlockId::new(0)); // Entry first
+        assert_eq!(rpo[3], BasicBlockId::new(3)); // Join point last
+    }
+
+    #[test]
+    fn test_reverse_post_order_with_unreachable() {
+        // bb0 -> bb1, bb2 (unreachable)
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020)); // unreachable
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+
+        let rpo = cfg.reverse_post_order();
+        assert_eq!(rpo.len(), 3); // Should include unreachable block
+    }
+
+    // --- Dominator Tree Tests ---
+
+    #[test]
+    fn test_dominators_single_block() {
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+        cfg.add_block(make_block(0, 0x1000));
+
+        let dom = cfg.compute_dominators();
+        // Entry dominates itself
+        assert!(dom.dominates(BasicBlockId::new(0), BasicBlockId::new(0)));
+    }
+
+    #[test]
+    fn test_dominators_linear() {
+        // bb0 -> bb1 -> bb2
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        let dom = cfg.compute_dominators();
+
+        // bb0 dominates all
+        assert!(dom.dominates(BasicBlockId::new(0), BasicBlockId::new(0)));
+        assert!(dom.dominates(BasicBlockId::new(0), BasicBlockId::new(1)));
+        assert!(dom.dominates(BasicBlockId::new(0), BasicBlockId::new(2)));
+
+        // bb1 dominates bb2
+        assert!(dom.dominates(BasicBlockId::new(1), BasicBlockId::new(2)));
+
+        // bb2 doesn't dominate bb1
+        assert!(!dom.dominates(BasicBlockId::new(2), BasicBlockId::new(1)));
+    }
+
+    #[test]
+    fn test_dominators_diamond() {
+        //     bb0
+        //    /   \
+        //  bb1   bb2
+        //    \   /
+        //     bb3
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+        cfg.add_block(make_block(3, 0x1030));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        let dom = cfg.compute_dominators();
+
+        // bb0 dominates all
+        assert!(dom.dominates(BasicBlockId::new(0), BasicBlockId::new(3)));
+
+        // bb1 does NOT dominate bb3 (bb3 reachable via bb2)
+        assert!(!dom.dominates(BasicBlockId::new(1), BasicBlockId::new(3)));
+        assert!(!dom.dominates(BasicBlockId::new(2), BasicBlockId::new(3)));
+    }
+
+    #[test]
+    fn test_immediate_dominator() {
+        // bb0 -> bb1 -> bb2
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        let dom = cfg.compute_dominators();
+
+        // Entry has no idom (or self)
+        assert!(dom.immediate_dominator(BasicBlockId::new(0)).is_none());
+
+        // bb1's idom is bb0
+        assert_eq!(
+            dom.immediate_dominator(BasicBlockId::new(1)),
+            Some(BasicBlockId::new(0))
+        );
+
+        // bb2's idom is bb1
+        assert_eq!(
+            dom.immediate_dominator(BasicBlockId::new(2)),
+            Some(BasicBlockId::new(1))
+        );
+    }
+
+    // --- Loop Detection Tests ---
+
+    #[test]
+    fn test_find_loops_no_loops() {
+        // bb0 -> bb1 -> bb2 (no back edges)
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        let loops = cfg.find_loops();
+        assert!(loops.is_empty());
+    }
+
+    #[test]
+    fn test_find_loops_simple_loop() {
+        // bb0 -> bb1 -> bb2 -> bb1 (loop header bb1)
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1)); // back edge
+
+        let loops = cfg.find_loops();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].header, BasicBlockId::new(1));
+        assert_eq!(loops[0].back_edge, BasicBlockId::new(2));
+        assert!(loops[0].body.contains(&BasicBlockId::new(1)));
+        assert!(loops[0].body.contains(&BasicBlockId::new(2)));
+    }
+
+    #[test]
+    fn test_find_loops_self_loop() {
+        // bb0 -> bb1 -> bb1 (self-loop)
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(1)); // self-loop
+
+        let loops = cfg.find_loops();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].header, BasicBlockId::new(1));
+        assert_eq!(loops[0].back_edge, BasicBlockId::new(1));
+    }
+
+    #[test]
+    fn test_find_loops_nested() {
+        // Outer loop: bb0 -> bb1 -> bb2 -> bb3 -> bb1
+        // Inner loop: bb1 -> bb2 -> bb1
+        let entry = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(entry);
+
+        cfg.add_block(make_block(0, 0x1000));
+        cfg.add_block(make_block(1, 0x1010));
+        cfg.add_block(make_block(2, 0x1020));
+        cfg.add_block(make_block(3, 0x1030));
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1)); // inner back edge
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(1)); // outer back edge
+
+        let loops = cfg.find_loops();
+        assert_eq!(loops.len(), 2);
+    }
+}
