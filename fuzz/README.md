@@ -39,6 +39,8 @@ cargo install cargo-fuzz
 
 ## Available Fuzz Targets
 
+### Basic Targets
+
 | Target | Description |
 |--------|-------------|
 | `x86_64_decoder` | Fuzzes the x86-64 instruction decoder with arbitrary byte sequences |
@@ -46,6 +48,29 @@ cargo install cargo-fuzz
 | `riscv_decoder` | Fuzzes the RISC-V instruction decoder with arbitrary byte sequences |
 | `elf_parser` | Fuzzes the ELF binary format parser |
 | `macho_parser` | Fuzzes the Mach-O binary format parser |
+
+### Structure-Aware Targets (Recommended for Deep Testing)
+
+| Target | Description |
+|--------|-------------|
+| `elf_structured` | Uses the `arbitrary` crate to generate valid-ish ELF headers with fuzzed field values |
+| `macho_structured` | Uses the `arbitrary` crate to generate valid-ish Mach-O headers with fuzzed field values |
+
+Structure-aware targets generate inputs that follow the expected format structure (magic bytes, headers, sections) while fuzzing individual field values. This achieves higher code coverage than pure random mutation.
+
+### Fuzzing Dictionaries
+
+Dictionaries are available in `fuzz/dictionaries/` to improve fuzzing effectiveness:
+
+| Dictionary | Contents |
+|------------|----------|
+| `elf.dict` | ELF magic bytes, class values, machine types, section types, common section names, boundary values |
+| `macho.dict` | Mach-O magic numbers, CPU types, file types, load commands, segment/section names, boundary values |
+
+Use dictionaries with the `--dict` flag:
+```bash
+cargo +nightly fuzz run elf_parser -- -dict=dictionaries/elf.dict
+```
 
 ## Running Fuzz Targets
 
