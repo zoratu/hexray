@@ -980,3 +980,233 @@ fn test_full_pipeline_arm64_macho() {
         }
     }
 }
+
+// =============================================================================
+// Decompiler Optimization Pass Tests
+// =============================================================================
+
+#[test]
+fn test_decompile_with_optimization_levels() {
+    skip_if_missing!("test_decompile");
+
+    use hexray_analysis::{DecompilerConfig, OptimizationLevel};
+
+    let data = fs::read(fixture_path("test_decompile")).expect("Failed to read fixture");
+    let macho = MachO::parse(&data).expect("Failed to parse Mach-O");
+
+    let main_sym = macho
+        .symbols()
+        .find(|s| s.name == "_main" || s.name == "main");
+
+    if let Some(func) = main_sym {
+        let text_section = macho.sections().find(|s| {
+            s.virtual_address() <= func.address
+                && func.address < s.virtual_address() + s.data().len() as u64
+        });
+
+        if let Some(section) = text_section {
+            let arch = macho.architecture();
+            let offset = (func.address - section.virtual_address()) as usize;
+            let end_offset = section.data().len().min(offset + 2048);
+            let func_data = &section.data()[offset..end_offset];
+
+            let instructions = disassemble_block(arch, func_data, func.address);
+
+            if !instructions.is_empty() {
+                let cfg = CfgBuilder::build(&instructions, func.address);
+
+                if cfg.num_blocks() > 0 {
+                    // Test with no optimizations
+                    let config_none = DecompilerConfig::new(OptimizationLevel::None);
+                    let decompiler_none = Decompiler::new().with_config(config_none);
+                    let output_none = decompiler_none.decompile(&cfg, &func.name);
+                    assert!(
+                        !output_none.is_empty(),
+                        "No-opt decompilation should produce output"
+                    );
+
+                    // Test with standard optimizations
+                    let config_standard = DecompilerConfig::new(OptimizationLevel::Standard);
+                    let decompiler_standard = Decompiler::new().with_config(config_standard);
+                    let output_standard = decompiler_standard.decompile(&cfg, &func.name);
+                    assert!(
+                        !output_standard.is_empty(),
+                        "Standard decompilation should produce output"
+                    );
+
+                    // Test with aggressive optimizations
+                    let config_aggressive = DecompilerConfig::new(OptimizationLevel::Aggressive);
+                    let decompiler_aggressive = Decompiler::new().with_config(config_aggressive);
+                    let output_aggressive = decompiler_aggressive.decompile(&cfg, &func.name);
+                    assert!(
+                        !output_aggressive.is_empty(),
+                        "Aggressive decompilation should produce output"
+                    );
+
+                    // All outputs should have balanced braces
+                    for (output, level) in [
+                        (&output_none, "none"),
+                        (&output_standard, "standard"),
+                        (&output_aggressive, "aggressive"),
+                    ] {
+                        let open_braces = output.matches('{').count();
+                        let close_braces = output.matches('}').count();
+                        assert_eq!(
+                            open_braces, close_braces,
+                            "Braces should be balanced at {} level",
+                            level
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_decompile_with_selective_passes() {
+    skip_if_missing!("test_decompile");
+
+    use hexray_analysis::{DecompilerConfig, OptimizationLevel, OptimizationPass};
+
+    let data = fs::read(fixture_path("test_decompile")).expect("Failed to read fixture");
+    let macho = MachO::parse(&data).expect("Failed to parse Mach-O");
+
+    let main_sym = macho
+        .symbols()
+        .find(|s| s.name == "_main" || s.name == "main");
+
+    if let Some(func) = main_sym {
+        let text_section = macho.sections().find(|s| {
+            s.virtual_address() <= func.address
+                && func.address < s.virtual_address() + s.data().len() as u64
+        });
+
+        if let Some(section) = text_section {
+            let arch = macho.architecture();
+            let offset = (func.address - section.virtual_address()) as usize;
+            let end_offset = section.data().len().min(offset + 2048);
+            let func_data = &section.data()[offset..end_offset];
+
+            let instructions = disassemble_block(arch, func_data, func.address);
+
+            if !instructions.is_empty() {
+                let cfg = CfgBuilder::build(&instructions, func.address);
+
+                if cfg.num_blocks() > 0 {
+                    // Test with specific passes enabled
+                    let config = DecompilerConfig::new(OptimizationLevel::None)
+                        .enable_pass(OptimizationPass::ExpressionSimplification)
+                        .enable_pass(OptimizationPass::ConstantPropagation);
+
+                    let decompiler = Decompiler::new().with_config(config);
+                    let output = decompiler.decompile(&cfg, &func.name);
+
+                    assert!(
+                        !output.is_empty(),
+                        "Selective pass decompilation should produce output"
+                    );
+
+                    // Verify balanced syntax
+                    let open_parens = output.matches('(').count();
+                    let close_parens = output.matches(')').count();
+                    assert_eq!(open_parens, close_parens, "Parentheses should be balanced");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn test_decompile_with_disabled_passes() {
+    skip_if_missing!("test_decompile");
+
+    use hexray_analysis::{DecompilerConfig, OptimizationLevel, OptimizationPass};
+
+    let data = fs::read(fixture_path("test_decompile")).expect("Failed to read fixture");
+    let macho = MachO::parse(&data).expect("Failed to parse Mach-O");
+
+    let main_sym = macho
+        .symbols()
+        .find(|s| s.name == "_main" || s.name == "main");
+
+    if let Some(func) = main_sym {
+        let text_section = macho.sections().find(|s| {
+            s.virtual_address() <= func.address
+                && func.address < s.virtual_address() + s.data().len() as u64
+        });
+
+        if let Some(section) = text_section {
+            let arch = macho.architecture();
+            let offset = (func.address - section.virtual_address()) as usize;
+            let end_offset = section.data().len().min(offset + 2048);
+            let func_data = &section.data()[offset..end_offset];
+
+            let instructions = disassemble_block(arch, func_data, func.address);
+
+            if !instructions.is_empty() {
+                let cfg = CfgBuilder::build(&instructions, func.address);
+
+                if cfg.num_blocks() > 0 {
+                    // Test with specific passes disabled
+                    let config = DecompilerConfig::new(OptimizationLevel::Standard)
+                        .disable_pass(OptimizationPass::GotoConversion)
+                        .disable_pass(OptimizationPass::SwitchDetection);
+
+                    let decompiler = Decompiler::new().with_config(config);
+                    let output = decompiler.decompile(&cfg, &func.name);
+
+                    assert!(
+                        !output.is_empty(),
+                        "Disabled pass decompilation should produce output"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Optimization Pass Unit Tests
+// =============================================================================
+
+#[test]
+fn test_config_pass_enable_disable() {
+    use hexray_analysis::{DecompilerConfig, OptimizationLevel, OptimizationPass};
+
+    // Test that enabling a pass works
+    let config = DecompilerConfig::new(OptimizationLevel::None)
+        .enable_pass(OptimizationPass::ConstantPropagation);
+    assert!(config.is_pass_enabled(OptimizationPass::ConstantPropagation));
+    assert!(!config.is_pass_enabled(OptimizationPass::DeadStoreElimination));
+
+    // Test that disabling a pass works
+    let config = DecompilerConfig::new(OptimizationLevel::Standard)
+        .disable_pass(OptimizationPass::ConstantPropagation);
+    assert!(!config.is_pass_enabled(OptimizationPass::ConstantPropagation));
+    assert!(config.is_pass_enabled(OptimizationPass::ExpressionSimplification));
+}
+
+#[test]
+fn test_optimization_level_passes() {
+    use hexray_analysis::{DecompilerConfig, OptimizationLevel, OptimizationPass};
+
+    // None level should have no passes enabled
+    let config_none = DecompilerConfig::new(OptimizationLevel::None);
+    assert!(!config_none.is_pass_enabled(OptimizationPass::ExpressionSimplification));
+
+    // Basic level should have basic passes
+    let config_basic = DecompilerConfig::new(OptimizationLevel::Basic);
+    assert!(config_basic.is_pass_enabled(OptimizationPass::ExpressionSimplification));
+    assert!(!config_basic.is_pass_enabled(OptimizationPass::DeadStoreElimination));
+
+    // Standard level should have standard passes
+    let config_standard = DecompilerConfig::new(OptimizationLevel::Standard);
+    assert!(config_standard.is_pass_enabled(OptimizationPass::ExpressionSimplification));
+    assert!(config_standard.is_pass_enabled(OptimizationPass::DeadStoreElimination));
+
+    // Aggressive level should have all passes
+    let config_aggressive = DecompilerConfig::new(OptimizationLevel::Aggressive);
+    assert!(config_aggressive.is_pass_enabled(OptimizationPass::VariableNaming));
+    assert!(config_aggressive.is_pass_enabled(OptimizationPass::LinkedListDetection));
+}

@@ -55,9 +55,9 @@ pub use dataflow::{
     ReachingDefinitions,
 };
 pub use decompiler::{
-    CallingConvention, CatchInfo, CleanupInfo, Decompiler, ExceptionInfo, FunctionSignature,
-    ParamType, Parameter, ParameterLocation, RelocationTable, SignatureRecovery, StringTable,
-    SymbolTable, TryBlockInfo,
+    CallingConvention, CatchInfo, CleanupInfo, Decompiler, DecompilerConfig, ExceptionInfo,
+    FunctionSignature, OptimizationLevel, OptimizationPass, ParamType, Parameter,
+    ParameterLocation, RelocationTable, SignatureRecovery, StringTable, SymbolTable, TryBlockInfo,
 };
 pub use exception_handling::{
     extract_all_exception_info, extract_all_exception_info_with_rtti, ExceptionError,

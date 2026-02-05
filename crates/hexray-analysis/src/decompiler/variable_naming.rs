@@ -3,8 +3,6 @@
 //! Infers better variable names based on how variables are used in the code.
 //! This improves readability by giving meaningful names to temporary variables.
 
-#![allow(dead_code)] // Module not yet integrated into pipeline
-
 use std::collections::HashMap;
 
 use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
@@ -21,6 +19,7 @@ pub struct NamingHints {
 
 /// How a variable is used.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Some variants reserved for future use
 pub enum UsagePattern {
     /// Used as loop counter.
     LoopCounter,
@@ -509,6 +508,14 @@ fn suggest_from_function_arg(func_name: &str, arg_index: usize) -> Option<String
         ("malloc" | "calloc", 0) => Some("size".to_string()),
         _ => None,
     }
+}
+
+/// Analyzes nodes and applies suggested variable names.
+///
+/// This is the main entry point for the variable naming pass.
+pub fn suggest_variable_names(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let hints = collect_naming_hints(&nodes);
+    apply_naming_hints(nodes, &hints)
 }
 
 /// Apply naming suggestions to nodes.

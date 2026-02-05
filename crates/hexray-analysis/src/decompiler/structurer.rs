@@ -159,52 +159,110 @@ pub enum LoopKind {
 }
 
 impl StructuredCfg {
-    /// Creates a structured CFG from an unstructured one.
+    /// Creates a structured CFG from an unstructured one with default configuration.
     pub fn from_cfg(cfg: &ControlFlowGraph) -> Self {
+        Self::from_cfg_with_config(cfg, &super::config::DecompilerConfig::default())
+    }
+
+    /// Creates a structured CFG with custom configuration.
+    pub fn from_cfg_with_config(
+        cfg: &ControlFlowGraph,
+        config: &super::config::DecompilerConfig,
+    ) -> Self {
+        use super::config::OptimizationPass;
+
         let mut structurer = Structurer::new(cfg);
-        let body = structurer.structure();
+        let mut body = structurer.structure();
 
         // Post-process to propagate arguments into function calls (before copy propagation)
-        let body = propagate_call_args(body);
+        if config.is_pass_enabled(OptimizationPass::CallArgPropagation) {
+            body = propagate_call_args(body);
+        }
 
         // Post-process to merge return value captures across block boundaries
-        let body = merge_return_value_captures(body);
+        if config.is_pass_enabled(OptimizationPass::ReturnValueMerge) {
+            body = merge_return_value_captures(body);
+        }
 
         // Post-process to eliminate temporary register patterns
-        let body = simplify_statements(body);
+        if config.is_pass_enabled(OptimizationPass::TempSimplification) {
+            body = simplify_statements(body);
+        }
 
         // Post-process to detect for loops from while loops with init/update
-        let body = detect_for_loops(body);
+        if config.is_pass_enabled(OptimizationPass::ForLoopDetection) {
+            body = detect_for_loops(body);
+        }
 
         // Post-process to hoist loop-invariant computations
-        let body = super::loop_invariant::hoist_loop_invariants(body);
+        if config.is_pass_enabled(OptimizationPass::LoopInvariantHoisting) {
+            body = super::loop_invariant::hoist_loop_invariants(body);
+        }
 
         // Post-process to detect memcpy/memset patterns in for loops
-        let body = super::loop_pattern_detection::detect_loop_patterns(body);
+        if config.is_pass_enabled(OptimizationPass::LoopPatternDetection) {
+            body = super::loop_pattern_detection::detect_loop_patterns(body);
+        }
+
+        // Post-process to canonicalize loop forms
+        if config.is_pass_enabled(OptimizationPass::LoopCanonicalization) {
+            body = super::loop_canonicalization::canonicalize_loops(body);
+        }
+
+        // Post-process to detect memset/array initialization idioms
+        if config.is_pass_enabled(OptimizationPass::MemsetIdiomDetection) {
+            body = super::memset_idiom::detect_init_patterns(body);
+        }
 
         // Post-process to detect switch statements from if-else chains
-        let body = detect_switch_statements(body);
+        if config.is_pass_enabled(OptimizationPass::SwitchDetection) {
+            body = detect_switch_statements(body);
+        }
 
         // Post-process to detect short-circuit boolean patterns (a && b, a || b)
-        let body = detect_short_circuit(body);
+        if config.is_pass_enabled(OptimizationPass::ShortCircuitDetection) {
+            body = detect_short_circuit(body);
+        }
 
         // Post-process to convert gotos to break/continue where applicable
-        let body = convert_gotos_to_break_continue(body, None);
+        if config.is_pass_enabled(OptimizationPass::GotoConversion) {
+            body = convert_gotos_to_break_continue(body, None);
+        }
 
         // Post-process to flatten nested if-else into guard clauses
-        let body = flatten_guard_clauses(body);
+        if config.is_pass_enabled(OptimizationPass::GuardClauseFlattening) {
+            body = flatten_guard_clauses(body);
+        }
+
+        // Post-process for constant folding and propagation
+        if config.is_pass_enabled(OptimizationPass::ConstantPropagation) {
+            body = super::constant_propagation::propagate_constants(body);
+        }
 
         // Post-process to simplify expressions (constant folding, algebraic simplifications)
-        let body = simplify_expressions(body);
+        if config.is_pass_enabled(OptimizationPass::ExpressionSimplification) {
+            body = simplify_expressions(body);
+        }
 
         // Post-process to detect string function patterns (strlen, strcpy, etc.)
-        let body = super::string_patterns::detect_string_patterns(body);
+        if config.is_pass_enabled(OptimizationPass::StringPatternDetection) {
+            body = super::string_patterns::detect_string_patterns(body);
+        }
 
         // Post-process to simplify architecture-specific patterns (CSEL, min/max, abs)
-        let body = super::arch_patterns::simplify_arch_patterns(body);
+        if config.is_pass_enabled(OptimizationPass::ArchPatternSimplification) {
+            body = super::arch_patterns::simplify_arch_patterns(body);
+        }
 
         // Post-process to eliminate dead stores
-        let body = super::dead_store::eliminate_dead_stores(body);
+        if config.is_pass_enabled(OptimizationPass::DeadStoreElimination) {
+            body = super::dead_store::eliminate_dead_stores(body);
+        }
+
+        // Post-process to infer better variable names
+        if config.is_pass_enabled(OptimizationPass::VariableNaming) {
+            body = super::variable_naming::suggest_variable_names(body);
+        }
 
         Self {
             body,

@@ -203,10 +203,110 @@ fn bench_signature_recovery(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_optimization_levels(c: &mut Criterion) {
+    use hexray_analysis::{DecompilerConfig, OptimizationLevel};
+
+    let mut group = c.benchmark_group("optimization_levels");
+
+    // Create a complex CFG for benchmarking
+    let complex_cfg = CfgBuilder::build(&create_branching_instructions(20), 0x1000);
+    let loop_cfg = CfgBuilder::build(&create_loop_instructions(), 0x1000);
+
+    // Benchmark no optimizations
+    let config_none = DecompilerConfig::new(OptimizationLevel::None);
+    let decompiler_none = Decompiler::new().with_config(config_none);
+    group.bench_function("branching_opt_none", |b| {
+        b.iter(|| decompiler_none.decompile(black_box(&complex_cfg), "test_func"))
+    });
+
+    // Benchmark basic optimizations
+    let config_basic = DecompilerConfig::new(OptimizationLevel::Basic);
+    let decompiler_basic = Decompiler::new().with_config(config_basic);
+    group.bench_function("branching_opt_basic", |b| {
+        b.iter(|| decompiler_basic.decompile(black_box(&complex_cfg), "test_func"))
+    });
+
+    // Benchmark standard optimizations
+    let config_standard = DecompilerConfig::new(OptimizationLevel::Standard);
+    let decompiler_standard = Decompiler::new().with_config(config_standard);
+    group.bench_function("branching_opt_standard", |b| {
+        b.iter(|| decompiler_standard.decompile(black_box(&complex_cfg), "test_func"))
+    });
+
+    // Benchmark aggressive optimizations
+    let config_aggressive = DecompilerConfig::new(OptimizationLevel::Aggressive);
+    let decompiler_aggressive = Decompiler::new().with_config(config_aggressive);
+    group.bench_function("branching_opt_aggressive", |b| {
+        b.iter(|| decompiler_aggressive.decompile(black_box(&complex_cfg), "test_func"))
+    });
+
+    // Loop benchmarks at different optimization levels
+    group.bench_function("loop_opt_none", |b| {
+        b.iter(|| decompiler_none.decompile(black_box(&loop_cfg), "test_func"))
+    });
+
+    group.bench_function("loop_opt_standard", |b| {
+        b.iter(|| decompiler_standard.decompile(black_box(&loop_cfg), "test_func"))
+    });
+
+    group.bench_function("loop_opt_aggressive", |b| {
+        b.iter(|| decompiler_aggressive.decompile(black_box(&loop_cfg), "test_func"))
+    });
+
+    group.finish();
+}
+
+fn bench_output_quality(c: &mut Criterion) {
+    use hexray_analysis::{DecompilerConfig, OptimizationLevel};
+
+    let mut group = c.benchmark_group("output_quality");
+
+    // This benchmark measures how long it takes to produce output
+    // at different quality levels. More optimizations = potentially better output
+    // but may take longer.
+
+    let complex_cfg = CfgBuilder::build(&create_branching_instructions(30), 0x1000);
+
+    // Measure output size at different levels (as a proxy for quality)
+    let config_none = DecompilerConfig::new(OptimizationLevel::None);
+    let config_standard = DecompilerConfig::new(OptimizationLevel::Standard);
+    let config_aggressive = DecompilerConfig::new(OptimizationLevel::Aggressive);
+
+    let decompiler_none = Decompiler::new().with_config(config_none);
+    let decompiler_standard = Decompiler::new().with_config(config_standard);
+    let decompiler_aggressive = Decompiler::new().with_config(config_aggressive);
+
+    // Benchmark that includes output length tracking
+    group.bench_function("complex_none", |b| {
+        b.iter(|| {
+            let output = decompiler_none.decompile(black_box(&complex_cfg), "test");
+            black_box(output.len())
+        })
+    });
+
+    group.bench_function("complex_standard", |b| {
+        b.iter(|| {
+            let output = decompiler_standard.decompile(black_box(&complex_cfg), "test");
+            black_box(output.len())
+        })
+    });
+
+    group.bench_function("complex_aggressive", |b| {
+        b.iter(|| {
+            let output = decompiler_aggressive.decompile(black_box(&complex_cfg), "test");
+            black_box(output.len())
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_cfg_construction,
     bench_decompilation,
-    bench_signature_recovery
+    bench_signature_recovery,
+    bench_optimization_levels,
+    bench_output_quality
 );
 criterion_main!(benches);

@@ -14,8 +14,9 @@ use clap::{Parser, Subcommand};
 use hexray_analysis::{
     AnalysisProject, CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter,
     CallGraphJsonExporter, CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
-    Decompiler, FunctionInfo, ParallelCallGraphBuilder, RelocationTable, StringConfig,
-    StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
+    Decompiler, DecompilerConfig, FunctionInfo, OptimizationLevel, OptimizationPass,
+    ParallelCallGraphBuilder, RelocationTable, StringConfig, StringDetector, StringTable,
+    SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -109,6 +110,18 @@ enum Commands {
         /// Load type library for struct field resolution (posix, linux, macos, libc, all, or auto)
         #[arg(long, short = 't')]
         types: Option<String>,
+        /// Optimization level: none (0), basic (1), standard (2), aggressive (3)
+        #[arg(long, short = 'O', default_value = "2")]
+        opt_level: String,
+        /// Enable specific optimization passes (can be repeated)
+        #[arg(long = "enable-pass")]
+        enable_passes: Vec<String>,
+        /// Disable specific optimization passes (can be repeated)
+        #[arg(long = "disable-pass")]
+        disable_passes: Vec<String>,
+        /// List available optimization passes and exit
+        #[arg(long)]
+        list_passes: bool,
     },
     /// Build and display call graph
     Callgraph {
@@ -433,7 +446,17 @@ fn main() -> Result<()> {
             depth,
             project,
             types,
+            opt_level,
+            enable_passes,
+            disable_passes,
+            list_passes,
         }) => {
+            // Handle --list-passes
+            if list_passes {
+                print_optimization_passes();
+                return Ok(());
+            }
+
             let target = resolve_decompile_target(&binary, target)?;
             let project = match project {
                 Some(path) => Some(
@@ -443,6 +466,10 @@ fn main() -> Result<()> {
                 None => None,
             };
             let type_db = load_type_database(&binary, types.as_deref())?;
+
+            // Build decompiler config
+            let config = build_decompiler_config(&opt_level, &enable_passes, &disable_passes)?;
+
             if follow {
                 decompile_with_follow(
                     &binary,
@@ -451,6 +478,7 @@ fn main() -> Result<()> {
                     depth,
                     project.as_ref(),
                     type_db.as_ref(),
+                    Some(&config),
                 )?;
             } else {
                 decompile_function(
@@ -459,6 +487,7 @@ fn main() -> Result<()> {
                     show_addresses,
                     project.as_ref(),
                     type_db.as_ref(),
+                    Some(&config),
                 )?;
             }
         }
@@ -1043,6 +1072,7 @@ fn decompile_function(
     show_addresses: bool,
     project: Option<&AnalysisProject>,
     type_db: Option<&std::sync::Arc<TypeDatabase>>,
+    config: Option<&DecompilerConfig>,
 ) -> Result<()> {
     let fmt = binary.as_format();
 
@@ -1171,6 +1201,9 @@ fn decompile_function(
         .with_calling_convention(calling_convention);
     if let Some(db) = type_db {
         decompiler = decompiler.with_type_database(db.clone());
+    }
+    if let Some(cfg_opts) = config {
+        decompiler = decompiler.with_config(cfg_opts.clone());
     }
     let pseudocode = decompiler.decompile(&cfg, &name);
 
@@ -1830,6 +1863,7 @@ fn decompile_with_follow(
     max_depth: usize,
     project: Option<&AnalysisProject>,
     type_db: Option<&std::sync::Arc<TypeDatabase>>,
+    config: Option<&DecompilerConfig>,
 ) -> Result<()> {
     use std::collections::HashSet;
 
@@ -1975,6 +2009,9 @@ fn decompile_with_follow(
         if let Some(db) = type_db {
             decompiler = decompiler.with_type_database(db.clone());
         }
+        if let Some(cfg_opts) = config {
+            decompiler = decompiler.with_config(cfg_opts.clone());
+        }
         let pseudocode = decompiler.decompile(&cfg, &func_name);
 
         println!("{}", pseudocode);
@@ -2113,6 +2150,141 @@ fn extract_internal_call_targets(
     }
 
     targets
+}
+
+/// Build a DecompilerConfig from CLI options.
+fn build_decompiler_config(
+    opt_level: &str,
+    enable_passes: &[String],
+    disable_passes: &[String],
+) -> Result<DecompilerConfig> {
+    // Parse optimization level
+    let level = match opt_level {
+        "0" | "none" => OptimizationLevel::None,
+        "1" | "basic" => OptimizationLevel::Basic,
+        "2" | "standard" => OptimizationLevel::Standard,
+        "3" | "aggressive" => OptimizationLevel::Aggressive,
+        other => bail!(
+            "Invalid optimization level '{}'. Use: 0/none, 1/basic, 2/standard, 3/aggressive",
+            other
+        ),
+    };
+
+    let mut config = DecompilerConfig::new(level);
+
+    // Apply enabled passes
+    for pass_name in enable_passes {
+        let pass = parse_pass_name(pass_name)?;
+        config = config.enable_pass(pass);
+    }
+
+    // Apply disabled passes
+    for pass_name in disable_passes {
+        let pass = parse_pass_name(pass_name)?;
+        config = config.disable_pass(pass);
+    }
+
+    Ok(config)
+}
+
+/// Parse a pass name string into an OptimizationPass.
+fn parse_pass_name(name: &str) -> Result<OptimizationPass> {
+    match name.to_lowercase().as_str() {
+        "call-arg-propagation" | "call_arg_propagation" => Ok(OptimizationPass::CallArgPropagation),
+        "return-value-merge" | "return_value_merge" => Ok(OptimizationPass::ReturnValueMerge),
+        "temp-simplification" | "temp_simplification" => Ok(OptimizationPass::TempSimplification),
+        "for-loop-detection" | "for_loop_detection" => Ok(OptimizationPass::ForLoopDetection),
+        "loop-invariant-hoisting" | "loop_invariant_hoisting" => {
+            Ok(OptimizationPass::LoopInvariantHoisting)
+        }
+        "loop-pattern-detection" | "loop_pattern_detection" => {
+            Ok(OptimizationPass::LoopPatternDetection)
+        }
+        "switch-detection" | "switch_detection" => Ok(OptimizationPass::SwitchDetection),
+        "short-circuit-detection" | "short_circuit_detection" => {
+            Ok(OptimizationPass::ShortCircuitDetection)
+        }
+        "goto-conversion" | "goto_conversion" => Ok(OptimizationPass::GotoConversion),
+        "guard-clause-flattening" | "guard_clause_flattening" => {
+            Ok(OptimizationPass::GuardClauseFlattening)
+        }
+        "expression-simplification" | "expression_simplification" => {
+            Ok(OptimizationPass::ExpressionSimplification)
+        }
+        "string-pattern-detection" | "string_pattern_detection" => {
+            Ok(OptimizationPass::StringPatternDetection)
+        }
+        "arch-pattern-simplification" | "arch_pattern_simplification" => {
+            Ok(OptimizationPass::ArchPatternSimplification)
+        }
+        "dead-store-elimination" | "dead_store_elimination" => {
+            Ok(OptimizationPass::DeadStoreElimination)
+        }
+        "linked-list-detection" | "linked_list_detection" => {
+            Ok(OptimizationPass::LinkedListDetection)
+        }
+        "variable-naming" | "variable_naming" => Ok(OptimizationPass::VariableNaming),
+        "loop-canonicalization" | "loop_canonicalization" => {
+            Ok(OptimizationPass::LoopCanonicalization)
+        }
+        "memset-idiom-detection" | "memset_idiom_detection" => {
+            Ok(OptimizationPass::MemsetIdiomDetection)
+        }
+        "constant-propagation" | "constant_propagation" => {
+            Ok(OptimizationPass::ConstantPropagation)
+        }
+        "type-inference" | "type_inference" => Ok(OptimizationPass::TypeInference),
+        "switch-recovery" | "switch_recovery" => Ok(OptimizationPass::SwitchRecovery),
+        other => bail!(
+            "Unknown optimization pass '{}'. Use --list-passes to see available passes.",
+            other
+        ),
+    }
+}
+
+/// Print available optimization passes.
+fn print_optimization_passes() {
+    println!("Available optimization passes:\n");
+    println!("  Control Flow:");
+    println!("    for-loop-detection          - Detect for loop patterns");
+    println!("    loop-invariant-hoisting     - Hoist invariant expressions out of loops");
+    println!("    loop-pattern-detection      - Detect common loop patterns");
+    println!("    loop-canonicalization       - Convert do-while to while loops");
+    println!("    switch-detection            - Detect switch statement patterns");
+    println!("    switch-recovery             - Recover switch tables");
+    println!("    short-circuit-detection     - Detect && and || expressions");
+    println!("    goto-conversion             - Convert gotos to structured control flow");
+    println!("    guard-clause-flattening     - Flatten guard clause patterns");
+    println!();
+    println!("  Expression:");
+    println!("    expression-simplification   - Simplify complex expressions");
+    println!("    constant-propagation        - Propagate and fold constants");
+    println!("    call-arg-propagation        - Propagate arguments to call sites");
+    println!("    return-value-merge          - Merge return value assignments");
+    println!("    temp-simplification         - Simplify temporary variables");
+    println!();
+    println!("  Pattern Recognition:");
+    println!("    string-pattern-detection    - Detect string operations (strlen, strcmp, etc.)");
+    println!("    arch-pattern-simplification - Simplify architecture-specific patterns");
+    println!("    memset-idiom-detection      - Detect memset/array initialization loops");
+    println!("    linked-list-detection       - Detect linked list traversal patterns");
+    println!();
+    println!("  Analysis:");
+    println!("    dead-store-elimination      - Remove dead stores");
+    println!("    variable-naming             - Improve variable names from usage");
+    println!("    type-inference              - Infer variable types");
+    println!();
+    println!("Optimization levels:");
+    println!("    0/none       - No optimizations");
+    println!("    1/basic      - Basic simplifications only");
+    println!("    2/standard   - Default: all standard passes (recommended)");
+    println!("    3/aggressive - Include experimental passes");
+    println!();
+    println!("Examples:");
+    println!("    hexray decompile main -O0                    # No optimizations");
+    println!("    hexray decompile main -O3                    # Aggressive optimizations");
+    println!("    hexray decompile main --disable-pass goto-conversion");
+    println!("    hexray decompile main -O1 --enable-pass constant-propagation");
 }
 
 fn build_xrefs(

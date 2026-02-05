@@ -954,7 +954,7 @@ impl FunctionSignatures {
     pub fn with_libc() -> Self {
         let mut sigs = Self::new();
 
-        // Add common libc signatures
+        // ======== stdio.h ========
         sigs.add_signature(FunctionSignature {
             name: "printf".to_string(),
             return_type: Type::sint(4),
@@ -963,9 +963,154 @@ impl FunctionSignatures {
         });
 
         sigs.add_signature(FunctionSignature {
+            name: "fprintf".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("stream".to_string(), Type::ptr(Type::Void)),
+                ("format".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: true,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "sprintf".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("str".to_string(), Type::ptr(Type::sint(1))),
+                ("format".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: true,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "snprintf".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("str".to_string(), Type::ptr(Type::sint(1))),
+                ("size".to_string(), Type::uint(8)),
+                ("format".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: true,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "scanf".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("format".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: true,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "fopen".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("filename".to_string(), Type::ptr(Type::sint(1))),
+                ("mode".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "fclose".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("stream".to_string(), Type::ptr(Type::Void))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "fread".to_string(),
+            return_type: Type::uint(8),
+            parameters: vec![
+                ("ptr".to_string(), Type::ptr(Type::Void)),
+                ("size".to_string(), Type::uint(8)),
+                ("count".to_string(), Type::uint(8)),
+                ("stream".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "fwrite".to_string(),
+            return_type: Type::uint(8),
+            parameters: vec![
+                ("ptr".to_string(), Type::ptr(Type::Void)),
+                ("size".to_string(), Type::uint(8)),
+                ("count".to_string(), Type::uint(8)),
+                ("stream".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "fgets".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("str".to_string(), Type::ptr(Type::sint(1))),
+                ("n".to_string(), Type::sint(4)),
+                ("stream".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "fputs".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("str".to_string(), Type::ptr(Type::sint(1))),
+                ("stream".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "puts".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("str".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "getc".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("stream".to_string(), Type::ptr(Type::Void))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "putc".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("c".to_string(), Type::sint(4)),
+                ("stream".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        // ======== stdlib.h ========
+        sigs.add_signature(FunctionSignature {
             name: "malloc".to_string(),
             return_type: Type::ptr(Type::Void),
             parameters: vec![("size".to_string(), Type::uint(8))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "calloc".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("num".to_string(), Type::uint(8)),
+                ("size".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "realloc".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("ptr".to_string(), Type::ptr(Type::Void)),
+                ("size".to_string(), Type::uint(8)),
+            ],
             variadic: false,
         });
 
@@ -976,6 +1121,103 @@ impl FunctionSignatures {
             variadic: false,
         });
 
+        sigs.add_signature(FunctionSignature {
+            name: "atoi".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("str".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "atol".to_string(),
+            return_type: Type::sint(8),
+            parameters: vec![("str".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "atof".to_string(),
+            return_type: Type::f64(),
+            parameters: vec![("str".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strtol".to_string(),
+            return_type: Type::sint(8),
+            parameters: vec![
+                ("str".to_string(), Type::ptr(Type::sint(1))),
+                ("endptr".to_string(), Type::ptr(Type::ptr(Type::sint(1)))),
+                ("base".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strtoul".to_string(),
+            return_type: Type::uint(8),
+            parameters: vec![
+                ("str".to_string(), Type::ptr(Type::sint(1))),
+                ("endptr".to_string(), Type::ptr(Type::ptr(Type::sint(1)))),
+                ("base".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "exit".to_string(),
+            return_type: Type::Void,
+            parameters: vec![("status".to_string(), Type::sint(4))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "abort".to_string(),
+            return_type: Type::Void,
+            parameters: vec![],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "getenv".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![("name".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "system".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("command".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "qsort".to_string(),
+            return_type: Type::Void,
+            parameters: vec![
+                ("base".to_string(), Type::ptr(Type::Void)),
+                ("num".to_string(), Type::uint(8)),
+                ("size".to_string(), Type::uint(8)),
+                ("compar".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "bsearch".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("key".to_string(), Type::ptr(Type::Void)),
+                ("base".to_string(), Type::ptr(Type::Void)),
+                ("num".to_string(), Type::uint(8)),
+                ("size".to_string(), Type::uint(8)),
+                ("compar".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        // ======== string.h ========
         sigs.add_signature(FunctionSignature {
             name: "strlen".to_string(),
             return_type: Type::uint(8),
@@ -994,12 +1236,408 @@ impl FunctionSignatures {
         });
 
         sigs.add_signature(FunctionSignature {
+            name: "strncmp".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("s1".to_string(), Type::ptr(Type::sint(1))),
+                ("s2".to_string(), Type::ptr(Type::sint(1))),
+                ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strcpy".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("dest".to_string(), Type::ptr(Type::sint(1))),
+                ("src".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strncpy".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("dest".to_string(), Type::ptr(Type::sint(1))),
+                ("src".to_string(), Type::ptr(Type::sint(1))),
+                ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strcat".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("dest".to_string(), Type::ptr(Type::sint(1))),
+                ("src".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strncat".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("dest".to_string(), Type::ptr(Type::sint(1))),
+                ("src".to_string(), Type::ptr(Type::sint(1))),
+                ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strchr".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("s".to_string(), Type::ptr(Type::sint(1))),
+                ("c".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strrchr".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("s".to_string(), Type::ptr(Type::sint(1))),
+                ("c".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strstr".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("haystack".to_string(), Type::ptr(Type::sint(1))),
+                ("needle".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strtok".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("str".to_string(), Type::ptr(Type::sint(1))),
+                ("delim".to_string(), Type::ptr(Type::sint(1))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "strdup".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![("s".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
             name: "memcpy".to_string(),
             return_type: Type::ptr(Type::Void),
             parameters: vec![
                 ("dest".to_string(), Type::ptr(Type::Void)),
                 ("src".to_string(), Type::ptr(Type::Void)),
                 ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "memmove".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("dest".to_string(), Type::ptr(Type::Void)),
+                ("src".to_string(), Type::ptr(Type::Void)),
+                ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "memset".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("ptr".to_string(), Type::ptr(Type::Void)),
+                ("value".to_string(), Type::sint(4)),
+                ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "memcmp".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("s1".to_string(), Type::ptr(Type::Void)),
+                ("s2".to_string(), Type::ptr(Type::Void)),
+                ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "memchr".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("s".to_string(), Type::ptr(Type::Void)),
+                ("c".to_string(), Type::sint(4)),
+                ("n".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        // ======== unistd.h (POSIX) ========
+        sigs.add_signature(FunctionSignature {
+            name: "read".to_string(),
+            return_type: Type::sint(8),
+            parameters: vec![
+                ("fd".to_string(), Type::sint(4)),
+                ("buf".to_string(), Type::ptr(Type::Void)),
+                ("count".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "write".to_string(),
+            return_type: Type::sint(8),
+            parameters: vec![
+                ("fd".to_string(), Type::sint(4)),
+                ("buf".to_string(), Type::ptr(Type::Void)),
+                ("count".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "open".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("pathname".to_string(), Type::ptr(Type::sint(1))),
+                ("flags".to_string(), Type::sint(4)),
+            ],
+            variadic: true,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "close".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("fd".to_string(), Type::sint(4))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "lseek".to_string(),
+            return_type: Type::sint(8),
+            parameters: vec![
+                ("fd".to_string(), Type::sint(4)),
+                ("offset".to_string(), Type::sint(8)),
+                ("whence".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "fork".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "execve".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("pathname".to_string(), Type::ptr(Type::sint(1))),
+                ("argv".to_string(), Type::ptr(Type::ptr(Type::sint(1)))),
+                ("envp".to_string(), Type::ptr(Type::ptr(Type::sint(1)))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "sleep".to_string(),
+            return_type: Type::uint(4),
+            parameters: vec![("seconds".to_string(), Type::uint(4))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "getpid".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "getcwd".to_string(),
+            return_type: Type::ptr(Type::sint(1)),
+            parameters: vec![
+                ("buf".to_string(), Type::ptr(Type::sint(1))),
+                ("size".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "chdir".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("path".to_string(), Type::ptr(Type::sint(1)))],
+            variadic: false,
+        });
+
+        // ======== socket functions ========
+        sigs.add_signature(FunctionSignature {
+            name: "socket".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("domain".to_string(), Type::sint(4)),
+                ("type".to_string(), Type::sint(4)),
+                ("protocol".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "bind".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("sockfd".to_string(), Type::sint(4)),
+                ("addr".to_string(), Type::ptr(Type::Void)),
+                ("addrlen".to_string(), Type::uint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "listen".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("sockfd".to_string(), Type::sint(4)),
+                ("backlog".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "accept".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("sockfd".to_string(), Type::sint(4)),
+                ("addr".to_string(), Type::ptr(Type::Void)),
+                ("addrlen".to_string(), Type::ptr(Type::uint(4))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "connect".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("sockfd".to_string(), Type::sint(4)),
+                ("addr".to_string(), Type::ptr(Type::Void)),
+                ("addrlen".to_string(), Type::uint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "send".to_string(),
+            return_type: Type::sint(8),
+            parameters: vec![
+                ("sockfd".to_string(), Type::sint(4)),
+                ("buf".to_string(), Type::ptr(Type::Void)),
+                ("len".to_string(), Type::uint(8)),
+                ("flags".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "recv".to_string(),
+            return_type: Type::sint(8),
+            parameters: vec![
+                ("sockfd".to_string(), Type::sint(4)),
+                ("buf".to_string(), Type::ptr(Type::Void)),
+                ("len".to_string(), Type::uint(8)),
+                ("flags".to_string(), Type::sint(4)),
+            ],
+            variadic: false,
+        });
+
+        // ======== pthread functions ========
+        sigs.add_signature(FunctionSignature {
+            name: "pthread_create".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("thread".to_string(), Type::ptr(Type::uint(8))),
+                ("attr".to_string(), Type::ptr(Type::Void)),
+                ("start_routine".to_string(), Type::ptr(Type::Void)),
+                ("arg".to_string(), Type::ptr(Type::Void)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "pthread_join".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("thread".to_string(), Type::uint(8)),
+                ("retval".to_string(), Type::ptr(Type::ptr(Type::Void))),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "pthread_mutex_lock".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("mutex".to_string(), Type::ptr(Type::Void))],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "pthread_mutex_unlock".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![("mutex".to_string(), Type::ptr(Type::Void))],
+            variadic: false,
+        });
+
+        // ======== mmap functions ========
+        sigs.add_signature(FunctionSignature {
+            name: "mmap".to_string(),
+            return_type: Type::ptr(Type::Void),
+            parameters: vec![
+                ("addr".to_string(), Type::ptr(Type::Void)),
+                ("length".to_string(), Type::uint(8)),
+                ("prot".to_string(), Type::sint(4)),
+                ("flags".to_string(), Type::sint(4)),
+                ("fd".to_string(), Type::sint(4)),
+                ("offset".to_string(), Type::sint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "munmap".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("addr".to_string(), Type::ptr(Type::Void)),
+                ("length".to_string(), Type::uint(8)),
+            ],
+            variadic: false,
+        });
+
+        sigs.add_signature(FunctionSignature {
+            name: "mprotect".to_string(),
+            return_type: Type::sint(4),
+            parameters: vec![
+                ("addr".to_string(), Type::ptr(Type::Void)),
+                ("len".to_string(), Type::uint(8)),
+                ("prot".to_string(), Type::sint(4)),
             ],
             variadic: false,
         });

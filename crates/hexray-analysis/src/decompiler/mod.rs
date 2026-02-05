@@ -10,14 +10,18 @@
 pub mod abi;
 mod arch_patterns;
 pub mod array_detection;
+pub mod config;
+mod constant_propagation;
 mod dead_store;
 mod emitter;
 mod expression;
 mod for_loop_detection;
 mod irreducible_cfg;
 mod linked_list;
+mod loop_canonicalization;
 mod loop_invariant;
 mod loop_pattern_detection;
+mod memset_idiom;
 mod naming;
 mod short_circuit;
 mod signature;
@@ -27,6 +31,7 @@ mod structurer;
 mod switch_recovery;
 mod variable_naming;
 
+pub use config::{DecompilerConfig, OptimizationLevel, OptimizationPass};
 pub use emitter::PseudoCodeEmitter;
 pub use expression::{BinOpKind, Expr, ExprKind, UnaryOpKind, Variable};
 pub use irreducible_cfg::{IrreducibleCfgAnalysis, IrreducibleRegion};
@@ -317,6 +322,8 @@ pub struct Decompiler {
     /// When enabled, SSA form is built and type inference is run to
     /// automatically populate type_info.
     pub enable_auto_type_inference: bool,
+    /// Configuration for decompiler optimization passes.
+    pub config: Option<DecompilerConfig>,
 }
 
 impl Default for Decompiler {
@@ -338,6 +345,7 @@ impl Default for Decompiler {
             exception_info: None,
             constant_database: None,
             enable_auto_type_inference: false,
+            config: None,
         }
     }
 }
@@ -504,6 +512,15 @@ impl Decompiler {
         self
     }
 
+    /// Sets the decompiler configuration for optimization passes.
+    ///
+    /// When set, controls which optimization passes run during decompilation.
+    /// If not set, uses the default configuration (Standard optimization level).
+    pub fn with_config(mut self, config: DecompilerConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 0: Run type inference if enabled
@@ -530,7 +547,11 @@ impl Decompiler {
         }
 
         // Step 1: Structure the control flow
-        let structured = StructuredCfg::from_cfg(cfg);
+        let structured = if let Some(ref config) = self.config {
+            StructuredCfg::from_cfg_with_config(cfg, config)
+        } else {
+            StructuredCfg::from_cfg(cfg)
+        };
 
         // Step 2: Apply struct inference if enabled
         let structured = if self.enable_struct_inference {
