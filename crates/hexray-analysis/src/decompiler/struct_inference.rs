@@ -680,18 +680,51 @@ impl StructInference {
                 })
                 .collect();
 
+            // Detect embedded arrays from sequential field accesses
+            let array_fields = self.detect_embedded_arrays(&field_data);
+
             for (offset, size, access_list) in field_data {
-                // Infer type from usage (may be a union if multiple sizes)
-                let field_type = self.infer_field_type(&access_list, size, offset);
+                // Skip if this is part of a detected array (and not the start)
+                if array_fields.iter().any(|(start, elem_size, count)| {
+                    offset != *start && offset >= *start && offset < start + elem_size * count
+                }) {
+                    continue;
+                }
+
+                // Check if this is the start of an embedded array
+                let field_type = if let Some(&(_, elem_size, count)) =
+                    array_fields.iter().find(|(s, _, _)| *s == offset)
+                {
+                    // This is an array
+                    let elem_type = self.infer_simple_type(&access_list, elem_size);
+                    InferredType::Array {
+                        element_type: Box::new(elem_type),
+                        count: Some(count),
+                    }
+                } else {
+                    // Regular field - infer type from usage (may be a union if multiple sizes)
+                    self.infer_field_type(&access_list, size, offset)
+                };
+
+                // Generate a better field name based on type
+                let field_name = self.generate_field_name(&field_type, offset, base_name);
+
+                let actual_size = if let Some((_, elem_size, count)) =
+                    array_fields.iter().find(|(s, _, _)| *s == offset)
+                {
+                    elem_size * count
+                } else {
+                    size
+                };
 
                 let field = InferredField {
                     offset,
-                    size,
+                    size: actual_size,
                     field_type,
-                    name: format!("field_{:x}", offset),
+                    name: field_name,
                 };
 
-                max_end = max_end.max(offset + size);
+                max_end = max_end.max(offset + actual_size);
                 fields.push(field);
             }
 
@@ -711,6 +744,119 @@ impl StructInference {
 
             self.base_to_struct.insert(base_name.clone(), struct_name);
             self.structs.push(inferred_struct);
+        }
+    }
+
+    /// Detects embedded arrays from sequential field accesses with same size.
+    /// Returns (start_offset, element_size, element_count) for each detected array.
+    fn detect_embedded_arrays(
+        &self,
+        field_data: &[(usize, usize, Vec<MemoryAccess>)],
+    ) -> Vec<(usize, usize, usize)> {
+        let mut arrays = Vec::new();
+
+        // Group by element size and look for sequential patterns
+        let mut by_size: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (offset, size, _) in field_data {
+            by_size.entry(*size).or_default().push(*offset);
+        }
+
+        for (size, mut offsets) in by_size {
+            offsets.sort();
+
+            // Look for sequences of 3 or more elements with consistent stride
+            if offsets.len() < 3 {
+                continue;
+            }
+
+            let mut i = 0;
+            while i < offsets.len() - 2 {
+                let start = offsets[i];
+                let stride = offsets[i + 1] - offsets[i];
+
+                // Only consider arrays if stride equals element size
+                if stride != size {
+                    i += 1;
+                    continue;
+                }
+
+                // Count how many elements follow the pattern
+                let mut count = 1;
+                let mut j = i + 1;
+                while j < offsets.len() && offsets[j] == start + count * stride {
+                    count += 1;
+                    j += 1;
+                }
+
+                // At least 3 elements to be considered an array
+                if count >= 3 {
+                    arrays.push((start, size, count));
+                    i = j; // Skip past the array
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        arrays
+    }
+
+    /// Generates a better field name based on type and context.
+    fn generate_field_name(
+        &self,
+        field_type: &InferredType,
+        offset: usize,
+        base_name: &str,
+    ) -> String {
+        match field_type {
+            InferredType::Pointer(_) => {
+                // Check if this might be a self-pointer (linked list)
+                if let Some(current_struct) = self.base_to_struct.get(base_name) {
+                    if let InferredType::StructPointer(ref target) = field_type {
+                        if target == current_struct {
+                            return "next".to_string();
+                        }
+                    }
+                }
+                format!("ptr_{:x}", offset)
+            }
+            InferredType::StructPointer(struct_name) => {
+                // Check if self-referential (linked list)
+                if let Some(current_struct) = self.base_to_struct.get(base_name) {
+                    if struct_name == current_struct {
+                        return "next".to_string();
+                    }
+                }
+                // Use a name based on the target struct
+                format!("{}_ptr", struct_name.trim_start_matches("struct_"))
+            }
+            InferredType::Bool => format!("flag_{:x}", offset),
+            InferredType::SignedInt(size) | InferredType::UnsignedInt(size) => {
+                // Common field sizes get semantic names at known offsets
+                match (offset, *size) {
+                    (0, 4) => "count".to_string(), // First field, often a count
+                    (0, 8) => "size".to_string(),  // First field, often a size
+                    _ => format!("field_{:x}", offset),
+                }
+            }
+            InferredType::Array {
+                element_type,
+                count,
+            } => {
+                let elem_name = match element_type.as_ref() {
+                    InferredType::SignedInt(1) | InferredType::UnsignedInt(1) => "data",
+                    InferredType::Pointer(_) => "ptrs",
+                    _ => "arr",
+                };
+                if let Some(n) = count {
+                    format!("{}_{}", elem_name, n)
+                } else {
+                    format!("{}_arr", elem_name)
+                }
+            }
+            InferredType::Float(4) => format!("f_{:x}", offset),
+            InferredType::Float(8) => format!("d_{:x}", offset),
+            _ => format!("field_{:x}", offset),
         }
     }
 
@@ -1324,5 +1470,139 @@ mod tests {
         // Should contain struct definition
         assert!(output.contains("struct my_struct"));
         assert!(output.contains("union union_0 field_0"));
+    }
+
+    #[test]
+    fn test_embedded_array_detection() {
+        let mut inference = StructInference::new().with_min_field_count(2);
+
+        // Create sequential accesses that form an array: arr[0], arr[1], arr[2], arr[3]
+        let access0 = make_field_access("rbx", 0, 4);
+        let access1 = make_field_access("rbx", 4, 4);
+        let access2 = make_field_access("rbx", 8, 4);
+        let access3 = make_field_access("rbx", 12, 4);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(make_var("eax", 4), access0),
+                Expr::assign(make_var("eax", 4), access1),
+                Expr::assign(make_var("eax", 4), access2),
+                Expr::assign(make_var("eax", 4), access3),
+            ],
+            address_range: (0x1000, 0x1040),
+        };
+
+        inference.analyze(&[block]);
+
+        // Should detect one struct
+        assert_eq!(inference.structs().len(), 1);
+
+        let s = &inference.structs()[0];
+        // Should have collapsed the 4 fields into one array field
+        assert_eq!(s.fields.len(), 1);
+
+        // The field should be an array of 4 elements
+        let field = &s.fields[0];
+        assert_eq!(field.offset, 0);
+        if let InferredType::Array {
+            element_type,
+            count,
+        } = &field.field_type
+        {
+            assert_eq!(*count, Some(4));
+            assert!(matches!(
+                element_type.as_ref(),
+                InferredType::UnsignedInt(4)
+            ));
+        } else {
+            panic!("Expected Array type, got {:?}", field.field_type);
+        }
+    }
+
+    #[test]
+    fn test_embedded_array_with_other_fields() {
+        let mut inference = StructInference::new().with_min_field_count(2);
+
+        // Create a struct with: size (8), count (4), array[3] (3x4=12)
+        let access_size = make_field_access("rbx", 0, 8);
+        let access_count = make_field_access("rbx", 8, 4);
+        // Array starting at offset 16
+        let access_arr0 = make_field_access("rbx", 16, 4);
+        let access_arr1 = make_field_access("rbx", 20, 4);
+        let access_arr2 = make_field_access("rbx", 24, 4);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(make_var("rax", 8), access_size),
+                Expr::assign(make_var("eax", 4), access_count),
+                Expr::assign(make_var("eax", 4), access_arr0),
+                Expr::assign(make_var("eax", 4), access_arr1),
+                Expr::assign(make_var("eax", 4), access_arr2),
+            ],
+            address_range: (0x1000, 0x1050),
+        };
+
+        inference.analyze(&[block]);
+
+        assert_eq!(inference.structs().len(), 1);
+
+        let s = &inference.structs()[0];
+        // Should have 3 fields: size, count, and array
+        assert_eq!(s.fields.len(), 3);
+
+        // First field at offset 0 (size)
+        assert_eq!(s.fields[0].offset, 0);
+        assert!(matches!(
+            s.fields[0].field_type,
+            InferredType::UnsignedInt(8)
+        ));
+
+        // Second field at offset 8 (count)
+        assert_eq!(s.fields[1].offset, 8);
+        assert!(matches!(
+            s.fields[1].field_type,
+            InferredType::UnsignedInt(4)
+        ));
+
+        // Third field at offset 16 should be an array
+        assert_eq!(s.fields[2].offset, 16);
+        assert!(matches!(
+            s.fields[2].field_type,
+            InferredType::Array { count: Some(3), .. }
+        ));
+    }
+
+    #[test]
+    fn test_field_naming_for_pointers() {
+        let inference = StructInference::new();
+
+        // Test pointer naming
+        let ptr_type = InferredType::Pointer(Box::new(InferredType::Unknown));
+        let name = inference.generate_field_name(&ptr_type, 8, "rbx");
+        assert_eq!(name, "ptr_8");
+
+        // Test bool naming
+        let bool_type = InferredType::Bool;
+        let name = inference.generate_field_name(&bool_type, 16, "rbx");
+        assert_eq!(name, "flag_10");
+    }
+
+    #[test]
+    fn test_array_type_display() {
+        let array_type = InferredType::Array {
+            element_type: Box::new(InferredType::SignedInt(4)),
+            count: Some(10),
+        };
+        assert_eq!(array_type.to_c_string(), "int32_t[10]");
+        assert_eq!(array_type.size(), Some(40));
+
+        let array_type_unknown_count = InferredType::Array {
+            element_type: Box::new(InferredType::UnsignedInt(8)),
+            count: None,
+        };
+        assert_eq!(array_type_unknown_count.to_c_string(), "uint64_t[]");
+        assert_eq!(array_type_unknown_count.size(), None);
     }
 }
