@@ -209,7 +209,21 @@ The project uses GitHub Actions for continuous integration:
 - **Coverage**: cargo-llvm-cov with Codecov integration
 - **Linting**: Clippy with `-D warnings`
 - **Formatting**: cargo fmt verification
-- **Benchmarks**: Criterion benchmarks with PR comparison
+
+### Local Benchmarking
+
+For reliable performance comparisons, run benchmarks locally on consistent hardware:
+
+```bash
+# Save baseline (e.g., before changes)
+cargo bench --workspace -- --save-baseline main
+
+# Make changes, then compare
+cargo bench --workspace -- --save-baseline pr
+
+# Compare results (install with: cargo install critcmp)
+critcmp main pr
+```
 
 ## Use Cases
 
