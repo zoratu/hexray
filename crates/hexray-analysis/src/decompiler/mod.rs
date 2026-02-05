@@ -16,6 +16,7 @@ mod dead_store;
 mod emitter;
 mod expression;
 mod for_loop_detection;
+pub mod interprocedural;
 mod irreducible_cfg;
 mod linked_list;
 mod loop_canonicalization;
@@ -35,6 +36,9 @@ mod variable_naming;
 pub use config::{DecompilerConfig, OptimizationLevel, OptimizationPass};
 pub use emitter::PseudoCodeEmitter;
 pub use expression::{BinOpKind, Expr, ExprKind, UnaryOpKind, Variable};
+pub use interprocedural::{
+    CallSiteInfo, FunctionSummary, InterproceduralAnalysis, SummaryDatabase, SummaryType,
+};
 pub use irreducible_cfg::{IrreducibleCfgAnalysis, IrreducibleRegion};
 pub use naming::{NamingContext, TypeHint};
 pub use quality_metrics::{compute_metrics, QualityMetrics};
