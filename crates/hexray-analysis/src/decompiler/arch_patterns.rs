@@ -236,6 +236,26 @@ fn apply_arch_simplifications(expr: Expr) -> Expr {
         return simplified;
     }
 
+    // Rotate patterns
+    if let Some(simplified) = simplify_rotate_pattern(&expr) {
+        return simplified;
+    }
+
+    // Bit manipulation patterns
+    if let Some(simplified) = simplify_bit_manipulation_pattern(&expr) {
+        return simplified;
+    }
+
+    // Multiply-by-constant patterns
+    if let Some(simplified) = simplify_multiply_constant_pattern(&expr) {
+        return simplified;
+    }
+
+    // Clamp/saturate patterns
+    if let Some(simplified) = simplify_clamp_pattern(&expr) {
+        return simplified;
+    }
+
     expr
 }
 
@@ -527,6 +547,355 @@ fn simplify_sign_extend_pattern(expr: &Expr) -> Option<Expr> {
 fn try_merge_cmp_csel(_cmp: &Expr, _csel: &Expr) -> Option<Expr> {
     // This would require tracking the flags register state
     // For now, just return None and let individual patterns handle it
+    None
+}
+
+/// Simplify rotate patterns.
+///
+/// Detects patterns like:
+/// - `(x << n) | (x >> (32 - n))` => `rotl(x, n)` (left rotate)
+/// - `(x >> n) | (x << (32 - n))` => `rotr(x, n)` (right rotate)
+fn simplify_rotate_pattern(expr: &Expr) -> Option<Expr> {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Or,
+        left,
+        right,
+    } = &expr.kind
+    {
+        // Try both orderings: (shl | shr) and (shr | shl)
+        if let Some(result) = try_extract_rotate(left, right) {
+            return Some(result);
+        }
+        if let Some(result) = try_extract_rotate(right, left) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn try_extract_rotate(a: &Expr, b: &Expr) -> Option<Expr> {
+    // Pattern: (x << n) | (x >> (width - n)) => rotl(x, n)
+    if let ExprKind::BinOp {
+        op: BinOpKind::Shl,
+        left: x1,
+        right: n1,
+    } = &a.kind
+    {
+        if let ExprKind::BinOp {
+            op: BinOpKind::Shr,
+            left: x2,
+            right: n2,
+        } = &b.kind
+        {
+            if exprs_equal(x1, x2) {
+                // Check if n2 = width - n1
+                if let (
+                    ExprKind::IntLit(shift),
+                    ExprKind::BinOp {
+                        op: BinOpKind::Sub,
+                        left: width,
+                        right: shift2,
+                    },
+                ) = (&n1.kind, &n2.kind)
+                {
+                    if let ExprKind::IntLit(w) = &width.kind {
+                        if (*w == 32 || *w == 64) && exprs_equal(n1, shift2) {
+                            return Some(Expr::call(
+                                CallTarget::Named("rotl".to_string()),
+                                vec![x1.as_ref().clone(), Expr::int(*shift)],
+                            ));
+                        }
+                    }
+                }
+                // Check for constant complement: n1 + n2 = width
+                if let (ExprKind::IntLit(s1), ExprKind::IntLit(s2)) = (&n1.kind, &n2.kind) {
+                    if *s1 + *s2 == 32 || *s1 + *s2 == 64 {
+                        return Some(Expr::call(
+                            CallTarget::Named("rotl".to_string()),
+                            vec![x1.as_ref().clone(), Expr::int(*s1)],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern: (x >> n) | (x << (width - n)) => rotr(x, n)
+    if let ExprKind::BinOp {
+        op: BinOpKind::Shr,
+        left: x1,
+        right: n1,
+    } = &a.kind
+    {
+        if let ExprKind::BinOp {
+            op: BinOpKind::Shl,
+            left: x2,
+            right: n2,
+        } = &b.kind
+        {
+            if exprs_equal(x1, x2) {
+                if let (ExprKind::IntLit(s1), ExprKind::IntLit(s2)) = (&n1.kind, &n2.kind) {
+                    if *s1 + *s2 == 32 || *s1 + *s2 == 64 {
+                        return Some(Expr::call(
+                            CallTarget::Named("rotr".to_string()),
+                            vec![x1.as_ref().clone(), Expr::int(*s1)],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Simplify bit manipulation patterns.
+///
+/// Detects patterns like:
+/// - `(x >> n) & 1` => test bit n
+/// - `(x >> n) & mask` => bit field extraction
+/// - Byte swap patterns
+fn simplify_bit_manipulation_pattern(expr: &Expr) -> Option<Expr> {
+    // Pattern: (x >> n) & 1 - this is a bit test, keep as is but potentially annotate
+    // We'll let this through for now, but could convert to __builtin_bit_test
+
+    // Pattern: byte swap - detect common bswap patterns
+    if let Some(result) = try_simplify_bswap(expr) {
+        return Some(result);
+    }
+
+    // Pattern: popcount loop - detect while((x &= x-1)) count++
+    // This is complex to detect in expression form, skip for now
+
+    None
+}
+
+fn try_simplify_bswap(expr: &Expr) -> Option<Expr> {
+    // 32-bit bswap pattern:
+    // ((x >> 24) & 0xFF) | ((x >> 8) & 0xFF00) | ((x << 8) & 0xFF0000) | ((x << 24) & 0xFF000000)
+    // This is complex - detect simpler patterns first
+
+    // Simple pattern: look for Or chains with shifts and masks
+    if let ExprKind::BinOp {
+        op: BinOpKind::Or, ..
+    } = &expr.kind
+    {
+        // Count the number of Or operations
+        let or_count = count_or_operations(expr);
+        if or_count >= 3 {
+            // Likely a byte swap pattern - check if all involve the same base variable
+            if let Some(base_var) = extract_common_bswap_var(expr) {
+                return Some(Expr::call(
+                    CallTarget::Named("bswap".to_string()),
+                    vec![base_var],
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn count_or_operations(expr: &Expr) -> usize {
+    match &expr.kind {
+        ExprKind::BinOp {
+            op: BinOpKind::Or,
+            left,
+            right,
+        } => 1 + count_or_operations(left) + count_or_operations(right),
+        _ => 0,
+    }
+}
+
+fn extract_common_bswap_var(expr: &Expr) -> Option<Expr> {
+    // Extract all leaf variables from the Or chain and check they're the same
+    let mut vars = Vec::new();
+    collect_shifted_vars(expr, &mut vars);
+
+    if vars.len() >= 4 {
+        // Check all vars are the same
+        let first = &vars[0];
+        if vars.iter().all(|v| exprs_equal(first, v)) {
+            return Some(first.clone());
+        }
+    }
+    None
+}
+
+fn collect_shifted_vars(expr: &Expr, vars: &mut Vec<Expr>) {
+    match &expr.kind {
+        ExprKind::BinOp {
+            op: BinOpKind::Or,
+            left,
+            right,
+        } => {
+            collect_shifted_vars(left, vars);
+            collect_shifted_vars(right, vars);
+        }
+        ExprKind::BinOp {
+            op: BinOpKind::And,
+            left,
+            ..
+        } => {
+            // Extract the variable from shift & mask
+            collect_shifted_vars(left, vars);
+        }
+        ExprKind::BinOp {
+            op: BinOpKind::Shl | BinOpKind::Shr,
+            left,
+            ..
+        } => {
+            if let ExprKind::Var(_) = &left.kind {
+                vars.push(left.as_ref().clone());
+            }
+        }
+        ExprKind::Var(_) => {
+            vars.push(expr.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Simplify multiply-by-constant patterns.
+///
+/// Compilers often use shifts and adds instead of multiply:
+/// - `x + (x << 1)` => `x * 3`
+/// - `x + (x << 2)` => `x * 5`
+/// - `(x << 3) - x` => `x * 7`
+fn simplify_multiply_constant_pattern(expr: &Expr) -> Option<Expr> {
+    // Pattern: x + (x << n) => x * (1 + 2^n)
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &expr.kind
+    {
+        // x + (x << n)
+        if let ExprKind::BinOp {
+            op: BinOpKind::Shl,
+            left: shifted,
+            right: shift_amt,
+        } = &right.kind
+        {
+            if exprs_equal(left, shifted) {
+                if let ExprKind::IntLit(n) = &shift_amt.kind {
+                    if *n >= 1 && *n <= 5 {
+                        let multiplier = 1 + (1i128 << *n);
+                        return Some(Expr::binop(
+                            BinOpKind::Mul,
+                            left.as_ref().clone(),
+                            Expr::int(multiplier),
+                        ));
+                    }
+                }
+            }
+        }
+        // (x << n) + x
+        if let ExprKind::BinOp {
+            op: BinOpKind::Shl,
+            left: shifted,
+            right: shift_amt,
+        } = &left.kind
+        {
+            if exprs_equal(right, shifted) {
+                if let ExprKind::IntLit(n) = &shift_amt.kind {
+                    if *n >= 1 && *n <= 5 {
+                        let multiplier = 1 + (1i128 << *n);
+                        return Some(Expr::binop(
+                            BinOpKind::Mul,
+                            right.as_ref().clone(),
+                            Expr::int(multiplier),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern: (x << n) - x => x * (2^n - 1)
+    if let ExprKind::BinOp {
+        op: BinOpKind::Sub,
+        left,
+        right,
+    } = &expr.kind
+    {
+        if let ExprKind::BinOp {
+            op: BinOpKind::Shl,
+            left: shifted,
+            right: shift_amt,
+        } = &left.kind
+        {
+            if exprs_equal(right, shifted) {
+                if let ExprKind::IntLit(n) = &shift_amt.kind {
+                    if *n >= 2 && *n <= 5 {
+                        let multiplier = (1i128 << *n) - 1;
+                        return Some(Expr::binop(
+                            BinOpKind::Mul,
+                            right.as_ref().clone(),
+                            Expr::int(multiplier),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Simplify clamp/saturate patterns.
+///
+/// Detects patterns like:
+/// - `min(max(x, lo), hi)` => `clamp(x, lo, hi)`
+/// - `max(min(x, hi), lo)` => `clamp(x, lo, hi)`
+fn simplify_clamp_pattern(expr: &Expr) -> Option<Expr> {
+    // Pattern: min(max(x, lo), hi)
+    if let ExprKind::Call {
+        target: CallTarget::Named(outer_name),
+        args: outer_args,
+    } = &expr.kind
+    {
+        if outer_name == "min" && outer_args.len() == 2 {
+            if let ExprKind::Call {
+                target: CallTarget::Named(inner_name),
+                args: inner_args,
+            } = &outer_args[0].kind
+            {
+                if inner_name == "max" && inner_args.len() == 2 {
+                    // min(max(x, lo), hi) => clamp(x, lo, hi)
+                    return Some(Expr::call(
+                        CallTarget::Named("clamp".to_string()),
+                        vec![
+                            inner_args[0].clone(), // x
+                            inner_args[1].clone(), // lo
+                            outer_args[1].clone(), // hi
+                        ],
+                    ));
+                }
+            }
+        }
+
+        // Pattern: max(min(x, hi), lo)
+        if outer_name == "max" && outer_args.len() == 2 {
+            if let ExprKind::Call {
+                target: CallTarget::Named(inner_name),
+                args: inner_args,
+            } = &outer_args[0].kind
+            {
+                if inner_name == "min" && inner_args.len() == 2 {
+                    // max(min(x, hi), lo) => clamp(x, lo, hi)
+                    return Some(Expr::call(
+                        CallTarget::Named("clamp".to_string()),
+                        vec![
+                            inner_args[0].clone(), // x
+                            outer_args[1].clone(), // lo
+                            inner_args[1].clone(), // hi
+                        ],
+                    ));
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -824,6 +1193,118 @@ mod tests {
             } = &s.kind
             {
                 assert_eq!(name, "max");
+            }
+        }
+    }
+
+    #[test]
+    fn test_simplify_rotate_left() {
+        // (x << 8) | (x >> 24) => rotl(x, 8) for 32-bit
+        let x = make_var("x");
+        let shl = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(8));
+        let shr = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(24));
+        let expr = Expr::binop(BinOpKind::Or, shl, shr);
+
+        let simplified = simplify_rotate_pattern(&expr);
+        assert!(simplified.is_some());
+        if let Some(s) = simplified {
+            if let ExprKind::Call {
+                target: CallTarget::Named(name),
+                args,
+            } = &s.kind
+            {
+                assert_eq!(name, "rotl");
+                assert_eq!(args.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_simplify_rotate_right() {
+        // (x >> 8) | (x << 24) => rotr(x, 8) for 32-bit
+        let x = make_var("x");
+        let shr = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(8));
+        let shl = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(24));
+        let expr = Expr::binop(BinOpKind::Or, shr, shl);
+
+        let simplified = simplify_rotate_pattern(&expr);
+        assert!(simplified.is_some());
+        if let Some(s) = simplified {
+            if let ExprKind::Call {
+                target: CallTarget::Named(name),
+                ..
+            } = &s.kind
+            {
+                assert_eq!(name, "rotr");
+            }
+        }
+    }
+
+    #[test]
+    fn test_simplify_multiply_by_3() {
+        // x + (x << 1) => x * 3
+        let x = make_var("x");
+        let shifted = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(1));
+        let expr = Expr::binop(BinOpKind::Add, x.clone(), shifted);
+
+        let simplified = simplify_multiply_constant_pattern(&expr);
+        assert!(simplified.is_some());
+        if let Some(s) = simplified {
+            if let ExprKind::BinOp {
+                op: BinOpKind::Mul,
+                right,
+                ..
+            } = &s.kind
+            {
+                assert!(matches!(right.kind, ExprKind::IntLit(3)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_simplify_multiply_by_7() {
+        // (x << 3) - x => x * 7
+        let x = make_var("x");
+        let shifted = Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(3));
+        let expr = Expr::binop(BinOpKind::Sub, shifted, x.clone());
+
+        let simplified = simplify_multiply_constant_pattern(&expr);
+        assert!(simplified.is_some());
+        if let Some(s) = simplified {
+            if let ExprKind::BinOp {
+                op: BinOpKind::Mul,
+                right,
+                ..
+            } = &s.kind
+            {
+                assert!(matches!(right.kind, ExprKind::IntLit(7)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_simplify_clamp() {
+        // min(max(x, 0), 255) => clamp(x, 0, 255)
+        let x = make_var("x");
+        let inner = Expr::call(
+            CallTarget::Named("max".to_string()),
+            vec![x.clone(), Expr::int(0)],
+        );
+        let expr = Expr::call(
+            CallTarget::Named("min".to_string()),
+            vec![inner, Expr::int(255)],
+        );
+
+        let simplified = simplify_clamp_pattern(&expr);
+        assert!(simplified.is_some());
+        if let Some(s) = simplified {
+            if let ExprKind::Call {
+                target: CallTarget::Named(name),
+                args,
+            } = &s.kind
+            {
+                assert_eq!(name, "clamp");
+                assert_eq!(args.len(), 3);
             }
         }
     }

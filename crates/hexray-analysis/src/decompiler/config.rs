@@ -306,6 +306,7 @@ impl DecompilerConfig {
                     | LoopInvariantHoisting
                     | LoopPatternDetection
                     | SwitchDetection
+                    | SwitchRecovery
                     | ShortCircuitDetection
                     | GotoConversion
                     | GuardClauseFlattening
@@ -314,6 +315,7 @@ impl DecompilerConfig {
                     | ArchPatternSimplification
                     | DeadStoreElimination
                     | ConstantPropagation
+                    | LoopCanonicalization
             ),
             Aggressive => {
                 // All passes enabled at aggressive level
