@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::expression::{BinOpKind, Expr, ExprKind, UnaryOpKind};
+use super::expression::{BinOpKind, Expr, ExprKind, UnaryOpKind, VarKind};
 use super::structurer::StructuredNode;
 
 /// Performs constant folding and propagation on structured nodes.
@@ -261,14 +261,18 @@ impl ConstantPropagator {
     fn propagate_expr(&mut self, expr: Expr) -> Expr {
         let folded = self.fold_expr(expr);
 
-        // Track constant assignments
+        // Track constant assignments only for register and temp variables.
+        // Stack, global, and argument variables are memory-backed and should
+        // not have constants propagated (they could be modified via pointers).
         if let ExprKind::Assign { ref lhs, ref rhs } = folded.kind {
             if let ExprKind::Var(v) = &lhs.kind {
-                if let Some(val) = self.try_eval(rhs) {
-                    self.constants.insert(v.name.clone(), val);
-                } else {
-                    // Non-constant assignment invalidates the variable
-                    self.constants.remove(&v.name);
+                if matches!(v.kind, VarKind::Register(_) | VarKind::Temp(_)) {
+                    if let Some(val) = self.try_eval(rhs) {
+                        self.constants.insert(v.name.clone(), val);
+                    } else {
+                        // Non-constant assignment invalidates the variable
+                        self.constants.remove(&v.name);
+                    }
                 }
             }
         }
@@ -279,9 +283,13 @@ impl ConstantPropagator {
     fn fold_expr(&self, expr: Expr) -> Expr {
         match expr.kind {
             ExprKind::Var(ref v) => {
-                // Substitute known constants
-                if let Some(&val) = self.constants.get(&v.name) {
-                    return Expr::int(val);
+                // Only substitute constants for register and temp variables.
+                // Stack, global, and argument variables are memory-backed and
+                // could be modified through pointers, so we don't propagate them.
+                if matches!(v.kind, VarKind::Register(_) | VarKind::Temp(_)) {
+                    if let Some(&val) = self.constants.get(&v.name) {
+                        return Expr::int(val);
+                    }
                 }
                 expr
             }
@@ -382,7 +390,9 @@ impl ConstantPropagator {
             }
 
             ExprKind::Deref { addr, size } => {
-                let addr = self.fold_expr(*addr);
+                // Don't propagate constants into deref addresses - replacing a
+                // pointer with a literal produces unreadable code like *(0)
+                let addr = self.fold_expr_preserve_vars(*addr);
                 Expr::deref(addr, size)
             }
 
@@ -396,7 +406,9 @@ impl ConstantPropagator {
                 index,
                 element_size,
             } => {
-                let base = self.fold_expr(*base);
+                // Don't propagate constants into base - replacing a pointer
+                // with a literal produces unreadable code like 0[i]
+                let base = self.fold_expr_preserve_vars(*base);
                 let index = self.fold_expr(*index);
                 Expr::array_access(base, index, element_size)
             }
@@ -406,8 +418,83 @@ impl ConstantPropagator {
                 field_name,
                 offset,
             } => {
-                let base = self.fold_expr(*base);
+                // Don't propagate constants into base - preserve readable names
+                let base = self.fold_expr_preserve_vars(*base);
                 Expr::field_access(base, field_name, offset)
+            }
+
+            // Pass through unchanged
+            _ => expr,
+        }
+    }
+
+    /// Folds expressions but preserves variable names (doesn't substitute constants).
+    /// Used for memory addresses where we want to keep readable names.
+    fn fold_expr_preserve_vars(&self, expr: Expr) -> Expr {
+        match expr.kind {
+            // Don't substitute constants for variables - preserve the name
+            ExprKind::Var(_) => expr,
+
+            ExprKind::BinOp { op, left, right } => {
+                let left = self.fold_expr_preserve_vars(*left);
+                let right = self.fold_expr_preserve_vars(*right);
+
+                // Still do algebraic simplifications
+                if let Some(simplified) = simplify_binop(op, &left, &right) {
+                    return simplified;
+                }
+
+                Expr::binop(op, left, right)
+            }
+
+            ExprKind::UnaryOp { op, operand } => {
+                let operand = self.fold_expr_preserve_vars(*operand);
+                Expr::unary(op, operand)
+            }
+
+            ExprKind::Cast {
+                expr: inner,
+                to_size,
+                signed,
+            } => {
+                let inner = self.fold_expr_preserve_vars(*inner);
+                Expr {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(inner),
+                        to_size,
+                        signed,
+                    },
+                }
+            }
+
+            // For nested derefs/arrays, keep preserving vars
+            ExprKind::Deref { addr, size } => {
+                let addr = self.fold_expr_preserve_vars(*addr);
+                Expr::deref(addr, size)
+            }
+
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                let base = self.fold_expr_preserve_vars(*base);
+                let index = self.fold_expr_preserve_vars(*index);
+                Expr::array_access(base, index, element_size)
+            }
+
+            ExprKind::FieldAccess {
+                base,
+                field_name,
+                offset,
+            } => {
+                let base = self.fold_expr_preserve_vars(*base);
+                Expr::field_access(base, field_name, offset)
+            }
+
+            ExprKind::AddressOf(inner) => {
+                let inner = self.fold_expr_preserve_vars(*inner);
+                Expr::address_of(inner)
             }
 
             // Pass through unchanged
@@ -418,7 +505,14 @@ impl ConstantPropagator {
     fn try_eval(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
-            ExprKind::Var(v) => self.constants.get(&v.name).copied(),
+            ExprKind::Var(v) => {
+                // Only evaluate register and temp variables as constants
+                if matches!(v.kind, VarKind::Register(_) | VarKind::Temp(_)) {
+                    self.constants.get(&v.name).copied()
+                } else {
+                    None
+                }
+            }
             ExprKind::BinOp { op, left, right } => {
                 let l = self.try_eval(left)?;
                 let r = self.try_eval(right)?;
@@ -678,5 +772,54 @@ mod tests {
         };
         let folded = prop.fold_expr(cond);
         assert!(matches!(folded.kind, ExprKind::IntLit(20)));
+    }
+
+    #[test]
+    fn test_stack_vars_not_propagated() {
+        // Stack variables should NOT have constants propagated because they
+        // are memory-backed and could be modified through pointers.
+        let mut prop = ConstantPropagator::new();
+
+        // Create a stack variable
+        let stack_var = Expr::var(Variable {
+            name: "var_0".to_string(),
+            kind: VarKind::Stack(0),
+            size: 8,
+        });
+
+        // Assign a constant to it
+        let assign = Expr::assign(stack_var.clone(), Expr::int(42));
+        prop.propagate_expr(assign);
+
+        // Stack variable should NOT be tracked as a constant
+        assert_eq!(prop.constants.get("var_0"), None);
+
+        // Using the stack variable should NOT substitute
+        let folded = prop.fold_expr(stack_var.clone());
+        assert!(matches!(folded.kind, ExprKind::Var(_)));
+    }
+
+    #[test]
+    fn test_register_vars_are_propagated() {
+        // Register variables should have constants propagated
+        let mut prop = ConstantPropagator::new();
+
+        // Create a register variable
+        let reg_var = Expr::var(Variable {
+            name: "x0".to_string(),
+            kind: VarKind::Register(0),
+            size: 8,
+        });
+
+        // Assign a constant to it
+        let assign = Expr::assign(reg_var.clone(), Expr::int(42));
+        prop.propagate_expr(assign);
+
+        // Register variable should be tracked
+        assert_eq!(prop.constants.get("x0"), Some(&42));
+
+        // Using the register variable should substitute
+        let folded = prop.fold_expr(reg_var);
+        assert!(matches!(folded.kind, ExprKind::IntLit(42)));
     }
 }

@@ -312,8 +312,8 @@ impl DecompilerConfig {
                     | ExpressionSimplification
                     | StringPatternDetection
                     | ArchPatternSimplification
-                    | DeadStoreElimination // Note: ConstantPropagation is only in Aggressive level
-                                           // until stack variable handling is improved
+                    | DeadStoreElimination
+                    | ConstantPropagation
             ),
             Aggressive => {
                 // All passes enabled at aggressive level
