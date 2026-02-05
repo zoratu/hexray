@@ -20,10 +20,15 @@ impl CfgBuilder {
         }
 
         // Step 1: Find all leaders (block start addresses)
+        // Build sorted index once for efficient lookups - O(n log n)
+        let mut sorted_indices: Vec<usize> = (0..instructions.len()).collect();
+        sorted_indices.sort_by_key(|&i| instructions[i].address);
+
         let mut leaders = BTreeSet::new();
         leaders.insert(entry);
 
-        for inst in instructions {
+        for (pos, &idx) in sorted_indices.iter().enumerate() {
+            let inst = &instructions[idx];
             match &inst.control_flow {
                 ControlFlow::UnconditionalBranch { target } => {
                     leaders.insert(*target);
@@ -43,16 +48,16 @@ impl CfgBuilder {
                     leaders.insert(*return_addr);
                 }
                 ControlFlow::Return | ControlFlow::Halt | ControlFlow::Syscall => {
-                    // Next instruction (if any) is a leader
-                    if let Some(next) = instructions.iter().find(|i| i.address > inst.address) {
-                        leaders.insert(next.address);
+                    // Next instruction (if any) is a leader - O(1) lookup via sorted index
+                    if let Some(&next_idx) = sorted_indices.get(pos + 1) {
+                        leaders.insert(instructions[next_idx].address);
                     }
                 }
                 _ => {}
             }
         }
 
-        // Step 2: Create basic blocks
+        // Step 2: Create basic blocks (reuses sorted_indices from Step 1)
         let leaders_vec: Vec<_> = leaders.iter().copied().collect();
         let mut address_to_block: std::collections::HashMap<u64, BasicBlockId> =
             std::collections::HashMap::new();
@@ -64,17 +69,18 @@ impl CfgBuilder {
 
             let next_leader = leaders_vec.get(i + 1).copied();
 
-            let block_insts: Vec<_> = instructions
-                .iter()
-                .filter(|inst| {
-                    inst.address >= leader && next_leader.map_or(true, |nl| inst.address < nl)
-                })
-                .cloned()
-                .collect();
+            // Use binary search to find instruction range for this block - O(log n) instead of O(n)
+            let start_idx =
+                sorted_indices.partition_point(|&idx| instructions[idx].address < leader);
+            let end_idx = if let Some(nl) = next_leader {
+                sorted_indices.partition_point(|&idx| instructions[idx].address < nl)
+            } else {
+                sorted_indices.len()
+            };
 
             let mut block = BasicBlock::new(block_id, leader);
-            for inst in block_insts {
-                block.push_instruction(inst);
+            for &idx in &sorted_indices[start_idx..end_idx] {
+                block.push_instruction(instructions[idx].clone());
             }
             blocks.push(block);
         }

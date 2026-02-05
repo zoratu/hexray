@@ -16,6 +16,8 @@ pub struct SsaOptimizer {
     used_values: HashSet<SsaValue>,
     /// Copy propagation mapping: value -> replacement.
     copy_map: HashMap<SsaValue, SsaValue>,
+    /// Cache for resolved copy chains (memoization).
+    resolved_cache: HashMap<SsaValue, SsaValue>,
     /// Constant values.
     constants: HashMap<SsaValue, i128>,
 }
@@ -26,6 +28,7 @@ impl SsaOptimizer {
         Self {
             used_values: HashSet::new(),
             copy_map: HashMap::new(),
+            resolved_cache: HashMap::new(),
             constants: HashMap::new(),
         }
     }
@@ -40,6 +43,9 @@ impl SsaOptimizer {
         while changed && iteration < max_iterations {
             changed = false;
             iteration += 1;
+
+            // Clear resolution cache at start of each pass (copy_map may have changed)
+            self.resolved_cache.clear();
 
             // 1. Simplify phi nodes
             changed |= self.simplify_phis(func);
@@ -106,20 +112,58 @@ impl SsaOptimizer {
         let first = &non_self[0].1;
         if non_self.iter().all(|(_, v)| v == first) {
             // Apply copy propagation to get the canonical value
-            Some(self.resolve_copy(first))
+            Some(self.resolve_copy_readonly(first))
         } else {
             None
         }
     }
 
-    /// Resolves a value through the copy chain.
-    fn resolve_copy(&self, value: &SsaValue) -> SsaValue {
+    /// Resolves a value through the copy chain with memoization.
+    fn resolve_copy(&mut self, value: &SsaValue) -> SsaValue {
+        // Check cache first - O(1) lookup
+        if let Some(cached) = self.resolved_cache.get(value) {
+            return cached.clone();
+        }
+
+        // Not in copy map at all - return as-is
+        if !self.copy_map.contains_key(value) {
+            return value.clone();
+        }
+
+        // Walk the chain and collect values for caching
         let mut current = value.clone();
+        let mut chain = Vec::new();
         let mut visited = HashSet::new();
 
         while let Some(replacement) = self.copy_map.get(&current) {
             if !visited.insert(current.clone()) {
                 // Cycle detected
+                break;
+            }
+            chain.push(current.clone());
+            current = replacement.clone();
+        }
+
+        // Cache all values in the chain to their final resolved value
+        for v in chain {
+            self.resolved_cache.insert(v, current.clone());
+        }
+
+        current
+    }
+
+    /// Resolves a value through the copy chain (immutable version for queries).
+    fn resolve_copy_readonly(&self, value: &SsaValue) -> SsaValue {
+        // Check cache first
+        if let Some(cached) = self.resolved_cache.get(value) {
+            return cached.clone();
+        }
+
+        let mut current = value.clone();
+        let mut visited = HashSet::new();
+
+        while let Some(replacement) = self.copy_map.get(&current) {
+            if !visited.insert(current.clone()) {
                 break;
             }
             current = replacement.clone();
@@ -242,7 +286,7 @@ impl SsaOptimizer {
         match op {
             SsaOperand::Immediate(imm) => Some(*imm),
             SsaOperand::Value(v) => {
-                let resolved = self.resolve_copy(v);
+                let resolved = self.resolve_copy_readonly(v);
                 self.constants.get(&resolved).copied()
             }
             _ => None,
@@ -380,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_copy_propagation_no_copies() {
-        let optimizer = SsaOptimizer::new();
+        let mut optimizer = SsaOptimizer::new();
 
         let r0 = SsaValue::new(Location::Register(0), 0);
         let resolved = optimizer.resolve_copy(&r0);
@@ -817,6 +861,7 @@ mod tests {
     fn test_optimizer_default() {
         let optimizer = SsaOptimizer::default();
         assert!(optimizer.copy_map.is_empty());
+        assert!(optimizer.resolved_cache.is_empty());
         assert!(optimizer.constants.is_empty());
         assert!(optimizer.used_values.is_empty());
     }

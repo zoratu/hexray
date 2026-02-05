@@ -46,24 +46,32 @@
 //! ```
 
 mod abbrev;
+pub mod addr_table;
 mod die;
 pub mod eh_frame;
 mod info;
 mod leb128;
 mod line;
+pub mod loclists;
 pub mod lsda;
+pub mod rnglists;
+pub mod str_offsets;
 mod types;
 
 pub use abbrev::{Abbreviation, AbbreviationTable, AttributeSpec};
+pub use addr_table::AddressTable;
 pub use die::{Attribute, AttributeValue, Die, DieParser};
 pub use eh_frame::{parse_eh_frame, CfiInstruction, Cie, EhFrame, EhFrameParser, Fde};
 pub use info::{CompilationUnit, CompilationUnitHeader, DebugInfoParser};
 pub use leb128::{decode_sleb128, decode_uleb128};
 pub use line::{FileEntry, LineNumberProgram, LineNumberProgramHeader, LineRow};
+pub use loclists::{DwLle, LocationEntry, LocationListsParser};
 pub use lsda::{
     ActionRecord, CallSite, CatchHandler, CatchType, CleanupHandler, ExceptionHandlingInfo, Lsda,
     LsdaParser, TryBlock,
 };
+pub use rnglists::{AddressRange, DwRle, RangeListsParser};
+pub use str_offsets::StringOffsetsTable;
 pub use types::{DwAt, DwAte, DwForm, DwLang, DwLne, DwLns, DwTag};
 
 /// High-level debug information interface.
@@ -76,6 +84,10 @@ pub struct DebugInfo {
     pub compilation_units: Vec<CompilationUnit>,
     /// Parsed line number programs (indexed by offset in .debug_line).
     pub line_programs: Vec<(u64, LineNumberProgram)>,
+    /// Line programs indexed by offset for O(1) lookup.
+    line_programs_by_offset: std::collections::HashMap<u64, usize>,
+    /// CU address ranges sorted for binary search: (low_pc, high_pc, cu_index).
+    cu_ranges: Vec<(u64, u64, usize)>,
 }
 
 impl DebugInfo {
@@ -84,37 +96,70 @@ impl DebugInfo {
         compilation_units: Vec<CompilationUnit>,
         line_programs: Vec<(u64, LineNumberProgram)>,
     ) -> Self {
+        // Build line program index for O(1) lookup
+        let line_programs_by_offset: std::collections::HashMap<u64, usize> = line_programs
+            .iter()
+            .enumerate()
+            .map(|(i, (off, _))| (*off, i))
+            .collect();
+
+        // Build sorted CU ranges for O(log n) lookup
+        let mut cu_ranges: Vec<(u64, u64, usize)> = compilation_units
+            .iter()
+            .enumerate()
+            .filter_map(|(i, cu)| {
+                let low = cu.low_pc()?;
+                let high = cu.high_pc()?;
+                // High PC might be a size, not an address
+                let high_addr = if high < low { low + high } else { high };
+                Some((low, high_addr, i))
+            })
+            .collect();
+        cu_ranges.sort_by_key(|(low, _, _)| *low);
+
         Self {
             compilation_units,
             line_programs,
+            line_programs_by_offset,
+            cu_ranges,
+        }
+    }
+
+    /// Find compilation unit containing address using binary search - O(log n).
+    fn find_cu_index(&self, address: u64) -> Option<usize> {
+        // Binary search for the CU with the largest low_pc <= address
+        let pos = self
+            .cu_ranges
+            .partition_point(|(low, _, _)| *low <= address);
+        if pos == 0 {
+            return None;
+        }
+        let (low, high, cu_idx) = self.cu_ranges[pos - 1];
+        if address >= low && address < high {
+            Some(cu_idx)
+        } else {
+            None
         }
     }
 
     /// Find the source location for an address.
     pub fn find_location(&self, address: u64) -> Option<SourceLocation<'_>> {
-        // First find the compilation unit containing this address
-        for cu in &self.compilation_units {
-            if let (Some(low), Some(high)) = (cu.low_pc(), cu.high_pc()) {
-                // High PC might be a size, not an address
-                let high_addr = if high < low { low + high } else { high };
-                if address >= low && address < high_addr {
-                    // Found the compilation unit, now look up line info
-                    if let Some(stmt_list) = cu.stmt_list() {
-                        if let Some((_, prog)) =
-                            self.line_programs.iter().find(|(off, _)| *off == stmt_list)
-                        {
-                            if let Some(row) = prog.find_location(address) {
-                                let file_name = prog.file_name(row.file);
-                                return Some(SourceLocation {
-                                    file: file_name,
-                                    line: row.line,
-                                    column: row.column,
-                                    compilation_unit: Some(cu),
-                                });
-                            }
-                        }
-                    }
-                    break;
+        // O(log n) lookup for compilation unit
+        let cu_idx = self.find_cu_index(address)?;
+        let cu = &self.compilation_units[cu_idx];
+
+        // O(1) lookup for line program
+        if let Some(stmt_list) = cu.stmt_list() {
+            if let Some(&prog_idx) = self.line_programs_by_offset.get(&stmt_list) {
+                let (_, prog) = &self.line_programs[prog_idx];
+                if let Some(row) = prog.find_location(address) {
+                    let file_name = prog.file_name(row.file);
+                    return Some(SourceLocation {
+                        file: file_name,
+                        line: row.line,
+                        column: row.column,
+                        compilation_unit: Some(cu),
+                    });
                 }
             }
         }
@@ -123,6 +168,17 @@ impl DebugInfo {
 
     /// Find the function (subprogram) containing an address.
     pub fn find_function(&self, address: u64) -> Option<FunctionInfo<'_>> {
+        // O(log n) lookup for compilation unit
+        if let Some(cu_idx) = self.find_cu_index(address) {
+            let cu = &self.compilation_units[cu_idx];
+            if let Some(die) = cu.find_subprogram(address) {
+                return Some(FunctionInfo {
+                    die,
+                    compilation_unit: cu,
+                });
+            }
+        }
+        // Fallback: linear search for CUs without address ranges
         for cu in &self.compilation_units {
             if let Some(die) = cu.find_subprogram(address) {
                 return Some(FunctionInfo {

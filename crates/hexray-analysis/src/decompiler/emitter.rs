@@ -16,6 +16,60 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
+/// Represents a case value or range for switch statement output.
+enum CaseRange {
+    /// A single case value.
+    Single(i128),
+    /// A range of consecutive values (inclusive).
+    Range(i128, i128),
+}
+
+/// Collapses consecutive case values into ranges for cleaner output.
+/// Uses GCC extension syntax `case 1 ... 5:` for ranges of 3+ consecutive values.
+fn collapse_case_values(values: &[i128]) -> Vec<CaseRange> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted: Vec<i128> = values.to_vec();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut result = Vec::new();
+    let mut range_start = sorted[0];
+    let mut range_end = sorted[0];
+
+    for &v in &sorted[1..] {
+        if v == range_end + 1 {
+            // Extend the range
+            range_end = v;
+        } else {
+            // Emit previous range
+            emit_range(&mut result, range_start, range_end);
+            range_start = v;
+            range_end = v;
+        }
+    }
+    // Emit final range
+    emit_range(&mut result, range_start, range_end);
+
+    result
+}
+
+/// Helper to emit a range (as single values if small, as range if 3+ consecutive).
+fn emit_range(result: &mut Vec<CaseRange>, start: i128, end: i128) {
+    let count = (end - start + 1) as usize;
+    if count >= 3 {
+        // Emit as a range
+        result.push(CaseRange::Range(start, end));
+    } else {
+        // Emit as individual values
+        for v in start..=end {
+            result.push(CaseRange::Single(v));
+        }
+    }
+}
+
 /// Information about a function's signature detected from analysis.
 struct FunctionInfo {
     /// Detected parameter names (in order).
@@ -2172,14 +2226,34 @@ impl PseudoCodeEmitter {
             } => {
                 writeln!(output, "{}switch ({}) {{", indent, self.format_expr(value)).unwrap();
                 for (values, body) in cases {
-                    for v in values {
-                        // Format case value, using character literal if appropriate
-                        let case_str = if is_likely_character_constant(*v) {
-                            format_as_char_literal(*v)
-                        } else {
-                            format!("{}", v)
-                        };
-                        writeln!(output, "{}case {}:", indent, case_str).unwrap();
+                    // Detect consecutive ranges for cleaner output
+                    let ranges = collapse_case_values(values);
+                    for range in ranges {
+                        match range {
+                            CaseRange::Single(v) => {
+                                let case_str = if is_likely_character_constant(v) {
+                                    format_as_char_literal(v)
+                                } else {
+                                    format!("{}", v)
+                                };
+                                writeln!(output, "{}case {}:", indent, case_str).unwrap();
+                            }
+                            CaseRange::Range(start, end) => {
+                                // Use GCC case range extension: case 1 ... 5:
+                                let start_str = if is_likely_character_constant(start) {
+                                    format_as_char_literal(start)
+                                } else {
+                                    format!("{}", start)
+                                };
+                                let end_str = if is_likely_character_constant(end) {
+                                    format_as_char_literal(end)
+                                } else {
+                                    format!("{}", end)
+                                };
+                                writeln!(output, "{}case {} ... {}:", indent, start_str, end_str)
+                                    .unwrap();
+                            }
+                        }
                     }
                     self.emit_nodes(body, output, depth + 1);
                     writeln!(output, "{}    break;", indent).unwrap();
