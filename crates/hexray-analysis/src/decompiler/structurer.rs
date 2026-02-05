@@ -47,16 +47,20 @@ pub enum StructuredNode {
     While {
         condition: Expr,
         body: Vec<StructuredNode>,
-        /// Loop header block ID (for break/continue detection).
+        /// Loop header block ID (for continue detection).
         header: Option<BasicBlockId>,
+        /// Loop exit block ID (for break detection).
+        exit_block: Option<BasicBlockId>,
     },
 
     /// Do-while loop.
     DoWhile {
         body: Vec<StructuredNode>,
         condition: Expr,
-        /// Loop header block ID (for break/continue detection).
+        /// Loop header block ID (for continue detection).
         header: Option<BasicBlockId>,
+        /// Loop exit block ID (for break detection).
+        exit_block: Option<BasicBlockId>,
     },
 
     /// For loop (recognized from while with init/update).
@@ -65,15 +69,19 @@ pub enum StructuredNode {
         condition: Expr,
         update: Option<Expr>,
         body: Vec<StructuredNode>,
-        /// Loop header block ID (for break/continue detection).
+        /// Loop header block ID (for continue detection).
         header: Option<BasicBlockId>,
+        /// Loop exit block ID (for break detection).
+        exit_block: Option<BasicBlockId>,
     },
 
     /// Infinite loop.
     Loop {
         body: Vec<StructuredNode>,
-        /// Loop header block ID (for break/continue detection).
+        /// Loop header block ID (for continue detection).
         header: Option<BasicBlockId>,
+        /// Loop exit block ID (for break detection).
+        exit_block: Option<BasicBlockId>,
     },
 
     /// Break statement.
@@ -168,6 +176,9 @@ impl StructuredCfg {
         // Post-process to detect for loops from while loops with init/update
         let body = detect_for_loops(body);
 
+        // Post-process to hoist loop-invariant computations
+        let body = super::loop_invariant::hoist_loop_invariants(body);
+
         // Post-process to detect memcpy/memset patterns in for loops
         let body = super::loop_pattern_detection::detect_loop_patterns(body);
 
@@ -211,6 +222,8 @@ struct Structurer<'a> {
     /// Blocks that are allowed to be inlined even if they have multiple predecessors.
     /// This is used for join points after if-else structures.
     inline_allowed: HashSet<BasicBlockId>,
+    /// Irreducible CFG analysis results.
+    irreducible_analysis: super::irreducible_cfg::IrreducibleCfgAnalysis,
 }
 
 impl<'a> Structurer<'a> {
@@ -267,6 +280,19 @@ impl<'a> Structurer<'a> {
             }
         }
 
+        // Perform dominance-based irreducible CFG detection
+        let irreducible_analysis = super::irreducible_cfg::IrreducibleCfgAnalysis::analyze(cfg);
+
+        // Mark entry points of irreducible regions for labeling
+        // (except the suggested header which can be entered normally)
+        for region in &irreducible_analysis.regions {
+            for &entry in &region.entry_points {
+                if entry != region.suggested_header {
+                    multi_pred_blocks.insert(entry);
+                }
+            }
+        }
+
         Self {
             cfg,
             loops,
@@ -276,6 +302,7 @@ impl<'a> Structurer<'a> {
             processed: HashSet::new(),
             multi_pred_blocks,
             inline_allowed: HashSet::new(),
+            irreducible_analysis,
         }
     }
 
@@ -713,6 +740,9 @@ impl<'a> Structurer<'a> {
             None => return StructuredNode::Goto(header),
         };
 
+        // Get the primary exit block (first one, if any)
+        let exit_block = info.exit_blocks.first().copied();
+
         match info.kind {
             LoopKind::While => {
                 // Get condition from header's conditional branch
@@ -727,6 +757,7 @@ impl<'a> Structurer<'a> {
                     condition,
                     body,
                     header: Some(header),
+                    exit_block,
                 }
             }
 
@@ -739,6 +770,7 @@ impl<'a> Structurer<'a> {
                     body,
                     condition,
                     header: Some(header),
+                    exit_block,
                 }
             }
 
@@ -747,6 +779,7 @@ impl<'a> Structurer<'a> {
                 StructuredNode::Loop {
                     body,
                     header: Some(header),
+                    exit_block,
                 }
             }
 
@@ -764,6 +797,7 @@ impl<'a> Structurer<'a> {
                     condition,
                     body,
                     header: Some(header),
+                    exit_block,
                 }
             }
         }
@@ -1610,19 +1644,23 @@ fn simplify_conditions_in_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition: condition.simplify(),
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
             condition: condition.simplify(),
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -1630,16 +1668,23 @@ fn simplify_conditions_in_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init: init.map(|e| e.simplify()),
             condition: condition.simplify(),
             update: update.map(|e| e.simplify()),
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: body.into_iter().map(simplify_conditions_in_node).collect(),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -1736,19 +1781,23 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition,
             body: remove_temp_assignments(body),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: remove_temp_assignments(body),
             condition,
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -1756,16 +1805,23 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: remove_temp_assignments(body),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: remove_temp_assignments(body),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -1826,6 +1882,7 @@ fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
             body,
             condition,
             header,
+            exit_block,
         } => {
             let body = propagate_temps_to_conditions(body);
             // Collect temp values from the body
@@ -1836,6 +1893,7 @@ fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
                 body,
                 condition,
                 header,
+                exit_block,
             }
         }
         // For Sequences, use the sequential propagation
@@ -1856,10 +1914,12 @@ fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition,
             body: propagate_temps_to_conditions(body),
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -1867,16 +1927,23 @@ fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: propagate_temps_to_conditions(body),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: propagate_temps_to_conditions(body),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -1974,19 +2041,23 @@ fn substitute_temps_in_conditions(
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition: substitute_vars(&condition, temps),
             body,
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body,
             condition: substitute_vars(&condition, temps),
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -1994,12 +2065,14 @@ fn substitute_temps_in_conditions(
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init: init.map(|e| substitute_vars(&e, temps)),
             condition: substitute_vars(&condition, temps),
             update: update.map(|e| substitute_vars(&e, temps)),
             body,
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -2130,6 +2203,7 @@ fn substitute_globals_in_node(
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition: substitute_global_refs(&condition, global_refs),
             body: body
@@ -2137,11 +2211,13 @@ fn substitute_globals_in_node(
                 .map(|n| substitute_globals_in_node(n, global_refs))
                 .collect(),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: body
                 .into_iter()
@@ -2149,6 +2225,7 @@ fn substitute_globals_in_node(
                 .collect(),
             condition: substitute_global_refs(&condition, global_refs),
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -2156,6 +2233,7 @@ fn substitute_globals_in_node(
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init: init.map(|e| substitute_global_refs(&e, global_refs)),
             condition: substitute_global_refs(&condition, global_refs),
@@ -2165,13 +2243,19 @@ fn substitute_globals_in_node(
                 .map(|n| substitute_globals_in_node(n, global_refs))
                 .collect(),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: body
                 .into_iter()
                 .map(|n| substitute_globals_in_node(n, global_refs))
                 .collect(),
             header,
+            exit_block,
         },
         StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
             nodes
@@ -2213,19 +2297,23 @@ fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition,
             body: body.into_iter().map(simplify_node_copies).collect(),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: body.into_iter().map(simplify_node_copies).collect(),
             condition,
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -2233,16 +2321,23 @@ fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: body.into_iter().map(simplify_node_copies).collect(),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: body.into_iter().map(simplify_node_copies).collect(),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -2419,19 +2514,23 @@ fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition,
             body: propagate_call_args(body),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: propagate_call_args(body),
             condition,
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -2439,16 +2538,23 @@ fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: propagate_call_args(body),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: propagate_call_args(body),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -2705,19 +2811,23 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition,
             body: merge_return_value_captures(body),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: merge_return_value_captures(body),
             condition,
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -2725,16 +2835,23 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: merge_return_value_captures(body),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: merge_return_value_captures(body),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -2791,19 +2908,23 @@ fn detect_switch_in_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition,
             body: detect_switch_statements(body),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: detect_switch_statements(body),
             condition,
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -2811,16 +2932,23 @@ fn detect_switch_in_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: detect_switch_statements(body),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: detect_switch_statements(body),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -2852,7 +2980,56 @@ fn try_extract_switch(
     then_body: &[StructuredNode],
     else_body: &Option<Vec<StructuredNode>>,
 ) -> Option<StructuredNode> {
-    // Check if condition is a comparison against a literal
+    // First, try to extract range condition (x >= min && x <= max)
+    if let Some(range_info) = extract_switch_range_info(condition) {
+        let values: Vec<i128> = (range_info.start..=range_info.end).collect();
+        // For range conditions, we start with that case and continue checking else chain
+        let mut cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = vec![(values, then_body.to_vec())];
+        let mut current_else = else_body.clone();
+        let switch_var_key = range_info.var_key.clone();
+        let switch_var_expr = range_info.var_expr.clone();
+
+        // Walk down the else chain looking for more cases (range or equality)
+        while let Some(ref else_nodes) = current_else {
+            let mut found_if = false;
+            for node in else_nodes {
+                if let StructuredNode::If {
+                    condition: else_cond,
+                    then_body: else_then,
+                    else_body: nested_else,
+                } = node
+                {
+                    if let Some((var_key, _, values)) = extract_switch_case_or_range(else_cond) {
+                        if var_key == switch_var_key {
+                            cases.push((values, else_then.to_vec()));
+                            current_else = nested_else.clone();
+                            found_if = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !found_if {
+                break;
+            }
+        }
+
+        // Need at least 2 cases for range-based switches (the range might cover many values)
+        if cases.len() >= 2 || cases.iter().map(|(v, _)| v.len()).sum::<usize>() >= 3 {
+            let default = current_else.map(detect_switch_statements);
+            let final_cases = cases
+                .into_iter()
+                .map(|(vals, body)| (vals, detect_switch_statements(body)))
+                .collect();
+            return Some(StructuredNode::Switch {
+                value: switch_var_expr,
+                cases: final_cases,
+                default,
+            });
+        }
+    }
+
+    // Check if condition is a comparison against a literal (== or != pattern)
     let first_info = extract_switch_case_info(condition)?;
 
     // Determine if we're dealing with == or != patterns
@@ -2883,7 +3060,8 @@ fn try_extract_switch(
             } = node
             {
                 // Check if this condition matches our switch variable
-                if let Some((var_key, var_expr, value)) = extract_switch_case(else_cond) {
+                // Try both equality and range patterns
+                if let Some((var_key, var_expr, values)) = extract_switch_case_or_range(else_cond) {
                     // If this is the second case and variable differs, switch to the new variable
                     // This handles cases where the first condition uses the original parameter
                     // but subsequent conditions use a copy
@@ -2895,7 +3073,7 @@ fn try_extract_switch(
                     }
 
                     if var_key == switch_var_key {
-                        cases.push((vec![value], else_then.to_vec()));
+                        cases.push((values, else_then.to_vec()));
                         current_else = nested_else.clone();
                         found_if = true;
                         break;
@@ -3048,6 +3226,155 @@ struct SwitchCaseInfo {
     negated: bool,
 }
 
+/// Result of extracting a range-based switch case condition.
+/// Contains the variable key, variable expression, and the range bounds.
+struct SwitchRangeInfo {
+    var_key: String,
+    var_expr: Expr,
+    /// Inclusive start of the range.
+    start: i128,
+    /// Inclusive end of the range.
+    end: i128,
+}
+
+/// Maximum size for a range to be expanded into individual case values.
+/// Ranges larger than this will not be converted to switch cases to avoid
+/// creating massive switch statements.
+const MAX_SWITCH_RANGE_SIZE: i128 = 256;
+
+/// Try to extract a range condition from an expression.
+///
+/// Detects patterns like:
+/// - `x >= min && x <= max`
+/// - `x > min - 1 && x < max + 1`
+/// - `min <= x && x <= max`
+///
+/// Returns (var_key, var_expr, start, end) for the inclusive range [start, end].
+fn extract_switch_range_info(condition: &Expr) -> Option<SwitchRangeInfo> {
+    use super::expression::BinOpKind;
+    use super::expression::ExprKind;
+
+    // Look for logical AND of two comparisons
+    if let ExprKind::BinOp {
+        op: BinOpKind::LogicalAnd,
+        left,
+        right,
+    } = &condition.kind
+    {
+        // Try to extract bounds from both sides
+        let left_bound = extract_range_bound(left);
+        let right_bound = extract_range_bound(right);
+
+        if let (Some(lb), Some(rb)) = (left_bound, right_bound) {
+            // Both must reference the same variable
+            if lb.var_key != rb.var_key {
+                return None;
+            }
+
+            // Determine which is the lower and which is the upper bound
+            let (start, end) = match (lb.is_lower, rb.is_lower) {
+                (true, false) => (lb.value, rb.value), // x >= start && x <= end
+                (false, true) => (rb.value, lb.value), // x <= end && x >= start
+                _ => return None,                      // Both are same type - not a valid range
+            };
+
+            // Sanity check: start should be <= end and range should be reasonable
+            if start > end {
+                return None;
+            }
+
+            let range_size = end.saturating_sub(start).saturating_add(1);
+            if range_size > MAX_SWITCH_RANGE_SIZE {
+                return None;
+            }
+
+            return Some(SwitchRangeInfo {
+                var_key: lb.var_key,
+                var_expr: lb.var_expr,
+                start,
+                end,
+            });
+        }
+    }
+
+    None
+}
+
+/// Information about a single bound in a range condition.
+struct RangeBoundInfo {
+    var_key: String,
+    var_expr: Expr,
+    value: i128,
+    /// True if this is a lower bound (x >= N or x > N)
+    is_lower: bool,
+}
+
+/// Extract a range bound from a comparison expression.
+/// Handles: x >= N, x > N, x <= N, x < N, N <= x, N < x, N >= x, N > x
+fn extract_range_bound(expr: &Expr) -> Option<RangeBoundInfo> {
+    use super::expression::BinOpKind;
+    use super::expression::ExprKind;
+
+    if let ExprKind::BinOp { op, left, right } = &expr.kind {
+        // x op N
+        if let Some(key) = get_expr_var_key(left) {
+            if let ExprKind::IntLit(n) = right.kind {
+                let (value, is_lower) = match op {
+                    BinOpKind::Ge => (n, true),      // x >= n: lower bound, inclusive
+                    BinOpKind::Gt => (n + 1, true),  // x > n: lower bound is n+1
+                    BinOpKind::Le => (n, false),     // x <= n: upper bound, inclusive
+                    BinOpKind::Lt => (n - 1, false), // x < n: upper bound is n-1
+                    _ => return None,
+                };
+                return Some(RangeBoundInfo {
+                    var_key: key,
+                    var_expr: (**left).clone(),
+                    value,
+                    is_lower,
+                });
+            }
+        }
+        // N op x (reversed)
+        if let Some(key) = get_expr_var_key(right) {
+            if let ExprKind::IntLit(n) = left.kind {
+                let (value, is_lower) = match op {
+                    BinOpKind::Le => (n, true),      // n <= x: lower bound, inclusive
+                    BinOpKind::Lt => (n + 1, true),  // n < x: lower bound is n+1
+                    BinOpKind::Ge => (n, false),     // n >= x: upper bound, inclusive
+                    BinOpKind::Gt => (n - 1, false), // n > x: upper bound is n-1
+                    _ => return None,
+                };
+                return Some(RangeBoundInfo {
+                    var_key: key,
+                    var_expr: (**right).clone(),
+                    value,
+                    is_lower,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Try to extract a switch case or range from a condition.
+/// First tries exact match (var == N), then range match (x >= min && x <= max).
+/// Returns (var_key, var_expr, values) where values is a Vec of all case values.
+fn extract_switch_case_or_range(condition: &Expr) -> Option<(String, Expr, Vec<i128>)> {
+    // First try exact equality
+    if let Some((key, expr, value)) = extract_switch_case(condition) {
+        return Some((key, expr, vec![value]));
+    }
+
+    // Then try range
+    if let Some(range_info) = extract_switch_range_info(condition) {
+        let values: Vec<i128> = (range_info.start..=range_info.end).collect();
+        return Some((range_info.var_key, range_info.var_expr, values));
+    }
+
+    None
+}
+
 /// Extract switch case from a condition: var == N or var != N
 /// Returns the case info if it matches the pattern.
 fn extract_switch_case_info(condition: &Expr) -> Option<SwitchCaseInfo> {
@@ -3128,6 +3455,8 @@ fn create_comparison(var_key: &str, value: i128) -> Expr {
 struct LoopContext {
     /// Block ID of the loop header (for continue detection).
     header: BasicBlockId,
+    /// Block ID of the loop exit (for break detection).
+    exit_block: Option<BasicBlockId>,
 }
 
 /// Converts goto statements to break/continue where applicable.
@@ -3156,35 +3485,53 @@ fn convert_gotos_in_node(
             condition,
             body,
             header,
+            exit_block,
         } => {
-            // Create a loop context from the stored header, or use the parent context
-            let loop_ctx = header.map(|h| LoopContext { header: h });
+            // Create a loop context from the stored header and exit block
+            let loop_ctx = header.map(|h| LoopContext {
+                header: h,
+                exit_block,
+            });
             let ctx = loop_ctx.as_ref().or(current_loop);
             StructuredNode::While {
                 condition,
                 body: convert_gotos_in_loop_body(body, ctx),
                 header,
+                exit_block,
             }
         }
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => {
-            let loop_ctx = header.map(|h| LoopContext { header: h });
+            let loop_ctx = header.map(|h| LoopContext {
+                header: h,
+                exit_block,
+            });
             let ctx = loop_ctx.as_ref().or(current_loop);
             StructuredNode::DoWhile {
                 body: convert_gotos_in_loop_body(body, ctx),
                 condition,
                 header,
+                exit_block,
             }
         }
-        StructuredNode::Loop { body, header } => {
-            let loop_ctx = header.map(|h| LoopContext { header: h });
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => {
+            let loop_ctx = header.map(|h| LoopContext {
+                header: h,
+                exit_block,
+            });
             let ctx = loop_ctx.as_ref().or(current_loop);
             StructuredNode::Loop {
                 body: convert_gotos_in_loop_body(body, ctx),
                 header,
+                exit_block,
             }
         }
         StructuredNode::For {
@@ -3193,8 +3540,12 @@ fn convert_gotos_in_node(
             update,
             body,
             header,
+            exit_block,
         } => {
-            let loop_ctx = header.map(|h| LoopContext { header: h });
+            let loop_ctx = header.map(|h| LoopContext {
+                header: h,
+                exit_block,
+            });
             let ctx = loop_ctx.as_ref().or(current_loop);
             StructuredNode::For {
                 init,
@@ -3202,6 +3553,7 @@ fn convert_gotos_in_node(
                 update,
                 body: convert_gotos_in_loop_body(body, ctx),
                 header,
+                exit_block,
             }
         }
         StructuredNode::If {
@@ -3235,8 +3587,12 @@ fn convert_gotos_in_node(
                     // Goto to loop header = continue
                     return StructuredNode::Continue;
                 }
-                // Note: We could check if target is outside the loop body
-                // but that requires more context. For now, keep as goto.
+                // Check if goto targets the loop exit block = break
+                if let Some(exit) = ctx.exit_block {
+                    if target == exit {
+                        return StructuredNode::Break;
+                    }
+                }
             }
             StructuredNode::Goto(target)
         }
@@ -3245,16 +3601,13 @@ fn convert_gotos_in_node(
     }
 }
 
-/// Converts gotos in a loop body, creating a new loop context.
+/// Converts gotos in a loop body, using the provided loop context.
 fn convert_gotos_in_loop_body(
     body: Vec<StructuredNode>,
-    _outer_loop: Option<&LoopContext>,
+    loop_ctx: Option<&LoopContext>,
 ) -> Vec<StructuredNode> {
-    // For now, we don't have the block ID available from the structured form,
-    // so we process the body without a specific loop context.
-    // The break/continue detection happens at the CFG level during initial structuring.
-    // This pass catches any remaining opportunities.
-    convert_gotos_to_break_continue(body, None)
+    // Use the provided loop context to detect break/continue opportunities.
+    convert_gotos_to_break_continue(body, loop_ctx)
 }
 
 /// Simplifies all expressions in the structured nodes using constant folding
@@ -3295,19 +3648,23 @@ fn simplify_expressions_in_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => StructuredNode::While {
             condition: condition.simplify(),
             body: simplify_expressions(body),
             header,
+            exit_block,
         },
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: simplify_expressions(body),
             condition: condition.simplify(),
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -3315,16 +3672,23 @@ fn simplify_expressions_in_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init: init.map(|e| e.simplify()),
             condition: condition.simplify(),
             update: update.map(|e| e.simplify()),
             body: simplify_expressions(body),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: simplify_expressions(body),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -3444,11 +3808,13 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
             condition,
             body,
             header,
+            exit_block,
         } => {
             output.push(StructuredNode::While {
                 condition,
                 body: flatten_guard_clauses(body),
                 header,
+                exit_block,
             });
         }
 
@@ -3456,11 +3822,13 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
             body,
             condition,
             header,
+            exit_block,
         } => {
             output.push(StructuredNode::DoWhile {
                 body: flatten_guard_clauses(body),
                 condition,
                 header,
+                exit_block,
             });
         }
 
@@ -3470,6 +3838,7 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
             update,
             body,
             header,
+            exit_block,
         } => {
             output.push(StructuredNode::For {
                 init,
@@ -3477,13 +3846,19 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
                 update,
                 body: flatten_guard_clauses(body),
                 header,
+                exit_block,
             });
         }
 
-        StructuredNode::Loop { body, header } => {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => {
             output.push(StructuredNode::Loop {
                 body: flatten_guard_clauses(body),
                 header,
+                exit_block,
             });
         }
 
@@ -3998,6 +4373,7 @@ mod tests {
             condition: Expr::int(1),
             body: vec![],
             header: Some(BasicBlockId::new(1)),
+            exit_block: None,
         };
 
         if let StructuredNode::While {
@@ -4020,6 +4396,7 @@ mod tests {
             body: vec![StructuredNode::Break],
             condition: Expr::int(0),
             header: Some(BasicBlockId::new(2)),
+            exit_block: None,
         };
 
         if let StructuredNode::DoWhile { body, header, .. } = node {
@@ -4038,6 +4415,7 @@ mod tests {
             update: Some(Expr::int(1)),
             body: vec![],
             header: None,
+            exit_block: None,
         };
 
         if let StructuredNode::For { init, update, .. } = node {
@@ -4053,9 +4431,10 @@ mod tests {
         let node = StructuredNode::Loop {
             body: vec![StructuredNode::Continue],
             header: Some(BasicBlockId::new(0)),
+            exit_block: None,
         };
 
-        if let StructuredNode::Loop { body, header } = node {
+        if let StructuredNode::Loop { body, header, .. } = node {
             assert_eq!(body.len(), 1);
             assert!(header.is_some());
         } else {
@@ -4116,6 +4495,122 @@ mod tests {
         } else {
             panic!("Expected Switch node");
         }
+    }
+
+    // --- Range-based switch case tests ---
+
+    fn make_test_var(name: &str) -> Expr {
+        use super::super::expression::{VarKind, Variable};
+        Expr::var(Variable {
+            kind: VarKind::Temp(0),
+            name: name.to_string(),
+            size: 4,
+        })
+    }
+
+    #[test]
+    fn test_extract_switch_range_info() {
+        use super::super::expression::BinOpKind;
+
+        // Test x >= 1 && x <= 10
+        let var_x = make_test_var("x");
+        let cond = Expr::binop(
+            BinOpKind::LogicalAnd,
+            Expr::binop(BinOpKind::Ge, var_x.clone(), Expr::int(1)),
+            Expr::binop(BinOpKind::Le, var_x.clone(), Expr::int(10)),
+        );
+
+        let range_info = extract_switch_range_info(&cond);
+        assert!(range_info.is_some());
+        let info = range_info.unwrap();
+        assert_eq!(info.start, 1);
+        assert_eq!(info.end, 10);
+    }
+
+    #[test]
+    fn test_extract_switch_range_reversed() {
+        use super::super::expression::BinOpKind;
+
+        // Test x <= 10 && x >= 1 (reversed order)
+        let var_x = make_test_var("x");
+        let cond = Expr::binop(
+            BinOpKind::LogicalAnd,
+            Expr::binop(BinOpKind::Le, var_x.clone(), Expr::int(10)),
+            Expr::binop(BinOpKind::Ge, var_x.clone(), Expr::int(1)),
+        );
+
+        let range_info = extract_switch_range_info(&cond);
+        assert!(range_info.is_some());
+        let info = range_info.unwrap();
+        assert_eq!(info.start, 1);
+        assert_eq!(info.end, 10);
+    }
+
+    #[test]
+    fn test_extract_switch_range_gt_lt() {
+        use super::super::expression::BinOpKind;
+
+        // Test x > 0 && x < 11 (should become [1, 10])
+        let var_x = make_test_var("x");
+        let cond = Expr::binop(
+            BinOpKind::LogicalAnd,
+            Expr::binop(BinOpKind::Gt, var_x.clone(), Expr::int(0)),
+            Expr::binop(BinOpKind::Lt, var_x.clone(), Expr::int(11)),
+        );
+
+        let range_info = extract_switch_range_info(&cond);
+        assert!(range_info.is_some());
+        let info = range_info.unwrap();
+        assert_eq!(info.start, 1);
+        assert_eq!(info.end, 10);
+    }
+
+    #[test]
+    fn test_extract_switch_range_too_large() {
+        use super::super::expression::BinOpKind;
+
+        // Test x >= 0 && x <= 1000 (should fail - range too large)
+        let var_x = make_test_var("x");
+        let cond = Expr::binop(
+            BinOpKind::LogicalAnd,
+            Expr::binop(BinOpKind::Ge, var_x.clone(), Expr::int(0)),
+            Expr::binop(BinOpKind::Le, var_x.clone(), Expr::int(1000)),
+        );
+
+        let range_info = extract_switch_range_info(&cond);
+        assert!(range_info.is_none()); // Too large, should fail
+    }
+
+    #[test]
+    fn test_extract_switch_case_or_range_equality() {
+        use super::super::expression::BinOpKind;
+
+        // Test x == 5 (should return single value)
+        let var_x = make_test_var("x");
+        let cond = Expr::binop(BinOpKind::Eq, var_x.clone(), Expr::int(5));
+
+        let result = extract_switch_case_or_range(&cond);
+        assert!(result.is_some());
+        let (_, _, values) = result.unwrap();
+        assert_eq!(values, vec![5]);
+    }
+
+    #[test]
+    fn test_extract_switch_case_or_range_range() {
+        use super::super::expression::BinOpKind;
+
+        // Test x >= 1 && x <= 3 (should return [1, 2, 3])
+        let var_x = make_test_var("x");
+        let cond = Expr::binop(
+            BinOpKind::LogicalAnd,
+            Expr::binop(BinOpKind::Ge, var_x.clone(), Expr::int(1)),
+            Expr::binop(BinOpKind::Le, var_x.clone(), Expr::int(3)),
+        );
+
+        let result = extract_switch_case_or_range(&cond);
+        assert!(result.is_some());
+        let (_, _, values) = result.unwrap();
+        assert_eq!(values, vec![1, 2, 3]);
     }
 
     #[test]
@@ -4529,6 +5024,7 @@ mod tests {
             condition: Expr::int(1),
             body: vec![StructuredNode::Break],
             header: None,
+            exit_block: None,
         }];
 
         let flattened = flatten_guard_clauses(nodes);
@@ -4646,6 +5142,7 @@ mod tests {
             update: Some(Expr::int(1)),
             body: vec![],
             header: None,
+            exit_block: None,
         }];
 
         let simplified = simplify_expressions(nodes);
@@ -4668,6 +5165,7 @@ mod tests {
     fn test_convert_gotos_to_continue() {
         let ctx = LoopContext {
             header: BasicBlockId::new(1),
+            exit_block: None,
         };
 
         let nodes = vec![StructuredNode::Goto(BasicBlockId::new(1))];
@@ -4686,5 +5184,64 @@ mod tests {
         assert_eq!(converted.len(), 2);
         assert!(matches!(converted[0], StructuredNode::Return(_)));
         assert!(matches!(converted[1], StructuredNode::Break));
+    }
+
+    #[test]
+    fn test_convert_gotos_to_break() {
+        // Goto to exit block should become break
+        let ctx = LoopContext {
+            header: BasicBlockId::new(1),
+            exit_block: Some(BasicBlockId::new(5)),
+        };
+
+        let nodes = vec![StructuredNode::Goto(BasicBlockId::new(5))];
+        let converted = convert_gotos_to_break_continue(nodes, Some(&ctx));
+
+        // Goto to exit block becomes break
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(converted[0], StructuredNode::Break));
+    }
+
+    #[test]
+    fn test_convert_gotos_in_loop_with_exit() {
+        // Test that gotos inside a while loop get converted to breaks
+        let loop_header = BasicBlockId::new(10);
+        let loop_exit = BasicBlockId::new(20);
+
+        let while_node = StructuredNode::While {
+            condition: Expr::int(1),
+            body: vec![
+                StructuredNode::If {
+                    condition: Expr::int(0),
+                    then_body: vec![StructuredNode::Goto(loop_exit)], // should become break
+                    else_body: None,
+                },
+                StructuredNode::Goto(loop_header), // should become continue
+            ],
+            header: Some(loop_header),
+            exit_block: Some(loop_exit),
+        };
+
+        let converted = convert_gotos_to_break_continue(vec![while_node], None);
+
+        // Check that the while loop body has break and continue
+        assert_eq!(converted.len(), 1);
+        if let StructuredNode::While { body, .. } = &converted[0] {
+            // Should have an If and Continue
+            assert_eq!(body.len(), 2);
+
+            // Check the If has a break in its then_body
+            if let StructuredNode::If { then_body, .. } = &body[0] {
+                assert_eq!(then_body.len(), 1);
+                assert!(matches!(then_body[0], StructuredNode::Break));
+            } else {
+                panic!("Expected If node");
+            }
+
+            // Check the second node is continue
+            assert!(matches!(body[1], StructuredNode::Continue));
+        } else {
+            panic!("Expected While node");
+        }
     }
 }

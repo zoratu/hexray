@@ -3287,6 +3287,7 @@ mod tests {
             condition: cond,
             body,
             header: None,
+            exit_block: None,
         };
 
         let cfg = StructuredCfg {

@@ -878,19 +878,23 @@ impl StructInference {
                 condition,
                 body,
                 header,
+                exit_block,
             } => StructuredNode::While {
                 condition: self.transform_expr(condition),
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
                 header: *header,
+                exit_block: *exit_block,
             },
             StructuredNode::DoWhile {
                 body,
                 condition,
                 header,
+                exit_block,
             } => StructuredNode::DoWhile {
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
                 condition: self.transform_expr(condition),
                 header: *header,
+                exit_block: *exit_block,
             },
             StructuredNode::For {
                 init,
@@ -898,16 +902,23 @@ impl StructInference {
                 update,
                 body,
                 header,
+                exit_block,
             } => StructuredNode::For {
                 init: init.as_ref().map(|e| self.transform_expr(e)),
                 condition: self.transform_expr(condition),
                 update: update.as_ref().map(|e| self.transform_expr(e)),
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
                 header: *header,
+                exit_block: *exit_block,
             },
-            StructuredNode::Loop { body, header } => StructuredNode::Loop {
+            StructuredNode::Loop {
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::Loop {
                 body: body.iter().map(|n| self.transform_node(n)).collect(),
                 header: *header,
+                exit_block: *exit_block,
             },
             StructuredNode::Switch {
                 value,

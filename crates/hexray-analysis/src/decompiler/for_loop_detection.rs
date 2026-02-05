@@ -47,6 +47,7 @@ pub fn detect_for_loops(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
                         update: Some(update),
                         body: detect_for_loops(new_body),
                         header: None,
+                        exit_block: None,
                     });
 
                     i += 2;
@@ -79,22 +80,26 @@ fn detect_for_loops_in_node(node: StructuredNode) -> StructuredNode {
             condition,
             body,
             header,
+            exit_block,
         } => {
             // Check if the while body itself has init/update pattern (rare but possible)
             StructuredNode::While {
                 condition,
                 body: detect_for_loops(body),
                 header,
+                exit_block,
             }
         }
         StructuredNode::DoWhile {
             body,
             condition,
             header,
+            exit_block,
         } => StructuredNode::DoWhile {
             body: detect_for_loops(body),
             condition,
             header,
+            exit_block,
         },
         StructuredNode::For {
             init,
@@ -102,16 +107,23 @@ fn detect_for_loops_in_node(node: StructuredNode) -> StructuredNode {
             update,
             body,
             header,
+            exit_block,
         } => StructuredNode::For {
             init,
             condition,
             update,
             body: detect_for_loops(body),
             header,
+            exit_block,
         },
-        StructuredNode::Loop { body, header } => StructuredNode::Loop {
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
             body: detect_for_loops(body),
             header,
+            exit_block,
         },
         StructuredNode::Switch {
             value,
@@ -406,6 +418,7 @@ mod tests {
             condition,
             body: vec![body_block],
             header: None,
+            exit_block: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -434,6 +447,7 @@ mod tests {
             condition,
             body: vec![body_block],
             header: None,
+            exit_block: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -459,6 +473,7 @@ mod tests {
             condition,
             body: vec![body_block],
             header: None,
+            exit_block: None,
         };
 
         let result = detect_for_loops(vec![while_loop]);
@@ -483,6 +498,7 @@ mod tests {
             condition,
             body: vec![body_block],
             header: None,
+            exit_block: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -514,6 +530,7 @@ mod tests {
             condition,
             body: vec![body_block],
             header: None,
+            exit_block: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -544,6 +561,7 @@ mod tests {
             condition,
             body: vec![body_block],
             header: None,
+            exit_block: None,
         };
 
         let result = detect_for_loops(vec![init_block, while_loop]);
@@ -579,6 +597,7 @@ mod tests {
             condition: inner_cond,
             body: vec![inner_body],
             header: None,
+            exit_block: None,
         };
 
         let outer_init = Expr::assign(make_var("i"), Expr::int(0));
@@ -595,6 +614,7 @@ mod tests {
             condition: outer_cond,
             body: outer_body,
             header: None,
+            exit_block: None,
         };
 
         let result = detect_for_loops(vec![outer_init_block, outer_while]);

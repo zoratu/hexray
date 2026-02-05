@@ -12,6 +12,8 @@ pub mod array_detection;
 mod emitter;
 mod expression;
 mod for_loop_detection;
+mod irreducible_cfg;
+mod loop_invariant;
 mod loop_pattern_detection;
 mod naming;
 mod short_circuit;
@@ -22,6 +24,7 @@ mod switch_recovery;
 
 pub use emitter::PseudoCodeEmitter;
 pub use expression::{BinOpKind, Expr, ExprKind, UnaryOpKind, Variable};
+pub use irreducible_cfg::{IrreducibleCfgAnalysis, IrreducibleRegion};
 pub use naming::{NamingContext, TypeHint};
 pub use signature::{
     CallingConvention, FunctionSignature, ParamType, Parameter, ParameterLocation,
