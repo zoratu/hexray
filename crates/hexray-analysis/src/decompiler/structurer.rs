@@ -197,6 +197,15 @@ impl StructuredCfg {
         // Post-process to simplify expressions (constant folding, algebraic simplifications)
         let body = simplify_expressions(body);
 
+        // Post-process to detect string function patterns (strlen, strcpy, etc.)
+        let body = super::string_patterns::detect_string_patterns(body);
+
+        // Post-process to simplify architecture-specific patterns (CSEL, min/max, abs)
+        let body = super::arch_patterns::simplify_arch_patterns(body);
+
+        // Post-process to eliminate dead stores
+        let body = super::dead_store::eliminate_dead_stores(body);
+
         Self {
             body,
             cfg_entry: cfg.entry,
