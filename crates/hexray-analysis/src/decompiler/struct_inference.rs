@@ -73,6 +73,14 @@ pub enum InferredType {
         element_type: Box<InferredType>,
         count: Option<usize>,
     },
+    /// Union of multiple types at the same offset.
+    /// Used when the same memory location is accessed with different sizes/types.
+    Union {
+        /// Name of the inferred union.
+        name: String,
+        /// The alternative types.
+        members: Vec<(String, InferredType)>,
+    },
 }
 
 impl InferredType {
@@ -116,6 +124,9 @@ impl InferredType {
                     format!("{}[]", element_type.to_c_string())
                 }
             }
+            InferredType::Union { name, .. } => {
+                format!("union {}", name)
+            }
         }
     }
 
@@ -133,6 +144,10 @@ impl InferredType {
             } => {
                 let elem_size = element_type.size()?;
                 Some(elem_size * (*count)?)
+            }
+            InferredType::Union { members, .. } => {
+                // Union size is the maximum of all member sizes
+                members.iter().filter_map(|(_, t)| t.size()).max()
             }
         }
     }
@@ -655,12 +670,19 @@ impl StructInference {
             let mut fields = Vec::new();
             let mut max_end = 0usize;
 
-            for (&offset, access_list) in &accesses.accesses {
-                // Find the most common/largest size for this offset
-                let size = access_list.iter().map(|a| a.size).max().unwrap_or(8);
+            // Collect all field data first
+            let field_data: Vec<_> = accesses
+                .accesses
+                .iter()
+                .map(|(&offset, access_list)| {
+                    let size = access_list.iter().map(|a| a.size).max().unwrap_or(8);
+                    (offset, size, access_list.clone())
+                })
+                .collect();
 
-                // Infer type from usage
-                let field_type = self.infer_field_type(access_list, size);
+            for (offset, size, access_list) in field_data {
+                // Infer type from usage (may be a union if multiple sizes)
+                let field_type = self.infer_field_type(&access_list, size, offset);
 
                 let field = InferredField {
                     offset,
@@ -693,7 +715,39 @@ impl StructInference {
     }
 
     /// Infers the type of a field from its accesses.
-    fn infer_field_type(&self, accesses: &[MemoryAccess], size: usize) -> InferredType {
+    fn infer_field_type(
+        &self,
+        accesses: &[MemoryAccess],
+        size: usize,
+        offset: usize,
+    ) -> InferredType {
+        // Collect unique sizes accessed at this offset
+        let mut unique_sizes: Vec<usize> = accesses.iter().map(|a| a.size).collect();
+        unique_sizes.sort();
+        unique_sizes.dedup();
+
+        // If multiple different sizes are used, this is likely a union
+        if unique_sizes.len() > 1 {
+            let union_name = format!("union_{:x}", offset);
+            let mut members = Vec::new();
+
+            for &member_size in &unique_sizes {
+                let member_name = format!("as_{}", size_name(member_size));
+                let member_type = self.infer_simple_type(accesses, member_size);
+                members.push((member_name, member_type));
+            }
+
+            return InferredType::Union {
+                name: union_name,
+                members,
+            };
+        }
+
+        self.infer_simple_type(accesses, size)
+    }
+
+    /// Infers a simple (non-union) type from accesses.
+    fn infer_simple_type(&self, accesses: &[MemoryAccess], size: usize) -> InferredType {
         // Check if any access shows this is a pointer (dereferenced)
         if accesses.iter().any(|a| a.is_dereferenced) {
             return InferredType::Pointer(Box::new(InferredType::Unknown));
@@ -888,6 +942,24 @@ impl StructInference {
     pub fn generate_struct_definitions(&self) -> String {
         let mut output = String::new();
 
+        // First, output any union type definitions used by the structs
+        for s in &self.structs {
+            for field in &s.fields {
+                if let InferredType::Union { name, members } = &field.field_type {
+                    output.push_str(&format!("union {} {{\n", name));
+                    for (member_name, member_type) in members {
+                        output.push_str(&format!(
+                            "    {} {};\n",
+                            member_type.to_c_string(),
+                            member_name
+                        ));
+                    }
+                    output.push_str("};\n\n");
+                }
+            }
+        }
+
+        // Then output struct definitions
         for s in &self.structs {
             output.push_str(&format!("struct {} {{\n", s.name));
 
@@ -919,6 +991,18 @@ impl StructInference {
 impl Default for StructInference {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Returns a human-readable name for a size in bytes.
+fn size_name(size: usize) -> &'static str {
+    match size {
+        1 => "byte",
+        2 => "word",
+        4 => "dword",
+        8 => "qword",
+        16 => "xmmword",
+        _ => "data",
     }
 }
 
@@ -1134,5 +1218,100 @@ mod tests {
         } else {
             panic!("Expected Block");
         }
+    }
+
+    #[test]
+    fn test_union_inference_from_different_sizes() {
+        let mut inference = StructInference::new().with_min_field_count(2);
+
+        // Access the same offset with different sizes - this indicates a union
+        let access_qword = make_field_access("rbx", 0, 8);
+        let access_dword = make_field_access("rbx", 0, 4);
+        let access_other = make_field_access("rbx", 8, 8);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(make_var("rax", 8), access_qword),
+                Expr::assign(make_var("eax", 4), access_dword),
+                Expr::assign(make_var("rdx", 8), access_other),
+            ],
+            address_range: (0x1000, 0x1030),
+        };
+
+        inference.analyze(&[block]);
+
+        // Should have inferred one struct
+        assert_eq!(inference.structs().len(), 1);
+
+        let s = &inference.structs()[0];
+        // Should have 2 fields: one at offset 0 (union) and one at offset 8
+        assert_eq!(s.fields.len(), 2);
+
+        // First field at offset 0 should be a union
+        let field_0 = &s.fields[0];
+        assert_eq!(field_0.offset, 0);
+        assert!(
+            matches!(&field_0.field_type, InferredType::Union { members, .. } if members.len() == 2)
+        );
+
+        // Union should have dword and qword members
+        if let InferredType::Union { members, .. } = &field_0.field_type {
+            let sizes: Vec<_> = members.iter().filter_map(|(_, t)| t.size()).collect();
+            assert!(sizes.contains(&4));
+            assert!(sizes.contains(&8));
+        }
+    }
+
+    #[test]
+    fn test_union_type_display() {
+        let union_type = InferredType::Union {
+            name: "test_union".to_string(),
+            members: vec![
+                ("as_dword".to_string(), InferredType::UnsignedInt(4)),
+                ("as_qword".to_string(), InferredType::UnsignedInt(8)),
+            ],
+        };
+
+        assert_eq!(union_type.to_c_string(), "union test_union");
+        assert_eq!(union_type.size(), Some(8)); // Max of member sizes
+    }
+
+    #[test]
+    fn test_generate_union_definitions() {
+        let s = InferredStruct {
+            name: "my_struct".to_string(),
+            fields: vec![InferredField {
+                offset: 0,
+                size: 8,
+                field_type: InferredType::Union {
+                    name: "union_0".to_string(),
+                    members: vec![
+                        ("as_dword".to_string(), InferredType::UnsignedInt(4)),
+                        ("as_qword".to_string(), InferredType::UnsignedInt(8)),
+                    ],
+                },
+                name: "field_0".to_string(),
+            }],
+            size: Some(8),
+            access_count: 3,
+        };
+
+        let inference = StructInference {
+            base_accesses: HashMap::new(),
+            structs: vec![s],
+            struct_counter: 1,
+            base_to_struct: HashMap::new(),
+            min_field_count: 2,
+        };
+
+        let output = inference.generate_struct_definitions();
+        // Should contain union definition
+        assert!(output.contains("union union_0"));
+        assert!(output.contains("as_dword"));
+        assert!(output.contains("as_qword"));
+        // Should contain struct definition
+        assert!(output.contains("struct my_struct"));
+        assert!(output.contains("union union_0 field_0"));
     }
 }

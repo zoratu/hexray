@@ -68,6 +68,28 @@ pub enum Type {
 
     /// C-string (null-terminated char*).
     CString,
+
+    /// Template instantiation (e.g., std::vector<int>).
+    Template {
+        /// The template name (e.g., "std::vector", "std::map").
+        name: String,
+        /// Template arguments (can be types or values).
+        args: Vec<TemplateArg>,
+    },
+}
+
+/// A template argument (can be a type or a non-type value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateArg {
+    /// Type argument (e.g., `int` in `vector<int>`).
+    Type(Box<Type>),
+    /// Non-type argument (e.g., `10` in `array<int, 10>`).
+    Value(i64),
+    /// Nested template (e.g., `vector<int>` in `vector<vector<int>>`).
+    Template {
+        name: String,
+        args: Vec<TemplateArg>,
+    },
 }
 
 impl Type {
@@ -142,7 +164,64 @@ impl Type {
                 Some(elem_size * (*count)? as u8)
             }
             Self::Struct { size, .. } => Some(*size as u8),
+            Self::Template { .. } => None, // Template size depends on instantiation
         }
+    }
+
+    /// Returns true if this is a template instantiation.
+    pub fn is_template(&self) -> bool {
+        matches!(self, Self::Template { .. })
+    }
+
+    /// Creates a template type from name and arguments.
+    pub fn template(name: impl Into<String>, args: Vec<TemplateArg>) -> Self {
+        Self::Template {
+            name: name.into(),
+            args,
+        }
+    }
+
+    /// Creates a common std::vector<T> type.
+    pub fn std_vector(element_type: Type) -> Self {
+        Self::template(
+            "std::vector",
+            vec![TemplateArg::Type(Box::new(element_type))],
+        )
+    }
+
+    /// Creates a common std::string type.
+    pub fn std_string() -> Self {
+        Self::template(
+            "std::basic_string",
+            vec![TemplateArg::Type(Box::new(Type::sint(1)))],
+        )
+    }
+
+    /// Creates a common std::map<K, V> type.
+    pub fn std_map(key_type: Type, value_type: Type) -> Self {
+        Self::template(
+            "std::map",
+            vec![
+                TemplateArg::Type(Box::new(key_type)),
+                TemplateArg::Type(Box::new(value_type)),
+            ],
+        )
+    }
+
+    /// Creates a common std::unique_ptr<T> type.
+    pub fn std_unique_ptr(pointee: Type) -> Self {
+        Self::template(
+            "std::unique_ptr",
+            vec![TemplateArg::Type(Box::new(pointee))],
+        )
+    }
+
+    /// Creates a common std::shared_ptr<T> type.
+    pub fn std_shared_ptr(pointee: Type) -> Self {
+        Self::template(
+            "std::shared_ptr",
+            vec![TemplateArg::Type(Box::new(pointee))],
+        )
     }
 
     /// Merges two types, taking the more specific one.
@@ -225,6 +304,35 @@ impl fmt::Display for Type {
                 }
             }
             Type::CString => write!(f, "char*"),
+            Type::Template { name, args } => {
+                write!(f, "{}<", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ">")
+            }
+        }
+    }
+}
+
+impl fmt::Display for TemplateArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemplateArg::Type(ty) => write!(f, "{}", ty),
+            TemplateArg::Value(v) => write!(f, "{}", v),
+            TemplateArg::Template { name, args } => {
+                write!(f, "{}<", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ">")
+            }
         }
     }
 }
@@ -341,18 +449,81 @@ impl TypeInference {
 
             // Comparisons tell us about signedness
             Operation::Compare | Operation::Test => {
-                // If followed by signed branch, values are signed
-                // This is simplified - real analysis would look at branch conditions
+                // Infer signedness from the mnemonic - x86 has specific signed/unsigned comparisons
+                let mnemonic = inst.mnemonic.to_lowercase();
+
+                // Signed comparisons (G = Greater, L = Less - signed)
+                let is_signed_cmp = mnemonic.contains("cmov")
+                    && (mnemonic.ends_with("g")
+                        || mnemonic.ends_with("l")
+                        || mnemonic.ends_with("ge")
+                        || mnemonic.ends_with("le")
+                        || mnemonic.ends_with("ng")
+                        || mnemonic.ends_with("nl"));
+
+                // Unsigned comparisons (A = Above, B = Below - unsigned)
+                let is_unsigned_cmp = mnemonic.contains("cmov")
+                    && (mnemonic.ends_with("a")
+                        || mnemonic.ends_with("b")
+                        || mnemonic.ends_with("ae")
+                        || mnemonic.ends_with("be")
+                        || mnemonic.ends_with("na")
+                        || mnemonic.ends_with("nb"));
+
+                // Also check for seta/setb/setg/setl patterns
+                let is_signed_set = mnemonic.starts_with("set")
+                    && (mnemonic.ends_with("g")
+                        || mnemonic.ends_with("l")
+                        || mnemonic.ends_with("ge")
+                        || mnemonic.ends_with("le"));
+                let is_unsigned_set = mnemonic.starts_with("set")
+                    && (mnemonic.ends_with("a")
+                        || mnemonic.ends_with("b")
+                        || mnemonic.ends_with("ae")
+                        || mnemonic.ends_with("be"));
+
+                // Apply signedness constraints to operands
+                for op in &inst.uses {
+                    if let SsaOperand::Value(v) = op {
+                        if is_signed_cmp || is_signed_set {
+                            self.constraints.push((v.clone(), Constraint::IsSigned));
+                        } else if is_unsigned_cmp || is_unsigned_set {
+                            self.constraints.push((v.clone(), Constraint::IsUnsigned));
+                        }
+                    }
+                }
             }
 
             // Arithmetic propagates types
             Operation::Add | Operation::Sub | Operation::Mul | Operation::Div => {
+                let mnemonic = inst.mnemonic.to_lowercase();
+
+                // Infer signedness from division/multiplication mnemonics
+                // IDIV/IMUL are signed, DIV/MUL are unsigned
+                let is_signed_arith = mnemonic.starts_with("idiv") || mnemonic.starts_with("imul");
+                let is_unsigned_arith = (mnemonic.starts_with("div")
+                    && !mnemonic.starts_with("divs"))
+                    || (mnemonic.starts_with("mul") && !mnemonic.starts_with("muls"));
+
                 if let Some(def) = inst.defs.first() {
+                    if is_signed_arith {
+                        self.constraints.push((def.clone(), Constraint::IsSigned));
+                    } else if is_unsigned_arith {
+                        self.constraints.push((def.clone(), Constraint::IsUnsigned));
+                    }
+
                     // Result type depends on operands
                     for op in &inst.uses {
                         if let SsaOperand::Value(v) = op {
                             self.constraints
                                 .push((def.clone(), Constraint::Equals(v.clone())));
+
+                            // Propagate signedness to operands
+                            if is_signed_arith {
+                                self.constraints.push((v.clone(), Constraint::IsSigned));
+                            } else if is_unsigned_arith {
+                                self.constraints.push((v.clone(), Constraint::IsUnsigned));
+                            }
                         }
                     }
                 }
@@ -372,8 +543,60 @@ impl TypeInference {
                 }
             }
 
-            // Move just propagates types
+            // Move operations - detect sign/zero extension
             Operation::Move => {
+                let mnemonic = inst.mnemonic.to_lowercase();
+
+                // MOVSX/MOVSXD - sign extend (value is signed)
+                // Intel: movsx, movsxd
+                // AT&T: movsbl (byte to long), movswl (word to long), movslq (long to quad), etc.
+                let is_sign_extend = mnemonic.starts_with("movsx")
+                    || mnemonic.starts_with("movsxd")
+                    || (mnemonic.starts_with("movs")
+                        && (mnemonic.ends_with("l")
+                            || mnemonic.ends_with("q")
+                            || mnemonic.ends_with("w")));
+
+                // MOVZX - zero extend (value is unsigned)
+                // Intel: movzx
+                // AT&T: movzbl, movzwl, movzbq, movzwq, etc.
+                let is_zero_extend = mnemonic.starts_with("movzx")
+                    || (mnemonic.starts_with("movz")
+                        && (mnemonic.ends_with("l")
+                            || mnemonic.ends_with("q")
+                            || mnemonic.ends_with("w")));
+
+                // CBW/CWDE/CDQE - convert byte/word/dword with sign extension
+                let is_sign_convert = mnemonic == "cbw"
+                    || mnemonic == "cwde"
+                    || mnemonic == "cdqe"
+                    || mnemonic == "cwd"
+                    || mnemonic == "cdq"
+                    || mnemonic == "cqo"
+                    || mnemonic == "cbtw"  // AT&T for cbw
+                    || mnemonic == "cwtl"  // AT&T for cwde
+                    || mnemonic == "cltq"  // AT&T for cdqe
+                    || mnemonic == "cwtd"  // AT&T for cwd
+                    || mnemonic == "cltd"  // AT&T for cdq
+                    || mnemonic == "cqto"; // AT&T for cqo
+
+                if let Some(def) = inst.defs.first() {
+                    if is_sign_extend || is_sign_convert {
+                        self.constraints.push((def.clone(), Constraint::IsSigned));
+                    } else if is_zero_extend {
+                        self.constraints.push((def.clone(), Constraint::IsUnsigned));
+                    }
+                }
+
+                if let Some(SsaOperand::Value(src)) = inst.uses.first() {
+                    if is_sign_extend || is_sign_convert {
+                        self.constraints.push((src.clone(), Constraint::IsSigned));
+                    } else if is_zero_extend {
+                        self.constraints.push((src.clone(), Constraint::IsUnsigned));
+                    }
+                }
+
+                // Always propagate type equivalence
                 if let (Some(def), Some(SsaOperand::Value(src))) =
                     (inst.defs.first(), inst.uses.first())
                 {
@@ -678,6 +901,22 @@ impl TypeInference {
                 }
             }
             Type::CString => "char*".to_string(),
+            Type::Template { name, args } => {
+                let arg_strs: Vec<_> = args.iter().map(Self::template_arg_to_c_string).collect();
+                format!("{}<{}>", name, arg_strs.join(", "))
+            }
+        }
+    }
+
+    /// Converts a TemplateArg to a C-style string.
+    fn template_arg_to_c_string(arg: &TemplateArg) -> String {
+        match arg {
+            TemplateArg::Type(ty) => Self::type_to_c_string(ty),
+            TemplateArg::Value(v) => v.to_string(),
+            TemplateArg::Template { name, args } => {
+                let arg_strs: Vec<_> = args.iter().map(Self::template_arg_to_c_string).collect();
+                format!("{}<{}>", name, arg_strs.join(", "))
+            }
         }
     }
 }
@@ -785,6 +1024,289 @@ impl Default for FunctionSignatures {
     }
 }
 
+/// Parser for C++ template type names from demangled symbols.
+///
+/// Handles names like:
+/// - `std::vector<int>`
+/// - `std::map<std::string, int>`
+/// - `MyTemplate<int, 10>` (with non-type arguments)
+/// - `std::vector<std::vector<int>>` (nested templates)
+#[derive(Debug, Default)]
+pub struct TemplateParser;
+
+impl TemplateParser {
+    /// Creates a new template parser.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Parses a demangled C++ type name into a Type.
+    ///
+    /// Returns `Some(Type)` if the name represents a template instantiation,
+    /// `None` otherwise.
+    pub fn parse(&self, name: &str) -> Option<Type> {
+        let name = name.trim();
+
+        // Check if it's a template (contains '<')
+        if !name.contains('<') {
+            return None;
+        }
+
+        self.parse_template_type(name)
+    }
+
+    /// Parses a template type from a string.
+    fn parse_template_type(&self, s: &str) -> Option<Type> {
+        let s = s.trim();
+
+        // Find the template name and arguments
+        let open_bracket = s.find('<')?;
+
+        // Make sure there's a closing bracket
+        if !s.ends_with('>') {
+            return None;
+        }
+
+        let template_name = s[..open_bracket].trim();
+        let args_str = &s[open_bracket + 1..s.len() - 1];
+
+        // Parse template arguments
+        let args = self.parse_template_args(args_str)?;
+
+        Some(Type::Template {
+            name: template_name.to_string(),
+            args,
+        })
+    }
+
+    /// Parses template arguments from a comma-separated string.
+    ///
+    /// Handles nested templates by tracking bracket depth.
+    fn parse_template_args(&self, s: &str) -> Option<Vec<TemplateArg>> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let mut args = Vec::new();
+        let mut depth = 0;
+        let mut start = 0;
+
+        for (i, c) in s.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => depth -= 1,
+                ',' if depth == 0 => {
+                    let arg_str = s[start..i].trim();
+                    if let Some(arg) = self.parse_single_arg(arg_str) {
+                        args.push(arg);
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+
+        // Parse the last argument
+        let last_arg = s[start..].trim();
+        if !last_arg.is_empty() {
+            if let Some(arg) = self.parse_single_arg(last_arg) {
+                args.push(arg);
+            }
+        }
+
+        Some(args)
+    }
+
+    /// Parses a single template argument.
+    fn parse_single_arg(&self, s: &str) -> Option<TemplateArg> {
+        let s = s.trim();
+
+        // Check if it's a numeric value (non-type template argument)
+        if let Ok(val) = s.parse::<i64>() {
+            return Some(TemplateArg::Value(val));
+        }
+
+        // Check if it's a nested template
+        if s.contains('<') {
+            if let Some(Type::Template { name, args }) = self.parse_template_type(s) {
+                return Some(TemplateArg::Template { name, args });
+            }
+        }
+
+        // Otherwise, treat it as a type
+        let ty = self.parse_primitive_type(s);
+        Some(TemplateArg::Type(Box::new(ty)))
+    }
+
+    /// Parses a primitive type name into a Type.
+    fn parse_primitive_type(&self, s: &str) -> Type {
+        let s = s.trim();
+
+        // Handle pointers
+        if let Some(inner) = s.strip_suffix('*') {
+            return Type::ptr(self.parse_primitive_type(inner.trim()));
+        }
+
+        // Handle const (strip it for now)
+        let s = s.strip_prefix("const ").unwrap_or(s);
+        let s = s.strip_suffix(" const").unwrap_or(s);
+
+        // Handle references (treat as pointers for decompilation)
+        let s = s.strip_suffix('&').unwrap_or(s).trim();
+
+        match s {
+            "void" => Type::Void,
+            "bool" => Type::Bool,
+            "char" | "signed char" => Type::sint(1),
+            "unsigned char" => Type::uint(1),
+            "short" | "signed short" | "short int" | "signed short int" => Type::sint(2),
+            "unsigned short" | "unsigned short int" => Type::uint(2),
+            "int" | "signed" | "signed int" => Type::sint(4),
+            "unsigned" | "unsigned int" => Type::uint(4),
+            "long" | "signed long" | "long int" | "signed long int" => Type::sint(8),
+            "unsigned long" | "unsigned long int" => Type::uint(8),
+            "long long" | "signed long long" | "long long int" => Type::sint(8),
+            "unsigned long long" | "unsigned long long int" => Type::uint(8),
+            "float" => Type::f32(),
+            "double" => Type::f64(),
+            "long double" => Type::Float { size: 16 },
+            // C99/C++11 fixed-width types
+            "int8_t" => Type::sint(1),
+            "uint8_t" => Type::uint(1),
+            "int16_t" => Type::sint(2),
+            "uint16_t" => Type::uint(2),
+            "int32_t" => Type::sint(4),
+            "uint32_t" => Type::uint(4),
+            "int64_t" => Type::sint(8),
+            "uint64_t" => Type::uint(8),
+            "size_t" | "uintptr_t" => Type::uint(8),
+            "ssize_t" | "intptr_t" | "ptrdiff_t" => Type::sint(8),
+            // Common STL types
+            "std::string" | "string" => Type::std_string(),
+            // Unknown type - return as unknown with name
+            _ => {
+                // Could be a class/struct name or unknown type
+                Type::Struct {
+                    name: Some(s.to_string()),
+                    fields: Vec::new(),
+                    size: 0,
+                }
+            }
+        }
+    }
+
+    /// Checks if a type name is a known STL template.
+    pub fn is_stl_template(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "std::vector"
+                | "std::list"
+                | "std::deque"
+                | "std::set"
+                | "std::multiset"
+                | "std::map"
+                | "std::multimap"
+                | "std::unordered_set"
+                | "std::unordered_map"
+                | "std::unordered_multiset"
+                | "std::unordered_multimap"
+                | "std::array"
+                | "std::pair"
+                | "std::tuple"
+                | "std::optional"
+                | "std::variant"
+                | "std::unique_ptr"
+                | "std::shared_ptr"
+                | "std::weak_ptr"
+                | "std::function"
+                | "std::basic_string"
+        )
+    }
+}
+
+/// Database for tracking template instantiations across a codebase.
+///
+/// This allows grouping related types (e.g., all `std::vector<T>` instantiations)
+/// and understanding template usage patterns.
+#[derive(Debug, Default)]
+pub struct TemplateDatabase {
+    /// All known template instantiations by their full name.
+    instantiations: HashMap<String, Type>,
+    /// Template name -> list of instantiation names.
+    by_template: HashMap<String, Vec<String>>,
+}
+
+impl TemplateDatabase {
+    /// Creates a new empty template database.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a template instantiation to the database.
+    pub fn add(&mut self, ty: Type) {
+        if let Type::Template { ref name, .. } = ty {
+            let full_name = ty.to_string();
+            self.by_template
+                .entry(name.clone())
+                .or_default()
+                .push(full_name.clone());
+            self.instantiations.insert(full_name, ty);
+        }
+    }
+
+    /// Parses and adds a type name to the database.
+    ///
+    /// Returns `Some(Type)` if it was a template type, `None` otherwise.
+    pub fn parse_and_add(&mut self, type_name: &str) -> Option<Type> {
+        let parser = TemplateParser::new();
+        let ty = parser.parse(type_name)?;
+        self.add(ty.clone());
+        Some(ty)
+    }
+
+    /// Gets a template instantiation by its full name.
+    pub fn get(&self, full_name: &str) -> Option<&Type> {
+        self.instantiations.get(full_name)
+    }
+
+    /// Gets all instantiations of a particular template.
+    ///
+    /// For example, `get_instantiations("std::vector")` returns all
+    /// vector instantiations like `std::vector<int>`, `std::vector<std::string>`, etc.
+    pub fn get_instantiations(&self, template_name: &str) -> Vec<&Type> {
+        self.by_template
+            .get(template_name)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| self.instantiations.get(n))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns all known template names (without arguments).
+    pub fn template_names(&self) -> impl Iterator<Item = &String> {
+        self.by_template.keys()
+    }
+
+    /// Returns the total number of template instantiations.
+    pub fn len(&self) -> usize {
+        self.instantiations.len()
+    }
+
+    /// Returns true if the database is empty.
+    pub fn is_empty(&self) -> bool {
+        self.instantiations.is_empty()
+    }
+
+    /// Returns all template instantiations.
+    pub fn all(&self) -> impl Iterator<Item = &Type> {
+        self.instantiations.values()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +1347,336 @@ mod tests {
 
         let malloc = sigs.get("malloc").unwrap();
         assert!(malloc.return_type.is_pointer());
+    }
+
+    #[test]
+    fn test_signedness_constraint_application() {
+        let inference = TypeInference::new();
+
+        // IsSigned constraint on Unknown -> signed int
+        let result = inference.apply_constraint(&Type::Unknown, &Constraint::IsSigned);
+        assert!(matches!(result, Type::Int { signed: true, .. }));
+
+        // IsUnsigned constraint on Unknown -> unsigned int
+        let result = inference.apply_constraint(&Type::Unknown, &Constraint::IsUnsigned);
+        assert!(matches!(result, Type::Int { signed: false, .. }));
+
+        // IsSigned on existing int -> keeps size, changes signedness
+        let result = inference.apply_constraint(&Type::uint(4), &Constraint::IsSigned);
+        assert_eq!(result, Type::sint(4));
+
+        // IsUnsigned on existing signed int -> keeps size, changes signedness
+        let result = inference.apply_constraint(&Type::sint(2), &Constraint::IsUnsigned);
+        assert_eq!(result, Type::uint(2));
+    }
+
+    #[test]
+    fn test_signedness_detection_patterns() {
+        // Test that we recognize signed vs unsigned division mnemonics
+        let signed_mnemonics = ["idiv", "idivl", "idivq", "imul", "imull", "imulq"];
+        let unsigned_mnemonics = ["div", "divl", "divq", "mul", "mull", "mulq"];
+
+        for mnemonic in signed_mnemonics {
+            let m = mnemonic.to_lowercase();
+            let is_signed = m.starts_with("idiv") || m.starts_with("imul");
+            assert!(is_signed, "Expected {} to be detected as signed", mnemonic);
+        }
+
+        for mnemonic in unsigned_mnemonics {
+            let m = mnemonic.to_lowercase();
+            let is_unsigned = (m.starts_with("div") && !m.starts_with("divs"))
+                || (m.starts_with("mul") && !m.starts_with("muls"));
+            assert!(
+                is_unsigned,
+                "Expected {} to be detected as unsigned",
+                mnemonic
+            );
+        }
+    }
+
+    #[test]
+    fn test_sign_zero_extension_patterns() {
+        // Test detection of sign/zero extend mnemonics
+        // Intel syntax
+        let sign_extend_intel = ["movsx", "movsxd"];
+        // AT&T syntax (movsbl = move sign-extend byte to long, etc.)
+        let sign_extend_att = ["movsbl", "movswl", "movsbq", "movswq", "movslq"];
+
+        let zero_extend_intel = ["movzx"];
+        let zero_extend_att = ["movzbl", "movzwl", "movzbq", "movzwq"];
+
+        // Function matching the actual detection logic
+        let is_sign_ext = |mnemonic: &str| {
+            let m = mnemonic.to_lowercase();
+            m.starts_with("movsx")
+                || m.starts_with("movsxd")
+                || (m.starts_with("movs")
+                    && (m.ends_with("l") || m.ends_with("q") || m.ends_with("w")))
+        };
+
+        let is_zero_ext = |mnemonic: &str| {
+            let m = mnemonic.to_lowercase();
+            m.starts_with("movzx")
+                || (m.starts_with("movz")
+                    && (m.ends_with("l") || m.ends_with("q") || m.ends_with("w")))
+        };
+
+        for mnemonic in sign_extend_intel.iter().chain(sign_extend_att.iter()) {
+            assert!(
+                is_sign_ext(mnemonic),
+                "Expected {} to be detected as sign extension",
+                mnemonic
+            );
+        }
+
+        for mnemonic in zero_extend_intel.iter().chain(zero_extend_att.iter()) {
+            assert!(
+                is_zero_ext(mnemonic),
+                "Expected {} to be detected as zero extension",
+                mnemonic
+            );
+        }
+    }
+
+    #[test]
+    fn test_comparison_signedness_patterns() {
+        // Signed comparisons: G(reater), L(ess) - use signed interpretation
+        let signed_cmov = ["cmovg", "cmovl", "cmovge", "cmovle", "cmovng", "cmovnl"];
+        let unsigned_cmov = ["cmova", "cmovb", "cmovae", "cmovbe", "cmovna", "cmovnb"];
+
+        for mnemonic in signed_cmov {
+            let m = mnemonic.to_lowercase();
+            let is_signed = m.contains("cmov")
+                && (m.ends_with("g")
+                    || m.ends_with("l")
+                    || m.ends_with("ge")
+                    || m.ends_with("le")
+                    || m.ends_with("ng")
+                    || m.ends_with("nl"));
+            assert!(
+                is_signed,
+                "Expected {} to indicate signed comparison",
+                mnemonic
+            );
+        }
+
+        for mnemonic in unsigned_cmov {
+            let m = mnemonic.to_lowercase();
+            let is_unsigned = m.contains("cmov")
+                && (m.ends_with("a")
+                    || m.ends_with("b")
+                    || m.ends_with("ae")
+                    || m.ends_with("be")
+                    || m.ends_with("na")
+                    || m.ends_with("nb"));
+            assert!(
+                is_unsigned,
+                "Expected {} to indicate unsigned comparison",
+                mnemonic
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_instruction_signedness() {
+        // SET instructions also indicate signedness
+        let signed_set = ["setg", "setl", "setge", "setle"];
+        let unsigned_set = ["seta", "setb", "setae", "setbe"];
+
+        for mnemonic in signed_set {
+            let m = mnemonic.to_lowercase();
+            let is_signed = m.starts_with("set")
+                && (m.ends_with("g") || m.ends_with("l") || m.ends_with("ge") || m.ends_with("le"));
+            assert!(is_signed, "Expected {} to indicate signed", mnemonic);
+        }
+
+        for mnemonic in unsigned_set {
+            let m = mnemonic.to_lowercase();
+            let is_unsigned = m.starts_with("set")
+                && (m.ends_with("a") || m.ends_with("b") || m.ends_with("ae") || m.ends_with("be"));
+            assert!(is_unsigned, "Expected {} to indicate unsigned", mnemonic);
+        }
+    }
+
+    #[test]
+    fn test_type_to_c_string_signedness() {
+        // Verify C type string output reflects signedness
+        assert_eq!(TypeInference::type_to_c_string(&Type::sint(4)), "int");
+        assert_eq!(
+            TypeInference::type_to_c_string(&Type::uint(4)),
+            "unsigned int"
+        );
+        assert_eq!(TypeInference::type_to_c_string(&Type::sint(8)), "int64_t");
+        assert_eq!(TypeInference::type_to_c_string(&Type::uint(8)), "uint64_t");
+        assert_eq!(TypeInference::type_to_c_string(&Type::sint(1)), "int8_t");
+        assert_eq!(TypeInference::type_to_c_string(&Type::uint(1)), "uint8_t");
+        assert_eq!(TypeInference::type_to_c_string(&Type::sint(2)), "int16_t");
+        assert_eq!(TypeInference::type_to_c_string(&Type::uint(2)), "uint16_t");
+    }
+
+    #[test]
+    fn test_template_type_display() {
+        // Simple template
+        let vec_int = Type::std_vector(Type::sint(4));
+        assert_eq!(vec_int.to_string(), "std::vector<int32>");
+
+        // Nested template
+        let vec_vec_int = Type::std_vector(Type::std_vector(Type::sint(4)));
+        assert_eq!(vec_vec_int.to_string(), "std::vector<std::vector<int32>>");
+
+        // Map with two type arguments
+        let map_str_int = Type::std_map(Type::std_string(), Type::sint(4));
+        assert_eq!(
+            map_str_int.to_string(),
+            "std::map<std::basic_string<int8>, int32>"
+        );
+    }
+
+    #[test]
+    fn test_template_parser_simple() {
+        let parser = TemplateParser::new();
+
+        // Simple template
+        let ty = parser.parse("std::vector<int>").unwrap();
+        assert!(ty.is_template());
+        if let Type::Template { name, args } = &ty {
+            assert_eq!(name, "std::vector");
+            assert_eq!(args.len(), 1);
+        }
+
+        // Not a template
+        assert!(parser.parse("int").is_none());
+        assert!(parser.parse("std::string").is_none());
+    }
+
+    #[test]
+    fn test_template_parser_nested() {
+        let parser = TemplateParser::new();
+
+        // Nested template
+        let ty = parser.parse("std::vector<std::vector<int>>").unwrap();
+        if let Type::Template { name, args } = &ty {
+            assert_eq!(name, "std::vector");
+            assert_eq!(args.len(), 1);
+            // First arg should be a nested template
+            if let TemplateArg::Template {
+                name: inner_name,
+                args: inner_args,
+            } = &args[0]
+            {
+                assert_eq!(inner_name, "std::vector");
+                assert_eq!(inner_args.len(), 1);
+            } else {
+                panic!("Expected nested template argument");
+            }
+        }
+    }
+
+    #[test]
+    fn test_template_parser_multiple_args() {
+        let parser = TemplateParser::new();
+
+        // Map with two type arguments
+        let ty = parser.parse("std::map<std::string, int>").unwrap();
+        if let Type::Template { name, args } = &ty {
+            assert_eq!(name, "std::map");
+            assert_eq!(args.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_template_parser_non_type_arg() {
+        let parser = TemplateParser::new();
+
+        // Template with non-type argument
+        let ty = parser.parse("std::array<int, 10>").unwrap();
+        if let Type::Template { name, args } = &ty {
+            assert_eq!(name, "std::array");
+            assert_eq!(args.len(), 2);
+            // Second arg should be a value
+            assert!(matches!(args[1], TemplateArg::Value(10)));
+        }
+    }
+
+    #[test]
+    fn test_template_database() {
+        let mut db = TemplateDatabase::new();
+
+        // Add some template instantiations
+        db.parse_and_add("std::vector<int>");
+        db.parse_and_add("std::vector<double>");
+        db.parse_and_add("std::map<std::string, int>");
+
+        assert_eq!(db.len(), 3);
+
+        // Get all vector instantiations
+        let vectors = db.get_instantiations("std::vector");
+        assert_eq!(vectors.len(), 2);
+
+        // Get all map instantiations
+        let maps = db.get_instantiations("std::map");
+        assert_eq!(maps.len(), 1);
+    }
+
+    #[test]
+    fn test_template_type_helpers() {
+        // Test std:: type helpers
+        let vec = Type::std_vector(Type::sint(4));
+        assert!(vec.is_template());
+
+        let unique = Type::std_unique_ptr(Type::sint(4));
+        assert!(unique.is_template());
+
+        let shared = Type::std_shared_ptr(Type::sint(4));
+        assert!(shared.is_template());
+    }
+
+    #[test]
+    fn test_template_to_c_string() {
+        // Verify C++ template type strings
+        let vec_int = Type::std_vector(Type::sint(4));
+        assert_eq!(
+            TypeInference::type_to_c_string(&vec_int),
+            "std::vector<int>"
+        );
+
+        // With non-type argument
+        let ty = Type::template(
+            "std::array",
+            vec![
+                TemplateArg::Type(Box::new(Type::sint(4))),
+                TemplateArg::Value(10),
+            ],
+        );
+        assert_eq!(TypeInference::type_to_c_string(&ty), "std::array<int, 10>");
+    }
+
+    #[test]
+    fn test_stl_template_detection() {
+        let parser = TemplateParser::new();
+
+        // Known STL templates
+        assert!(parser.is_stl_template("std::vector"));
+        assert!(parser.is_stl_template("std::map"));
+        assert!(parser.is_stl_template("std::unique_ptr"));
+
+        // Not STL templates
+        assert!(!parser.is_stl_template("MyClass"));
+        assert!(!parser.is_stl_template("boost::shared_ptr"));
+    }
+
+    #[test]
+    fn test_template_arg_display() {
+        let type_arg = TemplateArg::Type(Box::new(Type::sint(4)));
+        assert_eq!(type_arg.to_string(), "int32");
+
+        let value_arg = TemplateArg::Value(42);
+        assert_eq!(value_arg.to_string(), "42");
+
+        let nested_arg = TemplateArg::Template {
+            name: "std::vector".to_string(),
+            args: vec![TemplateArg::Type(Box::new(Type::sint(4)))],
+        };
+        assert_eq!(nested_arg.to_string(), "std::vector<int32>");
     }
 }

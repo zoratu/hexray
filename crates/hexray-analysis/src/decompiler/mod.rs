@@ -12,6 +12,7 @@ pub mod array_detection;
 mod emitter;
 mod expression;
 mod for_loop_detection;
+mod loop_pattern_detection;
 mod naming;
 mod short_circuit;
 mod signature;

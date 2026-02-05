@@ -168,6 +168,9 @@ impl StructuredCfg {
         // Post-process to detect for loops from while loops with init/update
         let body = detect_for_loops(body);
 
+        // Post-process to detect memcpy/memset patterns in for loops
+        let body = super::loop_pattern_detection::detect_loop_patterns(body);
+
         // Post-process to detect switch statements from if-else chains
         let body = detect_switch_statements(body);
 
