@@ -154,6 +154,97 @@ impl CallingConvention {
     }
 }
 
+/// Parameter usage pattern hints for better type inference.
+#[derive(Debug, Clone, Default)]
+pub struct ParameterUsageHints {
+    /// Parameter is dereferenced as a pointer.
+    pub is_dereferenced: bool,
+    /// Parameter is used in pointer arithmetic.
+    pub is_pointer_arithmetic: bool,
+    /// Parameter is compared against null.
+    pub is_null_checked: bool,
+    /// Parameter is passed to a string function (strlen, strcmp, etc.).
+    pub is_string_arg: bool,
+    /// Parameter is used as an array index.
+    pub is_array_index: bool,
+    /// Parameter is used as a loop bound.
+    pub is_loop_bound: bool,
+    /// Parameter is used in a comparison (likely signed).
+    pub is_signed_comparison: bool,
+    /// Parameter is used in unsigned operations.
+    pub is_unsigned_ops: bool,
+    /// Parameter is part of a pointer+size pair (common pattern).
+    pub is_size_param: bool,
+    /// Functions this parameter is passed to (for type propagation).
+    pub passed_to_functions: Vec<String>,
+}
+
+impl ParameterUsageHints {
+    /// Infers a type from the usage hints.
+    pub fn infer_type(&self, base_size: u8) -> ParamType {
+        // If dereferenced, it's a pointer
+        if self.is_dereferenced || self.is_pointer_arithmetic || self.is_null_checked {
+            return ParamType::Pointer;
+        }
+
+        // If passed to string functions, it's a char*
+        if self.is_string_arg {
+            return ParamType::Pointer;
+        }
+
+        // If used as array index or loop bound, likely unsigned
+        if self.is_array_index || self.is_loop_bound || self.is_size_param {
+            return ParamType::UnsignedInt(base_size * 8);
+        }
+
+        // If unsigned operations, use unsigned
+        if self.is_unsigned_ops {
+            return ParamType::UnsignedInt(base_size * 8);
+        }
+
+        // Default to signed
+        ParamType::SignedInt(base_size * 8)
+    }
+
+    /// Returns a better parameter name based on usage.
+    pub fn suggest_name(&self, index: usize) -> String {
+        if self.is_string_arg {
+            return match index {
+                0 => "str".to_string(),
+                1 => "str2".to_string(),
+                _ => format!("str{}", index),
+            };
+        }
+
+        if self.is_dereferenced || self.is_pointer_arithmetic {
+            return match index {
+                0 => "ptr".to_string(),
+                1 => "ptr2".to_string(),
+                _ => format!("ptr{}", index),
+            };
+        }
+
+        if self.is_size_param || self.is_loop_bound {
+            return match index {
+                0 => "size".to_string(),
+                1 => "count".to_string(),
+                2 => "len".to_string(),
+                _ => format!("n{}", index),
+            };
+        }
+
+        if self.is_array_index {
+            return match index {
+                0 => "index".to_string(),
+                1 => "idx".to_string(),
+                _ => format!("i{}", index),
+            };
+        }
+
+        format!("arg{}", index)
+    }
+}
+
 /// Location where a parameter is passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterLocation {
@@ -369,6 +460,7 @@ impl FunctionSignature {
 /// 1. Identifying which argument registers are read before being written
 /// 2. Tracking register sizes to infer parameter types
 /// 3. Detecting return value usage before the return instruction
+/// 4. Analyzing usage patterns for better type inference
 #[derive(Debug)]
 pub struct SignatureRecovery {
     /// The calling convention to use.
@@ -387,11 +479,24 @@ pub struct SignatureRecovery {
     float_return: bool,
     /// Parameter names assigned from stack slot analysis.
     param_names: HashMap<usize, String>,
+    /// Usage hints for parameters (indexed by arg register index).
+    param_hints: HashMap<usize, ParameterUsageHints>,
+    /// String functions for detection.
+    string_functions: HashSet<&'static str>,
 }
 
 impl SignatureRecovery {
     /// Creates a new signature recovery engine with the given calling convention.
     pub fn new(convention: CallingConvention) -> Self {
+        let string_functions: HashSet<&'static str> = [
+            "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat", "strchr",
+            "strrchr", "strstr", "strtok", "strdup", "strndup", "sprintf", "snprintf", "sscanf",
+            "printf", "fprintf", "puts", "fputs", "gets", "fgets", "atoi", "atol", "atof",
+            "strtol", "strtoul", "strtod",
+        ]
+        .into_iter()
+        .collect();
+
         Self {
             convention,
             read_regs: HashSet::new(),
@@ -401,6 +506,8 @@ impl SignatureRecovery {
             return_size: 8,
             float_return: false,
             param_names: HashMap::new(),
+            param_hints: HashMap::new(),
+            string_functions,
         }
     }
 
@@ -414,12 +521,40 @@ impl SignatureRecovery {
         self.return_size = 8;
         self.float_return = false;
         self.param_names.clear();
+        self.param_hints.clear();
 
         // Analyze the function body
         self.analyze_nodes(&cfg.body, false);
 
         // Build the signature
         self.build_signature()
+    }
+
+    /// Records a usage hint for a parameter.
+    fn record_usage_hint(
+        &mut self,
+        reg_name: &str,
+        hint_fn: impl FnOnce(&mut ParameterUsageHints),
+    ) {
+        if let Some(idx) = self.arg_register_index(reg_name) {
+            let hints = self.param_hints.entry(idx).or_default();
+            hint_fn(hints);
+        }
+    }
+
+    /// Checks if an expression is a null constant (0).
+    fn is_null_constant(expr: &Expr) -> bool {
+        matches!(expr.kind, ExprKind::IntLit(0))
+    }
+
+    /// Extracts a function name from a call target.
+    fn extract_call_name(target: &super::expression::CallTarget) -> Option<String> {
+        match target {
+            super::expression::CallTarget::Named(name) => Some(name.clone()),
+            super::expression::CallTarget::Direct { .. } => None,
+            super::expression::CallTarget::Indirect(_) => None,
+            super::expression::CallTarget::IndirectGot { .. } => None,
+        }
     }
 
     /// Analyzes a list of structured nodes.
@@ -584,6 +719,16 @@ impl SignatureRecovery {
 
     /// Analyzes an expression for register reads (argument detection).
     fn analyze_expr_reads(&mut self, expr: &Expr) {
+        self.analyze_expr_reads_with_context(expr, false, false);
+    }
+
+    /// Analyzes an expression with context about how it's being used.
+    fn analyze_expr_reads_with_context(
+        &mut self,
+        expr: &Expr,
+        is_dereferenced: bool,
+        is_comparison: bool,
+    ) {
         match &expr.kind {
             ExprKind::Var(var) => {
                 let name = var.name.to_lowercase();
@@ -594,34 +739,134 @@ impl SignatureRecovery {
                     // Track the size
                     let size = self.reg_size_from_name(&var.name);
                     if size > 0 {
-                        self.reg_sizes.insert(name, size);
+                        self.reg_sizes.insert(name.clone(), size);
+                    }
+
+                    // Record usage hints
+                    if is_dereferenced {
+                        self.record_usage_hint(&name, |h| h.is_dereferenced = true);
+                    }
+                    if is_comparison {
+                        self.record_usage_hint(&name, |h| h.is_signed_comparison = true);
                     }
                 }
             }
-            ExprKind::BinOp { left, right, .. } => {
-                self.analyze_expr_reads(left);
-                self.analyze_expr_reads(right);
+            ExprKind::BinOp { op, left, right } => {
+                // Check for null comparison: arg == 0 or arg != 0
+                let is_null_cmp = matches!(op, BinOpKind::Eq | BinOpKind::Ne)
+                    && (Self::is_null_constant(left) || Self::is_null_constant(right));
+
+                if is_null_cmp {
+                    if let ExprKind::Var(var) = &left.kind {
+                        self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                            h.is_null_checked = true
+                        });
+                    }
+                    if let ExprKind::Var(var) = &right.kind {
+                        self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                            h.is_null_checked = true
+                        });
+                    }
+                }
+
+                // Check for pointer arithmetic - only when adding/subtracting a scaled value
+                // (e.g., ptr + i * sizeof(T) or ptr + constant offset)
+                if matches!(op, BinOpKind::Add | BinOpKind::Sub) {
+                    // Check if right side looks like an offset (scaled index or small constant)
+                    let right_is_offset = match &right.kind {
+                        ExprKind::BinOp {
+                            op: BinOpKind::Mul | BinOpKind::Shl,
+                            ..
+                        } => true,
+                        ExprKind::IntLit(n) => *n != 0 && (*n < 0x1000 || *n > 0), // Small offset
+                        _ => false,
+                    };
+
+                    if right_is_offset {
+                        if let ExprKind::Var(var) = &left.kind {
+                            if self.is_arg_register(&var.name.to_lowercase()) {
+                                self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                                    h.is_pointer_arithmetic = true
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check for signed comparisons
+                let is_signed_cmp = matches!(
+                    op,
+                    BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge
+                );
+
+                // Check for unsigned shift right (typically unsigned)
+                if matches!(op, BinOpKind::Shr) {
+                    if let ExprKind::Var(var) = &left.kind {
+                        self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                            h.is_unsigned_ops = true
+                        });
+                    }
+                }
+
+                self.analyze_expr_reads_with_context(left, false, is_signed_cmp);
+                self.analyze_expr_reads_with_context(right, false, is_signed_cmp);
             }
             ExprKind::UnaryOp { operand, .. } => {
-                self.analyze_expr_reads(operand);
+                self.analyze_expr_reads_with_context(operand, false, is_comparison);
             }
             ExprKind::Deref { addr, .. } => {
-                self.analyze_expr_reads(addr);
+                // The address expression is being dereferenced
+                self.analyze_expr_reads_with_context(addr, true, false);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                // Base is being used as a pointer
+                self.analyze_expr_reads_with_context(base, true, false);
+                // Index might be an array index parameter
+                if let ExprKind::Var(var) = &index.kind {
+                    self.record_usage_hint(&var.name.to_lowercase(), |h| h.is_array_index = true);
+                }
+                self.analyze_expr_reads_with_context(index, false, false);
             }
             ExprKind::Assign { lhs, rhs } => {
-                self.analyze_expr_reads(rhs);
+                self.analyze_expr_reads_with_context(rhs, false, false);
                 // Don't analyze LHS reads - it's being written
                 if let ExprKind::Deref { addr, .. } = &lhs.kind {
-                    self.analyze_expr_reads(addr);
+                    self.analyze_expr_reads_with_context(addr, true, false);
                 }
             }
-            ExprKind::Call { args, .. } => {
-                for arg in args {
-                    self.analyze_expr_reads(arg);
+            ExprKind::Call { target, args } => {
+                // Check if calling a string function
+                let func_name = Self::extract_call_name(target);
+                let is_string_fn = func_name
+                    .as_ref()
+                    .map(|n| {
+                        let clean_name = n.strip_prefix('_').unwrap_or(n);
+                        self.string_functions.contains(clean_name)
+                    })
+                    .unwrap_or(false);
+
+                for (i, arg) in args.iter().enumerate() {
+                    // First arg to string functions is typically a string
+                    if is_string_fn && i == 0 {
+                        if let ExprKind::Var(var) = &arg.kind {
+                            self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                                h.is_string_arg = true
+                            });
+                        }
+                    }
+
+                    // Record which functions parameters are passed to
+                    if let (Some(fn_name), ExprKind::Var(var)) = (&func_name, &arg.kind) {
+                        self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                            h.passed_to_functions.push(fn_name.clone())
+                        });
+                    }
+
+                    self.analyze_expr_reads_with_context(arg, false, false);
                 }
             }
             ExprKind::Cast { expr: inner, .. } => {
-                self.analyze_expr_reads(inner);
+                self.analyze_expr_reads_with_context(inner, is_dereferenced, is_comparison);
             }
             ExprKind::Conditional {
                 cond,
@@ -857,19 +1102,29 @@ impl SignatureRecovery {
                     8 // Default to 64-bit
                 };
 
-                let param_type = match size {
-                    1 => ParamType::SignedInt(8),
-                    2 => ParamType::SignedInt(16),
-                    4 => ParamType::SignedInt(32),
-                    _ => ParamType::SignedInt(64),
+                // Get usage hints for this parameter
+                let hints = self.param_hints.get(&idx);
+
+                // Infer type from usage hints if available
+                let param_type = if let Some(hints) = hints {
+                    hints.infer_type(size)
+                } else {
+                    match size {
+                        1 => ParamType::SignedInt(8),
+                        2 => ParamType::SignedInt(16),
+                        4 => ParamType::SignedInt(32),
+                        _ => ParamType::SignedInt(64),
+                    }
                 };
 
-                // Use a custom name if we have one
-                let name = self
-                    .param_names
-                    .get(&idx)
-                    .cloned()
-                    .unwrap_or_else(|| format!("arg{}", idx));
+                // Use a custom name if we have one, or infer from hints
+                let name = if let Some(custom_name) = self.param_names.get(&idx) {
+                    custom_name.clone()
+                } else if let Some(hints) = hints {
+                    hints.suggest_name(idx)
+                } else {
+                    format!("arg{}", idx)
+                };
 
                 sig.parameters.push(Parameter::new(
                     name,
@@ -881,6 +1136,9 @@ impl SignatureRecovery {
                 ));
             }
         }
+
+        // Detect pointer+size parameter pairs
+        self.detect_param_pairs(&mut sig);
 
         // Check for float arguments
         let float_regs = self.convention.float_arg_registers();
@@ -910,6 +1168,48 @@ impl SignatureRecovery {
         }
 
         sig
+    }
+
+    /// Detects common parameter pairs like (buffer, size) and improves naming.
+    fn detect_param_pairs(&self, sig: &mut FunctionSignature) {
+        if sig.parameters.len() < 2 {
+            return;
+        }
+
+        // Look for pointer + size pairs
+        let mut i = 0;
+        while i < sig.parameters.len() - 1 {
+            let is_ptr = matches!(sig.parameters[i].param_type, ParamType::Pointer);
+            let is_size = matches!(
+                sig.parameters[i + 1].param_type,
+                ParamType::UnsignedInt(_) | ParamType::SignedInt(32 | 64)
+            );
+
+            if is_ptr && is_size {
+                // Check if the size param has hints suggesting it's a size
+                let next_idx = match &sig.parameters[i + 1].location {
+                    ParameterLocation::IntegerRegister { index, .. } => Some(*index),
+                    _ => None,
+                };
+
+                if let Some(idx) = next_idx {
+                    if let Some(hints) = self.param_hints.get(&idx) {
+                        if hints.is_loop_bound || hints.is_array_index {
+                            // This is likely a size parameter
+                            sig.parameters[i + 1].param_type = ParamType::UnsignedInt(64);
+                            if sig.parameters[i + 1].name.starts_with("arg") {
+                                sig.parameters[i + 1].name = match i {
+                                    0 => "size".to_string(),
+                                    1 => "count".to_string(),
+                                    _ => format!("n{}", i + 1),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 }
 
