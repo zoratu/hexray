@@ -24,8 +24,16 @@
 //! | `[rbx + rcx*4]`              | `*(rbx + rcx * 4)`        | `rbx[rcx]`     |
 //! | `[rbx + rcx*8 + 0x10]`       | `*(rbx + rcx * 8 + 0x10)` | `rbx[rcx + 2]` |
 //! | `lea rax, [rbx + rcx*4]`     | `rbx + rcx * 4`           | `&rbx[rcx]`    |
+//!
+//! # Array Bounds Inference
+//!
+//! This module also provides array bounds inference from loop bounds:
+//! - When a loop iterates `for (i = 0; i < N; i++)` accessing `arr[i]`,
+//!   we infer that `arr` has at least `N` elements.
 
 use super::expression::{BinOpKind, Expr, ExprKind};
+use super::structurer::StructuredNode;
+use std::collections::HashMap;
 
 /// Result of array pattern detection.
 #[derive(Debug, Clone)]
@@ -410,6 +418,498 @@ pub fn is_likely_array_base(expr: &Expr) -> bool {
     }
 }
 
+// =============================================================================
+// Array Bounds Inference from Loop Bounds
+// =============================================================================
+
+/// Information about an inferred array bound.
+#[derive(Debug, Clone)]
+pub struct ArrayBoundInfo {
+    /// The variable name of the array base.
+    pub array_name: String,
+    /// The inferred minimum size (number of elements).
+    pub min_size: ArrayBoundExpr,
+    /// The element size in bytes.
+    pub element_size: usize,
+    /// Confidence level of the inference.
+    pub confidence: BoundConfidence,
+}
+
+/// Expression representing an array bound.
+#[derive(Debug, Clone)]
+pub enum ArrayBoundExpr {
+    /// A constant bound (e.g., `arr[10]` means size >= 11).
+    Constant(i128),
+    /// A variable bound (e.g., `for i < n` means size >= n).
+    Variable(String),
+    /// A computed bound (e.g., `n * m`).
+    Product(Box<ArrayBoundExpr>, Box<ArrayBoundExpr>),
+    /// A sum of bounds.
+    Sum(Box<ArrayBoundExpr>, Box<ArrayBoundExpr>),
+}
+
+impl std::fmt::Display for ArrayBoundExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArrayBoundExpr::Constant(n) => write!(f, "{}", n),
+            ArrayBoundExpr::Variable(name) => write!(f, "{}", name),
+            ArrayBoundExpr::Product(a, b) => write!(f, "({} * {})", a, b),
+            ArrayBoundExpr::Sum(a, b) => write!(f, "({} + {})", a, b),
+        }
+    }
+}
+
+/// Confidence level of an inferred bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BoundConfidence {
+    /// Low confidence - might be wrong.
+    Low,
+    /// Medium confidence - likely correct.
+    Medium,
+    /// High confidence - almost certainly correct.
+    High,
+}
+
+/// Collected array bounds from analyzing structured code.
+#[derive(Debug, Clone, Default)]
+pub struct ArrayBounds {
+    /// Map from array variable name to inferred bounds.
+    bounds: HashMap<String, Vec<ArrayBoundInfo>>,
+}
+
+impl ArrayBounds {
+    /// Creates a new empty bounds collection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a bound for an array.
+    pub fn add_bound(&mut self, info: ArrayBoundInfo) {
+        self.bounds
+            .entry(info.array_name.clone())
+            .or_default()
+            .push(info);
+    }
+
+    /// Gets all bounds for an array.
+    pub fn get_bounds(&self, array_name: &str) -> Option<&Vec<ArrayBoundInfo>> {
+        self.bounds.get(array_name)
+    }
+
+    /// Gets the best (highest confidence) constant bound for an array.
+    pub fn get_best_constant_bound(&self, array_name: &str) -> Option<i128> {
+        self.bounds.get(array_name).and_then(|bounds| {
+            bounds
+                .iter()
+                .filter_map(|b| {
+                    if let ArrayBoundExpr::Constant(n) = b.min_size {
+                        Some((n, b.confidence))
+                    } else {
+                        None
+                    }
+                })
+                .max_by_key(|(_, conf)| *conf)
+                .map(|(n, _)| n)
+        })
+    }
+
+    /// Gets all arrays with inferred bounds.
+    pub fn arrays(&self) -> impl Iterator<Item = &str> {
+        self.bounds.keys().map(String::as_str)
+    }
+
+    /// Merges another bounds collection into this one.
+    pub fn merge(&mut self, other: ArrayBounds) {
+        for (name, bounds) in other.bounds {
+            self.bounds.entry(name).or_default().extend(bounds);
+        }
+    }
+}
+
+/// Infers array bounds from structured code by analyzing loop patterns.
+pub fn infer_array_bounds(nodes: &[StructuredNode]) -> ArrayBounds {
+    let mut bounds = ArrayBounds::new();
+
+    for node in nodes {
+        collect_bounds_from_node(node, &mut bounds);
+    }
+
+    bounds
+}
+
+/// Recursively collects array bounds from a structured node.
+fn collect_bounds_from_node(node: &StructuredNode, bounds: &mut ArrayBounds) {
+    match node {
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            ..
+        } => {
+            // Try to extract loop variable and bounds
+            if let (Some(init_expr), Some(update_expr)) = (init, update) {
+                if let Some((loop_var, start, bound)) =
+                    extract_loop_bounds_for_inference(init_expr, condition)
+                {
+                    // Check for simple increment
+                    if is_simple_increment_for_inference(update_expr, &loop_var) {
+                        // Scan body for array accesses using the loop variable
+                        collect_array_accesses_in_loop(body, &loop_var, start, &bound, bounds);
+                    }
+                }
+            }
+            // Recurse into body
+            for child in body {
+                collect_bounds_from_node(child, bounds);
+            }
+        }
+
+        StructuredNode::While { body, .. } | StructuredNode::DoWhile { body, .. } => {
+            // Could analyze while loops too, but for loops are more reliable
+            for child in body {
+                collect_bounds_from_node(child, bounds);
+            }
+        }
+
+        StructuredNode::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for child in then_body {
+                collect_bounds_from_node(child, bounds);
+            }
+            if let Some(else_nodes) = else_body {
+                for child in else_nodes {
+                    collect_bounds_from_node(child, bounds);
+                }
+            }
+        }
+
+        StructuredNode::Switch { cases, default, .. } => {
+            for (_, case_body) in cases {
+                for child in case_body {
+                    collect_bounds_from_node(child, bounds);
+                }
+            }
+            if let Some(default_body) = default {
+                for child in default_body {
+                    collect_bounds_from_node(child, bounds);
+                }
+            }
+        }
+
+        StructuredNode::Sequence(nodes) => {
+            for child in nodes {
+                collect_bounds_from_node(child, bounds);
+            }
+        }
+
+        StructuredNode::Block { statements, .. } => {
+            // Block contains expressions, not structured nodes
+            for expr in statements {
+                scan_expr_for_constant_indices(expr, bounds);
+            }
+        }
+
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            for child in try_body {
+                collect_bounds_from_node(child, bounds);
+            }
+            for handler in catch_handlers {
+                for child in &handler.body {
+                    collect_bounds_from_node(child, bounds);
+                }
+            }
+        }
+
+        // Leaf nodes with expressions - scan for direct array accesses
+        StructuredNode::Expr(expr) => {
+            scan_expr_for_constant_indices(expr, bounds);
+        }
+
+        _ => {}
+    }
+}
+
+/// Extracts loop bounds from init and condition expressions.
+fn extract_loop_bounds_for_inference(
+    init: &Expr,
+    condition: &Expr,
+) -> Option<(String, i128, ArrayBoundExpr)> {
+    // init: var = start_value
+    let (var_name, start_val) = match &init.kind {
+        ExprKind::Assign { lhs, rhs } => {
+            let name = get_var_name(lhs)?;
+            let start = get_const_value(rhs).unwrap_or(0);
+            (name, start)
+        }
+        _ => return None,
+    };
+
+    // condition: var < bound or var <= bound-1 or var != bound
+    let bound = match &condition.kind {
+        ExprKind::BinOp { op, left, right } => {
+            let cond_var = get_var_name(left)?;
+            if cond_var != var_name {
+                return None;
+            }
+            match op {
+                BinOpKind::Lt | BinOpKind::ULt | BinOpKind::Ne => expr_to_bound(right),
+                BinOpKind::Le | BinOpKind::ULe => {
+                    // var <= N means bound is N+1
+                    let inner = expr_to_bound(right);
+                    ArrayBoundExpr::Sum(Box::new(inner), Box::new(ArrayBoundExpr::Constant(1)))
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    Some((var_name, start_val, bound))
+}
+
+/// Converts an expression to an ArrayBoundExpr.
+fn expr_to_bound(expr: &Expr) -> ArrayBoundExpr {
+    match &expr.kind {
+        ExprKind::IntLit(n) => ArrayBoundExpr::Constant(*n),
+        ExprKind::Var(var) => ArrayBoundExpr::Variable(var.name.clone()),
+        ExprKind::BinOp {
+            op: BinOpKind::Mul,
+            left,
+            right,
+        } => ArrayBoundExpr::Product(
+            Box::new(expr_to_bound(left)),
+            Box::new(expr_to_bound(right)),
+        ),
+        ExprKind::BinOp {
+            op: BinOpKind::Add,
+            left,
+            right,
+        } => ArrayBoundExpr::Sum(
+            Box::new(expr_to_bound(left)),
+            Box::new(expr_to_bound(right)),
+        ),
+        _ => ArrayBoundExpr::Variable(format!("<{}>", expr)),
+    }
+}
+
+/// Checks if an update expression is a simple increment.
+fn is_simple_increment_for_inference(update: &Expr, loop_var: &str) -> bool {
+    match &update.kind {
+        ExprKind::Assign { lhs, rhs } => {
+            let name = match get_var_name(lhs) {
+                Some(n) => n,
+                None => return false,
+            };
+            if name != loop_var {
+                return false;
+            }
+            if let ExprKind::BinOp { op, left, right } = &rhs.kind {
+                if *op != BinOpKind::Add {
+                    return false;
+                }
+                let left_var = get_var_name(left);
+                let right_val = get_const_value(right);
+                if left_var == Some(loop_var.to_string()) && right_val == Some(1) {
+                    return true;
+                }
+            }
+            false
+        }
+        ExprKind::CompoundAssign { lhs, op, rhs } => {
+            let name = match get_var_name(lhs) {
+                Some(n) => n,
+                None => return false,
+            };
+            if name != loop_var {
+                return false;
+            }
+            *op == BinOpKind::Add && get_const_value(rhs) == Some(1)
+        }
+        _ => false,
+    }
+}
+
+/// Scans loop body for array accesses using the loop variable.
+fn collect_array_accesses_in_loop(
+    body: &[StructuredNode],
+    loop_var: &str,
+    start: i128,
+    bound: &ArrayBoundExpr,
+    bounds: &mut ArrayBounds,
+) {
+    for node in body {
+        match node {
+            StructuredNode::Expr(expr) => {
+                collect_array_accesses_from_expr(expr, loop_var, start, bound, bounds);
+            }
+            StructuredNode::Block { statements, .. } => {
+                // Block contains expressions, not structured nodes
+                for expr in statements {
+                    collect_array_accesses_from_expr(expr, loop_var, start, bound, bounds);
+                }
+            }
+            StructuredNode::Sequence(nodes) => {
+                collect_array_accesses_in_loop(nodes, loop_var, start, bound, bounds);
+            }
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_array_accesses_in_loop(then_body, loop_var, start, bound, bounds);
+                if let Some(else_nodes) = else_body {
+                    collect_array_accesses_in_loop(else_nodes, loop_var, start, bound, bounds);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collects array accesses from an expression.
+fn collect_array_accesses_from_expr(
+    expr: &Expr,
+    loop_var: &str,
+    _start: i128,
+    bound: &ArrayBoundExpr,
+    bounds: &mut ArrayBounds,
+) {
+    match &expr.kind {
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => {
+            // Check if index uses the loop variable
+            if expr_uses_var(index, loop_var) {
+                if let Some(array_name) = get_var_name(base) {
+                    bounds.add_bound(ArrayBoundInfo {
+                        array_name,
+                        min_size: bound.clone(),
+                        element_size: *element_size,
+                        confidence: BoundConfidence::High,
+                    });
+                }
+            }
+            // Recurse into base and index
+            collect_array_accesses_from_expr(base, loop_var, _start, bound, bounds);
+            collect_array_accesses_from_expr(index, loop_var, _start, bound, bounds);
+        }
+        ExprKind::Assign { lhs, rhs } => {
+            collect_array_accesses_from_expr(lhs, loop_var, _start, bound, bounds);
+            collect_array_accesses_from_expr(rhs, loop_var, _start, bound, bounds);
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            collect_array_accesses_from_expr(left, loop_var, _start, bound, bounds);
+            collect_array_accesses_from_expr(right, loop_var, _start, bound, bounds);
+        }
+        ExprKind::UnaryOp { operand, .. } => {
+            collect_array_accesses_from_expr(operand, loop_var, _start, bound, bounds);
+        }
+        ExprKind::Deref { addr, .. } => {
+            collect_array_accesses_from_expr(addr, loop_var, _start, bound, bounds);
+        }
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_array_accesses_from_expr(arg, loop_var, _start, bound, bounds);
+            }
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            collect_array_accesses_from_expr(inner, loop_var, _start, bound, bounds);
+        }
+        _ => {}
+    }
+}
+
+/// Checks if an expression uses a specific variable.
+fn expr_uses_var(expr: &Expr, var_name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Var(var) => var.name == var_name,
+        ExprKind::BinOp { left, right, .. } => {
+            expr_uses_var(left, var_name) || expr_uses_var(right, var_name)
+        }
+        ExprKind::UnaryOp { operand, .. } => expr_uses_var(operand, var_name),
+        ExprKind::Cast { expr: inner, .. } => expr_uses_var(inner, var_name),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_uses_var(base, var_name) || expr_uses_var(index, var_name)
+        }
+        _ => false,
+    }
+}
+
+/// Scans expression for constant array indices to infer minimum bounds.
+fn scan_expr_for_constant_indices(expr: &Expr, bounds: &mut ArrayBounds) {
+    match &expr.kind {
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => {
+            // If index is a constant, we know array size must be at least index+1
+            if let ExprKind::IntLit(idx) = &index.kind {
+                if let Some(array_name) = get_var_name(base) {
+                    if *idx >= 0 {
+                        bounds.add_bound(ArrayBoundInfo {
+                            array_name,
+                            min_size: ArrayBoundExpr::Constant(*idx + 1),
+                            element_size: *element_size,
+                            confidence: BoundConfidence::Medium, // Might be out of bounds access
+                        });
+                    }
+                }
+            }
+            scan_expr_for_constant_indices(base, bounds);
+            scan_expr_for_constant_indices(index, bounds);
+        }
+        ExprKind::Assign { lhs, rhs } => {
+            scan_expr_for_constant_indices(lhs, bounds);
+            scan_expr_for_constant_indices(rhs, bounds);
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            scan_expr_for_constant_indices(left, bounds);
+            scan_expr_for_constant_indices(right, bounds);
+        }
+        ExprKind::UnaryOp { operand, .. } => {
+            scan_expr_for_constant_indices(operand, bounds);
+        }
+        ExprKind::Deref { addr, .. } => {
+            scan_expr_for_constant_indices(addr, bounds);
+        }
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                scan_expr_for_constant_indices(arg, bounds);
+            }
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            scan_expr_for_constant_indices(inner, bounds);
+        }
+        _ => {}
+    }
+}
+
+/// Gets the variable name from an expression.
+fn get_var_name(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Var(var) => Some(var.name.clone()),
+        _ => None,
+    }
+}
+
+/// Gets constant value from an expression.
+fn get_const_value(expr: &Expr) -> Option<i128> {
+    match &expr.kind {
+        ExprKind::IntLit(val) => Some(*val),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +1153,164 @@ mod tests {
         assert_eq!(infer_element_size(3), 1);
         assert_eq!(infer_element_size(-8), 8);
         assert_eq!(infer_element_size(-4), 4);
+    }
+
+    // --- Array Bounds Inference Tests ---
+
+    #[test]
+    fn test_array_bound_expr_display() {
+        let const_bound = ArrayBoundExpr::Constant(10);
+        assert_eq!(const_bound.to_string(), "10");
+
+        let var_bound = ArrayBoundExpr::Variable("n".to_string());
+        assert_eq!(var_bound.to_string(), "n");
+
+        let product = ArrayBoundExpr::Product(
+            Box::new(ArrayBoundExpr::Variable("m".to_string())),
+            Box::new(ArrayBoundExpr::Variable("n".to_string())),
+        );
+        assert_eq!(product.to_string(), "(m * n)");
+
+        let sum = ArrayBoundExpr::Sum(
+            Box::new(ArrayBoundExpr::Variable("n".to_string())),
+            Box::new(ArrayBoundExpr::Constant(1)),
+        );
+        assert_eq!(sum.to_string(), "(n + 1)");
+    }
+
+    #[test]
+    fn test_array_bounds_collection() {
+        let mut bounds = ArrayBounds::new();
+
+        bounds.add_bound(ArrayBoundInfo {
+            array_name: "arr".to_string(),
+            min_size: ArrayBoundExpr::Constant(10),
+            element_size: 4,
+            confidence: BoundConfidence::High,
+        });
+
+        bounds.add_bound(ArrayBoundInfo {
+            array_name: "arr".to_string(),
+            min_size: ArrayBoundExpr::Variable("n".to_string()),
+            element_size: 4,
+            confidence: BoundConfidence::Medium,
+        });
+
+        let arr_bounds = bounds.get_bounds("arr");
+        assert!(arr_bounds.is_some());
+        assert_eq!(arr_bounds.unwrap().len(), 2);
+
+        let best = bounds.get_best_constant_bound("arr");
+        assert_eq!(best, Some(10));
+    }
+
+    #[test]
+    fn test_infer_bounds_from_for_loop() {
+        // Create: for (i = 0; i < n; i++) { arr[i] = 0; }
+        let i_var = Variable::reg("i", 8);
+        let arr_var = Variable::reg("arr", 8);
+        let n_var = Variable::reg("n", 8);
+
+        let init = Expr::assign(Expr::var(i_var.clone()), Expr::int(0));
+
+        let condition = Expr::binop(
+            BinOpKind::Lt,
+            Expr::var(i_var.clone()),
+            Expr::var(n_var.clone()),
+        );
+
+        let update = Expr::assign(
+            Expr::var(i_var.clone()),
+            Expr::binop(BinOpKind::Add, Expr::var(i_var.clone()), Expr::int(1)),
+        );
+
+        let body_stmt = Expr::assign(
+            Expr::array_access(Expr::var(arr_var), Expr::var(i_var), 4),
+            Expr::int(0),
+        );
+
+        let for_loop = StructuredNode::For {
+            init: Some(init),
+            condition,
+            update: Some(update),
+            body: vec![StructuredNode::Expr(body_stmt)],
+            header: None,
+            exit_block: None,
+        };
+
+        let bounds = infer_array_bounds(&[for_loop]);
+
+        let arr_bounds = bounds.get_bounds("arr");
+        assert!(arr_bounds.is_some());
+        let arr_bounds = arr_bounds.unwrap();
+        assert!(!arr_bounds.is_empty());
+
+        // Should have inferred size >= n
+        let first_bound = &arr_bounds[0];
+        assert_eq!(first_bound.element_size, 4);
+        assert_eq!(first_bound.confidence, BoundConfidence::High);
+        if let ArrayBoundExpr::Variable(name) = &first_bound.min_size {
+            assert_eq!(name, "n");
+        } else {
+            panic!("Expected variable bound 'n'");
+        }
+    }
+
+    #[test]
+    fn test_infer_bounds_from_constant_access() {
+        // arr[5] = 10;
+        let arr_var = Variable::reg("arr", 8);
+
+        let stmt = Expr::assign(
+            Expr::array_access(Expr::var(arr_var), Expr::int(5), 4),
+            Expr::int(10),
+        );
+
+        let node = StructuredNode::Expr(stmt);
+        let bounds = infer_array_bounds(&[node]);
+
+        let arr_bounds = bounds.get_bounds("arr");
+        assert!(arr_bounds.is_some());
+        let arr_bounds = arr_bounds.unwrap();
+        assert!(!arr_bounds.is_empty());
+
+        // Should have inferred size >= 6 (index 5 means at least 6 elements)
+        let first_bound = &arr_bounds[0];
+        assert_eq!(first_bound.element_size, 4);
+        if let ArrayBoundExpr::Constant(n) = &first_bound.min_size {
+            assert_eq!(*n, 6); // 5 + 1
+        } else {
+            panic!("Expected constant bound 6");
+        }
+    }
+
+    #[test]
+    fn test_bound_confidence_ordering() {
+        assert!(BoundConfidence::Low < BoundConfidence::Medium);
+        assert!(BoundConfidence::Medium < BoundConfidence::High);
+    }
+
+    #[test]
+    fn test_array_bounds_merge() {
+        let mut bounds1 = ArrayBounds::new();
+        bounds1.add_bound(ArrayBoundInfo {
+            array_name: "arr1".to_string(),
+            min_size: ArrayBoundExpr::Constant(10),
+            element_size: 4,
+            confidence: BoundConfidence::High,
+        });
+
+        let mut bounds2 = ArrayBounds::new();
+        bounds2.add_bound(ArrayBoundInfo {
+            array_name: "arr2".to_string(),
+            min_size: ArrayBoundExpr::Constant(20),
+            element_size: 8,
+            confidence: BoundConfidence::Medium,
+        });
+
+        bounds1.merge(bounds2);
+
+        assert!(bounds1.get_bounds("arr1").is_some());
+        assert!(bounds1.get_bounds("arr2").is_some());
     }
 }
