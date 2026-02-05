@@ -23,6 +23,7 @@ mod loop_invariant;
 mod loop_pattern_detection;
 mod memset_idiom;
 mod naming;
+pub mod quality_metrics;
 mod short_circuit;
 mod signature;
 mod string_patterns;
@@ -36,6 +37,7 @@ pub use emitter::PseudoCodeEmitter;
 pub use expression::{BinOpKind, Expr, ExprKind, UnaryOpKind, Variable};
 pub use irreducible_cfg::{IrreducibleCfgAnalysis, IrreducibleRegion};
 pub use naming::{NamingContext, TypeHint};
+pub use quality_metrics::{compute_metrics, QualityMetrics};
 pub use signature::{
     CallingConvention, FunctionSignature, ParamType, Parameter, ParameterLocation,
     SignatureRecovery,
