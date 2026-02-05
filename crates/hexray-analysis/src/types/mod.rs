@@ -660,32 +660,64 @@ impl TypeInference {
     fn check_fp_mnemonic(&mut self, inst: &crate::ssa::types::SsaInstruction) {
         let mnemonic = inst.mnemonic.to_lowercase();
 
-        // Floating-point operation prefixes/patterns
-        let is_fp = mnemonic.starts_with("f") && (
-            mnemonic.starts_with("fadd") ||
-            mnemonic.starts_with("fsub") ||
-            mnemonic.starts_with("fmul") ||
-            mnemonic.starts_with("fdiv") ||
-            mnemonic.starts_with("fmov") ||
-            mnemonic.starts_with("fcmp") ||
-            mnemonic.starts_with("fcvt") ||
-            mnemonic.starts_with("fsqrt") ||
-            mnemonic.starts_with("fabs") ||
-            mnemonic.starts_with("fneg")
-        ) || mnemonic.contains("ss") || mnemonic.contains("sd") || // SSE single/double
+        // x86/x86-64 floating-point patterns
+        let is_x86_fp = mnemonic.contains("ss") || mnemonic.contains("sd") || // SSE single/double
+           mnemonic.contains("ps") || mnemonic.contains("pd") || // packed single/double
            mnemonic.starts_with("vf") || // AVX FP
-           mnemonic.starts_with("adds") || mnemonic.starts_with("addd") ||
-           mnemonic.starts_with("muls") || mnemonic.starts_with("muld");
+           mnemonic.starts_with("v") && (
+               mnemonic.contains("add") || mnemonic.contains("sub") ||
+               mnemonic.contains("mul") || mnemonic.contains("div")
+           ) && (mnemonic.contains("ss") || mnemonic.contains("sd") ||
+                 mnemonic.contains("ps") || mnemonic.contains("pd"));
+
+        // ARM64 floating-point patterns
+        let is_arm64_fp = mnemonic.starts_with("f")
+            && (mnemonic.starts_with("fadd")
+                || mnemonic.starts_with("fsub")
+                || mnemonic.starts_with("fmul")
+                || mnemonic.starts_with("fdiv")
+                || mnemonic.starts_with("fmov")
+                || mnemonic.starts_with("fcmp")
+                || mnemonic.starts_with("fcvt")
+                || mnemonic.starts_with("fsqrt")
+                || mnemonic.starts_with("fabs")
+                || mnemonic.starts_with("fneg")
+                || mnemonic.starts_with("fmadd")
+                || mnemonic.starts_with("fmsub")
+                || mnemonic.starts_with("fnmadd")
+                || mnemonic.starts_with("fnmsub")
+                || mnemonic.starts_with("frint")
+                || mnemonic.starts_with("fmax")
+                || mnemonic.starts_with("fmin"));
+
+        // ARM64 SIMD/NEON floating-point
+        let is_neon_fp = mnemonic.starts_with("scvtf") || // signed int to float
+            mnemonic.starts_with("ucvtf") || // unsigned int to float
+            mnemonic.starts_with("fcvtz") || // float to int with truncation
+            mnemonic.starts_with("fcvtn") || // float to int with nearest
+            mnemonic.starts_with("fcvta") || // float to int away from zero
+            mnemonic.starts_with("fcvtm") || // float to int minus infinity
+            mnemonic.starts_with("fcvtp"); // float to int plus infinity
+
+        let is_fp = is_x86_fp || is_arm64_fp || is_neon_fp;
 
         if is_fp {
             // Determine size from mnemonic
-            let size = if mnemonic.contains("sd")
+            // Double precision: x86 (sd/pd) or ARM64 (ends with 'd')
+            let is_double = mnemonic.contains("sd")
                 || mnemonic.contains("pd")
-                || mnemonic.ends_with("d") && mnemonic.len() > 3
-            {
+                || (mnemonic.ends_with("d") && mnemonic.len() > 3);
+
+            // Half precision: ARM64 (ends with 'h')
+            let is_half = mnemonic.ends_with("h") && mnemonic.len() > 3;
+
+            // Default to single precision (4 bytes) for ss/ps/ends with 's'/etc.
+            let size = if is_double {
                 8 // double
+            } else if is_half {
+                2 // half precision
             } else {
-                4 // single (default)
+                4 // single (default for ss/ps or ARM64 's' suffix)
             };
 
             // Mark all defs as floating-point
@@ -700,6 +732,117 @@ impl TypeInference {
                     self.constraints
                         .push((v.clone(), Constraint::IsFloat(size)));
                 }
+            }
+        }
+
+        // Additional ARM64 type inference patterns
+        self.check_arm64_patterns(inst);
+    }
+
+    /// Additional ARM64-specific type inference patterns.
+    fn check_arm64_patterns(&mut self, inst: &crate::ssa::types::SsaInstruction) {
+        let mnemonic = inst.mnemonic.to_lowercase();
+
+        // ARM64 signed/unsigned extend patterns
+        // SXTB, SXTH, SXTW - sign extend byte/half/word
+        // UXTB, UXTH, UXTW - zero extend byte/half/word
+        let is_sign_extend = mnemonic.starts_with("sxt");
+        let is_zero_extend = mnemonic.starts_with("uxt");
+
+        if is_sign_extend || is_zero_extend {
+            if let Some(def) = inst.defs.first() {
+                if is_sign_extend {
+                    self.constraints.push((def.clone(), Constraint::IsSigned));
+                } else {
+                    self.constraints.push((def.clone(), Constraint::IsUnsigned));
+                }
+            }
+            if let Some(SsaOperand::Value(src)) = inst.uses.first() {
+                if is_sign_extend {
+                    self.constraints.push((src.clone(), Constraint::IsSigned));
+                } else {
+                    self.constraints.push((src.clone(), Constraint::IsUnsigned));
+                }
+            }
+        }
+
+        // ARM64 signed vs unsigned division
+        // SDIV - signed divide, UDIV - unsigned divide
+        let is_signed_div = mnemonic == "sdiv";
+        let is_unsigned_div = mnemonic == "udiv";
+
+        if is_signed_div || is_unsigned_div {
+            for def in &inst.defs {
+                if is_signed_div {
+                    self.constraints.push((def.clone(), Constraint::IsSigned));
+                } else {
+                    self.constraints.push((def.clone(), Constraint::IsUnsigned));
+                }
+            }
+            for op in &inst.uses {
+                if let SsaOperand::Value(v) = op {
+                    if is_signed_div {
+                        self.constraints.push((v.clone(), Constraint::IsSigned));
+                    } else {
+                        self.constraints.push((v.clone(), Constraint::IsUnsigned));
+                    }
+                }
+            }
+        }
+
+        // ARM64 signed vs unsigned multiply-high
+        // SMULH - signed multiply high, UMULH - unsigned multiply high
+        let is_signed_mul = mnemonic == "smulh" || mnemonic.starts_with("smull");
+        let is_unsigned_mul = mnemonic == "umulh" || mnemonic.starts_with("umull");
+
+        if is_signed_mul || is_unsigned_mul {
+            for def in &inst.defs {
+                if is_signed_mul {
+                    self.constraints.push((def.clone(), Constraint::IsSigned));
+                } else {
+                    self.constraints.push((def.clone(), Constraint::IsUnsigned));
+                }
+            }
+            for op in &inst.uses {
+                if let SsaOperand::Value(v) = op {
+                    if is_signed_mul {
+                        self.constraints.push((v.clone(), Constraint::IsSigned));
+                    } else {
+                        self.constraints.push((v.clone(), Constraint::IsUnsigned));
+                    }
+                }
+            }
+        }
+
+        // ARM64 conditional comparisons - CCMP/CCMN
+        // These often indicate signed/unsigned based on condition codes
+        // CSET/CSINC/CSINV/CSNEG - conditional select patterns
+        if mnemonic.starts_with("cs") {
+            if let Some(def) = inst.defs.first() {
+                // Result is typically used as a boolean or small integer
+                self.constraints.push((def.clone(), Constraint::MinSize(1)));
+            }
+        }
+
+        // ASR (arithmetic shift right) indicates signed
+        // LSR (logical shift right) indicates unsigned
+        if mnemonic == "asr" || mnemonic.starts_with("asr ") {
+            for op in &inst.uses {
+                if let SsaOperand::Value(v) = op {
+                    self.constraints.push((v.clone(), Constraint::IsSigned));
+                }
+            }
+            for def in &inst.defs {
+                self.constraints.push((def.clone(), Constraint::IsSigned));
+            }
+        } else if mnemonic == "lsr" || mnemonic.starts_with("lsr ") {
+            for op in &inst.uses {
+                if let SsaOperand::Value(v) = op {
+                    self.constraints.push((v.clone(), Constraint::IsUnsigned));
+                }
+            }
+            for def in &inst.defs {
+                self.constraints.push((def.clone(), Constraint::IsUnsigned));
             }
         }
     }
@@ -2301,6 +2444,84 @@ mod tests {
         // Not STL templates
         assert!(!parser.is_stl_template("MyClass"));
         assert!(!parser.is_stl_template("boost::shared_ptr"));
+    }
+
+    #[test]
+    fn test_arm64_extend_patterns() {
+        // Test detection of ARM64 extend mnemonics
+        let sign_extend = ["sxtb", "sxth", "sxtw"];
+        let zero_extend = ["uxtb", "uxth", "uxtw"];
+
+        for mnemonic in sign_extend {
+            let m = mnemonic.to_lowercase();
+            assert!(
+                m.starts_with("sxt"),
+                "Expected {} to be detected as sign extension",
+                mnemonic
+            );
+        }
+
+        for mnemonic in zero_extend {
+            let m = mnemonic.to_lowercase();
+            assert!(
+                m.starts_with("uxt"),
+                "Expected {} to be detected as zero extension",
+                mnemonic
+            );
+        }
+    }
+
+    #[test]
+    fn test_arm64_division_patterns() {
+        // Test detection of ARM64 division signedness
+        let m1 = "sdiv".to_lowercase();
+        assert!(m1 == "sdiv", "Expected sdiv to be signed division");
+
+        let m2 = "udiv".to_lowercase();
+        assert!(m2 == "udiv", "Expected udiv to be unsigned division");
+    }
+
+    #[test]
+    fn test_arm64_shift_signedness() {
+        // ASR = arithmetic shift right = signed
+        // LSR = logical shift right = unsigned
+        let m1 = "asr".to_lowercase();
+        assert!(m1 == "asr", "ASR should indicate signed operands");
+
+        let m2 = "lsr".to_lowercase();
+        assert!(m2 == "lsr", "LSR should indicate unsigned operands");
+    }
+
+    #[test]
+    fn test_arm64_fp_patterns() {
+        // ARM64 floating-point mnemonics
+        let fp_mnemonics = [
+            "fadd", "fsub", "fmul", "fdiv", "fmov", "fcmp", "fcvt", "fsqrt", "fabs", "fneg",
+            "fmadd", "fmsub", "fnmadd", "fnmsub", "frint", "fmax", "fmin",
+        ];
+
+        for mnemonic in fp_mnemonics {
+            let m = mnemonic.to_lowercase();
+            assert!(
+                m.starts_with("f"),
+                "Expected {} to start with 'f'",
+                mnemonic
+            );
+        }
+
+        // ARM64 SIMD/NEON conversion mnemonics
+        let neon_fp = ["scvtf", "ucvtf", "fcvtzs", "fcvtzu", "fcvtns", "fcvtnu"];
+        for mnemonic in neon_fp {
+            let m = mnemonic.to_lowercase();
+            assert!(
+                m.starts_with("scvtf")
+                    || m.starts_with("ucvtf")
+                    || m.starts_with("fcvtz")
+                    || m.starts_with("fcvtn"),
+                "Expected {} to be NEON FP conversion",
+                mnemonic
+            );
+        }
     }
 
     #[test]
