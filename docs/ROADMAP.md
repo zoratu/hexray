@@ -187,7 +187,7 @@ This document outlines the development roadmap, competitive analysis, and featur
 - PR benchmark comparison workflow
 
 **Test Coverage** ✅
-- Unit tests across all crates (800+ tests)
+- Unit tests across all crates (837+ tests)
 - Property-based testing with proptest
 - Differential testing against system tools (objdump, nm, strings)
 - Snapshot testing for CLI output stability
@@ -233,9 +233,75 @@ hexray session info project.hrp
 hexray session export project.hrp --format json
 ```
 
+#### Phase 13.6: Advanced Analysis Infrastructure ✅
+
+**C++ Analysis Improvements** ✅
+- Location: `crates/hexray-analysis/src/devirtualization.rs`
+- Virtual function call devirtualization using vtables and RTTI
+- Location: `crates/hexray-analysis/src/class_reconstruction.rs`
+- C++ class reconstruction from vtables
+- Generates C++ header declarations
+- Base class and virtual method recovery
+
+**Architecture-Specific Patterns** ✅
+- Location: `crates/hexray-analysis/src/decompiler/riscv_vector.rs`
+- RISC-V Vector Extension (RVV) intrinsic patterns
+- vsetvli, vector loads/stores, arithmetic, reductions, masks
+- Location: `crates/hexray-analysis/src/decompiler/float_patterns.rs`
+- IEEE 754 floating-point pattern detection
+- NaN/infinity checks, signbit, fabs, fneg, fast_rsqrt, copysign
+
+**Quality & Testing Infrastructure** ✅
+- Location: `crates/hexray-analysis/src/decompiler/benchmark.rs`
+- Benchmark suite with ground truth comparison
+- Expected/forbidden pattern validation
+- Quality scoring against known outputs
+- Location: `crates/hexray-analysis/src/decompiler/comparison.rs`
+- Cross-decompiler comparison framework
+- Ghidra, IDA Pro, Binary Ninja output parsing
+- Structural and control flow similarity metrics
+
+**Performance Infrastructure** ✅
+- Location: `crates/hexray-analysis/src/analysis_cache.rs`
+- Analysis result caching (memory + disk)
+- Content-based cache keys with LRU eviction
+- Thread-safe shared cache for parallel analysis
+- Location: `crates/hexray-analysis/src/incremental.rs`
+- Incremental re-analysis on binary patches
+- Binary diff computation and change detection
+- Call graph-aware dependency propagation
+- Only recomputes affected functions
+
+**Test Coverage** ✅
+- 837+ unit tests in hexray-analysis
+- Property-based testing for CFG and type inference
+- Docker-based fuzzing infrastructure
+
 ---
 
 ## Remaining Work
+
+### Phase 13.7: Documentation & Tutorials
+**Status:** Planned
+
+**API Documentation:**
+- [ ] Comprehensive examples for analysis_cache module
+- [ ] Comprehensive examples for incremental analysis module
+- [ ] Examples for C++ class reconstruction APIs
+- [ ] Examples for exception handling extraction
+- [ ] Examples for devirtualization usage
+
+**Tutorials:**
+- [ ] "Getting Started with hexray" - Basic CLI usage
+- [ ] "Analyzing a C++ Binary" - Vtables, RTTI, exception handling
+- [ ] "Using the Decompiler API" - Programmatic decompilation
+- [ ] "Incremental Analysis Workflow" - Working with patched binaries
+- [ ] "Extending hexray" - Adding new analysis passes
+
+**Reference Documentation:**
+- [ ] Architecture decision records (ADRs)
+- [ ] Module dependency diagrams
+- [ ] Performance tuning guide
 
 ### Phase 14: User Interface
 **Status:** Future

@@ -87,6 +87,8 @@ pub enum OptimizationPass {
     TypeInference,
     /// Improved switch statement recovery.
     SwitchRecovery,
+    /// Handle irreducible CFG regions (gotos, state machines).
+    IrreducibleHandling,
 }
 
 impl OptimizationPass {
@@ -115,6 +117,7 @@ impl OptimizationPass {
             ConstantPropagation,
             TypeInference,
             SwitchRecovery,
+            IrreducibleHandling,
         ]
     }
 
@@ -143,6 +146,7 @@ impl OptimizationPass {
             ConstantPropagation => "constant-propagation",
             TypeInference => "type-inference",
             SwitchRecovery => "switch-recovery",
+            IrreducibleHandling => "irreducible-handling",
         }
     }
 
@@ -171,6 +175,7 @@ impl OptimizationPass {
             ConstantPropagation => "Constant folding and propagation",
             TypeInference => "Type inference improvements",
             SwitchRecovery => "Improved switch statement recovery",
+            IrreducibleHandling => "Handle irreducible CFG regions",
         }
     }
 
@@ -199,6 +204,7 @@ impl OptimizationPass {
             "constant-propagation" => Some(ConstantPropagation),
             "type-inference" => Some(TypeInference),
             "switch-recovery" => Some(SwitchRecovery),
+            "irreducible-handling" => Some(IrreducibleHandling),
             _ => None,
         }
     }
@@ -316,6 +322,7 @@ impl DecompilerConfig {
                     | DeadStoreElimination
                     | ConstantPropagation
                     | LoopCanonicalization
+                    | IrreducibleHandling
             ),
             Aggressive => {
                 // All passes enabled at aggressive level

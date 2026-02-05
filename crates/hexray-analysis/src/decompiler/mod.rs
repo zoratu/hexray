@@ -10,11 +10,14 @@
 pub mod abi;
 mod arch_patterns;
 pub mod array_detection;
+pub mod benchmark;
+pub mod comparison;
 pub mod config;
 mod constant_propagation;
 mod dead_store;
 mod emitter;
 mod expression;
+pub mod float_patterns;
 mod for_loop_detection;
 pub mod interprocedural;
 mod irreducible_cfg;
@@ -25,6 +28,7 @@ mod loop_pattern_detection;
 mod memset_idiom;
 mod naming;
 pub mod quality_metrics;
+pub mod riscv_vector;
 mod short_circuit;
 mod signature;
 mod string_patterns;
@@ -330,6 +334,9 @@ pub struct Decompiler {
     pub enable_auto_type_inference: bool,
     /// Configuration for decompiler optimization passes.
     pub config: Option<DecompilerConfig>,
+    /// Database of inter-procedural function summaries.
+    /// When set, provides type information from analyzed callees.
+    pub summary_database: Option<Arc<SummaryDatabase>>,
 }
 
 impl Default for Decompiler {
@@ -352,6 +359,7 @@ impl Default for Decompiler {
             constant_database: None,
             enable_auto_type_inference: false,
             config: None,
+            summary_database: None,
         }
     }
 }
@@ -527,6 +535,18 @@ impl Decompiler {
         self
     }
 
+    /// Sets the inter-procedural summary database.
+    ///
+    /// When set, the decompiler uses function summaries from analyzed callees
+    /// to improve type inference at call sites. This provides:
+    /// - Return type information for function calls
+    /// - Parameter type hints for callee functions
+    /// - Purity and side-effect information
+    pub fn with_summary_database(mut self, db: Arc<SummaryDatabase>) -> Self {
+        self.summary_database = Some(db);
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 0: Run type inference if enabled
@@ -545,9 +565,19 @@ impl Decompiler {
             HashMap::new()
         };
 
+        // Step 0b: Get type hints from inter-procedural analysis if available
+        let ipc_types = if let Some(ref summary_db) = self.summary_database {
+            self.extract_ipc_type_hints(summary_db, func_name)
+        } else {
+            HashMap::new()
+        };
+
         // Merge inferred types with explicitly provided types
-        // (explicit types take precedence)
-        let mut merged_types = inferred_types;
+        // Priority: explicit > inferred > inter-procedural
+        let mut merged_types = ipc_types;
+        for (k, v) in inferred_types {
+            merged_types.insert(k, v);
+        }
         for (k, v) in &self.type_info {
             merged_types.insert(k.clone(), v.clone());
         }
@@ -778,6 +808,75 @@ impl Decompiler {
         func_name.to_string()
     }
 
+    /// Extracts type hints from inter-procedural analysis.
+    ///
+    /// Uses function summaries to provide type information for:
+    /// - Return values from known function calls
+    /// - Parameter types for the current function
+    fn extract_ipc_type_hints(
+        &self,
+        summary_db: &SummaryDatabase,
+        func_name: &str,
+    ) -> HashMap<String, String> {
+        let mut hints = HashMap::new();
+
+        // Check if we have a summary for this function by name
+        if let Some(summary) = summary_db.get_summary_by_name(func_name) {
+            // Add parameter type hints
+            for (idx, param_type) in &summary.param_types {
+                let param_name = match self.calling_convention {
+                    CallingConvention::SystemV | CallingConvention::Aarch64 => {
+                        format!("arg{}", idx)
+                    }
+                    CallingConvention::Win64 => format!("arg{}", idx),
+                    CallingConvention::RiscV => format!("a{}", idx),
+                };
+                hints.insert(param_name, Self::summary_type_to_c(param_type));
+            }
+        }
+
+        hints
+    }
+
+    /// Converts a SummaryType to a C type string.
+    fn summary_type_to_c(ty: &SummaryType) -> String {
+        match ty {
+            SummaryType::Unknown => "int".to_string(),
+            SummaryType::Void => "void".to_string(),
+            SummaryType::Bool => "bool".to_string(),
+            SummaryType::SignedInt(8) => "int8_t".to_string(),
+            SummaryType::SignedInt(16) => "int16_t".to_string(),
+            SummaryType::SignedInt(32) => "int".to_string(),
+            SummaryType::SignedInt(64) => "int64_t".to_string(),
+            SummaryType::SignedInt(bits) => format!("int{}_t", bits),
+            SummaryType::UnsignedInt(8) => "uint8_t".to_string(),
+            SummaryType::UnsignedInt(16) => "uint16_t".to_string(),
+            SummaryType::UnsignedInt(32) => "uint32_t".to_string(),
+            SummaryType::UnsignedInt(64) => "uint64_t".to_string(),
+            SummaryType::UnsignedInt(bits) => format!("uint{}_t", bits),
+            SummaryType::Float(32) => "float".to_string(),
+            SummaryType::Float(64) => "double".to_string(),
+            SummaryType::Float(bits) => format!("float{}", bits),
+            SummaryType::Pointer(inner) => format!("{}*", Self::summary_type_to_c(inner)),
+            SummaryType::Array(elem, Some(len)) => {
+                format!("{}[{}]", Self::summary_type_to_c(elem), len)
+            }
+            SummaryType::Array(elem, None) => format!("{}[]", Self::summary_type_to_c(elem)),
+            SummaryType::Struct(name) => format!("struct {}", name),
+            SummaryType::FunctionPointer {
+                params,
+                return_type,
+            } => {
+                let param_str: Vec<_> = params.iter().map(Self::summary_type_to_c).collect();
+                format!(
+                    "{}(*)({})",
+                    Self::summary_type_to_c(return_type),
+                    param_str.join(", ")
+                )
+            }
+        }
+    }
+
     /// Recovers the function signature from a CFG.
     ///
     /// This performs signature recovery without generating decompiled code,
@@ -803,6 +902,43 @@ impl Decompiler {
         let mut inference = StructInference::new();
         inference.analyze(&structured.body);
         inference.structs().to_vec()
+    }
+
+    /// Decompiles a CFG and returns both the code and quality metrics.
+    ///
+    /// This combines `decompile` with `compute_metrics` for convenience.
+    /// Returns a tuple of (pseudo_code, quality_metrics).
+    pub fn decompile_with_metrics(
+        &self,
+        cfg: &ControlFlowGraph,
+        func_name: &str,
+    ) -> (String, QualityMetrics) {
+        // Get the structured representation
+        let structured = if let Some(ref config) = self.config {
+            StructuredCfg::from_cfg_with_config(cfg, config)
+        } else {
+            StructuredCfg::from_cfg(cfg)
+        };
+
+        // Compute metrics on the structured code
+        let metrics = compute_metrics(&structured.body);
+
+        // Get the decompiled code
+        let code = self.decompile(cfg, func_name);
+
+        (code, metrics)
+    }
+
+    /// Computes quality metrics for a CFG without generating code.
+    ///
+    /// This is useful for quick quality assessment or benchmarking.
+    pub fn compute_quality_metrics(&self, cfg: &ControlFlowGraph) -> QualityMetrics {
+        let structured = if let Some(ref config) = self.config {
+            StructuredCfg::from_cfg_with_config(cfg, config)
+        } else {
+            StructuredCfg::from_cfg(cfg)
+        };
+        compute_metrics(&structured.body)
     }
 
     /// Decompiles a CFG and returns both the code and inferred struct definitions.
@@ -859,7 +995,8 @@ impl Decompiler {
 ///
 /// This function wraps code in try/catch blocks based on the exception info.
 /// It identifies which nodes fall within try block address ranges and creates
-/// TryCatch nodes with appropriate catch handlers.
+/// TryCatch nodes with appropriate catch handlers. Landing pad addresses are
+/// used to extract the actual handler code from the structured output.
 fn apply_exception_handling(
     body: Vec<StructuredNode>,
     exception_info: &ExceptionInfo,
@@ -868,11 +1005,40 @@ fn apply_exception_handling(
         return body;
     }
 
+    // First, build an index of all landing pad addresses
+    let landing_pads: std::collections::HashSet<u64> = exception_info
+        .try_blocks
+        .iter()
+        .flat_map(|tb| tb.handlers.iter().map(|h| h.landing_pad))
+        .collect();
+
+    // Find nodes that belong to landing pads
+    let mut landing_pad_nodes: std::collections::HashMap<u64, Vec<StructuredNode>> =
+        std::collections::HashMap::new();
+    let mut remaining_body = Vec::new();
+
+    for node in &body {
+        if let Some((node_start, _)) = get_node_address_range(node) {
+            // Check if this node is a landing pad entry
+            if let Some(&lp_addr) = landing_pads.iter().find(|&&lp| {
+                // Node starts at or shortly after landing pad
+                node_start >= lp && node_start < lp + 32
+            }) {
+                landing_pad_nodes
+                    .entry(lp_addr)
+                    .or_default()
+                    .push(node.clone());
+                continue;
+            }
+        }
+        remaining_body.push(node.clone());
+    }
+
     let mut result = Vec::new();
     let mut i = 0;
 
-    while i < body.len() {
-        let node = &body[i];
+    while i < remaining_body.len() {
+        let node = &remaining_body[i];
 
         // Get the address range of this node
         if let Some((node_start, _node_end)) = get_node_address_range(node) {
@@ -883,13 +1049,13 @@ fn apply_exception_handling(
                 .find(|tb| node_start >= tb.start && node_start < tb.end)
             {
                 // Collect all nodes that fall within this try block
-                let mut try_body = vec![body[i].clone()];
+                let mut try_body = vec![remaining_body[i].clone()];
                 i += 1;
 
-                while i < body.len() {
-                    if let Some((next_start, _)) = get_node_address_range(&body[i]) {
+                while i < remaining_body.len() {
+                    if let Some((next_start, _)) = get_node_address_range(&remaining_body[i]) {
                         if next_start >= try_block.start && next_start < try_block.end {
-                            try_body.push(body[i].clone());
+                            try_body.push(remaining_body[i].clone());
                             i += 1;
                         } else {
                             break;
@@ -899,19 +1065,27 @@ fn apply_exception_handling(
                     }
                 }
 
-                // Create catch handlers
+                // Create catch handlers with extracted landing pad bodies
                 let catch_handlers: Vec<structurer::CatchHandler> = try_block
                     .handlers
                     .iter()
-                    .map(|h| structurer::CatchHandler {
-                        exception_type: if h.is_catch_all {
-                            None
-                        } else {
-                            h.catch_type.clone()
-                        },
-                        variable_name: Some("e".to_string()),
-                        body: vec![], // Catch body would need landing pad analysis
-                        landing_pad: h.landing_pad,
+                    .map(|h| {
+                        // Get the landing pad body if we found it
+                        let handler_body = landing_pad_nodes
+                            .get(&h.landing_pad)
+                            .cloned()
+                            .unwrap_or_default();
+
+                        structurer::CatchHandler {
+                            exception_type: if h.is_catch_all {
+                                None
+                            } else {
+                                h.catch_type.clone()
+                            },
+                            variable_name: Some("e".to_string()),
+                            body: handler_body,
+                            landing_pad: h.landing_pad,
+                        }
                     })
                     .collect();
 
@@ -925,7 +1099,7 @@ fn apply_exception_handling(
         }
 
         // Not in a try block, add as-is
-        result.push(body[i].clone());
+        result.push(remaining_body[i].clone());
         i += 1;
     }
 

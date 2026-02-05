@@ -224,6 +224,12 @@ impl StructuredCfg {
             body = detect_short_circuit(body);
         }
 
+        // Post-process to handle irreducible CFG regions
+        // Should run BEFORE goto conversion to ensure irreducible gotos are preserved
+        if config.is_pass_enabled(OptimizationPass::IrreducibleHandling) {
+            body = super::irreducible_cfg::handle_irreducible_regions(cfg, body);
+        }
+
         // Post-process to convert gotos to break/continue where applicable
         if config.is_pass_enabled(OptimizationPass::GotoConversion) {
             body = convert_gotos_to_break_continue(body, None);

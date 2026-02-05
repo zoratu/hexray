@@ -14,14 +14,20 @@
 //! - Indirect call resolution
 //! - Virtual function table (vtable) detection
 //! - Stack canary (stack protector) detection
+//! - C++ class reconstruction
+//! - Analysis result caching
 
+pub mod analysis_cache;
 pub mod callgraph;
 pub mod cfg_builder;
+pub mod class_reconstruction;
 pub mod cpp_special;
 pub mod dataflow;
 pub mod decompiler;
+pub mod devirtualization;
 pub mod exception_handling;
 pub mod function_finder;
+pub mod incremental;
 pub mod indirect_calls;
 pub mod output;
 pub mod parallel;
@@ -43,8 +49,18 @@ pub use strings::{
 };
 pub use xrefs::{Xref, XrefBuilder, XrefDatabase, XrefType};
 
+pub use analysis_cache::{
+    create_shared_cache, AnalysisCache, BinaryCacheKey, CacheConfig, CacheError, CacheResult,
+    CacheStats, CachedBasicBlock, CachedCallGraph, CachedCfg, CachedDataFlow, CachedDefUse,
+    CachedDisassembly, CachedFunction, CachedInstruction, CachedTypes, FunctionCacheKey,
+    SharedAnalysisCache,
+};
 pub use callgraph::{CallGraph, CallGraphBuilder, CallGraphNode, CallSite, CallType};
 pub use cfg_builder::CfgBuilder;
+pub use class_reconstruction::{
+    BaseClass, ClassReconstructor, DataMember, FunctionSignatureHint, MethodParameter,
+    ReconstructedClass, ReconstructedClassDatabase, ReconstructionStats, VirtualMethod,
+};
 pub use cpp_special::{
     BaseCall, CppSpecialDatabase, CppSpecialDetector, SpecialMemberAnalysis, SpecialMemberKind,
     VtableAssignment,
@@ -64,6 +80,12 @@ pub use exception_handling::{
     ExceptionExtractor, ExceptionResult,
 };
 pub use function_finder::FunctionFinder;
+pub use incremental::{
+    AffectedAnalysis, BinaryDiff, DependencyTracker, DiffStats,
+    FunctionInfo as IncrementalFunctionInfo, IncrementalAnalyzer, IncrementalAnalyzerBuilder,
+    IncrementalError, IncrementalResult, IncrementalStats, InvalidationLevel, Patch, PatchSet,
+    PatchType,
+};
 pub use output::{
     CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CfgDotExporter,
     CfgHtmlExporter, CfgJsonExporter,

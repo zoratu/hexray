@@ -138,6 +138,35 @@ Analysis passes and decompilation.
 - `StringDetector` - Finds ASCII/UTF-8/UTF-16 strings
 - `DetectedStringTable` - String address → content mapping
 
+**C++ Analysis:**
+- `VtableDatabase` - Virtual function table detection and parsing
+- `RttiDatabase` - RTTI typeinfo structure parsing
+- `ClassReconstructor` - C++ class reconstruction from vtables and RTTI
+- `CppSpecialDetector` - Constructor/destructor identification
+- `Devirtualizer` - Virtual function call devirtualization
+
+**Exception Handling:**
+- `ExceptionExtractor` - Try/catch/finally block recovery
+- `TryBlockInfo`, `CatchInfo`, `CleanupInfo` - Exception handling structures
+- Support for C++ EH (Itanium ABI) and SEH (Windows)
+
+**Analysis Caching (`analysis_cache` module):**
+- `AnalysisCache` - Persistent cache for analysis results
+- `FunctionCacheKey` - Content-based cache keys
+- Disk and memory caching with LRU eviction
+- Thread-safe shared cache via `Arc<AnalysisCache>`
+
+**Incremental Analysis (`incremental` module):**
+- `BinaryDiff` - Compute patches between binary versions
+- `DependencyTracker` - Track function boundaries and call edges
+- `IncrementalAnalyzer` - Re-analyze only affected functions
+- Call graph-aware change propagation
+
+**Quality & Testing:**
+- `QualityMetrics` - Automated decompiler output scoring
+- `BenchmarkSuite` - Ground truth comparison testing
+- `ComparisonTester` - Cross-decompiler comparison (Ghidra, IDA)
+
 **Decompilation Pipeline:**
 ```
 Instructions → CFG → SSA → Data Flow → Type Inference → Structured CFG → Expressions → Pseudo-code

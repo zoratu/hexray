@@ -27,9 +27,17 @@ cargo build --all-targets || {
 }
 
 echo ""
-echo "=== Running tests ==="
+echo "=== Running core tests ==="
 cargo test || {
     echo "ERROR: Tests failed."
+    exit 1
+}
+
+# Run property-based tests with a limited number of cases for speed
+echo ""
+echo "=== Running property tests (quick) ==="
+PROPTEST_CASES=20 cargo test -p hexray-analysis --test proptest_cfg --test proptest_types 2>/dev/null || {
+    echo "ERROR: Property tests failed."
     exit 1
 }
 

@@ -373,25 +373,58 @@ if let Some(ty) = inference.type_of(&Location::Register(0)) {
 
 ## Implemented Features
 
+### Core Analysis
 - [x] SSA-based intermediate representation
 - [x] Type inference and recovery
 - [x] Data flow analysis framework
 - [x] Data flow queries (trace backward/forward)
 - [x] Dead code elimination (SSA-based)
-- [x] Expression simplification
-- [x] Compound assignment detection
-- [x] Short-circuit boolean optimization
-- [x] Switch statement recovery
-- [x] Array access detection
-- [x] Struct field inference
 - [x] Constant propagation
 - [x] Copy propagation
 
+### Expression Quality
+- [x] Expression simplification
+- [x] Compound assignment detection
+- [x] Short-circuit boolean optimization
+- [x] Array access detection
+- [x] Struct field inference
+
+### Control Flow
+- [x] Switch statement recovery (jump tables, if-chains)
+- [x] Loop canonicalization (while, do-while, for)
+- [x] Irreducible CFG handling (node splitting, goto reduction)
+
+### C++ Support
+- [x] Virtual function table reconstruction
+- [x] RTTI parsing (Itanium ABI)
+- [x] Constructor/destructor identification
+- [x] Exception handling (try/catch/finally)
+- [x] Virtual call devirtualization
+- [x] C++ class reconstruction from vtables
+
+### Architecture-Specific
+- [x] RISC-V vector extension patterns (RVV intrinsics)
+- [x] Floating-point pattern detection (NaN, infinity, signbit, fabs)
+- [x] Architecture-specific idiom recognition
+
+### Performance & Quality
+- [x] Inter-procedural analysis
+- [x] Parallel decompilation of independent functions
+- [x] Analysis result caching (memory + disk)
+- [x] Incremental re-analysis on binary patches
+- [x] Quality metrics for automated scoring
+- [x] Benchmark suite with ground truth comparison
+
+### Debug Info Integration
+- [x] DWARF variable name extraction (parameters, locals)
+- [x] Source line number mapping
+- [x] Function boundary discovery from debug info
+- [x] Stack offset to variable name mapping
+
 ## Future Improvements
 
-- [ ] Full DWARF variable name integration
-- [ ] Inter-procedural analysis
 - [ ] Function pointer type recovery
+- [ ] GUI/TUI interface
 
 ## Module Structure
 
@@ -410,3 +443,22 @@ The decompiler is organized into focused modules:
 | `signature.rs` | Function signature recovery |
 | `naming.rs` | Variable naming heuristics |
 | `abi.rs` | ABI-specific calling conventions |
+| `irreducible_cfg.rs` | Irreducible CFG handling (node splitting, goto reduction) |
+| `interprocedural.rs` | Inter-procedural analysis and function summaries |
+| `quality_metrics.rs` | Automated output quality scoring |
+| `riscv_vector.rs` | RISC-V vector extension pattern recognition |
+| `float_patterns.rs` | IEEE 754 floating-point pattern detection |
+| `benchmark.rs` | Ground truth comparison benchmarking |
+| `comparison.rs` | Cross-decompiler comparison testing |
+
+### Analysis Infrastructure
+
+| Module | Purpose |
+|--------|---------|
+| `analysis_cache.rs` | Persistent caching of analysis results |
+| `incremental.rs` | Incremental re-analysis on binary patches |
+| `class_reconstruction.rs` | C++ class reconstruction from vtables/RTTI |
+| `devirtualization.rs` | Virtual function call devirtualization |
+| `vtable.rs` | Virtual function table detection and parsing |
+| `rtti.rs` | C++ RTTI typeinfo parsing |
+| `exception_handling.rs` | Try/catch/finally block recovery |
