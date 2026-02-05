@@ -830,6 +830,184 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .forbid_pattern(ForbiddenPattern::Goto),
     );
 
+    // Additional loop patterns
+    suite.add_case(
+        BenchmarkCase::new("loop_with_break")
+            .with_description("Loop with early exit via break")
+            .with_category("loops")
+            .with_difficulty(2)
+            .with_source("while (i < n) { if (arr[i] == target) break; i++; }")
+            .expect_pattern(ExpectedPattern::WhileLoop)
+            .expect_pattern(ExpectedPattern::Contains("break".to_string()))
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("loop_with_continue")
+            .with_description("Loop with continue to skip iterations")
+            .with_category("loops")
+            .with_difficulty(2)
+            .with_source("for (i = 0; i < n; i++) { if (arr[i] < 0) continue; sum += arr[i]; }")
+            .expect_pattern(ExpectedPattern::ForLoop)
+            .expect_pattern(ExpectedPattern::Contains("continue".to_string()))
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    // Bit manipulation patterns
+    suite.add_case(
+        BenchmarkCase::new("bit_test")
+            .with_description("Test if bit is set")
+            .with_category("bitwise")
+            .with_difficulty(2)
+            .with_source("return (x & (1 << n)) != 0;")
+            .expect_pattern(ExpectedPattern::Operator("&".to_string()))
+            .expect_pattern(ExpectedPattern::Return),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("bit_set")
+            .with_description("Set a bit")
+            .with_category("bitwise")
+            .with_difficulty(2)
+            .with_source("return x | (1 << n);")
+            .expect_pattern(ExpectedPattern::Operator("|".to_string()))
+            .expect_pattern(ExpectedPattern::Return),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("bit_clear")
+            .with_description("Clear a bit")
+            .with_category("bitwise")
+            .with_difficulty(2)
+            .with_source("return x & ~(1 << n);")
+            .expect_pattern(ExpectedPattern::Operator("&".to_string()))
+            .expect_pattern(ExpectedPattern::Return),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("is_power_of_two")
+            .with_description("Check if number is power of 2")
+            .with_category("bitwise")
+            .with_difficulty(3)
+            .with_source("return x && !(x & (x - 1));")
+            .expect_pattern(ExpectedPattern::Operator("&".to_string()))
+            .expect_pattern(ExpectedPattern::Return),
+    );
+
+    // Compound assignment patterns
+    suite.add_case(
+        BenchmarkCase::new("compound_add")
+            .with_description("Compound addition assignment")
+            .with_category("arithmetic")
+            .with_difficulty(1)
+            .with_source("sum += value;")
+            .expect_pattern(ExpectedPattern::Operator("+=".to_string())),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("increment")
+            .with_description("Increment operator")
+            .with_category("arithmetic")
+            .with_difficulty(1)
+            .with_source("i++;")
+            .expect_pattern(ExpectedPattern::Operator("++".to_string())),
+    );
+
+    // Short-circuit evaluation
+    suite.add_case(
+        BenchmarkCase::new("short_circuit_and")
+            .with_description("Short-circuit AND evaluation")
+            .with_category("conditionals")
+            .with_difficulty(2)
+            .with_source("if (ptr != NULL && ptr->value > 0) { ... }")
+            .expect_pattern(ExpectedPattern::Operator("&&".to_string()))
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("short_circuit_or")
+            .with_description("Short-circuit OR evaluation")
+            .with_category("conditionals")
+            .with_difficulty(2)
+            .with_source("if (a < 0 || b < 0) return -1;")
+            .expect_pattern(ExpectedPattern::Operator("||".to_string()))
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    // Nested struct access
+    suite.add_case(
+        BenchmarkCase::new("nested_struct_access")
+            .with_description("Nested struct field access")
+            .with_category("structs")
+            .with_difficulty(3)
+            .with_source("return rect->top_left.x + rect->bottom_right.x;")
+            .expect_pattern(ExpectedPattern::StructAccess)
+            .expect_pattern(ExpectedPattern::Return),
+    );
+
+    // Array of structs
+    suite.add_case(
+        BenchmarkCase::new("array_of_structs")
+            .with_description("Array of structs access")
+            .with_category("structs")
+            .with_difficulty(3)
+            .with_source("for (i = 0; i < n; i++) { sum += points[i].x; }")
+            .expect_pattern(ExpectedPattern::ForLoop)
+            .expect_pattern(ExpectedPattern::ArrayAccess)
+            .expect_pattern(ExpectedPattern::StructAccess)
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    // Clamp pattern
+    suite.add_case(
+        BenchmarkCase::new("clamp_pattern")
+            .with_description("Value clamping pattern")
+            .with_category("arithmetic")
+            .with_difficulty(3)
+            .with_source("if (x < lo) return lo; if (x > hi) return hi; return x;")
+            .expect_pattern(ExpectedPattern::IfElse)
+            .expect_pattern(ExpectedPattern::Return)
+            .with_min_quality(0.6),
+    );
+
+    // Bubble sort (complex algorithm)
+    suite.add_case(
+        BenchmarkCase::new("bubble_sort")
+            .with_description("Bubble sort algorithm")
+            .with_category("algorithms")
+            .with_difficulty(4)
+            .with_source(
+                r#"
+                for (int i = 0; i < n - 1; i++) {
+                    for (int j = 0; j < n - i - 1; j++) {
+                        if (arr[j] > arr[j + 1]) {
+                            int temp = arr[j];
+                            arr[j] = arr[j + 1];
+                            arr[j + 1] = temp;
+                        }
+                    }
+                }
+            "#,
+            )
+            .expect_pattern(ExpectedPattern::ForLoop)
+            .expect_pattern(ExpectedPattern::ArrayAccess)
+            .expect_pattern(ExpectedPattern::IfElse)
+            .forbid_pattern(ForbiddenPattern::Goto)
+            .with_min_quality(0.6),
+    );
+
+    // Factorial recursive (if recursive calls are detected)
+    suite.add_case(
+        BenchmarkCase::new("factorial_iterative")
+            .with_description("Factorial calculation (iterative)")
+            .with_category("algorithms")
+            .with_difficulty(2)
+            .with_source("for (int i = 1; i <= n; i++) { result *= i; }")
+            .expect_pattern(ExpectedPattern::ForLoop)
+            .expect_pattern(ExpectedPattern::Operator("*=".to_string()))
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
     suite
 }
 

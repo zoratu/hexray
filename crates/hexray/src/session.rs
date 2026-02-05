@@ -8,6 +8,9 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use hexray_analysis::{
+    create_shared_cache, CacheConfig, CacheStats, FunctionCacheKey, SharedAnalysisCache,
+};
 use rusqlite::{params, Connection};
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -19,7 +22,7 @@ use std::fs;
 use std::io::{BufWriter, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Session metadata stored in SQLite
@@ -142,6 +145,8 @@ pub struct Session {
     pager_threshold: usize,
     /// Current undo position (ID of last action that is "done")
     undo_position: Option<i64>,
+    /// Analysis cache for expensive computations
+    analysis_cache: SharedAnalysisCache,
 }
 
 impl Session {
@@ -191,6 +196,16 @@ impl Session {
             ],
         )?;
 
+        // Create analysis cache with disk persistence in session directory
+        let cache_dir = session_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".hexray_cache");
+        let cache_config = CacheConfig::default()
+            .with_disk_path(&cache_dir)
+            .with_max_age(Duration::from_secs(30 * 24 * 60 * 60)); // 30 days
+        let analysis_cache = create_shared_cache(cache_config);
+
         Ok(Self {
             conn,
             meta,
@@ -198,6 +213,7 @@ impl Session {
             session_path: session_path.to_path_buf(),
             pager_threshold: 50,
             undo_position: None,
+            analysis_cache,
         })
     }
 
@@ -267,6 +283,16 @@ impl Session {
             .ok()
             .flatten();
 
+        // Create/load analysis cache with disk persistence
+        let cache_dir = session_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(".hexray_cache");
+        let cache_config = CacheConfig::default()
+            .with_disk_path(&cache_dir)
+            .with_max_age(Duration::from_secs(30 * 24 * 60 * 60)); // 30 days
+        let analysis_cache = create_shared_cache(cache_config);
+
         Ok(Self {
             conn,
             meta,
@@ -274,6 +300,7 @@ impl Session {
             session_path: session_path.to_path_buf(),
             pager_threshold: 50,
             undo_position,
+            analysis_cache,
         })
     }
 
@@ -777,6 +804,52 @@ impl Session {
             bookmarks: self.get_all_annotations(AnnotationKind::Bookmark).len(),
         })
     }
+
+    // ==================== Analysis Cache ====================
+
+    /// Get the analysis cache for external use.
+    #[allow(dead_code)]
+    pub fn analysis_cache(&self) -> &SharedAnalysisCache {
+        &self.analysis_cache
+    }
+
+    /// Get cache statistics.
+    pub fn cache_stats(&self) -> CacheStats {
+        self.analysis_cache.stats()
+    }
+
+    /// Get cache memory usage in bytes.
+    pub fn cache_memory_usage(&self) -> usize {
+        self.analysis_cache.memory_usage()
+    }
+
+    /// Get number of cached entries.
+    pub fn cache_entry_count(&self) -> usize {
+        self.analysis_cache.entry_count()
+    }
+
+    /// Clear the analysis cache.
+    pub fn clear_cache(&self) {
+        self.analysis_cache.clear();
+    }
+
+    /// Clear expired cache entries.
+    pub fn clear_expired_cache(&self) {
+        self.analysis_cache.clear_expired();
+    }
+
+    /// Flush cache to disk.
+    pub fn flush_cache(&self) -> Result<()> {
+        self.analysis_cache
+            .flush()
+            .map_err(|e| anyhow::anyhow!("Cache flush error: {}", e))
+    }
+
+    /// Create a cache key for the given function address and code bytes.
+    #[allow(dead_code)]
+    pub fn make_cache_key(&self, address: u64, code: &[u8]) -> FunctionCacheKey {
+        FunctionCacheKey::new(address, code)
+    }
 }
 
 /// Session statistics
@@ -1053,6 +1126,43 @@ impl Repl {
                     stats.bookmarks,
                 )))
             }
+            "cache" => {
+                let subcommand = parts.get(1).copied().unwrap_or("stats");
+                match subcommand {
+                    "stats" | "info" => {
+                        let stats = self.session.cache_stats();
+                        let memory = self.session.cache_memory_usage();
+                        let entries = self.session.cache_entry_count();
+                        let hit_rate = stats.hit_rate() * 100.0;
+                        Ok(Some(format!(
+                            "Analysis Cache Statistics:\n  Entries: {}\n  Memory: {} KB\n  Hits: {}\n  Misses: {}\n  Hit rate: {:.1}%\n  Disk reads: {}\n  Disk writes: {}\n  Evictions: {}",
+                            entries,
+                            memory / 1024,
+                            stats.hits,
+                            stats.misses,
+                            hit_rate,
+                            stats.disk_reads,
+                            stats.disk_writes,
+                            stats.evictions,
+                        )))
+                    }
+                    "clear" => {
+                        self.session.clear_cache();
+                        Ok(Some("Cache cleared".to_string()))
+                    }
+                    "flush" => {
+                        self.session.flush_cache()?;
+                        Ok(Some("Cache flushed to disk".to_string()))
+                    }
+                    "expire" => {
+                        self.session.clear_expired_cache();
+                        Ok(Some("Expired entries cleared".to_string()))
+                    }
+                    _ => Ok(Some(
+                        "Usage: cache [stats|clear|flush|expire]\n  stats  - Show cache statistics\n  clear  - Clear all cached entries\n  flush  - Persist cache to disk\n  expire - Remove expired entries".to_string(),
+                    )),
+                }
+            }
             "quit" | "exit" => {
                 // This will be handled by EOF
                 println!("Session saved. Goodbye!");
@@ -1076,6 +1186,7 @@ Session:
   history [n]           Show command history (last n entries)
   recall <n> | !<n>     Show output from history entry n
   stats                 Show session statistics
+  cache [cmd]           Manage analysis cache (stats|clear|flush|expire)
   quit | exit           Save and exit
 
 Annotations:

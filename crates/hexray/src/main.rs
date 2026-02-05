@@ -12,11 +12,11 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
-    AnalysisProject, CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter,
+    AnalysisProject, BinaryDiff, CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter,
     CallGraphJsonExporter, CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
     Decompiler, DecompilerConfig, FunctionInfo, OptimizationLevel, OptimizationPass,
-    ParallelCallGraphBuilder, RelocationTable, StringConfig, StringDetector, StringTable,
-    SymbolTable, XrefBuilder, XrefType,
+    ParallelCallGraphBuilder, PatchType, RelocationTable, StringConfig, StringDetector,
+    StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -190,6 +190,19 @@ enum Commands {
     Session {
         #[command(subcommand)]
         action: SessionAction,
+    },
+    /// Compare two binary versions and show affected functions
+    Diff {
+        /// Path to the original binary
+        original: PathBuf,
+        /// Path to the modified binary
+        modified: PathBuf,
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+        /// Show detailed patch information
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -391,6 +404,17 @@ fn main() -> Result<()> {
         }
     }
 
+    // Handle diff command (doesn't use the main binary argument)
+    if let Some(Commands::Diff {
+        original,
+        modified,
+        json,
+        verbose,
+    }) = cli.command
+    {
+        return handle_diff_command(&original, &modified, json, verbose);
+    }
+
     // Get binary path (required for all other commands)
     let binary_path = cli.binary.as_ref().ok_or_else(|| {
         anyhow::anyhow!("Binary file path is required. Usage: hexray <BINARY> [COMMAND]")
@@ -539,6 +563,10 @@ fn main() -> Result<()> {
                     unreachable!("Session command should have been handled earlier");
                 }
             }
+        }
+        Some(Commands::Diff { .. }) => {
+            // Already handled before binary loading
+            unreachable!("Diff command should have been handled earlier");
         }
         None => {
             // Default: disassemble
@@ -2623,6 +2651,198 @@ fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Resul
                 Err(e) => {
                     println!("Cannot redo: {}", e);
                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Diff Command Handler
+// =============================================================================
+
+/// JSON output for diff command
+#[derive(Serialize)]
+struct JsonDiffOutput {
+    original: String,
+    modified: String,
+    stats: JsonDiffStats,
+    patches: Vec<JsonPatch>,
+    affected_functions: Vec<JsonAffectedFunction>,
+}
+
+#[derive(Serialize)]
+struct JsonDiffStats {
+    changed_regions: usize,
+    bytes_changed: usize,
+    bytes_inserted: usize,
+    bytes_deleted: usize,
+    similarity: f64,
+}
+
+#[derive(Serialize)]
+struct JsonPatch {
+    address: String,
+    old_size: usize,
+    new_size: usize,
+    patch_type: String,
+}
+
+#[derive(Serialize)]
+struct JsonAffectedFunction {
+    address: String,
+    name: String,
+    size: usize,
+}
+
+fn handle_diff_command(
+    original_path: &Path,
+    modified_path: &Path,
+    json: bool,
+    verbose: bool,
+) -> Result<()> {
+    // Read both binaries
+    let original_data = fs::read(original_path).with_context(|| {
+        format!(
+            "Failed to read original binary: {}",
+            original_path.display()
+        )
+    })?;
+    let modified_data = fs::read(modified_path).with_context(|| {
+        format!(
+            "Failed to read modified binary: {}",
+            modified_path.display()
+        )
+    })?;
+
+    // Compute the diff
+    let diff = BinaryDiff::compute(&original_data, &modified_data);
+
+    // Parse the original binary to find function symbols
+    let original_binary = match detect_format(&original_data) {
+        BinaryType::Elf => {
+            let elf = Elf::parse(&original_data).context("Failed to parse original as ELF")?;
+            Binary::Elf(elf)
+        }
+        BinaryType::MachO => {
+            let macho =
+                MachO::parse(&original_data).context("Failed to parse original as Mach-O")?;
+            Binary::MachO(macho)
+        }
+        BinaryType::Pe => {
+            let pe = Pe::parse(&original_data).context("Failed to parse original as PE")?;
+            Binary::Pe(pe)
+        }
+        BinaryType::Unknown => {
+            bail!("Unknown binary format for original file");
+        }
+    };
+
+    let fmt = original_binary.as_format();
+
+    // Find functions affected by the patches
+    let mut affected_functions: Vec<(u64, String, u64)> = Vec::new();
+    for sym in fmt.symbols() {
+        if !sym.is_function() || sym.address == 0 || sym.size == 0 {
+            continue;
+        }
+        let func_start = sym.address;
+        let func_end = sym.address + sym.size;
+
+        // Check if any patch overlaps with this function
+        if diff.patches.affects_range(func_start, func_end) {
+            let name = demangle_or_original(&sym.name);
+            affected_functions.push((sym.address, name, sym.size));
+        }
+    }
+
+    // Sort by address
+    affected_functions.sort_by_key(|(addr, _, _)| *addr);
+
+    if json {
+        let output = JsonDiffOutput {
+            original: original_path.display().to_string(),
+            modified: modified_path.display().to_string(),
+            stats: JsonDiffStats {
+                changed_regions: diff.stats.changed_regions,
+                bytes_changed: diff.stats.bytes_changed,
+                bytes_inserted: diff.stats.bytes_inserted,
+                bytes_deleted: diff.stats.bytes_deleted,
+                similarity: diff.stats.similarity,
+            },
+            patches: diff
+                .patches
+                .patches
+                .iter()
+                .map(|p| JsonPatch {
+                    address: format!("{:#x}", p.address),
+                    old_size: p.old_bytes.len(),
+                    new_size: p.new_bytes.len(),
+                    patch_type: match p.patch_type {
+                        PatchType::Insertion => "insertion".to_string(),
+                        PatchType::Deletion => "deletion".to_string(),
+                        PatchType::Replacement => "replacement".to_string(),
+                        PatchType::SizeChange => "size_change".to_string(),
+                    },
+                })
+                .collect(),
+            affected_functions: affected_functions
+                .iter()
+                .map(|(addr, name, size)| JsonAffectedFunction {
+                    address: format!("{:#x}", addr),
+                    name: name.clone(),
+                    size: *size as usize,
+                })
+                .collect(),
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Binary Diff Analysis");
+        println!("====================");
+        println!("Original: {}", original_path.display());
+        println!("Modified: {}", modified_path.display());
+        println!();
+        println!("Statistics:");
+        println!("  Changed regions:  {}", diff.stats.changed_regions);
+        println!("  Bytes changed:    {}", diff.stats.bytes_changed);
+        println!("  Bytes inserted:   {}", diff.stats.bytes_inserted);
+        println!("  Bytes deleted:    {}", diff.stats.bytes_deleted);
+        println!("  Similarity:       {:.1}%", diff.stats.similarity * 100.0);
+        println!();
+
+        if verbose && !diff.patches.is_empty() {
+            println!("Patches ({}):", diff.patches.len());
+            println!("{}", "-".repeat(60));
+            for patch in &diff.patches.patches {
+                let type_str = match patch.patch_type {
+                    PatchType::Insertion => "INSERT",
+                    PatchType::Deletion => "DELETE",
+                    PatchType::Replacement => "REPLACE",
+                    PatchType::SizeChange => "RESIZE",
+                };
+                println!(
+                    "  {:#010x}: {} ({} -> {} bytes)",
+                    patch.address,
+                    type_str,
+                    patch.old_bytes.len(),
+                    patch.new_bytes.len()
+                );
+            }
+            println!();
+        }
+
+        if affected_functions.is_empty() {
+            println!("No function symbols affected by the changes.");
+            println!(
+                "(Note: changes may affect code not covered by symbols, or the binary may be stripped)"
+            );
+        } else {
+            println!("Affected Functions ({}):", affected_functions.len());
+            println!("{}", "-".repeat(60));
+            println!("{:<18} {:<8} Name", "Address", "Size");
+            for (addr, name, size) in &affected_functions {
+                println!("{:#018x} {:<8} {}", addr, size, name);
             }
         }
     }

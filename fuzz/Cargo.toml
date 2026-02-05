@@ -9,8 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+hexray-core = { path = "../crates/hexray-core" }
 hexray-disasm = { path = "../crates/hexray-disasm", features = ["all-archs"] }
 hexray-formats = { path = "../crates/hexray-formats" }
+hexray-analysis = { path = "../crates/hexray-analysis" }
 arbitrary = { version = "1", features = ["derive"] }
 
 [[bin]]
@@ -58,6 +60,20 @@ bench = false
 [[bin]]
 name = "macho_structured"
 path = "fuzz_targets/macho_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cfg_builder"
+path = "fuzz_targets/cfg_builder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompiler"
+path = "fuzz_targets/decompiler.rs"
 test = false
 doc = false
 bench = false
