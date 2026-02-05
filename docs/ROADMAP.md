@@ -277,6 +277,34 @@ hexray session export project.hrp --format json
 - Property-based testing for CFG and type inference
 - Docker-based fuzzing infrastructure
 
+**Ground Truth Benchmark Suite** ✅
+- Location: `crates/hexray-analysis/src/decompiler/benchmark.rs`
+- 20+ benchmark cases with expected pattern validation
+- Test patterns: loops (for, while, do-while, break, continue), conditionals (if-else, switch, ternary, short-circuit), arithmetic (bit manipulation, power-of-two, clamp), algorithms (bubble sort, factorial)
+- Quality scoring against forbidden patterns (no gotos, no excessive nesting)
+
+**Multi-Language Test Fixtures** ✅
+- Location: `tests/fixtures/`
+- C patterns: loops, conditionals, structs, arithmetic
+- C++ patterns: classes, vtables, multiple inheritance, exception handling, RAII
+- Rust patterns: Option/Result, traits, closures, iterators, generics
+- D patterns: contracts, templates, scope guards, CTFE, mixins
+- Go patterns: interfaces, goroutines, channels, defer/panic/recover
+- Swift patterns: protocols, optionals, closures, enums with associated values
+
+**Decompiler Regression Tests** ✅
+- Location: `crates/hexray/tests/decompiler_regression.rs`
+- System binary decompilation validation (macOS /bin/ls, /bin/cat)
+- Stability tests for deterministic output
+- Loop detection validation
+- Crash resistance testing on edge cases
+
+**Analysis Path Fuzzing** ✅
+- Location: `fuzz/fuzz_targets/cfg_builder.rs`, `fuzz/fuzz_targets/decompiler.rs`
+- CFG construction fuzzing with arbitrary instruction sequences
+- Full decompilation pipeline fuzzing with configuration variations
+- Struct inference and optimization level permutations
+
 ---
 
 ## Remaining Work

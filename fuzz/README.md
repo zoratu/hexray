@@ -49,6 +49,13 @@ cargo install cargo-fuzz
 | `elf_parser` | Fuzzes the ELF binary format parser |
 | `macho_parser` | Fuzzes the Mach-O binary format parser |
 
+### Analysis Targets
+
+| Target | Description |
+|--------|-------------|
+| `cfg_builder` | Fuzzes the control flow graph construction from disassembled instructions |
+| `decompiler` | Fuzzes the full decompilation pipeline with various configurations |
+
 ### Structure-Aware Targets (Recommended for Deep Testing)
 
 | Target | Description |

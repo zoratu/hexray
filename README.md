@@ -104,6 +104,9 @@ hexray ./binary xrefs 0x401000
 # Detected strings
 hexray ./binary strings
 
+# Compare two binaries (incremental analysis)
+hexray diff original.bin patched.bin --json
+
 # Interactive session (persistent annotations)
 hexray session new ./binary --output project.hrp
 hexray session resume project.hrp
@@ -180,12 +183,13 @@ hexray/
 - [Architecture Overview](docs/ARCHITECTURE.md) - Crate structure and data flow
 - [Decompiler Guide](docs/DECOMPILER.md) - Decompilation pipeline details
 - [Supported Instructions](docs/INSTRUCTIONS.md) - Complete instruction reference
+- [Testing Infrastructure](docs/TESTING.md) - Ground truth benchmarks, test fixtures, fuzzing
 - [Development Roadmap](docs/ROADMAP.md) - Feature status and plans
 
 ## Development
 
 ```bash
-# Run tests
+# Run tests (1300+ tests across all crates)
 cargo test --workspace
 
 # Run with debug output
@@ -198,8 +202,24 @@ cargo bench --workspace
 ./scripts/bench-regression.sh baseline  # Save baseline
 ./scripts/bench-regression.sh compare   # Compare to baseline
 
-# Fuzz testing
+# Fuzz testing (decoders, parsers, and decompiler)
 cd fuzz && cargo +nightly fuzz run x86_64_decoder
+cd fuzz && cargo +nightly fuzz run decompiler
+
+# Run all fuzzers via Docker
+cd fuzz && ./run-fuzzers.sh --hours 2
+```
+
+### Ground Truth Testing
+
+The decompiler includes a benchmark suite with 20+ test patterns validated against expected output:
+
+```bash
+# Run decompiler regression tests
+cargo test --package hexray --test decompiler_regression
+
+# Multi-language test fixtures available in tests/fixtures/
+# C, C++, Rust, D, Go, Swift patterns for cross-compiler validation
 ```
 
 ### Local Benchmarking
