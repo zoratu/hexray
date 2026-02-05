@@ -202,14 +202,6 @@ cargo bench --workspace
 cd fuzz && cargo +nightly fuzz run x86_64_decoder
 ```
 
-### CI Pipeline
-
-The project uses GitHub Actions for continuous integration:
-- **Testing**: Multi-OS (Ubuntu, macOS) with stable Rust and MSRV (1.70)
-- **Coverage**: cargo-llvm-cov with Codecov integration
-- **Linting**: Clippy with `-D warnings`
-- **Formatting**: cargo fmt verification
-
 ### Local Benchmarking
 
 For reliable performance comparisons, run benchmarks locally on consistent hardware:
