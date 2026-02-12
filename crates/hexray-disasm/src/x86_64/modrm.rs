@@ -225,6 +225,7 @@ pub fn decode_modrm_rm(
                 displacement,
                 size: (operand_size / 8) as u8,
                 segment: None,
+                broadcast: false,
             }),
             offset,
         ));
@@ -263,6 +264,7 @@ pub fn decode_modrm_rm(
             displacement,
             size: (operand_size / 8) as u8,
             segment: None,
+            broadcast: false,
         }),
         offset,
     ))

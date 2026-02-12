@@ -108,6 +108,8 @@ pub struct MemoryRef {
     pub size: u8,
     /// Segment override (x86 specific).
     pub segment: Option<Register>,
+    /// EVEX/SVE-style memory broadcast indicator.
+    pub broadcast: bool,
 }
 
 impl MemoryRef {
@@ -120,6 +122,7 @@ impl MemoryRef {
             displacement: 0,
             size,
             segment: None,
+            broadcast: false,
         }
     }
 
@@ -132,6 +135,7 @@ impl MemoryRef {
             displacement,
             size,
             segment: None,
+            broadcast: false,
         }
     }
 
@@ -144,6 +148,7 @@ impl MemoryRef {
             displacement: address,
             size,
             segment: None,
+            broadcast: false,
         }
     }
 
@@ -162,12 +167,19 @@ impl MemoryRef {
             displacement,
             size,
             segment: None,
+            broadcast: false,
         }
     }
 
     /// Sets the segment override.
     pub fn with_segment(mut self, segment: Register) -> Self {
         self.segment = Some(segment);
+        self
+    }
+
+    /// Sets EVEX-style broadcast indicator.
+    pub fn with_broadcast(mut self, broadcast: bool) -> Self {
+        self.broadcast = broadcast;
         self
     }
 }
@@ -215,7 +227,11 @@ impl std::fmt::Display for Operand {
                     }
                 }
 
-                write!(f, "]")
+                write!(f, "]")?;
+                if mem.broadcast {
+                    write!(f, "{{bcst}}")?;
+                }
+                Ok(())
             }
             Self::PcRelative { target, .. } => write!(f, "{:#x}", target),
         }
@@ -340,6 +356,7 @@ mod tests {
         assert_eq!(mem.displacement, 0);
         assert_eq!(mem.size, 8);
         assert!(mem.segment.is_none());
+        assert!(!mem.broadcast);
     }
 
     #[test]
@@ -392,6 +409,13 @@ mod tests {
         let mem = MemoryRef::base(base, 8).with_segment(fs);
 
         assert!(mem.segment.is_some());
+    }
+
+    #[test]
+    fn test_memoryref_with_broadcast() {
+        let base = make_reg(0, 64);
+        let mem = MemoryRef::base(base, 4).with_broadcast(true);
+        assert!(mem.broadcast);
     }
 
     // --- Display Tests ---
@@ -478,6 +502,15 @@ mod tests {
         let op = Operand::Memory(mem);
         let display = format!("{}", op);
         assert_eq!(display, "[rax + rcx*8 + 0x100]");
+    }
+
+    #[test]
+    fn test_operand_display_memory_broadcast() {
+        let reg = make_reg(0, 64); // rax
+        let mem = MemoryRef::base(reg, 4).with_broadcast(true);
+        let op = Operand::Memory(mem);
+        let display = format!("{}", op);
+        assert_eq!(display, "[rax]{bcst}");
     }
 
     #[test]

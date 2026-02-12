@@ -26,7 +26,10 @@ pub use liveness::LivenessAnalysis;
 pub use queries::{DataFlowQuery, DataFlowQueryEngine, DataFlowResult, DataFlowRole, DataFlowStep};
 pub use reaching_defs::ReachingDefinitions;
 
-use hexray_core::{BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation, Register};
+use hexray_core::{
+    register::{arm64, riscv, x86},
+    Architecture, BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation, Register,
+};
 use std::collections::HashMap;
 
 /// A location (register or memory) that can be defined or used.
@@ -144,11 +147,10 @@ impl InstructionEffects {
 
             // Call: uses arguments, defines return value
             Operation::Call => {
-                // TODO: ABI-specific handling
-                // For now, conservatively assume it uses/defines common registers
                 for op in &inst.operands {
                     effects.add_use(op);
                 }
+                effects.add_call_abi_effects(inst);
             }
 
             // Return: uses return value register
@@ -212,6 +214,73 @@ impl InstructionEffects {
         }
     }
 
+    fn add_call_abi_effects(&mut self, inst: &Instruction) {
+        let Some(arch) = infer_arch_from_operands(inst) else {
+            return;
+        };
+
+        match arch {
+            Architecture::X86_64 | Architecture::X86 => {
+                // SysV-style integer argument registers.
+                for reg in [x86::RDI, x86::RSI, x86::RDX, x86::RCX, x86::R8, x86::R9] {
+                    self.uses.push(Location::Register(reg));
+                }
+                // Caller-saved GPRs + return register.
+                for reg in [
+                    x86::RAX,
+                    x86::RCX,
+                    x86::RDX,
+                    x86::RSI,
+                    x86::RDI,
+                    x86::R8,
+                    x86::R9,
+                    x86::R10,
+                    x86::R11,
+                ] {
+                    self.defs.push(Location::Register(reg));
+                }
+            }
+            Architecture::Arm64 => {
+                // AArch64 AAPCS argument registers x0-x7.
+                for reg in arm64::X0..=7 {
+                    self.uses.push(Location::Register(reg));
+                }
+                // Caller-saved x0-x17 (x0 is return value).
+                for reg in arm64::X0..=17 {
+                    self.defs.push(Location::Register(reg));
+                }
+            }
+            Architecture::RiscV64 | Architecture::RiscV32 => {
+                // RISC-V a0-a7 arguments.
+                for reg in riscv::X10..=riscv::X17 {
+                    self.uses.push(Location::Register(reg));
+                }
+                // Caller-saved: ra, t0-t6, a0-a7.
+                for reg in [
+                    riscv::X1,
+                    riscv::X5,
+                    riscv::X6,
+                    riscv::X7,
+                    riscv::X10,
+                    riscv::X11,
+                    riscv::X12,
+                    riscv::X13,
+                    riscv::X14,
+                    riscv::X15,
+                    riscv::X16,
+                    riscv::X17,
+                    riscv::X28,
+                    riscv::X29,
+                    riscv::X30,
+                    riscv::X31,
+                ] {
+                    self.defs.push(Location::Register(reg));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn add_use(&mut self, operand: &Operand) {
         match operand {
             Operand::Register(reg) => {
@@ -258,6 +327,22 @@ fn is_stack_pointer(reg_id: u16) -> bool {
 fn is_frame_pointer(reg_id: u16) -> bool {
     // x86_64: RBP = 5, ARM64: FP (x29) = 29
     reg_id == 5 || reg_id == 29
+}
+
+fn infer_arch_from_operands(inst: &Instruction) -> Option<Architecture> {
+    fn arch_from_operand(op: &Operand) -> Option<Architecture> {
+        match op {
+            Operand::Register(r) => Some(r.arch),
+            Operand::Memory(mem) => mem
+                .base
+                .as_ref()
+                .map(|r| r.arch)
+                .or_else(|| mem.index.as_ref().map(|r| r.arch)),
+            _ => None,
+        }
+    }
+
+    inst.operands.iter().find_map(arch_from_operand)
 }
 
 /// Trait for dataflow analyses that compute per-block information.
@@ -582,6 +667,7 @@ mod tests {
                 displacement: -8,
                 size: 8,
                 segment: None,
+                broadcast: false,
             }),
         ];
 
@@ -609,6 +695,7 @@ mod tests {
                 displacement: -8,
                 size: 8,
                 segment: None,
+                broadcast: false,
             }),
         ];
 
@@ -656,6 +743,21 @@ mod tests {
                     .iter()
                     .all(|l| !matches!(l, Location::Register(_)))
         );
+    }
+
+    #[test]
+    fn test_instruction_effects_call_abi_x86_64() {
+        let mut inst = Instruction::new(0x1000, 2, vec![0xff, 0xd0], "call");
+        inst.operation = Operation::Call;
+        let target = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        inst.operands = vec![Operand::Register(target)];
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.uses.contains(&Location::Register(x86::RDI)));
+        assert!(effects.uses.contains(&Location::Register(x86::RSI)));
+        assert!(effects.defs.contains(&Location::Register(x86::RAX)));
+        assert!(effects.defs.contains(&Location::Register(x86::R11)));
     }
 
     #[test]

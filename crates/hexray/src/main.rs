@@ -1495,12 +1495,19 @@ fn load_type_database(
         }
         "auto" => {
             // Detect based on binary format
-            posix::load_posix_types(&mut db);
-            libc::load_libc_functions(&mut db);
             match binary {
-                Binary::Elf(_) => linux::load_linux_types(&mut db),
-                Binary::MachO(_) => macos::load_macos_types(&mut db),
-                Binary::Pe(_) => {} // TODO: Windows types
+                Binary::Elf(_) => {
+                    posix::load_posix_types(&mut db);
+                    linux::load_linux_types(&mut db);
+                    libc::load_libc_functions(&mut db);
+                }
+                Binary::MachO(_) => {
+                    posix::load_posix_types(&mut db);
+                    macos::load_macos_types(&mut db);
+                    libc::load_libc_functions(&mut db);
+                }
+                // Keep empty until Win32/NT type libraries are added.
+                Binary::Pe(_) => {}
             }
         }
         _ => bail!(

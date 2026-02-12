@@ -2051,10 +2051,13 @@ impl X86_64Disassembler {
             return Some((Operand::Register(decode_xmm(rm_reg, vector_size)), 0));
         }
 
-        // Memory operand - use standard decoding but potentially with broadcast
-        // For now, just use standard memory decoding
-        // TODO: Add broadcast indicator to memory operand
-        decode_modrm_rm(bytes, modrm, prefixes, vector_size)
+        // Memory operand: propagate EVEX.b when used as broadcast.
+        let (operand, consumed) = decode_modrm_rm(bytes, modrm, prefixes, vector_size)?;
+        let operand = match operand {
+            Operand::Memory(mem) => Operand::Memory(mem.with_broadcast(evex.broadcast)),
+            other => other,
+        };
+        Some((operand, consumed))
     }
 
     /// Format EVEX mnemonic with opmask and zeroing suffix.
@@ -3897,6 +3900,27 @@ mod tests {
         assert_eq!(result.instruction.mnemonic, "vmovaps");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
+    }
+
+    #[test]
+    fn test_evex_memory_operand_broadcast_flag() {
+        let disasm = X86_64Disassembler::new();
+        let prefixes = Prefixes::default();
+        // mod=00, reg=000, rm=000 => memory [rax] with no displacement
+        let modrm = ModRM::parse_evex(0x00, &super::super::Evex::default());
+        let evex = super::super::Evex {
+            broadcast: true,
+            ..Default::default()
+        };
+
+        let (operand, consumed) = disasm
+            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512)
+            .expect("expected decoded operand");
+        assert_eq!(consumed, 0);
+        match operand {
+            Operand::Memory(mem) => assert!(mem.broadcast),
+            _ => panic!("expected memory operand"),
+        }
     }
 
     // ==========================================================================

@@ -854,6 +854,7 @@ mod tests {
                 displacement: disp,
                 size: 8,
                 segment: None,
+                broadcast: false,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 3,
@@ -878,6 +879,7 @@ mod tests {
                 displacement: disp,
                 size: 8,
                 segment: None,
+                broadcast: false,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 6,
