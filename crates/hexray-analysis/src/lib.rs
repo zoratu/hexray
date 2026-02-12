@@ -71,8 +71,8 @@ pub use dataflow::{
     ReachingDefinitions,
 };
 pub use decompiler::{
-    CallingConvention, CatchInfo, CleanupInfo, Decompiler, DecompilerConfig, ExceptionInfo,
-    FunctionSignature, OptimizationLevel, OptimizationPass, ParamType, Parameter,
+    BinaryDataContext, CallingConvention, CatchInfo, CleanupInfo, Decompiler, DecompilerConfig,
+    ExceptionInfo, FunctionSignature, OptimizationLevel, OptimizationPass, ParamType, Parameter,
     ParameterLocation, RelocationTable, SignatureRecovery, StringTable, SymbolTable, TryBlockInfo,
 };
 pub use exception_handling::{

@@ -105,6 +105,50 @@ pub struct CleanupInfo {
     pub landing_pad: u64,
 }
 
+/// Binary data context for jump table reconstruction.
+///
+/// This provides access to read-only data sections needed for switch
+/// statement recovery (reading jump table entries from .rodata, __const, etc.)
+#[derive(Debug, Clone, Default)]
+pub struct BinaryDataContext {
+    /// Pairs of (base_address, data) for each data section.
+    sections: Vec<(u64, Vec<u8>)>,
+}
+
+impl BinaryDataContext {
+    /// Creates a new empty binary data context.
+    pub fn new() -> Self {
+        Self {
+            sections: Vec::new(),
+        }
+    }
+
+    /// Adds a data section.
+    pub fn add_section(&mut self, base: u64, data: Vec<u8>) {
+        self.sections.push((base, data));
+    }
+
+    /// Returns the section containing the given address.
+    pub fn section_containing(&self, addr: u64) -> Option<(&[u8], u64)> {
+        for (base, data) in &self.sections {
+            if addr >= *base && addr < *base + data.len() as u64 {
+                return Some((data, *base));
+            }
+        }
+        None
+    }
+
+    /// Returns an iterator over all sections.
+    pub fn sections(&self) -> impl Iterator<Item = &(u64, Vec<u8>)> {
+        self.sections.iter()
+    }
+
+    /// Returns true if the context contains no sections.
+    pub fn is_empty(&self) -> bool {
+        self.sections.is_empty()
+    }
+}
+
 /// String table for resolving addresses to string literals.
 #[derive(Debug, Clone, Default)]
 pub struct StringTable {
@@ -337,6 +381,9 @@ pub struct Decompiler {
     /// Database of inter-procedural function summaries.
     /// When set, provides type information from analyzed callees.
     pub summary_database: Option<Arc<SummaryDatabase>>,
+    /// Binary data context for jump table reconstruction.
+    /// When set, enables proper switch statement recovery by reading jump tables.
+    pub binary_data: Option<BinaryDataContext>,
 }
 
 impl Default for Decompiler {
@@ -360,6 +407,7 @@ impl Default for Decompiler {
             enable_auto_type_inference: false,
             config: None,
             summary_database: None,
+            binary_data: None,
         }
     }
 }
@@ -547,6 +595,16 @@ impl Decompiler {
         self
     }
 
+    /// Sets the binary data context for jump table reconstruction.
+    ///
+    /// When set, enables proper switch statement recovery by providing access
+    /// to read-only data sections (.rodata, __const, .rdata) where jump
+    /// tables are typically stored.
+    pub fn with_binary_data(mut self, ctx: BinaryDataContext) -> Self {
+        self.binary_data = Some(ctx);
+        self
+    }
+
     /// Decompiles a CFG to pseudo-code.
     pub fn decompile(&self, cfg: &ControlFlowGraph, func_name: &str) -> String {
         // Step 0: Run type inference if enabled
@@ -584,9 +642,17 @@ impl Decompiler {
 
         // Step 1: Structure the control flow
         let structured = if let Some(ref config) = self.config {
-            StructuredCfg::from_cfg_with_config(cfg, config)
+            StructuredCfg::from_cfg_with_config_and_binary_data(
+                cfg,
+                config,
+                self.binary_data.as_ref(),
+            )
         } else {
-            StructuredCfg::from_cfg(cfg)
+            StructuredCfg::from_cfg_with_config_and_binary_data(
+                cfg,
+                &config::DecompilerConfig::default(),
+                self.binary_data.as_ref(),
+            )
         };
 
         // Step 2: Apply struct inference if enabled

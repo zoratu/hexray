@@ -1884,8 +1884,12 @@ pub fn resolve_adrp_patterns(exprs: Vec<Expr>) -> Vec<Expr> {
     let mut i = 0;
 
     while i < exprs.len() {
-        // Look for ADRP pattern: reg = page_address (from adrp mnemonic tracking)
-        if let Some(combined) = try_combine_adrp_add(&exprs, i) {
+        // Try ADRP + LDR pattern first (for GOT loads)
+        if let Some(combined) = try_combine_adrp_ldr(&exprs, i) {
+            result.push(combined);
+            i += 2; // Skip both adrp and ldr
+                    // Then try ADRP + ADD pattern
+        } else if let Some(combined) = try_combine_adrp_add(&exprs, i) {
             result.push(combined);
             i += 2; // Skip both adrp and add
         } else {
@@ -1895,6 +1899,42 @@ pub fn resolve_adrp_patterns(exprs: Vec<Expr>) -> Vec<Expr> {
     }
 
     result
+}
+
+/// Tries to combine an ADRP + LDR pattern at position i.
+///
+/// Typical ARM64 sequence:
+/// - `xN = page_addr` (ADRP)
+/// - `xM = *(xN + offset)` (LDR)
+///
+/// This is lowered to a single GotRef-based assignment so later symbol resolution
+/// can print a named global instead of raw page math.
+fn try_combine_adrp_ldr(exprs: &[Expr], i: usize) -> Option<Expr> {
+    if i + 1 >= exprs.len() {
+        return None;
+    }
+
+    // First expression should be: reg = page_address (ADRP result)
+    let (adrp_reg, page_addr) = match_adrp_assignment(&exprs[i])?;
+
+    // Second expression should be: dst = *(reg + offset) or dst = *reg
+    let (dst_reg, ldr_base, ldr_offset, ldr_size) = match_ldr_assignment(&exprs[i + 1])?;
+
+    // The LDR base register must match ADRP destination register.
+    if adrp_reg != ldr_base {
+        return None;
+    }
+
+    let combined_addr = page_addr.wrapping_add(ldr_offset as u64);
+
+    Some(Expr::assign(
+        Expr::var(Variable {
+            name: dst_reg,
+            kind: VarKind::Register(0),
+            size: 8,
+        }),
+        Expr::got_ref(combined_addr, 0, ldr_size, exprs[i + 1].clone()),
+    ))
 }
 
 /// Tries to combine an ADRP + ADD pattern at position i.
@@ -1926,6 +1966,41 @@ fn try_combine_adrp_add(exprs: &[Expr], i: usize) -> Option<Expr> {
         }),
         Expr::int(combined_addr as i128),
     ))
+}
+
+/// Matches an LDR-style assignment: dst = *(base + offset) or dst = *base.
+fn match_ldr_assignment(expr: &Expr) -> Option<(String, String, i128, u8)> {
+    if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+        let dst_reg = if let ExprKind::Var(v) = &lhs.kind {
+            v.name.clone()
+        } else {
+            return None;
+        };
+
+        if let ExprKind::Deref { addr, size } = &rhs.kind {
+            match &addr.kind {
+                ExprKind::Var(v) => {
+                    return Some((dst_reg, v.name.clone(), 0, *size));
+                }
+                ExprKind::BinOp {
+                    op: BinOpKind::Add,
+                    left,
+                    right,
+                } => {
+                    if let (ExprKind::Var(v), ExprKind::IntLit(offset)) = (&left.kind, &right.kind)
+                    {
+                        return Some((dst_reg, v.name.clone(), *offset, *size));
+                    }
+                    if let (ExprKind::IntLit(offset), ExprKind::Var(v)) = (&left.kind, &right.kind)
+                    {
+                        return Some((dst_reg, v.name.clone(), *offset, *size));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Matches an ADRP assignment: reg = page_address

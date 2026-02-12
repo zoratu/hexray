@@ -1145,8 +1145,10 @@ impl<'a> Structurer<'a> {
         block_id: BasicBlockId,
         block: &BasicBlock,
     ) -> StructuredNode {
-        let cond_expr =
-            self.rewrite_condition_call_return_alias(block_id, condition_to_expr_with_block(condition, block));
+        let cond_expr = self.rewrite_condition_call_return_alias(
+            block_id,
+            condition_to_expr_with_block(condition, block),
+        );
 
         // Find join point
         let join = self.find_join_point(true_target, false_target, region_end);
@@ -1295,13 +1297,7 @@ impl<'a> Structurer<'a> {
 
         // Return the first one in reverse post-order (closest to switch)
         let rpo = self.cfg.reverse_post_order();
-        for block in rpo {
-            if common.contains(&block) {
-                return Some(block);
-            }
-        }
-
-        None
+        rpo.into_iter().find(|&block| common.contains(&block))
     }
 
     fn find_join_point(
@@ -1568,8 +1564,8 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
 /// that conditions like `test eax, eax` display as `if (ebx == 0)` when we've merged
 /// the call into `ebx = func()`.
 fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
-    use hexray_core::Operand;
     use super::expression::{VarKind, Variable};
+    use hexray_core::Operand;
 
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
     let mut at_block_start = true;
@@ -3194,7 +3190,10 @@ fn merge_return_value_captures_with_counter(
 }
 
 /// Recursively applies return value capture merging to nested structures.
-fn merge_return_value_captures_node(node: StructuredNode, capture_counter: &mut u32) -> StructuredNode {
+fn merge_return_value_captures_node(
+    node: StructuredNode,
+    capture_counter: &mut u32,
+) -> StructuredNode {
     match node {
         StructuredNode::If {
             condition,
@@ -3203,7 +3202,8 @@ fn merge_return_value_captures_node(node: StructuredNode, capture_counter: &mut 
         } => StructuredNode::If {
             condition,
             then_body: merge_return_value_captures_with_counter(then_body, capture_counter),
-            else_body: else_body.map(|nodes| merge_return_value_captures_with_counter(nodes, capture_counter)),
+            else_body: else_body
+                .map(|nodes| merge_return_value_captures_with_counter(nodes, capture_counter)),
         },
         StructuredNode::While {
             condition,
@@ -3259,18 +3259,27 @@ fn merge_return_value_captures_node(node: StructuredNode, capture_counter: &mut 
             value,
             cases: cases
                 .into_iter()
-                .map(|(vals, body)| (vals, merge_return_value_captures_with_counter(body, capture_counter)))
+                .map(|(vals, body)| {
+                    (
+                        vals,
+                        merge_return_value_captures_with_counter(body, capture_counter),
+                    )
+                })
                 .collect(),
-            default: default.map(|nodes| merge_return_value_captures_with_counter(nodes, capture_counter)),
+            default: default
+                .map(|nodes| merge_return_value_captures_with_counter(nodes, capture_counter)),
         },
-        StructuredNode::Sequence(nodes) => {
-            StructuredNode::Sequence(merge_return_value_captures_with_counter(nodes, capture_counter))
-        }
+        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
+            merge_return_value_captures_with_counter(nodes, capture_counter),
+        ),
         other => other,
     }
 }
 
-fn capture_return_register_uses_in_block(statements: Vec<Expr>, capture_counter: &mut u32) -> Vec<Expr> {
+fn capture_return_register_uses_in_block(
+    statements: Vec<Expr>,
+    capture_counter: &mut u32,
+) -> Vec<Expr> {
     use super::expression::{ExprKind, VarKind, Variable};
 
     let mut stmts = statements;
@@ -3292,7 +3301,11 @@ fn capture_return_register_uses_in_block(statements: Vec<Expr>, capture_counter:
             continue;
         }
 
-        let primary_reg = next_regs.iter().next().cloned().unwrap_or_else(|| "x0".to_string());
+        let primary_reg = next_regs
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "x0".to_string());
         let aliases = return_register_aliases(&primary_reg);
         let reg_size = if matches!(primary_reg.as_str(), "eax" | "w0") {
             4
@@ -3431,7 +3444,7 @@ fn substitute_return_register_uses(expr: Expr, aliases: &[String], replacement: 
         match expr.kind {
             ExprKind::Var(v) => {
                 let lower = v.name.to_lowercase();
-                if !in_plain_lhs && aliases.iter().any(|n| *n == lower) {
+                if !in_plain_lhs && aliases.contains(&lower) {
                     replacement.clone()
                 } else {
                     Expr::var(v)
@@ -3445,8 +3458,12 @@ fn substitute_return_register_uses(expr: Expr, aliases: &[String], replacement: 
             ExprKind::UnaryOp { op, operand } => {
                 Expr::unary(op, sub(*operand, aliases, replacement, false))
             }
-            ExprKind::Deref { addr, size } => Expr::deref(sub(*addr, aliases, replacement, false), size),
-            ExprKind::AddressOf(inner) => Expr::address_of(sub(*inner, aliases, replacement, false)),
+            ExprKind::Deref { addr, size } => {
+                Expr::deref(sub(*addr, aliases, replacement, false), size)
+            }
+            ExprKind::AddressOf(inner) => {
+                Expr::address_of(sub(*inner, aliases, replacement, false))
+            }
             ExprKind::ArrayAccess {
                 base,
                 index,
@@ -5927,10 +5944,7 @@ mod tests {
             name: "arg0".to_string(),
             size: 8,
         });
-        let use_stmt = Expr::assign(
-            Expr::var(Variable::reg("tmp0", 8)),
-            Expr::deref(arg0, 4),
-        );
+        let use_stmt = Expr::assign(Expr::var(Variable::reg("tmp0", 8)), Expr::deref(arg0, 4));
 
         let mut counter = 0u32;
         let out = capture_return_register_uses_in_block(vec![call, use_stmt], &mut counter);

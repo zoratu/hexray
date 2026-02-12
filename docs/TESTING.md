@@ -321,12 +321,12 @@ As of the latest release:
 
 ## Continuous Integration
 
-Tests run automatically on every push and pull request via GitHub Actions:
+This project uses local and self-hosted CI workflows (no GitHub Actions required):
 
-1. **Build Matrix**: Ubuntu + macOS
-2. **Rust Versions**: Stable + MSRV (1.70)
-3. **Checks**: clippy, rustfmt, tests, benchmarks
-4. **Coverage**: cargo-llvm-cov with Codecov upload
+1. **Fast tier**: `scripts/ci-local --tier fast`
+2. **Medium tier**: `scripts/ci-local --tier medium`
+3. **Full tier**: `scripts/ci-local --tier full`
+4. **Cross-arch Docker matrix**: `scripts/ci-cross-docker` (or `scripts/ci-local --tier full --cross`)
 
 ## Adding New Tests
 

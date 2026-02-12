@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::expression::{BinOpKind, Expr, ExprKind};
 use super::structurer::StructuredNode;
+use super::BinaryDataContext;
 
 /// Information about a detected switch statement.
 #[derive(Debug, Clone)]
@@ -66,10 +67,12 @@ pub struct JumpTableInfo {
 /// Switch statement recovery analyzer.
 pub struct SwitchRecovery<'a> {
     cfg: &'a ControlFlowGraph,
-    /// Binary data for reading jump tables (optional).
+    /// Binary data for reading jump tables (optional, legacy single-section).
     binary_data: Option<&'a [u8]>,
-    /// Base address of the binary data section.
+    /// Base address of the binary data section (legacy single-section).
     data_base: u64,
+    /// Binary data context for multi-section lookup (preferred).
+    binary_ctx: Option<&'a BinaryDataContext>,
 }
 
 impl<'a> SwitchRecovery<'a> {
@@ -79,13 +82,20 @@ impl<'a> SwitchRecovery<'a> {
             cfg,
             binary_data: None,
             data_base: 0,
+            binary_ctx: None,
         }
     }
 
-    /// Sets the binary data for jump table reading.
+    /// Sets the binary data for jump table reading (single section, legacy API).
     pub fn with_binary_data(mut self, data: &'a [u8], base: u64) -> Self {
         self.binary_data = Some(data);
         self.data_base = base;
+        self
+    }
+
+    /// Sets the binary data context for jump table reading (multi-section, preferred).
+    pub fn with_binary_context(mut self, ctx: &'a BinaryDataContext) -> Self {
+        self.binary_ctx = Some(ctx);
         self
     }
 
@@ -183,49 +193,189 @@ impl<'a> SwitchRecovery<'a> {
         let mut entry_size: u8 = 4; // Default to 4-byte entries
         let is_relative = true;
 
-        // Scan instructions for patterns
-        for inst in &block.instructions {
-            match inst.operation {
-                // Look for comparison (bounds check)
-                Operation::Compare => {
-                    if inst.operands.len() >= 2 {
-                        switch_var = Some(Expr::from_operand(&inst.operands[0]));
-                        if let Operand::Immediate(imm) = &inst.operands[1] {
-                            // The comparison value is the maximum case value
-                            bound_check = Some((imm.value as i64, BasicBlockId::new(0)));
-                            // Default block TBD
+        // Helper function to scan a block for patterns
+        // We scan in reverse to find the comparison closest to the branch (the actual bounds check)
+        let scan_block = |block: &BasicBlock,
+                          switch_var: &mut Option<Expr>,
+                          bound_check: &mut Option<(i64, BasicBlockId)>,
+                          table_base: &mut Option<u64>,
+                          entry_size: &mut u8| {
+            // First pass (forward): find table base and entry size
+            for inst in &block.instructions {
+                match inst.operation {
+                    // Look for LEA (table base address)
+                    Operation::LoadEffectiveAddress => {
+                        if inst.operands.len() >= 2 {
+                            match &inst.operands[1] {
+                                Operand::PcRelative { target, .. } => {
+                                    *table_base = Some(*target);
+                                }
+                                // Also handle memory operand with PC-relative base
+                                Operand::Memory(mem) => {
+                                    if let Some(ref base_reg) = mem.base {
+                                        // Check if base is the program counter (RIP on x86_64)
+                                        if base_reg.name().to_lowercase() == "rip"
+                                            || base_reg.id == 16
+                                        {
+                                            // Calculate absolute address from instruction address + displacement
+                                            let inst_end = inst.address + inst.bytes.len() as u64;
+                                            let target =
+                                                inst_end.wrapping_add(mem.displacement as u64);
+                                            *table_base = Some(target);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
+                    }
+
+                    // Look for load with scaled index (table access)
+                    Operation::Load | Operation::Move => {
+                        if let Some(Operand::Memory(mem)) = inst.operands.get(1) {
+                            if mem.index.is_some() && mem.scale > 1 {
+                                *entry_size = mem.scale;
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+
+            // Second pass (reverse): find the bounds check comparison closest to terminator
+            // This avoids picking up stack frame setup instructions like "sub $0x10, %rsp"
+            let mut cmp_register_name: Option<String> = None;
+
+            for inst in block.instructions.iter().rev() {
+                match inst.operation {
+                    // Look for comparison (bounds check) - but only if we don't have one yet
+                    Operation::Compare | Operation::Sub => {
+                        if bound_check.is_none() && inst.operands.len() >= 2 {
+                            // Check if second operand is an immediate that looks like a small switch bound
+                            // (large values like stack frame size should be ignored)
+                            if let Operand::Immediate(imm) = &inst.operands[1] {
+                                let value = imm.value as i64;
+                                // Reasonable switch bounds are typically < 256
+                                // Stack frame sizes are often multiples of 8 or 16 (like 0x10, 0x20, etc)
+                                if (0..256).contains(&value) {
+                                    *bound_check = Some((value, BasicBlockId::new(0)));
+                                    // Remember which register is being compared
+                                    if let Operand::Register(reg) = &inst.operands[0] {
+                                        cmp_register_name = Some(reg.name().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // If we found a comparison, try to trace back to find the actual switch value
+            // Look for a load/move that defines the comparison register
+            if let Some(ref reg_name) = cmp_register_name {
+                // Scan forward through instructions to find the definition of the comparison register
+                for inst in &block.instructions {
+                    match inst.operation {
+                        Operation::Load | Operation::Move => {
+                            // Check if this instruction defines the comparison register
+                            if let Some(Operand::Register(dst)) = inst.operands.first() {
+                                let dst_name = dst.name().to_string();
+                                // Check if this defines our register (handle eax/rax aliasing)
+                                if dst_name == *reg_name
+                                    || (dst_name == "eax" && reg_name == "rax")
+                                    || (dst_name == "rax" && reg_name == "eax")
+                                {
+                                    // Found the definition - use the source as switch value
+                                    if let Some(src) = inst.operands.get(1) {
+                                        *switch_var = Some(Expr::from_operand(src));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
 
-                // Look for LEA (table base address)
-                Operation::LoadEffectiveAddress => {
-                    if inst.operands.len() >= 2 {
-                        if let Operand::PcRelative { target, .. } = &inst.operands[1] {
-                            table_base = Some(*target);
+                // If we still don't have a switch_var, use the register directly
+                // but try to make it a named argument if it's a calling convention register
+                if switch_var.is_none() {
+                    let var_name = match reg_name.as_str() {
+                        "edi" | "rdi" => "arg0".to_string(),
+                        "esi" | "rsi" => "arg1".to_string(),
+                        "edx" | "rdx" => "arg2".to_string(),
+                        "ecx" | "rcx" => "arg3".to_string(),
+                        "r8d" | "r8" => "arg4".to_string(),
+                        "r9d" | "r9" => "arg5".to_string(),
+                        // ARM64 registers
+                        "w0" | "x0" => "arg0".to_string(),
+                        "w1" | "x1" => "arg1".to_string(),
+                        _ => reg_name.clone(),
+                    };
+                    *switch_var = Some(Expr::var(super::expression::Variable {
+                        name: var_name,
+                        kind: super::expression::VarKind::Temp(0),
+                        size: 4,
+                    }));
+                }
+            }
+        };
+
+        // Scan the current block
+        scan_block(
+            block,
+            &mut switch_var,
+            &mut bound_check,
+            &mut table_base,
+            &mut entry_size,
+        );
+
+        // If we didn't find a bounds check, look at predecessor blocks
+        // The common pattern is: predecessor has bounds check, this block has the jump
+        if bound_check.is_none() {
+            let preds = self.cfg.predecessors(block.id);
+            for &pred_id in preds {
+                if let Some(pred_block) = self.cfg.block(pred_id) {
+                    scan_block(
+                        pred_block,
+                        &mut switch_var,
+                        &mut bound_check,
+                        &mut table_base,
+                        &mut entry_size,
+                    );
+                    if bound_check.is_some() {
+                        // Check if predecessor has conditional branch - default is the other target
+                        if let BlockTerminator::ConditionalBranch {
+                            true_target,
+                            false_target,
+                            ..
+                        } = &pred_block.terminator
+                        {
+                            // The default block is the one that's NOT the indirect jump block
+                            let default_target = if *true_target == block.id {
+                                *false_target
+                            } else {
+                                *true_target
+                            };
+                            if let Some((max_val, _)) = bound_check {
+                                bound_check = Some((max_val, default_target));
+                            }
                         }
+                        break;
                     }
                 }
-
-                // Look for load with scaled index (table access)
-                Operation::Load | Operation::Move => {
-                    if let Some(Operand::Memory(mem)) = inst.operands.get(1) {
-                        if mem.index.is_some() && mem.scale > 1 {
-                            entry_size = mem.scale;
-                        }
-                    }
-                }
-
-                _ => {}
             }
         }
 
-        let switch_var = switch_var?;
+        // We need at least the table base to proceed
+        let table_base = table_base?;
 
         // Construct jump table info
         let (max_value, default_block) = bound_check.unwrap_or((255, BasicBlockId::new(0)));
         let table_info = JumpTableInfo {
-            table_base: table_base.unwrap_or(0),
+            table_base,
             entry_size,
             entry_count: (max_value + 1) as u32,
             is_relative,
@@ -233,18 +383,34 @@ impl<'a> SwitchRecovery<'a> {
             max_value,
         };
 
+        // If we found bounds check but not switch_var, create a generic one
+        let switch_var = switch_var.unwrap_or_else(|| {
+            Expr::var(super::expression::Variable {
+                name: "val".to_string(),
+                kind: super::expression::VarKind::Temp(0),
+                size: 4,
+            })
+        });
+
         Some((switch_var, Some((max_value, default_block)), table_info))
     }
 
     /// Reads case targets from a jump table in binary data.
     fn read_jump_table(&self, info: &JumpTableInfo) -> Option<Vec<(Vec<i128>, BasicBlockId)>> {
-        let data = self.binary_data?;
+        // Get the data slice and base address - try binary_ctx first, then legacy method
+        let (data, data_base) = if let Some(ctx) = self.binary_ctx {
+            ctx.section_containing(info.table_base)?
+        } else if let Some(data) = self.binary_data {
+            (data, self.data_base)
+        } else {
+            return None;
+        };
 
         // Calculate offset into data
-        if info.table_base < self.data_base {
+        if info.table_base < data_base {
             return None;
         }
-        let offset = (info.table_base - self.data_base) as usize;
+        let offset = (info.table_base - data_base) as usize;
 
         if offset >= data.len() {
             return None;

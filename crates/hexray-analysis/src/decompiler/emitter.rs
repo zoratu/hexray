@@ -671,7 +671,9 @@ impl PseudoCodeEmitter {
                 element_size,
             } => {
                 if let ExprKind::Var(v) = &base.kind {
-                    if (v.name == "rip" || v.name == "eip") && matches!(index.kind, ExprKind::IntLit(_)) {
+                    if (v.name == "rip" || v.name == "eip")
+                        && matches!(index.kind, ExprKind::IntLit(_))
+                    {
                         if let ExprKind::IntLit(idx) = &index.kind {
                             if *idx >= 0 {
                                 let off = (*idx as usize) * *element_size;
@@ -1080,7 +1082,11 @@ impl PseudoCodeEmitter {
                                 let addr_expr = if off == 0 {
                                     (**base).clone()
                                 } else {
-                                    Expr::binop(BinOpKind::Add, (**base).clone(), Expr::int(off as i128))
+                                    Expr::binop(
+                                        BinOpKind::Add,
+                                        (**base).clone(),
+                                        Expr::int(off as i128),
+                                    )
                                 };
                                 if let Some(field_access) =
                                     self.try_format_struct_field(&addr_expr, *element_size, table)
@@ -1148,7 +1154,9 @@ impl PseudoCodeEmitter {
                 element_size,
             } => {
                 if let ExprKind::Var(v) = &base.kind {
-                    if (v.name == "rip" || v.name == "eip") && matches!(index.kind, ExprKind::IntLit(_)) {
+                    if (v.name == "rip" || v.name == "eip")
+                        && matches!(index.kind, ExprKind::IntLit(_))
+                    {
                         if let ExprKind::IntLit(idx) = &index.kind {
                             if *idx >= 0 {
                                 let off = (*idx as usize) * *element_size;

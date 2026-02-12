@@ -171,6 +171,19 @@ impl<'a> MachO<'a> {
         );
         symbols.extend(stub_symbols);
 
+        // Parse GOT symbols (map GOT entry addresses to import symbol names)
+        let got_symbols = Self::parse_got_symbols(
+            data,
+            offset,
+            &load_commands,
+            &segments,
+            strtab,
+            symtab_offset,
+            symtab_count,
+            is_64,
+        );
+        symbols.extend(got_symbols);
+
         // Estimate symbol sizes based on neighboring symbols
         Self::estimate_symbol_sizes(&mut symbols, &segments);
 
@@ -383,6 +396,129 @@ impl<'a> MachO<'a> {
         }
 
         stub_symbols
+    }
+
+    /// Parse GOT symbols from the __got section.
+    /// This maps GOT entry addresses to their corresponding import symbol names.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_got_symbols(
+        data: &[u8],
+        file_offset: usize,
+        load_commands: &[LoadCommand],
+        segments: &[Segment],
+        strtab: &[u8],
+        symtab_offset: usize,
+        symtab_count: usize,
+        is_64: bool,
+    ) -> Vec<Symbol> {
+        let mut got_symbols = Vec::new();
+
+        // Find indirect symbol table info from LC_DYSYMTAB
+        let (indirect_symoff, _nindirect) = load_commands
+            .iter()
+            .find_map(|lc| {
+                if let LoadCommand::Dysymtab {
+                    indirectsymoff,
+                    nindirectsyms,
+                    ..
+                } = lc
+                {
+                    Some((*indirectsymoff, *nindirectsyms))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((0, 0));
+
+        if indirect_symoff == 0 || symtab_offset == 0 {
+            return got_symbols;
+        }
+
+        // Find the __got section (could be in __DATA_CONST or __DATA segment)
+        let got_section = segments
+            .iter()
+            .flat_map(|seg| seg.sections.iter())
+            .find(|sect| sect.name() == "__got");
+
+        let got = match got_section {
+            Some(g) => g,
+            None => return got_symbols,
+        };
+
+        // Each GOT entry is a pointer (8 bytes on 64-bit, 4 bytes on 32-bit)
+        let entry_size = if is_64 { 8 } else { 4 };
+        let num_entries = got.size as usize / entry_size;
+        let nlist_entry_size = if is_64 { 16 } else { 12 };
+
+        // reserved1 contains the index into the indirect symbol table
+        let indirect_start_index = got.reserved1 as usize;
+
+        for i in 0..num_entries {
+            // Read the indirect symbol table entry (4 bytes each)
+            let indirect_offset = file_offset
+                .saturating_add(indirect_symoff as usize)
+                .saturating_add((indirect_start_index + i).saturating_mul(4));
+            if indirect_offset.saturating_add(4) > data.len() {
+                break;
+            }
+
+            let sym_index = u32::from_le_bytes([
+                data[indirect_offset],
+                data[indirect_offset + 1],
+                data[indirect_offset + 2],
+                data[indirect_offset + 3],
+            ]) as usize;
+
+            // Skip special indirect symbol values
+            const INDIRECT_SYMBOL_LOCAL: u32 = 0x80000000;
+            const INDIRECT_SYMBOL_ABS: u32 = 0x40000000;
+            if sym_index as u32 == INDIRECT_SYMBOL_LOCAL || sym_index as u32 == INDIRECT_SYMBOL_ABS
+            {
+                continue;
+            }
+
+            // Look up the symbol in the main symbol table
+            if sym_index >= symtab_count {
+                continue;
+            }
+
+            let sym_offset =
+                symtab_offset.saturating_add(sym_index.saturating_mul(nlist_entry_size));
+            if sym_offset.saturating_add(nlist_entry_size) > data.len() {
+                continue;
+            }
+
+            // Parse the nlist to get the name
+            if let Ok(nlist) = Nlist::parse(&data[sym_offset..], is_64) {
+                let name = if (nlist.n_strx as usize) < strtab.len() {
+                    let name_bytes = &strtab[nlist.n_strx as usize..];
+                    let end = name_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(name_bytes.len());
+                    String::from_utf8_lossy(&name_bytes[..end]).to_string()
+                } else {
+                    continue;
+                };
+
+                if name.is_empty() {
+                    continue;
+                }
+
+                // Create a symbol at the GOT entry address
+                let got_addr = got.addr + (i * entry_size) as u64;
+                got_symbols.push(Symbol {
+                    name,
+                    address: got_addr,
+                    size: entry_size as u64,
+                    kind: SymbolKind::Object, // GOT entries are data, not functions
+                    binding: hexray_core::SymbolBinding::Global,
+                    section_index: None,
+                });
+            }
+        }
+
+        got_symbols
     }
 
     fn parse_symbols(

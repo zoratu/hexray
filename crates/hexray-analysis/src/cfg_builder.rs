@@ -32,6 +32,11 @@ impl CfgBuilder {
             match &inst.control_flow {
                 ControlFlow::UnconditionalBranch { target } => {
                     leaders.insert(*target);
+                    // The instruction after an unconditional branch may be reachable via
+                    // another path (e.g., jump table entries), so mark it as a leader too
+                    if let Some(&next_idx) = sorted_indices.get(pos + 1) {
+                        leaders.insert(instructions[next_idx].address);
+                    }
                 }
                 ControlFlow::ConditionalBranch {
                     target,
@@ -47,7 +52,10 @@ impl CfgBuilder {
                 ControlFlow::IndirectCall { return_addr } => {
                     leaders.insert(*return_addr);
                 }
-                ControlFlow::Return | ControlFlow::Halt | ControlFlow::Syscall => {
+                ControlFlow::Return
+                | ControlFlow::Halt
+                | ControlFlow::Syscall
+                | ControlFlow::IndirectBranch { .. } => {
                     // Next instruction (if any) is a leader - O(1) lookup via sorted index
                     if let Some(&next_idx) = sorted_indices.get(pos + 1) {
                         leaders.insert(instructions[next_idx].address);

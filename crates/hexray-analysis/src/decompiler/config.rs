@@ -320,6 +320,7 @@ impl DecompilerConfig {
                     | StringPatternDetection
                     | ArchPatternSimplification
                     | DeadStoreElimination
+                    | VariableNaming
                     | ConstantPropagation
                     | LoopCanonicalization
                     | IrreducibleHandling
@@ -380,6 +381,7 @@ mod tests {
         let config = DecompilerConfig::default();
         assert_eq!(config.level, OptimizationLevel::Standard);
         assert!(config.is_pass_enabled(OptimizationPass::ExpressionSimplification));
+        assert!(config.is_pass_enabled(OptimizationPass::VariableNaming));
     }
 
     #[test]

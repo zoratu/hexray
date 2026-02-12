@@ -12,11 +12,11 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
-    AnalysisProject, BinaryDiff, CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter,
-    CallGraphJsonExporter, CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter,
-    Decompiler, DecompilerConfig, FunctionInfo, OptimizationLevel, OptimizationPass,
-    ParallelCallGraphBuilder, PatchType, RelocationTable, StringConfig, StringDetector,
-    StringTable, SymbolTable, XrefBuilder, XrefType,
+    AnalysisProject, BinaryDataContext, BinaryDiff, CallGraphBuilder, CallGraphDotExporter,
+    CallGraphHtmlExporter, CallGraphJsonExporter, CfgBuilder, CfgDotExporter, CfgHtmlExporter,
+    CfgJsonExporter, Decompiler, DecompilerConfig, FunctionInfo, OptimizationLevel,
+    OptimizationPass, ParallelCallGraphBuilder, PatchType, RelocationTable, StringConfig,
+    StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -1197,6 +1197,9 @@ fn decompile_function(
     // Build relocation table for kernel modules
     let relocation_table = build_relocation_table(binary);
 
+    // Build binary data context for jump table reconstruction
+    let binary_data_ctx = build_binary_data_context(fmt);
+
     // Try to load DWARF debug info for variable names
     let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary) {
         let names = get_dwarf_variable_names(&debug_info, start_addr);
@@ -1224,8 +1227,10 @@ fn decompile_function(
         .with_string_table(string_table)
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
+        .with_binary_data(binary_data_ctx)
         .with_dwarf_names(dwarf_names)
         .with_constant_database(const_db)
+        .with_struct_inference(true)
         .with_calling_convention(calling_convention);
     if let Some(db) = type_db {
         decompiler = decompiler.with_type_database(db.clone());
@@ -1285,6 +1290,33 @@ fn build_symbol_table(fmt: &dyn BinaryFormat) -> SymbolTable {
     }
 
     table
+}
+
+/// Builds a binary data context from read-only data sections for jump table reconstruction.
+fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
+    let mut ctx = BinaryDataContext::new();
+
+    for section in fmt.sections() {
+        let name = section.name().to_lowercase();
+        // Include sections that may contain jump tables:
+        // - .rodata (ELF read-only data)
+        // - __const (Mach-O constants)
+        // - .rdata (Windows read-only data)
+        // - __DATA_CONST (Mach-O data constants)
+        // - __text, .text (code sections - compilers often embed small jump tables here)
+        if !section.data().is_empty()
+            && (name.contains("rodata")
+                || name.contains("const")
+                || name == ".rdata"
+                || name == "rdata"
+                || name == "__text"
+                || name == ".text")
+        {
+            ctx.add_section(section.virtual_address(), section.data().to_vec());
+        }
+    }
+
+    ctx
 }
 
 /// Builds a relocation table from ELF relocations.
@@ -2033,6 +2065,7 @@ fn decompile_with_follow(
             .with_relocation_table(relocation_table.clone())
             .with_dwarf_names(dwarf_names)
             .with_constant_database(const_db.clone())
+            .with_struct_inference(true)
             .with_calling_convention(calling_convention);
         if let Some(db) = type_db {
             decompiler = decompiler.with_type_database(db.clone());
@@ -3733,6 +3766,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     .with_addresses(false)
                     .with_symbol_table(symbols)
                     .with_constant_database(const_db)
+                    .with_struct_inference(true)
                     .with_calling_convention(calling_convention);
 
                 let pseudo_code = decompiler.decompile(&cfg, &func_name);
