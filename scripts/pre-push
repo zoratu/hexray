@@ -6,6 +6,19 @@
 
 set -e
 
+ensure_image() {
+    local platform="$1"
+    local image="$2"
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "Image $image not found. Building for $platform..."
+        docker build --platform "$platform" -t "$image" .
+    fi
+}
+
+ensure_image "linux/amd64" "hexray-test:amd64"
+ensure_image "linux/arm64" "hexray-test:arm64"
+
 echo "=== Running tests on linux/amd64 ==="
 docker run --platform linux/amd64 --rm hexray-test:amd64
 
