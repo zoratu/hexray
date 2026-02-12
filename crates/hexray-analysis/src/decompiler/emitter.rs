@@ -571,11 +571,117 @@ impl PseudoCodeEmitter {
         self.format_lvalue(expr, &empty)
     }
 
+    /// Normalizes known libc global symbols to user-friendly names.
+    fn simplify_libc_global_name(&self, raw: &str) -> Option<&'static str> {
+        let mut sym = raw;
+        if let Some(rest) = sym.strip_prefix("__imp_") {
+            sym = rest;
+        }
+        if let Some(rest) = sym.strip_prefix("imp_") {
+            sym = rest;
+        }
+        while let Some(rest) = sym.strip_prefix('_') {
+            sym = rest;
+        }
+
+        match sym {
+            "stdin" | "stdinp" => Some("stdin"),
+            "stdout" | "stdoutp" => Some("stdout"),
+            "stderr" | "stderrp" => Some("stderr"),
+            "errno" => Some("errno"),
+            _ => None,
+        }
+    }
+
+    /// Best-effort recognition for libc globals from already-formatted text fragments.
+    fn simplify_libc_global_text(&self, raw: &str) -> Option<&'static str> {
+        let trimmed = raw.trim();
+        let lowered = trimmed.to_lowercase();
+
+        for candidate in ["stderr", "stdout", "stdin", "errno"] {
+            if lowered == candidate
+                || lowered.ends_with(&format!("({candidate})"))
+                || lowered.contains(&format!("*{candidate}"))
+                || lowered.contains(&format!("&{candidate}"))
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Formats dereference chains rooted in known libc globals as `*name` / `**name`.
+    fn try_format_libc_global_deref_chain(&self, addr: &Expr) -> Option<String> {
+        let mut deref_depth = 1usize;
+        let mut cursor = addr;
+
+        loop {
+            match &cursor.kind {
+                ExprKind::Deref { addr: inner, .. } => {
+                    deref_depth += 1;
+                    cursor = inner;
+                }
+                // Strip no-op casts around pointer expressions.
+                ExprKind::Cast { expr: inner, .. } => {
+                    cursor = inner;
+                }
+                _ => break,
+            }
+        }
+
+        let alias = match &cursor.kind {
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                ..
+            } => {
+                if let Some(ref reloc_table) = self.relocation_table {
+                    if let Some(name) = reloc_table.get_got(*instruction_address) {
+                        self.simplify_libc_global_name(name)
+                    } else if let Some(name) = reloc_table.get_got(*address) {
+                        self.simplify_libc_global_name(name)
+                    } else {
+                        None
+                    }
+                } else if let Some(ref sym_table) = self.symbol_table {
+                    sym_table
+                        .get(*address)
+                        .and_then(|name| self.simplify_libc_global_name(name))
+                } else {
+                    None
+                }
+            }
+            ExprKind::Var(v) => self.simplify_libc_global_name(&v.name),
+            // Some lowering paths keep global names as unknown textual atoms.
+            ExprKind::Unknown(s) => self.simplify_libc_global_name(s),
+            _ => None,
+        }?;
+
+        Some(format!("{}{}", "*".repeat(deref_depth), alias))
+    }
+
     /// Formats an lvalue (left-hand side of assignment).
     /// This is like format_expr_with_strings but doesn't resolve addresses to string literals,
     /// since you can't assign to a string literal.
     fn format_lvalue(&self, expr: &Expr, table: &StringTable) -> String {
         match &expr.kind {
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                if let ExprKind::Var(v) = &base.kind {
+                    if (v.name == "rip" || v.name == "eip") && matches!(index.kind, ExprKind::IntLit(_)) {
+                        if let ExprKind::IntLit(idx) = &index.kind {
+                            if *idx >= 0 {
+                                let off = (*idx as usize) * *element_size;
+                                return format!("g_flags_rip_{:x}", off);
+                            }
+                        }
+                    }
+                }
+                self.format_expr_with_strings(expr, table)
+            }
             // For GotRef as lvalue, never resolve to string - use data_ naming
             ExprKind::GotRef {
                 address,
@@ -587,15 +693,24 @@ impl PseudoCodeEmitter {
                 // Try to resolve using instruction address first (for relocatable objects)
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get_got(*instruction_address) {
+                        if let Some(alias) = self.simplify_libc_global_name(name) {
+                            return alias.to_string();
+                        }
                         return name.to_string();
                     }
                     if let Some(name) = reloc_table.get_got(*address) {
+                        if let Some(alias) = self.simplify_libc_global_name(name) {
+                            return alias.to_string();
+                        }
                         return name.to_string();
                     }
                 }
                 // Try symbol table
                 if let Some(ref sym_table) = self.symbol_table {
                     if let Some(name) = sym_table.get(*address) {
+                        if let Some(alias) = self.simplify_libc_global_name(name) {
+                            return alias.to_string();
+                        }
                         return name.to_string();
                     }
                 }
@@ -660,6 +775,10 @@ impl PseudoCodeEmitter {
                 )
             }
             ExprKind::Deref { addr, size } => {
+                // Special case: nested dereferences rooted at libc globals.
+                if let Some(simplified) = self.try_format_libc_global_deref_chain(addr) {
+                    return simplified;
+                }
                 // Check if this is a stack slot access (rbp + offset or rbp - offset)
                 if let Some(var_name) = self.try_format_stack_slot(addr, *size) {
                     return var_name;
@@ -687,12 +806,30 @@ impl PseudoCodeEmitter {
                 };
                 // Don't resolve strings in deref address - dereferencing a string literal
                 // doesn't make sense. Show the pointer/data variable instead.
-                format!("{}({})", prefix, self.format_expr_no_string_resolve(addr))
+                let addr_text = self.format_expr_no_string_resolve(addr);
+                if let Some(alias) = self.simplify_libc_global_text(&addr_text) {
+                    return format!("*{}", alias);
+                }
+                format!("{}({})", prefix, addr_text)
             }
             ExprKind::Assign { lhs, rhs } => {
                 // Check for compound assignment patterns: x = x op y → x op= y
                 if let ExprKind::BinOp { op, left, right } = &rhs.kind {
                     if exprs_equal(lhs, left) {
+                        if matches!(op, BinOpKind::Or | BinOpKind::And | BinOpKind::Xor) {
+                            if let Some(flag_name) = self.try_format_flag_lvalue(lhs) {
+                                if let ExprKind::IntLit(mask) = right.kind {
+                                    if let Some(compound_op) = op.compound_op_str() {
+                                        return format!(
+                                            "{} {}= {}",
+                                            flag_name,
+                                            compound_op,
+                                            self.format_flag_mask(mask)
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         // For lhs, don't resolve strings (can't write to string literals)
                         let lhs_str = self.format_lvalue(lhs, table);
                         let rhs_str = self.format_expr_with_strings(right, table);
@@ -734,16 +871,25 @@ impl PseudoCodeEmitter {
                 // This uses the relocation at the instruction to find the symbol
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get_got(*instruction_address) {
+                        if let Some(alias) = self.simplify_libc_global_name(name) {
+                            return alias.to_string();
+                        }
                         return name.to_string();
                     }
                     // Fall back to computed address (for linked binaries)
                     if let Some(name) = reloc_table.get_got(*address) {
+                        if let Some(alias) = self.simplify_libc_global_name(name) {
+                            return alias.to_string();
+                        }
                         return name.to_string();
                     }
                 }
                 // Try symbol table
                 if let Some(ref sym_table) = self.symbol_table {
                     if let Some(name) = sym_table.get(*address) {
+                        if let Some(alias) = self.simplify_libc_global_name(name) {
+                            return alias.to_string();
+                        }
                         return name.to_string();
                     }
                 }
@@ -851,9 +997,10 @@ impl PseudoCodeEmitter {
                 } else {
                     // Rename callee-saved registers to meaningful names
                     // These are commonly used to hold return values/error codes
-                    rename_register(&var.name)
+                    normalize_variable_name(&rename_register(&var.name))
                 }
             }
+            ExprKind::Unknown(name) => normalize_variable_name(name),
             // Handle casts with potential elimination based on known types
             ExprKind::Cast {
                 expr: inner,
@@ -920,6 +1067,32 @@ impl PseudoCodeEmitter {
                 index,
                 element_size,
             } => {
+                if let ExprKind::IntLit(idx) = &index.kind {
+                    if *idx >= 0 {
+                        if let ExprKind::Var(base_var) = &base.kind {
+                            let is_stack_like = matches!(
+                                base_var.name.as_str(),
+                                "sp" | "rsp" | "rbp" | "x29" | "rip" | "eip"
+                            );
+                            if !is_stack_like {
+                                let off = (*idx as usize) * *element_size;
+                                // If we know the base pointer type, prefer typed field names.
+                                let addr_expr = if off == 0 {
+                                    (**base).clone()
+                                } else {
+                                    Expr::binop(BinOpKind::Add, (**base).clone(), Expr::int(off as i128))
+                                };
+                                if let Some(field_access) =
+                                    self.try_format_struct_field(&addr_expr, *element_size, table)
+                                {
+                                    return field_access;
+                                }
+                                let base_str = self.format_expr_no_string_resolve(base);
+                                return format!("{}->field_{:x}", base_str, off);
+                            }
+                        }
+                    }
+                }
                 // Check if base is a stack/frame pointer
                 if let ExprKind::Var(v) = &base.kind {
                     let is_stack_ptr = v.name == "sp" || v.name == "rsp";
@@ -961,9 +1134,58 @@ impl PseudoCodeEmitter {
         }
     }
 
+    fn try_format_flag_lvalue(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Deref { addr, .. } => {
+                if let ExprKind::GotRef { address, .. } = &addr.kind {
+                    return Some(format!("g_flags_{:x}", address));
+                }
+                None
+            }
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                if let ExprKind::Var(v) = &base.kind {
+                    if (v.name == "rip" || v.name == "eip") && matches!(index.kind, ExprKind::IntLit(_)) {
+                        if let ExprKind::IntLit(idx) = &index.kind {
+                            if *idx >= 0 {
+                                let off = (*idx as usize) * *element_size;
+                                return Some(format!("g_flags_rip_{:x}", off));
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn format_flag_mask(&self, value: i128) -> String {
+        if value > 0 && (value & (value - 1)) == 0 {
+            format!("FLAG_{:x}", value)
+        } else {
+            format_integer(value)
+        }
+    }
+
     /// Emits pseudo-code for a structured CFG.
     pub fn emit(&self, cfg: &StructuredCfg, func_name: &str) -> String {
         let mut output = String::new();
+        let is_main_like = matches!(func_name, "main" | "_main");
+        let rename_main_param = |name: &str, idx: usize| -> String {
+            if is_main_like {
+                match (idx, name) {
+                    (0, "arg0") => "argc".to_string(),
+                    (1, "arg1") => "argv".to_string(),
+                    _ => name.to_string(),
+                }
+            } else {
+                name.to_string()
+            }
+        };
 
         // Analyze function body for pattern-based variable naming (loop indices, etc.)
         self.naming_ctx.borrow_mut().analyze(&cfg.body);
@@ -1010,7 +1232,14 @@ impl PseudoCodeEmitter {
                 let params: Vec<_> = sig
                     .parameters
                     .iter()
-                    .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
+                    .enumerate()
+                    .map(|(idx, p)| {
+                        format!(
+                            "{} {}",
+                            p.param_type.to_c_string(),
+                            rename_main_param(&p.name, idx)
+                        )
+                    })
                     .collect();
                 writeln!(
                     output,
@@ -1025,7 +1254,11 @@ impl PseudoCodeEmitter {
                 let params: Vec<_> = func_info
                     .parameters
                     .iter()
-                    .map(|p| format!("{} {}", self.get_type(p), p))
+                    .enumerate()
+                    .map(|(idx, p)| {
+                        let name = rename_main_param(p, idx);
+                        format!("{} {}", self.get_type(p), name)
+                    })
                     .collect();
                 writeln!(
                     output,
@@ -1049,7 +1282,11 @@ impl PseudoCodeEmitter {
                 let params: Vec<_> = func_info
                     .parameters
                     .iter()
-                    .map(|p| format!("{} {}", self.get_type(p), p))
+                    .enumerate()
+                    .map(|(idx, p)| {
+                        let name = rename_main_param(p, idx);
+                        format!("{} {}", self.get_type(p), name)
+                    })
                     .collect();
                 writeln!(
                     output,
@@ -1273,6 +1510,13 @@ impl PseudoCodeEmitter {
         // Check first block for parameter patterns and prologue
         if let Some(StructuredNode::Block { statements, .. }) = body.first() {
             for (idx, stmt) in statements.iter().enumerate() {
+                // Parameter setup should happen before any real call in prologue.
+                // If we already reached a call, stop scanning to avoid treating
+                // post-call return-register uses as function parameters.
+                if let ExprKind::Call { .. } = &stmt.kind {
+                    break;
+                }
+
                 // Skip prologue statements
                 if is_prologue_statement(stmt) {
                     info.skip_statements.insert((0, idx));
@@ -1302,6 +1546,10 @@ impl PseudoCodeEmitter {
                         }
                     }
                 }
+
+                // Stop after the first non-prologue, non-parameter-setup statement.
+                // This keeps parameter inference anchored to function entry setup.
+                break;
             }
         }
 
@@ -1380,6 +1628,9 @@ impl PseudoCodeEmitter {
     }
 
     /// Emits nodes, skipping specified statements and tracking variable declarations.
+    ///
+    /// When `is_top_level` is true, we don't break on control exits because labeled
+    /// sections after gotos are still reachable via those gotos.
     fn emit_nodes_with_skip_and_decls(
         &self,
         nodes: &[StructuredNode],
@@ -1388,9 +1639,23 @@ impl PseudoCodeEmitter {
         skip: &HashSet<(usize, usize)>,
         declared_vars: &mut HashSet<String>,
     ) {
+        self.emit_nodes_with_skip_and_decls_inner(nodes, output, depth, skip, declared_vars, true)
+    }
+
+    fn emit_nodes_with_skip_and_decls_inner(
+        &self,
+        nodes: &[StructuredNode],
+        output: &mut String,
+        depth: usize,
+        skip: &HashSet<(usize, usize)>,
+        declared_vars: &mut HashSet<String>,
+        is_top_level: bool,
+    ) {
         for (block_idx, node) in nodes.iter().enumerate() {
             self.emit_node_with_skip_and_decls(node, output, depth, block_idx, skip, declared_vars);
-            if self.is_control_exit(node) {
+            // At top level, don't break on control exits - labeled sections after gotos
+            // are reachable. Only break within nested structures (if/while bodies).
+            if !is_top_level && self.is_control_exit(node) {
                 break;
             }
         }
@@ -3014,11 +3279,12 @@ fn rename_register(name: &str) -> String {
         "r9b" | "r9w" => "tmp_r9".to_string(),
         "r10b" | "r10w" => "tmp_r10".to_string(),
         "r11b" | "r11w" => "tmp_r11".to_string(),
-        // Caller-saved 32-bit registers often used as temporaries
-        "ecx" => "tmp_ecx".to_string(),
-        "edx" => "tmp_edx".to_string(),
-        "esi" => "tmp_esi".to_string(),
-        "edi" => "tmp_edi".to_string(),
+        // 32-bit subregister forms of the first argument registers.
+        // These appear frequently in parameter setup and should keep arg naming.
+        "edi" => "arg0".to_string(),
+        "esi" => "arg1".to_string(),
+        "edx" => "arg2".to_string(),
+        "ecx" => "arg3".to_string(),
         "r8d" => "tmp_r8".to_string(),
         "r9d" => "tmp_r9".to_string(),
         "r10d" => "tmp_r10".to_string(),
@@ -3026,6 +3292,15 @@ fn rename_register(name: &str) -> String {
         // Keep other registers as-is (rsp, rbp, rip, etc.)
         _ => name.to_string(),
     }
+}
+
+fn normalize_variable_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("arg_") {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit()) {
+            return format!("local_{}", rest.to_lowercase());
+        }
+    }
+    name.to_string()
 }
 
 /// Checks if two expressions are structurally equal.
@@ -3058,6 +3333,30 @@ fn exprs_equal(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Deref { addr: aa, size: sa }, ExprKind::Deref { addr: ab, size: sb }) => {
             sa == sb && exprs_equal(aa, ab)
         }
+        (
+            ExprKind::ArrayAccess {
+                base: ba,
+                index: ia,
+                element_size: ea,
+            },
+            ExprKind::ArrayAccess {
+                base: bb,
+                index: ib,
+                element_size: eb,
+            },
+        ) => ea == eb && exprs_equal(ba, bb) && exprs_equal(ia, ib),
+        (
+            ExprKind::FieldAccess {
+                base: ba,
+                field_name: fa,
+                offset: oa,
+            },
+            ExprKind::FieldAccess {
+                base: bb,
+                field_name: fb,
+                offset: ob,
+            },
+        ) => oa == ob && fa == fb && exprs_equal(ba, bb),
         _ => false,
     }
 }
@@ -3478,5 +3777,70 @@ mod tests {
 
         // Unknown variables should still default to "int"
         assert_eq!(emitter.get_type("unknown_var"), "int");
+    }
+
+    #[test]
+    fn test_libc_global_gotref_name_simplification() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x1000, "__stderrp".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::got_ref(0x1000, 0, 8, Expr::unknown("rip_ref"));
+
+        assert_eq!(emitter.format_expr(&expr), "stderr");
+    }
+
+    #[test]
+    fn test_libc_global_nested_deref_simplification() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x2000, "__stdoutp".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::deref(Expr::got_ref(0x2000, 0, 8, Expr::unknown("rip_ref")), 8);
+
+        assert_eq!(emitter.format_expr(&expr), "*stdout");
+    }
+
+    #[test]
+    fn test_struct_field_style_for_constant_array_access() {
+        use super::super::expression::Variable;
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let expr = Expr::array_access(Expr::var(Variable::reg("x8", 8)), Expr::int(2), 8);
+        assert_eq!(emitter.format_expr(&expr), "x8->field_10");
+    }
+
+    #[test]
+    fn test_flag_name_for_rip_relative_array_lvalue() {
+        use super::super::expression::Variable;
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let lhs = Expr::array_access(Expr::var(Variable::reg("rip", 8)), Expr::int(12), 4);
+        let rhs = Expr::binop(BinOpKind::Or, lhs.clone(), Expr::int(1));
+        let stmt = Expr::assign(lhs, rhs);
+
+        assert_eq!(emitter.format_expr(&stmt), "g_flags_rip_30 |= FLAG_1");
+    }
+
+    #[test]
+    fn test_normalize_arg_hex_variable_name() {
+        use super::super::expression::{VarKind, Variable};
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let expr = Expr::unknown("arg_4");
+        // Unknown stays unknown; use Var path to test normalization.
+        let var_expr = Expr::var(Variable {
+            kind: VarKind::Temp(1),
+            name: "arg_4".to_string(),
+            size: 4,
+        });
+        let out = emitter.format_expr(&var_expr);
+        assert_eq!(out, "local_4");
+        assert_eq!(normalize_variable_name("arg_30"), "local_30");
+        assert_eq!(normalize_variable_name("arg0"), "arg0");
+        assert_eq!(normalize_variable_name("result"), "result");
+        // Ensure no panic on non-hex suffix.
+        assert_eq!(normalize_variable_name("arg_xyz"), "arg_xyz");
+        assert_eq!(emitter.format_expr(&expr), "local_4");
     }
 }

@@ -16,6 +16,7 @@ use super::expression::{resolve_adrp_patterns, BinOpKind, Expr};
 use super::for_loop_detection::{detect_for_loops, get_expr_var_key};
 use super::short_circuit::detect_short_circuit;
 use super::switch_recovery::SwitchRecovery;
+use super::BinaryDataContext;
 
 /// A structured representation of control flow.
 #[derive(Debug)]
@@ -276,6 +277,119 @@ impl StructuredCfg {
         }
     }
 
+    /// Creates a structured CFG with custom configuration and binary data for jump table reconstruction.
+    pub fn from_cfg_with_config_and_binary_data(
+        cfg: &ControlFlowGraph,
+        config: &super::config::DecompilerConfig,
+        binary_data: Option<&BinaryDataContext>,
+    ) -> Self {
+        use super::config::OptimizationPass;
+
+        let mut structurer = Structurer::new_with_binary_data(cfg, binary_data);
+        let mut body = structurer.structure();
+
+        // Post-process to propagate arguments into function calls (before copy propagation)
+        if config.is_pass_enabled(OptimizationPass::CallArgPropagation) {
+            body = propagate_call_args(body);
+        }
+
+        // Post-process to merge return value captures across block boundaries
+        if config.is_pass_enabled(OptimizationPass::ReturnValueMerge) {
+            body = merge_return_value_captures(body);
+        }
+
+        // Post-process to eliminate temporary register patterns
+        if config.is_pass_enabled(OptimizationPass::TempSimplification) {
+            body = simplify_statements(body);
+        }
+
+        // Post-process to detect for loops from while loops with init/update
+        if config.is_pass_enabled(OptimizationPass::ForLoopDetection) {
+            body = detect_for_loops(body);
+        }
+
+        // Post-process to hoist loop-invariant computations
+        if config.is_pass_enabled(OptimizationPass::LoopInvariantHoisting) {
+            body = super::loop_invariant::hoist_loop_invariants(body);
+        }
+
+        // Post-process to detect memcpy/memset patterns in for loops
+        if config.is_pass_enabled(OptimizationPass::LoopPatternDetection) {
+            body = super::loop_pattern_detection::detect_loop_patterns(body);
+        }
+
+        // Post-process to canonicalize loop forms
+        if config.is_pass_enabled(OptimizationPass::LoopCanonicalization) {
+            body = super::loop_canonicalization::canonicalize_loops(body);
+        }
+
+        // Post-process to detect memset/array initialization idioms
+        if config.is_pass_enabled(OptimizationPass::MemsetIdiomDetection) {
+            body = super::memset_idiom::detect_init_patterns(body);
+        }
+
+        // Post-process to detect switch statements from if-else chains
+        if config.is_pass_enabled(OptimizationPass::SwitchDetection) {
+            body = detect_switch_statements(body);
+        }
+
+        // Post-process to detect short-circuit boolean patterns (a && b, a || b)
+        if config.is_pass_enabled(OptimizationPass::ShortCircuitDetection) {
+            body = detect_short_circuit(body);
+        }
+
+        // Post-process to handle irreducible CFG regions
+        // Should run BEFORE goto conversion to ensure irreducible gotos are preserved
+        if config.is_pass_enabled(OptimizationPass::IrreducibleHandling) {
+            body = super::irreducible_cfg::handle_irreducible_regions(cfg, body);
+        }
+
+        // Post-process to convert gotos to break/continue where applicable
+        if config.is_pass_enabled(OptimizationPass::GotoConversion) {
+            body = convert_gotos_to_break_continue(body, None);
+        }
+
+        // Post-process to flatten nested if-else into guard clauses
+        if config.is_pass_enabled(OptimizationPass::GuardClauseFlattening) {
+            body = flatten_guard_clauses(body);
+        }
+
+        // Post-process for constant folding and propagation
+        if config.is_pass_enabled(OptimizationPass::ConstantPropagation) {
+            body = super::constant_propagation::propagate_constants(body);
+        }
+
+        // Post-process to simplify expressions (constant folding, algebraic simplifications)
+        if config.is_pass_enabled(OptimizationPass::ExpressionSimplification) {
+            body = simplify_expressions(body);
+        }
+
+        // Post-process to detect string function patterns (strlen, strcpy, etc.)
+        if config.is_pass_enabled(OptimizationPass::StringPatternDetection) {
+            body = super::string_patterns::detect_string_patterns(body);
+        }
+
+        // Post-process to simplify architecture-specific patterns (CSEL, min/max, abs)
+        if config.is_pass_enabled(OptimizationPass::ArchPatternSimplification) {
+            body = super::arch_patterns::simplify_arch_patterns(body);
+        }
+
+        // Post-process to eliminate dead stores
+        if config.is_pass_enabled(OptimizationPass::DeadStoreElimination) {
+            body = super::dead_store::eliminate_dead_stores(body);
+        }
+
+        // Post-process to infer better variable names
+        if config.is_pass_enabled(OptimizationPass::VariableNaming) {
+            body = super::variable_naming::suggest_variable_names(body);
+        }
+
+        Self {
+            body,
+            cfg_entry: cfg.entry,
+        }
+    }
+
     /// Returns the structured body.
     pub fn body(&self) -> &[StructuredNode] {
         &self.body
@@ -297,6 +411,8 @@ struct Structurer<'a> {
     inline_allowed: HashSet<BasicBlockId>,
     /// Irreducible CFG analysis results.
     irreducible_analysis: super::irreducible_cfg::IrreducibleCfgAnalysis,
+    /// Binary data context for jump table reconstruction.
+    binary_data: Option<&'a BinaryDataContext>,
 }
 
 impl<'a> Structurer<'a> {
@@ -356,13 +472,12 @@ impl<'a> Structurer<'a> {
         // Perform dominance-based irreducible CFG detection
         let irreducible_analysis = super::irreducible_cfg::IrreducibleCfgAnalysis::analyze(cfg);
 
-        // Mark entry points of irreducible regions for labeling
-        // (except the suggested header which can be entered normally)
+        // Mark ALL entry points of irreducible regions for labeling.
+        // Even the suggested header needs a label if it's targeted by a goto
+        // from within the irreducible region (back edges).
         for region in &irreducible_analysis.regions {
             for &entry in &region.entry_points {
-                if entry != region.suggested_header {
-                    multi_pred_blocks.insert(entry);
-                }
+                multi_pred_blocks.insert(entry);
             }
         }
 
@@ -376,7 +491,17 @@ impl<'a> Structurer<'a> {
             multi_pred_blocks,
             inline_allowed: HashSet::new(),
             irreducible_analysis,
+            binary_data: None,
         }
+    }
+
+    fn new_with_binary_data(
+        cfg: &'a ControlFlowGraph,
+        binary_data: Option<&'a BinaryDataContext>,
+    ) -> Self {
+        let mut structurer = Self::new(cfg);
+        structurer.binary_data = binary_data;
+        structurer
     }
 
     /// Checks if a block (and its successors) eventually return with just cleanup calls.
@@ -555,10 +680,13 @@ impl<'a> Structurer<'a> {
     fn structure(&mut self) -> Vec<StructuredNode> {
         let mut result = self.structure_region(self.cfg.entry, None);
 
-        // Emit any unprocessed multi-predecessor blocks as labeled sections
-        // Sort by address for consistent output
-        let mut unprocessed: Vec<_> = self
-            .multi_pred_blocks
+        // Emit ALL unprocessed blocks as labeled sections, not just multi_pred_blocks.
+        // This is crucial for irreducible CFGs where some blocks may not be reachable
+        // through normal structured control flow but are still part of the function.
+        // Sort by address for consistent, deterministic output.
+        let all_block_ids: Vec<_> = self.cfg.block_ids().collect();
+
+        let mut unprocessed: Vec<_> = all_block_ids
             .iter()
             .filter(|b| !self.processed.contains(b))
             .copied()
@@ -566,7 +694,13 @@ impl<'a> Structurer<'a> {
         unprocessed.sort_by_key(|b| self.cfg.block(*b).map(|blk| blk.start).unwrap_or(0));
 
         for block_id in unprocessed {
-            // Add label
+            // Re-check if still unprocessed - previous iterations may have processed this block
+            // as part of structuring another block (e.g., if-else branches)
+            if self.processed.contains(&block_id) {
+                continue;
+            }
+
+            // Add label for the block
             result.push(StructuredNode::Label(block_id));
 
             // Structure from this block
@@ -622,6 +756,8 @@ impl<'a> Structurer<'a> {
             // Check if this is a loop header
             if self.loop_headers.contains(&block_id) && !self.visited.contains(&block_id) {
                 self.visited.insert(block_id);
+                // Mark the loop header as processed so it won't be emitted as an orphan block
+                self.processed.insert(block_id);
                 let loop_node = self.structure_loop(block_id);
                 result.push(loop_node);
 
@@ -702,8 +838,14 @@ impl<'a> Structurer<'a> {
                     }
 
                     // Structure the if/else
-                    let if_node =
-                        self.structure_if_else(*condition, *true_target, *false_target, end, block);
+                    let if_node = self.structure_if_else(
+                        *condition,
+                        *true_target,
+                        *false_target,
+                        end,
+                        block_id,
+                        block,
+                    );
                     result.push(if_node);
 
                     // Find join point and continue
@@ -711,8 +853,17 @@ impl<'a> Structurer<'a> {
 
                     // Mark the join point as inline-allowed so we don't emit a goto to it.
                     // This is the natural continuation after the if-else structure.
+                    // HOWEVER, don't mark irreducible entry points as inline-allowed, since
+                    // they have gotos targeting them from other places in the code.
                     if let Some(join_id) = join {
-                        self.inline_allowed.insert(join_id);
+                        let is_irreducible_entry = self
+                            .irreducible_analysis
+                            .regions
+                            .iter()
+                            .any(|r| r.entry_points.contains(&join_id));
+                        if !is_irreducible_entry {
+                            self.inline_allowed.insert(join_id);
+                        }
                     }
 
                     current = join;
@@ -733,7 +884,10 @@ impl<'a> Structurer<'a> {
                     possible_targets, ..
                 } => {
                     // Try to recover a switch statement from the indirect jump
-                    let switch_recovery = SwitchRecovery::new(self.cfg);
+                    let mut switch_recovery = SwitchRecovery::new(self.cfg);
+                    if let Some(bin_ctx) = self.binary_data {
+                        switch_recovery = switch_recovery.with_binary_context(bin_ctx);
+                    }
                     if let Some(switch_info) = switch_recovery.try_recover_switch(block_id) {
                         // Successfully detected a switch pattern
                         // Add block statements first
@@ -934,7 +1088,10 @@ impl<'a> Structurer<'a> {
             let true_in_loop = info.body.contains(true_target);
             let false_in_loop = info.body.contains(false_target);
 
-            let cond_expr = condition_to_expr_with_block(*condition, block);
+            let cond_expr = self.rewrite_condition_call_return_alias(
+                header,
+                condition_to_expr_with_block(*condition, block),
+            );
 
             if true_in_loop && !false_in_loop {
                 // Condition true -> stay in loop
@@ -964,7 +1121,10 @@ impl<'a> Structurer<'a> {
                 ..
             } = &block.terminator
             {
-                let cond_expr = condition_to_expr_with_block(*condition, block);
+                let cond_expr = self.rewrite_condition_call_return_alias(
+                    back_edge,
+                    condition_to_expr_with_block(*condition, block),
+                );
                 if *true_target == info.header {
                     return (cond_expr, back_edge);
                 } else if *false_target == info.header {
@@ -982,9 +1142,11 @@ impl<'a> Structurer<'a> {
         true_target: BasicBlockId,
         false_target: BasicBlockId,
         region_end: Option<BasicBlockId>,
+        block_id: BasicBlockId,
         block: &BasicBlock,
     ) -> StructuredNode {
-        let cond_expr = condition_to_expr_with_block(condition, block);
+        let cond_expr =
+            self.rewrite_condition_call_return_alias(block_id, condition_to_expr_with_block(condition, block));
 
         // Find join point
         let join = self.find_join_point(true_target, false_target, region_end);
@@ -1011,31 +1173,135 @@ impl<'a> Structurer<'a> {
         }
     }
 
+    /// In blocks entered from a call-terminated predecessor, treat arg0/x0/w0
+    /// as a call return value alias in condition expressions.
+    fn rewrite_condition_call_return_alias(&self, block_id: BasicBlockId, expr: Expr) -> Expr {
+        use super::expression::{VarKind, Variable};
+
+        let preds = self.cfg.predecessors(block_id);
+        if preds.len() != 1 {
+            return expr;
+        }
+        let pred = preds[0];
+        let Some(pred_block) = self.cfg.block(pred) else {
+            return expr;
+        };
+        let Some(last_inst) = pred_block.instructions.last() else {
+            return expr;
+        };
+        if !last_inst.is_call() {
+            return expr;
+        }
+
+        let replacement = Expr::var(Variable {
+            kind: VarKind::Temp(0),
+            name: "ret_0".to_string(),
+            size: 8,
+        });
+        let aliases = vec![
+            "arg0".to_string(),
+            "x0".to_string(),
+            "w0".to_string(),
+            "a0".to_string(),
+        ];
+        substitute_return_register_uses(expr, &aliases, &replacement)
+    }
+
     /// Structures a switch statement from recovered switch information.
     fn structure_switch_from_recovery(
         &mut self,
         switch_info: super::switch_recovery::SwitchInfo,
     ) -> StructuredNode {
-        // Structure each case body
-        let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = switch_info
+        // Find the join point where all switch cases converge
+        // This prevents cases from including code from subsequent cases
+        let switch_end = self.find_switch_join_point(&switch_info);
+
+        // Structure each case body, stopping at the join point
+        let mut cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = switch_info
             .cases
             .into_iter()
             .map(|(values, target)| {
-                let body = self.structure_region(target, None);
+                let body = self.structure_region(target, switch_end);
                 (values, body)
             })
             .collect();
 
+        // Sort cases by their minimum value for readability
+        cases.sort_by_key(|(values, _)| values.iter().min().copied().unwrap_or(0));
+
         // Structure the default case if present
-        let default = switch_info
-            .default
-            .map(|target| self.structure_region(target, None));
+        // But skip if it's already been processed (e.g., by the bounds check if-else)
+        let default = switch_info.default.and_then(|target| {
+            if self.processed.contains(&target) {
+                // Default was already structured by bounds check, skip it
+                None
+            } else {
+                Some(self.structure_region(target, switch_end))
+            }
+        });
 
         StructuredNode::Switch {
             value: switch_info.switch_value,
             cases,
             default,
         }
+    }
+
+    /// Find the common join point where all switch cases converge.
+    fn find_switch_join_point(
+        &self,
+        switch_info: &super::switch_recovery::SwitchInfo,
+    ) -> Option<BasicBlockId> {
+        // Collect all case targets (including default)
+        let mut targets: Vec<BasicBlockId> = switch_info
+            .cases
+            .iter()
+            .map(|(_, target)| *target)
+            .collect();
+        if let Some(default) = switch_info.default {
+            targets.push(default);
+        }
+
+        if targets.is_empty() {
+            return None;
+        }
+
+        // Find blocks reachable from each target
+        let mut reachable_sets: Vec<HashSet<BasicBlockId>> = Vec::new();
+        for target in &targets {
+            let mut reachable = HashSet::new();
+            self.collect_reachable(*target, &mut reachable, None);
+            reachable_sets.push(reachable);
+        }
+
+        // Find blocks reachable from ALL targets (intersection)
+        if reachable_sets.is_empty() {
+            return None;
+        }
+
+        let mut common = reachable_sets[0].clone();
+        for set in reachable_sets.iter().skip(1) {
+            common = common.intersection(set).copied().collect();
+        }
+
+        // Remove the case blocks themselves from candidates
+        for target in &targets {
+            common.remove(target);
+        }
+
+        if common.is_empty() {
+            return None;
+        }
+
+        // Return the first one in reverse post-order (closest to switch)
+        let rpo = self.cfg.reverse_post_order();
+        for block in rpo {
+            if common.contains(&block) {
+                return Some(block);
+            }
+        }
+
+        None
     }
 
     fn find_join_point(
@@ -1303,15 +1569,43 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
 /// the call into `ebx = func()`.
 fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
     use hexray_core::Operand;
+    use super::expression::{VarKind, Variable};
 
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
     let mut at_block_start = true;
     let mut saw_call = false;
+    let mut ret_capture_counter: u32 = 0;
 
     for inst in &block.instructions {
         // Track if we've seen a call instruction
         if inst.is_call() {
             saw_call = true;
+            // Model call return register as a unique temporary to avoid reusing arg names.
+            let temp_name = format!("ret_{}", ret_capture_counter);
+            ret_capture_counter += 1;
+            let ret_var64 = Expr::var(Variable {
+                name: temp_name.clone(),
+                kind: VarKind::Temp(ret_capture_counter),
+                size: 8,
+            });
+            let ret_var32 = Expr::var(Variable {
+                name: temp_name.clone(),
+                kind: VarKind::Temp(ret_capture_counter),
+                size: 4,
+            });
+            reg_values.insert("rax".to_string(), ret_var64.clone());
+            reg_values.insert("eax".to_string(), ret_var32.clone());
+            reg_values.insert("x0".to_string(), ret_var64);
+            reg_values.insert("w0".to_string(), ret_var32.clone());
+            reg_values.insert("a0".to_string(), ret_var32);
+            reg_values.insert(
+                "arg0".to_string(),
+                Expr::var(Variable {
+                    name: temp_name,
+                    kind: VarKind::Temp(ret_capture_counter),
+                    size: 8,
+                }),
+            );
             at_block_start = false;
             continue;
         }
@@ -1685,14 +1979,16 @@ fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     // Third pass: propagate temp register values into conditions
     let nodes = propagate_temps_to_conditions(nodes);
 
-    // Fourth pass: remove temp register assignments that have been propagated
-    let nodes = remove_temp_assignments(nodes);
-
-    // Fifth pass: substitute global refs everywhere (including conditions)
+    // Fourth pass: substitute global refs everywhere (including conditions).
+    // This must run before removing temp assignments so block-local GOT aliases
+    // (e.g., x8 = stdout/stderr) are still available for substitution.
     let nodes: Vec<_> = nodes
         .into_iter()
         .map(|node| substitute_globals_in_node(node, &global_refs))
         .collect();
+
+    // Fifth pass: remove temp register assignments that have been propagated.
+    let nodes = remove_temp_assignments(nodes);
 
     // Sixth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
     nodes.into_iter().map(simplify_conditions_in_node).collect()
@@ -2235,10 +2531,23 @@ fn substitute_globals_in_node(
             statements,
             address_range,
         } => {
+            // Build block-local GotRef aliases so per-block temporaries (e.g., x8)
+            // are substituted correctly without leaking across sibling blocks.
+            let mut scoped_refs = global_refs.clone();
+            for stmt in &statements {
+                if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+                    if let ExprKind::GotRef { .. } = &rhs.kind {
+                        if let ExprKind::Var(lhs_var) = &lhs.kind {
+                            scoped_refs.insert(lhs_var.name.clone(), (**rhs).clone());
+                        }
+                    }
+                }
+            }
+
             // Substitute in statements and remove GotRef assignments
             let statements: Vec<_> = statements
                 .into_iter()
-                .map(|stmt| substitute_global_refs(&stmt, global_refs))
+                .map(|stmt| substitute_global_refs(&stmt, &scoped_refs))
                 .filter(|stmt| {
                     // Remove GotRef assignments (they've been propagated)
                     if let ExprKind::Assign { rhs, .. } = &stmt.kind {
@@ -2518,10 +2827,17 @@ fn substitute_global_refs(expr: &Expr, global_refs: &HashMap<String, Expr>) -> E
         ExprKind::UnaryOp { op, operand } => {
             Expr::unary(*op, substitute_global_refs(operand, global_refs))
         }
-        ExprKind::Assign { lhs, rhs } => Expr::assign(
-            substitute_global_refs(lhs, global_refs),
-            substitute_global_refs(rhs, global_refs),
-        ),
+        ExprKind::Assign { lhs, rhs } => {
+            // Never rewrite a plain variable assignment target (`x = ...`) into
+            // a global symbol (`stdout = ...`). Only substitute in RHS and
+            // non-variable lvalues like dereference targets.
+            let new_lhs = if matches!(lhs.kind, ExprKind::Var(_)) {
+                (**lhs).clone()
+            } else {
+                substitute_global_refs(lhs, global_refs)
+            };
+            Expr::assign(new_lhs, substitute_global_refs(rhs, global_refs))
+        }
         _ => expr.clone(),
     }
 }
@@ -2773,13 +3089,21 @@ fn extract_call_arguments(arg_values: &HashMap<String, Expr>) -> Vec<Expr> {
 ///   Block1: ...
 ///   Block2: var = func(); ...
 fn merge_return_value_captures(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut capture_counter = 0u32;
+    merge_return_value_captures_with_counter(nodes, &mut capture_counter)
+}
+
+fn merge_return_value_captures_with_counter(
+    nodes: Vec<StructuredNode>,
+    capture_counter: &mut u32,
+) -> Vec<StructuredNode> {
     use super::expression::ExprKind;
 
     let mut result: Vec<StructuredNode> = Vec::with_capacity(nodes.len());
 
     for node in nodes {
         // First, recursively process nested structures
-        let node = merge_return_value_captures_node(node);
+        let node = merge_return_value_captures_node(node, capture_counter);
 
         // Check if we should merge with the previous block
         if let StructuredNode::Block {
@@ -2855,6 +3179,7 @@ fn merge_return_value_captures(nodes: Vec<StructuredNode>) -> Vec<StructuredNode
                     }
                 }
             }
+            let statements = capture_return_register_uses_in_block(statements, capture_counter);
             result.push(StructuredNode::Block {
                 id,
                 statements,
@@ -2869,7 +3194,7 @@ fn merge_return_value_captures(nodes: Vec<StructuredNode>) -> Vec<StructuredNode
 }
 
 /// Recursively applies return value capture merging to nested structures.
-fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
+fn merge_return_value_captures_node(node: StructuredNode, capture_counter: &mut u32) -> StructuredNode {
     match node {
         StructuredNode::If {
             condition,
@@ -2877,8 +3202,8 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             else_body,
         } => StructuredNode::If {
             condition,
-            then_body: merge_return_value_captures(then_body),
-            else_body: else_body.map(merge_return_value_captures),
+            then_body: merge_return_value_captures_with_counter(then_body, capture_counter),
+            else_body: else_body.map(|nodes| merge_return_value_captures_with_counter(nodes, capture_counter)),
         },
         StructuredNode::While {
             condition,
@@ -2887,7 +3212,7 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             exit_block,
         } => StructuredNode::While {
             condition,
-            body: merge_return_value_captures(body),
+            body: merge_return_value_captures_with_counter(body, capture_counter),
             header,
             exit_block,
         },
@@ -2897,7 +3222,7 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::DoWhile {
-            body: merge_return_value_captures(body),
+            body: merge_return_value_captures_with_counter(body, capture_counter),
             condition,
             header,
             exit_block,
@@ -2913,7 +3238,7 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             init,
             condition,
             update,
-            body: merge_return_value_captures(body),
+            body: merge_return_value_captures_with_counter(body, capture_counter),
             header,
             exit_block,
         },
@@ -2922,7 +3247,7 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::Loop {
-            body: merge_return_value_captures(body),
+            body: merge_return_value_captures_with_counter(body, capture_counter),
             header,
             exit_block,
         },
@@ -2934,15 +3259,289 @@ fn merge_return_value_captures_node(node: StructuredNode) -> StructuredNode {
             value,
             cases: cases
                 .into_iter()
-                .map(|(vals, body)| (vals, merge_return_value_captures(body)))
+                .map(|(vals, body)| (vals, merge_return_value_captures_with_counter(body, capture_counter)))
                 .collect(),
-            default: default.map(merge_return_value_captures),
+            default: default.map(|nodes| merge_return_value_captures_with_counter(nodes, capture_counter)),
         },
         StructuredNode::Sequence(nodes) => {
-            StructuredNode::Sequence(merge_return_value_captures(nodes))
+            StructuredNode::Sequence(merge_return_value_captures_with_counter(nodes, capture_counter))
         }
         other => other,
     }
+}
+
+fn capture_return_register_uses_in_block(statements: Vec<Expr>, capture_counter: &mut u32) -> Vec<Expr> {
+    use super::expression::{ExprKind, VarKind, Variable};
+
+    let mut stmts = statements;
+    let mut i = 0usize;
+
+    while i + 1 < stmts.len() {
+        let call_target = match &stmts[i].kind {
+            ExprKind::Call { target, .. } if is_real_function_call(target) => Some(target),
+            _ => None,
+        };
+        if call_target.is_none() {
+            i += 1;
+            continue;
+        }
+
+        let next_regs = collect_return_register_uses(&stmts[i + 1]);
+        if next_regs.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let primary_reg = next_regs.iter().next().cloned().unwrap_or_else(|| "x0".to_string());
+        let aliases = return_register_aliases(&primary_reg);
+        let reg_size = if matches!(primary_reg.as_str(), "eax" | "w0") {
+            4
+        } else {
+            8
+        };
+
+        let temp_name = format!("ret_{}", *capture_counter);
+        *capture_counter += 1;
+        let temp_var = Variable {
+            kind: VarKind::Temp(*capture_counter),
+            name: temp_name,
+            size: reg_size,
+        };
+        let temp_expr = Expr::var(temp_var.clone());
+
+        let capture_stmt = Expr::assign(
+            temp_expr.clone(),
+            Expr::var(Variable {
+                kind: VarKind::Register(0),
+                name: primary_reg,
+                size: reg_size,
+            }),
+        );
+
+        // Insert capture immediately after call.
+        stmts.insert(i + 1, capture_stmt);
+
+        // Rewrite uses in subsequent statements until clobber/new call.
+        let mut j = i + 2;
+        while j < stmts.len() {
+            if j > i + 2 {
+                if let ExprKind::Call { target, .. } = &stmts[j].kind {
+                    if is_real_function_call(target) {
+                        break;
+                    }
+                }
+            }
+            if statement_clobbers_return_register(&stmts[j], &aliases) {
+                break;
+            }
+            stmts[j] = substitute_return_register_uses(stmts[j].clone(), &aliases, &temp_expr);
+            j += 1;
+        }
+
+        i = j;
+    }
+
+    stmts
+}
+
+fn return_register_aliases(reg_name: &str) -> Vec<String> {
+    match reg_name {
+        "eax" | "rax" => vec!["eax".to_string(), "rax".to_string()],
+        "w0" | "x0" | "arg0" => vec!["w0".to_string(), "x0".to_string(), "arg0".to_string()],
+        "a0" => vec!["a0".to_string()],
+        _ => vec![reg_name.to_string()],
+    }
+}
+
+fn collect_return_register_uses(stmt: &Expr) -> HashSet<String> {
+    use super::expression::ExprKind;
+
+    fn walk(expr: &Expr, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Var(v) => {
+                let name = v.name.to_lowercase();
+                if is_return_register(&name) || name == "arg0" {
+                    out.insert(name);
+                }
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            ExprKind::UnaryOp { operand, .. } => walk(operand, out),
+            ExprKind::Deref { addr, .. } => walk(addr, out),
+            ExprKind::AddressOf(inner) => walk(inner, out),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                walk(base, out);
+                walk(index, out);
+            }
+            ExprKind::FieldAccess { base, .. } => walk(base, out),
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    walk(arg, out);
+                }
+            }
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                walk(lhs, out);
+                walk(rhs, out);
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                walk(cond, out);
+                walk(then_expr, out);
+                walk(else_expr, out);
+            }
+            ExprKind::Cast { expr, .. } => walk(expr, out),
+            ExprKind::BitField { expr, .. } => walk(expr, out),
+            ExprKind::Phi(values) => {
+                for value in values {
+                    walk(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = HashSet::new();
+    walk(stmt, &mut out);
+    out
+}
+
+fn statement_clobbers_return_register(stmt: &Expr, aliases: &[String]) -> bool {
+    use super::expression::ExprKind;
+    match &stmt.kind {
+        ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => {
+            if let ExprKind::Var(v) = &lhs.kind {
+                aliases.iter().any(|n| *n == v.name.to_lowercase())
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn substitute_return_register_uses(expr: Expr, aliases: &[String], replacement: &Expr) -> Expr {
+    use super::expression::ExprKind;
+
+    fn sub(expr: Expr, aliases: &[String], replacement: &Expr, in_plain_lhs: bool) -> Expr {
+        match expr.kind {
+            ExprKind::Var(v) => {
+                let lower = v.name.to_lowercase();
+                if !in_plain_lhs && aliases.iter().any(|n| *n == lower) {
+                    replacement.clone()
+                } else {
+                    Expr::var(v)
+                }
+            }
+            ExprKind::BinOp { op, left, right } => Expr::binop(
+                op,
+                sub(*left, aliases, replacement, false),
+                sub(*right, aliases, replacement, false),
+            ),
+            ExprKind::UnaryOp { op, operand } => {
+                Expr::unary(op, sub(*operand, aliases, replacement, false))
+            }
+            ExprKind::Deref { addr, size } => Expr::deref(sub(*addr, aliases, replacement, false), size),
+            ExprKind::AddressOf(inner) => Expr::address_of(sub(*inner, aliases, replacement, false)),
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => Expr::array_access(
+                sub(*base, aliases, replacement, false),
+                sub(*index, aliases, replacement, false),
+                element_size,
+            ),
+            ExprKind::FieldAccess {
+                base,
+                field_name,
+                offset,
+            } => Expr::field_access(sub(*base, aliases, replacement, false), field_name, offset),
+            ExprKind::Call { target, args } => Expr::call(
+                target,
+                args.into_iter()
+                    .map(|a| sub(a, aliases, replacement, false))
+                    .collect(),
+            ),
+            ExprKind::Assign { lhs, rhs } => {
+                let lhs_is_plain_var = matches!(lhs.kind, ExprKind::Var(_));
+                Expr::assign(
+                    sub(*lhs, aliases, replacement, lhs_is_plain_var),
+                    sub(*rhs, aliases, replacement, false),
+                )
+            }
+            ExprKind::CompoundAssign { op, lhs, rhs } => {
+                let lhs_is_plain_var = matches!(lhs.kind, ExprKind::Var(_));
+                Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op,
+                        lhs: Box::new(sub(*lhs, aliases, replacement, lhs_is_plain_var)),
+                        rhs: Box::new(sub(*rhs, aliases, replacement, false)),
+                    },
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => Expr {
+                kind: ExprKind::Conditional {
+                    cond: Box::new(sub(*cond, aliases, replacement, false)),
+                    then_expr: Box::new(sub(*then_expr, aliases, replacement, false)),
+                    else_expr: Box::new(sub(*else_expr, aliases, replacement, false)),
+                },
+            },
+            ExprKind::Cast {
+                expr,
+                to_size,
+                signed,
+            } => Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(sub(*expr, aliases, replacement, false)),
+                    to_size,
+                    signed,
+                },
+            },
+            ExprKind::BitField { expr, start, width } => Expr {
+                kind: ExprKind::BitField {
+                    expr: Box::new(sub(*expr, aliases, replacement, false)),
+                    start,
+                    width,
+                },
+            },
+            ExprKind::Phi(values) => Expr {
+                kind: ExprKind::Phi(
+                    values
+                        .into_iter()
+                        .map(|v| sub(v, aliases, replacement, false))
+                        .collect(),
+                ),
+            },
+            ExprKind::IntLit(n) => Expr::int(n),
+            ExprKind::Unknown(name) => Expr::unknown(name),
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                size,
+                display_expr,
+                is_deref,
+            } => Expr {
+                kind: ExprKind::GotRef {
+                    address,
+                    instruction_address,
+                    size,
+                    display_expr: Box::new(sub(*display_expr, aliases, replacement, false)),
+                    is_deref,
+                },
+            },
+        }
+    }
+
+    sub(expr, aliases, replacement, false)
 }
 
 /// Post-processes nodes to detect switch statements from chains of if-else.
@@ -5315,6 +5914,53 @@ mod tests {
             assert!(matches!(body[1], StructuredNode::Continue));
         } else {
             panic!("Expected While node");
+        }
+    }
+
+    #[test]
+    fn test_capture_return_register_uses_after_call_arg0() {
+        use crate::decompiler::expression::{CallTarget, ExprKind, VarKind, Variable};
+
+        let call = Expr::call(CallTarget::Named("___error".to_string()), vec![]);
+        let arg0 = Expr::var(Variable {
+            kind: VarKind::Arg(0),
+            name: "arg0".to_string(),
+            size: 8,
+        });
+        let use_stmt = Expr::assign(
+            Expr::var(Variable::reg("tmp0", 8)),
+            Expr::deref(arg0, 4),
+        );
+
+        let mut counter = 0u32;
+        let out = capture_return_register_uses_in_block(vec![call, use_stmt], &mut counter);
+
+        assert_eq!(out.len(), 3);
+        // Inserted capture: ret_0 = arg0
+        if let ExprKind::Assign { lhs, rhs } = &out[1].kind {
+            match (&lhs.kind, &rhs.kind) {
+                (ExprKind::Var(lv), ExprKind::Var(rv)) => {
+                    assert_eq!(lv.name, "ret_0");
+                    assert_eq!(rv.name, "arg0");
+                }
+                _ => panic!("expected var-to-var capture assignment"),
+            }
+        } else {
+            panic!("expected inserted assignment");
+        }
+        // Original use rewritten to ret_0
+        if let ExprKind::Assign { rhs, .. } = &out[2].kind {
+            if let ExprKind::Deref { addr, .. } = &rhs.kind {
+                if let ExprKind::Var(v) = &addr.kind {
+                    assert_eq!(v.name, "ret_0");
+                } else {
+                    panic!("expected deref of ret_0");
+                }
+            } else {
+                panic!("expected deref RHS");
+            }
+        } else {
+            panic!("expected rewritten use assignment");
         }
     }
 }
