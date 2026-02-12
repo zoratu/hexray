@@ -426,6 +426,13 @@ impl PseudoCodeEmitter {
         arg_index: usize,
         table: &StringTable,
     ) -> String {
+        // signal/signaction handler argument: resolve raw addresses to function names.
+        if matches!(func_name, "signal" | "_signal" | "sigaction") && matches!(arg_index, 1 | 2) {
+            if let Some(name) = self.resolve_function_pointer_arg(arg) {
+                return name;
+            }
+        }
+
         // Try to recognize magic constants based on the function and argument position
         if let Some(ref const_db) = self.constant_database {
             // Check if this argument position has a known constant category
@@ -458,6 +465,16 @@ impl PseudoCodeEmitter {
         }
         // Fall back to normal expression formatting
         self.format_expr_with_strings(arg, table)
+    }
+
+    /// Resolve a function pointer-like argument to a symbol name, when possible.
+    fn resolve_function_pointer_arg(&self, arg: &Expr) -> Option<String> {
+        let sym = self.symbol_table.as_ref()?;
+        match &arg.kind {
+            ExprKind::IntLit(n) if *n > 0 => sym.get(*n as u64).map(ToOwned::to_owned),
+            ExprKind::GotRef { address, .. } => sym.get(*address).map(ToOwned::to_owned),
+            _ => None,
+        }
     }
 
     /// Formats comparison operands, converting integers to character literals when appropriate.
@@ -3828,6 +3845,20 @@ mod tests {
         let stmt = Expr::assign(lhs, rhs);
 
         assert_eq!(emitter.format_expr(&stmt), "g_flags_rip_30 |= FLAG_1");
+    }
+
+    #[test]
+    fn test_signal_handler_argument_symbol_resolution() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x1234, "signal_handler".to_string());
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+
+        let call = Expr::call(
+            super::super::expression::CallTarget::Named("signal".to_string()),
+            vec![Expr::int(2), Expr::int(0x1234)],
+        );
+
+        assert_eq!(emitter.format_expr(&call), "signal(2, signal_handler)");
     }
 
     #[test]

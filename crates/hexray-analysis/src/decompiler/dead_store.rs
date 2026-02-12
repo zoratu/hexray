@@ -242,6 +242,7 @@ fn eliminate_in_node(node: StructuredNode, uses: &HashSet<String>) -> Option<Str
                 .into_iter()
                 .filter(|stmt| !is_dead_store(stmt, uses))
                 .collect();
+            let statements = eliminate_consecutive_overwrites(statements);
 
             // Don't emit empty blocks
             if statements.is_empty() {
@@ -393,6 +394,82 @@ fn has_side_effects(expr: &Expr) -> bool {
     }
 }
 
+/// Removes immediately consecutive overwrites to the same lvalue.
+///
+/// Example:
+/// `x = 1; x = 2;` -> `x = 2;`
+/// `*p = a; *p = b;` -> `*p = b;`
+///
+/// This is conservative: we only remove the earlier store when the two writes
+/// are adjacent and the earlier RHS has no side effects.
+fn eliminate_consecutive_overwrites(statements: Vec<Expr>) -> Vec<Expr> {
+    if statements.len() < 2 {
+        return statements;
+    }
+
+    let mut out: Vec<Expr> = Vec::with_capacity(statements.len());
+    let mut i = 0usize;
+    while i < statements.len() {
+        if i + 1 < statements.len() {
+            let cur = &statements[i];
+            let next = &statements[i + 1];
+            if let (
+                ExprKind::Assign {
+                    lhs: lhs_a,
+                    rhs: rhs_a,
+                },
+                ExprKind::Assign { lhs: lhs_b, .. },
+            ) = (&cur.kind, &next.kind)
+            {
+                if exprs_equivalent_lvalue(lhs_a, lhs_b) && !has_side_effects(rhs_a) {
+                    // Skip current write; it's immediately overwritten.
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        out.push(statements[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// Structural lvalue equivalence for store overwrite checks.
+fn exprs_equivalent_lvalue(a: &Expr, b: &Expr) -> bool {
+    match (&a.kind, &b.kind) {
+        (ExprKind::Var(va), ExprKind::Var(vb)) => va.name == vb.name,
+        (ExprKind::Deref { addr: aa, size: sa }, ExprKind::Deref { addr: ab, size: sb }) => {
+            sa == sb && exprs_equivalent_lvalue(aa, ab)
+        }
+        (
+            ExprKind::ArrayAccess {
+                base: ba,
+                index: ia,
+                element_size: ea,
+            },
+            ExprKind::ArrayAccess {
+                base: bb,
+                index: ib,
+                element_size: eb,
+            },
+        ) => ea == eb && exprs_equivalent_lvalue(ba, bb) && exprs_equivalent_lvalue(ia, ib),
+        (
+            ExprKind::FieldAccess {
+                base: ba,
+                offset: oa,
+                ..
+            },
+            ExprKind::FieldAccess {
+                base: bb,
+                offset: ob,
+                ..
+            },
+        ) => oa == ob && exprs_equivalent_lvalue(ba, bb),
+        (ExprKind::IntLit(na), ExprKind::IntLit(nb)) => na == nb,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +577,33 @@ mod tests {
         assert!(uses.contains("x")); // Used in rhs of y assignment
         assert!(uses.contains("z")); // Used in rhs of y assignment
         assert!(!uses.contains("y")); // Only assigned, not used
+    }
+
+    #[test]
+    fn test_eliminate_consecutive_overwrites_simple_var() {
+        let nodes = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                make_assign("x", Expr::int(1)),
+                make_assign("x", Expr::int(2)),
+                make_assign("y", make_var("x")),
+            ],
+            address_range: (0, 0),
+        }];
+
+        let mut uses = HashSet::new();
+        uses.insert("x".to_string());
+        uses.insert("y".to_string());
+        let out = eliminate_in_nodes(nodes, &uses);
+        if let StructuredNode::Block { statements, .. } = &out[0] {
+            assert_eq!(statements.len(), 2);
+            if let ExprKind::Assign { rhs, .. } = &statements[0].kind {
+                assert!(matches!(rhs.kind, ExprKind::IntLit(2)));
+            } else {
+                panic!("expected assignment");
+            }
+        } else {
+            panic!("expected block");
+        }
     }
 }

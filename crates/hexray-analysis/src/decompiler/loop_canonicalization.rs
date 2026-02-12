@@ -62,6 +62,16 @@ fn canonicalize_node(node: StructuredNode) -> StructuredNode {
                     header,
                     exit_block,
                 }
+            } else if let Some((condition, remaining)) =
+                extract_trailing_break_condition(&canonicalized_body)
+            {
+                // loop { body; if (cond) break; } -> do { body; } while (!cond);
+                StructuredNode::DoWhile {
+                    body: remaining,
+                    condition,
+                    header,
+                    exit_block,
+                }
             } else {
                 StructuredNode::Loop {
                     body: canonicalized_body,
@@ -298,6 +308,44 @@ fn extract_leading_break_condition(body: &[StructuredNode]) -> Option<(Expr, Vec
     None
 }
 
+/// Extracts a break condition from the end of a loop body.
+///
+/// Looks for patterns like:
+/// ```text
+/// ...;
+/// if (condition) break;
+/// ```
+///
+/// Returns the negated condition suitable for a do-while condition and the body
+/// without the trailing break-if.
+fn extract_trailing_break_condition(
+    body: &[StructuredNode],
+) -> Option<(Expr, Vec<StructuredNode>)> {
+    if body.is_empty() {
+        return None;
+    }
+
+    let last = body.last()?;
+    if let StructuredNode::If {
+        condition,
+        then_body,
+        else_body: None,
+    } = last
+    {
+        if then_body.len() == 1 && matches!(then_body[0], StructuredNode::Break) {
+            let mut remaining = body[..body.len() - 1].to_vec();
+            // Avoid generating an empty do-while body.
+            if remaining.is_empty() {
+                return None;
+            }
+            // loop { ...; if (cond) break; } => do { ... } while (!cond)
+            let do_while_cond = negate_condition(condition.clone());
+            return Some((do_while_cond, std::mem::take(&mut remaining)));
+        }
+    }
+    None
+}
+
 /// Negates a condition expression.
 fn negate_condition(condition: Expr) -> Expr {
     match &condition.kind {
@@ -401,5 +449,37 @@ mod tests {
 
         // !!x -> x
         assert!(matches!(negated.kind, ExprKind::Var(_)));
+    }
+
+    #[test]
+    fn test_loop_with_trailing_break_to_do_while() {
+        // loop { body; if (done) break; } -> do { body; } while (!done)
+        let body_stmt = StructuredNode::Expr(Expr::assign(make_var("x"), Expr::int(1)));
+        let input = StructuredNode::Loop {
+            body: vec![
+                body_stmt.clone(),
+                StructuredNode::If {
+                    condition: make_var("done"),
+                    then_body: vec![StructuredNode::Break],
+                    else_body: None,
+                },
+            ],
+            header: Some(BasicBlockId::new(0)),
+            exit_block: Some(BasicBlockId::new(1)),
+        };
+
+        let result = canonicalize_node(input);
+        match result {
+            StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
+                assert_eq!(body.len(), 1);
+                match condition.kind {
+                    ExprKind::UnaryOp { .. } => {}
+                    _ => panic!("expected negated condition for do-while"),
+                }
+            }
+            _ => panic!("Expected DoWhile"),
+        }
     }
 }

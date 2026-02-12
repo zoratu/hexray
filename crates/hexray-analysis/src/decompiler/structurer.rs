@@ -254,6 +254,7 @@ impl StructuredCfg {
         // Post-process to detect string function patterns (strlen, strcpy, etc.)
         if config.is_pass_enabled(OptimizationPass::StringPatternDetection) {
             body = super::string_patterns::detect_string_patterns(body);
+            body = simplify_strcmp_switch_patterns(body);
         }
 
         // Post-process to simplify architecture-specific patterns (CSEL, min/max, abs)
@@ -367,6 +368,7 @@ impl StructuredCfg {
         // Post-process to detect string function patterns (strlen, strcpy, etc.)
         if config.is_pass_enabled(OptimizationPass::StringPatternDetection) {
             body = super::string_patterns::detect_string_patterns(body);
+            body = simplify_strcmp_switch_patterns(body);
         }
 
         // Post-process to simplify architecture-specific patterns (CSEL, min/max, abs)
@@ -3573,6 +3575,239 @@ fn detect_switch_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     result
 }
 
+/// Rewrites common option-parsing pattern:
+///   `tmp = strcmp(x, "..."); switch (tmp) { case 0: ... default: ... }`
+/// into:
+///   `if (strcmp(x, "...") == 0) { ... } else { ... }`
+fn simplify_strcmp_switch_patterns(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    // First recurse into children.
+    let recursed: Vec<StructuredNode> = nodes
+        .into_iter()
+        .map(simplify_strcmp_switch_in_node)
+        .collect();
+
+    // Then rewrite adjacent node pairs at this level.
+    let mut out = Vec::with_capacity(recursed.len());
+    let mut i = 0usize;
+    while i < recursed.len() {
+        if i + 1 < recursed.len() {
+            if let Some(mut rewritten) =
+                rewrite_strcmp_switch_pair(recursed[i].clone(), recursed[i + 1].clone())
+            {
+                out.append(&mut rewritten);
+                i += 2;
+                continue;
+            }
+        }
+        out.push(recursed[i].clone());
+        i += 1;
+    }
+
+    out
+}
+
+fn simplify_strcmp_switch_in_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: simplify_strcmp_switch_patterns(then_body),
+            else_body: else_body.map(simplify_strcmp_switch_patterns),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition,
+            body: simplify_strcmp_switch_patterns(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: simplify_strcmp_switch_patterns(body),
+            condition,
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: simplify_strcmp_switch_patterns(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: simplify_strcmp_switch_patterns(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| (vals, simplify_strcmp_switch_patterns(body)))
+                .collect(),
+            default: default.map(simplify_strcmp_switch_patterns),
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(simplify_strcmp_switch_patterns(nodes))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: simplify_strcmp_switch_patterns(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| CatchHandler {
+                    body: simplify_strcmp_switch_patterns(h.body),
+                    ..h
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn rewrite_strcmp_switch_pair(
+    first: StructuredNode,
+    second: StructuredNode,
+) -> Option<Vec<StructuredNode>> {
+    // Extract `tmp = strcmp(...);` from first node.
+    let (remaining_first, cmp_var, cmp_call) = extract_strcmp_assignment(first)?;
+
+    // Extract `switch(tmp)` with only `case 0` (+ optional default) from second.
+    let (then_body, else_body) = extract_zero_case_switch(&second, &cmp_var)?;
+
+    let condition = Expr::binop(BinOpKind::Eq, cmp_call, Expr::int(0));
+    let if_node = StructuredNode::If {
+        condition,
+        then_body,
+        else_body,
+    };
+
+    let mut out = Vec::new();
+    if let Some(node) = remaining_first {
+        out.push(node);
+    }
+    out.push(if_node);
+    Some(out)
+}
+
+fn extract_strcmp_assignment(
+    node: StructuredNode,
+) -> Option<(Option<StructuredNode>, String, Expr)> {
+    // Support either:
+    //   Expr(tmp = strcmp(...))
+    // or
+    //   Block { ..., tmp = strcmp(...) } (assignment must be last stmt)
+    match node {
+        StructuredNode::Expr(expr) => {
+            let (var, call) = match_strcmp_assign(&expr)?;
+            Some((None, var, call))
+        }
+        StructuredNode::Block {
+            id,
+            mut statements,
+            address_range,
+        } => {
+            let last = statements.last()?.clone();
+            let (var, call) = match_strcmp_assign(&last)?;
+            statements.pop();
+            let remaining = if statements.is_empty() {
+                None
+            } else {
+                Some(StructuredNode::Block {
+                    id,
+                    statements,
+                    address_range,
+                })
+            };
+            Some((remaining, var, call))
+        }
+        _ => None,
+    }
+}
+
+fn match_strcmp_assign(expr: &Expr) -> Option<(String, Expr)> {
+    if let super::expression::ExprKind::Assign { lhs, rhs } = &expr.kind {
+        if let super::expression::ExprKind::Var(v) = &lhs.kind {
+            if let super::expression::ExprKind::Call {
+                target: super::expression::CallTarget::Named(name),
+                ..
+            } = &rhs.kind
+            {
+                let lower = name.to_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "strcmp" | "strncmp" | "strcasecmp" | "strncasecmp"
+                ) {
+                    return Some((v.name.clone(), (**rhs).clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_zero_case_switch(
+    node: &StructuredNode,
+    expected_var: &str,
+) -> Option<(Vec<StructuredNode>, Option<Vec<StructuredNode>>)> {
+    let StructuredNode::Switch {
+        value,
+        cases,
+        default,
+    } = node
+    else {
+        return None;
+    };
+
+    let super::expression::ExprKind::Var(v) = &value.kind else {
+        return None;
+    };
+    if v.name != expected_var {
+        return None;
+    }
+
+    // Only handle single-case switches where the case is exactly value 0.
+    if cases.len() != 1 {
+        return None;
+    }
+    let (vals, body) = &cases[0];
+    if vals.len() != 1 || vals[0] != 0 {
+        return None;
+    }
+
+    Some((body.clone(), default.clone()))
+}
+
 /// Detect switch patterns in a single node and its children.
 fn detect_switch_in_node(node: StructuredNode) -> StructuredNode {
     match node {
@@ -5975,6 +6210,52 @@ mod tests {
             }
         } else {
             panic!("expected rewritten use assignment");
+        }
+    }
+
+    #[test]
+    fn test_rewrite_strcmp_switch_to_if() {
+        use crate::decompiler::expression::{CallTarget, VarKind, Variable};
+
+        let cmp_var = Expr::var(Variable {
+            kind: VarKind::Temp(0),
+            name: "cmp_result".to_string(),
+            size: 4,
+        });
+        let assign = Expr::assign(
+            cmp_var.clone(),
+            Expr::call(
+                CallTarget::Named("strcmp".to_string()),
+                vec![Expr::unknown("opt"), Expr::unknown("\"-separator\"")],
+            ),
+        );
+
+        let nodes = vec![
+            StructuredNode::Expr(assign),
+            StructuredNode::Switch {
+                value: cmp_var.clone(),
+                cases: vec![(vec![0], vec![StructuredNode::Return(Some(Expr::int(1)))])],
+                default: Some(vec![StructuredNode::Return(Some(Expr::int(0)))]),
+            },
+        ];
+
+        let out = simplify_strcmp_switch_patterns(nodes);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                assert_eq!(then_body.len(), 1);
+                assert!(else_body.is_some());
+                if let super::super::expression::ExprKind::BinOp { op, .. } = condition.kind {
+                    assert_eq!(op, BinOpKind::Eq);
+                } else {
+                    panic!("expected equality condition");
+                }
+            }
+            _ => panic!("expected If after rewrite"),
         }
     }
 }
