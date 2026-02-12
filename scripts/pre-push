@@ -1,30 +1,9 @@
 #!/bin/bash
-# Pre-push hook: Run tests in Docker on both x86_64 and ARM64 Linux
+# Pre-push hook: run medium local CI tier before every push.
 #
-# To install: cp scripts/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
-# Or run: scripts/install-hooks.sh
+# To install hooks: scripts/install-hooks.sh
 
-set -e
+set -euo pipefail
 
-ensure_image() {
-    local platform="$1"
-    local image="$2"
-
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
-        echo "Image $image not found. Building for $platform..."
-        docker build --platform "$platform" -t "$image" .
-    fi
-}
-
-ensure_image "linux/amd64" "hexray-test:amd64"
-ensure_image "linux/arm64" "hexray-test:arm64"
-
-echo "=== Running tests on linux/amd64 ==="
-docker run --platform linux/amd64 --rm hexray-test:amd64
-
-echo ""
-echo "=== Running tests on linux/arm64 ==="
-docker run --platform linux/arm64 --rm hexray-test:arm64
-
-echo ""
-echo "All tests passed on both architectures. Pushing..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+"$SCRIPT_DIR/ci-local" --tier medium

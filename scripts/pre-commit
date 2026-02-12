@@ -1,45 +1,9 @@
 #!/bin/bash
-# Pre-commit hook: Run fast checks before every commit
+# Pre-commit hook: run fast local CI tier before every commit.
 #
-# To install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
-# Or run: scripts/install-hooks.sh
+# To install hooks: scripts/install-hooks.sh
 
-set -e
+set -euo pipefail
 
-echo "=== Checking formatting ==="
-cargo fmt --check || {
-    echo "ERROR: Code is not formatted. Run 'cargo fmt' to fix."
-    exit 1
-}
-
-echo ""
-echo "=== Running clippy ==="
-cargo clippy --all-targets --all-features -- -D warnings 2>/dev/null || {
-    echo "ERROR: Clippy found issues. Fix them before committing."
-    exit 1
-}
-
-echo ""
-echo "=== Building ==="
-cargo build --all-targets || {
-    echo "ERROR: Build failed."
-    exit 1
-}
-
-echo ""
-echo "=== Running core tests ==="
-cargo test || {
-    echo "ERROR: Tests failed."
-    exit 1
-}
-
-# Run property-based tests with a limited number of cases for speed
-echo ""
-echo "=== Running property tests (quick) ==="
-PROPTEST_CASES=20 cargo test -p hexray-analysis --test proptest_cfg --test proptest_types 2>/dev/null || {
-    echo "ERROR: Property tests failed."
-    exit 1
-}
-
-echo ""
-echo "All checks passed!"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+"$SCRIPT_DIR/ci-local" --tier fast

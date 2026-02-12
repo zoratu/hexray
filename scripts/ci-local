@@ -1,0 +1,115 @@
+#!/bin/bash
+# Local CI entrypoint with tiered workflows.
+#
+# Tiers:
+#   fast   - quick checks for pre-commit
+#   medium - deeper validation for pre-push
+#   full   - full local suite (and optional docker cross-arch matrix)
+#
+# Examples:
+#   scripts/ci-local --tier fast
+#   scripts/ci-local --tier medium
+#   scripts/ci-local --tier full
+#   scripts/ci-local --tier full --cross
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+TIER="medium"
+RUN_CROSS="auto"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--help]
+
+  --tier      Select workflow tier (default: medium)
+  --cross     Force docker cross-arch matrix during full tier
+  --no-cross  Disable docker cross-arch matrix during full tier
+  --help      Show this message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tier)
+            TIER="${2:-}"
+            shift 2
+            ;;
+        --cross)
+            RUN_CROSS="yes"
+            shift
+            ;;
+        --no-cross)
+            RUN_CROSS="no"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+run() {
+    echo ""
+    echo "=== $1 ==="
+    shift
+    "$@"
+}
+
+run_fast() {
+    run "Formatting" cargo fmt --all --check
+    run "Workspace check" cargo check --workspace --all-targets
+}
+
+run_medium() {
+    run_fast
+    run "Clippy (warnings as errors)" cargo clippy --workspace --all-targets --all-features -- -D warnings
+    run "Workspace unit/integration tests" cargo test --workspace --all-targets
+}
+
+run_full() {
+    run_medium
+
+    if [[ "$RUN_CROSS" == "yes" ]]; then
+        run "Docker cross-arch matrix" "$ROOT_DIR/scripts/ci-cross-docker"
+        return
+    fi
+
+    if [[ "$RUN_CROSS" == "auto" ]] && command -v docker >/dev/null 2>&1; then
+        echo ""
+        echo "=== Docker cross-arch matrix (auto) ==="
+        "$ROOT_DIR/scripts/ci-cross-docker" || {
+            echo "WARNING: docker cross-arch matrix failed."
+            echo "Run with '--no-cross' to skip, or fix docker environment."
+            exit 1
+        }
+    fi
+}
+
+case "$TIER" in
+    fast)
+        run_fast
+        ;;
+    medium)
+        run_medium
+        ;;
+    full)
+        run_full
+        ;;
+    *)
+        echo "Invalid tier: $TIER" >&2
+        usage
+        exit 2
+        ;;
+esac
+
+echo ""
+echo "Tier '$TIER' completed successfully."

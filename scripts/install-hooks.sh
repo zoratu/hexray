@@ -1,33 +1,31 @@
 #!/bin/bash
-# Install git hooks for local CI
+# Install git hooks for tiered local CI workflows.
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
+if [[ ! -d "$REPO_ROOT/.git/hooks" ]]; then
+    echo "ERROR: .git/hooks not found. Run this script from a git checkout." >&2
+    exit 1
+fi
+
 echo "Installing git hooks..."
 
-# Pre-commit hook (fast checks: fmt, clippy, build, test, property tests)
 cp "$SCRIPT_DIR/pre-commit" "$REPO_ROOT/.git/hooks/pre-commit"
 chmod +x "$REPO_ROOT/.git/hooks/pre-commit"
-echo "  - pre-commit: format, clippy, build, test, property tests"
+echo "  - pre-commit: scripts/ci-local --tier fast"
 
-# Pre-push hook (Docker cross-platform tests)
 cp "$SCRIPT_DIR/pre-push" "$REPO_ROOT/.git/hooks/pre-push"
 chmod +x "$REPO_ROOT/.git/hooks/pre-push"
-echo "  - pre-push: Docker tests on linux/amd64 and linux/arm64"
+echo "  - pre-push: scripts/ci-local --tier medium"
 
 echo ""
-echo "Building Docker images for pre-push hook..."
-docker build --platform linux/amd64 -t hexray-test:amd64 "$REPO_ROOT"
-docker build --platform linux/arm64 -t hexray-test:arm64 "$REPO_ROOT"
-
+echo "Done. Tiered local workflows:"
+echo "  - Fast:   scripts/ci-local --tier fast"
+echo "  - Medium: scripts/ci-local --tier medium"
+echo "  - Full:   scripts/ci-local --tier full"
 echo ""
-echo "Done! Hooks installed:"
-echo "  - Pre-commit: runs on every 'git commit'"
-echo "  - Pre-push: runs on every 'git push'"
-echo ""
-echo "Additional test scripts:"
-echo "  - scripts/test-analysis-modules.sh: comprehensive analysis module tests"
-echo "  - scripts/bench-regression.sh: benchmark regression testing"
+echo "Docker cross-arch matrix is run only in full tier."
+echo "It auto-builds missing images (hexray-test:amd64, hexray-test:arm64)."

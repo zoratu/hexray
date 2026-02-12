@@ -1,0 +1,36 @@
+#!/bin/bash
+# Docker cross-architecture CI matrix used by local workflows.
+# Runs the full Docker test image on linux/amd64 and linux/arm64.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker is not installed or not on PATH." >&2
+    exit 1
+fi
+
+ensure_image() {
+    local platform="$1"
+    local image="$2"
+
+    if ! docker image inspect "$image" >/dev/null 2>&1; then
+        echo "Image $image not found. Building for $platform..."
+        docker build --platform "$platform" -t "$image" .
+    fi
+}
+
+ensure_image "linux/amd64" "hexray-test:amd64"
+ensure_image "linux/arm64" "hexray-test:arm64"
+
+echo "=== Running tests on linux/amd64 ==="
+docker run --platform linux/amd64 --rm hexray-test:amd64
+
+echo ""
+echo "=== Running tests on linux/arm64 ==="
+docker run --platform linux/arm64 --rm hexray-test:arm64
+
+echo ""
+echo "Docker cross-arch matrix passed."
