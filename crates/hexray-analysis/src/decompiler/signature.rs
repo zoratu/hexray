@@ -187,6 +187,8 @@ pub struct ParameterUsageHints {
     pub function_pointer_arg_types: Vec<ParamType>,
     /// Best-effort inferred return type when this parameter is called indirectly.
     pub function_pointer_return_type: Option<ParamType>,
+    /// Confidence score for function-pointer inference from indirect evidence.
+    pub function_pointer_confidence: u8,
 }
 
 impl ParameterUsageHints {
@@ -243,6 +245,9 @@ impl ParameterUsageHints {
         }
 
         if self.is_function_pointer {
+            if self.function_pointer_confidence < 2 && self.function_pointer_arg_types.is_empty() {
+                return ParamType::Pointer;
+            }
             let params = if self.function_pointer_arg_types.is_empty() {
                 vec![ParamType::Pointer]
             } else {
@@ -1066,12 +1071,16 @@ impl SignatureRecovery {
                         });
                         if Self::is_callback_position(fn_name, i) {
                             self.record_usage_hint(&var.name.to_lowercase(), |h| {
-                                h.passed_as_callback_to.push((fn_name.clone(), i))
+                                h.passed_as_callback_to.push((fn_name.clone(), i));
+                                h.function_pointer_confidence =
+                                    h.function_pointer_confidence.saturating_add(4);
                             });
                         }
                         if let Some(sig) = self.callback_signature_from_summary(fn_name, i) {
                             self.record_usage_hint(&var.name.to_lowercase(), |h| {
                                 h.is_function_pointer = true;
+                                h.function_pointer_confidence =
+                                    h.function_pointer_confidence.saturating_add(5);
                                 if let ParamType::FunctionPointer {
                                     return_type,
                                     params,
@@ -1199,6 +1208,7 @@ impl SignatureRecovery {
 
     fn merge_param_types(a: &ParamType, b: &ParamType) -> ParamType {
         match (a, b) {
+            (ParamType::Unknown, t) | (t, ParamType::Unknown) => t.clone(),
             (ParamType::Pointer, _) | (_, ParamType::Pointer) => ParamType::Pointer,
             (ParamType::Float(sa), ParamType::Float(sb)) => ParamType::Float((*sa).max(*sb)),
             (ParamType::UnsignedInt(sa), ParamType::UnsignedInt(sb)) => {
@@ -1214,8 +1224,12 @@ impl SignatureRecovery {
             (ParamType::FunctionPointer { .. }, _) | (_, ParamType::FunctionPointer { .. }) => {
                 ParamType::Pointer
             }
-            _ => ParamType::SignedInt(64),
+            _ => ParamType::Unknown,
         }
+    }
+
+    fn is_ambiguous_indirect_arg_type(ty: &ParamType) -> bool {
+        matches!(ty, ParamType::Unknown | ParamType::SignedInt(64))
     }
 
     fn record_function_pointer_call_signature(&mut self, reg_name: &str, args: &[Expr]) {
@@ -1226,13 +1240,34 @@ impl SignatureRecovery {
     }
 
     fn record_function_pointer_call_signature_by_index(&mut self, idx: usize, args: &[Expr]) {
-        let inferred: Vec<ParamType> = args
+        let mut inferred: Vec<ParamType> = args
             .iter()
             .map(Self::infer_indirect_call_arg_type)
             .collect();
+        let informative_count = inferred
+            .iter()
+            .filter(|ty| !Self::is_ambiguous_indirect_arg_type(ty))
+            .count();
+        if informative_count == 0 {
+            inferred = vec![ParamType::Pointer; inferred.len()];
+        } else {
+            inferred = inferred
+                .into_iter()
+                .map(|ty| {
+                    if Self::is_ambiguous_indirect_arg_type(&ty) {
+                        ParamType::Pointer
+                    } else {
+                        ty
+                    }
+                })
+                .collect();
+        }
 
         let hints = self.param_hints.entry(idx).or_default();
         hints.is_function_pointer = true;
+        hints.function_pointer_confidence = hints
+            .function_pointer_confidence
+            .saturating_add(if informative_count > 0 { 2 } else { 1 });
         if hints.function_pointer_return_type.is_none() {
             hints.function_pointer_return_type = Some(ParamType::SignedInt(64));
         }
@@ -1641,6 +1676,7 @@ fn is_frame_pointer(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::decompiler::expression::{CallTarget, Variable};
+    use std::sync::Arc;
 
     #[test]
     fn test_calling_convention_registers() {
@@ -2067,6 +2103,10 @@ mod tests {
             "params: {:?}",
             sig.parameters
         );
+        assert_eq!(
+            sig.parameters[0].param_type.format_with_name("cb"),
+            "int64_t (*cb)(void*)"
+        );
     }
 
     #[test]
@@ -2130,7 +2170,7 @@ mod tests {
         assert!(!sig.parameters.is_empty());
         assert_eq!(
             sig.parameters[0].param_type.format_with_name("cb"),
-            "int64_t (*cb)(int64_t, int32_t)"
+            "int64_t (*cb)(void*, int32_t)"
         );
     }
 
@@ -2171,6 +2211,43 @@ mod tests {
         assert_eq!(sig.parameters.len(), 4);
         assert_eq!(
             sig.parameters[3].param_type.format_with_name("compar"),
+            "int32_t (*compar)(void*, void*)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_uses_summary_for_callback_types() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("bsearch".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::var(Variable::reg("rcx", 8)),
+                Expr::var(Variable::reg("r8", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let summary_db = Arc::new(super::super::interprocedural::SummaryDatabase::new());
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_summary_database(Some(summary_db));
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 5);
+        assert_eq!(
+            sig.parameters[4].param_type.format_with_name("compar"),
             "int32_t (*compar)(void*, void*)"
         );
     }

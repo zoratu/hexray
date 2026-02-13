@@ -697,6 +697,9 @@ impl Decompiler {
             .with_dwarf_names(self.dwarf_names.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
+        if let Some(ref db) = self.summary_database {
+            emitter = emitter.with_summary_database(db.clone());
+        }
         if let Some(ref db) = self.type_database {
             emitter = emitter.with_type_database(db.clone());
         }
@@ -949,7 +952,9 @@ impl Decompiler {
     /// useful for building symbol tables or function prototypes.
     pub fn recover_signature(&self, cfg: &ControlFlowGraph) -> FunctionSignature {
         let structured = StructuredCfg::from_cfg(cfg);
-        let mut recovery = SignatureRecovery::new(self.calling_convention);
+        let mut recovery = SignatureRecovery::new(self.calling_convention)
+            .with_relocation_table(self.relocation_table.clone())
+            .with_summary_database(self.summary_database.clone());
         recovery.analyze(&structured)
     }
 
@@ -1045,6 +1050,9 @@ impl Decompiler {
             .with_dwarf_names(self.dwarf_names.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
+        if let Some(ref db) = self.summary_database {
+            emitter = emitter.with_summary_database(db.clone());
+        }
         if let Some(ref db) = self.type_database {
             emitter = emitter.with_type_database(db.clone());
         }

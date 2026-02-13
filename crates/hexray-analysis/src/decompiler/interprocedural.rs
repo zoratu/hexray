@@ -696,6 +696,209 @@ impl SummaryDatabase {
             },
         );
 
+        // Callback-heavy libc/POSIX APIs
+        self.add_known_function(
+            "qsort",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::UnsignedInt(64)),
+                    (2, SummaryType::UnsignedInt(64)),
+                    (
+                        3,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::SignedInt(32)),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::Void),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "bsearch",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::pointer(SummaryType::Void)),
+                    (2, SummaryType::UnsignedInt(64)),
+                    (3, SummaryType::UnsignedInt(64)),
+                    (
+                        4,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::SignedInt(32)),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::pointer(SummaryType::Void)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "pthread_create",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::pointer(SummaryType::Void)),
+                    (
+                        2,
+                        SummaryType::FunctionPointer {
+                            params: vec![SummaryType::pointer(SummaryType::Void)],
+                            return_type: Box::new(SummaryType::pointer(SummaryType::Void)),
+                        },
+                    ),
+                    (3, SummaryType::pointer(SummaryType::Void)),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "signal",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::SignedInt(32)),
+                    (
+                        1,
+                        SummaryType::FunctionPointer {
+                            params: vec![SummaryType::SignedInt(32)],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::FunctionPointer {
+                    params: vec![SummaryType::SignedInt(32)],
+                    return_type: Box::new(SummaryType::Void),
+                }),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "atexit",
+            FunctionSummary {
+                address: 0,
+                param_types: [(
+                    0,
+                    SummaryType::FunctionPointer {
+                        params: vec![],
+                        return_type: Box::new(SummaryType::Void),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "at_quick_exit",
+            FunctionSummary {
+                address: 0,
+                param_types: [(
+                    0,
+                    SummaryType::FunctionPointer {
+                        params: vec![],
+                        return_type: Box::new(SummaryType::Void),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "on_exit",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (
+                        0,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::SignedInt(32),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                    (1, SummaryType::pointer(SummaryType::Void)),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "pthread_atfork",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (
+                        0,
+                        SummaryType::FunctionPointer {
+                            params: vec![],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                    (
+                        1,
+                        SummaryType::FunctionPointer {
+                            params: vec![],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                    (
+                        2,
+                        SummaryType::FunctionPointer {
+                            params: vec![],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
         // No-return functions
         self.add_known_function(
             "exit",
@@ -1322,6 +1525,19 @@ mod tests {
         // Check with underscore prefix
         let _exit = db.get_summary_by_name("_exit").unwrap();
         assert!(_exit.may_not_return);
+
+        // Callback-rich APIs should expose function pointer parameter types.
+        let qsort = db.get_summary_by_name("qsort").unwrap();
+        assert!(matches!(
+            qsort.param_types.get(&3),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+
+        let signal = db.get_summary_by_name("signal").unwrap();
+        assert!(matches!(
+            signal.param_types.get(&1),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
     }
 
     #[test]

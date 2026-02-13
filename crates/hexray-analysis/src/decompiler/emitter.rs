@@ -9,7 +9,7 @@ use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
 use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
 use super::structurer::{StructuredCfg, StructuredNode};
-use super::{RelocationTable, StringTable, SymbolTable};
+use super::{RelocationTable, StringTable, SummaryDatabase, SymbolTable};
 use hexray_types::{get_argument_category, ConstantCategory, ConstantDatabase, TypeDatabase};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -102,6 +102,8 @@ pub struct PseudoCodeEmitter {
     type_database: Option<Arc<TypeDatabase>>,
     /// Constant database for magic number recognition.
     constant_database: Option<Arc<ConstantDatabase>>,
+    /// Optional inter-procedural summary database for signature hints.
+    summary_database: Option<Arc<SummaryDatabase>>,
 }
 
 impl PseudoCodeEmitter {
@@ -120,6 +122,7 @@ impl PseudoCodeEmitter {
             use_signature_recovery: true,
             type_database: None,
             constant_database: None,
+            summary_database: None,
         }
     }
 
@@ -186,6 +189,12 @@ impl PseudoCodeEmitter {
     /// symbolic names (e.g., TIOCGWINSZ, SIGINT, O_RDONLY).
     pub fn with_constant_database(mut self, db: Arc<ConstantDatabase>) -> Self {
         self.constant_database = Some(db);
+        self
+    }
+
+    /// Sets inter-procedural summaries for signature recovery hints.
+    pub fn with_summary_database(mut self, db: Arc<SummaryDatabase>) -> Self {
+        self.summary_database = Some(db);
         self
     }
 
@@ -1218,7 +1227,8 @@ impl PseudoCodeEmitter {
         // Use advanced signature recovery if enabled
         let (signature, func_info) = if self.use_signature_recovery {
             let mut recovery = SignatureRecovery::new(self.calling_convention)
-                .with_relocation_table(self.relocation_table.clone());
+                .with_relocation_table(self.relocation_table.clone())
+                .with_summary_database(self.summary_database.clone());
             let sig = recovery.analyze(cfg);
 
             // Convert recovered signature to FunctionInfo for compatibility
@@ -1440,7 +1450,8 @@ impl PseudoCodeEmitter {
     /// for example to display it in a symbol table or for further analysis.
     pub fn recover_signature(&self, cfg: &StructuredCfg) -> FunctionSignature {
         let mut recovery = SignatureRecovery::new(self.calling_convention)
-            .with_relocation_table(self.relocation_table.clone());
+            .with_relocation_table(self.relocation_table.clone())
+            .with_summary_database(self.summary_database.clone());
         recovery.analyze(cfg)
     }
 
@@ -3565,6 +3576,7 @@ mod tests {
     use super::super::expression::BinOpKind;
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn test_emit_if_else() {
@@ -3758,6 +3770,40 @@ mod tests {
         assert_eq!(emitter.get_type("var_4"), "int");
         assert_eq!(emitter.get_type("local_8"), "int");
         assert_eq!(emitter.get_type("unknown_var"), "int");
+    }
+
+    #[test]
+    fn test_recover_signature_with_summary_callback_hint() {
+        use super::super::expression::Variable;
+
+        let call = Expr::call(
+            CallTarget::Named("bsearch".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::var(Variable::reg("rcx", 8)),
+                Expr::var(Variable::reg("r8", 8)),
+            ],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_summary_database(Arc::new(SummaryDatabase::new()));
+        let sig = emitter.recover_signature(&cfg);
+
+        assert_eq!(
+            sig.parameters[4].param_type.format_with_name("compar"),
+            "int32_t (*compar)(void*, void*)"
+        );
     }
 
     #[test]
