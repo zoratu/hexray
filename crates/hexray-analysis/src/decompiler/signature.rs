@@ -181,6 +181,10 @@ pub struct ParameterUsageHints {
     pub passed_as_callback_to: Vec<(String, usize)>,
     /// Parameter is used as an indirect call target.
     pub is_function_pointer: bool,
+    /// Best-effort inferred argument types when this parameter is called indirectly.
+    pub function_pointer_arg_types: Vec<ParamType>,
+    /// Best-effort inferred return type when this parameter is called indirectly.
+    pub function_pointer_return_type: Option<ParamType>,
 }
 
 impl ParameterUsageHints {
@@ -237,9 +241,18 @@ impl ParameterUsageHints {
         }
 
         if self.is_function_pointer {
+            let params = if self.function_pointer_arg_types.is_empty() {
+                vec![ParamType::Pointer]
+            } else {
+                self.function_pointer_arg_types.clone()
+            };
             return ParamType::FunctionPointer {
-                return_type: Box::new(ParamType::SignedInt(64)),
-                params: vec![ParamType::Pointer],
+                return_type: Box::new(
+                    self.function_pointer_return_type
+                        .clone()
+                        .unwrap_or(ParamType::SignedInt(64)),
+                ),
+                params,
             };
         }
 
@@ -583,6 +596,8 @@ pub struct SignatureRecovery {
     return_size: u8,
     /// Whether a float return register was used.
     float_return: bool,
+    /// Recovered function-pointer return type when applicable.
+    return_function_pointer: Option<ParamType>,
     /// Parameter names assigned from stack slot analysis.
     param_names: HashMap<usize, String>,
     /// Usage hints for parameters (indexed by arg register index).
@@ -611,6 +626,7 @@ impl SignatureRecovery {
             return_value_set: false,
             return_size: 8,
             float_return: false,
+            return_function_pointer: None,
             param_names: HashMap::new(),
             param_hints: HashMap::new(),
             string_functions,
@@ -626,6 +642,7 @@ impl SignatureRecovery {
         self.return_value_set = false;
         self.return_size = 8;
         self.float_return = false;
+        self.return_function_pointer = None;
         self.param_names.clear();
         self.param_hints.clear();
 
@@ -743,6 +760,9 @@ impl SignatureRecovery {
                 if let Some(size) = self.infer_expr_size(expr) {
                     self.return_size = size;
                 }
+                if let Some(fp) = self.infer_return_function_pointer(expr) {
+                    self.return_function_pointer = Some(fp);
+                }
             }
             StructuredNode::Return(None) => {
                 // void return
@@ -791,6 +811,9 @@ impl SignatureRecovery {
                         self.return_value_set = true;
                         if let Some(size) = self.infer_expr_size(rhs) {
                             self.return_size = size;
+                        }
+                        if let Some(fp) = self.infer_return_function_pointer(rhs) {
+                            self.return_function_pointer = Some(fp);
                         }
                         if self.is_float_return_register(&reg_lower) {
                             self.float_return = true;
@@ -941,16 +964,12 @@ impl SignatureRecovery {
             ExprKind::Call { target, args } => {
                 if let super::expression::CallTarget::Indirect(inner) = target {
                     if let ExprKind::Var(var) = &inner.kind {
-                        self.record_usage_hint(&var.name.to_lowercase(), |h| {
-                            h.is_function_pointer = true
-                        });
+                        self.record_function_pointer_call_signature(&var.name.to_lowercase(), args);
                     }
                     self.analyze_expr_reads_with_context(inner, false, false);
                 } else if let super::expression::CallTarget::IndirectGot { expr, .. } = target {
                     if let ExprKind::Var(var) = &expr.kind {
-                        self.record_usage_hint(&var.name.to_lowercase(), |h| {
-                            h.is_function_pointer = true
-                        });
+                        self.record_function_pointer_call_signature(&var.name.to_lowercase(), args);
                     }
                     self.analyze_expr_reads_with_context(expr, false, false);
                 }
@@ -1009,6 +1028,136 @@ impl SignatureRecovery {
     /// Returns true when a function argument position is typically a callback.
     fn is_callback_position(function_name: &str, arg_index: usize) -> bool {
         ParameterUsageHints::callback_signature(function_name, arg_index).is_some()
+    }
+
+    /// Infers a type for an argument passed into an indirect function call.
+    fn infer_indirect_call_arg_type(expr: &Expr) -> ParamType {
+        match &expr.kind {
+            ExprKind::Deref { .. }
+            | ExprKind::AddressOf(_)
+            | ExprKind::ArrayAccess { .. }
+            | ExprKind::FieldAccess { .. }
+            | ExprKind::GotRef { .. } => ParamType::Pointer,
+            ExprKind::IntLit(n) => {
+                if *n >= i32::MIN as i128 && *n <= i32::MAX as i128 {
+                    ParamType::SignedInt(32)
+                } else {
+                    ParamType::SignedInt(64)
+                }
+            }
+            ExprKind::Var(var) => {
+                let name = var.name.to_lowercase();
+                if name.starts_with("xmm") || name.starts_with("d") {
+                    ParamType::Float(64)
+                } else if name.starts_with("s") {
+                    ParamType::Float(32)
+                } else {
+                    match var.size {
+                        1 => ParamType::SignedInt(8),
+                        2 => ParamType::SignedInt(16),
+                        4 => ParamType::SignedInt(32),
+                        8 => ParamType::SignedInt(64),
+                        _ => ParamType::SignedInt(64),
+                    }
+                }
+            }
+            ExprKind::Cast {
+                to_size,
+                signed,
+                expr: _,
+            } => match (*to_size, *signed) {
+                (1, true) => ParamType::SignedInt(8),
+                (2, true) => ParamType::SignedInt(16),
+                (4, true) => ParamType::SignedInt(32),
+                (8, true) => ParamType::SignedInt(64),
+                (1, false) => ParamType::UnsignedInt(8),
+                (2, false) => ParamType::UnsignedInt(16),
+                (4, false) => ParamType::UnsignedInt(32),
+                (8, false) => ParamType::UnsignedInt(64),
+                _ => ParamType::SignedInt(64),
+            },
+            _ => ParamType::SignedInt(64),
+        }
+    }
+
+    fn merge_param_types(a: &ParamType, b: &ParamType) -> ParamType {
+        match (a, b) {
+            (ParamType::Pointer, _) | (_, ParamType::Pointer) => ParamType::Pointer,
+            (ParamType::Float(sa), ParamType::Float(sb)) => ParamType::Float((*sa).max(*sb)),
+            (ParamType::UnsignedInt(sa), ParamType::UnsignedInt(sb)) => {
+                ParamType::UnsignedInt((*sa).max(*sb))
+            }
+            (ParamType::SignedInt(sa), ParamType::SignedInt(sb)) => {
+                ParamType::SignedInt((*sa).max(*sb))
+            }
+            (ParamType::SignedInt(sa), ParamType::UnsignedInt(sb))
+            | (ParamType::UnsignedInt(sa), ParamType::SignedInt(sb)) => {
+                ParamType::SignedInt((*sa).max(*sb))
+            }
+            (ParamType::FunctionPointer { .. }, _) | (_, ParamType::FunctionPointer { .. }) => {
+                ParamType::Pointer
+            }
+            _ => ParamType::SignedInt(64),
+        }
+    }
+
+    fn record_function_pointer_call_signature(&mut self, reg_name: &str, args: &[Expr]) {
+        let Some(idx) = self.arg_register_index(reg_name) else {
+            return;
+        };
+
+        let inferred: Vec<ParamType> = args
+            .iter()
+            .map(Self::infer_indirect_call_arg_type)
+            .collect();
+
+        let hints = self.param_hints.entry(idx).or_default();
+        hints.is_function_pointer = true;
+        if hints.function_pointer_return_type.is_none() {
+            hints.function_pointer_return_type = Some(ParamType::SignedInt(64));
+        }
+        if hints.function_pointer_arg_types.is_empty() {
+            hints.function_pointer_arg_types = inferred;
+            return;
+        }
+
+        let common_len = hints.function_pointer_arg_types.len().min(inferred.len());
+        for (i, inferred_ty) in inferred.iter().enumerate().take(common_len) {
+            let merged = Self::merge_param_types(&hints.function_pointer_arg_types[i], inferred_ty);
+            hints.function_pointer_arg_types[i] = merged;
+        }
+
+        if inferred.len() > hints.function_pointer_arg_types.len() {
+            hints
+                .function_pointer_arg_types
+                .extend_from_slice(&inferred[hints.function_pointer_arg_types.len()..]);
+        }
+    }
+
+    fn infer_return_function_pointer(&self, expr: &Expr) -> Option<ParamType> {
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                let idx = self.arg_register_index(&var.name)?;
+                let hints = self.param_hints.get(&idx)?;
+                let ty = hints.infer_type(var.size.max(8));
+                matches!(ty, ParamType::FunctionPointer { .. }).then_some(ty)
+            }
+            ExprKind::Call { target, .. } => {
+                let name = Self::extract_call_name(target)?;
+                let clean = name.strip_prefix('_').unwrap_or(&name);
+                match clean {
+                    "signal" | "bsd_signal" | "sysv_signal" | "sigset" => {
+                        Some(ParamType::FunctionPointer {
+                            return_type: Box::new(ParamType::Void),
+                            params: vec![ParamType::SignedInt(32)],
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            ExprKind::Cast { expr: inner, .. } => self.infer_return_function_pointer(inner),
+            _ => None,
+        }
     }
 
     /// Extracts a register name from an expression if it's a simple register reference.
@@ -1283,7 +1432,9 @@ impl SignatureRecovery {
         // Determine return type
         sig.has_return = self.return_value_set;
         if self.return_value_set {
-            if self.float_return {
+            if let Some(ref fp_ty) = self.return_function_pointer {
+                sig.return_type = fp_ty.clone();
+            } else if self.float_return {
                 sig.return_type = ParamType::Float(64);
             } else {
                 sig.return_type = match self.return_size {
@@ -1780,6 +1931,64 @@ mod tests {
             ),
             "params: {:?}",
             sig.parameters
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_inferrs_indirect_call_prototype() {
+        use hexray_core::BasicBlockId;
+
+        let fn_ptr = Expr::var(Variable::reg("rdi", 8));
+        let by_ref_local = Expr::address_of(Expr::var(Variable::stack(-8, 8)));
+        let call = Expr::call(
+            CallTarget::Indirect(Box::new(fn_ptr)),
+            vec![by_ref_local, Expr::int(7)],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(
+            sig.parameters[0].param_type.format_with_name("cb"),
+            "int64_t (*cb)(void*, int32_t)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_function_pointer_return() {
+        use hexray_core::BasicBlockId;
+
+        let signal_call = Expr::call(
+            CallTarget::Named("signal".to_string()),
+            vec![Expr::int(2), Expr::var(Variable::reg("rdi", 8))],
+        );
+
+        let ret = StructuredNode::Return(Some(signal_call));
+        let cfg = StructuredCfg {
+            body: vec![ret],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert!(matches!(sig.return_type, ParamType::FunctionPointer { .. }));
+        assert_eq!(
+            sig.return_type.format_with_name("handler"),
+            "void (*handler)(int32_t)"
         );
     }
 
