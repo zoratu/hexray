@@ -1259,11 +1259,8 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, p)| {
-                        format!(
-                            "{} {}",
-                            p.param_type.to_c_string(),
-                            rename_main_param(&p.name, idx)
-                        )
+                        p.param_type
+                            .format_with_name(&rename_main_param(&p.name, idx))
                     })
                     .collect();
                 writeln!(
@@ -1383,7 +1380,7 @@ impl PseudoCodeEmitter {
             let params: Vec<_> = signature
                 .parameters
                 .iter()
-                .map(|p| format!("{} {}", p.param_type.to_c_string(), p.name))
+                .map(|p| p.param_type.format_with_name(&p.name))
                 .collect();
             writeln!(
                 output,

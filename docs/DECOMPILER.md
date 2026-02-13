@@ -423,7 +423,7 @@ if let Some(ty) = inference.type_of(&Location::Register(0)) {
 
 ## Future Improvements
 
-- [ ] Function pointer type recovery
+- [x] Function pointer type recovery (initial callback and indirect-call inference)
 - [ ] GUI/TUI interface
 
 ## Module Structure
