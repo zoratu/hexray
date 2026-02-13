@@ -184,6 +184,7 @@ hexray/
 - [Decompiler Guide](docs/DECOMPILER.md) - Decompilation pipeline details
 - [Supported Instructions](docs/INSTRUCTIONS.md) - Complete instruction reference
 - [Testing Infrastructure](docs/TESTING.md) - Ground truth benchmarks, test fixtures, fuzzing
+- [Performance and Determinism](docs/PERFORMANCE.md) - Parallelism knobs and stable benchmark workflow
 - [Development Roadmap](docs/ROADMAP.md) - Feature status and plans
 
 ## Development
@@ -241,6 +242,8 @@ cargo bench --workspace -- --save-baseline pr
 # Compare results (install with: cargo install critcmp)
 critcmp main pr
 ```
+
+See `/Volumes/OWC 1M2/Users/isaiah/src/hexray/docs/PERFORMANCE.md` for deterministic benchmark and parallelism guidance.
 
 ## Use Cases
 

@@ -34,6 +34,8 @@ scripts/ci-local --tier medium
 scripts/ci-local --tier full
 ```
 
+For stable benchmark comparisons and parallelism tuning guidance, see `/Volumes/OWC 1M2/Users/isaiah/src/hexray/docs/PERFORMANCE.md`.
+
 ## Ground Truth Benchmark Suite
 
 The benchmark suite provides automated quality assessment of decompiled output against expected patterns.
@@ -90,6 +92,8 @@ The benchmark suite evaluates decompiled output against:
 2. **Forbidden Patterns**: Constructs that MUST NOT appear (e.g., `goto`)
 3. **Structural Metrics**:
    - Nesting depth (target: ≤3 levels)
+   - Switch recovery thresholds (per-case minimum switch count)
+   - Goto reduction thresholds (per-case maximum goto count)
    - Label count (target: 0 for structured code)
    - Variable naming quality
 

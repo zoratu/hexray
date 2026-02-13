@@ -46,6 +46,10 @@ pub struct BenchmarkCase {
     pub category: String,
     /// Difficulty level (1-5).
     pub difficulty: u8,
+    /// Minimum switch statement count required in output.
+    pub min_switches: Option<usize>,
+    /// Maximum goto statements allowed in output.
+    pub max_gotos: Option<usize>,
 }
 
 impl BenchmarkCase {
@@ -60,6 +64,8 @@ impl BenchmarkCase {
             min_quality: 0.5,
             category: "general".to_string(),
             difficulty: 1,
+            min_switches: None,
+            max_gotos: None,
         }
     }
 
@@ -102,6 +108,18 @@ impl BenchmarkCase {
     /// Sets the difficulty level.
     pub fn with_difficulty(mut self, level: u8) -> Self {
         self.difficulty = level.clamp(1, 5);
+        self
+    }
+
+    /// Requires at least this many switch statements in output.
+    pub fn with_min_switches(mut self, min_switches: usize) -> Self {
+        self.min_switches = Some(min_switches);
+        self
+    }
+
+    /// Requires output to contain no more than this many goto statements.
+    pub fn with_max_gotos(mut self, max_gotos: usize) -> Self {
+        self.max_gotos = Some(max_gotos);
         self
     }
 }
@@ -173,6 +191,10 @@ pub struct BenchmarkResult {
     pub patterns_expected: usize,
     /// Number of forbidden patterns found (should be 0).
     pub violations_found: usize,
+    /// Number of switch statements in output.
+    pub switch_count: usize,
+    /// Number of goto statements in output.
+    pub goto_count: usize,
     /// Execution time.
     pub duration: Duration,
     /// The decompiled output.
@@ -380,6 +402,8 @@ impl BenchmarkSuite {
                     patterns_found: 0,
                     patterns_expected: case.expected_patterns.len(),
                     violations_found: 0,
+                    switch_count: 0,
+                    goto_count: 0,
                     duration: start.elapsed(),
                     output: String::new(),
                     pattern_results: Vec::new(),
@@ -389,11 +413,39 @@ impl BenchmarkSuite {
         };
 
         // Match patterns
-        let pattern_results = self.match_patterns(case, &output);
+        let mut pattern_results = self.match_patterns(case, &output);
         let patterns_found = pattern_results.iter().filter(|r| r.matched).count();
+        let switch_count = count_switch_statements(&output);
+        let goto_count = count_goto_statements(&output);
 
         // Check for forbidden patterns
-        let violations_found = self.count_violations(case, &output);
+        let mut violations_found = self.count_violations(case, &output);
+        if let Some(min_switches) = case.min_switches {
+            let matched = switch_count >= min_switches;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(min_switches>={})", min_switches),
+                matched,
+                location: output
+                    .lines()
+                    .position(|line| line.contains("switch (") || line.contains("switch(")),
+                details: Some(format!("found {} switch statements", switch_count)),
+            });
+        }
+        if let Some(max_gotos) = case.max_gotos {
+            let matched = goto_count <= max_gotos;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(max_gotos<={})", max_gotos),
+                matched,
+                location: output.lines().position(|line| line.contains("goto ")),
+                details: Some(format!("found {} goto statements", goto_count)),
+            });
+        }
 
         // Calculate score
         let pattern_score = if !case.expected_patterns.is_empty() {
@@ -415,6 +467,8 @@ impl BenchmarkSuite {
             patterns_found,
             patterns_expected: case.expected_patterns.len(),
             violations_found,
+            switch_count,
+            goto_count,
             duration: start.elapsed(),
             output,
             pattern_results,
@@ -669,6 +723,22 @@ fn contains_label_pattern(output: &str) -> bool {
     false
 }
 
+/// Count switch statements in decompiled output.
+fn count_switch_statements(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("switch(") || trimmed.starts_with("switch (")
+        })
+        .count()
+}
+
+/// Count goto statements in decompiled output.
+fn count_goto_statements(output: &str) -> usize {
+    output.matches("goto ").count()
+}
+
 /// Create the standard benchmark suite with common test cases.
 pub fn create_standard_suite() -> BenchmarkSuite {
     let mut suite = BenchmarkSuite::new();
@@ -736,7 +806,9 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_difficulty(2)
             .with_source("switch (op) { case '+': return a + b; case '-': return a - b; default: return 0; }")
             .expect_pattern(ExpectedPattern::Switch { min_cases: 2 })
-            .expect_pattern(ExpectedPattern::Return),
+            .expect_pattern(ExpectedPattern::Return)
+            .with_min_switches(1)
+            .with_max_gotos(0),
     );
 
     suite.add_case(
@@ -1043,13 +1115,15 @@ impl BenchmarkSuiteResults {
         for result in &self.case_results {
             let status = if result.passed { "PASS" } else { "FAIL" };
             report.push_str(&format!(
-                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations)\n",
+                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos)\n",
                 status,
                 result.case_id,
                 result.score * 100.0,
                 result.patterns_found,
                 result.patterns_expected,
-                result.violations_found
+                result.violations_found,
+                result.switch_count,
+                result.goto_count
             ));
             if let Some(ref err) = result.error {
                 report.push_str(&format!("       Error: {}\n", err));
@@ -1078,6 +1152,8 @@ mod tests {
         assert_eq!(case.difficulty, 3);
         assert_eq!(case.expected_patterns.len(), 1);
         assert_eq!(case.forbidden_patterns.len(), 1);
+        assert!(case.min_switches.is_none());
+        assert!(case.max_gotos.is_none());
     }
 
     #[test]
@@ -1153,6 +1229,35 @@ mod tests {
         let suite = create_standard_suite();
         assert!(!suite.is_empty());
         assert!(suite.len() >= 10);
+    }
+
+    #[test]
+    fn test_switch_goto_metric_thresholds() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(
+            BenchmarkCase::new("switch_quality")
+                .with_min_switches(1)
+                .with_max_gotos(0),
+        );
+
+        let pass_results = suite
+            .run_all(|_| Ok("switch (op) { case 1: return 1; default: return 0; }".to_string()));
+        assert_eq!(pass_results.passed, 1);
+        assert_eq!(pass_results.failed, 0);
+        assert_eq!(pass_results.case_results[0].switch_count, 1);
+        assert_eq!(pass_results.case_results[0].goto_count, 0);
+
+        let fail_results = suite.run_all(|_| {
+            Ok(
+                "switch (op) { case 1: goto label_1; default: return 0; }\nlabel_1:\nreturn 1;"
+                    .to_string(),
+            )
+        });
+        assert_eq!(fail_results.passed, 0);
+        assert_eq!(fail_results.failed, 1);
+        assert!(fail_results.case_results[0].violations_found > 0);
+        assert_eq!(fail_results.case_results[0].switch_count, 1);
+        assert_eq!(fail_results.case_results[0].goto_count, 1);
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! These tests ensure decompiler output remains stable across versions.
 //! Uses system binaries with known function names to verify output quality.
 
+use hexray_analysis::decompiler::SummaryDatabase;
 use hexray_analysis::{CfgBuilder, Decompiler, StringTable, SymbolTable};
-use hexray_core::Architecture;
+use hexray_core::{Architecture, Instruction, Operand};
 use hexray_disasm::{Arm64Disassembler, Disassembler, X86_64Disassembler};
 use hexray_formats::{detect_format, BinaryFormat, BinaryType, MachO};
 
@@ -126,6 +127,15 @@ fn validate_decompiled_output(code: &str) -> DecompileValidation {
             || code.contains("switch"),
         no_gotos: !code.contains("goto "),
     }
+}
+
+fn memory_operand_broadcast(inst: &Instruction) -> Option<bool> {
+    for op in &inst.operands {
+        if let Operand::Memory(mem) = op {
+            return Some(mem.broadcast);
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -355,5 +365,86 @@ fn test_decompiler_handles_loop_patterns() {
     }
     if has_increment {
         println!("  -> Increment pattern detected");
+    }
+}
+
+#[test]
+fn test_evex_broadcast_semantics_regression() {
+    let disasm = X86_64Disassembler::new();
+
+    // EVEX move with b=1 should not set memory broadcast for move/store forms.
+    let move_bytes = [0x62, 0xf1, 0x7c, 0x58, 0x10, 0x00];
+    let move_decoded = disasm.decode_instruction(&move_bytes, 0x2000).unwrap();
+    assert_eq!(move_decoded.instruction.mnemonic, "vmovups");
+    assert_eq!(
+        memory_operand_broadcast(&move_decoded.instruction),
+        Some(false),
+        "EVEX move forms should not carry memory broadcast flag"
+    );
+
+    // EVEX arithmetic memory form with b=1 may carry broadcast.
+    let arith_bytes = [0x62, 0xf1, 0x7c, 0x58, 0x58, 0x00];
+    let arith_decoded = disasm.decode_instruction(&arith_bytes, 0x2010).unwrap();
+    assert_eq!(arith_decoded.instruction.mnemonic, "vaddps");
+    assert_eq!(
+        memory_operand_broadcast(&arith_decoded.instruction),
+        Some(true),
+        "EVEX arithmetic memory forms should preserve broadcast flag"
+    );
+
+    // Ensure these EVEX instructions still pass through CFG + decompiler without regressions.
+    let mut block = Vec::new();
+    block.extend_from_slice(&move_bytes);
+    block.extend_from_slice(&arith_bytes);
+    block.push(0xc3); // ret
+
+    let instructions = disassemble_block(Architecture::X86_64, &block, 0x2000);
+    assert!(
+        !instructions.is_empty(),
+        "expected EVEX instructions to decode"
+    );
+    let cfg = CfgBuilder::build(&instructions, 0x2000);
+    let code = Decompiler::new().decompile(&cfg, "evex_regression");
+    assert!(
+        !code.is_empty(),
+        "EVEX regression function should decompile"
+    );
+}
+
+#[test]
+fn test_abi_call_side_effect_summaries_regression() {
+    let db = SummaryDatabase::new();
+
+    // Known pure libc-style helpers should remain pure.
+    for pure_name in ["strlen", "strcmp", "memcmp"] {
+        let summary = db
+            .get_summary_by_name(pure_name)
+            .unwrap_or_else(|| panic!("missing summary for {}", pure_name));
+        assert!(summary.is_pure, "{} should be pure", pure_name);
+        assert!(
+            summary.return_depends_only_on_args,
+            "{} should have arg-only return dependence",
+            pure_name
+        );
+    }
+
+    // Side-effectful APIs should not be marked pure.
+    for impure_name in ["malloc", "free", "printf", "puts", "memcpy", "strcpy"] {
+        let summary = db
+            .get_summary_by_name(impure_name)
+            .unwrap_or_else(|| panic!("missing summary for {}", impure_name));
+        assert!(!summary.is_pure, "{} should be impure", impure_name);
+    }
+
+    // ABI-aware noreturn effects are part of call-side-effect modeling.
+    for noreturn_name in ["exit", "_exit", "abort"] {
+        let summary = db
+            .get_summary_by_name(noreturn_name)
+            .unwrap_or_else(|| panic!("missing summary for {}", noreturn_name));
+        assert!(
+            summary.may_not_return,
+            "{} should be modeled as may_not_return",
+            noreturn_name
+        );
     }
 }
