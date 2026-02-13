@@ -32,6 +32,7 @@ Run tiers directly:
 scripts/ci-local --tier fast
 scripts/ci-local --tier medium
 scripts/ci-local --tier full
+scripts/ci-local --tier full --perf
 ```
 
 For stable benchmark comparisons and parallelism tuning guidance, see `/Volumes/OWC 1M2/Users/isaiah/src/hexray/docs/PERFORMANCE.md`.

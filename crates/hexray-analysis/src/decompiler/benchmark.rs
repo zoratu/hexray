@@ -812,6 +812,87 @@ pub fn create_standard_suite() -> BenchmarkSuite {
     );
 
     suite.add_case(
+        BenchmarkCase::new("dense_switch_dispatch")
+            .with_description("Dense jump-table-style switch dispatch")
+            .with_category("control_flow_quality")
+            .with_difficulty(4)
+            .with_source(
+                r#"
+                switch (opcode) {
+                    case 0: return handle_0();
+                    case 1: return handle_1();
+                    case 2: return handle_2();
+                    case 3: return handle_3();
+                    case 4: return handle_4();
+                    case 5: return handle_5();
+                    case 6: return handle_6();
+                    case 7: return handle_7();
+                    default: return handle_default();
+                }
+            "#,
+            )
+            .expect_pattern(ExpectedPattern::Switch { min_cases: 8 })
+            .expect_pattern(ExpectedPattern::Return)
+            .with_min_switches(1)
+            .with_max_gotos(0)
+            .forbid_pattern(ForbiddenPattern::Goto)
+            .forbid_pattern(ForbiddenPattern::Label)
+            .with_min_quality(0.8),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("sparse_switch_error_codes")
+            .with_description("Sparse switch over non-contiguous error codes")
+            .with_category("control_flow_quality")
+            .with_difficulty(4)
+            .with_source(
+                r#"
+                switch (err) {
+                    case 1: return ERR_IO;
+                    case 42: return ERR_TIMEOUT;
+                    case 255: return ERR_PERM;
+                    case 4096: return ERR_PROTO;
+                    default: return ERR_UNKNOWN;
+                }
+            "#,
+            )
+            .expect_pattern(ExpectedPattern::Switch { min_cases: 4 })
+            .expect_pattern(ExpectedPattern::Return)
+            .with_min_switches(1)
+            .with_max_gotos(0)
+            .forbid_pattern(ForbiddenPattern::Goto)
+            .with_min_quality(0.75),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("state_machine_switch_loop")
+            .with_description("State-machine style loop represented as switch, not goto chain")
+            .with_category("control_flow_quality")
+            .with_difficulty(5)
+            .with_source(
+                r#"
+                while (1) {
+                    switch (state) {
+                        case 0: state = init(); break;
+                        case 1: state = step(); break;
+                        case 2: return finalize();
+                        default: return fail();
+                    }
+                }
+            "#,
+            )
+            .expect_pattern(ExpectedPattern::WhileLoop)
+            .expect_pattern(ExpectedPattern::Switch { min_cases: 3 })
+            .expect_pattern(ExpectedPattern::Contains("break".to_string()))
+            .expect_pattern(ExpectedPattern::Return)
+            .with_min_switches(1)
+            .with_max_gotos(0)
+            .forbid_pattern(ForbiddenPattern::Goto)
+            .forbid_pattern(ForbiddenPattern::Label)
+            .with_min_quality(0.8),
+    );
+
+    suite.add_case(
         BenchmarkCase::new("ternary_expression")
             .with_description("Ternary conditional expression")
             .with_category("conditionals")
@@ -1229,6 +1310,37 @@ mod tests {
         let suite = create_standard_suite();
         assert!(!suite.is_empty());
         assert!(suite.len() >= 10);
+    }
+
+    #[test]
+    fn test_control_flow_quality_cases_have_metric_gates() {
+        let suite = create_standard_suite();
+        let expected_ids = [
+            "switch_statement",
+            "dense_switch_dispatch",
+            "sparse_switch_error_codes",
+            "state_machine_switch_loop",
+        ];
+
+        for id in expected_ids {
+            let case = suite
+                .cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("missing benchmark case: {}", id));
+            assert_eq!(
+                case.min_switches,
+                Some(1),
+                "{} should require switch recovery",
+                id
+            );
+            assert_eq!(
+                case.max_gotos,
+                Some(0),
+                "{} should forbid goto fallbacks",
+                id
+            );
+        }
     }
 
     #[test]

@@ -43,6 +43,12 @@ cargo bench --workspace -- --save-baseline change
 critcmp main change
 ```
 
+Or use the project helper script:
+
+```bash
+scripts/bench-deterministic --main-label main --change-label change --jobs 8 --test-threads 1
+```
+
 For lower noise:
 
 - Close heavy background workloads.
@@ -56,5 +62,6 @@ Use the tier that matches the decision you are making:
 - `scripts/ci-local --tier fast`: pre-commit speed checks.
 - `scripts/ci-local --tier medium`: pre-push confidence checks.
 - `scripts/ci-local --tier full`: release-grade local validation.
+- `scripts/ci-local --tier full --perf`: full tier plus deterministic benchmark gate.
 
 This keeps routine commits lightweight while preserving a consistent full-check path.

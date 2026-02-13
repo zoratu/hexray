@@ -197,6 +197,7 @@ cargo test --workspace
 scripts/ci-local --tier fast
 scripts/ci-local --tier medium
 scripts/ci-local --tier full
+scripts/ci-local --tier full --perf   # optional deterministic perf gate
 
 # Run with debug output
 RUST_LOG=debug cargo run -- ./binary decompile main
@@ -241,6 +242,9 @@ cargo bench --workspace -- --save-baseline pr
 
 # Compare results (install with: cargo install critcmp)
 critcmp main pr
+
+# Deterministic benchmark workflow helper
+scripts/bench-deterministic --main-label main --change-label pr --jobs 8 --test-threads 1
 ```
 
 See `/Volumes/OWC 1M2/Users/isaiah/src/hexray/docs/PERFORMANCE.md` for deterministic benchmark and parallelism guidance.

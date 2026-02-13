@@ -19,14 +19,17 @@ cd "$ROOT_DIR"
 
 TIER="medium"
 RUN_CROSS="auto"
+RUN_PERF="no"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--help]
+Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf] [--no-perf] [--help]
 
   --tier      Select workflow tier (default: medium)
   --cross     Force docker cross-arch matrix during full tier
   --no-cross  Disable docker cross-arch matrix during full tier
+  --perf      Run deterministic benchmark gate during full tier
+  --no-perf   Skip deterministic benchmark gate during full tier (default)
   --help      Show this message
 EOF
 }
@@ -43,6 +46,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-cross)
             RUN_CROSS="no"
+            shift
+            ;;
+        --perf)
+            RUN_PERF="yes"
+            shift
+            ;;
+        --no-perf)
+            RUN_PERF="no"
             shift
             ;;
         -h|--help)
@@ -77,6 +88,10 @@ run_medium() {
 
 run_full() {
     run_medium
+
+    if [[ "$RUN_PERF" == "yes" ]]; then
+        run "Deterministic benchmark gate" "$ROOT_DIR/scripts/bench-deterministic"
+    fi
 
     if [[ "$RUN_CROSS" == "yes" ]]; then
         run "Docker cross-arch matrix" "$ROOT_DIR/scripts/ci-cross-docker"

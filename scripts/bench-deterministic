@@ -1,0 +1,100 @@
+#!/bin/bash
+# Deterministic benchmark runner for local regression checks.
+#
+# Usage:
+#   scripts/bench-deterministic
+#   scripts/bench-deterministic --main-label main --change-label pr
+#   scripts/bench-deterministic --jobs 8 --test-threads 1
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+MAIN_LABEL="main"
+CHANGE_LABEL="change"
+JOBS="${CARGO_BUILD_JOBS:-}"
+TEST_THREADS="${RUST_TEST_THREADS:-1}"
+WARMUP="yes"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/bench-deterministic [options]
+
+Options:
+  --main-label <name>    Baseline label name (default: main)
+  --change-label <name>  Candidate label name (default: change)
+  --jobs <n>             Set CARGO_BUILD_JOBS for this run
+  --test-threads <n>     Set RUST_TEST_THREADS for this run (default: 1)
+  --no-warmup            Skip fast-tier warmup step
+  --help                 Show this message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --main-label)
+            MAIN_LABEL="${2:-}"
+            shift 2
+            ;;
+        --change-label)
+            CHANGE_LABEL="${2:-}"
+            shift 2
+            ;;
+        --jobs)
+            JOBS="${2:-}"
+            shift 2
+            ;;
+        --test-threads)
+            TEST_THREADS="${2:-}"
+            shift 2
+            ;;
+        --no-warmup)
+            WARMUP="no"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -n "$JOBS" ]]; then
+    export CARGO_BUILD_JOBS="$JOBS"
+fi
+export RUST_TEST_THREADS="$TEST_THREADS"
+
+echo "=== Deterministic Benchmark Configuration ==="
+echo "main label:    $MAIN_LABEL"
+echo "change label:  $CHANGE_LABEL"
+echo "build jobs:    ${CARGO_BUILD_JOBS:-default}"
+echo "test threads:  $RUST_TEST_THREADS"
+
+if [[ "$WARMUP" == "yes" ]]; then
+    echo ""
+    echo "=== Warmup (fast tier) ==="
+    "$ROOT_DIR/scripts/ci-local" --tier fast --no-cross --no-perf
+fi
+
+echo ""
+echo "=== Benchmark baseline: $MAIN_LABEL ==="
+cargo bench --workspace -- --save-baseline "$MAIN_LABEL"
+
+echo ""
+echo "=== Benchmark candidate: $CHANGE_LABEL ==="
+cargo bench --workspace -- --save-baseline "$CHANGE_LABEL"
+
+echo ""
+if command -v critcmp >/dev/null 2>&1; then
+    echo "=== critcmp comparison ==="
+    critcmp "$MAIN_LABEL" "$CHANGE_LABEL"
+else
+    echo "critcmp not found; install with:"
+    echo "  cargo install critcmp"
+fi

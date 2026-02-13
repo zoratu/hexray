@@ -1805,6 +1805,7 @@ impl X86_64Disassembler {
         }
         let modrm = ModRM::parse_evex(bytes[offset], &evex);
         offset += 1;
+        let rm_is_register = modrm.is_register();
 
         // Determine vector size from EVEX.L'L
         let vector_size = evex.vector_size();
@@ -1857,8 +1858,9 @@ impl X86_64Disassembler {
             offset += 1;
         }
 
-        // Build the mnemonic with opmask suffix if needed
-        let full_mnemonic = self.format_evex_mnemonic(&mnemonic, &evex);
+        // Build the mnemonic with EVEX decorators when applicable.
+        let b_suffix = self.evex_b_register_suffix(evex.mm, opcode, evex.pp, rm_is_register, &evex);
+        let full_mnemonic = self.format_evex_mnemonic(&mnemonic, &evex, b_suffix);
 
         let instruction = Instruction {
             address,
@@ -2093,8 +2095,41 @@ impl X86_64Disassembler {
         }
     }
 
-    /// Format EVEX mnemonic with opmask and zeroing suffix.
-    fn format_evex_mnemonic(&self, base: &str, evex: &super::prefix::Evex) -> String {
+    /// Returns EVEX.b register-form suffix when b encodes rounding/SAE semantics.
+    fn evex_b_register_suffix(
+        &self,
+        mm: u8,
+        opcode: u8,
+        pp: u8,
+        rm_is_register: bool,
+        evex: &super::prefix::Evex,
+    ) -> Option<&'static str> {
+        if !rm_is_register || !evex.broadcast {
+            return None;
+        }
+
+        // For a subset of EVEX floating-point arithmetic instructions implemented here,
+        // EVEX.b on register form carries embedded rounding/SAE semantics.
+        match mm {
+            // 0F map arithmetic forms (add/mul/sub/div)
+            1 if matches!(opcode, 0x58 | 0x59 | 0x5C | 0x5E) => match pp {
+                // packed single/double: round control + SAE
+                0 | 1 => Some("{er}"),
+                // scalar single/double: SAE-only indicator
+                2 | 3 => Some("{sae}"),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Format EVEX mnemonic with opmask, zeroing, and b-suffix decorators.
+    fn format_evex_mnemonic(
+        &self,
+        base: &str,
+        evex: &super::prefix::Evex,
+        b_suffix: Option<&'static str>,
+    ) -> String {
         let mut mnemonic = base.to_string();
 
         // Add opmask suffix if not k0
@@ -2105,6 +2140,10 @@ impl X86_64Disassembler {
         // Add zeroing suffix if enabled
         if evex.z && evex.aaa != 0 {
             mnemonic.push_str("{z}");
+        }
+
+        if let Some(suffix) = b_suffix {
+            mnemonic.push_str(suffix);
         }
 
         mnemonic
@@ -3973,6 +4012,32 @@ mod tests {
             Operand::Memory(mem) => assert!(!mem.broadcast),
             _ => panic!("expected memory operand"),
         }
+    }
+
+    #[test]
+    fn test_evex_b_register_form_uses_er_suffix_for_packed_arith() {
+        let disasm = X86_64Disassembler::new();
+        // EVEX.512.0F.W0 58 /r with b=1 and register source.
+        // 62 F1 74 58 58 C2 = vaddps zmm0, zmm1, zmm2 with EVEX.b set.
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x74, 0x58, 0x58, 0xc2], 0x1000)
+            .unwrap();
+        assert!(result.instruction.mnemonic.starts_with("vaddps"));
+        assert!(result.instruction.mnemonic.contains("{er}"));
+    }
+
+    #[test]
+    fn test_evex_b_register_form_uses_sae_suffix_for_scalar_arith() {
+        let disasm = X86_64Disassembler::new();
+        let evex = super::super::Evex {
+            broadcast: true,
+            ..Default::default()
+        };
+
+        // 0F map + add-family opcode + scalar pp form should classify as SAE suffix
+        // for register-source EVEX.b semantics.
+        let suffix = disasm.evex_b_register_suffix(1, 0x58, 2, true, &evex);
+        assert_eq!(suffix, Some("{sae}"));
     }
 
     // ==========================================================================
