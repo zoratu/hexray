@@ -327,26 +327,26 @@ hexray session export project.hrp --format json
 ## Remaining Work
 
 ### Phase 13.7: Documentation & Tutorials
-**Status:** Planned
+**Status:** Completed
 
 **API Documentation:**
-- [ ] Comprehensive examples for analysis_cache module
-- [ ] Comprehensive examples for incremental analysis module
-- [ ] Examples for C++ class reconstruction APIs
-- [ ] Examples for exception handling extraction
-- [ ] Examples for devirtualization usage
+- [x] Comprehensive examples for analysis_cache module (`docs/examples/ANALYSIS_CACHE_EXAMPLES.md`)
+- [x] Comprehensive examples for incremental analysis module (`docs/examples/INCREMENTAL_ANALYSIS_EXAMPLES.md`)
+- [x] Examples for C++ class reconstruction APIs (`docs/examples/CPP_CLASS_RECONSTRUCTION_EXAMPLES.md`)
+- [x] Examples for exception handling extraction (`docs/examples/EXCEPTION_HANDLING_EXAMPLES.md`)
+- [x] Examples for devirtualization usage (`docs/examples/DEVIRTUALIZATION_EXAMPLES.md`)
 
 **Tutorials:**
-- [ ] "Getting Started with hexray" - Basic CLI usage
-- [ ] "Analyzing a C++ Binary" - Vtables, RTTI, exception handling
-- [ ] "Using the Decompiler API" - Programmatic decompilation
-- [ ] "Incremental Analysis Workflow" - Working with patched binaries
-- [ ] "Extending hexray" - Adding new analysis passes
+- [x] "Getting Started with hexray" - Basic CLI usage (`docs/tutorials/GETTING_STARTED.md`)
+- [x] "Analyzing a C++ Binary" - Vtables, RTTI, exception handling (`docs/tutorials/ANALYZING_CPP_BINARY.md`)
+- [x] "Using the Decompiler API" - Programmatic decompilation (`docs/tutorials/USING_DECOMPILER_API.md`)
+- [x] "Incremental Analysis Workflow" - Working with patched binaries (`docs/tutorials/INCREMENTAL_ANALYSIS_WORKFLOW.md`)
+- [x] "Extending hexray" - Adding new analysis passes (`docs/tutorials/EXTENDING_HEXRAY.md`)
 
 **Reference Documentation:**
-- [ ] Architecture decision records (ADRs)
-- [ ] Module dependency diagrams
-- [ ] Performance tuning guide
+- [x] Architecture decision records (ADRs) (`docs/adr/`)
+- [x] Module dependency diagrams (`docs/MODULE_DEPENDENCIES.md`)
+- [x] Performance tuning guide (`docs/PERFORMANCE_TUNING.md`)
 
 ### Phase 14: User Interface
 **Status:** Future

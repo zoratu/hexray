@@ -185,6 +185,11 @@ hexray/
 - [Supported Instructions](docs/INSTRUCTIONS.md) - Complete instruction reference
 - [Testing Infrastructure](docs/TESTING.md) - Ground truth benchmarks, test fixtures, fuzzing
 - [Performance and Determinism](docs/PERFORMANCE.md) - Parallelism knobs and stable benchmark workflow
+- [Performance Tuning Guide](docs/PERFORMANCE_TUNING.md) - Fast/medium/full tier usage and benchmark stability
+- [Module Dependency Diagrams](docs/MODULE_DEPENDENCIES.md) - Crate and analysis-layer dependency maps
+- [Tutorials](docs/tutorials/GETTING_STARTED.md) - Getting started, API usage, incremental workflow, and extension guide
+- [API Examples](docs/examples/ANALYSIS_CACHE_EXAMPLES.md) - Analysis cache, incremental analysis, C++/EH/devirtualization examples
+- [Architecture Decision Records](docs/adr/README.md) - Decision log for CI/process and architecture choices
 - [Development Roadmap](docs/ROADMAP.md) - Feature status and plans
 
 ## Development
