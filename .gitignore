@@ -1,5 +1,6 @@
 # Rust
 /target/
+fuzz/target/
 **/*.rs.bk
 Cargo.lock
 
@@ -27,3 +28,9 @@ Thumbs.db
 # Test binaries
 ls
 nfsd.ko
+tests/fixtures/test_globals
+tests/fixtures/test_goto3
+tests/fixtures/test_gotos
+tests/fixtures/test_gotos2
+tests/fixtures/test_simple_goto
+tests/fixtures/test_structs

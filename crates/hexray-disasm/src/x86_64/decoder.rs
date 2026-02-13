@@ -1821,6 +1821,8 @@ impl X86_64Disassembler {
             let end = offset.min(bytes.len());
             DecodeError::unknown_opcode(address, &bytes[..end])
         })?;
+        let allow_mem_broadcast =
+            self.evex_memory_broadcast_allowed(evex.mm, opcode, evex.pp, operation);
 
         // Decode operands
         let mut operands = Vec::new();
@@ -1828,7 +1830,14 @@ impl X86_64Disassembler {
         // Decode r/m operand
         let rm_bytes = &bytes[offset..];
         let (rm_operand, rm_consumed) = self
-            .decode_evex_modrm_rm(rm_bytes, modrm, prefixes, &evex, vector_size)
+            .decode_evex_modrm_rm(
+                rm_bytes,
+                modrm,
+                prefixes,
+                &evex,
+                vector_size,
+                allow_mem_broadcast,
+            )
             .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
         offset += rm_consumed;
 
@@ -2042,6 +2051,7 @@ impl X86_64Disassembler {
         prefixes: &Prefixes,
         evex: &super::prefix::Evex,
         vector_size: u16,
+        allow_mem_broadcast: bool,
     ) -> Option<(Operand, usize)> {
         // If it's a register operand, decode as XMM/YMM/ZMM
         if modrm.is_register() {
@@ -2051,13 +2061,36 @@ impl X86_64Disassembler {
             return Some((Operand::Register(decode_xmm(rm_reg, vector_size)), 0));
         }
 
-        // Memory operand: propagate EVEX.b when used as broadcast.
+        // Memory operand: EVEX.b is broadcast only for opcodes that support it.
         let (operand, consumed) = decode_modrm_rm(bytes, modrm, prefixes, vector_size)?;
         let operand = match operand {
-            Operand::Memory(mem) => Operand::Memory(mem.with_broadcast(evex.broadcast)),
+            Operand::Memory(mem) => {
+                Operand::Memory(mem.with_broadcast(allow_mem_broadcast && evex.broadcast))
+            }
             other => other,
         };
         Some((operand, consumed))
+    }
+
+    fn evex_memory_broadcast_allowed(
+        &self,
+        mm: u8,
+        opcode: u8,
+        pp: u8,
+        operation: Operation,
+    ) -> bool {
+        match mm {
+            // 0F map: packed arithmetic/logic memory forms.
+            1 => {
+                if matches!(operation, Operation::Store | Operation::Move) {
+                    return false;
+                }
+                matches!(opcode, 0x54 | 0x56 | 0x57 | 0x58 | 0x59 | 0x5C | 0x5E) && pp <= 1
+            }
+            // 0F3A map: shuffle forms with broadcast-capable memory source.
+            3 => opcode == 0xC6 && pp <= 1,
+            _ => false,
+        }
     }
 
     /// Format EVEX mnemonic with opmask and zeroing suffix.
@@ -3914,11 +3947,30 @@ mod tests {
         };
 
         let (operand, consumed) = disasm
-            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512)
+            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512, true)
             .expect("expected decoded operand");
         assert_eq!(consumed, 0);
         match operand {
             Operand::Memory(mem) => assert!(mem.broadcast),
+            _ => panic!("expected memory operand"),
+        }
+    }
+
+    #[test]
+    fn test_evex_memory_operand_broadcast_restricted_for_moves() {
+        let disasm = X86_64Disassembler::new();
+        let prefixes = Prefixes::default();
+        let modrm = ModRM::parse_evex(0x00, &super::super::Evex::default());
+        let evex = super::super::Evex {
+            broadcast: true,
+            ..Default::default()
+        };
+
+        let (operand, _) = disasm
+            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512, false)
+            .expect("expected decoded operand");
+        match operand {
+            Operand::Memory(mem) => assert!(!mem.broadcast),
             _ => panic!("expected memory operand"),
         }
     }

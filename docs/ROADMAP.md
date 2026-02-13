@@ -172,12 +172,14 @@ This document outlines the development roadmap, competitive analysis, and featur
 
 #### Phase 13.5: Testing Infrastructure ✅
 
-**CI/CD Pipeline** ✅
-- Location: `.github/workflows/`
-- GitHub Actions with multi-OS testing (Ubuntu, macOS)
-- MSRV verification (Rust 1.70)
-- Code coverage with cargo-llvm-cov and Codecov
-- Clippy linting and format checking
+**Local Tiered CI Pipeline** ✅
+- Location: `scripts/ci-local`, Git hooks, and Dockerized hook tooling
+- Tiered workflow:
+  - `fast` (format + workspace check) for pre-commit speed
+  - `medium` (adds clippy + workspace tests) for pre-push confidence
+  - `full` (extended validation) for release-grade local CI runs
+- Runner-agnostic: designed to run consistently on local machines and containers
+- No GitHub Actions required
 
 **Benchmarking** ✅
 - Location: `crates/*/benches/`
@@ -238,6 +240,21 @@ hexray session export project.hrp --format json
 **C++ Analysis Improvements** ✅
 - Location: `crates/hexray-analysis/src/devirtualization.rs`
 - Virtual function call devirtualization using vtables and RTTI
+
+---
+
+## Recommended Next Steps (Priority Order)
+
+1. **Windows Type Libraries (PE parity gap)**
+   - Add Win32/NT type packs in `crates/hexray-types` (structs, enums, function prototypes).
+   - Wire PE auto-loading in `crates/hexray/src/main.rs` `--types auto`.
+2. **Decompiler Regression Expansion**
+   - Add targeted tests for new EVEX broadcast semantics and ABI-aware call side effects.
+   - Add option-parsing/`goto` fixtures only when referenced by automated tests.
+3. **Switch/Goto Quality Metrics**
+   - Add measurable quality gates for switch recovery and goto reduction in benchmark suite.
+4. **Performance + Determinism**
+   - Keep Rust parallelism tuned (`cargo` job counts / deterministic benches) and track regressions with local benchmark baselines.
 - Location: `crates/hexray-analysis/src/class_reconstruction.rs`
 - C++ class reconstruction from vtables
 - Generates C++ header declarations

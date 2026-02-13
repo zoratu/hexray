@@ -16,6 +16,24 @@ Hexray uses a multi-layered testing approach:
 | Benchmark Suite | Ground truth validation | `hexray-analysis/src/decompiler/benchmark.rs` |
 | Fuzz Tests | Crash resistance | `fuzz/fuzz_targets/` |
 
+## Local Tiered Workflow
+
+Hexray uses a local-first tiered workflow instead of GitHub Actions:
+
+| Tier | Typical Hook | Purpose |
+|------|--------------|---------|
+| `fast` | pre-commit | Keep commits lightweight (fmt + workspace check) |
+| `medium` | pre-push | Block regressions before push (adds clippy + tests) |
+| `full` | manual/ci-local | Exhaustive validation for release-quality checks |
+
+Run tiers directly:
+
+```bash
+scripts/ci-local --tier fast
+scripts/ci-local --tier medium
+scripts/ci-local --tier full
+```
+
 ## Ground Truth Benchmark Suite
 
 The benchmark suite provides automated quality assessment of decompiled output against expected patterns.

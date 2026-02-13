@@ -192,6 +192,11 @@ hexray/
 # Run tests (1300+ tests across all crates)
 cargo test --workspace
 
+# Tiered local CI (hook-aligned)
+scripts/ci-local --tier fast
+scripts/ci-local --tier medium
+scripts/ci-local --tier full
+
 # Run with debug output
 RUST_LOG=debug cargo run -- ./binary decompile main
 
