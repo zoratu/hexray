@@ -1,0 +1,10 @@
+int map_error(int err)
+{
+    switch (err) {
+    case 1: return ERR_IO;
+    case 42: return ERR_TIMEOUT;
+    case 255: return ERR_PERM;
+    case 4096: return ERR_PROTO;
+    default: return ERR_UNKNOWN;
+    }
+}

@@ -20,16 +20,19 @@ cd "$ROOT_DIR"
 TIER="medium"
 RUN_CROSS="auto"
 RUN_PERF="no"
+RUN_QUALITY_SMOKE="yes"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf] [--no-perf] [--help]
+Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf] [--no-perf] [--quality-smoke] [--no-quality-smoke] [--help]
 
   --tier      Select workflow tier (default: medium)
   --cross     Force docker cross-arch matrix during full tier
   --no-cross  Disable docker cross-arch matrix during full tier
   --perf      Run deterministic benchmark gate during full tier
   --no-perf   Skip deterministic benchmark gate during full tier (default)
+  --quality-smoke     Run fast fixture-backed decompiler quality smoke test (default)
+  --no-quality-smoke  Skip fast fixture-backed decompiler quality smoke test
   --help      Show this message
 EOF
 }
@@ -54,6 +57,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-perf)
             RUN_PERF="no"
+            shift
+            ;;
+        --quality-smoke)
+            RUN_QUALITY_SMOKE="yes"
+            shift
+            ;;
+        --no-quality-smoke)
+            RUN_QUALITY_SMOKE="no"
             shift
             ;;
         -h|--help)
@@ -83,6 +94,9 @@ run_fast() {
 run_medium() {
     run_fast
     run "Clippy (warnings as errors)" cargo clippy --workspace --all-targets --all-features -- -D warnings
+    if [[ "$RUN_QUALITY_SMOKE" == "yes" ]]; then
+        run "Decompiler quality smoke" "$ROOT_DIR/scripts/quality-smoke"
+    fi
     run "Workspace unit/integration tests" cargo test --workspace --all-targets
 }
 

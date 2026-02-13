@@ -1,0 +1,17 @@
+int run_state_machine(int state)
+{
+    while (1) {
+        switch (state) {
+        case 0:
+            state = init();
+            break;
+        case 1:
+            state = step();
+            break;
+        case 2:
+            return finalize();
+        default:
+            return fail();
+        }
+    }
+}

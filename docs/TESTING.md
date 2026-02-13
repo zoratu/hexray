@@ -33,9 +33,12 @@ scripts/ci-local --tier fast
 scripts/ci-local --tier medium
 scripts/ci-local --tier full
 scripts/ci-local --tier full --perf
+scripts/quality-smoke
 ```
 
 For stable benchmark comparisons and parallelism tuning guidance, see `/Volumes/OWC 1M2/Users/isaiah/src/hexray/docs/PERFORMANCE.md`.
+
+`scripts/quality-smoke` runs only fixture-backed control-flow quality cases (switch/goto recovery gates) for a cheap fail-fast signal.
 
 ## Ground Truth Benchmark Suite
 

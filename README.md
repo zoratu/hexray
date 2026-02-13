@@ -199,6 +199,9 @@ scripts/ci-local --tier medium
 scripts/ci-local --tier full
 scripts/ci-local --tier full --perf   # optional deterministic perf gate
 
+# Fast decompiler control-flow quality smoke (fixture-backed)
+scripts/quality-smoke
+
 # Run with debug output
 RUST_LOG=debug cargo run -- ./binary decompile main
 

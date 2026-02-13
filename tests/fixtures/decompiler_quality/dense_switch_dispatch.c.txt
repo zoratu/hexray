@@ -1,0 +1,14 @@
+int handle_dense(int opcode)
+{
+    switch (opcode) {
+    case 0: return handle_0();
+    case 1: return handle_1();
+    case 2: return handle_2();
+    case 3: return handle_3();
+    case 4: return handle_4();
+    case 5: return handle_5();
+    case 6: return handle_6();
+    case 7: return handle_7();
+    default: return handle_default();
+    }
+}
