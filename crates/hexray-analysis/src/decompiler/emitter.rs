@@ -1217,7 +1217,8 @@ impl PseudoCodeEmitter {
 
         // Use advanced signature recovery if enabled
         let (signature, func_info) = if self.use_signature_recovery {
-            let mut recovery = SignatureRecovery::new(self.calling_convention);
+            let mut recovery = SignatureRecovery::new(self.calling_convention)
+                .with_relocation_table(self.relocation_table.clone());
             let sig = recovery.analyze(cfg);
 
             // Convert recovered signature to FunctionInfo for compatibility
@@ -1438,7 +1439,8 @@ impl PseudoCodeEmitter {
     /// This can be used to get the signature separately from emission,
     /// for example to display it in a symbol table or for further analysis.
     pub fn recover_signature(&self, cfg: &StructuredCfg) -> FunctionSignature {
-        let mut recovery = SignatureRecovery::new(self.calling_convention);
+        let mut recovery = SignatureRecovery::new(self.calling_convention)
+            .with_relocation_table(self.relocation_table.clone());
         recovery.analyze(cfg)
     }
 
