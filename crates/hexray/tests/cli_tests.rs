@@ -459,8 +459,30 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         stdout
     );
     assert!(
-        stdout.contains("(*"),
-        "Output should include typed callback signature:\n{}",
+        stdout.contains("int32_t (*cmp)(void*, void*)")
+            || stdout.contains("int32_t (*compar)(void*, void*)")
+            || stdout.contains("int32_t (*arg2)(void*, void*)"),
+        "Output should include precise qsort callback signature:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "lookup_with_cmp"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("bsearch("),
+        "Output should include bsearch callback API call:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("int32_t (*cmp)(void*, void*)")
+            || stdout.contains("int32_t (*compar)(void*, void*)")
+            || stdout.contains("int32_t (*arg3)(void*, void*)"),
+        "Output should include precise bsearch callback signature:\n{}",
         stdout
     );
 
@@ -477,8 +499,27 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         stdout
     );
     assert!(
-        stdout.contains("(*"),
-        "Output should include typed signal-handler signature:\n{}",
+        stdout.contains("void (*h)(int32_t)")
+            || stdout.contains("void (*handler)(int32_t)")
+            || stdout.contains("void (*arg0)(int32_t)"),
+        "Output should include precise signal-handler signature:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "sort_with_static_cmp"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        !header.contains("(*ctx)")
+            && !header.contains("(*arg2)")
+            && !header.contains("(*cmp)")
+            && !header.contains("(*compar)"),
+        "Non-callback parameter should not be forced to function-pointer type:\n{}",
         stdout
     );
 }

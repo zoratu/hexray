@@ -23,13 +23,25 @@ int sort_with_cmp(int* arr, size_t n, cmp_fn_t cmp) {
     return arr[0];
 }
 
+int lookup_with_cmp(int* arr, size_t n, int key, cmp_fn_t cmp) {
+    int* found = bsearch(&key, arr, n, sizeof(int), cmp);
+    return found ? *found : -1;
+}
+
+int sort_with_static_cmp(int* arr, size_t n, void* ctx) {
+    (void)ctx;
+    qsort(arr, n, sizeof(int), cmp_ints);
+    return arr[0];
+}
+
 handler_fn_t install_handler(handler_fn_t h) {
     return signal(SIGINT, h);
 }
 
 int run_callbacks(int* arr, size_t n, handler_fn_t h) {
     int first = sort_with_cmp(arr, n, cmp_ints);
-    return first + (install_handler(h) != 0);
+    int looked = lookup_with_cmp(arr, n, 3, cmp_ints);
+    return first + looked + (install_handler(h) != 0);
 }
 
 int main(void) {

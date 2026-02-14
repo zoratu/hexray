@@ -1037,15 +1037,43 @@ pub fn create_standard_suite() -> BenchmarkSuite {
     );
 
     suite.add_case(
-        BenchmarkCase::new("callback_fp_typing")
-            .with_description("Callback API emits precise function-pointer types")
+        BenchmarkCase::new("callback_fp_typing_qsort")
+            .with_description("qsort callback API emits precise function-pointer types")
             .with_category("functions")
             .with_difficulty(3)
             .with_source("qsort(base, n, elem_size, compar);")
             .expect_pattern(ExpectedPattern::FunctionCall {
                 name: "qsort".to_string(),
             })
-            .expect_fp_decl("(*compar)")
+            .expect_fp_decl("int32_t (*compar)(void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_bsearch")
+            .with_description("bsearch callback API emits precise function-pointer types")
+            .with_category("functions")
+            .with_difficulty(3)
+            .with_source("bsearch(key, base, n, elem_size, compar);")
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "bsearch".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_signal")
+            .with_description("signal callback API emits precise handler types")
+            .with_category("functions")
+            .with_difficulty(3)
+            .with_source("signal(signum, handler);")
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "signal".to_string(),
+            })
+            .expect_fp_decl("void (*handler)(int32_t)")
             .with_min_fp_precision(1.0)
             .with_min_fp_recall(1.0),
     );
@@ -1495,6 +1523,36 @@ mod tests {
     }
 
     #[test]
+    fn test_callback_metric_gates_are_strict_in_standard_suite() {
+        let suite = create_standard_suite();
+        let expected_ids = [
+            "callback_fp_typing_qsort",
+            "callback_fp_typing_bsearch",
+            "callback_fp_typing_signal",
+        ];
+
+        for id in expected_ids {
+            let case = suite
+                .cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("missing benchmark case: {}", id));
+            assert_eq!(
+                case.min_fp_precision,
+                Some(1.0),
+                "{} should require perfect fp precision",
+                id
+            );
+            assert_eq!(
+                case.min_fp_recall,
+                Some(1.0),
+                "{} should require perfect fp recall",
+                id
+            );
+        }
+    }
+
+    #[test]
     fn test_function_pointer_precision_recall_metrics() {
         let mut suite = BenchmarkSuite::new();
         suite.add_case(
@@ -1528,6 +1586,20 @@ mod tests {
         assert_eq!(fail.fp_predicted, 0);
         assert_eq!(fail.fp_precision, 0.0);
         assert_eq!(fail.fp_recall, 0.0);
+    }
+
+    #[test]
+    fn test_function_pointer_precision_gate_catches_false_positive() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(BenchmarkCase::new("fp_no_false_positive").with_min_fp_precision(1.0));
+
+        let fail_results = suite
+            .run_all(|_| Ok("int32_t fn(void* p, int32_t (*cb)(void*)) { return 0; }".to_string()));
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.fp_expected, 0);
+        assert_eq!(fail.fp_predicted, 1);
+        assert_eq!(fail.fp_precision, 0.0);
     }
 
     #[test]

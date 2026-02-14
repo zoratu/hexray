@@ -124,9 +124,17 @@ impl PseudoCodeEmitter {
     fn callback_signature(function_name: &str, arg_index: usize) -> Option<ParamType> {
         let clean_name = function_name.strip_prefix('_').unwrap_or(function_name);
         match (clean_name, arg_index) {
-            ("qsort", 3) | ("bsearch", 3) => Some(ParamType::FunctionPointer {
+            ("qsort", 3) | ("bsearch", 3) | ("bsearch", 4) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::SignedInt(32)),
                 params: vec![ParamType::Pointer, ParamType::Pointer],
+            }),
+            ("qsort_r", 3) | ("qsort_s", 3) => Some(ParamType::FunctionPointer {
+                return_type: Box::new(ParamType::SignedInt(32)),
+                params: vec![ParamType::Pointer, ParamType::Pointer, ParamType::Pointer],
+            }),
+            ("qsort_r", 4) => Some(ParamType::FunctionPointer {
+                return_type: Box::new(ParamType::SignedInt(32)),
+                params: vec![ParamType::Pointer, ParamType::Pointer, ParamType::Pointer],
             }),
             ("signal", 1) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::Void),
@@ -140,34 +148,76 @@ impl PseudoCodeEmitter {
         }
     }
 
-    fn guess_param_index_from_callback_arg(arg: &Expr, param_count: usize) -> Option<usize> {
-        if param_count == 0 {
+    fn guess_param_index_from_callback_arg(arg: &Expr, param_names: &[String]) -> Option<usize> {
+        if let Some(name) = Self::extract_expr_name(arg) {
+            return Self::param_index_from_name(&name, param_names);
+        }
+        None
+    }
+
+    fn extract_expr_name(expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Var(var) => Some(var.name.to_lowercase()),
+            ExprKind::Unknown(name) => Some(name.to_lowercase()),
+            ExprKind::Cast { expr, .. } => Self::extract_expr_name(expr),
+            _ => None,
+        }
+    }
+
+    fn param_index_from_name(name: &str, param_names: &[String]) -> Option<usize> {
+        if param_names.is_empty() {
             return None;
         }
 
-        if let ExprKind::Var(var) = &arg.kind {
-            let name = var.name.to_lowercase();
-            if let Some(suffix) = name.strip_prefix("arg") {
-                if let Ok(idx) = suffix.parse::<usize>() {
-                    if idx < param_count {
-                        return Some(idx);
-                    }
+        if let Some(suffix) = name.strip_prefix("arg") {
+            if let Ok(idx) = suffix.parse::<usize>() {
+                if idx < param_names.len() {
+                    return Some(idx);
                 }
             }
         }
-
-        if param_count == 1 {
-            Some(0)
-        } else {
-            Some(param_count - 1)
+        if let Some(idx) = param_names
+            .iter()
+            .position(|param_name| param_name.eq_ignore_ascii_case(name))
+        {
+            return Some(idx);
         }
+        if let Some(idx) = get_arg_register_index(name) {
+            if idx < param_names.len() {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn param_index_from_callback_arg(
+        arg: &Expr,
+        param_names: &[String],
+        aliases: &HashMap<String, usize>,
+    ) -> Option<usize> {
+        if let Some(idx) = Self::guess_param_index_from_callback_arg(arg, param_names) {
+            return Some(idx);
+        }
+        if let Some(name) = Self::extract_expr_name(arg) {
+            if let Some(idx) = aliases.get(&name).copied() {
+                return Some(idx);
+            }
+            // Stack-like argument aliases (`arg_8`, `arg_10`) often represent
+            // the last incoming parameter when prologue lifting obscures the
+            // original register name.
+            if name.starts_with("arg_") && !param_names.is_empty() {
+                return Some(param_names.len() - 1);
+            }
+        }
+        None
     }
 
     fn collect_callback_overrides_expr(
         &self,
         expr: &Expr,
-        param_count: usize,
+        param_names: &[String],
         overrides: &mut HashMap<usize, ParamType>,
+        aliases: &mut HashMap<String, usize>,
     ) {
         match &expr.kind {
             ExprKind::Call { target, args } => {
@@ -182,65 +232,83 @@ impl PseudoCodeEmitter {
                 if let Some(name) = maybe_name {
                     for (idx, arg) in args.iter().enumerate() {
                         if let Some(sig) = Self::callback_signature(name, idx) {
-                            if let Some(param_idx) =
-                                Self::guess_param_index_from_callback_arg(arg, param_count)
-                            {
+                            let param_idx =
+                                Self::param_index_from_callback_arg(arg, param_names, aliases)
+                                    .or_else(|| {
+                                        let rendered = self.format_expr(arg);
+                                        let looks_like_lifted_slot = rendered.starts_with("arg_")
+                                            || rendered.starts_with("var_")
+                                            || rendered.starts_with("local_");
+                                        if looks_like_lifted_slot && !param_names.is_empty() {
+                                            Some(param_names.len() - 1)
+                                        } else {
+                                            None
+                                        }
+                                    });
+                            if let Some(param_idx) = param_idx {
                                 overrides.insert(param_idx, sig);
                             }
                         }
                     }
                 }
                 for arg in args {
-                    self.collect_callback_overrides_expr(arg, param_count, overrides);
+                    self.collect_callback_overrides_expr(arg, param_names, overrides, aliases);
                 }
             }
             ExprKind::Assign { lhs, rhs } => {
-                self.collect_callback_overrides_expr(lhs, param_count, overrides);
-                self.collect_callback_overrides_expr(rhs, param_count, overrides);
+                self.collect_callback_overrides_expr(lhs, param_names, overrides, aliases);
+                self.collect_callback_overrides_expr(rhs, param_names, overrides, aliases);
+                if let Some(lhs_name) = Self::extract_expr_name(lhs) {
+                    if let Some(rhs_idx) =
+                        Self::param_index_from_callback_arg(rhs, param_names, aliases)
+                    {
+                        aliases.insert(lhs_name, rhs_idx);
+                    }
+                }
             }
             ExprKind::BinOp { left, right, .. } => {
-                self.collect_callback_overrides_expr(left, param_count, overrides);
-                self.collect_callback_overrides_expr(right, param_count, overrides);
+                self.collect_callback_overrides_expr(left, param_names, overrides, aliases);
+                self.collect_callback_overrides_expr(right, param_names, overrides, aliases);
             }
             ExprKind::UnaryOp { operand, .. } => {
-                self.collect_callback_overrides_expr(operand, param_count, overrides);
+                self.collect_callback_overrides_expr(operand, param_names, overrides, aliases);
             }
             ExprKind::Deref { addr, .. } => {
-                self.collect_callback_overrides_expr(addr, param_count, overrides);
+                self.collect_callback_overrides_expr(addr, param_names, overrides, aliases);
             }
             ExprKind::AddressOf(inner) => {
-                self.collect_callback_overrides_expr(inner, param_count, overrides);
+                self.collect_callback_overrides_expr(inner, param_names, overrides, aliases);
             }
             ExprKind::ArrayAccess { base, index, .. } => {
-                self.collect_callback_overrides_expr(base, param_count, overrides);
-                self.collect_callback_overrides_expr(index, param_count, overrides);
+                self.collect_callback_overrides_expr(base, param_names, overrides, aliases);
+                self.collect_callback_overrides_expr(index, param_names, overrides, aliases);
             }
             ExprKind::FieldAccess { base, .. } => {
-                self.collect_callback_overrides_expr(base, param_count, overrides);
+                self.collect_callback_overrides_expr(base, param_names, overrides, aliases);
             }
             ExprKind::Conditional {
                 cond,
                 then_expr,
                 else_expr,
             } => {
-                self.collect_callback_overrides_expr(cond, param_count, overrides);
-                self.collect_callback_overrides_expr(then_expr, param_count, overrides);
-                self.collect_callback_overrides_expr(else_expr, param_count, overrides);
+                self.collect_callback_overrides_expr(cond, param_names, overrides, aliases);
+                self.collect_callback_overrides_expr(then_expr, param_names, overrides, aliases);
+                self.collect_callback_overrides_expr(else_expr, param_names, overrides, aliases);
             }
             ExprKind::Cast { expr, .. } => {
-                self.collect_callback_overrides_expr(expr, param_count, overrides);
+                self.collect_callback_overrides_expr(expr, param_names, overrides, aliases);
             }
             ExprKind::CompoundAssign { lhs, rhs, .. } => {
-                self.collect_callback_overrides_expr(lhs, param_count, overrides);
-                self.collect_callback_overrides_expr(rhs, param_count, overrides);
+                self.collect_callback_overrides_expr(lhs, param_names, overrides, aliases);
+                self.collect_callback_overrides_expr(rhs, param_names, overrides, aliases);
             }
             ExprKind::Phi(values) => {
                 for v in values {
-                    self.collect_callback_overrides_expr(v, param_count, overrides);
+                    self.collect_callback_overrides_expr(v, param_names, overrides, aliases);
                 }
             }
             ExprKind::BitField { expr, .. } => {
-                self.collect_callback_overrides_expr(expr, param_count, overrides);
+                self.collect_callback_overrides_expr(expr, param_names, overrides, aliases);
             }
             _ => {}
         }
@@ -249,30 +317,31 @@ impl PseudoCodeEmitter {
     fn collect_callback_overrides_node(
         &self,
         node: &StructuredNode,
-        param_count: usize,
+        param_names: &[String],
         overrides: &mut HashMap<usize, ParamType>,
+        aliases: &mut HashMap<String, usize>,
     ) {
         match node {
             StructuredNode::Block { statements, .. } => {
                 for stmt in statements {
-                    self.collect_callback_overrides_expr(stmt, param_count, overrides);
+                    self.collect_callback_overrides_expr(stmt, param_names, overrides, aliases);
                 }
             }
             StructuredNode::Expr(expr) => {
-                self.collect_callback_overrides_expr(expr, param_count, overrides);
+                self.collect_callback_overrides_expr(expr, param_names, overrides, aliases);
             }
             StructuredNode::If {
                 condition,
                 then_body,
                 else_body,
             } => {
-                self.collect_callback_overrides_expr(condition, param_count, overrides);
+                self.collect_callback_overrides_expr(condition, param_names, overrides, aliases);
                 for n in then_body {
-                    self.collect_callback_overrides_node(n, param_count, overrides);
+                    self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                 }
                 if let Some(else_nodes) = else_body {
                     for n in else_nodes {
-                        self.collect_callback_overrides_node(n, param_count, overrides);
+                        self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                     }
                 }
             }
@@ -282,9 +351,9 @@ impl PseudoCodeEmitter {
             | StructuredNode::DoWhile {
                 condition, body, ..
             } => {
-                self.collect_callback_overrides_expr(condition, param_count, overrides);
+                self.collect_callback_overrides_expr(condition, param_names, overrides, aliases);
                 for n in body {
-                    self.collect_callback_overrides_node(n, param_count, overrides);
+                    self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                 }
             }
             StructuredNode::For {
@@ -295,19 +364,19 @@ impl PseudoCodeEmitter {
                 ..
             } => {
                 if let Some(init) = init {
-                    self.collect_callback_overrides_expr(init, param_count, overrides);
+                    self.collect_callback_overrides_expr(init, param_names, overrides, aliases);
                 }
-                self.collect_callback_overrides_expr(condition, param_count, overrides);
+                self.collect_callback_overrides_expr(condition, param_names, overrides, aliases);
                 if let Some(update) = update {
-                    self.collect_callback_overrides_expr(update, param_count, overrides);
+                    self.collect_callback_overrides_expr(update, param_names, overrides, aliases);
                 }
                 for n in body {
-                    self.collect_callback_overrides_node(n, param_count, overrides);
+                    self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                 }
             }
             StructuredNode::Loop { body, .. } | StructuredNode::Sequence(body) => {
                 for n in body {
-                    self.collect_callback_overrides_node(n, param_count, overrides);
+                    self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                 }
             }
             StructuredNode::Switch {
@@ -315,31 +384,31 @@ impl PseudoCodeEmitter {
                 cases,
                 default,
             } => {
-                self.collect_callback_overrides_expr(value, param_count, overrides);
+                self.collect_callback_overrides_expr(value, param_names, overrides, aliases);
                 for (_, case_nodes) in cases {
                     for n in case_nodes {
-                        self.collect_callback_overrides_node(n, param_count, overrides);
+                        self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                     }
                 }
                 if let Some(default_nodes) = default {
                     for n in default_nodes {
-                        self.collect_callback_overrides_node(n, param_count, overrides);
+                        self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                     }
                 }
             }
             StructuredNode::Return(Some(expr)) => {
-                self.collect_callback_overrides_expr(expr, param_count, overrides);
+                self.collect_callback_overrides_expr(expr, param_names, overrides, aliases);
             }
             StructuredNode::TryCatch {
                 try_body,
                 catch_handlers,
             } => {
                 for n in try_body {
-                    self.collect_callback_overrides_node(n, param_count, overrides);
+                    self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                 }
                 for handler in catch_handlers {
                     for n in &handler.body {
-                        self.collect_callback_overrides_node(n, param_count, overrides);
+                        self.collect_callback_overrides_node(n, param_names, overrides, aliases);
                     }
                 }
             }
@@ -350,11 +419,12 @@ impl PseudoCodeEmitter {
     fn callback_param_overrides(
         &self,
         cfg: &StructuredCfg,
-        param_count: usize,
+        param_names: &[String],
     ) -> HashMap<usize, ParamType> {
         let mut overrides = HashMap::new();
+        let mut aliases = HashMap::new();
         for node in &cfg.body {
-            self.collect_callback_overrides_node(node, param_count, &mut overrides);
+            self.collect_callback_overrides_node(node, param_names, &mut overrides, &mut aliases);
         }
         overrides
     }
@@ -1516,16 +1586,24 @@ impl PseudoCodeEmitter {
             if sig.parameters.is_empty() && func_info.parameters.is_empty() {
                 writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
             } else if !sig.parameters.is_empty() {
-                // Use recovered signature with inferred types
-                let callback_overrides = self.callback_param_overrides(cfg, sig.parameters.len());
+                // Prefer recovered signature types; only override when still unresolved.
+                let recovered_param_names: Vec<String> =
+                    sig.parameters.iter().map(|p| p.name.clone()).collect();
+                let callback_overrides = self.callback_param_overrides(cfg, &recovered_param_names);
                 let params: Vec<_> = sig
                     .parameters
                     .iter()
                     .enumerate()
                     .map(|(idx, p)| {
                         let rendered_name = rename_main_param(&p.name, idx);
-                        if let Some(ty) = callback_overrides.get(&idx) {
-                            ty.format_with_name(&rendered_name)
+                        let can_override =
+                            !matches!(p.param_type, ParamType::FunctionPointer { .. });
+                        if can_override {
+                            if let Some(ty) = callback_overrides.get(&idx) {
+                                ty.format_with_name(&rendered_name)
+                            } else {
+                                Self::format_signature_param(p, &rendered_name)
+                            }
                         } else {
                             Self::format_signature_param(p, &rendered_name)
                         }
@@ -1541,8 +1619,7 @@ impl PseudoCodeEmitter {
                 .unwrap();
             } else {
                 // Fall back to legacy parameter detection
-                let callback_overrides =
-                    self.callback_param_overrides(cfg, func_info.parameters.len());
+                let callback_overrides = self.callback_param_overrides(cfg, &func_info.parameters);
                 let params: Vec<_> = func_info
                     .parameters
                     .iter()
@@ -1575,8 +1652,7 @@ impl PseudoCodeEmitter {
             if func_info.parameters.is_empty() {
                 writeln!(output, "{} {}()", return_type, func_name).unwrap();
             } else {
-                let callback_overrides =
-                    self.callback_param_overrides(cfg, func_info.parameters.len());
+                let callback_overrides = self.callback_param_overrides(cfg, &func_info.parameters);
                 let params: Vec<_> = func_info
                     .parameters
                     .iter()
@@ -4096,6 +4172,40 @@ mod tests {
         assert_eq!(
             PseudoCodeEmitter::format_signature_param(&param, "compar"),
             "void* compar"
+        );
+    }
+
+    #[test]
+    fn test_emit_does_not_force_callback_type_without_param_mapping() {
+        use super::super::expression::Variable;
+
+        let call = Expr::call(
+            CallTarget::Named("qsort".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::int(4),
+                Expr::unknown("cmp_ints"),
+            ],
+        );
+        let keep_r8_live = Expr::assign(Expr::unknown("tmp"), Expr::var(Variable::reg("r8", 8)));
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![call, keep_r8_live],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "qsort_wrapper");
+        let header = output.lines().next().unwrap_or_default();
+        assert!(
+            !header.contains("(*"),
+            "Header should not include inferred callback type without param mapping:\n{}",
+            output
         );
     }
 

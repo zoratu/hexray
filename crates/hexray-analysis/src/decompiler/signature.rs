@@ -196,7 +196,7 @@ impl ParameterUsageHints {
     fn callback_signature(function_name: &str, arg_index: usize) -> Option<ParamType> {
         let clean_name = function_name.strip_prefix('_').unwrap_or(function_name);
         match (clean_name, arg_index) {
-            ("qsort", 3) | ("bsearch", 3) => Some(ParamType::FunctionPointer {
+            ("qsort", 3) | ("bsearch", 3) | ("bsearch", 4) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::SignedInt(32)),
                 params: vec![ParamType::Pointer, ParamType::Pointer],
             }),
@@ -1066,30 +1066,6 @@ impl SignatureRecovery {
                     .unwrap_or(false);
 
                 for (i, arg) in args.iter().enumerate() {
-                    if let Some(fn_name) = &func_name {
-                        if Self::is_callback_position(fn_name, i) {
-                            if let Some(param_idx) = self.fallback_callback_param_index() {
-                                let hints = self.param_hints.entry(param_idx).or_default();
-                                hints.is_function_pointer = true;
-                                hints.function_pointer_confidence =
-                                    hints.function_pointer_confidence.saturating_add(2);
-                                hints.passed_as_callback_to.push((fn_name.clone(), i));
-                                if let Some(ParamType::FunctionPointer {
-                                    return_type,
-                                    params,
-                                }) = ParameterUsageHints::callback_signature(fn_name, i)
-                                {
-                                    if hints.function_pointer_arg_types.is_empty() {
-                                        hints.function_pointer_arg_types = params;
-                                    }
-                                    if hints.function_pointer_return_type.is_none() {
-                                        hints.function_pointer_return_type = Some(*return_type);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
                     // First arg to string functions is typically a string
                     if is_string_fn && i == 0 {
                         if let ExprKind::Var(var) = &arg.kind {
@@ -1115,11 +1091,16 @@ impl SignatureRecovery {
                             // If this callback argument flows through a local alias of an
                             // argument register, propagate callback hints to the original
                             // parameter index so function signatures become typed in CLI output.
+                            let fallback_idx = if self.may_alias_parameter(&var_name) {
+                                self.fallback_callback_param_index()
+                            } else {
+                                None
+                            };
                             if let Some(param_idx) = self
                                 .function_pointer_aliases
                                 .get(&var_name)
                                 .copied()
-                                .or_else(|| self.fallback_callback_param_index())
+                                .or(fallback_idx)
                             {
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
@@ -1143,11 +1124,16 @@ impl SignatureRecovery {
                                     h.function_pointer_return_type = Some(*return_type);
                                 }
                             });
+                            let fallback_idx = if self.may_alias_parameter(&var_name) {
+                                self.fallback_callback_param_index()
+                            } else {
+                                None
+                            };
                             if let Some(param_idx) = self
                                 .function_pointer_aliases
                                 .get(&var_name)
                                 .copied()
-                                .or_else(|| self.fallback_callback_param_index())
+                                .or(fallback_idx)
                             {
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
@@ -1421,6 +1407,12 @@ impl SignatureRecovery {
             (None, Some(b)) => Some(b),
             (None, None) => None,
         }
+    }
+
+    fn may_alias_parameter(&self, var_name: &str) -> bool {
+        var_name.starts_with("arg")
+            || var_name.starts_with("stack_")
+            || self.arg_register_index(var_name).is_some()
     }
 
     fn extract_var_name(&self, expr: &Expr) -> Option<String> {
@@ -2402,6 +2394,43 @@ mod tests {
 
         assert!(matches!(
             sig.parameters[1].param_type,
+            ParamType::FunctionPointer { .. }
+        ));
+    }
+
+    #[test]
+    fn test_signature_recovery_does_not_force_fp_for_non_parameter_callback_arg() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("qsort".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::int(4),
+                Expr::unknown("cmp_ints"),
+            ],
+        );
+        // Keep a fourth argument register live so fallback "last parameter" behavior
+        // would previously mislabel it as a callback.
+        let keep_r8_live = Expr::assign(Expr::unknown("tmp"), Expr::var(Variable::reg("r8", 8)));
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call, keep_r8_live],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 5);
+        assert!(!matches!(
+            sig.parameters[4].param_type,
             ParamType::FunctionPointer { .. }
         ));
     }
