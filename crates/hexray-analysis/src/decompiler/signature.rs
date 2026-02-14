@@ -1091,17 +1091,7 @@ impl SignatureRecovery {
                             // If this callback argument flows through a local alias of an
                             // argument register, propagate callback hints to the original
                             // parameter index so function signatures become typed in CLI output.
-                            let fallback_idx = if self.may_alias_parameter(&var_name) {
-                                self.fallback_callback_param_index()
-                            } else {
-                                None
-                            };
-                            if let Some(param_idx) = self
-                                .function_pointer_aliases
-                                .get(&var_name)
-                                .copied()
-                                .or(fallback_idx)
-                            {
+                            if let Some(param_idx) = self.resolve_param_index_from_name(&var_name) {
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
                                 hints.function_pointer_confidence =
@@ -1124,17 +1114,7 @@ impl SignatureRecovery {
                                     h.function_pointer_return_type = Some(*return_type);
                                 }
                             });
-                            let fallback_idx = if self.may_alias_parameter(&var_name) {
-                                self.fallback_callback_param_index()
-                            } else {
-                                None
-                            };
-                            if let Some(param_idx) = self
-                                .function_pointer_aliases
-                                .get(&var_name)
-                                .copied()
-                                .or(fallback_idx)
-                            {
+                            if let Some(param_idx) = self.resolve_param_index_from_name(&var_name) {
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
                                 hints.function_pointer_confidence =
@@ -1409,9 +1389,25 @@ impl SignatureRecovery {
         }
     }
 
+    fn resolve_param_index_from_name(&self, var_name: &str) -> Option<usize> {
+        if let Some(idx) = self.function_pointer_aliases.get(var_name).copied() {
+            return Some(idx);
+        }
+        if let Some(idx) = self.arg_register_index(var_name) {
+            return Some(idx);
+        }
+        if self.may_alias_parameter(var_name) {
+            return self.fallback_callback_param_index();
+        }
+        None
+    }
+
     fn may_alias_parameter(&self, var_name: &str) -> bool {
         var_name.starts_with("arg")
             || var_name.starts_with("stack_")
+            || var_name.starts_with("arg_")
+            || var_name.starts_with("var_")
+            || var_name.starts_with("local_")
             || self.arg_register_index(var_name).is_some()
     }
 
@@ -2187,6 +2183,41 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_recovery_detects_bsearch_callback_when_lifted_to_arg4() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("bsearch".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::int(4),
+                Expr::var(Variable::reg("r8", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 5);
+        assert_eq!(
+            sig.parameters[4].param_type.format_with_name("compar"),
+            "int32_t (*compar)(void*, void*)"
+        );
+    }
+
+    #[test]
     fn test_signature_recovery_detects_indirect_call_argument() {
         use hexray_core::BasicBlockId;
 
@@ -2394,6 +2425,40 @@ mod tests {
 
         assert!(matches!(
             sig.parameters[1].param_type,
+            ParamType::FunctionPointer { .. }
+        ));
+    }
+
+    #[test]
+    fn test_signature_recovery_propagates_callback_hint_through_lifted_var_alias() {
+        use hexray_core::BasicBlockId;
+
+        let save_arg = Expr::assign(Expr::unknown("var_8"), Expr::var(Variable::reg("rdx", 8)));
+        let call = Expr::call(
+            CallTarget::Named("qsort".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::int(4),
+                Expr::unknown("var_8"),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![save_arg, call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(matches!(
+            sig.parameters[2].param_type,
             ParamType::FunctionPointer { .. }
         ));
     }

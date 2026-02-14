@@ -33,6 +33,24 @@ fn run_hexray(args: &[&str]) -> Output {
         .expect("Failed to execute hexray")
 }
 
+fn decompile_header(binary: &str, symbol: &str) -> Option<String> {
+    let output = run_hexray(&[binary, "decompile", symbol]);
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.contains('(')
+                && line.ends_with(')')
+                && !line.starts_with("Decompiling ")
+                && !line.is_empty()
+        })
+        .map(ToString::to_string)
+}
+
 fn find_c_compiler() -> Option<&'static str> {
     ["cc", "clang", "gcc"].into_iter().find(|compiler| {
         Command::new(compiler)
@@ -72,7 +90,7 @@ fn build_c_fixture(source_name: &str) -> Option<PathBuf> {
     let out_bin = out_dir.join("fixture_bin");
 
     let compile = Command::new(compiler)
-        .args(["-O0", "-g", &source, "-o"])
+        .args(["-O0", "-g", "-pthread", &source, "-o"])
         .arg(&out_bin)
         .output();
     match compile {
@@ -522,6 +540,82 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         "Non-callback parameter should not be forced to function-pointer type:\n{}",
         stdout
     );
+
+    let output = run_hexray(&[&binary, "decompile", "spawn_with_start"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("pthread_create("),
+        "Output should include pthread callback API call:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("void* (*start_routine)(void*)")
+            || stdout.contains("void* (*start)(void*)")
+            || stdout.contains("void* (*arg1)(void*)")
+            || stdout.contains("void* (*arg0)(void*)"),
+        "Output should include precise pthread callback signature:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "spawn_with_static_start"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(
+        !header.contains("(*arg)") && !header.contains("(*arg0)") && !header.contains("(*arg1)"),
+        "Non-callback argument should not be forced to function-pointer type:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_decompile_callback_header_snapshots() {
+    let Some(binary) = build_c_fixture("test_callbacks.c") else {
+        return;
+    };
+    let binary = binary.to_string_lossy().to_string();
+
+    let expected = [
+        (
+            "sort_with_cmp",
+            "int32_t _sort_with_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+        ),
+        (
+            "lookup_with_cmp",
+            "int32_t _lookup_with_cmp(int64_t arg0, int64_t arg1, int32_t arg2, int32_t (*arg3)(void*, void*))",
+        ),
+        (
+            "sort_with_static_cmp",
+            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)",
+        ),
+        (
+            "spawn_with_start",
+            "void _spawn_with_start(int64_t arg0, void* (*arg1)(void*))",
+        ),
+        (
+            "spawn_with_static_start",
+            "void _spawn_with_static_start(int64_t arg0)",
+        ),
+    ];
+
+    for (symbol, expected_header) in expected {
+        let header = decompile_header(&binary, symbol)
+            .unwrap_or_else(|| panic!("missing decompile header for symbol {}", symbol));
+        assert_eq!(
+            header, expected_header,
+            "Header snapshot mismatch for symbol {}",
+            symbol
+        );
+    }
 }
 
 // =============================================================================

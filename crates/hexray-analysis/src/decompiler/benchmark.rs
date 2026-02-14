@@ -1078,6 +1078,36 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_min_fp_recall(1.0),
     );
 
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_pthread_create")
+            .with_description("pthread_create callback API emits precise start routine types")
+            .with_category("functions")
+            .with_difficulty(3)
+            .with_source("pthread_create(&thread, attr, start_routine, arg);")
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "pthread_create".to_string(),
+            })
+            .expect_fp_decl("void* (*start_routine)(void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_qsort_alias")
+            .with_description("qsort callback typing survives lifted local alias patterns")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source(
+                "tmp = compar; qsort(base, n, elem_size, tmp); /* lifted alias callback path */",
+            )
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
     // Struct patterns
     suite.add_case(
         BenchmarkCase::new("struct_access")
@@ -1529,6 +1559,8 @@ mod tests {
             "callback_fp_typing_qsort",
             "callback_fp_typing_bsearch",
             "callback_fp_typing_signal",
+            "callback_fp_typing_pthread_create",
+            "callback_fp_typing_qsort_alias",
         ];
 
         for id in expected_ids {

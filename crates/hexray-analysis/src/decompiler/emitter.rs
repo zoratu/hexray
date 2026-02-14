@@ -4210,6 +4210,40 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_types_bsearch_callback_when_lifted_to_arg4() {
+        use super::super::expression::Variable;
+
+        let call = Expr::call(
+            CallTarget::Named("bsearch".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::int(4),
+                Expr::var(Variable::reg("r8", 8)),
+            ],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "lookup_wrapper");
+        let header = output.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("(*arg4)(void*, void*)") || header.contains("(*compar)(void*, void*)"),
+            "Header should include typed bsearch callback in arg4 position:\n{}",
+            output
+        );
+    }
+
+    #[test]
     fn test_try_format_stack_slot() {
         use super::super::expression::Variable;
 

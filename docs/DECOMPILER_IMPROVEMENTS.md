@@ -2,6 +2,17 @@
 
 This document captures optimization opportunities discovered by analyzing real-world system binaries with hexray. Binaries tested include `/usr/bin/grep`, `/usr/bin/sort`, `/usr/bin/sqlite3`, `/bin/bash`, `/usr/bin/sed`, `/usr/bin/openssl`, `/usr/bin/tar`, and `/usr/bin/find`.
 
+## Recent Callback Typing Hardening (2026-02)
+
+Recent iterations tightened callback typing in both analysis and CLI output:
+- Signature recovery now propagates callback hints through lifted aliases (`stack_*`, `var_*`, `arg_*`) with stricter non-parameter guards.
+- CLI regressions now validate typed callback headers for `qsort`, `bsearch`, `signal`, and `pthread_create` callback paths.
+- Benchmark quality gates include strict callback precision/recall thresholds across direct and alias-heavy callback cases.
+
+Remaining high-value follow-up:
+- Replace emitter callback fallback heuristics with explicit provenance carried from signature recovery.
+- Add callback-typing stress fixtures for nested alias chains and mixed direct/indirect callback forwarding.
+
 ## Priority 1: Critical Issues
 
 ### 1.1 Switch Statement Reconstruction (HIGH IMPACT) ✅ IMPLEMENTED

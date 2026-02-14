@@ -1,10 +1,12 @@
 // Callback-heavy fixture for CLI decompiler regression tests.
+#include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdlib.h>
 
 typedef int (*cmp_fn_t)(const void*, const void*);
 typedef void (*handler_fn_t)(int);
+typedef void* (*thread_start_t)(void*);
 
 static int cmp_ints(const void* a, const void* b) {
     int lhs = *(const int*)a;
@@ -34,6 +36,20 @@ int sort_with_static_cmp(int* arr, size_t n, void* ctx) {
     return arr[0];
 }
 
+static void* thread_trampoline(void* arg) {
+    return arg;
+}
+
+int spawn_with_start(thread_start_t start_routine, void* arg) {
+    pthread_t tid;
+    return pthread_create(&tid, 0, start_routine, arg);
+}
+
+int spawn_with_static_start(void* arg) {
+    pthread_t tid;
+    return pthread_create(&tid, 0, thread_trampoline, arg);
+}
+
 handler_fn_t install_handler(handler_fn_t h) {
     return signal(SIGINT, h);
 }
@@ -41,7 +57,8 @@ handler_fn_t install_handler(handler_fn_t h) {
 int run_callbacks(int* arr, size_t n, handler_fn_t h) {
     int first = sort_with_cmp(arr, n, cmp_ints);
     int looked = lookup_with_cmp(arr, n, 3, cmp_ints);
-    return first + looked + (install_handler(h) != 0);
+    int spawned = spawn_with_start(thread_trampoline, arr);
+    return first + looked + spawned + (install_handler(h) != 0);
 }
 
 int main(void) {
