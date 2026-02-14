@@ -1046,7 +1046,7 @@ pub fn create_standard_suite() -> BenchmarkSuite {
                 name: "qsort".to_string(),
             })
             .expect_fp_decl("(*compar)")
-            .with_min_fp_precision(0.5)
+            .with_min_fp_precision(1.0)
             .with_min_fp_recall(1.0),
     );
 

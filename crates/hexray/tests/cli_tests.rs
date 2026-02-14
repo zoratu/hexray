@@ -458,6 +458,11 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         "Output should include callback API call:\n{}",
         stdout
     );
+    assert!(
+        stdout.contains("(*"),
+        "Output should include typed callback signature:\n{}",
+        stdout
+    );
 
     let output = run_hexray(&[&binary, "decompile", "install_handler"]);
     assert!(
@@ -469,6 +474,11 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
     assert!(
         stdout.contains("signal("),
         "Output should include signal callback API call:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("(*"),
+        "Output should include typed signal-handler signature:\n{}",
         stdout
     );
 }

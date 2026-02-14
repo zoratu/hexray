@@ -1066,6 +1066,30 @@ impl SignatureRecovery {
                     .unwrap_or(false);
 
                 for (i, arg) in args.iter().enumerate() {
+                    if let Some(fn_name) = &func_name {
+                        if Self::is_callback_position(fn_name, i) {
+                            if let Some(param_idx) = self.fallback_callback_param_index() {
+                                let hints = self.param_hints.entry(param_idx).or_default();
+                                hints.is_function_pointer = true;
+                                hints.function_pointer_confidence =
+                                    hints.function_pointer_confidence.saturating_add(2);
+                                hints.passed_as_callback_to.push((fn_name.clone(), i));
+                                if let Some(ParamType::FunctionPointer {
+                                    return_type,
+                                    params,
+                                }) = ParameterUsageHints::callback_signature(fn_name, i)
+                                {
+                                    if hints.function_pointer_arg_types.is_empty() {
+                                        hints.function_pointer_arg_types = params;
+                                    }
+                                    if hints.function_pointer_return_type.is_none() {
+                                        hints.function_pointer_return_type = Some(*return_type);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // First arg to string functions is typically a string
                     if is_string_fn && i == 0 {
                         if let ExprKind::Var(var) = &arg.kind {
@@ -1076,31 +1100,69 @@ impl SignatureRecovery {
                     }
 
                     // Record which functions parameters are passed to
-                    if let (Some(fn_name), ExprKind::Var(var)) = (&func_name, &arg.kind) {
-                        self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                    if let (Some(fn_name), Some(var_name)) =
+                        (&func_name, self.extract_var_name(arg))
+                    {
+                        self.record_usage_hint(&var_name, |h| {
                             h.passed_to_functions.push(fn_name.clone())
                         });
                         if Self::is_callback_position(fn_name, i) {
-                            self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                            self.record_usage_hint(&var_name, |h| {
                                 h.passed_as_callback_to.push((fn_name.clone(), i));
                                 h.function_pointer_confidence =
                                     h.function_pointer_confidence.saturating_add(4);
                             });
+                            // If this callback argument flows through a local alias of an
+                            // argument register, propagate callback hints to the original
+                            // parameter index so function signatures become typed in CLI output.
+                            if let Some(param_idx) = self
+                                .function_pointer_aliases
+                                .get(&var_name)
+                                .copied()
+                                .or_else(|| self.fallback_callback_param_index())
+                            {
+                                let hints = self.param_hints.entry(param_idx).or_default();
+                                hints.is_function_pointer = true;
+                                hints.function_pointer_confidence =
+                                    hints.function_pointer_confidence.saturating_add(4);
+                                hints.passed_as_callback_to.push((fn_name.clone(), i));
+                            }
                         }
                         if let Some(sig) = self.callback_signature_from_summary(fn_name, i) {
-                            self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                            let sig_for_hint = sig.clone();
+                            self.record_usage_hint(&var_name, |h| {
                                 h.is_function_pointer = true;
                                 h.function_pointer_confidence =
                                     h.function_pointer_confidence.saturating_add(5);
                                 if let ParamType::FunctionPointer {
                                     return_type,
                                     params,
-                                } = sig
+                                } = sig_for_hint.clone()
                                 {
                                     h.function_pointer_arg_types = params;
                                     h.function_pointer_return_type = Some(*return_type);
                                 }
                             });
+                            if let Some(param_idx) = self
+                                .function_pointer_aliases
+                                .get(&var_name)
+                                .copied()
+                                .or_else(|| self.fallback_callback_param_index())
+                            {
+                                let hints = self.param_hints.entry(param_idx).or_default();
+                                hints.is_function_pointer = true;
+                                hints.function_pointer_confidence =
+                                    hints.function_pointer_confidence.saturating_add(5);
+                                hints.passed_as_callback_to.push((fn_name.clone(), i));
+                                if let ParamType::FunctionPointer {
+                                    return_type,
+                                    params,
+                                } = sig
+                                {
+                                    hints.function_pointer_arg_types = params;
+                                    hints.function_pointer_return_type = Some(*return_type);
+                                }
+                            }
                         }
                     }
 
@@ -1346,9 +1408,28 @@ impl SignatureRecovery {
         }
     }
 
+    fn fallback_callback_param_index(&self) -> Option<usize> {
+        let max_from_reads = self
+            .read_regs
+            .iter()
+            .filter_map(|name| self.arg_register_index(name))
+            .max();
+        let max_from_aliases = self.function_pointer_aliases.values().copied().max();
+        match (max_from_reads, max_from_aliases) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     fn extract_var_name(&self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Var(v) => Some(v.name.to_lowercase()),
+            ExprKind::Unknown(name) => Some(name.to_lowercase()),
+            ExprKind::Deref { .. } => self
+                .extract_stack_offset(expr)
+                .map(|offset| format!("stack_{}", offset)),
             ExprKind::Cast { expr: inner, .. } => self.extract_var_name(inner),
             _ => None,
         }
@@ -1553,8 +1634,13 @@ impl SignatureRecovery {
         for (idx, (reg64, reg32)) in int_regs.iter().zip(int_regs_32.iter()).enumerate() {
             let reg64_lower = reg64.to_lowercase();
             let reg32_lower = reg32.to_lowercase();
+            let pseudo_arg = format!("arg{}", idx);
 
-            if self.read_regs.contains(&reg64_lower) || self.read_regs.contains(&reg32_lower) {
+            if self.read_regs.contains(&reg64_lower)
+                || self.read_regs.contains(&reg32_lower)
+                || self.read_regs.contains(&pseudo_arg)
+                || self.param_hints.contains_key(&idx)
+            {
                 max_int_arg = Some(idx);
             }
         }
@@ -2287,6 +2373,37 @@ mod tests {
             sig.parameters[4].param_type.format_with_name("compar"),
             "int32_t (*compar)(void*, void*)"
         );
+    }
+
+    #[test]
+    fn test_signature_recovery_propagates_callback_hint_through_alias() {
+        use hexray_core::BasicBlockId;
+
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let stack_slot = Expr::deref(Expr::binop(BinOpKind::Add, rbp, Expr::int(-8)), 8);
+        let save_arg = Expr::assign(stack_slot.clone(), Expr::var(Variable::reg("rsi", 8)));
+        let call = Expr::call(
+            CallTarget::Named("signal".to_string()),
+            vec![Expr::int(2), stack_slot],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![save_arg, call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(matches!(
+            sig.parameters[1].param_type,
+            ParamType::FunctionPointer { .. }
+        ));
     }
 
     #[test]
