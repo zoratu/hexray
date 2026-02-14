@@ -39,7 +39,7 @@
 
 use super::expression::{BinOpKind, Expr, ExprKind};
 use super::structurer::{StructuredCfg, StructuredNode};
-use super::RelocationTable;
+use super::{RelocationTable, SymbolTable};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -189,12 +189,26 @@ pub struct ParameterUsageHints {
     pub function_pointer_return_type: Option<ParamType>,
     /// Confidence score for function-pointer inference from indirect evidence.
     pub function_pointer_confidence: u8,
+    /// Human-readable reasons that led to function-pointer typing.
+    pub function_pointer_reasons: Vec<String>,
 }
 
 impl ParameterUsageHints {
+    fn normalize_callback_name(function_name: &str) -> &str {
+        let no_prefix = function_name.trim_start_matches('_');
+        no_prefix.split('@').next().unwrap_or(no_prefix)
+    }
+
+    fn add_function_pointer_reason(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if !self.function_pointer_reasons.iter().any(|r| r == &reason) {
+            self.function_pointer_reasons.push(reason);
+        }
+    }
+
     /// Returns a callback signature for known APIs and callback argument positions.
     fn callback_signature(function_name: &str, arg_index: usize) -> Option<ParamType> {
-        let clean_name = function_name.strip_prefix('_').unwrap_or(function_name);
+        let clean_name = Self::normalize_callback_name(function_name);
         match (clean_name, arg_index) {
             ("qsort", 3) | ("bsearch", 3) | ("bsearch", 4) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::SignedInt(32)),
@@ -527,6 +541,8 @@ pub struct FunctionSignature {
     pub is_variadic: bool,
     /// Whether a return value was detected.
     pub has_return: bool,
+    /// Per-parameter inference reasons, keyed by parameter index.
+    pub parameter_provenance: HashMap<usize, Vec<String>>,
 }
 
 impl FunctionSignature {
@@ -628,6 +644,8 @@ pub struct SignatureRecovery {
     string_functions: HashSet<&'static str>,
     /// Optional relocation table for resolving IndirectGot call targets.
     relocation_table: Option<RelocationTable>,
+    /// Optional symbol table for resolving direct-call targets.
+    symbol_table: Option<SymbolTable>,
     /// Optional inter-procedural summary database for signature hints.
     summary_database: Option<Arc<super::interprocedural::SummaryDatabase>>,
 }
@@ -659,6 +677,7 @@ impl SignatureRecovery {
             value_function_pointer_types: HashMap::new(),
             string_functions,
             relocation_table: None,
+            symbol_table: None,
             summary_database: None,
         }
     }
@@ -666,6 +685,12 @@ impl SignatureRecovery {
     /// Provides relocation data for resolving indirect GOT call targets.
     pub fn with_relocation_table(mut self, relocation_table: Option<RelocationTable>) -> Self {
         self.relocation_table = relocation_table;
+        self
+    }
+
+    /// Provides symbol names for resolving direct call targets.
+    pub fn with_symbol_table(mut self, symbol_table: Option<SymbolTable>) -> Self {
+        self.symbol_table = symbol_table;
         self
     }
 
@@ -721,12 +746,25 @@ impl SignatureRecovery {
     fn extract_call_name(&self, target: &super::expression::CallTarget) -> Option<String> {
         match target {
             super::expression::CallTarget::Named(name) => Some(name.clone()),
-            super::expression::CallTarget::Direct { .. } => None,
+            super::expression::CallTarget::Direct { target, call_site } => self
+                .relocation_table
+                .as_ref()
+                .and_then(|t| t.get(*call_site).map(ToString::to_string))
+                .or_else(|| {
+                    self.symbol_table
+                        .as_ref()
+                        .and_then(|t| t.get(*target).map(ToString::to_string))
+                }),
             super::expression::CallTarget::Indirect(_) => None,
             super::expression::CallTarget::IndirectGot { got_address, .. } => self
                 .relocation_table
                 .as_ref()
-                .and_then(|t| t.get_got(*got_address).map(|s| s.to_string())),
+                .and_then(|t| t.get_got(*got_address).map(|s| s.to_string()))
+                .or_else(|| {
+                    self.symbol_table
+                        .as_ref()
+                        .and_then(|t| t.get(*got_address).map(ToString::to_string))
+                }),
         }
     }
 
@@ -1087,6 +1125,10 @@ impl SignatureRecovery {
                                 h.passed_as_callback_to.push((fn_name.clone(), i));
                                 h.function_pointer_confidence =
                                     h.function_pointer_confidence.saturating_add(4);
+                                h.add_function_pointer_reason(format!(
+                                    "passed to '{}' argument {} (callback slot)",
+                                    fn_name, i
+                                ));
                             });
                             // If this callback argument flows through a local alias of an
                             // argument register, propagate callback hints to the original
@@ -1097,6 +1139,10 @@ impl SignatureRecovery {
                                 hints.function_pointer_confidence =
                                     hints.function_pointer_confidence.saturating_add(4);
                                 hints.passed_as_callback_to.push((fn_name.clone(), i));
+                                hints.add_function_pointer_reason(format!(
+                                    "alias/forwarded value passed to '{}' argument {} (callback slot)",
+                                    fn_name, i
+                                ));
                             }
                         }
                         if let Some(sig) = self.callback_signature_from_summary(fn_name, i) {
@@ -1105,6 +1151,10 @@ impl SignatureRecovery {
                                 h.is_function_pointer = true;
                                 h.function_pointer_confidence =
                                     h.function_pointer_confidence.saturating_add(5);
+                                h.add_function_pointer_reason(format!(
+                                    "summary marks '{}' argument {} as function-pointer callback",
+                                    fn_name, i
+                                ));
                                 if let ParamType::FunctionPointer {
                                     return_type,
                                     params,
@@ -1120,6 +1170,10 @@ impl SignatureRecovery {
                                 hints.function_pointer_confidence =
                                     hints.function_pointer_confidence.saturating_add(5);
                                 hints.passed_as_callback_to.push((fn_name.clone(), i));
+                                hints.add_function_pointer_reason(format!(
+                                    "summary callback type propagated through alias for '{}' argument {}",
+                                    fn_name, i
+                                ));
                                 if let ParamType::FunctionPointer {
                                     return_type,
                                     params,
@@ -1184,7 +1238,7 @@ impl SignatureRecovery {
         arg_index: usize,
     ) -> Option<ParamType> {
         let db = self.summary_database.as_ref()?;
-        let clean = function_name.strip_prefix('_').unwrap_or(function_name);
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
         let summary = db.get_summary_by_name(clean)?;
         let ty = summary.param_types.get(&arg_index)?;
         match ty {
@@ -1197,7 +1251,7 @@ impl SignatureRecovery {
 
     fn return_function_pointer_from_summary(&self, function_name: &str) -> Option<ParamType> {
         let db = self.summary_database.as_ref()?;
-        let clean = function_name.strip_prefix('_').unwrap_or(function_name);
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
         let summary = db.get_summary_by_name(clean)?;
         let ty = summary.return_type.as_ref()?;
         match ty {
@@ -1320,6 +1374,14 @@ impl SignatureRecovery {
         hints.function_pointer_confidence = hints
             .function_pointer_confidence
             .saturating_add(if informative_count > 0 { 2 } else { 1 });
+        hints.add_function_pointer_reason(if informative_count > 0 {
+            format!(
+                "used as indirect call target with {} observed argument(s)",
+                args.len()
+            )
+        } else {
+            "used as indirect call target (argument types ambiguous)".to_string()
+        });
         if hints.function_pointer_return_type.is_none() {
             hints.function_pointer_return_type = Some(ParamType::SignedInt(64));
         }
@@ -1682,6 +1744,15 @@ impl SignatureRecovery {
                         }
                     })
                     .unwrap_or(u8::MAX);
+
+                if matches!(param_type, ParamType::FunctionPointer { .. }) {
+                    if let Some(h) = hints {
+                        if !h.function_pointer_reasons.is_empty() {
+                            sig.parameter_provenance
+                                .insert(idx, h.function_pointer_reasons.clone());
+                        }
+                    }
+                }
 
                 sig.parameters.push(
                     Parameter::new(
@@ -2183,6 +2254,52 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_recovery_detects_qsort_callback_via_direct_symbol_table_name() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Direct {
+                target: 0x401000,
+                call_site: 0x1000,
+            },
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::var(Variable::reg("rcx", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut symbols = SymbolTable::new();
+        symbols.insert(0x401000, "_qsort@plt".to_string());
+
+        let mut recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_symbol_table(Some(symbols));
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 4);
+        assert!(
+            matches!(
+                sig.parameters[3].param_type,
+                ParamType::FunctionPointer { .. }
+            ),
+            "params: {:?}",
+            sig.parameters
+        );
+    }
+
+    #[test]
     fn test_signature_recovery_detects_bsearch_callback_when_lifted_to_arg4() {
         use hexray_core::BasicBlockId;
 
@@ -2461,6 +2578,47 @@ mod tests {
             sig.parameters[2].param_type,
             ParamType::FunctionPointer { .. }
         ));
+    }
+
+    #[test]
+    fn test_signature_recovery_handles_reused_lifted_alias_in_qsort_callback() {
+        use hexray_core::BasicBlockId;
+
+        let stmt1 = Expr::assign(Expr::unknown("arg_8"), Expr::unknown("arg0"));
+        let stmt2 = Expr::assign(Expr::unknown("var_10"), Expr::unknown("arg1"));
+        let stmt3 = Expr::assign(Expr::unknown("arg_8"), Expr::unknown("arg2"));
+        let call = Expr::call(
+            CallTarget::Named("_qsort".to_string()),
+            vec![
+                Expr::unknown("arg_8"),
+                Expr::unknown("var_10"),
+                Expr::int(4),
+                Expr::unknown("arg_8"),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![stmt1, stmt2, stmt3, call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.parameters.len() >= 3, "params: {:?}", sig.parameters);
+        assert!(
+            matches!(
+                sig.parameters[2].param_type,
+                ParamType::FunctionPointer { .. }
+            ),
+            "params: {:?}",
+            sig.parameters
+        );
     }
 
     #[test]

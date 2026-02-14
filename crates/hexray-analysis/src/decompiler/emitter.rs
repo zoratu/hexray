@@ -122,7 +122,11 @@ impl PseudoCodeEmitter {
     }
 
     fn callback_signature(function_name: &str, arg_index: usize) -> Option<ParamType> {
-        let clean_name = function_name.strip_prefix('_').unwrap_or(function_name);
+        let clean_name = function_name
+            .trim_start_matches('_')
+            .split('@')
+            .next()
+            .unwrap_or(function_name);
         match (clean_name, arg_index) {
             ("qsort", 3) | ("bsearch", 3) | ("bsearch", 4) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::SignedInt(32)),
@@ -148,27 +152,42 @@ impl PseudoCodeEmitter {
         }
     }
 
-    fn guess_param_index_from_callback_arg(arg: &Expr, param_names: &[String]) -> Option<usize> {
-        if let Some(name) = Self::extract_expr_name(arg) {
-            return Self::param_index_from_name(&name, param_names);
-        }
-        None
-    }
-
     fn extract_expr_name(expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Var(var) => Some(var.name.to_lowercase()),
             ExprKind::Unknown(name) => Some(name.to_lowercase()),
+            ExprKind::Deref { addr, .. } => Self::extract_stack_slot_name(addr),
             ExprKind::Cast { expr, .. } => Self::extract_expr_name(expr),
             _ => None,
         }
+    }
+
+    fn extract_stack_slot_name(addr: &Expr) -> Option<String> {
+        let ExprKind::BinOp { op, left, right } = &addr.kind else {
+            return None;
+        };
+        let ExprKind::Var(base) = &left.kind else {
+            return None;
+        };
+        let base_name = base.name.to_lowercase();
+        if !matches!(base_name.as_str(), "rbp" | "ebp" | "x29" | "fp" | "s0") {
+            return None;
+        }
+        let ExprKind::IntLit(offset) = right.kind else {
+            return None;
+        };
+        let actual = match op {
+            BinOpKind::Add => offset,
+            BinOpKind::Sub => -offset,
+            _ => return None,
+        };
+        Some(format!("stack_{}", actual))
     }
 
     fn param_index_from_name(name: &str, param_names: &[String]) -> Option<usize> {
         if param_names.is_empty() {
             return None;
         }
-
         if let Some(suffix) = name.strip_prefix("arg") {
             if let Ok(idx) = suffix.parse::<usize>() {
                 if idx < param_names.len() {
@@ -195,17 +214,19 @@ impl PseudoCodeEmitter {
         param_names: &[String],
         aliases: &HashMap<String, usize>,
     ) -> Option<usize> {
-        if let Some(idx) = Self::guess_param_index_from_callback_arg(arg, param_names) {
-            return Some(idx);
-        }
         if let Some(name) = Self::extract_expr_name(arg) {
+            if let Some(idx) = Self::param_index_from_name(&name, param_names) {
+                return Some(idx);
+            }
             if let Some(idx) = aliases.get(&name).copied() {
                 return Some(idx);
             }
-            // Stack-like argument aliases (`arg_8`, `arg_10`) often represent
-            // the last incoming parameter when prologue lifting obscures the
-            // original register name.
-            if name.starts_with("arg_") && !param_names.is_empty() {
+            if (name.starts_with("arg_")
+                || name.starts_with("var_")
+                || name.starts_with("local_")
+                || name.starts_with("stack_"))
+                && !param_names.is_empty()
+            {
                 return Some(param_names.len() - 1);
             }
         }
@@ -223,10 +244,19 @@ impl PseudoCodeEmitter {
             ExprKind::Call { target, args } => {
                 let maybe_name = match target {
                     CallTarget::Named(name) => Some(name.as_str()),
-                    CallTarget::Direct { target, .. } => self
-                        .symbol_table
+                    CallTarget::Direct {
+                        target: addr,
+                        call_site,
+                    } => self
+                        .relocation_table
                         .as_ref()
-                        .and_then(|symbols| symbols.get(*target)),
+                        .and_then(|r| r.get(*call_site))
+                        .or_else(|| self.symbol_table.as_ref().and_then(|s| s.get(*addr))),
+                    CallTarget::IndirectGot { got_address, .. } => self
+                        .relocation_table
+                        .as_ref()
+                        .and_then(|r| r.get_got(*got_address))
+                        .or_else(|| self.symbol_table.as_ref().and_then(|s| s.get(*got_address))),
                     _ => None,
                 };
                 if let Some(name) = maybe_name {
@@ -236,10 +266,11 @@ impl PseudoCodeEmitter {
                                 Self::param_index_from_callback_arg(arg, param_names, aliases)
                                     .or_else(|| {
                                         let rendered = self.format_expr(arg);
-                                        let looks_like_lifted_slot = rendered.starts_with("arg_")
+                                        let looks_like_slot = rendered.starts_with("arg_")
                                             || rendered.starts_with("var_")
-                                            || rendered.starts_with("local_");
-                                        if looks_like_lifted_slot && !param_names.is_empty() {
+                                            || rendered.starts_with("local_")
+                                            || rendered.starts_with("stack_");
+                                        if looks_like_slot && !param_names.is_empty() {
                                             Some(param_names.len() - 1)
                                         } else {
                                             None
@@ -248,6 +279,58 @@ impl PseudoCodeEmitter {
                             if let Some(param_idx) = param_idx {
                                 overrides.insert(param_idx, sig);
                             }
+                        }
+                    }
+                } else {
+                    // Fallback for unresolved import stubs where only argument shape is available.
+                    if args.len() == 4 && matches!(args[2].kind, ExprKind::IntLit(_)) {
+                        let param_idx =
+                            Self::param_index_from_callback_arg(&args[3], param_names, aliases)
+                                .or_else(|| {
+                                    let rendered = self.format_expr(&args[3]);
+                                    let looks_like_slot = rendered.starts_with("arg_")
+                                        || rendered.starts_with("var_")
+                                        || rendered.starts_with("local_")
+                                        || rendered.starts_with("stack_");
+                                    if looks_like_slot && !param_names.is_empty() {
+                                        Some(param_names.len() - 1)
+                                    } else {
+                                        None
+                                    }
+                                });
+                        if let Some(param_idx) = param_idx {
+                            overrides.insert(
+                                param_idx,
+                                ParamType::FunctionPointer {
+                                    return_type: Box::new(ParamType::SignedInt(32)),
+                                    params: vec![ParamType::Pointer, ParamType::Pointer],
+                                },
+                            );
+                        }
+                    }
+                    if args.len() == 4 && matches!(args[1].kind, ExprKind::IntLit(0)) {
+                        let param_idx =
+                            Self::param_index_from_callback_arg(&args[2], param_names, aliases)
+                                .or_else(|| {
+                                    let rendered = self.format_expr(&args[2]);
+                                    let looks_like_slot = rendered.starts_with("arg_")
+                                        || rendered.starts_with("var_")
+                                        || rendered.starts_with("local_")
+                                        || rendered.starts_with("stack_");
+                                    if looks_like_slot && !param_names.is_empty() {
+                                        Some(param_names.len() - 1)
+                                    } else {
+                                        None
+                                    }
+                                });
+                        if let Some(param_idx) = param_idx {
+                            overrides.insert(
+                                param_idx,
+                                ParamType::FunctionPointer {
+                                    return_type: Box::new(ParamType::Pointer),
+                                    params: vec![ParamType::Pointer],
+                                },
+                            );
                         }
                     }
                 }
@@ -1550,6 +1633,7 @@ impl PseudoCodeEmitter {
         let (signature, func_info) = if self.use_signature_recovery {
             let mut recovery = SignatureRecovery::new(self.calling_convention)
                 .with_relocation_table(self.relocation_table.clone())
+                .with_symbol_table(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone());
             let sig = recovery.analyze(cfg);
 
@@ -1586,7 +1670,6 @@ impl PseudoCodeEmitter {
             if sig.parameters.is_empty() && func_info.parameters.is_empty() {
                 writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
             } else if !sig.parameters.is_empty() {
-                // Prefer recovered signature types; only override when still unresolved.
                 let recovered_param_names: Vec<String> =
                     sig.parameters.iter().map(|p| p.name.clone()).collect();
                 let callback_overrides = self.callback_param_overrides(cfg, &recovered_param_names);
@@ -1596,14 +1679,10 @@ impl PseudoCodeEmitter {
                     .enumerate()
                     .map(|(idx, p)| {
                         let rendered_name = rename_main_param(&p.name, idx);
-                        let can_override =
-                            !matches!(p.param_type, ParamType::FunctionPointer { .. });
-                        if can_override {
-                            if let Some(ty) = callback_overrides.get(&idx) {
-                                ty.format_with_name(&rendered_name)
-                            } else {
-                                Self::format_signature_param(p, &rendered_name)
-                            }
+                        if matches!(p.param_type, ParamType::FunctionPointer { .. }) {
+                            Self::format_signature_param(p, &rendered_name)
+                        } else if let Some(ty) = callback_overrides.get(&idx) {
+                            ty.format_with_name(&rendered_name)
                         } else {
                             Self::format_signature_param(p, &rendered_name)
                         }
@@ -1796,6 +1875,7 @@ impl PseudoCodeEmitter {
     pub fn recover_signature(&self, cfg: &StructuredCfg) -> FunctionSignature {
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_relocation_table(self.relocation_table.clone())
+            .with_symbol_table(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone());
         recovery.analyze(cfg)
     }

@@ -122,6 +122,9 @@ enum Commands {
         /// List available optimization passes and exit
         #[arg(long)]
         list_passes: bool,
+        /// Show signature-recovery diagnostics (including function-pointer provenance)
+        #[arg(long)]
+        diagnostics: bool,
     },
     /// Build and display call graph
     Callgraph {
@@ -474,6 +477,7 @@ fn main() -> Result<()> {
             enable_passes,
             disable_passes,
             list_passes,
+            diagnostics,
         }) => {
             // Handle --list-passes
             if list_passes {
@@ -500,6 +504,7 @@ fn main() -> Result<()> {
                     &target,
                     show_addresses,
                     depth,
+                    diagnostics,
                     project.as_ref(),
                     type_db.as_ref(),
                     Some(&config),
@@ -509,6 +514,7 @@ fn main() -> Result<()> {
                     &binary,
                     &target,
                     show_addresses,
+                    diagnostics,
                     project.as_ref(),
                     type_db.as_ref(),
                     Some(&config),
@@ -1098,6 +1104,7 @@ fn decompile_function(
     binary: &Binary,
     target: &str,
     show_addresses: bool,
+    diagnostics: bool,
     project: Option<&AnalysisProject>,
     type_db: Option<&std::sync::Arc<TypeDatabase>>,
     config: Option<&DecompilerConfig>,
@@ -1237,6 +1244,10 @@ fn decompile_function(
     }
     if let Some(cfg_opts) = config {
         decompiler = decompiler.with_config(cfg_opts.clone());
+    }
+    if diagnostics {
+        let signature = decompiler.recover_signature(&cfg);
+        print_signature_diagnostics(&name, &signature);
     }
     let pseudocode = decompiler.decompile(&cfg, &name);
 
@@ -1923,11 +1934,13 @@ fn extract_strings(
 }
 
 /// Decompile a function and follow internal calls recursively.
+#[allow(clippy::too_many_arguments)]
 fn decompile_with_follow(
     binary: &Binary,
     target: &str,
     show_addresses: bool,
     max_depth: usize,
+    diagnostics: bool,
     project: Option<&AnalysisProject>,
     type_db: Option<&std::sync::Arc<TypeDatabase>>,
     config: Option<&DecompilerConfig>,
@@ -2080,6 +2093,10 @@ fn decompile_with_follow(
         if let Some(cfg_opts) = config {
             decompiler = decompiler.with_config(cfg_opts.clone());
         }
+        if diagnostics {
+            let signature = decompiler.recover_signature(&cfg);
+            print_signature_diagnostics(&func_name, &signature);
+        }
         let pseudocode = decompiler.decompile(&cfg, &func_name);
 
         println!("{}", pseudocode);
@@ -2112,6 +2129,40 @@ fn decompile_with_follow(
     println!("\n// Decompiled {} function(s)", decompiled.len());
 
     Ok(())
+}
+
+fn print_signature_diagnostics(name: &str, signature: &hexray_analysis::FunctionSignature) {
+    let mut printed_any = false;
+    for (idx, param) in signature.parameters.iter().enumerate() {
+        if !matches!(
+            param.param_type,
+            hexray_analysis::ParamType::FunctionPointer { .. }
+        ) {
+            continue;
+        }
+        printed_any = true;
+        println!(
+            "// [diag] {} param {} '{}' inferred as {}",
+            name,
+            idx,
+            param.name,
+            param.param_type.to_c_string()
+        );
+        if let Some(reasons) = signature.parameter_provenance.get(&idx) {
+            for reason in reasons {
+                println!("// [diag]   - {}", reason);
+            }
+        } else {
+            println!("// [diag]   - no explicit provenance recorded");
+        }
+    }
+    if !printed_any {
+        println!(
+            "// [diag] {}: no function-pointer parameters inferred",
+            name
+        );
+    }
+    println!();
 }
 
 /// Extract internal call targets from instructions.

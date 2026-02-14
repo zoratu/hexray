@@ -618,6 +618,39 @@ fn test_decompile_callback_header_snapshots() {
     }
 }
 
+#[test]
+fn test_decompile_callback_diagnostics() {
+    let Some(binary) = build_c_fixture("test_callbacks.c") else {
+        return;
+    };
+    let binary = binary.to_string_lossy().to_string();
+    let output = run_hexray(&[&binary, "decompile", "spawn_with_start", "--diagnostics"]);
+    assert!(
+        output.status.success(),
+        "decompile diagnostics should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[diag]") && stdout.contains("spawn_with_start"),
+        "Diagnostics banner should include target name:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("inferred as void* (*)(void*)")
+            || stdout.contains("no function-pointer parameters inferred"),
+        "Diagnostics should include function-pointer inference status:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("callback slot")
+            || stdout.contains("summary marks")
+            || stdout.contains("no function-pointer parameters inferred"),
+        "Diagnostics should include function-pointer provenance details:\n{}",
+        stdout
+    );
+}
+
 // =============================================================================
 // Callgraph Command Tests
 // =============================================================================

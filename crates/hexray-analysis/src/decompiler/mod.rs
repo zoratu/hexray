@@ -954,6 +954,7 @@ impl Decompiler {
         let structured = StructuredCfg::from_cfg(cfg);
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_relocation_table(self.relocation_table.clone())
+            .with_symbol_table(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone());
         recovery.analyze(&structured)
     }

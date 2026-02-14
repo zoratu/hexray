@@ -8,10 +8,12 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - Signature recovery now propagates callback hints through lifted aliases (`stack_*`, `var_*`, `arg_*`) with stricter non-parameter guards.
 - CLI regressions now validate typed callback headers for `qsort`, `bsearch`, `signal`, and `pthread_create` callback paths.
 - Benchmark quality gates include strict callback precision/recall thresholds across direct and alias-heavy callback cases.
+- Emitter callback fallback heuristics were removed; function-pointer callback typing now comes from signature recovery only.
+- `hexray decompile --diagnostics` now prints per-parameter function-pointer provenance.
 
 Remaining high-value follow-up:
-- Replace emitter callback fallback heuristics with explicit provenance carried from signature recovery.
-- Add callback-typing stress fixtures for nested alias chains and mixed direct/indirect callback forwarding.
+- Add callback-typing stress fixtures for nested multi-hop alias chains and mixed direct/indirect forwarding.
+- Expand diagnostics to include return-type provenance and confidence explanations.
 
 ## Priority 1: Critical Issues
 
