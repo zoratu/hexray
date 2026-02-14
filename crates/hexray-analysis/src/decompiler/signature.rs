@@ -462,6 +462,8 @@ pub struct Parameter {
     pub param_type: ParamType,
     /// Where the parameter is passed (register or stack).
     pub location: ParameterLocation,
+    /// Confidence in inferred type (0-255, higher is better).
+    pub type_confidence: u8,
 }
 
 impl Parameter {
@@ -475,7 +477,14 @@ impl Parameter {
             name: name.into(),
             param_type,
             location,
+            type_confidence: u8::MAX,
         }
+    }
+
+    /// Sets type confidence for this parameter.
+    pub fn with_confidence(mut self, confidence: u8) -> Self {
+        self.type_confidence = confidence;
+        self
     }
 
     /// Creates a parameter from an integer register.
@@ -487,6 +496,7 @@ impl Parameter {
                 name: reg_name.to_string(),
                 index,
             },
+            type_confidence: u8::MAX,
         }
     }
 
@@ -499,6 +509,7 @@ impl Parameter {
                 name: reg_name.to_string(),
                 index,
             },
+            type_confidence: u8::MAX,
         }
     }
 }
@@ -1156,6 +1167,19 @@ impl SignatureRecovery {
         }
     }
 
+    fn return_function_pointer_from_summary(&self, function_name: &str) -> Option<ParamType> {
+        let db = self.summary_database.as_ref()?;
+        let clean = function_name.strip_prefix('_').unwrap_or(function_name);
+        let summary = db.get_summary_by_name(clean)?;
+        let ty = summary.return_type.as_ref()?;
+        match ty {
+            super::interprocedural::SummaryType::FunctionPointer { .. } => {
+                Some(Self::param_type_from_summary(ty))
+            }
+            _ => None,
+        }
+    }
+
     /// Infers a type for an argument passed into an indirect function call.
     fn infer_indirect_call_arg_type(expr: &Expr) -> ParamType {
         match &expr.kind {
@@ -1314,7 +1338,7 @@ impl SignatureRecovery {
                             params: vec![ParamType::SignedInt(32)],
                         })
                     }
-                    _ => None,
+                    _ => self.return_function_pointer_from_summary(clean),
                 }
             }
             ExprKind::Cast { expr: inner, .. } => self.infer_return_function_pointer(inner),
@@ -1575,14 +1599,27 @@ impl SignatureRecovery {
                     format!("arg{}", idx)
                 };
 
-                sig.parameters.push(Parameter::new(
-                    name,
-                    param_type,
-                    ParameterLocation::IntegerRegister {
-                        name: int_regs[idx].to_string(),
-                        index: idx,
-                    },
-                ));
+                let confidence = hints
+                    .map(|h| {
+                        if matches!(param_type, ParamType::FunctionPointer { .. }) {
+                            h.function_pointer_confidence
+                        } else {
+                            u8::MAX
+                        }
+                    })
+                    .unwrap_or(u8::MAX);
+
+                sig.parameters.push(
+                    Parameter::new(
+                        name,
+                        param_type,
+                        ParameterLocation::IntegerRegister {
+                            name: int_regs[idx].to_string(),
+                            index: idx,
+                        },
+                    )
+                    .with_confidence(confidence),
+                );
             }
         }
 
@@ -2268,6 +2305,35 @@ mod tests {
         };
 
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert!(matches!(sig.return_type, ParamType::FunctionPointer { .. }));
+        assert_eq!(
+            sig.return_type.format_with_name("handler"),
+            "void (*handler)(int32_t)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_uses_summary_fallback_for_function_pointer_return() {
+        use hexray_core::BasicBlockId;
+
+        // "__signal" bypasses the direct hardcoded name match and exercises summary fallback.
+        let signal_call = Expr::call(
+            CallTarget::Named("__signal".to_string()),
+            vec![Expr::int(2), Expr::var(Variable::reg("rdi", 8))],
+        );
+
+        let ret = StructuredNode::Return(Some(signal_call));
+        let cfg = StructuredCfg {
+            body: vec![ret],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let summary_db = Arc::new(super::super::interprocedural::SummaryDatabase::new());
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_summary_database(Some(summary_db));
         let sig = recovery.analyze(&cfg);
 
         assert!(sig.has_return);

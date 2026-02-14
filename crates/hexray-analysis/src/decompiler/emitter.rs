@@ -107,6 +107,20 @@ pub struct PseudoCodeEmitter {
 }
 
 impl PseudoCodeEmitter {
+    fn format_signature_param(p: &super::signature::Parameter, rendered_name: &str) -> String {
+        // If callback typing confidence is low, keep emitted surface conservative.
+        if p.type_confidence < 3
+            && matches!(
+                p.param_type,
+                super::signature::ParamType::FunctionPointer { .. }
+            )
+        {
+            format!("void* {}", rendered_name)
+        } else {
+            p.param_type.format_with_name(rendered_name)
+        }
+    }
+
     /// Creates a new emitter.
     pub fn new(indent: &str, emit_addresses: bool) -> Self {
         Self {
@@ -1270,8 +1284,7 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, p)| {
-                        p.param_type
-                            .format_with_name(&rename_main_param(&p.name, idx))
+                        Self::format_signature_param(p, &rename_main_param(&p.name, idx))
                     })
                     .collect();
                 writeln!(
@@ -3803,6 +3816,30 @@ mod tests {
         assert_eq!(
             sig.parameters[4].param_type.format_with_name("compar"),
             "int32_t (*compar)(void*, void*)"
+        );
+    }
+
+    #[test]
+    fn test_low_confidence_callback_parameter_renders_as_void_ptr() {
+        let param = super::super::signature::Parameter::new(
+            "compar",
+            super::super::signature::ParamType::FunctionPointer {
+                return_type: Box::new(super::super::signature::ParamType::SignedInt(32)),
+                params: vec![
+                    super::super::signature::ParamType::Pointer,
+                    super::super::signature::ParamType::Pointer,
+                ],
+            },
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rcx".to_string(),
+                index: 3,
+            },
+        )
+        .with_confidence(1);
+
+        assert_eq!(
+            PseudoCodeEmitter::format_signature_param(&param, "compar"),
+            "void* compar"
         );
     }
 

@@ -50,6 +50,12 @@ pub struct BenchmarkCase {
     pub min_switches: Option<usize>,
     /// Maximum goto statements allowed in output.
     pub max_gotos: Option<usize>,
+    /// Expected function-pointer declaration snippets in output.
+    pub expected_fp_decls: Vec<String>,
+    /// Minimum precision threshold for function-pointer declaration recovery.
+    pub min_fp_precision: Option<f64>,
+    /// Minimum recall threshold for function-pointer declaration recovery.
+    pub min_fp_recall: Option<f64>,
 }
 
 impl BenchmarkCase {
@@ -66,6 +72,9 @@ impl BenchmarkCase {
             difficulty: 1,
             min_switches: None,
             max_gotos: None,
+            expected_fp_decls: Vec::new(),
+            min_fp_precision: None,
+            min_fp_recall: None,
         }
     }
 
@@ -120,6 +129,24 @@ impl BenchmarkCase {
     /// Requires output to contain no more than this many goto statements.
     pub fn with_max_gotos(mut self, max_gotos: usize) -> Self {
         self.max_gotos = Some(max_gotos);
+        self
+    }
+
+    /// Adds an expected function-pointer declaration snippet.
+    pub fn expect_fp_decl(mut self, decl: impl Into<String>) -> Self {
+        self.expected_fp_decls.push(decl.into());
+        self
+    }
+
+    /// Requires function-pointer typing precision at or above threshold.
+    pub fn with_min_fp_precision(mut self, min_precision: f64) -> Self {
+        self.min_fp_precision = Some(min_precision.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Requires function-pointer typing recall at or above threshold.
+    pub fn with_min_fp_recall(mut self, min_recall: f64) -> Self {
+        self.min_fp_recall = Some(min_recall.clamp(0.0, 1.0));
         self
     }
 }
@@ -195,6 +222,16 @@ pub struct BenchmarkResult {
     pub switch_count: usize,
     /// Number of goto statements in output.
     pub goto_count: usize,
+    /// Number of expected function-pointer declarations matched.
+    pub fp_true_positives: usize,
+    /// Number of predicted function-pointer declarations in output.
+    pub fp_predicted: usize,
+    /// Number of expected function-pointer declarations.
+    pub fp_expected: usize,
+    /// Function-pointer typing precision.
+    pub fp_precision: f64,
+    /// Function-pointer typing recall.
+    pub fp_recall: f64,
     /// Execution time.
     pub duration: Duration,
     /// The decompiled output.
@@ -404,6 +441,11 @@ impl BenchmarkSuite {
                     violations_found: 0,
                     switch_count: 0,
                     goto_count: 0,
+                    fp_true_positives: 0,
+                    fp_predicted: 0,
+                    fp_expected: 0,
+                    fp_precision: 0.0,
+                    fp_recall: 0.0,
                     duration: start.elapsed(),
                     output: String::new(),
                     pattern_results: Vec::new(),
@@ -417,6 +459,28 @@ impl BenchmarkSuite {
         let patterns_found = pattern_results.iter().filter(|r| r.matched).count();
         let switch_count = count_switch_statements(&output);
         let goto_count = count_goto_statements(&output);
+        let predicted_fp_decls = extract_function_pointer_decls(&output);
+        let fp_predicted = predicted_fp_decls.len();
+        let fp_expected = case.expected_fp_decls.len();
+        let fp_true_positives = case
+            .expected_fp_decls
+            .iter()
+            .filter(|decl| output.contains(decl.as_str()))
+            .count();
+        let fp_precision = if fp_predicted == 0 {
+            if fp_expected == 0 {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            fp_true_positives as f64 / fp_predicted as f64
+        };
+        let fp_recall = if fp_expected == 0 {
+            1.0
+        } else {
+            fp_true_positives as f64 / fp_expected as f64
+        };
 
         // Check for forbidden patterns
         let mut violations_found = self.count_violations(case, &output);
@@ -446,6 +510,30 @@ impl BenchmarkSuite {
                 details: Some(format!("found {} goto statements", goto_count)),
             });
         }
+        if let Some(min_precision) = case.min_fp_precision {
+            let matched = fp_precision >= min_precision;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(fp_precision>={:.2})", min_precision),
+                matched,
+                location: output.lines().position(|line| line.contains("(*")),
+                details: Some(format!("precision {:.3}", fp_precision)),
+            });
+        }
+        if let Some(min_recall) = case.min_fp_recall {
+            let matched = fp_recall >= min_recall;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(fp_recall>={:.2})", min_recall),
+                matched,
+                location: output.lines().position(|line| line.contains("(*")),
+                details: Some(format!("recall {:.3}", fp_recall)),
+            });
+        }
 
         // Calculate score
         let pattern_score = if !case.expected_patterns.is_empty() {
@@ -469,6 +557,11 @@ impl BenchmarkSuite {
             violations_found,
             switch_count,
             goto_count,
+            fp_true_positives,
+            fp_predicted,
+            fp_expected,
+            fp_precision,
+            fp_recall,
             duration: start.elapsed(),
             output,
             pattern_results,
@@ -739,6 +832,16 @@ fn count_goto_statements(output: &str) -> usize {
     output.matches("goto ").count()
 }
 
+/// Extract function-pointer declaration-like lines from output.
+fn extract_function_pointer_decls(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("(*") && line.contains(')'))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 /// Create the standard benchmark suite with common test cases.
 pub fn create_standard_suite() -> BenchmarkSuite {
     let mut suite = BenchmarkSuite::new();
@@ -931,6 +1034,20 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .expect_pattern(ExpectedPattern::FunctionCall {
                 name: "memcpy".to_string(),
             }),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing")
+            .with_description("Callback API emits precise function-pointer types")
+            .with_category("functions")
+            .with_difficulty(3)
+            .with_source("qsort(base, n, elem_size, compar);")
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort".to_string(),
+            })
+            .expect_fp_decl("(*compar)")
+            .with_min_fp_precision(0.5)
+            .with_min_fp_recall(1.0),
     );
 
     // Struct patterns
@@ -1196,7 +1313,7 @@ impl BenchmarkSuiteResults {
         for result in &self.case_results {
             let status = if result.passed { "PASS" } else { "FAIL" };
             report.push_str(&format!(
-                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos)\n",
+                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos, fp P/R {:.2}/{:.2})\n",
                 status,
                 result.case_id,
                 result.score * 100.0,
@@ -1204,7 +1321,9 @@ impl BenchmarkSuiteResults {
                 result.patterns_expected,
                 result.violations_found,
                 result.switch_count,
-                result.goto_count
+                result.goto_count,
+                result.fp_precision,
+                result.fp_recall
             ));
             if let Some(ref err) = result.error {
                 report.push_str(&format!("       Error: {}\n", err));
@@ -1235,6 +1354,9 @@ mod tests {
         assert_eq!(case.forbidden_patterns.len(), 1);
         assert!(case.min_switches.is_none());
         assert!(case.max_gotos.is_none());
+        assert!(case.expected_fp_decls.is_empty());
+        assert!(case.min_fp_precision.is_none());
+        assert!(case.min_fp_recall.is_none());
     }
 
     #[test]
@@ -1370,6 +1492,42 @@ mod tests {
         assert!(fail_results.case_results[0].violations_found > 0);
         assert_eq!(fail_results.case_results[0].switch_count, 1);
         assert_eq!(fail_results.case_results[0].goto_count, 1);
+    }
+
+    #[test]
+    fn test_function_pointer_precision_recall_metrics() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(
+            BenchmarkCase::new("fp_typing")
+                .expect_fp_decl("int32_t (*compar)(void*, void*)")
+                .with_min_fp_precision(1.0)
+                .with_min_fp_recall(1.0),
+        );
+
+        let pass_results = suite.run_all(|_| {
+            Ok(
+                "int32_t fn(void* base, int32_t (*compar)(void*, void*)) {\n    return 0;\n}\n"
+                    .to_string(),
+            )
+        });
+        assert_eq!(pass_results.passed, 1);
+        let pass = &pass_results.case_results[0];
+        assert_eq!(pass.fp_true_positives, 1);
+        assert_eq!(pass.fp_expected, 1);
+        assert_eq!(pass.fp_predicted, 1);
+        assert_eq!(pass.fp_precision, 1.0);
+        assert_eq!(pass.fp_recall, 1.0);
+
+        let fail_results = suite.run_all(|_| {
+            Ok("int32_t fn(void* base, void* compar) {\n    return 0;\n}\n".to_string())
+        });
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.fp_true_positives, 0);
+        assert_eq!(fail.fp_expected, 1);
+        assert_eq!(fail.fp_predicted, 0);
+        assert_eq!(fail.fp_precision, 0.0);
+        assert_eq!(fail.fp_recall, 0.0);
     }
 
     #[test]

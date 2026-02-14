@@ -3,8 +3,10 @@
 //! These tests verify that the hexray CLI works correctly with various
 //! commands and options against real test binaries.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get the path to the hexray binary.
 fn hexray_bin() -> String {
@@ -29,6 +31,64 @@ fn run_hexray(args: &[&str]) -> Output {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("Failed to execute hexray")
+}
+
+fn find_c_compiler() -> Option<&'static str> {
+    ["cc", "clang", "gcc"].into_iter().find(|compiler| {
+        Command::new(compiler)
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
+}
+
+fn build_c_fixture(source_name: &str) -> Option<PathBuf> {
+    let compiler = match find_c_compiler() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping test: no C compiler (cc/clang/gcc) found");
+            return None;
+        }
+    };
+
+    let source = fixture_path(source_name);
+    if !Path::new(&source).exists() {
+        eprintln!("Skipping test: fixture {} not found", source_name);
+        return None;
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let out_dir = std::env::temp_dir().join(format!(
+        "hexray-cli-fixture-{}-{}",
+        std::process::id(),
+        stamp
+    ));
+    if let Err(e) = fs::create_dir_all(&out_dir) {
+        eprintln!("Skipping test: failed to create temp dir: {}", e);
+        return None;
+    }
+    let out_bin = out_dir.join("fixture_bin");
+
+    let compile = Command::new(compiler)
+        .args(["-O0", "-g", &source, "-o"])
+        .arg(&out_bin)
+        .output();
+    match compile {
+        Ok(out) if out.status.success() => Some(out_bin),
+        Ok(out) => {
+            eprintln!(
+                "Skipping test: compiler failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("Skipping test: failed to invoke compiler: {}", e);
+            None
+        }
+    }
 }
 
 /// Helper macro to skip tests if fixture is missing.
@@ -371,6 +431,46 @@ fn test_decompile_with_addresses() {
             "Should show addresses in output"
         );
     }
+}
+
+#[test]
+fn test_decompile_callback_apis_via_compiled_fixture() {
+    let Some(binary) = build_c_fixture("test_callbacks.c") else {
+        return;
+    };
+
+    let binary = binary.to_string_lossy().to_string();
+    let output = run_hexray(&[&binary, "decompile", "sort_with_cmp"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("sort_with_cmp"),
+        "Output should include target function name:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("qsort("),
+        "Output should include callback API call:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "install_handler"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("signal("),
+        "Output should include signal callback API call:\n{}",
+        stdout
+    );
 }
 
 // =============================================================================
