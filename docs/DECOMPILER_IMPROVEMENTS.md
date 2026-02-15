@@ -21,6 +21,7 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - Signature recovery now infers non-void return forwarding for tail-position call wrappers when API/summary return types are known.
 - Callback alias tracking now retains candidate index sets, avoiding unstable last-writer alias overwrites under lifted alias reuse.
 - Slot-0 callback APIs now bias shape-fallback toward the lowest viable parameter index, which stabilizes wrappers like `on_exit` on canonical callback parameters.
+- Strict CLI callback snapshot regressions now enforce canonical typed headers for `register_on_exit` and `register_atfork`, including slot-0 fallback provenance coverage.
 
 Remaining high-value follow-up:
 - Continue reducing shape-fallback reliance in callback wrappers by expanding precise alias resolution for lifted temporaries.

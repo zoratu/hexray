@@ -745,6 +745,14 @@ fn test_decompile_callback_header_snapshots() {
             "spawn_with_start_multihop",
             "int32_t _spawn_with_start_multihop(int64_t arg0, void* (*arg1)(void*))",
         ),
+        (
+            "register_on_exit",
+            "int32_t _register_on_exit(void (*arg0)(int32_t, void*), int64_t arg1)",
+        ),
+        (
+            "register_atfork",
+            "int32_t _register_atfork(void (*arg0)(void), void (*arg1)(void), void (*arg2)(void))",
+        ),
     ];
 
     for (symbol, expected_header) in strict_expected {
@@ -851,22 +859,37 @@ fn test_decompile_callback_header_snapshots() {
 
     let on_exit_header = decompile_header(&binary, "register_on_exit")
         .unwrap_or_else(|| panic!("missing decompile header for symbol register_on_exit"));
-    assert!(
-        on_exit_header.contains("(*arg0)(int32_t, void*)")
-            || on_exit_header.contains("(*arg1)(int32_t, void*)"),
-        "Header snapshot mismatch for symbol register_on_exit: {}",
-        on_exit_header
-    );
+    if strict {
+        assert_eq!(
+            on_exit_header, "int32_t _register_on_exit(void (*arg0)(int32_t, void*), int64_t arg1)",
+            "Strict mode mismatch for symbol register_on_exit"
+        );
+    } else {
+        assert!(
+            on_exit_header.contains("(*arg0)(int32_t, void*)")
+                || on_exit_header.contains("(*arg1)(int32_t, void*)"),
+            "Header snapshot mismatch for symbol register_on_exit: {}",
+            on_exit_header
+        );
+    }
 
     let atfork_header = decompile_header(&binary, "register_atfork")
         .unwrap_or_else(|| panic!("missing decompile header for symbol register_atfork"));
-    assert!(
-        atfork_header.contains("(*arg0)(void)")
-            || atfork_header.contains("(*arg1)(void)")
-            || atfork_header.contains("(*arg2)(void)"),
-        "Header snapshot mismatch for symbol register_atfork: {}",
-        atfork_header
-    );
+    if strict {
+        assert_eq!(
+            atfork_header,
+            "int32_t _register_atfork(void (*arg0)(void), void (*arg1)(void), void (*arg2)(void))",
+            "Strict mode mismatch for symbol register_atfork"
+        );
+    } else {
+        assert!(
+            atfork_header.contains("(*arg0)(void)")
+                || atfork_header.contains("(*arg1)(void)")
+                || atfork_header.contains("(*arg2)(void)"),
+            "Header snapshot mismatch for symbol register_atfork: {}",
+            atfork_header
+        );
+    }
 }
 
 #[test]
@@ -921,6 +944,19 @@ fn test_decompile_callback_diagnostics() {
     assert!(
         stdout.contains("[source=slot-fallback]"),
         "Diagnostics should include slot-fallback provenance for multi-callback mapping:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "register_on_exit", "--diagnostics"]);
+    assert!(
+        output.status.success(),
+        "decompile diagnostics should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[source=shape-fallback] preferred lowest candidate for slot-0 callback"),
+        "Diagnostics should include slot-0 callback fallback provenance:\n{}",
         stdout
     );
 }
