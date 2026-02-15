@@ -83,3 +83,81 @@ int main(void) {
     
     return 0;
 }
+
+// Test: pointer arithmetic
+int strlen_manual(const char *s) {
+    const char *p = s;
+    while (*p) p++;
+    return p - s;
+}
+
+// Test: bit manipulation
+unsigned int count_bits(unsigned int n) {
+    unsigned int count = 0;
+    while (n) {
+        count += n & 1;
+        n >>= 1;
+    }
+    return count;
+}
+
+// Test: recursion (factorial)
+int factorial(int n) {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);
+}
+
+// Test: two's complement / abs
+int my_abs(int x) {
+    return x < 0 ? -x : x;
+}
+
+// Test: min/max
+int min(int a, int b) {
+    return a < b ? a : b;
+}
+
+int max(int a, int b) {
+    return a > b ? a : b;
+}
+
+// Test: clamp
+int clamp(int x, int lo, int hi) {
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
+}
+
+// Test: binary search
+int binary_search(int *arr, int n, int target) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (arr[mid] == target) return mid;
+        if (arr[mid] < target) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -1;
+}
+
+// Test: bubble sort (nested loops)
+void bubble_sort(int *arr, int n) {
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - i - 1; j++) {
+            if (arr[j] > arr[j + 1]) {
+                int temp = arr[j];
+                arr[j] = arr[j + 1];
+                arr[j + 1] = temp;
+            }
+        }
+    }
+}
+
+// Test: string comparison
+int my_strcmp(const char *s1, const char *s2) {
+    while (*s1 && *s1 == *s2) {
+        s1++;
+        s2++;
+    }
+    return *s1 - *s2;
+}

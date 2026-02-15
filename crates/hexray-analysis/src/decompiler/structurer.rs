@@ -1497,6 +1497,9 @@ fn condition_to_expr_before_address(
         Condition::BelowOrEqual => BinOpKind::ULe,
         Condition::Above => BinOpKind::UGt,
         Condition::AboveOrEqual => BinOpKind::UGe,
+        // Sign/NotSign: after CMP x, y, MI is set when x - y < 0 (signed)
+        Condition::Sign => BinOpKind::Lt,
+        Condition::NotSign => BinOpKind::Ge,
         _ => BinOpKind::Ne, // Default for flag-based conditions
     };
 
@@ -1886,14 +1889,15 @@ fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) 
         Expr::unknown(&inst.mnemonic)
     };
 
-    // Check for ARM64 conditional select: csel.cond, csinc.cond, etc.
+    // Check for ARM64 conditional instructions
     let mnem_lower = inst.mnemonic.to_lowercase();
     if let Some(dot_pos) = mnem_lower.find('.') {
         let prefix = &mnem_lower[..dot_pos];
+
         // CSEL/CSINC/CSINV/CSNEG have 3 operands: rd, rn, rm
+        // rd = cond ? rn : rm (or variant)
         if matches!(prefix, "csel" | "csinc" | "csinv" | "csneg") && inst.operands.len() >= 3 {
             if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
-                // Use the instruction address to find the CMP *before* this CSEL
                 let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
                 let then_expr = Expr::from_operand_with_inst(&inst.operands[1], inst);
                 let else_expr = Expr::from_operand_with_inst(&inst.operands[2], inst);
@@ -1905,6 +1909,65 @@ fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) 
                             cond: Box::new(cond_expr),
                             then_expr: Box::new(then_expr),
                             else_expr: Box::new(else_expr),
+                        },
+                    },
+                );
+            }
+        }
+
+        // CINC/CINV/CNEG have 2 operands: rd, rn
+        // cinc: rd = cond ? rn+1 : rn
+        // cinv: rd = cond ? ~rn : rn
+        // cneg: rd = cond ? -rn : rn
+        if matches!(prefix, "cinc" | "cinv" | "cneg") && inst.operands.len() >= 2 {
+            if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+                let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
+                let src_expr = Expr::from_operand_with_inst(&inst.operands[1], inst);
+
+                let then_expr = match prefix {
+                    "cinc" => Expr::binop(
+                        super::expression::BinOpKind::Add,
+                        src_expr.clone(),
+                        Expr::int(1),
+                    ),
+                    "cinv" => Expr::unary(super::expression::UnaryOpKind::Not, src_expr.clone()),
+                    "cneg" => Expr::unary(super::expression::UnaryOpKind::Neg, src_expr.clone()),
+                    _ => src_expr.clone(),
+                };
+
+                return Expr::assign(
+                    dest,
+                    Expr {
+                        kind: super::expression::ExprKind::Conditional {
+                            cond: Box::new(cond_expr),
+                            then_expr: Box::new(then_expr),
+                            else_expr: Box::new(src_expr),
+                        },
+                    },
+                );
+            }
+        }
+
+        // CSET/CSETM have 1 operand: rd
+        // cset: rd = cond ? 1 : 0
+        // csetm: rd = cond ? -1 : 0
+        if matches!(prefix, "cset" | "csetm") && inst.operands.len() >= 1 {
+            if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+                let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
+
+                let (then_val, else_val) = if prefix == "csetm" {
+                    (Expr::int(-1), Expr::int(0))
+                } else {
+                    (Expr::int(1), Expr::int(0))
+                };
+
+                return Expr::assign(
+                    dest,
+                    Expr {
+                        kind: super::expression::ExprKind::Conditional {
+                            cond: Box::new(cond_expr),
+                            then_expr: Box::new(then_val),
+                            else_expr: Box::new(else_val),
                         },
                     },
                 );
