@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hexray_core::{ControlFlow, IndexMode, Instruction, Operand, Operation, Symbol};
+use hexray_core::{ControlFlow, Instruction, Operand, Operation, Symbol};
 
 use crate::dataflow::{ConstState, ConstValue, Location};
 use crate::xrefs::{XrefDatabase, XrefType};
@@ -817,7 +817,9 @@ impl ResolutionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{Architecture, Immediate, MemoryRef, Operation, Register, RegisterClass};
+    use hexray_core::{
+        Architecture, Immediate, IndexMode, MemoryRef, Operation, Register, RegisterClass,
+    };
 
     fn make_register(id: u16) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, 64)

@@ -47,8 +47,8 @@
 use std::collections::HashMap;
 
 use hexray_core::{
-    register::x86, Architecture, BasicBlockId, ControlFlow, ControlFlowGraph, IndexMode,
-    Instruction, Operand, Operation,
+    register::x86, Architecture, BasicBlockId, ControlFlow, ControlFlowGraph, Instruction, Operand,
+    Operation,
 };
 
 /// Information about detected stack canary protection in a function.
@@ -803,7 +803,7 @@ impl StackCanaryAnalysis {
 mod tests {
     use super::*;
     use hexray_core::Register;
-    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, MemoryRef, Operand};
+    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, IndexMode, MemoryRef, Operand};
 
     fn make_x86_register(id: u16, size: u16) -> Register {
         Register::new(

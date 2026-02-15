@@ -28,8 +28,7 @@ pub use reaching_defs::ReachingDefinitions;
 
 use hexray_core::{
     register::{arm64, riscv, x86},
-    Architecture, BasicBlockId, ControlFlowGraph, IndexMode, Instruction, Operand, Operation,
-    Register,
+    Architecture, BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation, Register,
 };
 use std::collections::HashMap;
 
@@ -486,8 +485,8 @@ impl DataflowSolver {
 mod tests {
     use super::*;
     use hexray_core::{
-        Architecture, BasicBlock, BlockTerminator, Immediate, Instruction, MemoryRef, Operand,
-        Operation, Register, RegisterClass,
+        Architecture, BasicBlock, BlockTerminator, Immediate, IndexMode, Instruction, MemoryRef,
+        Operand, Operation, Register, RegisterClass,
     };
 
     // --- Location Tests ---
