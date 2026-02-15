@@ -56,6 +56,12 @@ pub struct BenchmarkCase {
     pub min_fp_precision: Option<f64>,
     /// Minimum recall threshold for function-pointer declaration recovery.
     pub min_fp_recall: Option<f64>,
+    /// Expected callback parameter indices (`argN`) for typed function-pointer parameters.
+    pub expected_callback_param_indices: Vec<usize>,
+    /// Minimum precision threshold for callback parameter-index stability.
+    pub min_callback_index_precision: Option<f64>,
+    /// Minimum recall threshold for callback parameter-index stability.
+    pub min_callback_index_recall: Option<f64>,
 }
 
 impl BenchmarkCase {
@@ -75,6 +81,9 @@ impl BenchmarkCase {
             expected_fp_decls: Vec::new(),
             min_fp_precision: None,
             min_fp_recall: None,
+            expected_callback_param_indices: Vec::new(),
+            min_callback_index_precision: None,
+            min_callback_index_recall: None,
         }
     }
 
@@ -147,6 +156,24 @@ impl BenchmarkCase {
     /// Requires function-pointer typing recall at or above threshold.
     pub fn with_min_fp_recall(mut self, min_recall: f64) -> Self {
         self.min_fp_recall = Some(min_recall.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Adds an expected callback parameter index (`argN`) for typed function-pointer params.
+    pub fn expect_callback_param_index(mut self, index: usize) -> Self {
+        self.expected_callback_param_indices.push(index);
+        self
+    }
+
+    /// Requires callback parameter-index precision at or above threshold.
+    pub fn with_min_callback_index_precision(mut self, min_precision: f64) -> Self {
+        self.min_callback_index_precision = Some(min_precision.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Requires callback parameter-index recall at or above threshold.
+    pub fn with_min_callback_index_recall(mut self, min_recall: f64) -> Self {
+        self.min_callback_index_recall = Some(min_recall.clamp(0.0, 1.0));
         self
     }
 }
@@ -232,6 +259,16 @@ pub struct BenchmarkResult {
     pub fp_precision: f64,
     /// Function-pointer typing recall.
     pub fp_recall: f64,
+    /// Number of expected callback parameter indices matched.
+    pub callback_index_true_positives: usize,
+    /// Number of predicted callback parameter indices.
+    pub callback_index_predicted: usize,
+    /// Number of expected callback parameter indices.
+    pub callback_index_expected: usize,
+    /// Callback parameter-index precision.
+    pub callback_index_precision: f64,
+    /// Callback parameter-index recall.
+    pub callback_index_recall: f64,
     /// Execution time.
     pub duration: Duration,
     /// The decompiled output.
@@ -446,6 +483,11 @@ impl BenchmarkSuite {
                     fp_expected: 0,
                     fp_precision: 0.0,
                     fp_recall: 0.0,
+                    callback_index_true_positives: 0,
+                    callback_index_predicted: 0,
+                    callback_index_expected: 0,
+                    callback_index_precision: 0.0,
+                    callback_index_recall: 0.0,
                     duration: start.elapsed(),
                     output: String::new(),
                     pattern_results: Vec::new(),
@@ -480,6 +522,28 @@ impl BenchmarkSuite {
             1.0
         } else {
             fp_true_positives as f64 / fp_expected as f64
+        };
+        let predicted_callback_indices = extract_callback_param_indices(&output);
+        let callback_index_predicted = predicted_callback_indices.len();
+        let callback_index_expected = case.expected_callback_param_indices.len();
+        let callback_index_true_positives = case
+            .expected_callback_param_indices
+            .iter()
+            .filter(|idx| predicted_callback_indices.contains(idx))
+            .count();
+        let callback_index_recall = if callback_index_expected == 0 {
+            1.0
+        } else {
+            callback_index_true_positives as f64 / callback_index_expected as f64
+        };
+        let callback_index_precision = if callback_index_predicted == 0 {
+            if callback_index_expected == 0 {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            callback_index_true_positives as f64 / callback_index_predicted as f64
         };
 
         // Check for forbidden patterns
@@ -534,6 +598,38 @@ impl BenchmarkSuite {
                 details: Some(format!("recall {:.3}", fp_recall)),
             });
         }
+        if let Some(min_precision) = case.min_callback_index_precision {
+            let matched = callback_index_precision >= min_precision;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(callback_index_precision>={:.2})", min_precision),
+                matched,
+                location: output.lines().position(|line| line.contains("(*arg")),
+                details: Some(format!(
+                    "precision {:.3} (matched {}/{})",
+                    callback_index_precision,
+                    callback_index_true_positives,
+                    callback_index_predicted
+                )),
+            });
+        }
+        if let Some(min_recall) = case.min_callback_index_recall {
+            let matched = callback_index_recall >= min_recall;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(callback_index_recall>={:.2})", min_recall),
+                matched,
+                location: output.lines().position(|line| line.contains("(*arg")),
+                details: Some(format!(
+                    "recall {:.3} (matched {}/{})",
+                    callback_index_recall, callback_index_true_positives, callback_index_expected
+                )),
+            });
+        }
 
         // Calculate score
         let pattern_score = if !case.expected_patterns.is_empty() {
@@ -562,6 +658,11 @@ impl BenchmarkSuite {
             fp_expected,
             fp_precision,
             fp_recall,
+            callback_index_true_positives,
+            callback_index_predicted,
+            callback_index_expected,
+            callback_index_precision,
+            callback_index_recall,
             duration: start.elapsed(),
             output,
             pattern_results,
@@ -842,6 +943,27 @@ fn extract_function_pointer_decls(output: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extract callback parameter indices from typed function-pointer parameters (`(*argN)`).
+fn extract_callback_param_indices(output: &str) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for line in output.lines() {
+        let mut rest = line;
+        while let Some(start) = rest.find("(*arg") {
+            let after = &rest[start + 5..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                if let Ok(idx) = digits.parse::<usize>() {
+                    indices.push(idx);
+                }
+            }
+            rest = after;
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// Create the standard benchmark suite with common test cases.
 pub fn create_standard_suite() -> BenchmarkSuite {
     let mut suite = BenchmarkSuite::new();
@@ -1042,6 +1164,8 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_category("functions")
             .with_difficulty(3)
             .with_source("qsort(base, n, elem_size, compar);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
             .expect_pattern(ExpectedPattern::FunctionCall {
                 name: "qsort".to_string(),
             })
@@ -1056,6 +1180,8 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_category("functions")
             .with_difficulty(3)
             .with_source("bsearch(key, base, n, elem_size, compar);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
             .expect_pattern(ExpectedPattern::FunctionCall {
                 name: "bsearch".to_string(),
             })
@@ -1070,6 +1196,8 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_category("functions")
             .with_difficulty(3)
             .with_source("signal(signum, handler);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
             .expect_pattern(ExpectedPattern::FunctionCall {
                 name: "signal".to_string(),
             })
@@ -1084,10 +1212,152 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_category("functions")
             .with_difficulty(3)
             .with_source("pthread_create(&thread, attr, start_routine, arg);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
             .expect_pattern(ExpectedPattern::FunctionCall {
                 name: "pthread_create".to_string(),
             })
             .expect_fp_decl("void* (*start_routine)(void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_qsort_r")
+            .with_description("qsort_r callback API emits precise context-aware comparator types")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("qsort_r(base, n, elem_size, compar, thunk);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_bsd_qsort_r")
+            .with_description("BSD qsort_r callback API emits precise comparator types at arg4")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("bsd_qsort_r(base, n, elem_size, thunk, compar);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "bsd_qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_on_exit")
+            .with_description("on_exit callback API emits precise handler signature types")
+            .with_category("functions")
+            .with_difficulty(3)
+            .with_source("on_exit(handler, ctx);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "on_exit".to_string(),
+            })
+            .expect_fp_decl("void (*handler)(int32_t, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_pthread_atfork")
+            .with_description(
+                "pthread_atfork callback API emits precise prepare/parent/child signatures",
+            )
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("pthread_atfork(prepare, parent, child);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "pthread_atfork".to_string(),
+            })
+            .expect_fp_decl("void (*prepare)(void)")
+            .expect_fp_decl("void (*parent)(void)")
+            .expect_fp_decl("void (*child)(void)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_hexray_qsort_r")
+            .with_description(
+                "shim qsort_r callback API emits precise context-aware comparator types",
+            )
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_qsort_r(base, n, elem_size, compar, thunk);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_hexray_bsd_qsort_r")
+            .with_description(
+                "shim BSD qsort_r callback API emits precise comparator types at arg4",
+            )
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_bsd_qsort_r(base, n, elem_size, thunk, compar);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_bsd_qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_hexray_on_exit")
+            .with_description("shim on_exit callback API emits precise handler signature types")
+            .with_category("functions")
+            .with_difficulty(3)
+            .with_source("hexray_on_exit(handler, ctx);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_on_exit".to_string(),
+            })
+            .expect_fp_decl("void (*handler)(int32_t, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_hexray_pthread_atfork")
+            .with_description(
+                "shim pthread_atfork callback API emits precise prepare/parent/child signatures",
+            )
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_pthread_atfork(prepare, parent, child);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_pthread_atfork".to_string(),
+            })
+            .expect_fp_decl("void (*prepare)(void)")
+            .expect_fp_decl("void (*parent)(void)")
+            .expect_fp_decl("void (*child)(void)")
             .with_min_fp_precision(1.0)
             .with_min_fp_recall(1.0),
     );
@@ -1100,12 +1370,217 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_source(
                 "tmp = compar; qsort(base, n, elem_size, tmp); /* lifted alias callback path */",
             )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
             .expect_pattern(ExpectedPattern::FunctionCall {
                 name: "qsort".to_string(),
             })
             .expect_fp_decl("int32_t (*compar)(void*, void*)")
             .with_min_fp_precision(1.0)
             .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_qsort_multihop")
+            .with_description("qsort callback typing survives multi-hop forwarding aliases")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source(
+                "lvl0 = compar; lvl1 = lvl0; lvl2 = lvl1; qsort(base, n, elem_size, lvl2);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_pthread_mixed")
+            .with_description("pthread callback typing survives mixed direct/indirect forwarding")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source(
+                "selected = cond ? start_routine : trampoline; pthread_create(&thread, attr, selected, arg);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "pthread_create".to_string(),
+            })
+            .expect_fp_decl("void* (*start_routine)(void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_bsearch_arg3")
+            .with_description("bsearch callback index stability under lifted arg3 callback shape")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("bsearch(key, base, n, compar, elem_size);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "bsearch".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg3)(void*, void*)")
+            .expect_callback_param_index(3)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_bsearch_arg4")
+            .with_description("bsearch callback index stability under lifted arg4 callback shape")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("bsearch(key, base, n, elem_size, compar);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "bsearch".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg4)(void*, void*)")
+            .expect_callback_param_index(4)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_qsort_r_arg3")
+            .with_description("qsort_r callback index stability under glibc callback slot")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("qsort_r(base, n, elem_size, compar, thunk);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg3)(void*, void*, void*)")
+            .expect_callback_param_index(3)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_bsd_qsort_r_arg4")
+            .with_description("BSD qsort_r callback index stability under callback slot arg4")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("bsd_qsort_r(base, n, elem_size, thunk, compar);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "bsd_qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg4)(void*, void*, void*)")
+            .expect_callback_param_index(4)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_qsort_r_arg3")
+            .with_description("shim qsort_r callback index stability under callback slot arg3")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_qsort_r(base, n, elem_size, compar, thunk);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg3)(void*, void*, void*)")
+            .expect_callback_param_index(3)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_bsd_qsort_r_arg4")
+            .with_description("shim BSD qsort_r callback index stability under callback slot arg4")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_bsd_qsort_r(base, n, elem_size, thunk, compar);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_bsd_qsort_r".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg4)(void*, void*, void*)")
+            .expect_callback_param_index(4)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_on_exit_arg0")
+            .with_description("on_exit callback index stability pins callback to arg0")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_on_exit(cb, ctx);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_on_exit".to_string(),
+            })
+            .expect_fp_decl("void (*arg0)(int32_t, void*)")
+            .expect_callback_param_index(0)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_pthread_atfork_args012")
+            .with_description(
+                "pthread_atfork callback index stability keeps prepare/parent/child slots",
+            )
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_pthread_atfork(prepare, parent, child);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_pthread_atfork".to_string(),
+            })
+            .expect_fp_decl("void (*arg0)(void)")
+            .expect_fp_decl("void (*arg1)(void)")
+            .expect_fp_decl("void (*arg2)(void)")
+            .expect_callback_param_index(0)
+            .expect_callback_param_index(1)
+            .expect_callback_param_index(2)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_pthread_atfork_alias_reuse")
+            .with_description(
+                "pthread_atfork callback index stability survives alias reuse across callback slots",
+            )
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "tmp = prepare; tmp = parent; tmp = child; hexray_pthread_atfork(tmp, tmp, tmp);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_pthread_atfork".to_string(),
+            })
+            .expect_fp_decl("void (*arg0)(void)")
+            .expect_fp_decl("void (*arg1)(void)")
+            .expect_fp_decl("void (*arg2)(void)")
+            .expect_callback_param_index(0)
+            .expect_callback_param_index(1)
+            .expect_callback_param_index(2)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
     );
 
     // Struct patterns
@@ -1371,7 +1846,7 @@ impl BenchmarkSuiteResults {
         for result in &self.case_results {
             let status = if result.passed { "PASS" } else { "FAIL" };
             report.push_str(&format!(
-                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos, fp P/R {:.2}/{:.2})\n",
+                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos, fp P/R {:.2}/{:.2}, cb-idx P/R {:.2}/{:.2})\n",
                 status,
                 result.case_id,
                 result.score * 100.0,
@@ -1381,7 +1856,9 @@ impl BenchmarkSuiteResults {
                 result.switch_count,
                 result.goto_count,
                 result.fp_precision,
-                result.fp_recall
+                result.fp_recall,
+                result.callback_index_precision,
+                result.callback_index_recall
             ));
             if let Some(ref err) = result.error {
                 report.push_str(&format!("       Error: {}\n", err));
@@ -1415,6 +1892,9 @@ mod tests {
         assert!(case.expected_fp_decls.is_empty());
         assert!(case.min_fp_precision.is_none());
         assert!(case.min_fp_recall.is_none());
+        assert!(case.expected_callback_param_indices.is_empty());
+        assert!(case.min_callback_index_precision.is_none());
+        assert!(case.min_callback_index_recall.is_none());
     }
 
     #[test]
@@ -1560,7 +2040,17 @@ mod tests {
             "callback_fp_typing_bsearch",
             "callback_fp_typing_signal",
             "callback_fp_typing_pthread_create",
+            "callback_fp_typing_qsort_r",
+            "callback_fp_typing_bsd_qsort_r",
+            "callback_fp_typing_on_exit",
+            "callback_fp_typing_pthread_atfork",
+            "callback_fp_typing_hexray_qsort_r",
+            "callback_fp_typing_hexray_bsd_qsort_r",
+            "callback_fp_typing_hexray_on_exit",
+            "callback_fp_typing_hexray_pthread_atfork",
             "callback_fp_typing_qsort_alias",
+            "callback_fp_typing_qsort_multihop",
+            "callback_fp_typing_pthread_mixed",
         ];
 
         for id in expected_ids {
@@ -1581,7 +2071,133 @@ mod tests {
                 "{} should require perfect fp recall",
                 id
             );
+            assert_eq!(
+                case.max_gotos,
+                Some(0),
+                "{} should disallow goto fallback",
+                id
+            );
+            assert!(
+                case.min_quality >= 0.95,
+                "{} should require strong quality floor",
+                id
+            );
         }
+
+        let callback_index_ids = [
+            "callback_index_stability_bsearch_arg3",
+            "callback_index_stability_bsearch_arg4",
+            "callback_index_stability_qsort_r_arg3",
+            "callback_index_stability_bsd_qsort_r_arg4",
+            "callback_index_stability_hexray_qsort_r_arg3",
+            "callback_index_stability_hexray_bsd_qsort_r_arg4",
+            "callback_index_stability_hexray_on_exit_arg0",
+            "callback_index_stability_hexray_pthread_atfork_args012",
+            "callback_index_stability_hexray_pthread_atfork_alias_reuse",
+        ];
+        for id in callback_index_ids {
+            let case = suite
+                .cases
+                .iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("missing benchmark case: {}", id));
+            assert_eq!(
+                case.min_callback_index_recall,
+                Some(1.0),
+                "{} should require perfect callback-index recall",
+                id
+            );
+            assert_eq!(
+                case.min_callback_index_precision,
+                Some(1.0),
+                "{} should require perfect callback-index precision",
+                id
+            );
+            assert_eq!(
+                case.max_gotos,
+                Some(0),
+                "{} should disallow goto fallback",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn test_callback_index_recall_metric() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(
+            BenchmarkCase::new("callback_index")
+                .expect_fp_decl("int32_t (*arg3)(void*, void*)")
+                .expect_callback_param_index(3)
+                .with_min_callback_index_precision(1.0)
+                .with_min_callback_index_recall(1.0),
+        );
+
+        let pass_results = suite.run_all(|_| {
+            Ok("int32_t f(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*)) { return 0; }".to_string())
+        });
+        assert_eq!(pass_results.passed, 1);
+        let pass = &pass_results.case_results[0];
+        assert_eq!(pass.callback_index_true_positives, 1);
+        assert_eq!(pass.callback_index_expected, 1);
+        assert_eq!(pass.callback_index_predicted, 1);
+        assert_eq!(pass.callback_index_precision, 1.0);
+        assert_eq!(pass.callback_index_recall, 1.0);
+
+        let fail_results = suite.run_all(|_| {
+            Ok("int32_t f(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*)) { return 0; }".to_string())
+        });
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.callback_index_true_positives, 0);
+        assert_eq!(fail.callback_index_expected, 1);
+        assert_eq!(fail.callback_index_predicted, 1);
+        assert_eq!(fail.callback_index_precision, 0.0);
+        assert_eq!(fail.callback_index_recall, 0.0);
+    }
+
+    #[test]
+    fn test_callback_index_recall_metric_multi_slot() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(
+            BenchmarkCase::new("callback_index_multi")
+                .expect_fp_decl("void (*arg0)(void)")
+                .expect_fp_decl("void (*arg1)(void)")
+                .expect_fp_decl("void (*arg2)(void)")
+                .expect_callback_param_index(0)
+                .expect_callback_param_index(1)
+                .expect_callback_param_index(2)
+                .with_min_callback_index_precision(1.0)
+                .with_min_callback_index_recall(1.0),
+        );
+
+        let pass_results = suite.run_all(|_| {
+            Ok(
+                "int32_t f(void (*arg0)(void), void (*arg1)(void), void (*arg2)(void)) { return 0; }"
+                    .to_string(),
+            )
+        });
+        assert_eq!(pass_results.passed, 1);
+        let pass = &pass_results.case_results[0];
+        assert_eq!(pass.callback_index_true_positives, 3);
+        assert_eq!(pass.callback_index_expected, 3);
+        assert_eq!(pass.callback_index_predicted, 3);
+        assert_eq!(pass.callback_index_precision, 1.0);
+        assert_eq!(pass.callback_index_recall, 1.0);
+
+        let fail_results = suite.run_all(|_| {
+            Ok(
+                "int32_t f(void (*arg0)(void), void (*arg2)(void), int64_t arg1) { return 0; }"
+                    .to_string(),
+            )
+        });
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.callback_index_true_positives, 2);
+        assert_eq!(fail.callback_index_expected, 3);
+        assert_eq!(fail.callback_index_predicted, 2);
+        assert_eq!(fail.callback_index_precision, 1.0);
+        assert_eq!(fail.callback_index_recall, 2.0 / 3.0);
     }
 
     #[test]

@@ -803,7 +803,7 @@ impl StackCanaryAnalysis {
 mod tests {
     use super::*;
     use hexray_core::Register;
-    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, MemoryRef, Operand};
+    use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, IndexMode, MemoryRef, Operand};
 
     fn make_x86_register(id: u16, size: u16) -> Register {
         Register::new(
@@ -869,6 +869,7 @@ mod tests {
             size: 8,
             segment: Some(fs_reg),
             broadcast: false,
+            index_mode: IndexMode::None,
         };
 
         let mut instr = Instruction::new(
@@ -910,6 +911,7 @@ mod tests {
             size: 8,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         };
 
         let mut instr = Instruction::new(0x1007, 4, vec![0x48, 0x89, 0x45, 0xf8], "mov");
@@ -975,6 +977,7 @@ mod tests {
             size: 8,
             segment: Some(fs_reg),
             broadcast: false,
+            index_mode: IndexMode::None,
         };
         let mut load_instr = Instruction::new(0x1000, 7, vec![0; 7], "mov");
         load_instr.operation = Operation::Move;
@@ -993,6 +996,7 @@ mod tests {
             size: 8,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         };
         let mut store_instr = Instruction::new(0x1007, 4, vec![0; 4], "mov");
         store_instr.operation = Operation::Move;

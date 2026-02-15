@@ -817,7 +817,9 @@ impl ResolutionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{Architecture, Immediate, MemoryRef, Operation, Register, RegisterClass};
+    use hexray_core::{
+        Architecture, Immediate, IndexMode, MemoryRef, Operation, Register, RegisterClass,
+    };
 
     fn make_register(id: u16) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, 64)
@@ -855,6 +857,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 3,
@@ -880,6 +883,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 6,

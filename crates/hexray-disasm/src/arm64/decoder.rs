@@ -6,8 +6,8 @@ use super::sme::SmeDecoder;
 use super::sve::SveDecoder;
 use crate::{DecodeError, DecodedInstruction, Disassembler};
 use hexray_core::{
-    register::arm64, Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand,
-    Operation, Register, RegisterClass,
+    register::arm64, Architecture, Condition, ControlFlow, IndexMode, Instruction, MemoryRef,
+    Operand, Operation, Register, RegisterClass,
 };
 
 /// ARM64 disassembler.
@@ -1033,11 +1033,12 @@ impl Arm64Disassembler {
 
         // Load/store register variants (bits 29-27 = 111)
         if op_29_27 == 0b111 {
-            // Atomic memory operations (ARMv8.1): bits 25-24 = 00, bit 21 = 1, V=0
+            // Atomic memory operations (ARMv8.1): bits 25-24 = 00, bit 21 = 1, V=0, bits 11-10 = 00
             // Must check BEFORE unscaled/pre/post-indexed as they have the same bits 25-24
             // Pattern: size[31:30]=xx, 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
             // V=0 distinguishes from SIMD/FP register offset loads which have V=1
-            if (op_25_23 >> 1) == 0b00 && op_21 == 1 && v == 0 {
+            // bits 11-10 = 00 distinguishes from register offset loads which have bits 11-10 = 10
+            if (op_25_23 >> 1) == 0b00 && op_21 == 1 && v == 0 && op_11_10 == 0b00 {
                 return self.decode_atomic_memory(insn, address, bytes);
             }
 
@@ -1072,9 +1073,10 @@ impl Arm64Disassembler {
             return self.decode_ldst_exclusive(insn, address, bytes);
         }
 
-        // Atomic memory operations (ARMv8.1): bits 31-24 = xx111000, bit 21 = 1
+        // Atomic memory operations (ARMv8.1): bits 31-24 = xx111000, bit 21 = 1, bits 11-10 = 00
         // Pattern: size[31:30]=xx, 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
-        if bits_29_24 == 0b111000 && (insn >> 21) & 1 == 1 {
+        // bits 11-10 = 00 distinguishes from register offset loads which have bits 11-10 = 10
+        if bits_29_24 == 0b111000 && (insn >> 21) & 1 == 1 && op_11_10 == 0b00 {
             return self.decode_atomic_memory(insn, address, bytes);
         }
 
@@ -1522,10 +1524,21 @@ impl Arm64Disassembler {
         let imm9 = ((insn >> 12) & 0x1FF) as i64;
         let rn = ((insn >> 5) & 0x1F) as u16;
         let rt = (insn & 0x1F) as u16;
-        let _is_pre = (insn >> 11) & 1 == 1;
+        let is_pre = (insn >> 11) & 1 == 1;
 
         let is_load = opc & 1 == 1;
         let offset = sign_extend(imm9 as u64, 9);
+
+        // Determine index mode and effective address offset
+        // - Post-indexed (bit 11 = 0): access at [base], then base += offset
+        // - Pre-indexed (bit 11 = 1): access at [base + offset], then base = that
+        let (index_mode, mem_offset) = if is_pre {
+            // Pre-indexed: [base, #offset]! - load from base+offset, writeback
+            (IndexMode::Pre, offset)
+        } else {
+            // Post-indexed: [base], #offset - load from base, then writeback
+            (IndexMode::Post, 0)
+        };
 
         if v == 1 {
             // SIMD/FP load/store with pre/post-indexed immediate
@@ -1548,17 +1561,19 @@ impl Arm64Disassembler {
             let mnemonic = if is_load { "ldr" } else { "str" };
             let reg = Self::simd_reg(rt, simd_size);
             let base = Self::xreg_sp(rn);
-            let mem = MemoryRef::base_disp(base, offset, access_size);
+            let mem = MemoryRef::base_disp_indexed(base, mem_offset, access_size, index_mode);
 
-            let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
-
-            let inst = Instruction::new(address, 4, bytes, mnemonic)
+            // Store the writeback offset for decompiler use
+            let mut inst = Instruction::new(address, 4, bytes, mnemonic)
                 .with_operation(if is_load {
                     Operation::Load
                 } else {
                     Operation::Store
                 })
-                .with_operands(operands);
+                .with_operands(vec![Operand::reg(reg), Operand::Memory(mem)]);
+
+            // Mark base register as both read and written (writeback)
+            inst.writes.push(Self::xreg_sp(rn));
 
             return Ok(DecodedInstruction {
                 instruction: inst,
@@ -1585,24 +1600,24 @@ impl Arm64Disassembler {
             }
         };
 
-        // For display, we'd normally add ! for pre-indexed, but we'll just use the mnemonic
         let reg = if is_64bit {
             Self::xreg(rt)
         } else {
             Self::wreg(rt)
         };
         let base = Self::xreg_sp(rn);
-        let mem = MemoryRef::base_disp(base, offset, access_size);
+        let mem = MemoryRef::base_disp_indexed(base, mem_offset, access_size, index_mode);
 
-        let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
-
-        let inst = Instruction::new(address, 4, bytes, base_mnemonic)
+        let mut inst = Instruction::new(address, 4, bytes, base_mnemonic)
             .with_operation(if is_load {
                 Operation::Load
             } else {
                 Operation::Store
             })
-            .with_operands(operands);
+            .with_operands(vec![Operand::reg(reg), Operand::Memory(mem)]);
+
+        // Mark base register as written (writeback)
+        inst.writes.push(Self::xreg_sp(rn));
 
         Ok(DecodedInstruction {
             instruction: inst,
@@ -2120,13 +2135,13 @@ impl Arm64Disassembler {
 
         let (base_mnemonic, operation, set_flags) = match (opc, n) {
             (0b00, 0) => ("and", Operation::And, false),
-            (0b00, 1) => ("bic", Operation::And, false), // AND NOT
+            (0b00, 1) => ("bic", Operation::AndNot, false), // rd = rn & ~rm
             (0b01, 0) => ("orr", Operation::Or, false),
-            (0b01, 1) => ("orn", Operation::Or, false), // OR NOT
+            (0b01, 1) => ("orn", Operation::Or, false), // OR NOT (handled in emitter via mnemonic)
             (0b10, 0) => ("eor", Operation::Xor, false),
-            (0b10, 1) => ("eon", Operation::Xor, false), // XOR NOT
+            (0b10, 1) => ("eon", Operation::Xor, false), // XOR NOT (handled in emitter via mnemonic)
             (0b11, 0) => ("ands", Operation::And, true),
-            (0b11, 1) => ("bics", Operation::And, true),
+            (0b11, 1) => ("bics", Operation::AndNot, true), // rd = rn & ~rm, sets flags
             _ => unreachable!(),
         };
 
@@ -2437,35 +2452,65 @@ impl Arm64Disassembler {
         let src2 = if sf { Self::xreg(rm) } else { Self::wreg(rm) };
         let (cond_str, _) = decode_condition(cond);
 
+        // For aliases, we need to invert the condition (e.g., eq -> ne)
+        // The encoding uses the inverted condition, so we display the inverted one
+        let inverted_cond = cond ^ 1;
+        let (inverted_cond_str, _) = decode_condition(inverted_cond);
+
         // Check for aliases
         let (final_mnemonic, operands) = if op == 0 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE
         {
-            // CINC alias
+            // CINC/CSET alias: CSINC Rd, Rn, Rn, invert(cond)
+            // The displayed condition is the inverted one
             if rn == 31 {
-                // CSET
-                ("cset", vec![Operand::reg(dst)])
+                // CSET Rd, cond (where cond is the inverted condition)
+                (
+                    format!("cset.{}", inverted_cond_str),
+                    vec![Operand::reg(dst)],
+                )
             } else {
-                ("cinc", vec![Operand::reg(dst), Operand::reg(src1)])
+                (
+                    format!("cinc.{}", inverted_cond_str),
+                    vec![Operand::reg(dst), Operand::reg(src1)],
+                )
             }
         } else if op == 1 && op2 == 0b00 && rn == rm && cond & 0xE != 0xE {
-            // CINV alias
+            // CINV/CSETM alias
             if rn == 31 {
-                ("csetm", vec![Operand::reg(dst)])
+                // CSETM Rd, cond
+                (
+                    format!("csetm.{}", inverted_cond_str),
+                    vec![Operand::reg(dst)],
+                )
             } else {
-                ("cinv", vec![Operand::reg(dst), Operand::reg(src1)])
+                (
+                    format!("cinv.{}", inverted_cond_str),
+                    vec![Operand::reg(dst), Operand::reg(src1)],
+                )
             }
         } else if op == 1 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE {
             // CNEG alias
-            ("cneg", vec![Operand::reg(dst), Operand::reg(src1)])
+            (
+                format!("cneg.{}", inverted_cond_str),
+                vec![Operand::reg(dst), Operand::reg(src1)],
+            )
         } else {
             (
-                mnemonic,
+                format!("{}.{}", mnemonic, cond_str),
                 vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
             )
         };
 
+        // Determine the operation: aliases with condition in name use SetConditional
+        let is_conditional_alias = final_mnemonic.contains('.');
+        let operation = if is_conditional_alias {
+            Operation::SetConditional
+        } else {
+            Operation::Move
+        };
+
         let inst = Instruction::new(address, 4, bytes, final_mnemonic)
-            .with_operation(Operation::Move)
+            .with_operation(operation)
             .with_operands(operands);
 
         Ok(DecodedInstruction {

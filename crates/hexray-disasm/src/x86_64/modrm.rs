@@ -3,7 +3,7 @@
 use super::prefix::{Evex, Prefixes, Rex};
 use hexray_core::{
     register::{x86, RegisterClass},
-    Architecture, MemoryRef, Operand, Register,
+    Architecture, IndexMode, MemoryRef, Operand, Register,
 };
 
 /// Decoded ModR/M byte.
@@ -226,6 +226,7 @@ pub fn decode_modrm_rm(
                 size: (operand_size / 8) as u8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             }),
             offset,
         ));
@@ -265,6 +266,7 @@ pub fn decode_modrm_rm(
             size: (operand_size / 8) as u8,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         }),
         offset,
     ))

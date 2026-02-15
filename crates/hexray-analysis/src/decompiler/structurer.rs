@@ -5,13 +5,15 @@
 #![allow(dead_code)]
 
 use hexray_core::{
-    cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, Operation,
+    cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, IndexMode,
+    Operand, Operation,
 };
 use std::collections::{HashMap, HashSet};
 
 use super::abi::{
     get_arg_register_index, is_callee_saved_register, is_return_register, is_temp_register,
 };
+use super::dead_store::collect_all_uses;
 use super::expression::{resolve_adrp_patterns, BinOpKind, Expr};
 use super::for_loop_detection::{detect_for_loops, get_expr_var_key};
 use super::short_circuit::detect_short_circuit;
@@ -977,7 +979,13 @@ impl<'a> Structurer<'a> {
                 // Get condition from header's conditional branch
                 let (condition, body_start) = self.get_while_condition(header, &info);
                 let body = if let Some(start) = body_start {
-                    self.structure_region(start, Some(header))
+                    if start == header {
+                        // Self-loop: the header IS the body. Use structure_loop_body
+                        // to include the header's statements in the body.
+                        self.structure_loop_body(header, &info)
+                    } else {
+                        self.structure_region(start, Some(header))
+                    }
                 } else {
                     vec![]
                 };
@@ -1392,12 +1400,21 @@ impl<'a> Structurer<'a> {
                 }
                 true
             })
-            .map(|(_, inst)| {
+            .flat_map(|(_, inst)| {
                 // Special handling for SETcc and CMOVcc to use block context
-                match inst.operation {
+                let main_expr = match inst.operation {
                     Operation::SetConditional => lift_setcc_with_context(inst, block),
                     Operation::ConditionalMove => lift_cmovcc_with_context(inst, block),
                     _ => Expr::from_instruction(inst),
+                };
+
+                // Generate writeback expressions for post-indexed loads/stores
+                let writeback = generate_writeback_expr(inst);
+
+                if let Some(wb) = writeback {
+                    vec![main_expr, wb]
+                } else {
+                    vec![main_expr]
                 }
             })
             .collect();
@@ -1469,6 +1486,17 @@ fn try_extract_arm64_branch_condition(
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
 /// Also substitutes register names with their values from preceding MOV instructions.
 fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
+    // Find the last compare in the block (no address limit)
+    condition_to_expr_before_address(cond, block, None)
+}
+
+/// Converts a Condition to an Expr, finding the compare instruction before the given address.
+/// This is needed for ARM64 CMP+CSEL chains where each CSEL uses a different preceding CMP.
+fn condition_to_expr_before_address(
+    cond: Condition,
+    block: &BasicBlock,
+    before_addr: Option<u64>,
+) -> Expr {
     let op = match cond {
         Condition::Equal => BinOpKind::Eq,
         Condition::NotEqual => BinOpKind::Ne,
@@ -1480,6 +1508,9 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
         Condition::BelowOrEqual => BinOpKind::ULe,
         Condition::Above => BinOpKind::UGt,
         Condition::AboveOrEqual => BinOpKind::UGe,
+        // Sign/NotSign: after CMP x, y, MI is set when x - y < 0 (signed)
+        Condition::Sign => BinOpKind::Lt,
+        Condition::NotSign => BinOpKind::Ge,
         _ => BinOpKind::Ne, // Default for flag-based conditions
     };
 
@@ -1492,15 +1523,42 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
         return cond_expr;
     }
 
-    // Find the last compare instruction in the block
-    let compare_inst = block.instructions.iter().rev().find(|inst| {
-        matches!(
-            inst.operation,
-            Operation::Compare | Operation::Test | Operation::Sub
-        )
-    });
+    // Find the last compare instruction in the block (before the given address if specified)
+    // This includes CMP, TEST, SUB/SUBS, ANDS, and NEG instructions
+    let compare_inst = block
+        .instructions
+        .iter()
+        .rev()
+        .filter(|inst| {
+            // If before_addr is specified, only consider instructions before that address
+            before_addr.map_or(true, |addr| inst.address < addr)
+        })
+        .find(|inst| {
+            matches!(
+                inst.operation,
+                Operation::Compare | Operation::Test | Operation::Sub | Operation::Neg
+            ) || (matches!(inst.operation, Operation::And) && inst.mnemonic.ends_with('s'))
+        });
 
     if let Some(inst) = compare_inst {
+        // For NEG instructions, flags reflect the negated result
+        // neg eax: SF set if (-eax) < 0, i.e., eax > 0
+        // For Sign condition after NEG, we need "operand > 0" (or < 0 for inverted)
+        if matches!(inst.operation, Operation::Neg) && !inst.operands.is_empty() {
+            let operand = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[0], inst),
+                &reg_values,
+            );
+            // NEG sets SF if result is negative, meaning original was positive
+            // So Sign (SF) after NEG means original > 0
+            let neg_op = match cond {
+                Condition::Sign => BinOpKind::Gt,    // SF set means orig > 0
+                Condition::NotSign => BinOpKind::Le, // SF clear means orig <= 0
+                _ => op,                             // Use default mapping for other conditions
+            };
+            return Expr::binop(neg_op, operand, Expr::int(0));
+        }
+
         // For SUB/SUBS instructions (ARM64), operands are [dst, src1, src2]
         // The comparison is between src1 and src2
         if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Sub) {
@@ -1513,6 +1571,20 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
                 &reg_values,
             );
             return Expr::binop(op, left, right);
+        } else if inst.operands.len() >= 3 && matches!(inst.operation, Operation::And) {
+            // For ANDS instructions (ARM64), operands are [dst, src1, src2] or [dst, src1, imm]
+            // The flags are set based on (src1 & src2), compared against zero
+            let src1 = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[1], inst),
+                &reg_values,
+            );
+            let src2 = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[2], inst),
+                &reg_values,
+            );
+            // Create (src1 & src2) and compare against zero
+            let and_result = Expr::binop(BinOpKind::And, src1, src2);
+            return Expr::binop(op, and_result, Expr::int(0));
         } else if inst.operands.len() >= 2 {
             // For CMP/TEST instructions, operands are [src1, src2]
             let left = substitute_register_in_expr(
@@ -1768,7 +1840,20 @@ fn negate_condition(expr: Expr) -> Expr {
 /// Parses the condition suffix from a SETcc or CMOVcc mnemonic.
 /// Returns None if the mnemonic doesn't have a recognized condition suffix.
 fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
-    // Extract suffix after "set" or "cmov"
+    // Handle ARM64 style: cset.eq, cinc.ne, csetm.mi, etc.
+    if let Some(dot_pos) = mnemonic.find('.') {
+        let prefix = &mnemonic[..dot_pos];
+        let suffix = &mnemonic[dot_pos + 1..];
+        // Check for ARM64 conditional instructions
+        if matches!(
+            prefix,
+            "cset" | "csetm" | "cinc" | "cinv" | "cneg" | "csel" | "csinc" | "csinv" | "csneg"
+        ) {
+            return parse_arm64_condition(suffix);
+        }
+    }
+
+    // Handle x86 style: sete, cmovne, etc.
     let suffix = if let Some(s) = mnemonic.strip_prefix("set") {
         s
     } else if let Some(s) = mnemonic.strip_prefix("cmov") {
@@ -1777,7 +1862,7 @@ fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
         return None;
     };
 
-    // Map suffix to Condition
+    // Map x86 suffix to Condition
     match suffix {
         "e" | "z" => Some(Condition::Equal),
         "ne" | "nz" => Some(Condition::NotEqual),
@@ -1799,8 +1884,75 @@ fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
     }
 }
 
+/// Parse ARM64 condition code suffixes
+fn parse_arm64_condition(suffix: &str) -> Option<Condition> {
+    match suffix {
+        "eq" => Some(Condition::Equal),
+        "ne" => Some(Condition::NotEqual),
+        "lt" => Some(Condition::Less),
+        "le" => Some(Condition::LessOrEqual),
+        "gt" => Some(Condition::Greater),
+        "ge" => Some(Condition::GreaterOrEqual),
+        // Unsigned comparisons
+        "lo" | "cc" => Some(Condition::Below), // Carry Clear = Below
+        "ls" => Some(Condition::BelowOrEqual), // Lower or Same
+        "hi" => Some(Condition::Above),        // Higher
+        "hs" | "cs" => Some(Condition::AboveOrEqual), // Carry Set = Above or Equal
+        // Sign/overflow
+        "mi" => Some(Condition::Sign),        // Negative (minus)
+        "pl" => Some(Condition::NotSign),     // Positive or zero (plus)
+        "vs" => Some(Condition::Overflow),    // Overflow set
+        "vc" => Some(Condition::NotOverflow), // Overflow clear
+        // "al" (always) shouldn't appear in cset - just ignore it
+        _ => None,
+    }
+}
+
+/// Generates a writeback expression for post-indexed load/store instructions.
+///
+/// For ARM64 post-indexed addressing like `ldrb w9, [x8], #1`:
+/// - The main load is: w9 = *x8
+/// - The writeback is: x8 = x8 + 1
+///
+/// Returns None if no writeback is needed.
+fn generate_writeback_expr(inst: &hexray_core::Instruction) -> Option<Expr> {
+    use super::expression::{ExprKind, VarKind, Variable};
+
+    // Check if this is a load or store operation
+    if !matches!(inst.operation, Operation::Load | Operation::Store) {
+        return None;
+    }
+
+    // Find the memory operand with pre/post-indexed mode
+    for operand in &inst.operands {
+        if let Operand::Memory(mem) = operand {
+            if mem.index_mode == IndexMode::Post || mem.index_mode == IndexMode::Pre {
+                // Both pre and post-indexed have writeback: base = base + displacement
+                if let Some(base_reg) = &mem.base {
+                    let base_name = base_reg.name().to_lowercase();
+                    let base_var = Expr {
+                        kind: ExprKind::Var(Variable {
+                            name: base_name.clone(),
+                            kind: VarKind::Register(base_reg.id),
+                            size: (base_reg.size / 8) as u8,
+                        }),
+                    };
+
+                    // Create: base = base + displacement
+                    let offset_expr = Expr::int(mem.displacement as i128);
+                    let add_expr = Expr::binop(BinOpKind::Add, base_var.clone(), offset_expr);
+                    return Some(Expr::assign(base_var, add_expr));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Lifts a SETcc instruction with block context to get the actual comparison.
 /// Returns an expression like: dest = (left op right)
+/// For ARM64 CSEL: dest = cond ? src1 : src2
 fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) -> Expr {
     let dest = if !inst.operands.is_empty() {
         Expr::from_operand_with_inst(&inst.operands[0], inst)
@@ -1808,7 +1960,93 @@ fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) 
         Expr::unknown(&inst.mnemonic)
     };
 
-    // Try to parse condition from mnemonic
+    // Check for ARM64 conditional instructions
+    let mnem_lower = inst.mnemonic.to_lowercase();
+    if let Some(dot_pos) = mnem_lower.find('.') {
+        let prefix = &mnem_lower[..dot_pos];
+
+        // CSEL/CSINC/CSINV/CSNEG have 3 operands: rd, rn, rm
+        // rd = cond ? rn : rm (or variant)
+        if matches!(prefix, "csel" | "csinc" | "csinv" | "csneg") && inst.operands.len() >= 3 {
+            if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+                let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
+                let then_expr = Expr::from_operand_with_inst(&inst.operands[1], inst);
+                let else_expr = Expr::from_operand_with_inst(&inst.operands[2], inst);
+
+                return Expr::assign(
+                    dest,
+                    Expr {
+                        kind: super::expression::ExprKind::Conditional {
+                            cond: Box::new(cond_expr),
+                            then_expr: Box::new(then_expr),
+                            else_expr: Box::new(else_expr),
+                        },
+                    },
+                );
+            }
+        }
+
+        // CINC/CINV/CNEG have 2 operands: rd, rn
+        // cinc: rd = cond ? rn+1 : rn
+        // cinv: rd = cond ? ~rn : rn
+        // cneg: rd = cond ? -rn : rn
+        if matches!(prefix, "cinc" | "cinv" | "cneg") && inst.operands.len() >= 2 {
+            if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+                let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
+                let src_expr = Expr::from_operand_with_inst(&inst.operands[1], inst);
+
+                let then_expr = match prefix {
+                    "cinc" => Expr::binop(
+                        super::expression::BinOpKind::Add,
+                        src_expr.clone(),
+                        Expr::int(1),
+                    ),
+                    "cinv" => Expr::unary(super::expression::UnaryOpKind::Not, src_expr.clone()),
+                    "cneg" => Expr::unary(super::expression::UnaryOpKind::Neg, src_expr.clone()),
+                    _ => src_expr.clone(),
+                };
+
+                return Expr::assign(
+                    dest,
+                    Expr {
+                        kind: super::expression::ExprKind::Conditional {
+                            cond: Box::new(cond_expr),
+                            then_expr: Box::new(then_expr),
+                            else_expr: Box::new(src_expr),
+                        },
+                    },
+                );
+            }
+        }
+
+        // CSET/CSETM have 1 operand: rd
+        // cset: rd = cond ? 1 : 0
+        // csetm: rd = cond ? -1 : 0
+        if matches!(prefix, "cset" | "csetm") && !inst.operands.is_empty() {
+            if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+                let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
+
+                let (then_val, else_val) = if prefix == "csetm" {
+                    (Expr::int(-1), Expr::int(0))
+                } else {
+                    (Expr::int(1), Expr::int(0))
+                };
+
+                return Expr::assign(
+                    dest,
+                    Expr {
+                        kind: super::expression::ExprKind::Conditional {
+                            cond: Box::new(cond_expr),
+                            then_expr: Box::new(then_val),
+                            else_expr: Box::new(else_val),
+                        },
+                    },
+                );
+            }
+        }
+    }
+
+    // Try to parse condition from mnemonic (for CSET, SETcc, etc.)
     if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
         // Get the comparison expression using the block context
         let cond_expr = condition_to_expr_with_block(cond, block);
@@ -2098,16 +2336,23 @@ fn simplify_conditions_in_node(node: StructuredNode) -> StructuredNode {
     }
 }
 
-/// Removes temp register assignments from all blocks.
+/// Removes temp register assignments from all blocks that are not used elsewhere.
+/// Uses liveness analysis to avoid removing temp assignments that are actually used
+/// (e.g., loop accumulators).
 fn remove_temp_assignments(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    // First pass: collect all variable uses in the entire tree
+    let mut uses = HashSet::new();
+    collect_all_uses(&nodes, &mut uses);
+
+    // Second pass: remove only temp assignments where the variable is not used
     nodes
         .into_iter()
-        .map(remove_temp_assignments_in_node)
+        .map(|node| remove_temp_assignments_in_node(node, &uses))
         .collect()
 }
 
 /// Removes temp register assignments from a single node.
-fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
+fn remove_temp_assignments_in_node(node: StructuredNode, uses: &HashSet<String>) -> StructuredNode {
     use super::expression::ExprKind;
 
     match node {
@@ -2121,8 +2366,9 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
                 .filter(|stmt| {
                     if let ExprKind::Assign { lhs, .. } = &stmt.kind {
                         if let ExprKind::Var(v) = &lhs.kind {
-                            if is_temp_register(&v.name) {
-                                return false; // Remove temp assignment
+                            // Only remove temp assignments if the variable is NOT used elsewhere
+                            if is_temp_register(&v.name) && !uses.contains(&v.name) {
+                                return false; // Remove unused temp assignment
                             }
                         }
                     }
@@ -2141,8 +2387,15 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             else_body,
         } => StructuredNode::If {
             condition,
-            then_body: remove_temp_assignments(then_body),
-            else_body: else_body.map(remove_temp_assignments),
+            then_body: then_body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
+            else_body: else_body.map(|e| {
+                e.into_iter()
+                    .map(|n| remove_temp_assignments_in_node(n, uses))
+                    .collect()
+            }),
         },
         StructuredNode::While {
             condition,
@@ -2151,7 +2404,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             exit_block,
         } => StructuredNode::While {
             condition,
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             header,
             exit_block,
         },
@@ -2161,7 +2417,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::DoWhile {
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             condition,
             header,
             exit_block,
@@ -2177,7 +2436,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             init,
             condition,
             update,
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             header,
             exit_block,
         },
@@ -2186,7 +2448,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::Loop {
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             header,
             exit_block,
         },
@@ -2198,11 +2463,27 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             value,
             cases: cases
                 .into_iter()
-                .map(|(vals, body)| (vals, remove_temp_assignments(body)))
+                .map(|(vals, body)| {
+                    (
+                        vals,
+                        body.into_iter()
+                            .map(|n| remove_temp_assignments_in_node(n, uses))
+                            .collect(),
+                    )
+                })
                 .collect(),
-            default: default.map(remove_temp_assignments),
+            default: default.map(|d| {
+                d.into_iter()
+                    .map(|n| remove_temp_assignments_in_node(n, uses))
+                    .collect()
+            }),
         },
-        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(remove_temp_assignments(nodes)),
+        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
+            nodes
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
+        ),
         other => other,
     }
 }

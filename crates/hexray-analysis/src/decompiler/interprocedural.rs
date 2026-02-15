@@ -725,6 +725,151 @@ impl SummaryDatabase {
         );
 
         self.add_known_function(
+            "qsort_r",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::UnsignedInt(64)),
+                    (2, SummaryType::UnsignedInt(64)),
+                    (
+                        3,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::SignedInt(32)),
+                        },
+                    ),
+                    (4, SummaryType::pointer(SummaryType::Void)),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::Void),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "hexray_qsort_r",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::UnsignedInt(64)),
+                    (2, SummaryType::UnsignedInt(64)),
+                    (
+                        3,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::SignedInt(32)),
+                        },
+                    ),
+                    (4, SummaryType::pointer(SummaryType::Void)),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "qsort_s",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::UnsignedInt(64)),
+                    (2, SummaryType::UnsignedInt(64)),
+                    (
+                        3,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::SignedInt(32)),
+                        },
+                    ),
+                    (4, SummaryType::pointer(SummaryType::Void)),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "bsd_qsort_r",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::UnsignedInt(64)),
+                    (2, SummaryType::UnsignedInt(64)),
+                    (3, SummaryType::pointer(SummaryType::Void)),
+                    (
+                        4,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::SignedInt(32)),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::Void),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "hexray_bsd_qsort_r",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (0, SummaryType::pointer(SummaryType::Void)),
+                    (1, SummaryType::UnsignedInt(64)),
+                    (2, SummaryType::UnsignedInt(64)),
+                    (3, SummaryType::pointer(SummaryType::Void)),
+                    (
+                        4,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::SignedInt(32)),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
             "bsearch",
             FunctionSummary {
                 address: 0,
@@ -865,7 +1010,67 @@ impl SummaryDatabase {
         );
 
         self.add_known_function(
+            "hexray_on_exit",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (
+                        0,
+                        SummaryType::FunctionPointer {
+                            params: vec![
+                                SummaryType::SignedInt(32),
+                                SummaryType::pointer(SummaryType::Void),
+                            ],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                    (1, SummaryType::pointer(SummaryType::Void)),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
             "pthread_atfork",
+            FunctionSummary {
+                address: 0,
+                param_types: [
+                    (
+                        0,
+                        SummaryType::FunctionPointer {
+                            params: vec![],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                    (
+                        1,
+                        SummaryType::FunctionPointer {
+                            params: vec![],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                    (
+                        2,
+                        SummaryType::FunctionPointer {
+                            params: vec![],
+                            return_type: Box::new(SummaryType::Void),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                return_type: Some(SummaryType::SignedInt(32)),
+                is_pure: false,
+                ..Default::default()
+            },
+        );
+
+        self.add_known_function(
+            "hexray_pthread_atfork",
             FunctionSummary {
                 address: 0,
                 param_types: [
@@ -1532,10 +1737,50 @@ mod tests {
             qsort.param_types.get(&3),
             Some(SummaryType::FunctionPointer { .. })
         ));
+        let qsort_r = db.get_summary_by_name("qsort_r").unwrap();
+        assert!(matches!(
+            qsort_r.param_types.get(&3),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+        let hexray_qsort_r = db.get_summary_by_name("hexray_qsort_r").unwrap();
+        assert!(matches!(
+            hexray_qsort_r.param_types.get(&3),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+        let bsd_qsort_r = db.get_summary_by_name("bsd_qsort_r").unwrap();
+        assert!(matches!(
+            bsd_qsort_r.param_types.get(&4),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+        let hexray_bsd_qsort_r = db.get_summary_by_name("hexray_bsd_qsort_r").unwrap();
+        assert!(matches!(
+            hexray_bsd_qsort_r.param_types.get(&4),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
 
         let signal = db.get_summary_by_name("signal").unwrap();
         assert!(matches!(
             signal.param_types.get(&1),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+        let on_exit = db.get_summary_by_name("on_exit").unwrap();
+        assert!(matches!(
+            on_exit.param_types.get(&0),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+        let hexray_on_exit = db.get_summary_by_name("hexray_on_exit").unwrap();
+        assert!(matches!(
+            hexray_on_exit.param_types.get(&0),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+        let pthread_atfork = db.get_summary_by_name("pthread_atfork").unwrap();
+        assert!(matches!(
+            pthread_atfork.param_types.get(&0),
+            Some(SummaryType::FunctionPointer { .. })
+        ));
+        let hexray_pthread_atfork = db.get_summary_by_name("hexray_pthread_atfork").unwrap();
+        assert!(matches!(
+            hexray_pthread_atfork.param_types.get(&0),
             Some(SummaryType::FunctionPointer { .. })
         ));
     }

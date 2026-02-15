@@ -1069,7 +1069,16 @@ impl Expr {
             Operation::Add => Self::make_binop(ops, BinOpKind::Add, &inst.mnemonic),
             Operation::Sub => {
                 // Special case: sub reg, reg is a zeroing idiom
-                if ops.len() >= 2 && ops[0] == ops[1] {
+                // For 2-operand (x86): sub eax, eax → ops[0] == ops[1]
+                // For 3-operand (ARM64): subs w8, w8, w8 → ops[1] == ops[2]
+                let is_zeroing = if ops.len() == 2 {
+                    ops[0] == ops[1]
+                } else if ops.len() >= 3 {
+                    ops[1] == ops[2]
+                } else {
+                    false
+                };
+                if is_zeroing {
                     Self::assign(Self::from_operand(&ops[0]), Self::int(0))
                 } else {
                     Self::make_binop(ops, BinOpKind::Sub, &inst.mnemonic)
@@ -1078,13 +1087,50 @@ impl Expr {
             Operation::Mul => Self::make_binop(ops, BinOpKind::Mul, &inst.mnemonic),
             Operation::Div => Self::make_binop(ops, BinOpKind::Div, &inst.mnemonic),
             Operation::And => Self::make_binop(ops, BinOpKind::And, &inst.mnemonic),
-            Operation::Or => Self::make_binop(ops, BinOpKind::Or, &inst.mnemonic),
+            Operation::Or => {
+                // ARM64 ORN: orn rd, rn, rm → rd = rn | ~rm
+                let mnem = inst.mnemonic.to_lowercase();
+                if mnem == "orn" && ops.len() >= 3 {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::binop(
+                            BinOpKind::Or,
+                            Self::from_operand(&ops[1]),
+                            Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[2])),
+                        ),
+                    )
+                } else {
+                    Self::make_binop(ops, BinOpKind::Or, &inst.mnemonic)
+                }
+            }
             Operation::Xor => {
                 // Special case: xor reg, reg is a zeroing idiom
-                if ops.len() >= 2 && ops[0] == ops[1] {
+                // For 2-operand (x86): xor eax, eax → ops[0] == ops[1]
+                // For 3-operand (ARM64): eor w8, w8, w8 → ops[1] == ops[2]
+                let is_zeroing = if ops.len() == 2 {
+                    ops[0] == ops[1]
+                } else if ops.len() >= 3 {
+                    ops[1] == ops[2]
+                } else {
+                    false
+                };
+                if is_zeroing {
                     Self::assign(Self::from_operand(&ops[0]), Self::int(0))
                 } else {
-                    Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic)
+                    // ARM64 EON: eon rd, rn, rm → rd = rn ^ ~rm
+                    let mnem = inst.mnemonic.to_lowercase();
+                    if mnem == "eon" && ops.len() >= 3 {
+                        Self::assign(
+                            Self::from_operand(&ops[0]),
+                            Self::binop(
+                                BinOpKind::Xor,
+                                Self::from_operand(&ops[1]),
+                                Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[2])),
+                            ),
+                        )
+                    } else {
+                        Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic)
+                    }
                 }
             }
             Operation::Shl => Self::make_binop(ops, BinOpKind::Shl, &inst.mnemonic),
@@ -1327,17 +1373,31 @@ impl Expr {
                     Self::unknown(&inst.mnemonic)
                 }
             }
-            // BMI1/BMI2 instructions
+            // BMI1/BMI2 instructions and ARM64 BIC
             Operation::AndNot => {
-                // ANDN: dest = ~src1 & src2
+                // x86 ANDN: dest = ~src1 & src2
+                // ARM64 BIC: dest = src1 & ~src2
                 if ops.len() >= 3 {
-                    Self::assign(
-                        Self::from_operand(&ops[0]),
-                        Self::binop(
-                            BinOpKind::And,
+                    let mnem = inst.mnemonic.to_lowercase();
+                    let is_arm_bic = mnem.starts_with("bic");
+
+                    let (lhs, rhs) = if is_arm_bic {
+                        // ARM64: bic rd, rn, rm → rd = rn & ~rm
+                        (
+                            Self::from_operand(&ops[1]),
+                            Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[2])),
+                        )
+                    } else {
+                        // x86: andn rd, rs1, rs2 → rd = ~rs1 & rs2
+                        (
                             Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[1])),
                             Self::from_operand(&ops[2]),
-                        ),
+                        )
+                    };
+
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::binop(BinOpKind::And, lhs, rhs),
                     )
                 } else {
                     Self::unknown(&inst.mnemonic)
@@ -1611,7 +1671,36 @@ impl Expr {
             }
             Operation::SetConditional => {
                 // SETcc instructions: set byte on condition
-                // The result is assigned to the destination operand (typically a register)
+                // ARM64 CSEL/CSINC/CSINV/CSNEG: conditional select
+                let mnem_lower = inst.mnemonic.to_lowercase();
+
+                // Check for ARM64 conditional select: csel.cond rd, rn, rm
+                if let Some(dot_pos) = mnem_lower.find('.') {
+                    let prefix = &mnem_lower[..dot_pos];
+                    let cond_suffix = &mnem_lower[dot_pos + 1..];
+
+                    if matches!(prefix, "csel" | "csinc" | "csinv" | "csneg") && ops.len() >= 3 {
+                        // Emit as: rd = cond ? rn : rm
+                        // Use condition name as a call (displays as "gt" etc.)
+                        let cond_expr =
+                            Self::call(CallTarget::Named(cond_suffix.to_string()), vec![]);
+                        let then_expr = Self::from_operand(&ops[1]);
+                        let else_expr = Self::from_operand(&ops[2]);
+
+                        return Self::assign(
+                            Self::from_operand(&ops[0]),
+                            Expr {
+                                kind: ExprKind::Conditional {
+                                    cond: Box::new(cond_expr),
+                                    then_expr: Box::new(then_expr),
+                                    else_expr: Box::new(else_expr),
+                                },
+                            },
+                        );
+                    }
+                }
+
+                // Default: assign result of condition check
                 if !ops.is_empty() {
                     Self::assign(
                         Self::from_operand(&ops[0]),

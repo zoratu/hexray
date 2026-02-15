@@ -90,6 +90,21 @@ impl Immediate {
     }
 }
 
+/// ARM64 memory indexing mode.
+///
+/// For load/store instructions with pre/post-indexed addressing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum IndexMode {
+    /// No writeback: `[base, #offset]` or `[base + index]`
+    #[default]
+    None,
+    /// Pre-indexed: `[base, #offset]!` - compute address first, then writeback
+    Pre,
+    /// Post-indexed: `[base], #offset` - use base as address, then add offset
+    Post,
+}
+
 /// Memory reference operand.
 ///
 /// Represents complex memory addressing like `[base + index*scale + disp]`.
@@ -110,6 +125,8 @@ pub struct MemoryRef {
     pub segment: Option<Register>,
     /// EVEX/SVE-style memory broadcast indicator.
     pub broadcast: bool,
+    /// ARM64 index mode (pre/post-indexed with writeback).
+    pub index_mode: IndexMode,
 }
 
 impl MemoryRef {
@@ -123,6 +140,7 @@ impl MemoryRef {
             size,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         }
     }
 
@@ -136,6 +154,26 @@ impl MemoryRef {
             size,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
+        }
+    }
+
+    /// Creates a memory reference with base, displacement, and index mode.
+    pub fn base_disp_indexed(
+        base: Register,
+        displacement: i64,
+        size: u8,
+        index_mode: IndexMode,
+    ) -> Self {
+        Self {
+            base: Some(base),
+            index: None,
+            scale: 1,
+            displacement,
+            size,
+            segment: None,
+            broadcast: false,
+            index_mode,
         }
     }
 
@@ -149,6 +187,7 @@ impl MemoryRef {
             size,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         }
     }
 
@@ -168,6 +207,7 @@ impl MemoryRef {
             size,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         }
     }
 

@@ -485,8 +485,8 @@ impl DataflowSolver {
 mod tests {
     use super::*;
     use hexray_core::{
-        Architecture, BasicBlock, BlockTerminator, Immediate, Instruction, MemoryRef, Operand,
-        Operation, Register, RegisterClass,
+        Architecture, BasicBlock, BlockTerminator, Immediate, IndexMode, Instruction, MemoryRef,
+        Operand, Operation, Register, RegisterClass,
     };
 
     // --- Location Tests ---
@@ -668,6 +668,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             }),
         ];
 
@@ -696,6 +697,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             }),
         ];
 
