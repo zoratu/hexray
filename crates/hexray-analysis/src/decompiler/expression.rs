@@ -1087,7 +1087,22 @@ impl Expr {
             Operation::Mul => Self::make_binop(ops, BinOpKind::Mul, &inst.mnemonic),
             Operation::Div => Self::make_binop(ops, BinOpKind::Div, &inst.mnemonic),
             Operation::And => Self::make_binop(ops, BinOpKind::And, &inst.mnemonic),
-            Operation::Or => Self::make_binop(ops, BinOpKind::Or, &inst.mnemonic),
+            Operation::Or => {
+                // ARM64 ORN: orn rd, rn, rm → rd = rn | ~rm
+                let mnem = inst.mnemonic.to_lowercase();
+                if mnem == "orn" && ops.len() >= 3 {
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::binop(
+                            BinOpKind::Or,
+                            Self::from_operand(&ops[1]),
+                            Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[2])),
+                        ),
+                    )
+                } else {
+                    Self::make_binop(ops, BinOpKind::Or, &inst.mnemonic)
+                }
+            }
             Operation::Xor => {
                 // Special case: xor reg, reg is a zeroing idiom
                 // For 2-operand (x86): xor eax, eax → ops[0] == ops[1]
@@ -1102,7 +1117,20 @@ impl Expr {
                 if is_zeroing {
                     Self::assign(Self::from_operand(&ops[0]), Self::int(0))
                 } else {
-                    Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic)
+                    // ARM64 EON: eon rd, rn, rm → rd = rn ^ ~rm
+                    let mnem = inst.mnemonic.to_lowercase();
+                    if mnem == "eon" && ops.len() >= 3 {
+                        Self::assign(
+                            Self::from_operand(&ops[0]),
+                            Self::binop(
+                                BinOpKind::Xor,
+                                Self::from_operand(&ops[1]),
+                                Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[2])),
+                            ),
+                        )
+                    } else {
+                        Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic)
+                    }
                 }
             }
             Operation::Shl => Self::make_binop(ops, BinOpKind::Shl, &inst.mnemonic),
@@ -1345,17 +1373,31 @@ impl Expr {
                     Self::unknown(&inst.mnemonic)
                 }
             }
-            // BMI1/BMI2 instructions
+            // BMI1/BMI2 instructions and ARM64 BIC
             Operation::AndNot => {
-                // ANDN: dest = ~src1 & src2
+                // x86 ANDN: dest = ~src1 & src2
+                // ARM64 BIC: dest = src1 & ~src2
                 if ops.len() >= 3 {
-                    Self::assign(
-                        Self::from_operand(&ops[0]),
-                        Self::binop(
-                            BinOpKind::And,
+                    let mnem = inst.mnemonic.to_lowercase();
+                    let is_arm_bic = mnem.starts_with("bic");
+
+                    let (lhs, rhs) = if is_arm_bic {
+                        // ARM64: bic rd, rn, rm → rd = rn & ~rm
+                        (
+                            Self::from_operand(&ops[1]),
+                            Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[2])),
+                        )
+                    } else {
+                        // x86: andn rd, rs1, rs2 → rd = ~rs1 & rs2
+                        (
                             Self::unary(UnaryOpKind::Not, Self::from_operand(&ops[1])),
                             Self::from_operand(&ops[2]),
-                        ),
+                        )
+                    };
+
+                    Self::assign(
+                        Self::from_operand(&ops[0]),
+                        Self::binop(BinOpKind::And, lhs, rhs),
                     )
                 } else {
                     Self::unknown(&inst.mnemonic)

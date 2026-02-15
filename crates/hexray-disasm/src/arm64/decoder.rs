@@ -2122,13 +2122,13 @@ impl Arm64Disassembler {
 
         let (base_mnemonic, operation, set_flags) = match (opc, n) {
             (0b00, 0) => ("and", Operation::And, false),
-            (0b00, 1) => ("bic", Operation::And, false), // AND NOT
+            (0b00, 1) => ("bic", Operation::AndNot, false), // rd = rn & ~rm
             (0b01, 0) => ("orr", Operation::Or, false),
-            (0b01, 1) => ("orn", Operation::Or, false), // OR NOT
+            (0b01, 1) => ("orn", Operation::Or, false), // OR NOT (handled in emitter via mnemonic)
             (0b10, 0) => ("eor", Operation::Xor, false),
-            (0b10, 1) => ("eon", Operation::Xor, false), // XOR NOT
+            (0b10, 1) => ("eon", Operation::Xor, false), // XOR NOT (handled in emitter via mnemonic)
             (0b11, 0) => ("ands", Operation::And, true),
-            (0b11, 1) => ("bics", Operation::And, true),
+            (0b11, 1) => ("bics", Operation::AndNot, true), // rd = rn & ~rm, sets flags
             _ => unreachable!(),
         };
 
