@@ -2022,7 +2022,7 @@ fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) 
         // CSET/CSETM have 1 operand: rd
         // cset: rd = cond ? 1 : 0
         // csetm: rd = cond ? -1 : 0
-        if matches!(prefix, "cset" | "csetm") && inst.operands.len() >= 1 {
+        if matches!(prefix, "cset" | "csetm") && !inst.operands.is_empty() {
             if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
                 let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
 
