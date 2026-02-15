@@ -19,9 +19,11 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - CLI callback fixture coverage now includes portable shim-backed APIs (`hexray_qsort_r`, `hexray_bsd_qsort_r`, `hexray_on_exit`, `hexray_pthread_atfork`) with end-to-end header assertions.
 - Callback benchmark quality floors were raised to `0.95`, and callback-index stability now enforces both precision and recall gates.
 - Signature recovery now infers non-void return forwarding for tail-position call wrappers when API/summary return types are known.
+- Callback alias tracking now retains candidate index sets, avoiding unstable last-writer alias overwrites under lifted alias reuse.
+- Slot-0 callback APIs now bias shape-fallback toward the lowest viable parameter index, which stabilizes wrappers like `on_exit` on canonical callback parameters.
 
 Remaining high-value follow-up:
-- Improve callback-parameter index attribution under heavy stack-slot alias reuse so shim wrappers stabilize on canonical parameter positions in strict mode.
+- Continue reducing shape-fallback reliance in callback wrappers by expanding precise alias resolution for lifted temporaries.
 
 ## Priority 1: Critical Issues
 
