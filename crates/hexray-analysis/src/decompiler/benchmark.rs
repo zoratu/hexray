@@ -1518,6 +1518,71 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .with_min_callback_index_recall(1.0),
     );
 
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_on_exit_arg0")
+            .with_description("on_exit callback index stability pins callback to arg0")
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_on_exit(cb, ctx);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_on_exit".to_string(),
+            })
+            .expect_fp_decl("void (*arg0)(int32_t, void*)")
+            .expect_callback_param_index(0)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_pthread_atfork_args012")
+            .with_description(
+                "pthread_atfork callback index stability keeps prepare/parent/child slots",
+            )
+            .with_category("functions")
+            .with_difficulty(4)
+            .with_source("hexray_pthread_atfork(prepare, parent, child);")
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_pthread_atfork".to_string(),
+            })
+            .expect_fp_decl("void (*arg0)(void)")
+            .expect_fp_decl("void (*arg1)(void)")
+            .expect_fp_decl("void (*arg2)(void)")
+            .expect_callback_param_index(0)
+            .expect_callback_param_index(1)
+            .expect_callback_param_index(2)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_hexray_pthread_atfork_alias_reuse")
+            .with_description(
+                "pthread_atfork callback index stability survives alias reuse across callback slots",
+            )
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "tmp = prepare; tmp = parent; tmp = child; hexray_pthread_atfork(tmp, tmp, tmp);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "hexray_pthread_atfork".to_string(),
+            })
+            .expect_fp_decl("void (*arg0)(void)")
+            .expect_fp_decl("void (*arg1)(void)")
+            .expect_fp_decl("void (*arg2)(void)")
+            .expect_callback_param_index(0)
+            .expect_callback_param_index(1)
+            .expect_callback_param_index(2)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
     // Struct patterns
     suite.add_case(
         BenchmarkCase::new("struct_access")
@@ -2026,6 +2091,9 @@ mod tests {
             "callback_index_stability_bsd_qsort_r_arg4",
             "callback_index_stability_hexray_qsort_r_arg3",
             "callback_index_stability_hexray_bsd_qsort_r_arg4",
+            "callback_index_stability_hexray_on_exit_arg0",
+            "callback_index_stability_hexray_pthread_atfork_args012",
+            "callback_index_stability_hexray_pthread_atfork_alias_reuse",
         ];
         for id in callback_index_ids {
             let case = suite
@@ -2086,6 +2154,50 @@ mod tests {
         assert_eq!(fail.callback_index_predicted, 1);
         assert_eq!(fail.callback_index_precision, 0.0);
         assert_eq!(fail.callback_index_recall, 0.0);
+    }
+
+    #[test]
+    fn test_callback_index_recall_metric_multi_slot() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(
+            BenchmarkCase::new("callback_index_multi")
+                .expect_fp_decl("void (*arg0)(void)")
+                .expect_fp_decl("void (*arg1)(void)")
+                .expect_fp_decl("void (*arg2)(void)")
+                .expect_callback_param_index(0)
+                .expect_callback_param_index(1)
+                .expect_callback_param_index(2)
+                .with_min_callback_index_precision(1.0)
+                .with_min_callback_index_recall(1.0),
+        );
+
+        let pass_results = suite.run_all(|_| {
+            Ok(
+                "int32_t f(void (*arg0)(void), void (*arg1)(void), void (*arg2)(void)) { return 0; }"
+                    .to_string(),
+            )
+        });
+        assert_eq!(pass_results.passed, 1);
+        let pass = &pass_results.case_results[0];
+        assert_eq!(pass.callback_index_true_positives, 3);
+        assert_eq!(pass.callback_index_expected, 3);
+        assert_eq!(pass.callback_index_predicted, 3);
+        assert_eq!(pass.callback_index_precision, 1.0);
+        assert_eq!(pass.callback_index_recall, 1.0);
+
+        let fail_results = suite.run_all(|_| {
+            Ok(
+                "int32_t f(void (*arg0)(void), void (*arg2)(void), int64_t arg1) { return 0; }"
+                    .to_string(),
+            )
+        });
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.callback_index_true_positives, 2);
+        assert_eq!(fail.callback_index_expected, 3);
+        assert_eq!(fail.callback_index_predicted, 2);
+        assert_eq!(fail.callback_index_precision, 1.0);
+        assert_eq!(fail.callback_index_recall, 2.0 / 3.0);
     }
 
     #[test]
