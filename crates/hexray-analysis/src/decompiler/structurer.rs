@@ -1513,7 +1513,7 @@ fn condition_to_expr_before_address(
     }
 
     // Find the last compare instruction in the block (before the given address if specified)
-    // This includes CMP, TEST, SUB/SUBS, and ANDS instructions
+    // This includes CMP, TEST, SUB/SUBS, ANDS, and NEG instructions
     let compare_inst = block
         .instructions
         .iter()
@@ -1525,11 +1525,29 @@ fn condition_to_expr_before_address(
         .find(|inst| {
             matches!(
                 inst.operation,
-                Operation::Compare | Operation::Test | Operation::Sub
+                Operation::Compare | Operation::Test | Operation::Sub | Operation::Neg
             ) || (matches!(inst.operation, Operation::And) && inst.mnemonic.ends_with('s'))
         });
 
     if let Some(inst) = compare_inst {
+        // For NEG instructions, flags reflect the negated result
+        // neg eax: SF set if (-eax) < 0, i.e., eax > 0
+        // For Sign condition after NEG, we need "operand > 0" (or < 0 for inverted)
+        if matches!(inst.operation, Operation::Neg) && !inst.operands.is_empty() {
+            let operand = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[0], inst),
+                &reg_values,
+            );
+            // NEG sets SF if result is negative, meaning original was positive
+            // So Sign (SF) after NEG means original > 0
+            let neg_op = match cond {
+                Condition::Sign => BinOpKind::Gt,    // SF set means orig > 0
+                Condition::NotSign => BinOpKind::Le, // SF clear means orig <= 0
+                _ => op,                             // Use default mapping for other conditions
+            };
+            return Expr::binop(neg_op, operand, Expr::int(0));
+        }
+
         // For SUB/SUBS instructions (ARM64), operands are [dst, src1, src2]
         // The comparison is between src1 and src2
         if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Sub) {
