@@ -977,7 +977,13 @@ impl<'a> Structurer<'a> {
                 // Get condition from header's conditional branch
                 let (condition, body_start) = self.get_while_condition(header, &info);
                 let body = if let Some(start) = body_start {
-                    self.structure_region(start, Some(header))
+                    if start == header {
+                        // Self-loop: the header IS the body. Use structure_loop_body
+                        // to include the header's statements in the body.
+                        self.structure_loop_body(header, &info)
+                    } else {
+                        self.structure_region(start, Some(header))
+                    }
                 } else {
                     vec![]
                 };
