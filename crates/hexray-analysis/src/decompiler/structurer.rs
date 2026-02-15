@@ -5,7 +5,8 @@
 #![allow(dead_code)]
 
 use hexray_core::{
-    cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, Operation,
+    cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, IndexMode,
+    Operand, Operation,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1399,12 +1400,21 @@ impl<'a> Structurer<'a> {
                 }
                 true
             })
-            .map(|(_, inst)| {
+            .flat_map(|(_, inst)| {
                 // Special handling for SETcc and CMOVcc to use block context
-                match inst.operation {
+                let main_expr = match inst.operation {
                     Operation::SetConditional => lift_setcc_with_context(inst, block),
                     Operation::ConditionalMove => lift_cmovcc_with_context(inst, block),
                     _ => Expr::from_instruction(inst),
+                };
+
+                // Generate writeback expressions for post-indexed loads/stores
+                let writeback = generate_writeback_expr(inst);
+
+                if let Some(wb) = writeback {
+                    vec![main_expr, wb]
+                } else {
+                    vec![main_expr]
                 }
             })
             .collect();
@@ -1896,6 +1906,48 @@ fn parse_arm64_condition(suffix: &str) -> Option<Condition> {
         // "al" (always) shouldn't appear in cset - just ignore it
         _ => None,
     }
+}
+
+/// Generates a writeback expression for post-indexed load/store instructions.
+///
+/// For ARM64 post-indexed addressing like `ldrb w9, [x8], #1`:
+/// - The main load is: w9 = *x8
+/// - The writeback is: x8 = x8 + 1
+///
+/// Returns None if no writeback is needed.
+fn generate_writeback_expr(inst: &hexray_core::Instruction) -> Option<Expr> {
+    use super::expression::{ExprKind, VarKind, Variable};
+
+    // Check if this is a load or store operation
+    if !matches!(inst.operation, Operation::Load | Operation::Store) {
+        return None;
+    }
+
+    // Find the memory operand with pre/post-indexed mode
+    for operand in &inst.operands {
+        if let Operand::Memory(mem) = operand {
+            if mem.index_mode == IndexMode::Post || mem.index_mode == IndexMode::Pre {
+                // Both pre and post-indexed have writeback: base = base + displacement
+                if let Some(base_reg) = &mem.base {
+                    let base_name = base_reg.name().to_lowercase();
+                    let base_var = Expr {
+                        kind: ExprKind::Var(Variable {
+                            name: base_name.clone(),
+                            kind: VarKind::Register(base_reg.id),
+                            size: (base_reg.size / 8) as u8,
+                        }),
+                    };
+
+                    // Create: base = base + displacement
+                    let offset_expr = Expr::int(mem.displacement as i128);
+                    let add_expr = Expr::binop(BinOpKind::Add, base_var.clone(), offset_expr);
+                    return Some(Expr::assign(base_var, add_expr));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Lifts a SETcc instruction with block context to get the actual comparison.
