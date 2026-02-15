@@ -955,8 +955,8 @@ fn test_decompile_callback_diagnostics() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[source=shape-fallback] preferred lowest candidate for slot-0 callback"),
-        "Diagnostics should include slot-0 callback fallback provenance:\n{}",
+        stdout.contains("[source=slot-fallback]"),
+        "Diagnostics should include slot-0 callback slot-fallback provenance:\n{}",
         stdout
     );
 }

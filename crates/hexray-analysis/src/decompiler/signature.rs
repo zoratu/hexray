@@ -1235,14 +1235,14 @@ impl SignatureRecovery {
                         let mut resolved_param_idx = self.resolve_param_index_from_expr(arg);
                         let mut used_shape_fallback = false;
                         let mut used_slot_fallback = false;
-                        let mut used_slot_zero_bias = false;
                         if is_callback_slot && resolved_param_idx.is_none() {
                             let callback_slots = self.callback_slot_indices(fn_name);
-                            if callback_slots.len() > 1
-                                && Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                            if Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                                && (callback_slots.len() > 1 || callback_slots.as_slice() == [0])
                             {
-                                // Multi-callback APIs (e.g., pthread_atfork) often map each
-                                // callback slot to the same-ordinal parameter.
+                                // APIs that preserve callback ordering in wrappers
+                                // (e.g., pthread_atfork, on_exit) often map callback slots
+                                // directly to same-ordinal parameters.
                                 resolved_param_idx = Some(i);
                                 used_slot_fallback = true;
                             } else {
@@ -1260,19 +1260,9 @@ impl SignatureRecovery {
                                         excluded.insert(other_idx);
                                     }
                                 }
-                                resolved_param_idx = if callback_slots.as_slice() == [0] {
-                                    let slot0_choice = self
-                                        .fallback_callback_param_index_excluding_lowest(&excluded);
-                                    used_slot_zero_bias = slot0_choice.is_some();
-                                    slot0_choice
-                                        .or_else(|| {
-                                            self.fallback_callback_param_index_excluding(&excluded)
-                                        })
-                                        .or_else(|| self.fallback_callback_param_index())
-                                } else {
-                                    self.fallback_callback_param_index_excluding(&excluded)
-                                        .or_else(|| self.fallback_callback_param_index())
-                                };
+                                resolved_param_idx = self
+                                    .fallback_callback_param_index_excluding(&excluded)
+                                    .or_else(|| self.fallback_callback_param_index());
                                 used_shape_fallback = resolved_param_idx.is_some();
                             }
                         }
@@ -1303,12 +1293,6 @@ impl SignatureRecovery {
                                         "[source=shape-fallback] mapped callback slot '{}' argument {} by ABI-shaped fallback",
                                         fn_name, i
                                     ));
-                                    if used_slot_zero_bias {
-                                        hints.add_function_pointer_reason(
-                                            "[source=shape-fallback] preferred lowest candidate for slot-0 callback"
-                                                .to_string(),
-                                        );
-                                    }
                                 }
                                 if used_slot_fallback {
                                     hints.add_function_pointer_reason(format!(
@@ -1742,35 +1726,6 @@ impl SignatureRecovery {
             .find(|idx| !excluded.contains(idx))
     }
 
-    fn fallback_callback_param_index_excluding_lowest(
-        &self,
-        excluded: &HashSet<usize>,
-    ) -> Option<usize> {
-        let mut candidates = BTreeSet::new();
-        for idx in self
-            .read_regs
-            .iter()
-            .filter_map(|name| self.arg_register_index(name))
-        {
-            candidates.insert(idx);
-        }
-        for idx in self
-            .written_regs
-            .iter()
-            .filter_map(|name| self.arg_register_index(name))
-        {
-            candidates.insert(idx);
-        }
-        for idx in self
-            .function_pointer_aliases
-            .values()
-            .flat_map(|indices| indices.iter().copied())
-        {
-            candidates.insert(idx);
-        }
-        candidates.into_iter().find(|idx| !excluded.contains(idx))
-    }
-
     fn callback_slot_indices(&self, function_name: &str) -> Vec<usize> {
         (0..8)
             .filter(|idx| ParameterUsageHints::callback_signature(function_name, *idx).is_some())
@@ -1780,7 +1735,7 @@ impl SignatureRecovery {
     fn prefer_slot_ordinal_callback_fallback(function_name: &str) -> bool {
         matches!(
             ParameterUsageHints::normalize_callback_name(function_name),
-            "pthread_atfork" | "hexray_pthread_atfork"
+            "pthread_atfork" | "hexray_pthread_atfork" | "on_exit" | "hexray_on_exit"
         )
     }
 
@@ -3196,7 +3151,7 @@ mod tests {
     }
 
     #[test]
-    fn test_signature_recovery_prefers_lowest_shape_fallback_for_slot0_callback() {
+    fn test_signature_recovery_uses_slot_ordinal_fallback_for_slot0_callback() {
         use hexray_core::BasicBlockId;
 
         let keep_arg0_live =
