@@ -611,6 +611,59 @@ impl PseudoCodeEmitter {
         self.format_lvalue(expr, &empty)
     }
 
+    /// Formats a binary operation's operand, adding parentheses if needed based on precedence.
+    /// The child expression needs parentheses if it has lower precedence than the parent operator,
+    /// or if it's on the right side of a left-associative operator with the same precedence.
+    fn format_binop_operand(
+        &self,
+        expr: &Expr,
+        parent_op: BinOpKind,
+        is_right_side: bool,
+        table: &StringTable,
+    ) -> String {
+        let expr_str = self.format_expr_with_strings(expr, table);
+
+        // Check if we need to add parentheses based on precedence
+        if let ExprKind::BinOp { op: child_op, .. } = &expr.kind {
+            let child_precedence = child_op.precedence();
+            let parent_precedence = parent_op.precedence();
+
+            // Add parentheses if:
+            // 1. Child has lower precedence than parent
+            // 2. For right side of left-associative operators with same precedence
+            if child_precedence < parent_precedence
+                || (child_precedence == parent_precedence
+                    && is_right_side
+                    && matches!(
+                        parent_op,
+                        BinOpKind::Sub
+                            | BinOpKind::Div
+                            | BinOpKind::Mod
+                            | BinOpKind::Shr
+                            | BinOpKind::Sar
+                    ))
+            {
+                return format!("({})", expr_str);
+            }
+        }
+
+        expr_str
+    }
+
+    /// Formats an expression as the base of a postfix operation (array subscript, member access).
+    /// Adds parentheses if the base is a binary operation, since [] and . bind tighter than any binary operator.
+    fn format_postfix_base(&self, expr: &Expr, table: &StringTable) -> String {
+        let expr_str = self.format_expr_with_strings(expr, table);
+
+        // Postfix operators ([] and .) have the highest precedence.
+        // Any binary operation as a base needs parentheses.
+        if matches!(&expr.kind, ExprKind::BinOp { .. }) {
+            return format!("({})", expr_str);
+        }
+
+        expr_str
+    }
+
     /// Normalizes known libc global symbols to user-friendly names.
     fn simplify_libc_global_name(&self, raw: &str) -> Option<&'static str> {
         let mut sym = raw;
@@ -801,12 +854,10 @@ impl PseudoCodeEmitter {
                         self.format_char_comparison_operands(left, right, table);
                     format!("{} {} {}", left_str, op.as_str(), right_str)
                 } else {
-                    format!(
-                        "{} {} {}",
-                        self.format_expr_with_strings(left, table),
-                        op.as_str(),
-                        self.format_expr_with_strings(right, table)
-                    )
+                    // Use precedence-aware formatting for arithmetic operations
+                    let left_str = self.format_binop_operand(left, *op, false, table);
+                    let right_str = self.format_binop_operand(right, *op, true, table);
+                    format!("{} {} {}", left_str, op.as_str(), right_str)
                 }
             }
             ExprKind::UnaryOp { op, operand } => {
@@ -834,7 +885,9 @@ impl PseudoCodeEmitter {
                 // Check if this is an array access pattern: base + index * size
                 if let Some((base, index)) = try_extract_array_access(addr, *size) {
                     // Don't resolve strings in array base/index - those should be pointers
-                    let base_str = self.format_expr_no_string_resolve(&base);
+                    // Use format_postfix_base to add parentheses if base is a binary operation
+                    let empty = super::StringTable::new();
+                    let base_str = self.format_postfix_base(&base, &empty);
                     let index_str = self.format_expr_no_string_resolve(&index);
                     return format!("{}[{}]", base_str, index_str);
                 }
@@ -1036,6 +1089,11 @@ impl PseudoCodeEmitter {
                 if name_lower == "wzr" || name_lower == "xzr" {
                     // ARM64 zero register represents constant 0
                     "0".to_string()
+                } else if matches!(name_lower.as_str(), "rip" | "eip") {
+                    // RIP/EIP should not appear in output - these should have been resolved
+                    // to GotRef during analysis. If they appear here, it's likely an unresolved
+                    // RIP-relative access. Show as a placeholder to avoid confusing output.
+                    "/* unresolved_pc_relative */".to_string()
                 } else {
                     // Rename callee-saved registers to meaningful names
                     // These are commonly used to hold return values/error codes
@@ -1099,7 +1157,8 @@ impl PseudoCodeEmitter {
             ExprKind::FieldAccess {
                 base, field_name, ..
             } => {
-                let base_str = self.format_expr_with_strings(base, table);
+                // Use parentheses if base is a binary operation (postfix has highest precedence)
+                let base_str = self.format_postfix_base(base, table);
                 // Use -> for pointer access (most common in decompiled code)
                 format!("{}->{}", base_str, field_name)
             }
@@ -1171,7 +1230,8 @@ impl PseudoCodeEmitter {
                     }
                 }
                 // Default array access formatting
-                let base_str = self.format_expr_with_strings(base, table);
+                // Use parentheses if base is a binary operation (postfix has highest precedence)
+                let base_str = self.format_postfix_base(base, table);
                 let index_str = self.format_expr_with_strings(index, table);
                 format!("{}[{}]", base_str, index_str)
             }
@@ -1500,41 +1560,67 @@ impl PseudoCodeEmitter {
                     if self.is_prologue_epilogue(stmt) {
                         continue;
                     }
-                    if let ExprKind::Assign { lhs, .. } = &stmt.kind {
-                        // Use try_format_stack_slot to get DWARF-aware variable name
-                        if let Some(var_name) = self.try_get_var_name(lhs) {
-                            vars.insert(var_name);
-                        }
-                    }
+                    // Collect variables from entire statement expression
+                    self.collect_vars_from_expr(stmt, vars);
                 }
             }
             StructuredNode::If {
+                condition,
                 then_body,
                 else_body,
                 ..
             } => {
+                // Collect variables from condition
+                self.collect_vars_from_expr(condition, vars);
                 self.collect_vars_from_nodes(then_body, vars);
                 if let Some(else_nodes) = else_body {
                     self.collect_vars_from_nodes(else_nodes, vars);
                 }
             }
-            StructuredNode::While { body, .. }
-            | StructuredNode::DoWhile { body, .. }
-            | StructuredNode::Loop { body, .. } => {
+            StructuredNode::While {
+                condition, body, ..
+            } => {
+                // Collect variables from condition
+                self.collect_vars_from_expr(condition, vars);
                 self.collect_vars_from_nodes(body, vars);
             }
-            StructuredNode::For { init, body, .. } => {
-                // Collect variable from init expression (e.g., for (i = 0; ...))
+            StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
+                // Collect variables from condition
+                self.collect_vars_from_expr(condition, vars);
+                self.collect_vars_from_nodes(body, vars);
+            }
+            StructuredNode::Loop { body, .. } => {
+                self.collect_vars_from_nodes(body, vars);
+            }
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
+                // Collect variables from init expression
                 if let Some(init_expr) = init {
-                    if let ExprKind::Assign { lhs, .. } = &init_expr.kind {
-                        if let Some(var_name) = self.try_get_var_name(lhs) {
-                            vars.insert(var_name);
-                        }
-                    }
+                    self.collect_vars_from_expr(init_expr, vars);
+                }
+                // Collect variables from condition
+                self.collect_vars_from_expr(condition, vars);
+                // Collect variables from update expression
+                if let Some(update_expr) = update {
+                    self.collect_vars_from_expr(update_expr, vars);
                 }
                 self.collect_vars_from_nodes(body, vars);
             }
-            StructuredNode::Switch { cases, default, .. } => {
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+                ..
+            } => {
+                // Collect variables from switch expression
+                self.collect_vars_from_expr(value, vars);
                 for (_, case_body) in cases {
                     self.collect_vars_from_nodes(case_body, vars);
                 }
@@ -1545,7 +1631,108 @@ impl PseudoCodeEmitter {
             StructuredNode::Sequence(nodes) => {
                 self.collect_vars_from_nodes(nodes, vars);
             }
+            StructuredNode::Return(Some(expr)) => {
+                // Collect variables from return expression
+                self.collect_vars_from_expr(expr, vars);
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                self.collect_vars_from_nodes(try_body, vars);
+                for handler in catch_handlers {
+                    self.collect_vars_from_nodes(&handler.body, vars);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Recursively collects all variable names used in an expression.
+    /// This includes variables on both LHS and RHS of assignments, in conditions, etc.
+    fn collect_vars_from_expr(&self, expr: &Expr, vars: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Var(v) => {
+                // Collect simple variable references
+                if v.name.starts_with("var_")
+                    || v.name.starts_with("local_")
+                    || v.name.starts_with("arg_")
+                {
+                    vars.insert(v.name.clone());
+                }
+            }
+            ExprKind::Deref { addr, .. } => {
+                // Try to get the variable name from the dereference
+                if let Some(var_name) = self.try_get_var_name(expr) {
+                    vars.insert(var_name);
+                }
+                // Also collect variables from the address expression
+                self.collect_vars_from_expr(addr, vars);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.collect_vars_from_expr(left, vars);
+                self.collect_vars_from_expr(right, vars);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                self.collect_vars_from_expr(operand, vars);
+            }
+            ExprKind::AddressOf(expr) => {
+                self.collect_vars_from_expr(expr, vars);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.collect_vars_from_expr(base, vars);
+                self.collect_vars_from_expr(index, vars);
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                self.collect_vars_from_expr(base, vars);
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.collect_vars_from_expr(arg, vars);
+                }
+            }
+            ExprKind::Assign { lhs, rhs } => {
+                // Collect from LHS (for variable declarations)
+                if let Some(var_name) = self.try_get_var_name(lhs) {
+                    vars.insert(var_name);
+                }
+                // Also collect variables used in LHS address computation
+                self.collect_vars_from_expr(lhs, vars);
+                // Collect from RHS
+                self.collect_vars_from_expr(rhs, vars);
+            }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                if let Some(var_name) = self.try_get_var_name(lhs) {
+                    vars.insert(var_name);
+                }
+                self.collect_vars_from_expr(lhs, vars);
+                self.collect_vars_from_expr(rhs, vars);
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_vars_from_expr(cond, vars);
+                self.collect_vars_from_expr(then_expr, vars);
+                self.collect_vars_from_expr(else_expr, vars);
+            }
+            ExprKind::Cast { expr, .. } => {
+                self.collect_vars_from_expr(expr, vars);
+            }
+            ExprKind::BitField { expr, .. } => {
+                self.collect_vars_from_expr(expr, vars);
+            }
+            ExprKind::Phi(exprs) => {
+                for e in exprs {
+                    self.collect_vars_from_expr(e, vars);
+                }
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                self.collect_vars_from_expr(display_expr, vars);
+            }
+            // Literals don't contain variables
+            ExprKind::IntLit(_) | ExprKind::Unknown(_) => {}
         }
     }
 
@@ -2868,7 +3055,45 @@ impl PseudoCodeEmitter {
 
 /// Formats an integer for C output.
 /// Uses decimal for "normal" values and hex for large addresses.
+fn recognize_magic_constant(value: i128) -> Option<&'static str> {
+    let n = value as u64;
+    match n {
+        0xDEADBEEFDEADBEEF => Some("DEADBEEF_DEADBEEF"),
+        0xdead000000000000 => Some("POISON_POINTER_DELTA"),
+        0xDEADBEEF => Some("DEADBEEF"),
+        0xFEEDFACE => Some("FEEDFACE"),
+        0xCAFEBABE => Some("CAFEBABE"),
+        0xDEADC0DE => Some("DEADC0DE"),
+        0xBADC0DE => Some("BADC0DE"),
+        0xCCCCCCCC => Some("CCCCCCCC"),
+        0xCDCDCDCD => Some("CDCDCDCD"),
+        0x00100100 => Some("LIST_POISON1"),
+        0x00200200 => Some("LIST_POISON2"),
+        _ => {
+            if value < 0 {
+                let abs_val = (-value) as u64;
+                match abs_val {
+                    0xDEADBEEF => Some("DEADBEEF"),
+                    0xFEEDFACE => Some("FEEDFACE"),
+                    0xCAFEBABE => Some("CAFEBABE"),
+                    0xDEADC0DE => Some("DEADC0DE"),
+                    0xBADC0DE => Some("BADC0DE"),
+                    0xCCCCCCCC => Some("CCCCCCCC"),
+                    0xCDCDCDCD => Some("CDCDCDCD"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn format_integer(n: i128) -> String {
+    if let Some(constant_name) = recognize_magic_constant(n) {
+        return constant_name.to_string();
+    }
+
     if n < 0 {
         // Negative numbers in decimal
         format!("{}", n)

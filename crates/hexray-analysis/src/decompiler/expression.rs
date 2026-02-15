@@ -2,8 +2,10 @@
 //!
 //! Converts low-level instructions into high-level expressions.
 
-use hexray_core::{Instruction, MemoryRef, Operand, Operation, Register};
+use hexray_core::{Architecture, Instruction, MemoryRef, Operand, Operation, Register};
 use std::fmt;
+
+use super::abi;
 
 /// A high-level expression.
 #[derive(Debug, Clone)]
@@ -323,11 +325,28 @@ pub enum VarKind {
 
 impl Variable {
     /// Creates a register variable.
+    ///
+    /// For x86-64, this normalizes partial register accesses to their 64-bit form:
+    /// - al, ah, ax, eax → rax
+    /// - bl, bh, bx, ebx → rbx
+    /// - etc.
+    ///
+    /// The original size is preserved in the size field.
     pub fn from_register(reg: &Register) -> Self {
+        let reg_name = reg.name();
+        let size_bytes = (reg.size / 8) as u8;
+
+        // Normalize x86-64 partial registers to their 64-bit form
+        let (normalized_name, original_size) = if matches!(reg.arch, Architecture::X86_64) {
+            abi::normalize_x86_64_register(reg_name, size_bytes).unwrap_or((reg_name, size_bytes))
+        } else {
+            (reg_name, size_bytes)
+        };
+
         Self {
             kind: VarKind::Register(reg.id),
-            name: reg.name().to_string(),
-            size: (reg.size / 8) as u8,
+            name: normalized_name.to_string(),
+            size: original_size,
         }
     }
 
@@ -2901,6 +2920,7 @@ fn extract_scaled_index_from_expr(expr: &Expr) -> Option<(Expr, i128)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hexray_core::{Architecture, Register, RegisterClass};
 
     #[test]
     fn test_constant_folding_arithmetic() {
@@ -4130,5 +4150,74 @@ mod tests {
             }
             other => panic!("Expected nested Cast, got {:?}", other),
         }
+    }
+    #[test]
+    fn test_register_normalization_8bit() {
+        // Test 8-bit register normalization
+        let reg_al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8); // al
+        let var_al = Variable::from_register(&reg_al);
+        assert_eq!(var_al.name, "rax");
+        assert_eq!(var_al.size, 1);
+
+        let reg_bl = Register::new(Architecture::X86_64, RegisterClass::General, 3, 8); // bl
+        let var_bl = Variable::from_register(&reg_bl);
+        assert_eq!(var_bl.name, "rbx");
+        assert_eq!(var_bl.size, 1);
+    }
+
+    #[test]
+    fn test_register_normalization_16bit() {
+        // Test 16-bit register normalization
+        let reg_ax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 16); // ax
+        let var_ax = Variable::from_register(&reg_ax);
+        assert_eq!(var_ax.name, "rax");
+        assert_eq!(var_ax.size, 2);
+
+        let reg_dx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 16); // dx
+        let var_dx = Variable::from_register(&reg_dx);
+        assert_eq!(var_dx.name, "rdx");
+        assert_eq!(var_dx.size, 2);
+    }
+
+    #[test]
+    fn test_register_normalization_32bit() {
+        // Test 32-bit register normalization
+        let reg_eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32); // eax
+        let var_eax = Variable::from_register(&reg_eax);
+        assert_eq!(var_eax.name, "rax");
+        assert_eq!(var_eax.size, 4);
+
+        let reg_ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32); // ecx
+        let var_ecx = Variable::from_register(&reg_ecx);
+        assert_eq!(var_ecx.name, "rcx");
+        assert_eq!(var_ecx.size, 4);
+    }
+
+    #[test]
+    fn test_register_normalization_64bit() {
+        // Test that 64-bit registers stay the same
+        let reg_rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64); // rax
+        let var_rax = Variable::from_register(&reg_rax);
+        assert_eq!(var_rax.name, "rax");
+        assert_eq!(var_rax.size, 8);
+
+        let reg_r8 = Register::new(Architecture::X86_64, RegisterClass::General, 8, 64); // r8
+        let var_r8 = Variable::from_register(&reg_r8);
+        assert_eq!(var_r8.name, "r8");
+        assert_eq!(var_r8.size, 8);
+    }
+
+    #[test]
+    fn test_register_normalization_arm64_unchanged() {
+        // Test that ARM64 registers are not affected
+        let reg_x0 = Register::new(Architecture::Arm64, RegisterClass::General, 0, 64); // x0
+        let var_x0 = Variable::from_register(&reg_x0);
+        assert_eq!(var_x0.name, "x0");
+        assert_eq!(var_x0.size, 8);
+
+        let reg_w0 = Register::new(Architecture::Arm64, RegisterClass::General, 0, 32); // w0
+        let var_w0 = Variable::from_register(&reg_w0);
+        assert_eq!(var_w0.name, "w0");
+        assert_eq!(var_w0.size, 4);
     }
 }

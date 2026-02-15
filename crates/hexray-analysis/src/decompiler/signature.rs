@@ -2201,8 +2201,8 @@ impl SignatureRecovery {
         let int_regs = self.convention.integer_arg_registers();
         let int_regs_32 = self.convention.integer_arg_registers_32();
 
-        // Track the highest argument index used
-        let mut max_int_arg: Option<usize> = None;
+        // Track which argument registers were actually read (use-before-def)
+        let mut used_args: Vec<usize> = Vec::new();
 
         for (idx, (reg64, reg32)) in int_regs.iter().zip(int_regs_32.iter()).enumerate() {
             let reg64_lower = reg64.to_lowercase();
@@ -2214,81 +2214,78 @@ impl SignatureRecovery {
                 || self.read_regs.contains(&pseudo_arg)
                 || self.param_hints.contains_key(&idx)
             {
-                max_int_arg = Some(idx);
+                used_args.push(idx);
             }
         }
 
-        // Create parameters for all argument slots up to the max used
-        // (to handle cases where an earlier arg isn't used but a later one is)
-        if let Some(max_idx) = max_int_arg {
-            for idx in 0..=max_idx {
-                let reg64 = int_regs[idx].to_lowercase();
-                let reg32 = int_regs_32[idx].to_lowercase();
+        // Create parameters only for registers that were actually used
+        for &idx in &used_args {
+            let reg64 = int_regs[idx].to_lowercase();
+            let reg32 = int_regs_32[idx].to_lowercase();
 
-                // Determine the size from register usage
-                let size = if let Some(s) = self.reg_sizes.get(&reg64) {
-                    *s
-                } else if let Some(s) = self.reg_sizes.get(&reg32) {
-                    *s
-                } else {
-                    8 // Default to 64-bit
-                };
+            // Determine the size from register usage
+            let size = if let Some(s) = self.reg_sizes.get(&reg64) {
+                *s
+            } else if let Some(s) = self.reg_sizes.get(&reg32) {
+                *s
+            } else {
+                8 // Default to 64-bit
+            };
 
-                // Get usage hints for this parameter
-                let hints = self.param_hints.get(&idx);
+            // Get usage hints for this parameter
+            let hints = self.param_hints.get(&idx);
 
-                // Infer type from usage hints if available
-                let param_type = if let Some(hints) = hints {
-                    hints.infer_type(size)
-                } else {
-                    match size {
-                        1 => ParamType::SignedInt(8),
-                        2 => ParamType::SignedInt(16),
-                        4 => ParamType::SignedInt(32),
-                        _ => ParamType::SignedInt(64),
+            // Infer type from usage hints if available
+            let param_type = if let Some(hints) = hints {
+                hints.infer_type(size)
+            } else {
+                match size {
+                    1 => ParamType::SignedInt(8),
+                    2 => ParamType::SignedInt(16),
+                    4 => ParamType::SignedInt(32),
+                    _ => ParamType::SignedInt(64),
+                }
+            };
+
+            // Use a custom name if we have one, or infer from hints
+            let name = if let Some(custom_name) = self.param_names.get(&idx) {
+                custom_name.clone()
+            } else if let Some(hints) = hints {
+                hints.suggest_name(idx)
+            } else {
+                format!("arg{}", idx)
+            };
+
+            let confidence = hints
+                .map(|h| {
+                    if matches!(param_type, ParamType::FunctionPointer { .. }) {
+                        h.function_pointer_confidence
+                    } else {
+                        u8::MAX
                     }
-                };
+                })
+                .unwrap_or(u8::MAX);
 
-                // Use a custom name if we have one, or infer from hints
-                let name = if let Some(custom_name) = self.param_names.get(&idx) {
-                    custom_name.clone()
-                } else if let Some(hints) = hints {
-                    hints.suggest_name(idx)
-                } else {
-                    format!("arg{}", idx)
-                };
-
-                let confidence = hints
-                    .map(|h| {
-                        if matches!(param_type, ParamType::FunctionPointer { .. }) {
-                            h.function_pointer_confidence
-                        } else {
-                            u8::MAX
-                        }
-                    })
-                    .unwrap_or(u8::MAX);
-
-                if matches!(param_type, ParamType::FunctionPointer { .. }) {
-                    if let Some(h) = hints {
-                        if !h.function_pointer_reasons.is_empty() {
-                            sig.parameter_provenance
-                                .insert(idx, h.function_pointer_reasons.clone());
-                        }
+            if matches!(param_type, ParamType::FunctionPointer { .. }) {
+                if let Some(h) = hints {
+                    if !h.function_pointer_reasons.is_empty() {
+                        sig.parameter_provenance
+                            .insert(idx, h.function_pointer_reasons.clone());
                     }
                 }
-
-                sig.parameters.push(
-                    Parameter::new(
-                        name,
-                        param_type,
-                        ParameterLocation::IntegerRegister {
-                            name: int_regs[idx].to_string(),
-                            index: idx,
-                        },
-                    )
-                    .with_confidence(confidence),
-                );
             }
+
+            sig.parameters.push(
+                Parameter::new(
+                    name,
+                    param_type,
+                    ParameterLocation::IntegerRegister {
+                        name: int_regs[idx].to_string(),
+                        index: idx,
+                    },
+                )
+                .with_confidence(confidence),
+            );
         }
 
         // Detect pointer+size parameter pairs
@@ -2884,9 +2881,11 @@ mod tests {
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
         let sig = recovery.analyze(&cfg);
 
-        assert_eq!(sig.parameters.len(), 5);
+        // With use-before-def analysis, only 4 args (0,1,2,4) are detected, not 5
+        assert_eq!(sig.parameters.len(), 4);
+        // The callback (originally arg4/r8) is now at index 3 in the params vector
         assert_eq!(
-            sig.parameters[4].param_type.format_with_name("compar"),
+            sig.parameters[3].param_type.format_with_name("compar"),
             "int32_t (*compar)(void*, void*)"
         );
     }
@@ -3097,8 +3096,9 @@ mod tests {
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
         let sig = recovery.analyze(&cfg);
 
+        // With use-before-def: only rsi (index 1) is detected -> 1 param at params[0]
         assert!(matches!(
-            sig.parameters[1].param_type,
+            sig.parameters[0].param_type,
             ParamType::FunctionPointer { .. }
         ));
     }
@@ -3167,10 +3167,12 @@ mod tests {
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
         let sig = recovery.analyze(&cfg);
 
-        assert!(sig.parameters.len() >= 3, "params: {:?}", sig.parameters);
+        // With use-before-def: only 2 registers detected (rdi=0, rdx=2) -> 2 params
+        assert!(sig.parameters.len() >= 2, "params: {:?}", sig.parameters);
+        // The callback (rdx, register index 2) is now at params[1]
         assert!(
             matches!(
-                sig.parameters[2].param_type,
+                sig.parameters[1].param_type,
                 ParamType::FunctionPointer { .. }
             ),
             "params: {:?}",
@@ -3178,7 +3180,7 @@ mod tests {
         );
         let reasons = sig
             .parameter_provenance
-            .get(&2)
+            .get(&2) // still index 2 (the register index)
             .cloned()
             .unwrap_or_default();
         assert!(
@@ -3223,10 +3225,12 @@ mod tests {
         let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
         let sig = recovery.analyze(&cfg);
 
-        assert!(sig.parameters.len() >= 3, "params: {:?}", sig.parameters);
+        // With use-before-def: only 1 register detected (x2) via alias -> 1 param
+        assert!(!sig.parameters.is_empty(), "params: {:?}", sig.parameters);
+        // The callback (x2, register index 2) is now at params[0]
         assert!(
             matches!(
-                sig.parameters[2].param_type,
+                sig.parameters[0].param_type,
                 ParamType::FunctionPointer { .. }
             ),
             "params: {:?}",
@@ -3234,7 +3238,7 @@ mod tests {
         );
         let reasons = sig
             .parameter_provenance
-            .get(&2)
+            .get(&2) // still register index 2
             .cloned()
             .unwrap_or_default();
         assert!(
@@ -3427,9 +3431,11 @@ mod tests {
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
         let sig = recovery.analyze(&cfg);
 
-        assert_eq!(sig.parameters.len(), 5);
+        // With use-before-def: 3 registers used (rdi=0, rsi=1, r8=4) -> 3 params
+        assert_eq!(sig.parameters.len(), 3);
+        // r8 (originally arg4) is now at index 2 and should NOT be a function pointer
         assert!(!matches!(
-            sig.parameters[4].param_type,
+            sig.parameters[2].param_type,
             ParamType::FunctionPointer { .. }
         ));
     }
