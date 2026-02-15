@@ -6,8 +6,8 @@ use super::sme::SmeDecoder;
 use super::sve::SveDecoder;
 use crate::{DecodeError, DecodedInstruction, Disassembler};
 use hexray_core::{
-    register::arm64, Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand,
-    Operation, Register, RegisterClass,
+    register::arm64, Architecture, Condition, ControlFlow, IndexMode, Instruction, MemoryRef,
+    Operand, Operation, Register, RegisterClass,
 };
 
 /// ARM64 disassembler.
@@ -1524,10 +1524,21 @@ impl Arm64Disassembler {
         let imm9 = ((insn >> 12) & 0x1FF) as i64;
         let rn = ((insn >> 5) & 0x1F) as u16;
         let rt = (insn & 0x1F) as u16;
-        let _is_pre = (insn >> 11) & 1 == 1;
+        let is_pre = (insn >> 11) & 1 == 1;
 
         let is_load = opc & 1 == 1;
         let offset = sign_extend(imm9 as u64, 9);
+
+        // Determine index mode and effective address offset
+        // - Post-indexed (bit 11 = 0): access at [base], then base += offset
+        // - Pre-indexed (bit 11 = 1): access at [base + offset], then base = that
+        let (index_mode, mem_offset) = if is_pre {
+            // Pre-indexed: [base, #offset]! - load from base+offset, writeback
+            (IndexMode::Pre, offset)
+        } else {
+            // Post-indexed: [base], #offset - load from base, then writeback
+            (IndexMode::Post, 0)
+        };
 
         if v == 1 {
             // SIMD/FP load/store with pre/post-indexed immediate
@@ -1550,17 +1561,19 @@ impl Arm64Disassembler {
             let mnemonic = if is_load { "ldr" } else { "str" };
             let reg = Self::simd_reg(rt, simd_size);
             let base = Self::xreg_sp(rn);
-            let mem = MemoryRef::base_disp(base, offset, access_size);
+            let mem = MemoryRef::base_disp_indexed(base, mem_offset, access_size, index_mode);
 
-            let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
-
-            let inst = Instruction::new(address, 4, bytes, mnemonic)
+            // Store the writeback offset for decompiler use
+            let mut inst = Instruction::new(address, 4, bytes, mnemonic)
                 .with_operation(if is_load {
                     Operation::Load
                 } else {
                     Operation::Store
                 })
-                .with_operands(operands);
+                .with_operands(vec![Operand::reg(reg), Operand::Memory(mem)]);
+
+            // Mark base register as both read and written (writeback)
+            inst.writes.push(Self::xreg_sp(rn));
 
             return Ok(DecodedInstruction {
                 instruction: inst,
@@ -1587,24 +1600,24 @@ impl Arm64Disassembler {
             }
         };
 
-        // For display, we'd normally add ! for pre-indexed, but we'll just use the mnemonic
         let reg = if is_64bit {
             Self::xreg(rt)
         } else {
             Self::wreg(rt)
         };
         let base = Self::xreg_sp(rn);
-        let mem = MemoryRef::base_disp(base, offset, access_size);
+        let mem = MemoryRef::base_disp_indexed(base, mem_offset, access_size, index_mode);
 
-        let operands = vec![Operand::reg(reg), Operand::Memory(mem)];
-
-        let inst = Instruction::new(address, 4, bytes, base_mnemonic)
+        let mut inst = Instruction::new(address, 4, bytes, base_mnemonic)
             .with_operation(if is_load {
                 Operation::Load
             } else {
                 Operation::Store
             })
-            .with_operands(operands);
+            .with_operands(vec![Operand::reg(reg), Operand::Memory(mem)]);
+
+        // Mark base register as written (writeback)
+        inst.writes.push(Self::xreg_sp(rn));
 
         Ok(DecodedInstruction {
             instruction: inst,

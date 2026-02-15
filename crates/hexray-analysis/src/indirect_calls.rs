@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hexray_core::{ControlFlow, Instruction, Operand, Operation, Symbol};
+use hexray_core::{ControlFlow, IndexMode, Instruction, Operand, Operation, Symbol};
 
 use crate::dataflow::{ConstState, ConstValue, Location};
 use crate::xrefs::{XrefDatabase, XrefType};
@@ -855,6 +855,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 3,
@@ -880,6 +881,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 6,

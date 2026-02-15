@@ -19,7 +19,7 @@ pub use basic_block::{BasicBlock, BasicBlockId, BlockTerminator};
 pub use cfg::ControlFlowGraph;
 pub use error::Error;
 pub use instruction::{Condition, ControlFlow, Instruction, Operation};
-pub use operand::{Immediate, MemoryRef, Operand};
+pub use operand::{Immediate, IndexMode, MemoryRef, Operand};
 pub use output::{escape_dot_string, DotConfig};
 pub use register::{Register, RegisterClass};
 pub use symbol::{Symbol, SymbolBinding, SymbolKind};

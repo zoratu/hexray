@@ -47,8 +47,8 @@
 use std::collections::HashMap;
 
 use hexray_core::{
-    register::x86, Architecture, BasicBlockId, ControlFlow, ControlFlowGraph, Instruction, Operand,
-    Operation,
+    register::x86, Architecture, BasicBlockId, ControlFlow, ControlFlowGraph, IndexMode,
+    Instruction, Operand, Operation,
 };
 
 /// Information about detected stack canary protection in a function.
@@ -869,6 +869,7 @@ mod tests {
             size: 8,
             segment: Some(fs_reg),
             broadcast: false,
+            index_mode: IndexMode::None,
         };
 
         let mut instr = Instruction::new(
@@ -910,6 +911,7 @@ mod tests {
             size: 8,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         };
 
         let mut instr = Instruction::new(0x1007, 4, vec![0x48, 0x89, 0x45, 0xf8], "mov");
@@ -975,6 +977,7 @@ mod tests {
             size: 8,
             segment: Some(fs_reg),
             broadcast: false,
+            index_mode: IndexMode::None,
         };
         let mut load_instr = Instruction::new(0x1000, 7, vec![0; 7], "mov");
         load_instr.operation = Operation::Move;
@@ -993,6 +996,7 @@ mod tests {
             size: 8,
             segment: None,
             broadcast: false,
+            index_mode: IndexMode::None,
         };
         let mut store_instr = Instruction::new(0x1007, 4, vec![0; 4], "mov");
         store_instr.operation = Operation::Move;

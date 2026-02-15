@@ -28,7 +28,8 @@ pub use reaching_defs::ReachingDefinitions;
 
 use hexray_core::{
     register::{arm64, riscv, x86},
-    Architecture, BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation, Register,
+    Architecture, BasicBlockId, ControlFlowGraph, IndexMode, Instruction, Operand, Operation,
+    Register,
 };
 use std::collections::HashMap;
 
@@ -668,6 +669,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             }),
         ];
 
@@ -696,6 +698,7 @@ mod tests {
                 size: 8,
                 segment: None,
                 broadcast: false,
+                index_mode: IndexMode::None,
             }),
         ];
 
