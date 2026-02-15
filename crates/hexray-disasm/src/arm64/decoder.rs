@@ -1033,11 +1033,12 @@ impl Arm64Disassembler {
 
         // Load/store register variants (bits 29-27 = 111)
         if op_29_27 == 0b111 {
-            // Atomic memory operations (ARMv8.1): bits 25-24 = 00, bit 21 = 1, V=0
+            // Atomic memory operations (ARMv8.1): bits 25-24 = 00, bit 21 = 1, V=0, bits 11-10 = 00
             // Must check BEFORE unscaled/pre/post-indexed as they have the same bits 25-24
             // Pattern: size[31:30]=xx, 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
             // V=0 distinguishes from SIMD/FP register offset loads which have V=1
-            if (op_25_23 >> 1) == 0b00 && op_21 == 1 && v == 0 {
+            // bits 11-10 = 00 distinguishes from register offset loads which have bits 11-10 = 10
+            if (op_25_23 >> 1) == 0b00 && op_21 == 1 && v == 0 && op_11_10 == 0b00 {
                 return self.decode_atomic_memory(insn, address, bytes);
             }
 
@@ -1072,9 +1073,10 @@ impl Arm64Disassembler {
             return self.decode_ldst_exclusive(insn, address, bytes);
         }
 
-        // Atomic memory operations (ARMv8.1): bits 31-24 = xx111000, bit 21 = 1
+        // Atomic memory operations (ARMv8.1): bits 31-24 = xx111000, bit 21 = 1, bits 11-10 = 00
         // Pattern: size[31:30]=xx, 111000, A, R, 1, Rs, o3, opc[2:0], 00, Rn, Rt
-        if bits_29_24 == 0b111000 && (insn >> 21) & 1 == 1 {
+        // bits 11-10 = 00 distinguishes from register offset loads which have bits 11-10 = 10
+        if bits_29_24 == 0b111000 && (insn >> 21) & 1 == 1 && op_11_10 == 0b00 {
             return self.decode_atomic_memory(insn, address, bytes);
         }
 

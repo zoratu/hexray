@@ -2962,15 +2962,17 @@ fn is_special_char_value(n: i128) -> bool {
 }
 
 /// Checks if a value is very likely to be a character constant.
-/// These are values that almost certainly represent characters in comparisons:
-/// - Letters (a-z, A-Z)
-/// - Digits ('0'-'9')
-/// - Common punctuation that would be meaningless as raw numbers
-///   (backslash, quotes)
+/// These are values that almost certainly represent characters in comparisons,
+/// specifically punctuation/escape characters that would be meaningless as numbers.
 ///
-/// Note: We don't include 0 (null) here because 0 is commonly used as a regular
-/// integer (false, count, etc.). Null comparisons like `str[i] == 0` are handled
-/// by the byte-context detection instead.
+/// Note: We explicitly EXCLUDE letters (A-Z, a-z) and digits ('0'-'9') from this
+/// function because values like 90 ('Z'), 80 ('P'), 70 ('F'), 60 are commonly used
+/// as numeric thresholds (grades, percentages, etc.). These should only be shown
+/// as char literals when there's explicit byte context (int8_t, char*, derefs, etc.).
+///
+/// We also exclude 0 (null) because 0 is commonly used as a regular integer
+/// (false, count, etc.). Null comparisons like `str[i] == 0` are handled by the
+/// byte-context detection instead.
 ///
 /// We intentionally exclude less-common control characters (7=\a, 8=\b, 11=\v, 12=\f)
 /// because comparisons like `x > 8` are often numeric bounds checks, not character
@@ -2980,14 +2982,12 @@ fn is_likely_character_constant(n: i128) -> bool {
         return false;
     }
     let c = n as u8;
+    // Only punctuation/escape characters that would be meaningless as raw numbers
     matches!(
         c,
-        b'a'..=b'z'
-            | b'A'..=b'Z'
-            | b'0'..=b'9'
-            | b'\\'  // Backslash - 92
+        b'\\'  // Backslash - 92
             | b'\''  // Single quote - 39
-            | b'"'   // Double quote - 34
+            | b'"' // Double quote - 34
     )
 }
 
