@@ -1469,6 +1469,17 @@ fn try_extract_arm64_branch_condition(
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
 /// Also substitutes register names with their values from preceding MOV instructions.
 fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
+    // Find the last compare in the block (no address limit)
+    condition_to_expr_before_address(cond, block, None)
+}
+
+/// Converts a Condition to an Expr, finding the compare instruction before the given address.
+/// This is needed for ARM64 CMP+CSEL chains where each CSEL uses a different preceding CMP.
+fn condition_to_expr_before_address(
+    cond: Condition,
+    block: &BasicBlock,
+    before_addr: Option<u64>,
+) -> Expr {
     let op = match cond {
         Condition::Equal => BinOpKind::Eq,
         Condition::NotEqual => BinOpKind::Ne,
@@ -1492,14 +1503,22 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
         return cond_expr;
     }
 
-    // Find the last compare instruction in the block
+    // Find the last compare instruction in the block (before the given address if specified)
     // This includes CMP, TEST, SUB/SUBS, and ANDS instructions
-    let compare_inst = block.instructions.iter().rev().find(|inst| {
-        matches!(
-            inst.operation,
-            Operation::Compare | Operation::Test | Operation::Sub
-        ) || (matches!(inst.operation, Operation::And) && inst.mnemonic.ends_with('s'))
-    });
+    let compare_inst = block
+        .instructions
+        .iter()
+        .rev()
+        .filter(|inst| {
+            // If before_addr is specified, only consider instructions before that address
+            before_addr.map_or(true, |addr| inst.address < addr)
+        })
+        .find(|inst| {
+            matches!(
+                inst.operation,
+                Operation::Compare | Operation::Test | Operation::Sub
+            ) || (matches!(inst.operation, Operation::And) && inst.mnemonic.ends_with('s'))
+        });
 
     if let Some(inst) = compare_inst {
         // For SUB/SUBS instructions (ARM64), operands are [dst, src1, src2]
@@ -1853,6 +1872,7 @@ fn parse_arm64_condition(suffix: &str) -> Option<Condition> {
 
 /// Lifts a SETcc instruction with block context to get the actual comparison.
 /// Returns an expression like: dest = (left op right)
+/// For ARM64 CSEL: dest = cond ? src1 : src2
 fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) -> Expr {
     let dest = if !inst.operands.is_empty() {
         Expr::from_operand_with_inst(&inst.operands[0], inst)
@@ -1860,7 +1880,33 @@ fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &BasicBlock) 
         Expr::unknown(&inst.mnemonic)
     };
 
-    // Try to parse condition from mnemonic
+    // Check for ARM64 conditional select: csel.cond, csinc.cond, etc.
+    let mnem_lower = inst.mnemonic.to_lowercase();
+    if let Some(dot_pos) = mnem_lower.find('.') {
+        let prefix = &mnem_lower[..dot_pos];
+        // CSEL/CSINC/CSINV/CSNEG have 3 operands: rd, rn, rm
+        if matches!(prefix, "csel" | "csinc" | "csinv" | "csneg") && inst.operands.len() >= 3 {
+            if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+                // Use the instruction address to find the CMP *before* this CSEL
+                let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
+                let then_expr = Expr::from_operand_with_inst(&inst.operands[1], inst);
+                let else_expr = Expr::from_operand_with_inst(&inst.operands[2], inst);
+
+                return Expr::assign(
+                    dest,
+                    Expr {
+                        kind: super::expression::ExprKind::Conditional {
+                            cond: Box::new(cond_expr),
+                            then_expr: Box::new(then_expr),
+                            else_expr: Box::new(else_expr),
+                        },
+                    },
+                );
+            }
+        }
+    }
+
+    // Try to parse condition from mnemonic (for CSET, SETcc, etc.)
     if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
         // Get the comparison expression using the block context
         let cond_expr = condition_to_expr_with_block(cond, block);

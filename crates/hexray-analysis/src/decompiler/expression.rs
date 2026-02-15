@@ -1671,7 +1671,36 @@ impl Expr {
             }
             Operation::SetConditional => {
                 // SETcc instructions: set byte on condition
-                // The result is assigned to the destination operand (typically a register)
+                // ARM64 CSEL/CSINC/CSINV/CSNEG: conditional select
+                let mnem_lower = inst.mnemonic.to_lowercase();
+
+                // Check for ARM64 conditional select: csel.cond rd, rn, rm
+                if let Some(dot_pos) = mnem_lower.find('.') {
+                    let prefix = &mnem_lower[..dot_pos];
+                    let cond_suffix = &mnem_lower[dot_pos + 1..];
+
+                    if matches!(prefix, "csel" | "csinc" | "csinv" | "csneg") && ops.len() >= 3 {
+                        // Emit as: rd = cond ? rn : rm
+                        // Use condition name as a call (displays as "gt" etc.)
+                        let cond_expr =
+                            Self::call(CallTarget::Named(cond_suffix.to_string()), vec![]);
+                        let then_expr = Self::from_operand(&ops[1]);
+                        let else_expr = Self::from_operand(&ops[2]);
+
+                        return Self::assign(
+                            Self::from_operand(&ops[0]),
+                            Expr {
+                                kind: ExprKind::Conditional {
+                                    cond: Box::new(cond_expr),
+                                    then_expr: Box::new(then_expr),
+                                    else_expr: Box::new(else_expr),
+                                },
+                            },
+                        );
+                    }
+                }
+
+                // Default: assign result of condition check
                 if !ops.is_empty() {
                     Self::assign(
                         Self::from_operand(&ops[0]),
