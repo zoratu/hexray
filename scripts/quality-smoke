@@ -1,10 +1,55 @@
 #!/bin/bash
 # Fast decompiler quality smoke check.
-# Runs only fixture-backed control-flow quality benchmark cases.
+# Runs fixture-backed control-flow quality benchmark cases, and optionally
+# callback typing CLI regressions.
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
+RUN_CALLBACK="no"
+STRICT_CALLBACK="no"
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/quality-smoke [--with-callback] [--strict-callback] [--help]
+
+  --with-callback   Also run callback CLI regression smoke tests
+  --strict-callback Enable strict callback snapshot mode (implies --with-callback)
+  --help            Show this message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --with-callback)
+            RUN_CALLBACK="yes"
+            shift
+            ;;
+        --strict-callback)
+            RUN_CALLBACK="yes"
+            STRICT_CALLBACK="yes"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
 cargo test -p hexray-analysis --test control_flow_quality_smoke -- --nocapture
+
+if [[ "$RUN_CALLBACK" == "yes" ]]; then
+    if [[ "$STRICT_CALLBACK" == "yes" ]]; then
+        HEXRAY_STRICT_CALLBACK_TYPING=1 cargo test -p hexray --test cli_tests callback -- --nocapture
+    else
+        cargo test -p hexray --test cli_tests callback -- --nocapture
+    fi
+fi

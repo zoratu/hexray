@@ -40,7 +40,7 @@
 use super::expression::{BinOpKind, Expr, ExprKind};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, SymbolTable};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Calling convention types supported by the decompiler.
@@ -215,12 +215,19 @@ impl ParameterUsageHints {
                 params: vec![ParamType::Pointer, ParamType::Pointer],
             }),
             // glibc qsort_r/qsort_s callback.
-            ("qsort_r", 3) | ("qsort_s", 3) => Some(ParamType::FunctionPointer {
+            ("qsort_r", 3) | ("qsort_s", 3) | ("hexray_qsort_r", 3) => {
+                Some(ParamType::FunctionPointer {
+                    return_type: Box::new(ParamType::SignedInt(32)),
+                    params: vec![ParamType::Pointer, ParamType::Pointer, ParamType::Pointer],
+                })
+            }
+            // Fixture-local BSD-style qsort_r callback shim.
+            ("hexray_bsd_qsort_r", 4) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::SignedInt(32)),
                 params: vec![ParamType::Pointer, ParamType::Pointer, ParamType::Pointer],
             }),
-            // BSD qsort_r callback.
-            ("qsort_r", 4) => Some(ParamType::FunctionPointer {
+            // BSD qsort_r callback (typically exposed as bsd_qsort_r symbols).
+            ("bsd_qsort_r", 4) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::SignedInt(32)),
                 params: vec![ParamType::Pointer, ParamType::Pointer, ParamType::Pointer],
             }),
@@ -236,16 +243,19 @@ impl ParameterUsageHints {
                 return_type: Box::new(ParamType::Void),
                 params: vec![ParamType::Void],
             }),
-            ("on_exit", 0) => Some(ParamType::FunctionPointer {
+            ("on_exit", 0) | ("hexray_on_exit", 0) => Some(ParamType::FunctionPointer {
                 return_type: Box::new(ParamType::Void),
                 params: vec![ParamType::SignedInt(32), ParamType::Pointer],
             }),
-            ("pthread_atfork", 0) | ("pthread_atfork", 1) | ("pthread_atfork", 2) => {
-                Some(ParamType::FunctionPointer {
-                    return_type: Box::new(ParamType::Void),
-                    params: vec![ParamType::Void],
-                })
-            }
+            ("pthread_atfork", 0)
+            | ("pthread_atfork", 1)
+            | ("pthread_atfork", 2)
+            | ("hexray_pthread_atfork", 0)
+            | ("hexray_pthread_atfork", 1)
+            | ("hexray_pthread_atfork", 2) => Some(ParamType::FunctionPointer {
+                return_type: Box::new(ParamType::Void),
+                params: vec![ParamType::Void],
+            }),
             _ => None,
         }
     }
@@ -543,6 +553,10 @@ pub struct FunctionSignature {
     pub has_return: bool,
     /// Per-parameter inference reasons, keyed by parameter index.
     pub parameter_provenance: HashMap<usize, Vec<String>>,
+    /// Inference reasons for return type recovery.
+    pub return_provenance: Vec<String>,
+    /// Confidence in inferred return type (0-255, higher is better).
+    pub return_confidence: u8,
 }
 
 impl FunctionSignature {
@@ -632,6 +646,12 @@ pub struct SignatureRecovery {
     float_return: bool,
     /// Recovered function-pointer return type when applicable.
     return_function_pointer: Option<ParamType>,
+    /// Candidate return type inferred from tail-position call forwarding.
+    tail_call_return_type: Option<ParamType>,
+    /// Human-readable reasons that led to return type inference.
+    return_provenance: Vec<String>,
+    /// Confidence in return type inference.
+    return_confidence: u8,
     /// Parameter names assigned from stack slot analysis.
     param_names: HashMap<usize, String>,
     /// Usage hints for parameters (indexed by arg register index).
@@ -671,6 +691,9 @@ impl SignatureRecovery {
             return_size: 8,
             float_return: false,
             return_function_pointer: None,
+            tail_call_return_type: None,
+            return_provenance: Vec::new(),
+            return_confidence: 0,
             param_names: HashMap::new(),
             param_hints: HashMap::new(),
             function_pointer_aliases: HashMap::new(),
@@ -713,6 +736,9 @@ impl SignatureRecovery {
         self.return_size = 8;
         self.float_return = false;
         self.return_function_pointer = None;
+        self.tail_call_return_type = None;
+        self.return_provenance.clear();
+        self.return_confidence = 0;
         self.param_names.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
@@ -720,6 +746,23 @@ impl SignatureRecovery {
 
         // Analyze the function body
         self.analyze_nodes(&cfg.body, false);
+
+        // Recover "return callee(...);" style wrappers where only a tail-position call is present.
+        if !self.return_value_set {
+            if let Some(candidate) = self.tail_call_return_type.clone() {
+                if !matches!(candidate, ParamType::Void | ParamType::Unknown) {
+                    self.return_value_set = true;
+                    self.return_size = candidate.size().max(1);
+                    if matches!(candidate, ParamType::FunctionPointer { .. }) {
+                        self.return_function_pointer = Some(candidate);
+                    } else {
+                        self.return_confidence = self.return_confidence.max(140);
+                    }
+                    self.return_provenance
+                        .push("tail-position call return forwarding".to_string());
+                }
+            }
+        }
 
         // Build the signature
         self.build_signature()
@@ -771,8 +814,11 @@ impl SignatureRecovery {
     /// Analyzes a list of structured nodes.
     fn analyze_nodes(&mut self, nodes: &[StructuredNode], in_return_path: bool) {
         for (i, node) in nodes.iter().enumerate() {
-            // Check if this is the last node and might lead to return
-            let is_near_return = in_return_path || (i == nodes.len() - 1);
+            // Check if this node is on, or directly feeds, a return path.
+            let next_is_void_return = nodes
+                .get(i + 1)
+                .is_some_and(|n| matches!(n, StructuredNode::Return(None)));
+            let is_near_return = in_return_path || (i == nodes.len() - 1) || next_is_void_return;
             self.analyze_node(node, is_near_return);
         }
     }
@@ -782,8 +828,9 @@ impl SignatureRecovery {
         match node {
             StructuredNode::Block { statements, .. } => {
                 for (i, stmt) in statements.iter().enumerate() {
-                    // For the last statement in a block near return, check for return value setup
-                    let near_ret = in_return_path && (i == statements.len() - 1);
+                    // For statements near the end of a block on a return path, check for
+                    // return value setup and tail-call forwarding patterns.
+                    let near_ret = in_return_path && i + 3 >= statements.len();
                     self.analyze_statement(stmt, near_ret);
                 }
             }
@@ -844,12 +891,34 @@ impl SignatureRecovery {
             StructuredNode::Return(Some(expr)) => {
                 self.analyze_expr_reads(expr);
                 self.return_value_set = true;
+                if !self
+                    .return_provenance
+                    .iter()
+                    .any(|r| r == "explicit return expression")
+                {
+                    self.return_provenance
+                        .push("explicit return expression".to_string());
+                }
+                self.return_confidence = self.return_confidence.max(200);
                 // Infer return type from expression
                 if let Some(size) = self.infer_expr_size(expr) {
                     self.return_size = size;
+                    let reason = format!("return expression width inferred as {} byte(s)", size);
+                    if !self.return_provenance.iter().any(|r| r == &reason) {
+                        self.return_provenance.push(reason);
+                    }
                 }
                 if let Some(fp) = self.infer_return_function_pointer(expr) {
                     self.return_function_pointer = Some(fp);
+                    if !self
+                        .return_provenance
+                        .iter()
+                        .any(|r| r == "return expression inferred as function pointer")
+                    {
+                        self.return_provenance
+                            .push("return expression inferred as function pointer".to_string());
+                    }
+                    self.return_confidence = self.return_confidence.max(240);
                 }
             }
             StructuredNode::Return(None) => {
@@ -871,6 +940,11 @@ impl SignatureRecovery {
             ExprKind::Assign { lhs, rhs } => {
                 // First, analyze the RHS for reads
                 self.analyze_expr_reads(rhs);
+                if near_return && !self.return_value_set {
+                    if let Some(candidate) = self.infer_tail_call_return_type(rhs) {
+                        self.tail_call_return_type = Some(candidate);
+                    }
+                }
 
                 // Check if LHS is a register being written
                 if let Some(reg_name) = self.extract_register_name(lhs) {
@@ -897,14 +971,46 @@ impl SignatureRecovery {
                     // Check for return value setup near return
                     if near_return && self.is_return_register(&reg_lower) {
                         self.return_value_set = true;
+                        let reason = format!(
+                            "value assigned to return register '{}' near return",
+                            reg_lower
+                        );
+                        if !self.return_provenance.iter().any(|r| r == &reason) {
+                            self.return_provenance.push(reason);
+                        }
+                        self.return_confidence = self.return_confidence.max(160);
                         if let Some(size) = self.infer_expr_size(rhs) {
                             self.return_size = size;
+                            let reason =
+                                format!("return register value width inferred as {} byte(s)", size);
+                            if !self.return_provenance.iter().any(|r| r == &reason) {
+                                self.return_provenance.push(reason);
+                            }
+                            self.return_confidence = self.return_confidence.max(170);
                         }
                         if let Some(fp) = self.infer_return_function_pointer(rhs) {
                             self.return_function_pointer = Some(fp);
+                            if !self.return_provenance.iter().any(|r| {
+                                r == "return register assignment inferred as function pointer"
+                            }) {
+                                self.return_provenance.push(
+                                    "return register assignment inferred as function pointer"
+                                        .to_string(),
+                                );
+                            }
+                            self.return_confidence = self.return_confidence.max(230);
                         }
                         if self.is_float_return_register(&reg_lower) {
                             self.float_return = true;
+                            if !self
+                                .return_provenance
+                                .iter()
+                                .any(|r| r == "float return register observed")
+                            {
+                                self.return_provenance
+                                    .push("float return register observed".to_string());
+                            }
+                            self.return_confidence = self.return_confidence.max(200);
                         }
                     }
                 }
@@ -926,9 +1032,9 @@ impl SignatureRecovery {
                 if let Some(lhs_name) = self.extract_var_name(lhs) {
                     if let Some(rhs_name) = self.extract_var_name(rhs) {
                         if let Some(idx) = self.arg_register_index(&rhs_name) {
-                            self.function_pointer_aliases.insert(lhs_name.clone(), idx);
+                            self.insert_function_pointer_alias(&lhs_name, idx);
                         } else if let Some(idx) = self.function_pointer_aliases.get(&rhs_name) {
-                            self.function_pointer_aliases.insert(lhs_name.clone(), *idx);
+                            self.insert_function_pointer_alias(&lhs_name, *idx);
                         }
 
                         if let Some(ty) = self.value_function_pointer_types.get(&rhs_name).cloned()
@@ -943,6 +1049,11 @@ impl SignatureRecovery {
                 }
             }
             ExprKind::Call { .. } => {
+                if near_return && !self.return_value_set {
+                    if let Some(candidate) = self.infer_tail_call_return_type(expr) {
+                        self.tail_call_return_type = Some(candidate);
+                    }
+                }
                 self.analyze_expr_reads(expr);
             }
             _ => {
@@ -1113,65 +1224,114 @@ impl SignatureRecovery {
                         }
                     }
 
-                    // Record which functions parameters are passed to
-                    if let (Some(fn_name), Some(var_name)) =
-                        (&func_name, self.extract_var_name(arg))
-                    {
-                        self.record_usage_hint(&var_name, |h| {
-                            h.passed_to_functions.push(fn_name.clone())
-                        });
-                        if Self::is_callback_position(fn_name, i) {
-                            self.record_usage_hint(&var_name, |h| {
-                                h.passed_as_callback_to.push((fn_name.clone(), i));
-                                h.function_pointer_confidence =
-                                    h.function_pointer_confidence.saturating_add(4);
-                                h.add_function_pointer_reason(format!(
-                                    "passed to '{}' argument {} (callback slot)",
-                                    fn_name, i
-                                ));
+                    // Record which functions parameters are passed to.
+                    if let Some(fn_name) = &func_name {
+                        let var_name = self.extract_var_name(arg);
+                        if let Some(name) = &var_name {
+                            self.record_usage_hint(name, |h| {
+                                h.passed_to_functions.push(fn_name.clone())
                             });
-                            // If this callback argument flows through a local alias of an
-                            // argument register, propagate callback hints to the original
-                            // parameter index so function signatures become typed in CLI output.
-                            if let Some(param_idx) = self.resolve_param_index_from_name(&var_name) {
+                        }
+
+                        let is_callback_slot = Self::is_callback_position(fn_name, i);
+                        let mut resolved_param_idx = self.resolve_param_index_from_expr(arg);
+                        let mut used_shape_fallback = false;
+                        let mut used_slot_fallback = false;
+                        if is_callback_slot && resolved_param_idx.is_none() {
+                            let callback_slots = self.callback_slot_indices(fn_name);
+                            if callback_slots.len() > 1
+                                && Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                            {
+                                // Multi-callback APIs (e.g., pthread_atfork) often map each
+                                // callback slot to the same-ordinal parameter.
+                                resolved_param_idx = Some(i);
+                                used_slot_fallback = true;
+                            } else {
+                                let mut excluded = HashSet::new();
+                                for (other_i, other_arg) in args.iter().enumerate() {
+                                    if other_i == i
+                                        || ParameterUsageHints::callback_signature(fn_name, other_i)
+                                            .is_some()
+                                    {
+                                        continue;
+                                    }
+                                    if let Some(other_idx) =
+                                        self.resolve_param_index_from_expr(other_arg)
+                                    {
+                                        excluded.insert(other_idx);
+                                    }
+                                }
+                                resolved_param_idx = self
+                                    .fallback_callback_param_index_excluding(&excluded)
+                                    .or_else(|| self.fallback_callback_param_index());
+                                used_shape_fallback = resolved_param_idx.is_some();
+                            }
+                        }
+                        if is_callback_slot {
+                            if let Some(name) = &var_name {
+                                self.record_usage_hint(name, |h| {
+                                    h.passed_as_callback_to.push((fn_name.clone(), i));
+                                    h.function_pointer_confidence =
+                                        h.function_pointer_confidence.saturating_add(4);
+                                    h.add_function_pointer_reason(format!(
+                                        "passed to '{}' argument {} (callback slot)",
+                                        fn_name, i
+                                    ));
+                                });
+                            }
+                            if let Some(param_idx) = resolved_param_idx {
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
                                 hints.function_pointer_confidence =
                                     hints.function_pointer_confidence.saturating_add(4);
                                 hints.passed_as_callback_to.push((fn_name.clone(), i));
                                 hints.add_function_pointer_reason(format!(
-                                    "alias/forwarded value passed to '{}' argument {} (callback slot)",
+                                    "[source=alias] alias/forwarded value passed to '{}' argument {} (callback slot)",
                                     fn_name, i
                                 ));
+                                if used_shape_fallback {
+                                    hints.add_function_pointer_reason(format!(
+                                        "[source=shape-fallback] mapped callback slot '{}' argument {} by ABI-shaped fallback",
+                                        fn_name, i
+                                    ));
+                                }
+                                if used_slot_fallback {
+                                    hints.add_function_pointer_reason(format!(
+                                        "[source=slot-fallback] mapped callback slot '{}' argument {} by slot ordinal",
+                                        fn_name, i
+                                    ));
+                                }
                             }
                         }
                         if let Some(sig) = self.callback_signature_from_summary(fn_name, i) {
-                            let sig_for_hint = sig.clone();
-                            self.record_usage_hint(&var_name, |h| {
-                                h.is_function_pointer = true;
-                                h.function_pointer_confidence =
-                                    h.function_pointer_confidence.saturating_add(5);
-                                h.add_function_pointer_reason(format!(
-                                    "summary marks '{}' argument {} as function-pointer callback",
-                                    fn_name, i
-                                ));
-                                if let ParamType::FunctionPointer {
-                                    return_type,
-                                    params,
-                                } = sig_for_hint.clone()
-                                {
-                                    h.function_pointer_arg_types = params;
-                                    h.function_pointer_return_type = Some(*return_type);
-                                }
-                            });
-                            if let Some(param_idx) = self.resolve_param_index_from_name(&var_name) {
+                            if let Some(name) = &var_name {
+                                let sig_for_hint = sig.clone();
+                                self.record_usage_hint(name, |h| {
+                                    h.is_function_pointer = true;
+                                    h.function_pointer_confidence =
+                                        h.function_pointer_confidence.saturating_add(5);
+                                    h.add_function_pointer_reason(format!(
+                                        "[source=summary] summary marks '{}' argument {} as function-pointer callback",
+                                        fn_name, i
+                                    ));
+                                    if let ParamType::FunctionPointer {
+                                        return_type,
+                                        params,
+                                    } = sig_for_hint.clone()
+                                    {
+                                        h.function_pointer_arg_types = params;
+                                        h.function_pointer_return_type = Some(*return_type);
+                                    }
+                                });
+                            }
+                            if let Some(param_idx) = resolved_param_idx {
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
                                 hints.function_pointer_confidence =
                                     hints.function_pointer_confidence.saturating_add(5);
                                 hints.passed_as_callback_to.push((fn_name.clone(), i));
                                 hints.add_function_pointer_reason(format!(
-                                    "summary callback type propagated through alias for '{}' argument {}",
+                                    "[source=summary] summary callback type propagated through alias for '{}' argument {}",
                                     fn_name, i
                                 ));
                                 if let ParamType::FunctionPointer {
@@ -1260,6 +1420,49 @@ impl SignatureRecovery {
             }
             _ => None,
         }
+    }
+
+    fn return_type_from_summary(&self, function_name: &str) -> Option<ParamType> {
+        let db = self.summary_database.as_ref()?;
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
+        let summary = db.get_summary_by_name(clean)?;
+        summary
+            .return_type
+            .as_ref()
+            .map(Self::param_type_from_summary)
+    }
+
+    fn known_call_return_type(function_name: &str) -> Option<ParamType> {
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
+        match clean {
+            "qsort" | "qsort_r" | "qsort_s" | "bsd_qsort_r" => Some(ParamType::Void),
+            "hexray_qsort_r"
+            | "hexray_bsd_qsort_r"
+            | "pthread_create"
+            | "on_exit"
+            | "hexray_on_exit"
+            | "pthread_atfork"
+            | "hexray_pthread_atfork" => Some(ParamType::SignedInt(32)),
+            "bsearch" => Some(ParamType::Pointer),
+            "signal" | "bsd_signal" | "sysv_signal" | "sigset" => {
+                Some(ParamType::FunctionPointer {
+                    return_type: Box::new(ParamType::Void),
+                    params: vec![ParamType::SignedInt(32)],
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_tail_call_return_type(&self, expr: &Expr) -> Option<ParamType> {
+        if let ExprKind::Call { target, .. } = &expr.kind {
+            let name = self.extract_call_name(target)?;
+            if let Some(summary_ty) = self.return_type_from_summary(&name) {
+                return Some(summary_ty);
+            }
+            return Self::known_call_return_type(&name);
+        }
+        None
     }
 
     /// Infers a type for an argument passed into an indirect function call.
@@ -1436,19 +1639,80 @@ impl SignatureRecovery {
         }
     }
 
+    fn insert_function_pointer_alias(&mut self, lhs_name: &str, idx: usize) {
+        self.function_pointer_aliases
+            .insert(lhs_name.to_string(), idx);
+        if let Some(offset_str) = lhs_name.strip_prefix("stack_") {
+            if let Ok(offset) = offset_str.parse::<i128>() {
+                if offset < 0 {
+                    let abs = (-offset) as u128;
+                    self.function_pointer_aliases
+                        .insert(format!("arg_{:x}", abs), idx);
+                    self.function_pointer_aliases
+                        .insert(format!("local_{:x}", abs), idx);
+                } else {
+                    let val = offset as u128;
+                    self.function_pointer_aliases
+                        .insert(format!("var_{:x}", val), idx);
+                }
+            }
+        }
+    }
+
     fn fallback_callback_param_index(&self) -> Option<usize> {
         let max_from_reads = self
             .read_regs
             .iter()
             .filter_map(|name| self.arg_register_index(name))
             .max();
+        let max_from_writes = self
+            .written_regs
+            .iter()
+            .filter_map(|name| self.arg_register_index(name))
+            .max();
         let max_from_aliases = self.function_pointer_aliases.values().copied().max();
-        match (max_from_reads, max_from_aliases) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+        [max_from_reads, max_from_writes, max_from_aliases]
+            .into_iter()
+            .flatten()
+            .max()
+    }
+
+    fn fallback_callback_param_index_excluding(&self, excluded: &HashSet<usize>) -> Option<usize> {
+        let mut candidates = BTreeSet::new();
+        for idx in self
+            .read_regs
+            .iter()
+            .filter_map(|name| self.arg_register_index(name))
+        {
+            candidates.insert(idx);
         }
+        for idx in self
+            .written_regs
+            .iter()
+            .filter_map(|name| self.arg_register_index(name))
+        {
+            candidates.insert(idx);
+        }
+        for idx in self.function_pointer_aliases.values().copied() {
+            candidates.insert(idx);
+        }
+        candidates
+            .into_iter()
+            .rev()
+            .find(|idx| !excluded.contains(idx))
+    }
+
+    fn callback_slot_indices(&self, function_name: &str) -> Vec<usize> {
+        (0..8)
+            .filter(|idx| ParameterUsageHints::callback_signature(function_name, *idx).is_some())
+            .collect()
+    }
+
+    fn prefer_slot_ordinal_callback_fallback(function_name: &str) -> bool {
+        matches!(
+            ParameterUsageHints::normalize_callback_name(function_name),
+            "pthread_atfork" | "hexray_pthread_atfork"
+        )
     }
 
     fn resolve_param_index_from_name(&self, var_name: &str) -> Option<usize> {
@@ -1458,10 +1722,48 @@ impl SignatureRecovery {
         if let Some(idx) = self.arg_register_index(var_name) {
             return Some(idx);
         }
+        if let Some(idx) = Self::lifted_stack_slot_index(var_name) {
+            return Some(idx);
+        }
+        if let Some(idx) = Self::lifted_local_slot_index(var_name) {
+            return Some(idx);
+        }
         if self.may_alias_parameter(var_name) {
             return self.fallback_callback_param_index();
         }
         None
+    }
+
+    fn resolve_param_index_from_expr(&self, expr: &Expr) -> Option<usize> {
+        if let Some(var_name) = self.extract_var_name(expr) {
+            if let Some(idx) = self.resolve_param_index_from_name(&var_name) {
+                return Some(idx);
+            }
+        }
+
+        if let Some(offset) = self.extract_stack_offset(expr) {
+            let stack_name = format!("stack_{}", offset);
+            if let Some(idx) = self.resolve_param_index_from_name(&stack_name) {
+                return Some(idx);
+            }
+        }
+
+        match &expr.kind {
+            ExprKind::Cast { expr: inner, .. } => self.resolve_param_index_from_expr(inner),
+            ExprKind::Unknown(name) => {
+                let lowered = name.to_lowercase();
+                if lowered.starts_with("arg_")
+                    || lowered.starts_with("var_")
+                    || lowered.starts_with("local_")
+                    || lowered.starts_with("stack_")
+                {
+                    self.fallback_callback_param_index()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn may_alias_parameter(&self, var_name: &str) -> bool {
@@ -1527,6 +1829,9 @@ impl SignatureRecovery {
                 }
             }
         }
+        if Self::lifted_arg_slot_index(&name_lower).is_some() {
+            return true;
+        }
 
         // Check both 64-bit and 32-bit register variants
         self.convention
@@ -1555,6 +1860,9 @@ impl SignatureRecovery {
                 return Some(idx);
             }
         }
+        if let Some(idx) = Self::lifted_arg_slot_index(&name_lower) {
+            return Some(idx);
+        }
 
         // Check 64-bit integer registers
         if let Some(idx) = self
@@ -1577,6 +1885,41 @@ impl SignatureRecovery {
         }
 
         None
+    }
+
+    fn lifted_arg_slot_index(name: &str) -> Option<usize> {
+        let suffix = name.strip_prefix("arg_")?;
+        let suffix = suffix.strip_prefix("0x").unwrap_or(suffix);
+        let offset = u64::from_str_radix(suffix, 16).ok()?;
+        if offset < 8 || offset % 8 != 0 {
+            return None;
+        }
+        Some(((offset - 8) / 8) as usize)
+    }
+
+    fn lifted_stack_slot_index(name: &str) -> Option<usize> {
+        let suffix = name.strip_prefix("stack_")?;
+        let raw = suffix.parse::<i64>().ok()?;
+        if raw >= 0 {
+            return None;
+        }
+        let offset = (-raw) as u64;
+        if offset < 8 || offset % 8 != 0 {
+            return None;
+        }
+        Some(((offset - 8) / 8) as usize)
+    }
+
+    fn lifted_local_slot_index(name: &str) -> Option<usize> {
+        let suffix = name
+            .strip_prefix("local_")
+            .or_else(|| name.strip_prefix("var_"))?;
+        let suffix = suffix.strip_prefix("0x").unwrap_or(suffix);
+        let offset = u64::from_str_radix(suffix, 16).ok()?;
+        if offset < 8 || offset % 8 != 0 {
+            return None;
+        }
+        Some(((offset - 8) / 8) as usize)
     }
 
     /// Checks if a register is a return register.
@@ -1783,6 +2126,8 @@ impl SignatureRecovery {
 
         // Determine return type
         sig.has_return = self.return_value_set;
+        sig.return_provenance = self.return_provenance.clone();
+        sig.return_confidence = self.return_confidence;
         if self.return_value_set {
             if let Some(ref fp_ty) = self.return_function_pointer {
                 sig.return_type = fp_ty.clone();
@@ -1971,6 +2316,17 @@ mod tests {
         assert_eq!(recovery.reg_size_from_name("w0"), 4);
         assert_eq!(recovery.reg_size_from_name("x19"), 8);
         assert_eq!(recovery.reg_size_from_name("w19"), 4);
+    }
+
+    #[test]
+    fn test_lifted_slot_index_helpers() {
+        assert_eq!(SignatureRecovery::lifted_arg_slot_index("arg_8"), Some(0));
+        assert_eq!(SignatureRecovery::lifted_arg_slot_index("arg_10"), Some(1));
+        assert_eq!(SignatureRecovery::lifted_arg_slot_index("arg_18"), Some(2));
+        assert_eq!(SignatureRecovery::lifted_stack_slot_index("stack_-8"), Some(0));
+        assert_eq!(SignatureRecovery::lifted_stack_slot_index("stack_-16"), Some(1));
+        assert_eq!(SignatureRecovery::lifted_local_slot_index("local_8"), Some(0));
+        assert_eq!(SignatureRecovery::lifted_local_slot_index("var_10"), Some(1));
     }
 
     #[test]
@@ -2751,6 +3107,71 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_recovery_does_not_mark_pthread_arg_when_static_start_is_used() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("pthread_create".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::int(0),
+                Expr::unknown("thread_trampoline"),
+                Expr::var(Variable::reg("rsi", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2);
+        assert!(!matches!(
+            sig.parameters[1].param_type,
+            ParamType::FunctionPointer { .. }
+        ));
+    }
+
+    #[test]
+    fn test_signature_recovery_does_not_mark_signal_param_when_static_handler_is_used() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("signal".to_string()),
+            vec![Expr::int(2), Expr::unknown("static_handler")],
+        );
+        let keep_param_live =
+            Expr::assign(Expr::unknown("tmp"), Expr::var(Variable::reg("rdi", 8)));
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call, keep_param_live],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 1);
+        assert!(!matches!(
+            sig.parameters[0].param_type,
+            ParamType::FunctionPointer { .. }
+        ));
+    }
+
+    #[test]
     fn test_signature_recovery_detects_qsort_r_callback() {
         use hexray_core::BasicBlockId;
 
@@ -2784,6 +3205,275 @@ mod tests {
             sig.parameters[3].param_type.format_with_name("compar"),
             "int32_t (*compar)(void*, void*, void*)"
         );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_bsd_qsort_r_callback() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("bsd_qsort_r".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::var(Variable::reg("rcx", 8)),
+                Expr::var(Variable::reg("r8", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 5);
+        assert_eq!(
+            sig.parameters[4].param_type.format_with_name("compar"),
+            "int32_t (*compar)(void*, void*, void*)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_on_exit_callback() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("on_exit".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(
+            sig.parameters[0].param_type.format_with_name("fn"),
+            "void (*fn)(int32_t, void*)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_hexray_on_exit_callback() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("hexray_on_exit".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(
+            sig.parameters[0].param_type.format_with_name("fn"),
+            "void (*fn)(int32_t, void*)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_pthread_atfork_callbacks() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("pthread_atfork".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 3);
+        assert_eq!(
+            sig.parameters[0].param_type.format_with_name("prepare"),
+            "void (*prepare)(void)"
+        );
+        assert_eq!(
+            sig.parameters[1].param_type.format_with_name("parent"),
+            "void (*parent)(void)"
+        );
+        assert_eq!(
+            sig.parameters[2].param_type.format_with_name("child"),
+            "void (*child)(void)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_hexray_qsort_r_callback() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("hexray_qsort_r".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::var(Variable::reg("rcx", 8)),
+                Expr::var(Variable::reg("r8", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 5);
+        assert_eq!(
+            sig.parameters[3].param_type.format_with_name("compar"),
+            "int32_t (*compar)(void*, void*, void*)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_infers_tail_call_forwarded_return_type() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("hexray_on_exit".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_does_not_infer_tail_return_for_void_callee() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("qsort".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+                Expr::var(Variable::reg("rcx", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(!sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Void);
+    }
+
+    #[test]
+    fn test_signature_recovery_infers_tail_call_return_when_void_return_node_is_separate() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("hexray_on_exit".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let ret = StructuredNode::Return(None);
+        let cfg = StructuredCfg {
+            body: vec![block, ret],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
     }
 
     #[test]

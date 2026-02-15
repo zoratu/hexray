@@ -2162,6 +2162,23 @@ fn print_signature_diagnostics(name: &str, signature: &hexray_analysis::Function
             name
         );
     }
+    if signature.has_return {
+        println!(
+            "// [diag] {} return inferred as {} (confidence {})",
+            name,
+            signature.return_type.to_c_string(),
+            signature.return_confidence
+        );
+        if signature.return_provenance.is_empty() {
+            println!("// [diag]   - no explicit return provenance recorded");
+        } else {
+            for reason in &signature.return_provenance {
+                println!("// [diag]   - {}", reason);
+            }
+        }
+    } else {
+        println!("// [diag] {} return inferred as void", name);
+    }
     println!();
 }
 

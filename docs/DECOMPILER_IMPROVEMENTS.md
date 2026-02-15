@@ -10,10 +10,18 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - Benchmark quality gates include strict callback precision/recall thresholds across direct and alias-heavy callback cases.
 - Emitter callback fallback heuristics were removed; function-pointer callback typing now comes from signature recovery only.
 - `hexray decompile --diagnostics` now prints per-parameter function-pointer provenance.
+- Callback stress fixtures now cover multi-hop alias chains and mixed callback forwarding paths for both `qsort` and `pthread_create`.
+- Diagnostics now include return-type provenance and confidence output.
+- Diagnostics now tag callback typing provenance sources (`[source=alias]`, `[source=summary]`, `[source=shape-fallback]`, `[source=slot-fallback]`) for easier triage.
+- Local tiered CI can enforce strict callback header snapshots via `HEXRAY_STRICT_CALLBACK_TYPING=1` (wired into `scripts/ci-local` medium/full by default).
+- Callback coverage now includes `qsort_r` (glibc + BSD symbol variants), `on_exit`, and `pthread_atfork` in signature recovery and benchmark quality gates.
+- `qsort_r` typing now defaults to glibc slot semantics for `qsort_r`/`qsort_s`, with BSD slot typing keyed to `bsd_qsort_r` symbols to reduce dual-slot false positives.
+- CLI callback fixture coverage now includes portable shim-backed APIs (`hexray_qsort_r`, `hexray_bsd_qsort_r`, `hexray_on_exit`, `hexray_pthread_atfork`) with end-to-end header assertions.
+- Callback benchmark quality floors were raised to `0.95`, and callback-index stability now enforces both precision and recall gates.
+- Signature recovery now infers non-void return forwarding for tail-position call wrappers when API/summary return types are known.
 
 Remaining high-value follow-up:
-- Add callback-typing stress fixtures for nested multi-hop alias chains and mixed direct/indirect forwarding.
-- Expand diagnostics to include return-type provenance and confidence explanations.
+- Improve callback-parameter index attribution under heavy stack-slot alias reuse so shim wrappers stabilize on canonical parameter positions in strict mode.
 
 ## Priority 1: Critical Issues
 

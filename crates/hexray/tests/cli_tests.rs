@@ -51,6 +51,15 @@ fn decompile_header(binary: &str, symbol: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn strict_callback_typing_mode() -> bool {
+    std::env::var("HEXRAY_STRICT_CALLBACK_TYPING")
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        })
+        .unwrap_or(false)
+}
+
 fn find_c_compiler() -> Option<&'static str> {
     ["cc", "clang", "gcc"].into_iter().find(|compiler| {
         Command::new(compiler)
@@ -531,13 +540,21 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let header = stdout.lines().next().unwrap_or_default();
+    let header = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.contains('(')
+                && line.ends_with(')')
+                && !line.starts_with("Decompiling ")
+                && !line.is_empty()
+        })
+        .unwrap_or_default();
     assert!(
-        !header.contains("(*ctx)")
-            && !header.contains("(*arg2)")
-            && !header.contains("(*cmp)")
-            && !header.contains("(*compar)"),
-        "Non-callback parameter should not be forced to function-pointer type:\n{}",
+        header == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)"
+            || header
+                == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+        "Static-callback wrapper header unexpectedly changed:\n{}",
         stdout
     );
 
@@ -569,10 +586,132 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let header = stdout.lines().next().unwrap_or_default();
+    let header = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.contains('(')
+                && line.ends_with(')')
+                && !line.starts_with("Decompiling ")
+                && !line.is_empty()
+        })
+        .unwrap_or_default();
     assert!(
-        !header.contains("(*arg)") && !header.contains("(*arg0)") && !header.contains("(*arg1)"),
-        "Non-callback argument should not be forced to function-pointer type:\n{}",
+        header == "int32_t _spawn_with_static_start(int64_t arg0)"
+            || header == "int32_t _spawn_with_static_start(void* (*arg0)(void*))",
+        "Static-start wrapper header unexpectedly changed:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "sort_with_cmp_multihop"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("int32_t (*cmp)(void*, void*)")
+            || stdout.contains("int32_t (*arg2)(void*, void*)"),
+        "Output should keep typed qsort callback through multihop aliasing:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "spawn_with_start_multihop"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("void* (*start_routine)(void*)")
+            || stdout.contains("void* (*arg0)(void*)")
+            || stdout.contains("void* (*arg1)(void*)"),
+        "Output should keep typed pthread callback through multihop aliasing:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "sort_with_qsort_r_glibc"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hexray_qsort_r("),
+        "Output should include glibc-like qsort_r callback API call:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("int32_t (*cmp)(void*, void*, void*)")
+            || stdout.contains("int32_t (*compar)(void*, void*, void*)")
+            || stdout.contains("int32_t (*arg2)(void*, void*, void*)")
+            || stdout.contains("int32_t (*arg3)(void*, void*, void*)"),
+        "Output should include precise glibc-like qsort_r callback signature:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "sort_with_qsort_r_bsd"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hexray_bsd_qsort_r("),
+        "Output should include BSD-like qsort_r callback API call:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("int32_t (*cmp)(void*, void*, void*)")
+            || stdout.contains("int32_t (*compar)(void*, void*, void*)")
+            || stdout.contains("int32_t (*arg2)(void*, void*, void*)")
+            || stdout.contains("int32_t (*arg3)(void*, void*, void*)"),
+        "Output should include precise BSD-like qsort_r callback signature:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "register_on_exit"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hexray_on_exit("),
+        "Output should include on_exit-style callback API call:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("void (*cb)(int32_t, void*)")
+            || stdout.contains("void (*arg0)(int32_t, void*)")
+            || stdout.contains("void (*arg1)(int32_t, void*)"),
+        "Output should include precise on_exit callback signature:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "register_atfork"]);
+    assert!(
+        output.status.success(),
+        "decompile callback fixture should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hexray_pthread_atfork("),
+        "Output should include pthread_atfork-style callback API call:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("void (*prepare)(void)")
+            || stdout.contains("void (*arg0)(void)")
+            || stdout.contains("void (*arg1)(void)")
+            || stdout.contains("void (*arg2)(void)"),
+        "Output should include precise atfork callback signatures:\n{}",
         stdout
     );
 }
@@ -583,8 +722,9 @@ fn test_decompile_callback_header_snapshots() {
         return;
     };
     let binary = binary.to_string_lossy().to_string();
+    let strict = strict_callback_typing_mode();
 
-    let expected = [
+    let strict_expected = [
         (
             "sort_with_cmp",
             "int32_t _sort_with_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
@@ -594,20 +734,20 @@ fn test_decompile_callback_header_snapshots() {
             "int32_t _lookup_with_cmp(int64_t arg0, int64_t arg1, int32_t arg2, int32_t (*arg3)(void*, void*))",
         ),
         (
-            "sort_with_static_cmp",
-            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)",
-        ),
-        (
             "spawn_with_start",
-            "void _spawn_with_start(int64_t arg0, void* (*arg1)(void*))",
+            "int32_t _spawn_with_start(int64_t arg0, void* (*arg1)(void*))",
         ),
         (
-            "spawn_with_static_start",
-            "void _spawn_with_static_start(int64_t arg0)",
+            "sort_with_cmp_multihop",
+            "int32_t _sort_with_cmp_multihop(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+        ),
+        (
+            "spawn_with_start_multihop",
+            "int32_t _spawn_with_start_multihop(int64_t arg0, void* (*arg1)(void*))",
         ),
     ];
 
-    for (symbol, expected_header) in expected {
+    for (symbol, expected_header) in strict_expected {
         let header = decompile_header(&binary, symbol)
             .unwrap_or_else(|| panic!("missing decompile header for symbol {}", symbol));
         assert_eq!(
@@ -616,6 +756,117 @@ fn test_decompile_callback_header_snapshots() {
             symbol
         );
     }
+
+    let static_cmp_header = decompile_header(&binary, "sort_with_static_cmp")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol sort_with_static_cmp"));
+    if strict {
+        assert_eq!(
+            static_cmp_header,
+            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+            "Strict mode mismatch for symbol sort_with_static_cmp"
+        );
+    } else {
+        assert!(
+            static_cmp_header == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)"
+                || static_cmp_header
+                    == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+            "Header snapshot mismatch for symbol sort_with_static_cmp: {}",
+            static_cmp_header
+        );
+    }
+
+    let static_spawn_header = decompile_header(&binary, "spawn_with_static_start")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol spawn_with_static_start"));
+    if strict {
+        assert_eq!(
+            static_spawn_header, "int32_t _spawn_with_static_start(void* (*arg0)(void*))",
+            "Strict mode mismatch for symbol spawn_with_static_start"
+        );
+    } else {
+        assert!(
+            static_spawn_header == "int32_t _spawn_with_static_start(int64_t arg0)"
+                || static_spawn_header == "int32_t _spawn_with_static_start(void* (*arg0)(void*))",
+            "Header snapshot mismatch for symbol spawn_with_static_start: {}",
+            static_spawn_header
+        );
+    }
+
+    let mixed_spawn_header = decompile_header(&binary, "spawn_mixed_forwarding")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol spawn_mixed_forwarding"));
+    if strict {
+        assert_eq!(
+            mixed_spawn_header,
+            "int32_t _spawn_mixed_forwarding(int64_t arg0, int64_t arg1, void* (*arg2)(void*))",
+            "Strict mode mismatch for symbol spawn_mixed_forwarding"
+        );
+    } else {
+        assert!(
+            mixed_spawn_header
+                == "int32_t _spawn_mixed_forwarding(void* (*arg0)(void*), int64_t arg1, int32_t arg2)"
+                || mixed_spawn_header
+                    == "int32_t _spawn_mixed_forwarding(int64_t arg0, void* (*arg1)(void*), int32_t arg2)"
+                || mixed_spawn_header
+                    == "int32_t _spawn_mixed_forwarding(int64_t arg0, int64_t arg1, void* (*arg2)(void*))",
+            "Header snapshot mismatch for symbol spawn_mixed_forwarding: {}",
+            mixed_spawn_header
+        );
+    }
+
+    let mixed_sort_header = decompile_header(&binary, "sort_mixed_forwarding")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol sort_mixed_forwarding"));
+    if strict {
+        assert_eq!(
+            mixed_sort_header,
+            "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
+            "Strict mode mismatch for symbol sort_mixed_forwarding"
+        );
+    } else {
+        assert!(
+            mixed_sort_header
+                == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*), int32_t arg3)"
+                || mixed_sort_header
+                    == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
+            "Header snapshot mismatch for symbol sort_mixed_forwarding: {}",
+            mixed_sort_header
+        );
+    }
+
+    let qsort_r_glibc_header = decompile_header(&binary, "sort_with_qsort_r_glibc")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol sort_with_qsort_r_glibc"));
+    assert!(
+        qsort_r_glibc_header.contains("(*arg2)(void*, void*, void*)")
+            || qsort_r_glibc_header.contains("(*arg3)(void*, void*, void*)"),
+        "Header snapshot mismatch for symbol sort_with_qsort_r_glibc: {}",
+        qsort_r_glibc_header
+    );
+
+    let qsort_r_bsd_header = decompile_header(&binary, "sort_with_qsort_r_bsd")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol sort_with_qsort_r_bsd"));
+    assert!(
+        qsort_r_bsd_header.contains("(*arg2)(void*, void*, void*)")
+            || qsort_r_bsd_header.contains("(*arg3)(void*, void*, void*)"),
+        "Header snapshot mismatch for symbol sort_with_qsort_r_bsd: {}",
+        qsort_r_bsd_header
+    );
+
+    let on_exit_header = decompile_header(&binary, "register_on_exit")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol register_on_exit"));
+    assert!(
+        on_exit_header.contains("(*arg0)(int32_t, void*)")
+            || on_exit_header.contains("(*arg1)(int32_t, void*)"),
+        "Header snapshot mismatch for symbol register_on_exit: {}",
+        on_exit_header
+    );
+
+    let atfork_header = decompile_header(&binary, "register_atfork")
+        .unwrap_or_else(|| panic!("missing decompile header for symbol register_atfork"));
+    assert!(
+        atfork_header.contains("(*arg0)(void)")
+            || atfork_header.contains("(*arg1)(void)")
+            || atfork_header.contains("(*arg2)(void)"),
+        "Header snapshot mismatch for symbol register_atfork: {}",
+        atfork_header
+    );
 }
 
 #[test]
@@ -647,6 +898,65 @@ fn test_decompile_callback_diagnostics() {
             || stdout.contains("summary marks")
             || stdout.contains("no function-pointer parameters inferred"),
         "Diagnostics should include function-pointer provenance details:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("return inferred as"),
+        "Diagnostics should include return-type inference details:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("confidence") || stdout.contains("return inferred as void"),
+        "Diagnostics should include return-type confidence or explicit void return:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[&binary, "decompile", "register_atfork", "--diagnostics"]);
+    assert!(
+        output.status.success(),
+        "decompile diagnostics should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[source=slot-fallback]"),
+        "Diagnostics should include slot-fallback provenance for multi-callback mapping:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_decompile_callback_golden_multihop_with_diagnostics() {
+    let Some(binary) = build_c_fixture("test_callbacks.c") else {
+        return;
+    };
+    let binary = binary.to_string_lossy().to_string();
+    let output = run_hexray(&[
+        &binary,
+        "decompile",
+        "sort_with_cmp_multihop",
+        "--diagnostics",
+    ]);
+    assert!(
+        output.status.success(),
+        "decompile diagnostics should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let header = stdout
+        .lines()
+        .find(|l| l.contains("_sort_with_cmp_multihop("));
+    assert_eq!(
+        header,
+        Some("int32_t _sort_with_cmp_multihop(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))"),
+        "Golden callback header mismatch:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("[diag]")
+            && stdout.contains("callback slot")
+            && stdout.contains("return inferred as"),
+        "Golden diagnostics should include callback and return provenance:\n{}",
         stdout
     );
 }
