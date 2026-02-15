@@ -2439,35 +2439,65 @@ impl Arm64Disassembler {
         let src2 = if sf { Self::xreg(rm) } else { Self::wreg(rm) };
         let (cond_str, _) = decode_condition(cond);
 
+        // For aliases, we need to invert the condition (e.g., eq -> ne)
+        // The encoding uses the inverted condition, so we display the inverted one
+        let inverted_cond = cond ^ 1;
+        let (inverted_cond_str, _) = decode_condition(inverted_cond);
+
         // Check for aliases
         let (final_mnemonic, operands) = if op == 0 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE
         {
-            // CINC alias
+            // CINC/CSET alias: CSINC Rd, Rn, Rn, invert(cond)
+            // The displayed condition is the inverted one
             if rn == 31 {
-                // CSET
-                ("cset", vec![Operand::reg(dst)])
+                // CSET Rd, cond (where cond is the inverted condition)
+                (
+                    format!("cset.{}", inverted_cond_str),
+                    vec![Operand::reg(dst)],
+                )
             } else {
-                ("cinc", vec![Operand::reg(dst), Operand::reg(src1)])
+                (
+                    format!("cinc.{}", inverted_cond_str),
+                    vec![Operand::reg(dst), Operand::reg(src1)],
+                )
             }
         } else if op == 1 && op2 == 0b00 && rn == rm && cond & 0xE != 0xE {
-            // CINV alias
+            // CINV/CSETM alias
             if rn == 31 {
-                ("csetm", vec![Operand::reg(dst)])
+                // CSETM Rd, cond
+                (
+                    format!("csetm.{}", inverted_cond_str),
+                    vec![Operand::reg(dst)],
+                )
             } else {
-                ("cinv", vec![Operand::reg(dst), Operand::reg(src1)])
+                (
+                    format!("cinv.{}", inverted_cond_str),
+                    vec![Operand::reg(dst), Operand::reg(src1)],
+                )
             }
         } else if op == 1 && op2 == 0b01 && rn == rm && cond & 0xE != 0xE {
             // CNEG alias
-            ("cneg", vec![Operand::reg(dst), Operand::reg(src1)])
+            (
+                format!("cneg.{}", inverted_cond_str),
+                vec![Operand::reg(dst), Operand::reg(src1)],
+            )
         } else {
             (
-                mnemonic,
+                format!("{}.{}", mnemonic, cond_str),
                 vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
             )
         };
 
+        // Determine the operation: aliases with condition in name use SetConditional
+        let is_conditional_alias = final_mnemonic.contains('.');
+        let operation = if is_conditional_alias {
+            Operation::SetConditional
+        } else {
+            Operation::Move
+        };
+
         let inst = Instruction::new(address, 4, bytes, final_mnemonic)
-            .with_operation(Operation::Move)
+            .with_operation(operation)
             .with_operands(operands);
 
         Ok(DecodedInstruction {

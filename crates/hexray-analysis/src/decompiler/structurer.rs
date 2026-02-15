@@ -1493,11 +1493,12 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
     }
 
     // Find the last compare instruction in the block
+    // This includes CMP, TEST, SUB/SUBS, and ANDS instructions
     let compare_inst = block.instructions.iter().rev().find(|inst| {
         matches!(
             inst.operation,
             Operation::Compare | Operation::Test | Operation::Sub
-        )
+        ) || (matches!(inst.operation, Operation::And) && inst.mnemonic.ends_with('s'))
     });
 
     if let Some(inst) = compare_inst {
@@ -1513,6 +1514,20 @@ fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
                 &reg_values,
             );
             return Expr::binop(op, left, right);
+        } else if inst.operands.len() >= 3 && matches!(inst.operation, Operation::And) {
+            // For ANDS instructions (ARM64), operands are [dst, src1, src2] or [dst, src1, imm]
+            // The flags are set based on (src1 & src2), compared against zero
+            let src1 = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[1], inst),
+                &reg_values,
+            );
+            let src2 = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[2], inst),
+                &reg_values,
+            );
+            // Create (src1 & src2) and compare against zero
+            let and_result = Expr::binop(BinOpKind::And, src1, src2);
+            return Expr::binop(op, and_result, Expr::int(0));
         } else if inst.operands.len() >= 2 {
             // For CMP/TEST instructions, operands are [src1, src2]
             let left = substitute_register_in_expr(
@@ -1768,7 +1783,20 @@ fn negate_condition(expr: Expr) -> Expr {
 /// Parses the condition suffix from a SETcc or CMOVcc mnemonic.
 /// Returns None if the mnemonic doesn't have a recognized condition suffix.
 fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
-    // Extract suffix after "set" or "cmov"
+    // Handle ARM64 style: cset.eq, cinc.ne, csetm.mi, etc.
+    if let Some(dot_pos) = mnemonic.find('.') {
+        let prefix = &mnemonic[..dot_pos];
+        let suffix = &mnemonic[dot_pos + 1..];
+        // Check for ARM64 conditional instructions
+        if matches!(
+            prefix,
+            "cset" | "csetm" | "cinc" | "cinv" | "cneg" | "csel" | "csinc" | "csinv" | "csneg"
+        ) {
+            return parse_arm64_condition(suffix);
+        }
+    }
+
+    // Handle x86 style: sete, cmovne, etc.
     let suffix = if let Some(s) = mnemonic.strip_prefix("set") {
         s
     } else if let Some(s) = mnemonic.strip_prefix("cmov") {
@@ -1777,7 +1805,7 @@ fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
         return None;
     };
 
-    // Map suffix to Condition
+    // Map x86 suffix to Condition
     match suffix {
         "e" | "z" => Some(Condition::Equal),
         "ne" | "nz" => Some(Condition::NotEqual),
@@ -1795,6 +1823,30 @@ fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
         "no" => Some(Condition::NotOverflow),
         "p" | "pe" => Some(Condition::Parity),
         "np" | "po" => Some(Condition::NotParity),
+        _ => None,
+    }
+}
+
+/// Parse ARM64 condition code suffixes
+fn parse_arm64_condition(suffix: &str) -> Option<Condition> {
+    match suffix {
+        "eq" => Some(Condition::Equal),
+        "ne" => Some(Condition::NotEqual),
+        "lt" => Some(Condition::Less),
+        "le" => Some(Condition::LessOrEqual),
+        "gt" => Some(Condition::Greater),
+        "ge" => Some(Condition::GreaterOrEqual),
+        // Unsigned comparisons
+        "lo" | "cc" => Some(Condition::Below), // Carry Clear = Below
+        "ls" => Some(Condition::BelowOrEqual), // Lower or Same
+        "hi" => Some(Condition::Above),        // Higher
+        "hs" | "cs" => Some(Condition::AboveOrEqual), // Carry Set = Above or Equal
+        // Sign/overflow
+        "mi" => Some(Condition::Sign),        // Negative (minus)
+        "pl" => Some(Condition::NotSign),     // Positive or zero (plus)
+        "vs" => Some(Condition::Overflow),    // Overflow set
+        "vc" => Some(Condition::NotOverflow), // Overflow clear
+        // "al" (always) shouldn't appear in cset - just ignore it
         _ => None,
     }
 }
