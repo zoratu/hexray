@@ -1069,7 +1069,16 @@ impl Expr {
             Operation::Add => Self::make_binop(ops, BinOpKind::Add, &inst.mnemonic),
             Operation::Sub => {
                 // Special case: sub reg, reg is a zeroing idiom
-                if ops.len() >= 2 && ops[0] == ops[1] {
+                // For 2-operand (x86): sub eax, eax → ops[0] == ops[1]
+                // For 3-operand (ARM64): subs w8, w8, w8 → ops[1] == ops[2]
+                let is_zeroing = if ops.len() == 2 {
+                    ops[0] == ops[1]
+                } else if ops.len() >= 3 {
+                    ops[1] == ops[2]
+                } else {
+                    false
+                };
+                if is_zeroing {
                     Self::assign(Self::from_operand(&ops[0]), Self::int(0))
                 } else {
                     Self::make_binop(ops, BinOpKind::Sub, &inst.mnemonic)
@@ -1081,7 +1090,16 @@ impl Expr {
             Operation::Or => Self::make_binop(ops, BinOpKind::Or, &inst.mnemonic),
             Operation::Xor => {
                 // Special case: xor reg, reg is a zeroing idiom
-                if ops.len() >= 2 && ops[0] == ops[1] {
+                // For 2-operand (x86): xor eax, eax → ops[0] == ops[1]
+                // For 3-operand (ARM64): eor w8, w8, w8 → ops[1] == ops[2]
+                let is_zeroing = if ops.len() == 2 {
+                    ops[0] == ops[1]
+                } else if ops.len() >= 3 {
+                    ops[1] == ops[2]
+                } else {
+                    false
+                };
+                if is_zeroing {
                     Self::assign(Self::from_operand(&ops[0]), Self::int(0))
                 } else {
                     Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic)
