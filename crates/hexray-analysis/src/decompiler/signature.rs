@@ -661,6 +661,8 @@ pub struct SignatureRecovery {
     /// A single alias can map to multiple argument indices when lifted temporaries are reused.
     /// We only treat alias mappings as precise when the candidate set is unambiguous.
     function_pointer_aliases: HashMap<String, BTreeSet<usize>>,
+    /// Most recently observed alias-to-parameter mapping for flow-sensitive disambiguation.
+    function_pointer_alias_latest: HashMap<String, usize>,
     /// Function-pointer typed locals derived from assignments/returns.
     value_function_pointer_types: HashMap<String, ParamType>,
     /// String functions for detection.
@@ -700,6 +702,7 @@ impl SignatureRecovery {
             param_names: HashMap::new(),
             param_hints: HashMap::new(),
             function_pointer_aliases: HashMap::new(),
+            function_pointer_alias_latest: HashMap::new(),
             value_function_pointer_types: HashMap::new(),
             string_functions,
             relocation_table: None,
@@ -745,6 +748,7 @@ impl SignatureRecovery {
         self.param_names.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
+        self.function_pointer_alias_latest.clear();
         self.value_function_pointer_types.clear();
 
         // Analyze the function body
@@ -1235,35 +1239,58 @@ impl SignatureRecovery {
                         let mut resolved_param_idx = self.resolve_param_index_from_expr(arg);
                         let mut used_shape_fallback = false;
                         let mut used_slot_fallback = false;
-                        if is_callback_slot && resolved_param_idx.is_none() {
+                        let mut used_alias_latest_fallback = false;
+                        if is_callback_slot {
                             let callback_slots = self.callback_slot_indices(fn_name);
-                            if Self::prefer_slot_ordinal_callback_fallback(fn_name)
-                                && (callback_slots.len() > 1 || callback_slots.as_slice() == [0])
+                            if callback_slots.len() == 1
+                                && !Self::prefer_slot_ordinal_callback_fallback(fn_name)
                             {
-                                // APIs that preserve callback ordering in wrappers
-                                // (e.g., pthread_atfork, on_exit) often map callback slots
-                                // directly to same-ordinal parameters.
-                                resolved_param_idx = Some(i);
-                                used_slot_fallback = true;
-                            } else {
-                                let mut excluded = HashSet::new();
-                                for (other_i, other_arg) in args.iter().enumerate() {
-                                    if other_i == i
-                                        || ParameterUsageHints::callback_signature(fn_name, other_i)
-                                            .is_some()
-                                    {
-                                        continue;
-                                    }
-                                    if let Some(other_idx) =
-                                        self.resolve_param_index_from_expr(other_arg)
-                                    {
-                                        excluded.insert(other_idx);
+                                if let Some(name) = &var_name {
+                                    if let Some(idx) = self.resolve_latest_alias_param_index(name) {
+                                        let ambiguous_alias =
+                                            self.alias_candidate_indices(name).len() > 1;
+                                        if resolved_param_idx.is_none() || ambiguous_alias {
+                                            resolved_param_idx = Some(idx);
+                                            used_alias_latest_fallback = true;
+                                        }
                                     }
                                 }
-                                resolved_param_idx = self
-                                    .fallback_callback_param_index_excluding(&excluded)
-                                    .or_else(|| self.fallback_callback_param_index());
-                                used_shape_fallback = resolved_param_idx.is_some();
+                            }
+                        }
+                        if is_callback_slot && resolved_param_idx.is_none() {
+                            let callback_slots = self.callback_slot_indices(fn_name);
+                            if resolved_param_idx.is_none() {
+                                if Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                                    && (callback_slots.len() > 1
+                                        || callback_slots.as_slice() == [0])
+                                {
+                                    // APIs that preserve callback ordering in wrappers
+                                    // (e.g., pthread_atfork, on_exit) often map callback slots
+                                    // directly to same-ordinal parameters.
+                                    resolved_param_idx = Some(i);
+                                    used_slot_fallback = true;
+                                } else {
+                                    let mut excluded = HashSet::new();
+                                    for (other_i, other_arg) in args.iter().enumerate() {
+                                        if other_i == i
+                                            || ParameterUsageHints::callback_signature(
+                                                fn_name, other_i,
+                                            )
+                                            .is_some()
+                                        {
+                                            continue;
+                                        }
+                                        if let Some(other_idx) =
+                                            self.resolve_param_index_from_expr(other_arg)
+                                        {
+                                            excluded.insert(other_idx);
+                                        }
+                                    }
+                                    resolved_param_idx = self
+                                        .fallback_callback_param_index_excluding(&excluded)
+                                        .or_else(|| self.fallback_callback_param_index());
+                                    used_shape_fallback = resolved_param_idx.is_some();
+                                }
                             }
                         }
                         if is_callback_slot {
@@ -1291,6 +1318,12 @@ impl SignatureRecovery {
                                 if used_shape_fallback {
                                     hints.add_function_pointer_reason(format!(
                                         "[source=shape-fallback] mapped callback slot '{}' argument {} by ABI-shaped fallback",
+                                        fn_name, i
+                                    ));
+                                }
+                                if used_alias_latest_fallback {
+                                    hints.add_function_pointer_reason(format!(
+                                        "[source=alias-latest] mapped callback slot '{}' argument {} by latest alias assignment",
                                         fn_name, i
                                     ));
                                 }
@@ -1639,7 +1672,7 @@ impl SignatureRecovery {
     }
 
     fn resolve_alias_param_index(&self, var_name: &str) -> Option<usize> {
-        let candidates = self.function_pointer_aliases.get(var_name)?;
+        let candidates = self.alias_candidate_indices(var_name);
         if candidates.len() == 1 {
             candidates.iter().next().copied()
         } else {
@@ -1647,32 +1680,83 @@ impl SignatureRecovery {
         }
     }
 
-    fn insert_function_pointer_alias(&mut self, lhs_name: &str, idx: usize) {
+    fn resolve_latest_alias_param_index(&self, var_name: &str) -> Option<usize> {
+        if let Some(idx) = self.function_pointer_alias_latest.get(var_name) {
+            return Some(*idx);
+        }
+        Self::lifted_alias_name_variants(var_name)
+            .into_iter()
+            .find_map(|name| self.function_pointer_alias_latest.get(&name).copied())
+    }
+
+    fn insert_function_pointer_alias_entry(&mut self, name: &str, idx: usize) {
         self.function_pointer_aliases
-            .entry(lhs_name.to_string())
+            .entry(name.to_string())
             .or_default()
             .insert(idx);
-        if let Some(offset_str) = lhs_name.strip_prefix("stack_") {
+        self.function_pointer_alias_latest
+            .insert(name.to_string(), idx);
+    }
+
+    fn insert_function_pointer_alias(&mut self, lhs_name: &str, idx: usize) {
+        self.insert_function_pointer_alias_entry(lhs_name, idx);
+        for alias_name in Self::lifted_alias_name_variants(lhs_name) {
+            self.insert_function_pointer_alias_entry(&alias_name, idx);
+        }
+    }
+
+    fn parse_lifted_hex_suffix(name: &str, prefix: &str) -> Option<u128> {
+        let suffix = name.strip_prefix(prefix)?;
+        let suffix = suffix.strip_prefix("0x").unwrap_or(suffix);
+        u128::from_str_radix(suffix, 16).ok()
+    }
+
+    fn lifted_alias_name_variants(var_name: &str) -> Vec<String> {
+        let mut variants = Vec::new();
+        if let Some(offset_str) = var_name.strip_prefix("stack_") {
             if let Ok(offset) = offset_str.parse::<i128>() {
                 if offset < 0 {
                     let abs = (-offset) as u128;
-                    self.function_pointer_aliases
-                        .entry(format!("arg_{:x}", abs))
-                        .or_default()
-                        .insert(idx);
-                    self.function_pointer_aliases
-                        .entry(format!("local_{:x}", abs))
-                        .or_default()
-                        .insert(idx);
+                    variants.push(format!("arg_{:x}", abs));
+                    variants.push(format!("local_{:x}", abs));
                 } else {
-                    let val = offset as u128;
-                    self.function_pointer_aliases
-                        .entry(format!("var_{:x}", val))
-                        .or_default()
-                        .insert(idx);
+                    variants.push(format!("var_{:x}", offset as u128));
                 }
             }
+            return variants;
         }
+
+        if var_name.starts_with("arg_") || var_name.starts_with("local_") {
+            let abs = Self::parse_lifted_hex_suffix(var_name, "arg_")
+                .or_else(|| Self::parse_lifted_hex_suffix(var_name, "local_"));
+            if let Some(abs) = abs {
+                if var_name.starts_with("arg_") {
+                    variants.push(format!("local_{:x}", abs));
+                } else {
+                    variants.push(format!("arg_{:x}", abs));
+                }
+                variants.push(format!("stack_-{}", abs));
+            }
+            return variants;
+        }
+
+        if let Some(offset) = Self::parse_lifted_hex_suffix(var_name, "var_") {
+            variants.push(format!("stack_{}", offset));
+        }
+        variants
+    }
+
+    fn alias_candidate_indices(&self, var_name: &str) -> BTreeSet<usize> {
+        let mut candidates = BTreeSet::new();
+        if let Some(indices) = self.function_pointer_aliases.get(var_name) {
+            candidates.extend(indices.iter().copied());
+        }
+        for alias_name in Self::lifted_alias_name_variants(var_name) {
+            if let Some(indices) = self.function_pointer_aliases.get(&alias_name) {
+                candidates.extend(indices.iter().copied());
+            }
+        }
+        candidates
     }
 
     fn fallback_callback_param_index(&self) -> Option<usize> {
@@ -1747,11 +1831,7 @@ impl SignatureRecovery {
         if let Some(idx) = self.resolve_alias_param_index(var_name) {
             return Some(idx);
         }
-        if self
-            .function_pointer_aliases
-            .get(var_name)
-            .is_some_and(|candidates| candidates.len() > 1)
-        {
+        if self.alias_candidate_indices(var_name).len() > 1 {
             return None;
         }
         if let Some(idx) = self.arg_register_index(var_name) {
@@ -1842,6 +1922,9 @@ impl SignatureRecovery {
             ExprKind::Deref { .. } => self
                 .extract_stack_offset(expr)
                 .map(|offset| format!("stack_{}", offset)),
+            ExprKind::ArrayAccess { .. } => self
+                .extract_stack_offset(expr)
+                .map(|offset| format!("stack_{}", offset)),
             ExprKind::Cast { expr: inner, .. } => self.extract_var_name(inner),
             _ => None,
         }
@@ -1858,23 +1941,60 @@ impl SignatureRecovery {
 
     /// Extracts a stack offset from a deref expression.
     fn extract_stack_offset(&self, expr: &Expr) -> Option<i128> {
-        if let ExprKind::Deref { addr, .. } = &expr.kind {
-            if let ExprKind::BinOp { op, left, right } = &addr.kind {
-                if let ExprKind::Var(base) = &left.kind {
-                    if is_frame_pointer(&base.name) {
-                        if let ExprKind::IntLit(offset) = &right.kind {
-                            let actual = match op {
-                                BinOpKind::Add => *offset,
-                                BinOpKind::Sub => -*offset,
-                                _ => return None,
-                            };
-                            return Some(actual);
+        match &expr.kind {
+            ExprKind::Deref { addr, .. } => {
+                if let ExprKind::BinOp { op, left, right } = &addr.kind {
+                    if let ExprKind::Var(base) = &left.kind {
+                        if is_frame_pointer(&base.name) {
+                            if let ExprKind::IntLit(offset) = &right.kind {
+                                let actual = match op {
+                                    BinOpKind::Add => *offset,
+                                    BinOpKind::Sub => -*offset,
+                                    _ => return None,
+                                };
+                                return Some(actual);
+                            }
                         }
                     }
                 }
+                if let ExprKind::ArrayAccess {
+                    base,
+                    index,
+                    element_size,
+                } = &addr.kind
+                {
+                    return self.extract_stack_offset_from_array_index(base, index, *element_size);
+                }
             }
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => return self.extract_stack_offset_from_array_index(base, index, *element_size),
+            _ => {}
         }
         None
+    }
+
+    fn extract_stack_offset_from_array_index(
+        &self,
+        base: &Expr,
+        index: &Expr,
+        element_size: usize,
+    ) -> Option<i128> {
+        let ExprKind::Var(base_var) = &base.kind else {
+            return None;
+        };
+        let base_name = base_var.name.to_lowercase();
+        if !is_frame_pointer(&base_name)
+            && !matches!(base_name.as_str(), "sp" | "rsp" | "esp" | "x31")
+        {
+            return None;
+        }
+        let ExprKind::IntLit(slot_index) = &index.kind else {
+            return None;
+        };
+        Some(*slot_index * element_size as i128)
     }
 
     /// Checks if a register name is an argument register.
@@ -2399,6 +2519,15 @@ mod tests {
             SignatureRecovery::lifted_local_slot_index("var_10"),
             Some(1)
         );
+    }
+
+    #[test]
+    fn test_extract_stack_offset_from_array_access() {
+        let recovery = SignatureRecovery::new(CallingConvention::Aarch64);
+        let fp_slot = Expr::array_access(Expr::var(Variable::reg("x29", 8)), Expr::int(-1), 8);
+        let sp_slot = Expr::array_access(Expr::var(Variable::reg("sp", 8)), Expr::int(2), 8);
+        assert_eq!(recovery.extract_stack_offset(&fp_slot), Some(-8));
+        assert_eq!(recovery.extract_stack_offset(&sp_slot), Some(16));
     }
 
     #[test]
@@ -3046,6 +3175,79 @@ mod tests {
             ),
             "params: {:?}",
             sig.parameters
+        );
+        let reasons = sig
+            .parameter_provenance
+            .get(&2)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            reasons.iter().any(|r| r.contains("[source=alias]")),
+            "provenance: {:?}",
+            reasons
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.contains("[source=shape-fallback]")),
+            "provenance: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_resolves_array_access_alias_in_qsort_callback() {
+        use hexray_core::BasicBlockId;
+
+        let fp_slot = Expr::array_access(Expr::var(Variable::reg("x29", 8)), Expr::int(-1), 8);
+        let sp_slot_arg1 = Expr::array_access(Expr::var(Variable::reg("sp", 8)), Expr::int(2), 8);
+        let sp_slot_cb = Expr::array_access(Expr::var(Variable::reg("sp", 8)), Expr::int(1), 8);
+        let stmt1 = Expr::assign(fp_slot.clone(), Expr::unknown("arg0"));
+        let stmt2 = Expr::assign(sp_slot_arg1.clone(), Expr::unknown("arg1"));
+        let stmt3 = Expr::assign(sp_slot_cb.clone(), Expr::unknown("arg2"));
+        let call = Expr::call(
+            CallTarget::Named("_qsort".to_string()),
+            vec![fp_slot, sp_slot_arg1, Expr::int(4), sp_slot_cb],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![stmt1, stmt2, stmt3, call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.parameters.len() >= 3, "params: {:?}", sig.parameters);
+        assert!(
+            matches!(
+                sig.parameters[2].param_type,
+                ParamType::FunctionPointer { .. }
+            ),
+            "params: {:?}",
+            sig.parameters
+        );
+        let reasons = sig
+            .parameter_provenance
+            .get(&2)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            reasons.iter().any(|r| r.contains("[source=alias]")),
+            "provenance: {:?}",
+            reasons
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.contains("[source=shape-fallback]")),
+            "provenance: {:?}",
+            reasons
         );
     }
 
