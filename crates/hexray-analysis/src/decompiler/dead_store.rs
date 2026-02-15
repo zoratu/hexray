@@ -19,7 +19,7 @@ pub fn eliminate_dead_stores(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> 
 }
 
 /// Collect all variable uses (reads) in the nodes.
-fn collect_all_uses(nodes: &[StructuredNode], uses: &mut HashSet<String>) {
+pub fn collect_all_uses(nodes: &[StructuredNode], uses: &mut HashSet<String>) {
     for node in nodes {
         collect_uses_in_node(node, uses);
     }

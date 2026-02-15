@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use super::abi::{
     get_arg_register_index, is_callee_saved_register, is_return_register, is_temp_register,
 };
+use super::dead_store::collect_all_uses;
 use super::expression::{resolve_adrp_patterns, BinOpKind, Expr};
 use super::for_loop_detection::{detect_for_loops, get_expr_var_key};
 use super::short_circuit::detect_short_circuit;
@@ -2283,16 +2284,23 @@ fn simplify_conditions_in_node(node: StructuredNode) -> StructuredNode {
     }
 }
 
-/// Removes temp register assignments from all blocks.
+/// Removes temp register assignments from all blocks that are not used elsewhere.
+/// Uses liveness analysis to avoid removing temp assignments that are actually used
+/// (e.g., loop accumulators).
 fn remove_temp_assignments(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    // First pass: collect all variable uses in the entire tree
+    let mut uses = HashSet::new();
+    collect_all_uses(&nodes, &mut uses);
+
+    // Second pass: remove only temp assignments where the variable is not used
     nodes
         .into_iter()
-        .map(remove_temp_assignments_in_node)
+        .map(|node| remove_temp_assignments_in_node(node, &uses))
         .collect()
 }
 
 /// Removes temp register assignments from a single node.
-fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
+fn remove_temp_assignments_in_node(node: StructuredNode, uses: &HashSet<String>) -> StructuredNode {
     use super::expression::ExprKind;
 
     match node {
@@ -2306,8 +2314,9 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
                 .filter(|stmt| {
                     if let ExprKind::Assign { lhs, .. } = &stmt.kind {
                         if let ExprKind::Var(v) = &lhs.kind {
-                            if is_temp_register(&v.name) {
-                                return false; // Remove temp assignment
+                            // Only remove temp assignments if the variable is NOT used elsewhere
+                            if is_temp_register(&v.name) && !uses.contains(&v.name) {
+                                return false; // Remove unused temp assignment
                             }
                         }
                     }
@@ -2326,8 +2335,15 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             else_body,
         } => StructuredNode::If {
             condition,
-            then_body: remove_temp_assignments(then_body),
-            else_body: else_body.map(remove_temp_assignments),
+            then_body: then_body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
+            else_body: else_body.map(|e| {
+                e.into_iter()
+                    .map(|n| remove_temp_assignments_in_node(n, uses))
+                    .collect()
+            }),
         },
         StructuredNode::While {
             condition,
@@ -2336,7 +2352,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             exit_block,
         } => StructuredNode::While {
             condition,
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             header,
             exit_block,
         },
@@ -2346,7 +2365,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::DoWhile {
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             condition,
             header,
             exit_block,
@@ -2362,7 +2384,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             init,
             condition,
             update,
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             header,
             exit_block,
         },
@@ -2371,7 +2396,10 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::Loop {
-            body: remove_temp_assignments(body),
+            body: body
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
             header,
             exit_block,
         },
@@ -2383,11 +2411,27 @@ fn remove_temp_assignments_in_node(node: StructuredNode) -> StructuredNode {
             value,
             cases: cases
                 .into_iter()
-                .map(|(vals, body)| (vals, remove_temp_assignments(body)))
+                .map(|(vals, body)| {
+                    (
+                        vals,
+                        body.into_iter()
+                            .map(|n| remove_temp_assignments_in_node(n, uses))
+                            .collect(),
+                    )
+                })
                 .collect(),
-            default: default.map(remove_temp_assignments),
+            default: default.map(|d| {
+                d.into_iter()
+                    .map(|n| remove_temp_assignments_in_node(n, uses))
+                    .collect()
+            }),
         },
-        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(remove_temp_assignments(nodes)),
+        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
+            nodes
+                .into_iter()
+                .map(|n| remove_temp_assignments_in_node(n, uses))
+                .collect(),
+        ),
         other => other,
     }
 }
