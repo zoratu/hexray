@@ -2862,6 +2862,10 @@ impl PseudoCodeEmitter {
             StructuredNode::While {
                 condition, body, ..
             } => {
+                // Eliminate dead loops: while (0) { ... } - body never executes
+                if let Some(0) = self.try_eval_constant(condition) {
+                    return;
+                }
                 let indent = self.indent.repeat(depth);
                 writeln!(
                     output,
@@ -3029,6 +3033,10 @@ impl PseudoCodeEmitter {
             StructuredNode::While {
                 condition, body, ..
             } => {
+                // Eliminate dead loops: while (0) { ... } - body never executes
+                if let Some(0) = self.try_eval_constant(condition) {
+                    return;
+                }
                 let indent = self.indent.repeat(depth);
                 writeln!(
                     output,
@@ -3666,6 +3674,10 @@ impl PseudoCodeEmitter {
             StructuredNode::While {
                 condition, body, ..
             } => {
+                // Eliminate dead loops: while (0) { ... } - body never executes
+                if let Some(0) = self.try_eval_constant(condition) {
+                    return;
+                }
                 writeln!(
                     output,
                     "{}while ({}) {{",
