@@ -2843,24 +2843,14 @@ impl PseudoCodeEmitter {
                 )
                 .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
-                if let Some(else_nodes) = actual_else {
-                    if !self.is_body_empty(else_nodes) {
-                        if else_nodes.len() == 1 {
-                            if let StructuredNode::If { .. } = &else_nodes[0] {
-                                write!(output, "{}}} else ", indent).unwrap();
-                                self.emit_node_with_decls(
-                                    &else_nodes[0],
-                                    output,
-                                    depth,
-                                    declared_vars,
-                                );
-                                return;
-                            }
-                        }
-                        writeln!(output, "{}}} else {{", indent).unwrap();
-                        self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
-                    }
-                }
+                // Emit else clause (handles else-if chains recursively)
+                self.emit_else_clause_with_decls(
+                    &actual_else.map(|v| v.to_vec()),
+                    output,
+                    depth,
+                    &indent,
+                    declared_vars,
+                );
                 writeln!(output, "{}}}", indent).unwrap();
             }
             StructuredNode::While {
@@ -3020,24 +3010,14 @@ impl PseudoCodeEmitter {
                 )
                 .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
-                if let Some(else_nodes) = actual_else {
-                    if !self.is_body_empty(else_nodes) {
-                        if else_nodes.len() == 1 {
-                            if let StructuredNode::If { .. } = &else_nodes[0] {
-                                write!(output, "{}}} else ", indent).unwrap();
-                                self.emit_node_with_decls(
-                                    &else_nodes[0],
-                                    output,
-                                    depth,
-                                    declared_vars,
-                                );
-                                return;
-                            }
-                        }
-                        writeln!(output, "{}}} else {{", indent).unwrap();
-                        self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
-                    }
-                }
+                // Emit else clause (handles else-if chains recursively)
+                self.emit_else_clause_with_decls(
+                    &actual_else.map(|v| v.to_vec()),
+                    output,
+                    depth,
+                    &indent,
+                    declared_vars,
+                );
                 writeln!(output, "{}}}", indent).unwrap();
             }
             StructuredNode::While {
@@ -3206,6 +3186,107 @@ impl PseudoCodeEmitter {
                 break;
             }
         }
+    }
+
+    /// Emit an else clause, handling else-if chains without extra indentation.
+    fn emit_else_clause(
+        &self,
+        else_body: &Option<Vec<StructuredNode>>,
+        output: &mut String,
+        depth: usize,
+        indent: &str,
+    ) {
+        let Some(else_nodes) = else_body else {
+            return;
+        };
+
+        if self.is_body_empty(else_nodes) {
+            return;
+        }
+
+        // Check for else-if pattern: single If node in else body
+        if else_nodes.len() == 1 {
+            if let StructuredNode::If {
+                condition,
+                then_body,
+                else_body: nested_else,
+            } = &else_nodes[0]
+            {
+                // Skip stack canary checks in else-if
+                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                    return;
+                }
+
+                // Emit as "} else if (cond) {" on one line
+                writeln!(
+                    output,
+                    "{}}} else if ({}) {{",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
+                self.emit_nodes(then_body, output, depth + 1);
+
+                // Recursively handle nested else clauses
+                self.emit_else_clause(nested_else, output, depth, indent);
+                return;
+            }
+        }
+
+        // Regular else block
+        writeln!(output, "{}}} else {{", indent).unwrap();
+        self.emit_nodes(else_nodes, output, depth + 1);
+    }
+
+    /// Emit an else clause with variable declarations, handling else-if chains.
+    fn emit_else_clause_with_decls(
+        &self,
+        else_body: &Option<Vec<StructuredNode>>,
+        output: &mut String,
+        depth: usize,
+        indent: &str,
+        declared_vars: &mut HashSet<String>,
+    ) {
+        let Some(else_nodes) = else_body else {
+            return;
+        };
+
+        if self.is_body_empty(else_nodes) {
+            return;
+        }
+
+        // Check for else-if pattern: single If node in else body
+        if else_nodes.len() == 1 {
+            if let StructuredNode::If {
+                condition,
+                then_body,
+                else_body: nested_else,
+            } = &else_nodes[0]
+            {
+                // Skip stack canary checks in else-if
+                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                    return;
+                }
+
+                // Emit as "} else if (cond) {" on one line
+                writeln!(
+                    output,
+                    "{}}} else if ({}) {{",
+                    indent,
+                    self.format_expr(condition)
+                )
+                .unwrap();
+                self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
+
+                // Recursively handle nested else clauses
+                self.emit_else_clause_with_decls(nested_else, output, depth, indent, declared_vars);
+                return;
+            }
+        }
+
+        // Regular else block
+        writeln!(output, "{}}} else {{", indent).unwrap();
+        self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
     }
 
     /// Checks if a body (list of nodes) ends with a control flow exit.
@@ -3454,20 +3535,8 @@ impl PseudoCodeEmitter {
                 .unwrap();
                 self.emit_nodes(&actual_then, output, depth + 1);
 
-                if let Some(else_body) = actual_else {
-                    if !self.is_body_empty(&else_body) {
-                        if else_body.len() == 1 {
-                            if let StructuredNode::If { .. } = &else_body[0] {
-                                // else if
-                                write!(output, "{}}} else ", indent).unwrap();
-                                self.emit_node(&else_body[0], output, depth);
-                                return;
-                            }
-                        }
-                        writeln!(output, "{}}} else {{", indent).unwrap();
-                        self.emit_nodes(&else_body, output, depth + 1);
-                    }
-                }
+                // Emit else clause (handles else-if chains recursively)
+                self.emit_else_clause(&actual_else, output, depth, &indent);
 
                 writeln!(output, "{}}}", indent).unwrap();
             }

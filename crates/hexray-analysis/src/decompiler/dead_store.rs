@@ -116,6 +116,9 @@ fn collect_uses_in_expr(expr: &Expr, uses: &mut HashSet<String>) {
         ExprKind::Var(v) => {
             uses.insert(v.name.clone());
         }
+        ExprKind::Unknown(name) => {
+            uses.insert(name.clone());
+        }
         ExprKind::Assign { lhs, rhs } => {
             // Don't count the lhs as a use (it's a def)
             // But do count any uses within the lhs (e.g., array index)
@@ -174,7 +177,7 @@ fn collect_uses_in_expr(expr: &Expr, uses: &mut HashSet<String>) {
 /// Collect uses within an lhs expression (but not the variable being assigned).
 fn collect_uses_in_lhs(expr: &Expr, uses: &mut HashSet<String>) {
     match &expr.kind {
-        ExprKind::Var(_) => {
+        ExprKind::Var(_) | ExprKind::Unknown(_) => {
             // Don't add - this is the target of assignment
         }
         ExprKind::Deref { addr, .. } => {
@@ -270,10 +273,49 @@ fn is_eliminable_var(name: &str, uses: &HashSet<String>) -> bool {
 
 /// Eliminate dead stores in a list of nodes.
 fn eliminate_in_nodes(nodes: Vec<StructuredNode>, uses: &HashSet<String>) -> Vec<StructuredNode> {
-    nodes
+    let nodes: Vec<_> = nodes
         .into_iter()
         .filter_map(|node| eliminate_in_node(node, uses))
-        .collect()
+        .collect();
+
+    // Also eliminate consecutive overwrite patterns at the StructuredNode level
+    eliminate_consecutive_expr_overwrites(nodes)
+}
+
+/// Eliminate consecutive StructuredNode::Expr assignments that overwrite the same variable.
+/// `Expr(x = 1); Expr(x = 2);` -> `Expr(x = 2);`
+fn eliminate_consecutive_expr_overwrites(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    if nodes.len() < 2 {
+        return nodes;
+    }
+
+    let mut out: Vec<StructuredNode> = Vec::with_capacity(nodes.len());
+    let mut i = 0usize;
+    while i < nodes.len() {
+        if i + 1 < nodes.len() {
+            if let (StructuredNode::Expr(cur), StructuredNode::Expr(next)) =
+                (&nodes[i], &nodes[i + 1])
+            {
+                if let (
+                    ExprKind::Assign {
+                        lhs: lhs_a,
+                        rhs: rhs_a,
+                    },
+                    ExprKind::Assign { lhs: lhs_b, .. },
+                ) = (&cur.kind, &next.kind)
+                {
+                    if exprs_equivalent_lvalue(lhs_a, lhs_b) && !has_side_effects(rhs_a) {
+                        // Skip current assignment; it's immediately overwritten.
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(nodes[i].clone());
+        i += 1;
+    }
+    out
 }
 
 /// Eliminate dead stores in a single node.
@@ -404,10 +446,16 @@ fn eliminate_in_node(node: StructuredNode, uses: &HashSet<String>) -> Option<Str
 fn is_dead_store(expr: &Expr, uses: &HashSet<String>) -> bool {
     match &expr.kind {
         ExprKind::Assign { lhs, rhs } => {
-            // Check if the lhs is a simple variable
-            if let ExprKind::Var(v) = &lhs.kind {
+            // Check if the lhs is a simple variable or unknown
+            let var_name = match &lhs.kind {
+                ExprKind::Var(v) => Some(&v.name),
+                ExprKind::Unknown(name) => Some(name),
+                _ => None,
+            };
+
+            if let Some(name) = var_name {
                 // Check if this is an eliminable dead store
-                if is_eliminable_var(&v.name, uses) {
+                if is_eliminable_var(name, uses) {
                     // But don't eliminate if rhs has side effects
                     return !has_side_effects(rhs);
                 }
@@ -484,6 +532,8 @@ fn eliminate_consecutive_overwrites(statements: Vec<Expr>) -> Vec<Expr> {
 fn exprs_equivalent_lvalue(a: &Expr, b: &Expr) -> bool {
     match (&a.kind, &b.kind) {
         (ExprKind::Var(va), ExprKind::Var(vb)) => va.name == vb.name,
+        // Unknown expressions are treated as variables with the given name
+        (ExprKind::Unknown(na), ExprKind::Unknown(nb)) => na == nb,
         (ExprKind::Deref { addr: aa, size: sa }, ExprKind::Deref { addr: ab, size: sb }) => {
             sa == sb && exprs_equivalent_lvalue(aa, ab)
         }
@@ -623,6 +673,47 @@ mod tests {
         assert!(uses.contains("x")); // Used in rhs of y assignment
         assert!(uses.contains("z")); // Used in rhs of y assignment
         assert!(!uses.contains("y")); // Only assigned, not used
+    }
+
+    fn make_unknown_assign(lhs: &str, rhs: Expr) -> Expr {
+        Expr::assign(Expr::unknown(lhs), rhs)
+    }
+
+    #[test]
+    fn test_eliminate_consecutive_overwrites_unknown() {
+        // Test that Unknown expressions work for consecutive overwrite detection
+        let nodes = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                make_unknown_assign("idx", Expr::int(2)),
+                make_unknown_assign("idx", Expr::int(4)),
+                make_unknown_assign("result", Expr::unknown("idx")),
+            ],
+            address_range: (0, 0),
+        }];
+
+        let mut uses = HashSet::new();
+        uses.insert("idx".to_string());
+        uses.insert("result".to_string());
+        let out = eliminate_in_nodes(nodes, &uses);
+        if let StructuredNode::Block { statements, .. } = &out[0] {
+            assert_eq!(
+                statements.len(),
+                2,
+                "Should eliminate idx=2, keep idx=4 and result=idx"
+            );
+            // First remaining should be idx = 4
+            if let ExprKind::Assign { rhs, .. } = &statements[0].kind {
+                assert!(
+                    matches!(rhs.kind, ExprKind::IntLit(4)),
+                    "First assignment should be idx=4"
+                );
+            } else {
+                panic!("expected assignment");
+            }
+        } else {
+            panic!("expected block");
+        }
     }
 
     #[test]
