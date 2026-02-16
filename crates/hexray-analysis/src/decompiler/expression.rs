@@ -2786,6 +2786,9 @@ fn is_loaded_value(expr: &Expr) -> bool {
         // Deref of anything loads a value (not a pointer, unless dereferencing a pointer-to-pointer)
         // When we see Deref { GotRef { ... } }, this is loading the global's value
         ExprKind::Deref { .. } => true,
+        // GotRef with is_deref=true represents a loaded global value
+        // e.g., mov rax, [rip+_g_counter] produces GotRef { is_deref: true, ... }
+        ExprKind::GotRef { is_deref: true, .. } => true,
         // Cast expressions preserve value semantics
         ExprKind::Cast { expr, .. } => is_loaded_value(expr),
         _ => false,
@@ -2809,8 +2812,9 @@ fn is_valid_ptr_base(expr: &Expr) -> bool {
                 || name.starts_with("r")
                 || name.starts_with("x") // General registers
         }
-        // GotRef is a valid pointer to global data
-        ExprKind::GotRef { .. } => true,
+        // GotRef with is_deref=false is a pointer to global data (LEA)
+        // GotRef with is_deref=true is a loaded value, not a pointer
+        ExprKind::GotRef { is_deref, .. } => !is_deref,
         // Deref is already a memory access
         ExprKind::Deref { .. } => true,
         // AddressOf produces a pointer
