@@ -3821,6 +3821,21 @@ impl PseudoCodeEmitter {
                 }
                 false
             }
+            // Compound assignment: rsp -= N or sp -= N (stack allocation/deallocation)
+            ExprKind::CompoundAssign { op, lhs, rhs } => {
+                if let ExprKind::Var(lhs_var) = &lhs.kind {
+                    if lhs_var.name == "rsp" || lhs_var.name == "sp" {
+                        // rsp -= N (stack allocation) or rsp += N (stack deallocation)
+                        if (matches!(op, super::expression::BinOpKind::Sub)
+                            || matches!(op, super::expression::BinOpKind::Add))
+                            && matches!(rhs.kind, ExprKind::IntLit(_))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
