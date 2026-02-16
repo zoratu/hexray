@@ -534,6 +534,10 @@ fn exprs_equivalent_lvalue(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Var(va), ExprKind::Var(vb)) => va.name == vb.name,
         // Unknown expressions are treated as variables with the given name
         (ExprKind::Unknown(na), ExprKind::Unknown(nb)) => na == nb,
+        // Cross-comparison between Var and Unknown (they can represent the same lvalue)
+        (ExprKind::Var(v), ExprKind::Unknown(n)) | (ExprKind::Unknown(n), ExprKind::Var(v)) => {
+            v.name == *n
+        }
         (ExprKind::Deref { addr: aa, size: sa }, ExprKind::Deref { addr: ab, size: sb }) => {
             sa == sb && exprs_equivalent_lvalue(aa, ab)
         }

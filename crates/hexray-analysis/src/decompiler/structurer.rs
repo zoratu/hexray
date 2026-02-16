@@ -296,6 +296,12 @@ impl StructuredCfg {
             body = super::variable_naming::suggest_variable_names(body);
         }
 
+        // Run dead store elimination again after variable naming
+        // This catches duplicates that arise from variables being renamed to the same name
+        if config.is_pass_enabled(OptimizationPass::DeadStoreElimination) {
+            body = super::dead_store::eliminate_dead_stores(body);
+        }
+
         Self {
             body,
             cfg_entry: cfg.entry,
@@ -429,6 +435,12 @@ impl StructuredCfg {
         // Post-process to infer better variable names
         if config.is_pass_enabled(OptimizationPass::VariableNaming) {
             body = super::variable_naming::suggest_variable_names(body);
+        }
+
+        // Run dead store elimination again after variable naming
+        // This catches duplicates that arise from variables being renamed to the same name
+        if config.is_pass_enabled(OptimizationPass::DeadStoreElimination) {
+            body = super::dead_store::eliminate_dead_stores(body);
         }
 
         Self {
