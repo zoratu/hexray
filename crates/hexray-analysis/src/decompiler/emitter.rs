@@ -1932,11 +1932,24 @@ impl PseudoCodeEmitter {
             }
             // Field access: base->field
             ExprKind::FieldAccess {
-                base, field_name, ..
+                base,
+                field_name,
+                offset,
             } => {
                 // Use parentheses if base is a binary operation (postfix has highest precedence)
                 let base_str = self.format_postfix_base(base, table);
-                // Use -> for pointer access (most common in decompiled code)
+
+                // If the field name is generic (field_N pattern without type info),
+                // use array notation for better readability.
+                if field_name.starts_with("field_") {
+                    // Convert byte offset to element index (assume 8-byte pointers)
+                    let elem_size = 8usize;
+                    if *offset % elem_size == 0 {
+                        let idx = *offset / elem_size;
+                        return format!("{}[{}]", base_str, idx);
+                    }
+                }
+                // Use -> for pointer access when we have real struct field names
                 format!("{}->{}", base_str, field_name)
             }
             // Array access: check if this is a stack slot (sp[N] or x29[N])
@@ -1954,7 +1967,8 @@ impl PseudoCodeEmitter {
                             );
                             if !is_stack_like {
                                 let off = (*idx as usize) * *element_size;
-                                // If we know the base pointer type, prefer typed field names.
+                                // Only use struct field notation if we have type database info.
+                                // Otherwise prefer array notation (e.g., argv[1] not argv->field_8).
                                 let addr_expr = if off == 0 {
                                     (**base).clone()
                                 } else {
@@ -1969,8 +1983,9 @@ impl PseudoCodeEmitter {
                                 {
                                     return field_access;
                                 }
+                                // Use array notation - cleaner for pointer arrays like argv
                                 let base_str = self.format_expr_no_string_resolve(base);
-                                return format!("{}->field_{:x}", base_str, off);
+                                return format!("{}[{}]", base_str, idx);
                             }
                         }
                     }
@@ -5066,12 +5081,13 @@ mod tests {
     }
 
     #[test]
-    fn test_struct_field_style_for_constant_array_access() {
+    fn test_array_notation_for_constant_array_access() {
         use super::super::expression::Variable;
 
         let emitter = PseudoCodeEmitter::new("    ", false);
+        // Array access with constant index uses array notation for readability
         let expr = Expr::array_access(Expr::var(Variable::reg("x8", 8)), Expr::int(2), 8);
-        assert_eq!(emitter.format_expr(&expr), "x8->field_10");
+        assert_eq!(emitter.format_expr(&expr), "x8[2]");
     }
 
     #[test]
