@@ -1089,6 +1089,20 @@ impl PseudoCodeEmitter {
                     let index_str = self.format_expr_no_string_resolve(&index);
                     return format!("{}[{}]", base_str, index_str);
                 }
+                // Check if this is a RIP/EIP-relative address (global variable reference)
+                if let Some(offset) = try_extract_rip_relative_offset(addr) {
+                    // Try to find a symbol at this relative offset
+                    if let Some(ref sym_table) = self.symbol_table {
+                        if let Some(name) = sym_table.get(offset) {
+                            if let Some(alias) = self.simplify_libc_global_name(name) {
+                                return alias.to_string();
+                            }
+                            return name.to_string();
+                        }
+                    }
+                    // Fall back to a generic global name with the offset
+                    return format!("_g_{:x}", offset);
+                }
                 // Fall back to default deref formatting
                 let prefix = match size {
                     1 => "*(uint8_t*)",
@@ -4048,6 +4062,40 @@ fn extract_shift_left_by_constant(expr: &Expr) -> Option<(Expr, i128)> {
     None
 }
 
+/// Extracts the byte offset from a RIP/EIP-relative address expression.
+/// Matches patterns like `rip + offset` or `eip + offset` where `offset` is an integer literal.
+/// Returns `Some(offset)` if the pattern matches, `None` otherwise.
+fn try_extract_rip_relative_offset(addr: &Expr) -> Option<u64> {
+    if let ExprKind::BinOp {
+        op: BinOpKind::Add,
+        left,
+        right,
+    } = &addr.kind
+    {
+        // Check if left is rip/eip and right is an integer offset
+        if let ExprKind::Var(v) = &left.kind {
+            if v.name == "rip" || v.name == "eip" {
+                if let ExprKind::IntLit(offset) = &right.kind {
+                    if *offset >= 0 {
+                        return Some(*offset as u64);
+                    }
+                }
+            }
+        }
+        // Check if right is rip/eip and left is an integer offset (commutative)
+        if let ExprKind::Var(v) = &right.kind {
+            if v.name == "rip" || v.name == "eip" {
+                if let ExprKind::IntLit(offset) = &left.kind {
+                    if *offset >= 0 {
+                        return Some(*offset as u64);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::expression::BinOpKind;
@@ -4693,6 +4741,99 @@ mod tests {
             break_count, 1,
             "Should have exactly one break in case 1:\n{}",
             output
+        );
+    }
+
+    #[test]
+    fn test_rip_relative_deref_resolution() {
+        use super::super::expression::{VarKind, Variable};
+        // Test that *(type*)(rip + offset) resolves to _g_<offset> instead of
+        // *(type*)(/* unresolved_pc_relative */ + offset)
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let table = StringTable::new();
+
+        // Create a Deref expression with rip + 6842 as the address
+        let rip_var = Expr::var(Variable {
+            kind: VarKind::Register(0),
+            name: "rip".to_string(),
+            size: 8,
+        });
+        let offset = Expr::int(6842);
+        let addr = Expr::binop(BinOpKind::Add, rip_var, offset);
+        let deref = Expr::deref(addr, 4);
+
+        let formatted = emitter.format_expr_with_strings(&deref, &table);
+
+        // Should resolve to _g_1aba (6842 in hex) instead of containing "unresolved_pc_relative"
+        assert!(
+            !formatted.contains("unresolved_pc_relative"),
+            "Should not contain unresolved_pc_relative: {}",
+            formatted
+        );
+        assert_eq!(formatted, "_g_1aba", "Should format as _g_<hex_offset>");
+
+        // Also test with eip
+        let eip_var = Expr::var(Variable {
+            kind: VarKind::Register(0),
+            name: "eip".to_string(),
+            size: 4,
+        });
+        let addr2 = Expr::binop(BinOpKind::Add, eip_var, Expr::int(0x1000));
+        let deref2 = Expr::deref(addr2, 8);
+
+        let formatted2 = emitter.format_expr_with_strings(&deref2, &table);
+        assert!(
+            !formatted2.contains("unresolved_pc_relative"),
+            "Should not contain unresolved_pc_relative for eip: {}",
+            formatted2
+        );
+        assert_eq!(
+            formatted2, "_g_1000",
+            "Should format as _g_<hex_offset> for eip"
+        );
+    }
+
+    #[test]
+    fn test_rip_relative_deref_in_compound_assignment() {
+        use super::super::expression::{VarKind, Variable};
+
+        // Test that compound assignment like `*(uint32_t*)(rip + 6842) |= 1`
+        // correctly resolves to `_g_1aba |= 1` instead of
+        // `*(uint32_t*)(/* unresolved_pc_relative */ + 6842) |= 1`
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let table = StringTable::new();
+
+        // Create a Deref expression with rip + 6842 as the address
+        let rip_var = Expr::var(Variable {
+            kind: VarKind::Register(0),
+            name: "rip".to_string(),
+            size: 8,
+        });
+        let offset = Expr::int(6842);
+        let addr = Expr::binop(BinOpKind::Add, rip_var.clone(), offset);
+        let deref = Expr::deref(addr.clone(), 4);
+
+        // Create x = x | 1 pattern which becomes x |= 1 compound assignment
+        let rhs_binop = Expr::binop(BinOpKind::Or, deref.clone(), Expr::int(1));
+        let assign = Expr::assign(deref, rhs_binop);
+
+        let formatted = emitter.format_expr_with_strings(&assign, &table);
+
+        // Should resolve to `_g_1aba |= 1` instead of containing "unresolved_pc_relative"
+        assert!(
+            !formatted.contains("unresolved_pc_relative"),
+            "Should not contain unresolved_pc_relative in compound assignment: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains("_g_1aba"),
+            "Should contain resolved global name _g_1aba: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains("|= 1"),
+            "Should contain compound assignment operator: {}",
+            formatted
         );
     }
 }

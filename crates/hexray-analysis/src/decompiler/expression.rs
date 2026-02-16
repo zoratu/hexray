@@ -2738,16 +2738,19 @@ fn is_spurious_deref_address(addr: &Expr) -> bool {
         // e.g., _g * 2, _g * 2 + 1
         ExprKind::BinOp { op, left, right } => {
             // If it's a multiplication where one side is a small constant
-            // and the other is a variable, this is likely a value computation
+            // and the other is a value (variable, memory load, or global),
+            // this is likely a value computation, not address arithmetic.
             if *op == BinOpKind::Mul {
-                let left_is_var = matches!(&left.kind, ExprKind::Var(_));
-                let right_is_var = matches!(&right.kind, ExprKind::Var(_));
+                let left_is_value = is_loaded_value(left);
+                let right_is_value = is_loaded_value(right);
                 let left_is_small_const = matches!(&left.kind, ExprKind::IntLit(n) if *n <= 256);
                 let right_is_small_const = matches!(&right.kind, ExprKind::IntLit(n) if *n <= 256);
 
-                // Pattern: var * small_const or small_const * var
+                // Pattern: value * small_const or small_const * value
                 // This is typical for value arithmetic, not address calculation
-                if (left_is_var && right_is_small_const) || (right_is_var && left_is_small_const) {
+                if (left_is_value && right_is_small_const)
+                    || (right_is_value && left_is_small_const)
+                {
                     return true;
                 }
             }
@@ -2769,6 +2772,22 @@ fn is_spurious_deref_address(addr: &Expr) -> bool {
 
             false
         }
+        _ => false,
+    }
+}
+
+/// Checks if an expression represents a loaded/computed value (not a pointer).
+/// These are values that, when multiplied by a small constant, indicate
+/// arithmetic computation rather than address calculation.
+fn is_loaded_value(expr: &Expr) -> bool {
+    match &expr.kind {
+        // Simple variables are loaded values
+        ExprKind::Var(_) => true,
+        // Deref of anything loads a value (not a pointer, unless dereferencing a pointer-to-pointer)
+        // When we see Deref { GotRef { ... } }, this is loading the global's value
+        ExprKind::Deref { .. } => true,
+        // Cast expressions preserve value semantics
+        ExprKind::Cast { expr, .. } => is_loaded_value(expr),
         _ => false,
     }
 }
@@ -4366,6 +4385,56 @@ mod tests {
     }
 
     #[test]
+    fn test_spurious_deref_removal_global_deref_times_const() {
+        // *(uint32_t*)(Deref{GotRef{_g_counter}} * 2 + 1) should simplify
+        // to (Deref{GotRef{_g_counter}} * 2) + 1
+        // This tests the case where a global variable's value is multiplied.
+        let got_ref = Expr::got_ref(0x1000, 0x100, 4, Expr::int(0));
+        let global_value = Expr::deref(got_ref, 4); // This loads the value of the global
+        let mul = Expr::binop(BinOpKind::Mul, global_value, Expr::int(2));
+        let add = Expr::binop(BinOpKind::Add, mul, Expr::int(1));
+        let outer_deref = Expr::deref(add, 4); // This spurious deref should be removed
+        let simplified = outer_deref.simplify();
+
+        // Should remove the spurious outer Deref, leaving just the addition
+        assert!(
+            matches!(
+                simplified.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::Add,
+                    ..
+                }
+            ),
+            "Expected BinOp(Add), got {:?}",
+            simplified.kind
+        );
+    }
+
+    #[test]
+    fn test_spurious_deref_removal_global_deref_times_const_no_add() {
+        // *(uint32_t*)(Deref{GotRef{_g_counter}} * 2) should simplify
+        // to Deref{GotRef{_g_counter}} * 2
+        let got_ref = Expr::got_ref(0x1000, 0x100, 4, Expr::int(0));
+        let global_value = Expr::deref(got_ref, 4);
+        let mul = Expr::binop(BinOpKind::Mul, global_value, Expr::int(2));
+        let outer_deref = Expr::deref(mul, 4);
+        let simplified = outer_deref.simplify();
+
+        // Should remove the spurious outer Deref, leaving just the multiplication
+        assert!(
+            matches!(
+                simplified.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::Mul,
+                    ..
+                }
+            ),
+            "Expected BinOp(Mul), got {:?}",
+            simplified.kind
+        );
+    }
+
+    #[test]
     fn test_legitimate_deref_preserved_with_pointer_base() {
         // *(uint32_t*)(rbp + 8) should NOT be simplified away
         // because rbp is a valid pointer base (frame pointer)
@@ -4387,6 +4456,34 @@ mod tests {
         assert!(
             is_memory_access,
             "Expected Deref or ArrayAccess, got {:?}",
+            simplified.kind
+        );
+    }
+
+    #[test]
+    fn test_legitimate_array_access_with_gotref_base() {
+        // *(uint32_t*)(GotRef{array} + index * 4) should be preserved as array access
+        // because GotRef is a valid pointer base for array indexing
+        let array_base = Expr::got_ref(0x2000, 0x200, 8, Expr::int(0));
+        let index = Expr::var(Variable {
+            kind: VarKind::Register(0),
+            name: "i".to_string(),
+            size: 8,
+        });
+        let scaled_index = Expr::binop(BinOpKind::Mul, index, Expr::int(4));
+        let addr = Expr::binop(BinOpKind::Add, array_base, scaled_index);
+        let deref = Expr::deref(addr, 4);
+        let simplified = deref.simplify();
+
+        // Should be converted to ArrayAccess (or at least preserved as Deref)
+        // NOT simplified to just a BinOp
+        let is_memory_access = matches!(
+            simplified.kind,
+            ExprKind::Deref { .. } | ExprKind::ArrayAccess { .. }
+        );
+        assert!(
+            is_memory_access,
+            "Expected Deref or ArrayAccess for array indexing, got {:?}",
             simplified.kind
         );
     }
