@@ -73,6 +73,8 @@ pub enum OptimizationPass {
     ArchPatternSimplification,
     /// Eliminate dead stores (assignments to unused variables).
     DeadStoreElimination,
+    /// Filter inline assembly and profiling infrastructure (stack pointer ops, __fentry__).
+    InlineAsmFilter,
     /// Detect linked list traversal patterns.
     LinkedListDetection,
     /// Infer better variable names from usage context.
@@ -110,6 +112,7 @@ impl OptimizationPass {
             StringPatternDetection,
             ArchPatternSimplification,
             DeadStoreElimination,
+            InlineAsmFilter,
             LinkedListDetection,
             VariableNaming,
             LoopCanonicalization,
@@ -139,6 +142,7 @@ impl OptimizationPass {
             StringPatternDetection => "string-pattern-detection",
             ArchPatternSimplification => "arch-pattern-simplification",
             DeadStoreElimination => "dead-store-elimination",
+            InlineAsmFilter => "inline-asm-filter",
             LinkedListDetection => "linked-list-detection",
             VariableNaming => "variable-naming",
             LoopCanonicalization => "loop-canonicalization",
@@ -168,6 +172,7 @@ impl OptimizationPass {
             StringPatternDetection => "Detect string function patterns",
             ArchPatternSimplification => "Simplify architecture-specific patterns",
             DeadStoreElimination => "Eliminate dead stores",
+            InlineAsmFilter => "Filter inline assembly and profiling infrastructure",
             LinkedListDetection => "Detect linked list traversal patterns",
             VariableNaming => "Infer better variable names from usage",
             LoopCanonicalization => "Canonicalize loop forms",
@@ -197,6 +202,7 @@ impl OptimizationPass {
             "string-pattern-detection" => Some(StringPatternDetection),
             "arch-pattern-simplification" => Some(ArchPatternSimplification),
             "dead-store-elimination" => Some(DeadStoreElimination),
+            "inline-asm-filter" => Some(InlineAsmFilter),
             "linked-list-detection" => Some(LinkedListDetection),
             "variable-naming" => Some(VariableNaming),
             "loop-canonicalization" => Some(LoopCanonicalization),

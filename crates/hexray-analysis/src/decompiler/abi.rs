@@ -159,6 +159,109 @@ pub fn is_temp_register(name: &str) -> bool {
     )
 }
 
+/// Normalizes an x86-64 register name to its 64-bit form.
+///
+/// This maps partial register names to their full 64-bit counterparts:
+/// - 8-bit: al, ah, bl, bh, cl, ch, dl, dh → rax, rbx, rcx, rdx
+/// - 8-bit: sil, dil, bpl, spl → rsi, rdi, rbp, rsp
+/// - 8-bit: r8b-r15b → r8-r15
+/// - 16-bit: ax, bx, cx, dx, si, di, bp, sp → rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp
+/// - 16-bit: r8w-r15w → r8-r15
+/// - 32-bit: eax, ebx, ecx, edx, esi, edi, ebp, esp → rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp
+/// - 32-bit: r8d-r15d → r8-r15
+///
+/// Returns Some((normalized_name, original_size)) if the register is a known x86-64 GPR,
+/// or None if it's not a standard GPR (like rip, xmm0, etc.).
+pub fn normalize_x86_64_register(name: &str, size_bytes: u8) -> Option<(&'static str, u8)> {
+    // Map partial registers to their 64-bit form
+    let result = match name {
+        // 64-bit registers - already normalized
+        "rax" => ("rax", size_bytes),
+        "rbx" => ("rbx", size_bytes),
+        "rcx" => ("rcx", size_bytes),
+        "rdx" => ("rdx", size_bytes),
+        "rsi" => ("rsi", size_bytes),
+        "rdi" => ("rdi", size_bytes),
+        "rbp" => ("rbp", size_bytes),
+        "rsp" => ("rsp", size_bytes),
+        "r8" => ("r8", size_bytes),
+        "r9" => ("r9", size_bytes),
+        "r10" => ("r10", size_bytes),
+        "r11" => ("r11", size_bytes),
+        "r12" => ("r12", size_bytes),
+        "r13" => ("r13", size_bytes),
+        "r14" => ("r14", size_bytes),
+        "r15" => ("r15", size_bytes),
+
+        // 8-bit low registers (al, bl, cl, dl)
+        "al" => ("rax", 1),
+        "bl" => ("rbx", 1),
+        "cl" => ("rcx", 1),
+        "dl" => ("rdx", 1),
+
+        // 8-bit high registers (ah, bh, ch, dh)
+        "ah" => ("rax", 1),
+        "bh" => ("rbx", 1),
+        "ch" => ("rcx", 1),
+        "dh" => ("rdx", 1),
+
+        // 8-bit extended registers
+        "sil" => ("rsi", 1),
+        "dil" => ("rdi", 1),
+        "bpl" => ("rbp", 1),
+        "spl" => ("rsp", 1),
+        "r8b" => ("r8", 1),
+        "r9b" => ("r9", 1),
+        "r10b" => ("r10", 1),
+        "r11b" => ("r11", 1),
+        "r12b" => ("r12", 1),
+        "r13b" => ("r13", 1),
+        "r14b" => ("r14", 1),
+        "r15b" => ("r15", 1),
+
+        // 16-bit registers
+        "ax" => ("rax", 2),
+        "bx" => ("rbx", 2),
+        "cx" => ("rcx", 2),
+        "dx" => ("rdx", 2),
+        "si" => ("rsi", 2),
+        "di" => ("rdi", 2),
+        "bp" => ("rbp", 2),
+        "sp" => ("rsp", 2),
+        "r8w" => ("r8", 2),
+        "r9w" => ("r9", 2),
+        "r10w" => ("r10", 2),
+        "r11w" => ("r11", 2),
+        "r12w" => ("r12", 2),
+        "r13w" => ("r13", 2),
+        "r14w" => ("r14", 2),
+        "r15w" => ("r15", 2),
+
+        // 32-bit registers
+        "eax" => ("rax", 4),
+        "ebx" => ("rbx", 4),
+        "ecx" => ("rcx", 4),
+        "edx" => ("rdx", 4),
+        "esi" => ("rsi", 4),
+        "edi" => ("rdi", 4),
+        "ebp" => ("rbp", 4),
+        "esp" => ("rsp", 4),
+        "r8d" => ("r8", 4),
+        "r9d" => ("r9", 4),
+        "r10d" => ("r10", 4),
+        "r11d" => ("r11", 4),
+        "r12d" => ("r12", 4),
+        "r13d" => ("r13", 4),
+        "r14d" => ("r14", 4),
+        "r15d" => ("r15", 4),
+
+        // Not a partial x86-64 GPR
+        _ => return None,
+    };
+
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +345,68 @@ mod tests {
         assert!(is_stack_pointer("esp"));
         assert!(is_stack_pointer("sp"));
         assert!(!is_stack_pointer("rbp"));
+    }
+
+    #[test]
+    fn test_normalize_x86_64_register_8bit() {
+        assert_eq!(normalize_x86_64_register("al", 1), Some(("rax", 1)));
+        assert_eq!(normalize_x86_64_register("ah", 1), Some(("rax", 1)));
+        assert_eq!(normalize_x86_64_register("bl", 1), Some(("rbx", 1)));
+        assert_eq!(normalize_x86_64_register("bh", 1), Some(("rbx", 1)));
+        assert_eq!(normalize_x86_64_register("cl", 1), Some(("rcx", 1)));
+        assert_eq!(normalize_x86_64_register("ch", 1), Some(("rcx", 1)));
+        assert_eq!(normalize_x86_64_register("dl", 1), Some(("rdx", 1)));
+        assert_eq!(normalize_x86_64_register("dh", 1), Some(("rdx", 1)));
+        assert_eq!(normalize_x86_64_register("sil", 1), Some(("rsi", 1)));
+        assert_eq!(normalize_x86_64_register("dil", 1), Some(("rdi", 1)));
+        assert_eq!(normalize_x86_64_register("bpl", 1), Some(("rbp", 1)));
+        assert_eq!(normalize_x86_64_register("spl", 1), Some(("rsp", 1)));
+        assert_eq!(normalize_x86_64_register("r8b", 1), Some(("r8", 1)));
+        assert_eq!(normalize_x86_64_register("r15b", 1), Some(("r15", 1)));
+    }
+
+    #[test]
+    fn test_normalize_x86_64_register_16bit() {
+        assert_eq!(normalize_x86_64_register("ax", 2), Some(("rax", 2)));
+        assert_eq!(normalize_x86_64_register("bx", 2), Some(("rbx", 2)));
+        assert_eq!(normalize_x86_64_register("cx", 2), Some(("rcx", 2)));
+        assert_eq!(normalize_x86_64_register("dx", 2), Some(("rdx", 2)));
+        assert_eq!(normalize_x86_64_register("si", 2), Some(("rsi", 2)));
+        assert_eq!(normalize_x86_64_register("di", 2), Some(("rdi", 2)));
+        assert_eq!(normalize_x86_64_register("bp", 2), Some(("rbp", 2)));
+        assert_eq!(normalize_x86_64_register("sp", 2), Some(("rsp", 2)));
+        assert_eq!(normalize_x86_64_register("r8w", 2), Some(("r8", 2)));
+        assert_eq!(normalize_x86_64_register("r15w", 2), Some(("r15", 2)));
+    }
+
+    #[test]
+    fn test_normalize_x86_64_register_32bit() {
+        assert_eq!(normalize_x86_64_register("eax", 4), Some(("rax", 4)));
+        assert_eq!(normalize_x86_64_register("ebx", 4), Some(("rbx", 4)));
+        assert_eq!(normalize_x86_64_register("ecx", 4), Some(("rcx", 4)));
+        assert_eq!(normalize_x86_64_register("edx", 4), Some(("rdx", 4)));
+        assert_eq!(normalize_x86_64_register("esi", 4), Some(("rsi", 4)));
+        assert_eq!(normalize_x86_64_register("edi", 4), Some(("rdi", 4)));
+        assert_eq!(normalize_x86_64_register("ebp", 4), Some(("rbp", 4)));
+        assert_eq!(normalize_x86_64_register("esp", 4), Some(("rsp", 4)));
+        assert_eq!(normalize_x86_64_register("r8d", 4), Some(("r8", 4)));
+        assert_eq!(normalize_x86_64_register("r15d", 4), Some(("r15", 4)));
+    }
+
+    #[test]
+    fn test_normalize_x86_64_register_64bit() {
+        // 64-bit registers should remain unchanged
+        assert_eq!(normalize_x86_64_register("rax", 8), Some(("rax", 8)));
+        assert_eq!(normalize_x86_64_register("rbx", 8), Some(("rbx", 8)));
+        assert_eq!(normalize_x86_64_register("r8", 8), Some(("r8", 8)));
+        assert_eq!(normalize_x86_64_register("r15", 8), Some(("r15", 8)));
+    }
+
+    #[test]
+    fn test_normalize_x86_64_register_non_gpr() {
+        // Non-GPR registers should return None
+        assert_eq!(normalize_x86_64_register("xmm0", 16), None);
+        assert_eq!(normalize_x86_64_register("rip", 8), None);
+        assert_eq!(normalize_x86_64_register("cs", 2), None);
     }
 }

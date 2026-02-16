@@ -2,10 +2,8 @@
 //!
 //! Converts low-level instructions into high-level expressions.
 
-use hexray_core::{Architecture, Instruction, MemoryRef, Operand, Operation, Register};
+use hexray_core::{Instruction, MemoryRef, Operand, Operation, Register};
 use std::fmt;
-
-use super::abi;
 
 /// A high-level expression.
 #[derive(Debug, Clone)]
@@ -325,28 +323,11 @@ pub enum VarKind {
 
 impl Variable {
     /// Creates a register variable.
-    ///
-    /// For x86-64, this normalizes partial register accesses to their 64-bit form:
-    /// - al, ah, ax, eax → rax
-    /// - bl, bh, bx, ebx → rbx
-    /// - etc.
-    ///
-    /// The original size is preserved in the size field.
     pub fn from_register(reg: &Register) -> Self {
-        let reg_name = reg.name();
-        let size_bytes = (reg.size / 8) as u8;
-
-        // Normalize x86-64 partial registers to their 64-bit form
-        let (normalized_name, original_size) = if matches!(reg.arch, Architecture::X86_64) {
-            abi::normalize_x86_64_register(reg_name, size_bytes).unwrap_or((reg_name, size_bytes))
-        } else {
-            (reg_name, size_bytes)
-        };
-
         Self {
             kind: VarKind::Register(reg.id),
-            name: normalized_name.to_string(),
-            size: original_size,
+            name: reg.name().to_string(),
+            size: (reg.size / 8) as u8,
         }
     }
 
@@ -2920,7 +2901,7 @@ fn extract_scaled_index_from_expr(expr: &Expr) -> Option<(Expr, i128)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{Architecture, Register, RegisterClass};
+    use hexray_core::{Architecture, RegisterClass};
 
     #[test]
     fn test_constant_folding_arithmetic() {

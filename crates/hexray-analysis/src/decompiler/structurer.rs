@@ -6,7 +6,7 @@
 
 use hexray_core::{
     cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, IndexMode,
-    Operand, Operation,
+    Instruction, Operand, Operation,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1483,6 +1483,34 @@ fn try_extract_arm64_branch_condition(
     None
 }
 
+/// Checks if an instruction sets CPU flags that can be used for conditional branches.
+/// Returns true for comparison instructions (CMP, TEST), arithmetic operations (ADD, SUB, INC, DEC),
+/// and logical operations (AND, OR, XOR) that affect condition codes.
+fn is_flag_setting_instruction(inst: &Instruction) -> bool {
+    match inst.operation {
+        // Explicit comparison instructions
+        Operation::Compare | Operation::Test => true,
+
+        // Arithmetic operations that set flags
+        Operation::Add | Operation::Sub | Operation::Inc | Operation::Dec | Operation::Neg => true,
+
+        // Logical operations - on ARM64 only set flags with 's' suffix, on x86 always set flags
+        Operation::And | Operation::Or | Operation::Xor => {
+            // Check if this is ARM instruction with 's' suffix (ANDS, ORRS, EORS)
+            // or x86 instruction (and, or, xor)
+            inst.mnemonic.ends_with('s')
+                || inst.mnemonic == "and"
+                || inst.mnemonic == "or"
+                || inst.mnemonic == "xor"
+        }
+
+        // Shift operations that set flags
+        Operation::Shl | Operation::Shr | Operation::Sar => true,
+
+        _ => false,
+    }
+}
+
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
 /// Also substitutes register names with their values from preceding MOV instructions.
 fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
@@ -1523,8 +1551,8 @@ fn condition_to_expr_before_address(
         return cond_expr;
     }
 
-    // Find the last compare instruction in the block (before the given address if specified)
-    // This includes CMP, TEST, SUB/SUBS, ANDS, and NEG instructions
+    // Find the last flag-setting instruction in the block (before the given address if specified)
+    // This includes CMP, TEST, SUB, NEG, ADD, INC, DEC, AND, OR, XOR, and shift operations
     let compare_inst = block
         .instructions
         .iter()
@@ -1533,12 +1561,7 @@ fn condition_to_expr_before_address(
             // If before_addr is specified, only consider instructions before that address
             before_addr.map_or(true, |addr| inst.address < addr)
         })
-        .find(|inst| {
-            matches!(
-                inst.operation,
-                Operation::Compare | Operation::Test | Operation::Sub | Operation::Neg
-            ) || (matches!(inst.operation, Operation::And) && inst.mnemonic.ends_with('s'))
-        });
+        .find(|inst| is_flag_setting_instruction(inst));
 
     if let Some(inst) = compare_inst {
         // For NEG instructions, flags reflect the negated result
@@ -1559,6 +1582,49 @@ fn condition_to_expr_before_address(
             return Expr::binop(neg_op, operand, Expr::int(0));
         }
 
+        // INC/DEC: compare result against 0
+        if matches!(inst.operation, Operation::Inc | Operation::Dec) && !inst.operands.is_empty() {
+            let operand = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[0], inst),
+                &reg_values,
+            );
+            let adjustment = if matches!(inst.operation, Operation::Inc) {
+                1
+            } else {
+                -1
+            };
+            let result = Expr::binop(BinOpKind::Add, operand, Expr::int(adjustment));
+            return Expr::binop(op, result, Expr::int(0));
+        }
+
+        // ADD (3 operands): ARM64 ADDS
+        if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Add) {
+            let src1 = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[1], inst),
+                &reg_values,
+            );
+            let src2 = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[2], inst),
+                &reg_values,
+            );
+            let result = Expr::binop(BinOpKind::Add, src1, src2);
+            return Expr::binop(op, result, Expr::int(0));
+        }
+
+        // ADD (2 operands): x86 ADD
+        if inst.operands.len() == 2 && matches!(inst.operation, Operation::Add) {
+            let dst = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[0], inst),
+                &reg_values,
+            );
+            let src = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[1], inst),
+                &reg_values,
+            );
+            let result = Expr::binop(BinOpKind::Add, dst, src);
+            return Expr::binop(op, result, Expr::int(0));
+        }
+
         // For SUB/SUBS instructions (ARM64), operands are [dst, src1, src2]
         // The comparison is between src1 and src2
         if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Sub) {
@@ -1571,9 +1637,13 @@ fn condition_to_expr_before_address(
                 &reg_values,
             );
             return Expr::binop(op, left, right);
-        } else if inst.operands.len() >= 3 && matches!(inst.operation, Operation::And) {
-            // For ANDS instructions (ARM64), operands are [dst, src1, src2] or [dst, src1, imm]
-            // The flags are set based on (src1 & src2), compared against zero
+        } else if inst.operands.len() >= 3
+            && matches!(
+                inst.operation,
+                Operation::And | Operation::Or | Operation::Xor
+            )
+        {
+            // ARM64: ANDS/ORRS/EORS dst, src1, src2
             let src1 = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[1], inst),
                 &reg_values,
@@ -1582,9 +1652,43 @@ fn condition_to_expr_before_address(
                 Expr::from_operand_with_inst(&inst.operands[2], inst),
                 &reg_values,
             );
-            // Create (src1 & src2) and compare against zero
-            let and_result = Expr::binop(BinOpKind::And, src1, src2);
-            return Expr::binop(op, and_result, Expr::int(0));
+            let binop_kind = match inst.operation {
+                Operation::And => BinOpKind::And,
+                Operation::Or => BinOpKind::Or,
+                Operation::Xor => BinOpKind::Xor,
+                _ => unreachable!(),
+            };
+            let result = Expr::binop(binop_kind, src1, src2);
+            return Expr::binop(op, result, Expr::int(0));
+        } else if inst.operands.len() == 2
+            && matches!(
+                inst.operation,
+                Operation::And | Operation::Or | Operation::Xor
+            )
+        {
+            // x86: AND/OR/XOR dst, src
+            let dst = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[0], inst),
+                &reg_values,
+            );
+            let src = substitute_register_in_expr(
+                Expr::from_operand_with_inst(&inst.operands[1], inst),
+                &reg_values,
+            );
+
+            // Special case: XOR reg, reg clears to 0
+            if matches!(inst.operation, Operation::Xor) && inst.operands[0] == inst.operands[1] {
+                return Expr::binop(op, Expr::int(0), Expr::int(0));
+            }
+
+            let binop_kind = match inst.operation {
+                Operation::And => BinOpKind::And,
+                Operation::Or => BinOpKind::Or,
+                Operation::Xor => BinOpKind::Xor,
+                _ => unreachable!(),
+            };
+            let result = Expr::binop(binop_kind, dst, src);
+            return Expr::binop(op, result, Expr::int(0));
         } else if inst.operands.len() >= 2 {
             // For CMP/TEST instructions, operands are [src1, src2]
             let left = substitute_register_in_expr(
