@@ -11,7 +11,8 @@ use hexray_core::{
 use std::collections::{HashMap, HashSet};
 
 use super::abi::{
-    get_arg_register_index, is_callee_saved_register, is_return_register, is_temp_register,
+    get_arg_register_index, is_argument_register, is_callee_saved_register, is_return_register,
+    is_temp_register,
 };
 use super::dead_store::collect_all_uses;
 use super::expression::{resolve_adrp_patterns, BinOpKind, Expr};
@@ -2470,6 +2471,11 @@ fn remove_temp_assignments_in_node(node: StructuredNode, uses: &HashSet<String>)
                 .filter(|stmt| {
                     if let ExprKind::Assign { lhs, .. } = &stmt.kind {
                         if let ExprKind::Var(v) = &lhs.kind {
+                            // Don't remove argument register assignments - they may be setting up
+                            // arguments for tail calls that appear as indirect jumps
+                            if is_argument_register(&v.name) {
+                                return true; // Keep argument register assignments
+                            }
                             // Only remove temp assignments if the variable is NOT used elsewhere
                             if is_temp_register(&v.name) && !uses.contains(&v.name) {
                                 return false; // Remove unused temp assignment
@@ -3354,8 +3360,8 @@ fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
 fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
     use super::expression::ExprKind;
 
-    // Track argument register values
-    let mut arg_values: HashMap<String, Expr> = HashMap::new();
+    // Track argument register values and their statement indices
+    let mut arg_values: HashMap<String, (usize, Expr)> = HashMap::new();
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
@@ -3364,9 +3370,8 @@ fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             if let ExprKind::Var(v) = &lhs.kind {
                 if get_arg_register_index(&v.name).is_some() {
-                    // Track this argument value
-                    arg_values.insert(v.name.clone(), (**rhs).clone());
-                    to_remove.insert(i);
+                    // Track this argument value along with its statement index
+                    arg_values.insert(v.name.clone(), (i, (**rhs).clone()));
                     result.push(stmt);
                     continue;
                 }
@@ -3377,10 +3382,14 @@ fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
         if let ExprKind::Call { target, args } = &stmt.kind {
             if is_real_function_call(target) && args.is_empty() {
                 // Try to extract arguments from tracked registers
-                let new_args = extract_call_arguments(&arg_values);
-                if !new_args.is_empty() {
+                let new_args = extract_call_arguments_with_indices(&arg_values);
+                if !new_args.0.is_empty() {
+                    // Mark the used arg assignments for removal
+                    for idx in new_args.1 {
+                        to_remove.insert(idx);
+                    }
                     // Create a new call with arguments
-                    let new_call = Expr::call(target.clone(), new_args);
+                    let new_call = Expr::call(target.clone(), new_args.0);
                     result.push(new_call);
                     // Clear argument tracking after the call
                     arg_values.clear();
@@ -3415,7 +3424,7 @@ fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
         result.push(stmt);
     }
 
-    // Filter out argument register assignments that were propagated
+    // Filter out argument register assignments that were actually propagated into calls
     result
         .into_iter()
         .enumerate()
@@ -3462,6 +3471,37 @@ fn extract_call_arguments(arg_values: &HashMap<String, Expr>) -> Vec<Expr> {
     }
 
     result
+}
+
+/// Extracts call arguments and returns (arguments, statement_indices_used).
+/// The statement indices are used to track which arg assignments should be removed.
+fn extract_call_arguments_with_indices(
+    arg_values: &HashMap<String, (usize, Expr)>,
+) -> (Vec<Expr>, Vec<usize>) {
+    let mut args: Vec<(usize, usize, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
+
+    for (reg_name, (stmt_idx, value)) in arg_values {
+        if let Some(arg_idx) = get_arg_register_index(reg_name) {
+            args.push((arg_idx, *stmt_idx, value.clone()));
+        }
+    }
+
+    // Sort by argument index
+    args.sort_by_key(|(arg_idx, _, _)| *arg_idx);
+
+    // Only include contiguous arguments starting from 0
+    let mut result = Vec::new();
+    let mut used_indices = Vec::new();
+    for (expected_idx, (actual_idx, stmt_idx, value)) in args.into_iter().enumerate() {
+        if actual_idx == expected_idx {
+            result.push(value);
+            used_indices.push(stmt_idx);
+        } else {
+            break;
+        }
+    }
+
+    (result, used_indices)
 }
 
 /// Merges return value captures across basic block boundaries.

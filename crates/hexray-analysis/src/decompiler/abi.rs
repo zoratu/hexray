@@ -159,6 +159,29 @@ pub fn is_temp_register(name: &str) -> bool {
     )
 }
 
+/// Checks if a register is an argument-passing register.
+///
+/// These should be protected from removal even if they appear unused,
+/// because they may be setting up arguments for tail calls via indirect jumps.
+///
+/// Supports:
+/// - x86-64 SysV ABI: rdi, rsi, rdx, rcx, r8, r9 (and their 32-bit variants)
+/// - ARM64 AAPCS64: x0-x7 / w0-w7
+/// - RISC-V: a0-a7
+pub fn is_argument_register(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        // x86-64 argument registers (System V ABI)
+        "rdi" | "edi" | "rsi" | "esi" | "rdx" | "edx" | "rcx" | "ecx" |
+        "r8" | "r8d" | "r9" | "r9d" |
+        // ARM64 argument registers
+        "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7" |
+        "w0" | "w1" | "w2" | "w3" | "w4" | "w5" | "w6" | "w7" |
+        // RISC-V argument registers
+        "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7"
+    )
+}
+
 /// Normalizes an x86-64 register name to its 64-bit form.
 ///
 /// This maps partial register names to their full 64-bit counterparts:

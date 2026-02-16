@@ -213,6 +213,52 @@ fn is_eliminable_var(name: &str, uses: &HashSet<String>) -> bool {
         return false;
     }
 
+    // Don't eliminate calling convention argument registers
+    // These may be set up for tail calls that appear as indirect jumps
+    // x86_64 System V ABI: rdi, rsi, rdx, rcx, r8, r9 (and 32-bit variants)
+    // ARM64: x0-x7 / w0-w7
+    if matches!(
+        name.to_lowercase().as_str(),
+        "rdi"
+            | "edi"
+            | "rsi"
+            | "esi"
+            | "rdx"
+            | "edx"
+            | "rcx"
+            | "ecx"
+            | "r8"
+            | "r8d"
+            | "r9"
+            | "r9d"
+            | "x0"
+            | "x1"
+            | "x2"
+            | "x3"
+            | "x4"
+            | "x5"
+            | "x6"
+            | "x7"
+            | "w0"
+            | "w1"
+            | "w2"
+            | "w3"
+            | "w4"
+            | "w5"
+            | "w6"
+            | "w7"
+            | "a0"
+            | "a1"
+            | "a2"
+            | "a3"
+            | "a4"
+            | "a5"
+            | "a6"
+            | "a7"
+    ) {
+        return false;
+    }
+
     // Don't eliminate arguments
     if name.starts_with("arg_") {
         return false;
