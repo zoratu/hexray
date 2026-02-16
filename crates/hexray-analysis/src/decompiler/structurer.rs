@@ -5642,11 +5642,9 @@ fn identify_return_labels(nodes: &[StructuredNode]) -> HashMap<BasicBlockId, Opt
                     }
                     StructuredNode::Block { statements, .. } => {
                         // Check if block just contains return value setup
-                        if statements.is_empty() {
-                            if i + 2 < nodes.len() {
-                                if let StructuredNode::Return(expr) = &nodes[i + 2] {
-                                    return_labels.insert(*label_id, expr.clone());
-                                }
+                        if statements.is_empty() && i + 2 < nodes.len() {
+                            if let StructuredNode::Return(expr) = &nodes[i + 2] {
+                                return_labels.insert(*label_id, expr.clone());
                             }
                         }
                     }
@@ -6045,7 +6043,7 @@ fn remove_unused_labels(
 /// ```
 pub fn convert_multilevel_breaks(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     // Identify gotos that escape multiple loop levels
-    let mut multilevel_gotos = find_multilevel_escape_gotos(&nodes);
+    let multilevel_gotos = find_multilevel_escape_gotos(&nodes);
 
     if multilevel_gotos.is_empty() {
         return nodes;
@@ -6053,7 +6051,7 @@ pub fn convert_multilevel_breaks(nodes: Vec<StructuredNode>) -> Vec<StructuredNo
 
     // For simple cases where the goto target is just after the outer loop,
     // convert to break instead of flag variable
-    convert_multilevel_to_break(nodes, &mut multilevel_gotos)
+    convert_multilevel_to_break(nodes, &multilevel_gotos)
 }
 
 /// Finds gotos that escape multiple nesting levels.

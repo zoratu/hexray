@@ -22,6 +22,7 @@ use super::structurer::{CatchHandler, StructuredNode};
 
 /// Architecture hint for pattern matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ArchHint {
     /// x86-64 architecture
     X86_64,
@@ -1268,6 +1269,7 @@ fn simplify_riscv_pseudo_pattern(expr: &Expr) -> Option<Expr> {
 /// addi rd, rd, imm[11:0]
 ///
 /// This pattern appears as: (upper << 12) + lower
+#[allow(dead_code)]
 pub fn simplify_riscv_li_pattern(expr: &Expr) -> Option<Expr> {
     if let ExprKind::BinOp {
         op: BinOpKind::Add,

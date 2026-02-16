@@ -17,9 +17,10 @@ use super::structurer::StructuredNode;
 use std::collections::HashMap;
 
 /// Inferred type for an expression.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExprType {
     /// Unknown type.
+    #[default]
     Unknown,
     /// Void type.
     Void,
@@ -212,12 +213,6 @@ impl ExprType {
             }
             ExprType::CString => "char*".to_string(),
         }
-    }
-}
-
-impl Default for ExprType {
-    fn default() -> Self {
-        ExprType::Unknown
     }
 }
 
@@ -1286,11 +1281,8 @@ impl ExpressionTypePropagation {
             }
             ExprKind::ArrayAccess { base, .. } => {
                 // Element type of array
-                if let Some(array_type) = self.infer_expr_type(base) {
-                    Some(array_type.deref())
-                } else {
-                    None
-                }
+                self.infer_expr_type(base)
+                    .map(|array_type| array_type.deref())
             }
             ExprKind::Cast {
                 to_size, signed, ..
@@ -1410,7 +1402,7 @@ impl Default for ExpressionTypePropagation {
 /// Checks if a value is likely a character constant.
 fn is_likely_char_constant(value: i128) -> bool {
     // Printable ASCII range
-    if value >= 0x20 && value <= 0x7e {
+    if (0x20..=0x7e).contains(&value) {
         return true;
     }
     // Common escape characters

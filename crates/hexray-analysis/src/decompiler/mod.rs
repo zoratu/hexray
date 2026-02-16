@@ -682,9 +682,7 @@ impl Decompiler {
         // Merge expression-level types into merged_types
         // Expression-level types are lower priority than SSA/IPC types
         for (k, v) in expr_types {
-            if !merged_types.contains_key(&k) {
-                merged_types.insert(k, v);
-            }
+            merged_types.entry(k).or_insert(v);
         }
 
         // Step 3: Apply exception handling if available
