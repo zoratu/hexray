@@ -35,6 +35,7 @@ mod string_patterns;
 mod struct_inference;
 mod structurer;
 mod switch_recovery;
+pub mod type_propagation;
 mod variable_naming;
 
 pub use config::{DecompilerConfig, OptimizationLevel, OptimizationPass};
@@ -53,6 +54,7 @@ pub use signature::{
 pub use struct_inference::{InferredField, InferredStruct, InferredType, StructInference};
 pub use structurer::{CatchHandler, LoopKind, StructuredCfg, StructuredNode};
 pub use switch_recovery::{JumpTableInfo, SwitchInfo, SwitchKind, SwitchRecovery};
+pub use type_propagation::{ExprType, ExpressionTypePropagation, KnownSignature};
 
 use hexray_core::ControlFlowGraph;
 use hexray_types::TypeDatabase;
@@ -671,6 +673,19 @@ impl Decompiler {
         } else {
             structured
         };
+
+        // Step 2b: Run expression-level type propagation
+        let mut expr_type_propagation = type_propagation::ExpressionTypePropagation::with_libc();
+        expr_type_propagation.analyze(&structured.body);
+        let expr_types = expr_type_propagation.export_for_decompiler();
+
+        // Merge expression-level types into merged_types
+        // Expression-level types are lower priority than SSA/IPC types
+        for (k, v) in expr_types {
+            if !merged_types.contains_key(&k) {
+                merged_types.insert(k, v);
+            }
+        }
 
         // Step 3: Apply exception handling if available
         let structured = if let Some(ref eh_info) = self.exception_info {

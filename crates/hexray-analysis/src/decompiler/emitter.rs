@@ -89,18 +89,79 @@ pub enum GlobalUsageHint {
     BitwiseOps,
     /// Used as a function pointer (suggests func_ prefix)
     FunctionPointer,
+    /// Points to string data (suggests str_ prefix)
+    StringPointer,
+    /// Appears to be a counter (incremented/decremented frequently)
+    Counter,
+    /// Read-only global (never written to, suggests const_ prefix)
+    ReadOnly,
+    /// Write-heavy global (written more than read, suggests state_ prefix)
+    WriteHeavy,
+    /// Array base pointer (suggests arr_ prefix)
+    ArrayBase,
+    /// Likely stdin/stdout/stderr file pointer
+    StdioStream,
     /// Default/unknown usage (uses data_ prefix)
     #[default]
     Unknown,
 }
 
+/// Size category for type-based naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalSizeHint {
+    /// 1-byte (char/uint8_t)
+    Byte,
+    /// 2-byte (short/uint16_t)
+    Word,
+    /// 4-byte (int/uint32_t)
+    DWord,
+    /// 8-byte (long/uint64_t/pointer)
+    QWord,
+    /// Unknown or variable size
+    Unknown,
+}
+
+impl GlobalSizeHint {
+    /// Creates a size hint from byte size.
+    pub fn from_size(size: u8) -> Self {
+        match size {
+            1 => Self::Byte,
+            2 => Self::Word,
+            4 => Self::DWord,
+            8 => Self::QWord,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Returns a type prefix for the size.
+    pub fn type_prefix(&self) -> &'static str {
+        match self {
+            Self::Byte => "b",
+            Self::Word => "w",
+            Self::DWord => "dw",
+            Self::QWord => "qw",
+            Self::Unknown => "",
+        }
+    }
+}
+
 /// Tracks access frequency and usage hints for global addresses.
 #[derive(Debug, Clone, Default)]
 pub struct GlobalAccessTracker {
-    /// Maps global address to access count.
+    /// Maps global address to total access count.
     pub access_counts: std::collections::HashMap<u64, usize>,
+    /// Maps global address to read count (rvalue usage).
+    pub read_counts: std::collections::HashMap<u64, usize>,
+    /// Maps global address to write count (lvalue usage).
+    pub write_counts: std::collections::HashMap<u64, usize>,
     /// Maps global address to detected usage hint.
     pub usage_hints: std::collections::HashMap<u64, GlobalUsageHint>,
+    /// Maps global address to observed access size (for type inference).
+    pub size_hints: std::collections::HashMap<u64, GlobalSizeHint>,
+    /// Tracks if a global has been incremented/decremented (counter detection).
+    pub increment_counts: std::collections::HashMap<u64, usize>,
+    /// Cache of resolved names for consistency within a single emission.
+    resolved_names: std::collections::HashMap<u64, String>,
 }
 
 impl GlobalAccessTracker {
@@ -125,9 +186,40 @@ impl GlobalAccessTracker {
             .or_insert(hint);
     }
 
+    /// Records a read access (global used as rvalue).
+    pub fn record_read(&mut self, address: u64) {
+        *self.read_counts.entry(address).or_insert(0) += 1;
+    }
+
+    /// Records a write access (global used as lvalue).
+    pub fn record_write(&mut self, address: u64) {
+        *self.write_counts.entry(address).or_insert(0) += 1;
+    }
+
+    /// Records an increment/decrement operation on a global.
+    pub fn record_increment(&mut self, address: u64) {
+        *self.increment_counts.entry(address).or_insert(0) += 1;
+    }
+
+    /// Records the access size for type inference.
+    pub fn record_size(&mut self, address: u64, size: u8) {
+        let hint = GlobalSizeHint::from_size(size);
+        self.size_hints.entry(address).or_insert(hint);
+    }
+
     /// Gets the access count for a global address.
     pub fn get_count(&self, address: u64) -> usize {
         self.access_counts.get(&address).copied().unwrap_or(0)
+    }
+
+    /// Gets read count for a global address.
+    pub fn get_read_count(&self, address: u64) -> usize {
+        self.read_counts.get(&address).copied().unwrap_or(0)
+    }
+
+    /// Gets write count for a global address.
+    pub fn get_write_count(&self, address: u64) -> usize {
+        self.write_counts.get(&address).copied().unwrap_or(0)
     }
 
     /// Gets the usage hint for a global address.
@@ -138,11 +230,112 @@ impl GlobalAccessTracker {
             .unwrap_or(GlobalUsageHint::Unknown)
     }
 
+    /// Gets the size hint for a global address.
+    pub fn get_size_hint(&self, address: u64) -> GlobalSizeHint {
+        self.size_hints
+            .get(&address)
+            .copied()
+            .unwrap_or(GlobalSizeHint::Unknown)
+    }
+
+    /// Determines if a global appears to be read-only (never written).
+    pub fn is_read_only(&self, address: u64) -> bool {
+        let writes = self.get_write_count(address);
+        let reads = self.get_read_count(address);
+        writes == 0 && reads > 0
+    }
+
+    /// Determines if a global is write-heavy (more writes than reads).
+    pub fn is_write_heavy(&self, address: u64) -> bool {
+        let writes = self.get_write_count(address);
+        let reads = self.get_read_count(address);
+        writes > reads && writes >= 2
+    }
+
+    /// Determines if a global appears to be a counter.
+    pub fn is_counter(&self, address: u64) -> bool {
+        self.increment_counts.get(&address).copied().unwrap_or(0) >= 1
+    }
+
     /// Returns addresses sorted by access frequency (most accessed first).
     pub fn addresses_by_frequency(&self) -> Vec<(u64, usize)> {
         let mut addrs: Vec<_> = self.access_counts.iter().map(|(&a, &c)| (a, c)).collect();
         addrs.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by count
         addrs
+    }
+
+    /// Groups globals by proximity (within 64 bytes of each other).
+    /// Returns groups of (base_address, member_addresses).
+    pub fn group_by_proximity(&self) -> Vec<(u64, Vec<u64>)> {
+        let mut addresses: Vec<u64> = self.access_counts.keys().copied().collect();
+        addresses.sort();
+
+        if addresses.is_empty() {
+            return Vec::new();
+        }
+
+        let mut groups: Vec<(u64, Vec<u64>)> = Vec::new();
+        let mut current_group_base = addresses[0];
+        let mut current_group = vec![addresses[0]];
+
+        for &addr in &addresses[1..] {
+            // If within 64 bytes of the last member, add to current group
+            if let Some(&last) = current_group.last() {
+                if addr.saturating_sub(last) <= 64 {
+                    current_group.push(addr);
+                    continue;
+                }
+            }
+            // Start a new group
+            if current_group.len() > 1 {
+                groups.push((current_group_base, current_group));
+            }
+            current_group_base = addr;
+            current_group = vec![addr];
+        }
+
+        // Don't forget the last group
+        if current_group.len() > 1 {
+            groups.push((current_group_base, current_group));
+        }
+
+        groups
+    }
+
+    /// Caches a resolved name for a global address.
+    pub fn cache_name(&mut self, address: u64, name: String) {
+        self.resolved_names.insert(address, name);
+    }
+
+    /// Gets a cached name if available.
+    pub fn get_cached_name(&self, address: u64) -> Option<&str> {
+        self.resolved_names.get(&address).map(|s| s.as_str())
+    }
+
+    /// Infers the best usage hint based on all collected data.
+    pub fn infer_best_hint(&self, address: u64) -> GlobalUsageHint {
+        // Check explicit hints first
+        let explicit = self.get_hint(address);
+        if explicit != GlobalUsageHint::Unknown {
+            return explicit;
+        }
+
+        // Check for counter pattern
+        if self.is_counter(address) {
+            return GlobalUsageHint::Counter;
+        }
+
+        // Check for read-only pattern
+        if self.is_read_only(address) {
+            return GlobalUsageHint::ReadOnly;
+        }
+
+        // Check for write-heavy pattern
+        if self.is_write_heavy(address) {
+            return GlobalUsageHint::WriteHeavy;
+        }
+
+        GlobalUsageHint::Unknown
     }
 }
 
@@ -806,19 +999,99 @@ impl PseudoCodeEmitter {
 
     /// Generates a fallback name for an unknown global address based on usage context.
     ///
-    /// The naming strategy is:
-    /// - `ptr_XXXX` - if accessed via pointer dereference
-    /// - `flags_XXXX` - if used in bitwise operations
-    /// - `func_XXXX` - if used as a function pointer
-    /// - `data_XXXX` - default fallback
+    /// The naming strategy (in priority order):
+    /// - Check for well-known libc globals by address patterns (stdin/stdout/stderr)
+    /// - Use explicit usage hints for semantic naming
+    /// - Fall back to type-based naming with size hints
+    ///
+    /// Prefixes:
+    /// - `g_stdin/g_stdout/g_stderr` - standard I/O streams
+    /// - `g_counter_XXXX` - incremented/decremented variables
+    /// - `g_const_XXXX` - read-only globals
+    /// - `g_state_XXXX` - write-heavy state variables
+    /// - `g_str_XXXX` - string pointers
+    /// - `g_arr_XXXX` - array base pointers
+    /// - `g_ptr_XXXX` - general pointer dereference
+    /// - `g_flags_XXXX` - bitwise operation targets
+    /// - `g_func_XXXX` - function pointers
+    /// - `g_XXXX` - default fallback
     fn format_global_fallback_name(&self, address: u64, hint: GlobalUsageHint) -> String {
-        let prefix = match hint {
-            GlobalUsageHint::PointerDeref => "ptr",
-            GlobalUsageHint::BitwiseOps => "flags",
-            GlobalUsageHint::FunctionPointer => "func",
-            GlobalUsageHint::Unknown => "data",
+        // Check for cached name first (consistency within emission)
+        if let Some(cached) = self.global_tracker.borrow().get_cached_name(address) {
+            return cached.to_string();
+        }
+
+        // Check for well-known libc globals by common address patterns
+        if let Some(libc_name) = Self::detect_libc_global_by_pattern(address) {
+            let name = format!("g_{}", libc_name);
+            self.global_tracker
+                .borrow_mut()
+                .cache_name(address, name.clone());
+            return name;
+        }
+
+        // Get the best hint by combining explicit hint with inferred patterns
+        let tracker = self.global_tracker.borrow();
+        let best_hint = if hint != GlobalUsageHint::Unknown {
+            hint
+        } else {
+            tracker.infer_best_hint(address)
         };
-        format!("{}_{:x}", prefix, address)
+        let size_hint = tracker.get_size_hint(address);
+        drop(tracker);
+
+        let prefix = match best_hint {
+            GlobalUsageHint::StdioStream => "g_stream",
+            GlobalUsageHint::Counter => "g_counter",
+            GlobalUsageHint::ReadOnly => "g_const",
+            GlobalUsageHint::WriteHeavy => "g_state",
+            GlobalUsageHint::StringPointer => "g_str",
+            GlobalUsageHint::ArrayBase => "g_arr",
+            GlobalUsageHint::PointerDeref => "g_ptr",
+            GlobalUsageHint::BitwiseOps => "g_flags",
+            GlobalUsageHint::FunctionPointer => "g_func",
+            GlobalUsageHint::Unknown => {
+                // Use size-based prefix for unknown globals
+                match size_hint {
+                    GlobalSizeHint::Byte => "g_byte",
+                    GlobalSizeHint::Word => "g_word",
+                    GlobalSizeHint::DWord => "g_dword",
+                    GlobalSizeHint::QWord => "g_qword",
+                    GlobalSizeHint::Unknown => "g",
+                }
+            }
+        };
+
+        let name = format!("{}_{:x}", prefix, address);
+        self.global_tracker
+            .borrow_mut()
+            .cache_name(address, name.clone());
+        name
+    }
+
+    /// Detects well-known libc globals by address patterns.
+    ///
+    /// On many systems, stdin/stdout/stderr are at predictable addresses
+    /// relative to each other (often 8 bytes apart in .bss).
+    fn detect_libc_global_by_pattern(address: u64) -> Option<&'static str> {
+        // Common patterns for stdio streams:
+        // - Often in .bss section, consecutive 8-byte pointers
+        // - Sometimes named _IO_stdin, _IO_stdout, _IO_stderr in glibc
+        // - Address endings can hint at which stream it is
+
+        // Check for common address suffixes that correlate with stdio streams
+        // These are heuristics based on typical linker layouts
+        let addr_low = address & 0xFFF; // Lower 12 bits
+
+        // Some binaries have stdio at predictable offsets
+        // This is a heuristic - not foolproof but helps in many cases
+        match addr_low {
+            // Common glibc patterns (stdin often at 0x40, stdout at 0x48, stderr at 0x50)
+            0x040 | 0x840 | 0x1040 => Some("stdin"),
+            0x048 | 0x848 | 0x1048 => Some("stdout"),
+            0x050 | 0x850 | 0x1050 => Some("stderr"),
+            _ => None,
+        }
     }
 
     /// Records a global access and returns the appropriate fallback name.
@@ -827,6 +1100,61 @@ impl PseudoCodeEmitter {
             .borrow_mut()
             .record_access(address, hint);
         self.format_global_fallback_name(address, hint)
+    }
+
+    /// Records a global access with size information for type inference.
+    fn record_and_name_global_with_size(
+        &self,
+        address: u64,
+        hint: GlobalUsageHint,
+        size: u8,
+    ) -> String {
+        {
+            let mut tracker = self.global_tracker.borrow_mut();
+            tracker.record_access(address, hint);
+            tracker.record_size(address, size);
+        }
+        self.format_global_fallback_name(address, hint)
+    }
+
+    /// Records a global read access (rvalue usage).
+    fn record_global_read(&self, address: u64) {
+        self.global_tracker.borrow_mut().record_read(address);
+    }
+
+    /// Records a global write access (lvalue usage).
+    fn record_global_write(&self, address: u64) {
+        self.global_tracker.borrow_mut().record_write(address);
+    }
+
+    /// Records a global increment/decrement operation.
+    fn record_global_increment(&self, address: u64) {
+        self.global_tracker.borrow_mut().record_increment(address);
+    }
+
+    /// Marks a global as a string pointer (points to string data).
+    fn mark_global_as_string(&self, address: u64) {
+        self.global_tracker
+            .borrow_mut()
+            .record_access(address, GlobalUsageHint::StringPointer);
+    }
+
+    /// Marks a global as an array base pointer.
+    fn mark_global_as_array(&self, address: u64) {
+        self.global_tracker
+            .borrow_mut()
+            .record_access(address, GlobalUsageHint::ArrayBase);
+    }
+
+    /// Extracts the GotRef address from an expression, if present.
+    /// Traverses through Deref and Cast to find the underlying GotRef.
+    fn extract_gotref_address(expr: &Expr) -> Option<u64> {
+        match &expr.kind {
+            ExprKind::GotRef { address, .. } => Some(*address),
+            ExprKind::Deref { addr, .. } => Self::extract_gotref_address(addr),
+            ExprKind::Cast { expr: inner, .. } => Self::extract_gotref_address(inner),
+            _ => None,
+        }
     }
 
     /// Returns the global access tracker for analysis.
@@ -1003,6 +1331,8 @@ impl PseudoCodeEmitter {
                 }
                 // Skip string table lookup for lvalues - you can't write to string literals
                 // Fall back to context-aware naming (lvalues are pointer derefs)
+                // Record as a write access since this is an lvalue
+                self.record_global_write(*address);
                 if *is_deref {
                     let prefix = match size {
                         1 => "*(uint8_t*)",
@@ -1011,7 +1341,11 @@ impl PseudoCodeEmitter {
                         8 => "*(uint64_t*)",
                         _ => "*",
                     };
-                    let name = self.record_and_name_global(*address, GlobalUsageHint::PointerDeref);
+                    let name = self.record_and_name_global_with_size(
+                        *address,
+                        GlobalUsageHint::PointerDeref,
+                        *size,
+                    );
                     format!("{}(&{})", prefix, name)
                 } else {
                     self.record_and_name_global(*address, GlobalUsageHint::PointerDeref)
@@ -1148,10 +1482,18 @@ impl PseudoCodeEmitter {
                         if let ExprKind::IntLit(1) = right.kind {
                             match op {
                                 super::expression::BinOpKind::Add => {
-                                    return format!("{}++", lhs_str)
+                                    // Track increment for counter detection
+                                    if let Some(addr) = Self::extract_gotref_address(lhs) {
+                                        self.record_global_increment(addr);
+                                    }
+                                    return format!("{}++", lhs_str);
                                 }
                                 super::expression::BinOpKind::Sub => {
-                                    return format!("{}--", lhs_str)
+                                    // Track decrement for counter detection
+                                    if let Some(addr) = Self::extract_gotref_address(lhs) {
+                                        self.record_global_increment(addr);
+                                    }
+                                    return format!("{}--", lhs_str);
                                 }
                                 _ => {}
                             }
@@ -1208,7 +1550,7 @@ impl PseudoCodeEmitter {
                     return format!("\"{}\"", escape_string(s));
                 }
                 // Fall back to showing computed address (better than "rip + offset")
-                // Use context-aware naming based on usage pattern
+                // Use context-aware naming based on usage pattern with size info
                 if *is_deref {
                     let prefix = match size {
                         1 => "*(uint8_t*)",
@@ -1217,8 +1559,14 @@ impl PseudoCodeEmitter {
                         8 => "*(uint64_t*)",
                         _ => "*",
                     };
-                    // Pointer dereference pattern
-                    let name = self.record_and_name_global(*address, GlobalUsageHint::PointerDeref);
+                    // Pointer dereference pattern - record size for type inference
+                    let name = self.record_and_name_global_with_size(
+                        *address,
+                        GlobalUsageHint::PointerDeref,
+                        *size,
+                    );
+                    // Record as a read access
+                    self.record_global_read(*address);
                     format!("{}(&{})", prefix, name)
                 } else {
                     // Address-of (LEA) - use default naming, tracker will categorize later if needed
@@ -1546,7 +1894,8 @@ impl PseudoCodeEmitter {
             let mut recovery = SignatureRecovery::new(self.calling_convention)
                 .with_relocation_table(self.relocation_table.clone())
                 .with_symbol_table(self.symbol_table.clone())
-                .with_summary_database(self.summary_database.clone());
+                .with_summary_database(self.summary_database.clone())
+                .with_function_name(func_name);
             let sig = recovery.analyze(cfg);
 
             // Convert recovered signature to FunctionInfo for compatibility
@@ -1766,10 +2115,25 @@ impl PseudoCodeEmitter {
     /// This can be used to get the signature separately from emission,
     /// for example to display it in a symbol table or for further analysis.
     pub fn recover_signature(&self, cfg: &StructuredCfg) -> FunctionSignature {
+        self.recover_signature_with_name(cfg, None)
+    }
+
+    /// Recovers the function signature with optional function name for known signatures.
+    ///
+    /// If the function name matches a known library function (e.g., "main", "malloc"),
+    /// the parameter names will be set to their canonical names.
+    pub fn recover_signature_with_name(
+        &self,
+        cfg: &StructuredCfg,
+        func_name: Option<&str>,
+    ) -> FunctionSignature {
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_relocation_table(self.relocation_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone());
+        if let Some(name) = func_name {
+            recovery = recovery.with_function_name(name);
+        }
         recovery.analyze(cfg)
     }
 
@@ -4614,10 +4978,10 @@ mod tests {
         let expr = Expr::got_ref(0x7000, 0, 8, Expr::unknown("ref"));
         let formatted = emitter.format_expr(&expr);
 
-        // Should use ptr_ prefix for pointer dereference
+        // Should use g_ptr_ prefix for pointer dereference (now with g_ prefix)
         assert!(
-            formatted.contains("ptr_7000"),
-            "Expected ptr_7000 in '{}' for pointer dereference",
+            formatted.contains("g_ptr_7000"),
+            "Expected g_ptr_7000 in '{}' for pointer dereference",
             formatted
         );
     }
@@ -4626,23 +4990,181 @@ mod tests {
     fn test_global_fallback_name_formats() {
         let emitter = PseudoCodeEmitter::new("    ", false);
 
-        // Test different naming hints
+        // Test different naming hints - now with g_ prefix
         assert_eq!(
             emitter.format_global_fallback_name(0x1234, GlobalUsageHint::PointerDeref),
-            "ptr_1234"
+            "g_ptr_1234"
         );
         assert_eq!(
             emitter.format_global_fallback_name(0x5678, GlobalUsageHint::BitwiseOps),
-            "flags_5678"
+            "g_flags_5678"
         );
         assert_eq!(
             emitter.format_global_fallback_name(0x9abc, GlobalUsageHint::FunctionPointer),
-            "func_9abc"
+            "g_func_9abc"
         );
         assert_eq!(
             emitter.format_global_fallback_name(0xdef0, GlobalUsageHint::Unknown),
-            "data_def0"
+            "g_def0"
         );
+
+        // Test new hint variants
+        assert_eq!(
+            emitter.format_global_fallback_name(0x1000, GlobalUsageHint::Counter),
+            "g_counter_1000"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0x2000, GlobalUsageHint::ReadOnly),
+            "g_const_2000"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0x3000, GlobalUsageHint::WriteHeavy),
+            "g_state_3000"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0x4000, GlobalUsageHint::StringPointer),
+            "g_str_4000"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0x5000, GlobalUsageHint::ArrayBase),
+            "g_arr_5000"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0x6000, GlobalUsageHint::StdioStream),
+            "g_stream_6000"
+        );
+    }
+
+    #[test]
+    fn test_global_tracker_read_write_counts() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Simulate read and write accesses
+        emitter.record_global_read(0x1000);
+        emitter.record_global_read(0x1000);
+        emitter.record_global_write(0x1000);
+
+        let tracker = emitter.global_tracker();
+        assert_eq!(tracker.get_read_count(0x1000), 2);
+        assert_eq!(tracker.get_write_count(0x1000), 1);
+        assert!(!tracker.is_read_only(0x1000)); // Has writes
+        assert!(!tracker.is_write_heavy(0x1000)); // More reads than writes
+    }
+
+    #[test]
+    fn test_global_tracker_read_only_detection() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Only read, no writes
+        emitter.record_global_read(0x2000);
+        emitter.record_global_read(0x2000);
+        emitter.record_global_read(0x2000);
+
+        let tracker = emitter.global_tracker();
+        assert!(tracker.is_read_only(0x2000));
+        assert_eq!(tracker.infer_best_hint(0x2000), GlobalUsageHint::ReadOnly);
+    }
+
+    #[test]
+    fn test_global_tracker_write_heavy_detection() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // More writes than reads
+        emitter.record_global_write(0x3000);
+        emitter.record_global_write(0x3000);
+        emitter.record_global_write(0x3000);
+        emitter.record_global_read(0x3000);
+
+        let tracker = emitter.global_tracker();
+        assert!(tracker.is_write_heavy(0x3000));
+        assert_eq!(tracker.infer_best_hint(0x3000), GlobalUsageHint::WriteHeavy);
+    }
+
+    #[test]
+    fn test_global_tracker_counter_detection() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Increment operation
+        emitter.record_global_increment(0x4000);
+
+        let tracker = emitter.global_tracker();
+        assert!(tracker.is_counter(0x4000));
+        assert_eq!(tracker.infer_best_hint(0x4000), GlobalUsageHint::Counter);
+    }
+
+    #[test]
+    fn test_global_tracker_size_hints() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Record size info
+        {
+            let mut tracker = emitter.global_tracker.borrow_mut();
+            tracker.record_size(0x5000, 4);
+            tracker.record_size(0x5008, 8);
+            tracker.record_size(0x5010, 1);
+        }
+
+        let tracker = emitter.global_tracker();
+        assert_eq!(tracker.get_size_hint(0x5000), GlobalSizeHint::DWord);
+        assert_eq!(tracker.get_size_hint(0x5008), GlobalSizeHint::QWord);
+        assert_eq!(tracker.get_size_hint(0x5010), GlobalSizeHint::Byte);
+    }
+
+    #[test]
+    fn test_global_tracker_proximity_grouping() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Create globals that should be grouped (within 64 bytes of each other)
+        {
+            let mut tracker = emitter.global_tracker.borrow_mut();
+            tracker.record_access(0x1000, GlobalUsageHint::Unknown);
+            tracker.record_access(0x1008, GlobalUsageHint::Unknown);
+            tracker.record_access(0x1010, GlobalUsageHint::Unknown);
+            // This one is far away
+            tracker.record_access(0x2000, GlobalUsageHint::Unknown);
+            tracker.record_access(0x2008, GlobalUsageHint::Unknown);
+        }
+
+        let tracker = emitter.global_tracker();
+        let groups = tracker.group_by_proximity();
+
+        // Should have 2 groups
+        assert_eq!(groups.len(), 2);
+
+        // First group should have 3 members
+        assert_eq!(groups[0].0, 0x1000);
+        assert_eq!(groups[0].1.len(), 3);
+
+        // Second group should have 2 members
+        assert_eq!(groups[1].0, 0x2000);
+        assert_eq!(groups[1].1.len(), 2);
+    }
+
+    #[test]
+    fn test_global_fallback_name_with_size_inference() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Record size for an unknown global
+        emitter.record_and_name_global_with_size(0x1234, GlobalUsageHint::Unknown, 4);
+
+        // Now the name should include size info
+        let tracker = emitter.global_tracker();
+        assert_eq!(tracker.get_size_hint(0x1234), GlobalSizeHint::DWord);
+    }
+
+    #[test]
+    fn test_global_name_caching_consistency() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // First access - should generate and cache the name
+        let name1 = emitter.format_global_fallback_name(0xABCD, GlobalUsageHint::PointerDeref);
+
+        // Second access - should return cached name
+        let name2 = emitter.format_global_fallback_name(0xABCD, GlobalUsageHint::BitwiseOps);
+
+        // Both should be the same (cached value)
+        assert_eq!(name1, name2);
+        assert_eq!(name1, "g_ptr_abcd");
     }
 
     #[test]

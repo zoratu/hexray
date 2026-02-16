@@ -2,6 +2,308 @@
 //!
 //! This module provides architecture-neutral functions for determining
 //! register roles across different ABIs (x86-64 System V, ARM64 AAPCS64, RISC-V).
+//!
+//! # Calling Conventions Supported
+//!
+//! ## x86-64 System V ABI (Linux, macOS, BSD)
+//! - Arguments: rdi, rsi, rdx, rcx, r8, r9 (integers/pointers)
+//! - FP arguments: xmm0-xmm7
+//! - Return: rax, rdx (128-bit)
+//! - Callee-saved: rbx, rbp, r12-r15
+//! - Red zone: 128 bytes below rsp
+//!
+//! ## ARM64 AAPCS64 (Procedure Call Standard for Arm 64-bit)
+//! - Arguments: x0-x7 (integers/pointers), v0-v7 (FP/SIMD)
+//! - Return: x0, x1 (128-bit), v0-v3 for FP
+//! - Callee-saved: x19-x28, x29 (FP), x30 (LR)
+//! - Special: x16/x17 (IP0/IP1), x18 (platform), x29 (FP), x30 (LR)
+//!
+//! ## RISC-V LP64/ILP32 (RV64I/RV32I)
+//! - Arguments: a0-a7 (integers), fa0-fa7 (FP with F/D extension)
+//! - Return: a0, a1 (64/128-bit), fa0-fa1 for FP
+//! - Callee-saved: s0-s11, ra
+//! - Special: sp (x2), gp (x3), tp (x4), zero (x0)
+
+/// Calling convention identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallingConvention {
+    /// x86-64 System V ABI (Linux, macOS, BSD)
+    X86_64SystemV,
+    /// Windows x64 calling convention
+    X86_64Win64,
+    /// ARM64 AAPCS64
+    Arm64Aapcs,
+    /// RISC-V LP64D (64-bit with D extension)
+    RiscVLp64d,
+    /// RISC-V LP64 (64-bit without FP)
+    RiscVLp64,
+    /// RISC-V ILP32D (32-bit with D extension)
+    RiscVIlp32d,
+    /// RISC-V ILP32 (32-bit without FP)
+    RiscVIlp32,
+    /// Unknown calling convention
+    Unknown,
+}
+
+impl CallingConvention {
+    /// Returns the argument registers for this calling convention.
+    pub fn argument_registers(&self) -> &'static [&'static str] {
+        match self {
+            Self::X86_64SystemV => &["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
+            Self::X86_64Win64 => &["rcx", "rdx", "r8", "r9"],
+            Self::Arm64Aapcs => &["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+            Self::RiscVLp64d | Self::RiscVLp64 | Self::RiscVIlp32d | Self::RiscVIlp32 => {
+                &["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]
+            }
+            Self::Unknown => &[],
+        }
+    }
+
+    /// Returns the FP argument registers for this calling convention.
+    pub fn fp_argument_registers(&self) -> &'static [&'static str] {
+        match self {
+            Self::X86_64SystemV | Self::X86_64Win64 => &[
+                "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+            ],
+            Self::Arm64Aapcs => &["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"],
+            Self::RiscVLp64d | Self::RiscVIlp32d => {
+                &["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"]
+            }
+            Self::RiscVLp64 | Self::RiscVIlp32 => &[], // No FP registers without F/D extension
+            Self::Unknown => &[],
+        }
+    }
+
+    /// Returns the return registers for this calling convention.
+    pub fn return_registers(&self) -> &'static [&'static str] {
+        match self {
+            Self::X86_64SystemV | Self::X86_64Win64 => &["rax", "rdx"],
+            Self::Arm64Aapcs => &["x0", "x1"],
+            Self::RiscVLp64d | Self::RiscVLp64 | Self::RiscVIlp32d | Self::RiscVIlp32 => {
+                &["a0", "a1"]
+            }
+            Self::Unknown => &[],
+        }
+    }
+
+    /// Returns the callee-saved registers for this calling convention.
+    pub fn callee_saved_registers(&self) -> &'static [&'static str] {
+        match self {
+            Self::X86_64SystemV => &["rbx", "rbp", "r12", "r13", "r14", "r15"],
+            Self::X86_64Win64 => &["rbx", "rbp", "rdi", "rsi", "r12", "r13", "r14", "r15"],
+            Self::Arm64Aapcs => &[
+                "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
+            ],
+            Self::RiscVLp64d | Self::RiscVLp64 | Self::RiscVIlp32d | Self::RiscVIlp32 => &[
+                "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11", "ra",
+            ],
+            Self::Unknown => &[],
+        }
+    }
+
+    /// Returns the stack pointer register name.
+    pub fn stack_pointer(&self) -> &'static str {
+        match self {
+            Self::X86_64SystemV | Self::X86_64Win64 => "rsp",
+            Self::Arm64Aapcs => "sp",
+            Self::RiscVLp64d | Self::RiscVLp64 | Self::RiscVIlp32d | Self::RiscVIlp32 => "sp",
+            Self::Unknown => "sp",
+        }
+    }
+
+    /// Returns the frame pointer register name.
+    pub fn frame_pointer(&self) -> &'static str {
+        match self {
+            Self::X86_64SystemV | Self::X86_64Win64 => "rbp",
+            Self::Arm64Aapcs => "x29",
+            Self::RiscVLp64d | Self::RiscVLp64 | Self::RiscVIlp32d | Self::RiscVIlp32 => "s0",
+            Self::Unknown => "fp",
+        }
+    }
+
+    /// Returns the link register (return address) name, if applicable.
+    pub fn link_register(&self) -> Option<&'static str> {
+        match self {
+            Self::X86_64SystemV | Self::X86_64Win64 => None, // Uses stack for return address
+            Self::Arm64Aapcs => Some("x30"),
+            Self::RiscVLp64d | Self::RiscVLp64 | Self::RiscVIlp32d | Self::RiscVIlp32 => Some("ra"),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Returns the red zone size (stack space below SP that's safe to use).
+    pub fn red_zone_size(&self) -> usize {
+        match self {
+            Self::X86_64SystemV => 128,
+            Self::X86_64Win64 => 0, // No red zone
+            Self::Arm64Aapcs => 0,  // No red zone (but 16-byte alignment)
+            Self::RiscVLp64d | Self::RiscVLp64 | Self::RiscVIlp32d | Self::RiscVIlp32 => 0,
+            Self::Unknown => 0,
+        }
+    }
+
+    /// Returns the stack alignment requirement in bytes.
+    pub fn stack_alignment(&self) -> usize {
+        match self {
+            Self::X86_64SystemV => 16,
+            Self::X86_64Win64 => 16,
+            Self::Arm64Aapcs => 16,
+            Self::RiscVLp64d | Self::RiscVLp64 => 16,
+            Self::RiscVIlp32d | Self::RiscVIlp32 => 8, // 32-bit uses 8-byte alignment
+            Self::Unknown => 8,
+        }
+    }
+
+    /// Returns the pointer size in bytes.
+    pub fn pointer_size(&self) -> usize {
+        match self {
+            Self::X86_64SystemV | Self::X86_64Win64 => 8,
+            Self::Arm64Aapcs => 8,
+            Self::RiscVLp64d | Self::RiscVLp64 => 8,
+            Self::RiscVIlp32d | Self::RiscVIlp32 => 4,
+            Self::Unknown => 8,
+        }
+    }
+}
+
+/// ARM64-specific register roles.
+pub mod arm64 {
+    /// Returns true if the register is an intra-procedure-call scratch register.
+    /// IP0 (x16) and IP1 (x17) are used by linkers for veneers and PLT entries.
+    pub fn is_ip_register(name: &str) -> bool {
+        matches!(name, "x16" | "w16" | "x17" | "w17" | "ip0" | "ip1")
+    }
+
+    /// Returns true if the register is the platform register.
+    /// x18 is reserved on some platforms (iOS, Windows on ARM).
+    pub fn is_platform_register(name: &str) -> bool {
+        matches!(name, "x18" | "w18")
+    }
+
+    /// Returns the condition code name for ARM64 conditional instructions.
+    pub fn condition_name(code: u8) -> &'static str {
+        match code & 0xF {
+            0x0 => "eq", // Equal (Z=1)
+            0x1 => "ne", // Not equal (Z=0)
+            0x2 => "cs", // Carry set / unsigned higher or same
+            0x3 => "cc", // Carry clear / unsigned lower
+            0x4 => "mi", // Minus / negative
+            0x5 => "pl", // Plus / positive or zero
+            0x6 => "vs", // Overflow
+            0x7 => "vc", // No overflow
+            0x8 => "hi", // Unsigned higher
+            0x9 => "ls", // Unsigned lower or same
+            0xA => "ge", // Signed greater or equal
+            0xB => "lt", // Signed less than
+            0xC => "gt", // Signed greater than
+            0xD => "le", // Signed less or equal
+            0xE => "al", // Always
+            0xF => "nv", // Never (but encodes as always)
+            _ => unreachable!(),
+        }
+    }
+
+    /// Inverts an ARM64 condition code.
+    pub fn invert_condition(code: u8) -> u8 {
+        code ^ 1
+    }
+}
+
+/// RISC-V-specific register roles.
+pub mod riscv {
+    /// Returns the ABI name for a RISC-V register number.
+    pub fn register_abi_name(reg: u8) -> &'static str {
+        match reg {
+            0 => "zero",
+            1 => "ra",
+            2 => "sp",
+            3 => "gp",
+            4 => "tp",
+            5 => "t0",
+            6 => "t1",
+            7 => "t2",
+            8 => "s0", // Also fp (frame pointer)
+            9 => "s1",
+            10 => "a0",
+            11 => "a1",
+            12 => "a2",
+            13 => "a3",
+            14 => "a4",
+            15 => "a5",
+            16 => "a6",
+            17 => "a7",
+            18 => "s2",
+            19 => "s3",
+            20 => "s4",
+            21 => "s5",
+            22 => "s6",
+            23 => "s7",
+            24 => "s8",
+            25 => "s9",
+            26 => "s10",
+            27 => "s11",
+            28 => "t3",
+            29 => "t4",
+            30 => "t5",
+            31 => "t6",
+            _ => "unknown",
+        }
+    }
+
+    /// Returns the FP register ABI name.
+    pub fn fp_register_abi_name(reg: u8) -> &'static str {
+        match reg {
+            0 => "ft0",
+            1 => "ft1",
+            2 => "ft2",
+            3 => "ft3",
+            4 => "ft4",
+            5 => "ft5",
+            6 => "ft6",
+            7 => "ft7",
+            8 => "fs0",
+            9 => "fs1",
+            10 => "fa0",
+            11 => "fa1",
+            12 => "fa2",
+            13 => "fa3",
+            14 => "fa4",
+            15 => "fa5",
+            16 => "fa6",
+            17 => "fa7",
+            18 => "fs2",
+            19 => "fs3",
+            20 => "fs4",
+            21 => "fs5",
+            22 => "fs6",
+            23 => "fs7",
+            24 => "fs8",
+            25 => "fs9",
+            26 => "fs10",
+            27 => "fs11",
+            28 => "ft8",
+            29 => "ft9",
+            30 => "ft10",
+            31 => "ft11",
+            _ => "unknown",
+        }
+    }
+
+    /// Returns true if the register is the global pointer.
+    pub fn is_global_pointer(name: &str) -> bool {
+        matches!(name, "gp" | "x3")
+    }
+
+    /// Returns true if the register is the thread pointer.
+    pub fn is_thread_pointer(name: &str) -> bool {
+        matches!(name, "tp" | "x4")
+    }
+
+    /// Returns true if this is the zero register.
+    pub fn is_zero_register(name: &str) -> bool {
+        matches!(name, "zero" | "x0")
+    }
+}
 
 /// Returns the argument index (0-based) for an argument register, or None if not an arg register.
 ///
@@ -431,5 +733,107 @@ mod tests {
         assert_eq!(normalize_x86_64_register("xmm0", 16), None);
         assert_eq!(normalize_x86_64_register("rip", 8), None);
         assert_eq!(normalize_x86_64_register("cs", 2), None);
+    }
+
+    // === CallingConvention tests ===
+
+    #[test]
+    fn test_x86_64_sysv_args() {
+        let cc = CallingConvention::X86_64SystemV;
+        let args = cc.argument_registers();
+        assert_eq!(args.len(), 6);
+        assert_eq!(args[0], "rdi");
+        assert_eq!(args[5], "r9");
+    }
+
+    #[test]
+    fn test_arm64_aapcs_args() {
+        let cc = CallingConvention::Arm64Aapcs;
+        let args = cc.argument_registers();
+        assert_eq!(args.len(), 8);
+        assert_eq!(args[0], "x0");
+        assert_eq!(args[7], "x7");
+    }
+
+    #[test]
+    fn test_riscv_args() {
+        let cc = CallingConvention::RiscVLp64d;
+        let args = cc.argument_registers();
+        assert_eq!(args.len(), 8);
+        assert_eq!(args[0], "a0");
+        assert_eq!(args[7], "a7");
+    }
+
+    #[test]
+    fn test_calling_convention_stack_alignment() {
+        assert_eq!(CallingConvention::X86_64SystemV.stack_alignment(), 16);
+        assert_eq!(CallingConvention::Arm64Aapcs.stack_alignment(), 16);
+        assert_eq!(CallingConvention::RiscVLp64d.stack_alignment(), 16);
+        assert_eq!(CallingConvention::RiscVIlp32.stack_alignment(), 8);
+    }
+
+    #[test]
+    fn test_calling_convention_red_zone() {
+        assert_eq!(CallingConvention::X86_64SystemV.red_zone_size(), 128);
+        assert_eq!(CallingConvention::X86_64Win64.red_zone_size(), 0);
+        assert_eq!(CallingConvention::Arm64Aapcs.red_zone_size(), 0);
+    }
+
+    #[test]
+    fn test_calling_convention_link_register() {
+        assert_eq!(CallingConvention::X86_64SystemV.link_register(), None);
+        assert_eq!(CallingConvention::Arm64Aapcs.link_register(), Some("x30"));
+        assert_eq!(CallingConvention::RiscVLp64d.link_register(), Some("ra"));
+    }
+
+    // === ARM64 module tests ===
+
+    #[test]
+    fn test_arm64_ip_registers() {
+        assert!(arm64::is_ip_register("x16"));
+        assert!(arm64::is_ip_register("x17"));
+        assert!(arm64::is_ip_register("ip0"));
+        assert!(!arm64::is_ip_register("x0"));
+    }
+
+    #[test]
+    fn test_arm64_condition_names() {
+        assert_eq!(arm64::condition_name(0x0), "eq");
+        assert_eq!(arm64::condition_name(0x1), "ne");
+        assert_eq!(arm64::condition_name(0xA), "ge");
+        assert_eq!(arm64::condition_name(0xB), "lt");
+    }
+
+    #[test]
+    fn test_arm64_invert_condition() {
+        assert_eq!(arm64::invert_condition(0x0), 0x1); // eq -> ne
+        assert_eq!(arm64::invert_condition(0x1), 0x0); // ne -> eq
+        assert_eq!(arm64::invert_condition(0xA), 0xB); // ge -> lt
+    }
+
+    // === RISC-V module tests ===
+
+    #[test]
+    fn test_riscv_register_names() {
+        assert_eq!(riscv::register_abi_name(0), "zero");
+        assert_eq!(riscv::register_abi_name(1), "ra");
+        assert_eq!(riscv::register_abi_name(2), "sp");
+        assert_eq!(riscv::register_abi_name(10), "a0");
+        assert_eq!(riscv::register_abi_name(17), "a7");
+    }
+
+    #[test]
+    fn test_riscv_fp_register_names() {
+        assert_eq!(riscv::fp_register_abi_name(0), "ft0");
+        assert_eq!(riscv::fp_register_abi_name(10), "fa0");
+        assert_eq!(riscv::fp_register_abi_name(17), "fa7");
+    }
+
+    #[test]
+    fn test_riscv_special_registers() {
+        assert!(riscv::is_zero_register("zero"));
+        assert!(riscv::is_zero_register("x0"));
+        assert!(riscv::is_global_pointer("gp"));
+        assert!(riscv::is_thread_pointer("tp"));
     }
 }

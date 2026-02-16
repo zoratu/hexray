@@ -621,6 +621,382 @@ impl FunctionSignature {
     }
 }
 
+/// Known function parameter names for well-known library functions.
+///
+/// Returns a slice of (param_index, param_name, param_type) for functions with known signatures.
+fn get_known_function_params(func_name: &str) -> Option<&'static [(&'static str, ParamType)]> {
+    // Normalize function name (strip leading underscores)
+    let name = func_name.trim_start_matches('_');
+
+    match name {
+        // main() function
+        "main" => Some(&[
+            ("argc", ParamType::SignedInt(32)),
+            ("argv", ParamType::Pointer),
+        ]),
+
+        // Memory functions
+        "malloc" | "valloc" => Some(&[("size", ParamType::UnsignedInt(64))]),
+        "calloc" => Some(&[
+            ("nmemb", ParamType::UnsignedInt(64)),
+            ("size", ParamType::UnsignedInt(64)),
+        ]),
+        "realloc" | "reallocf" => Some(&[
+            ("ptr", ParamType::Pointer),
+            ("size", ParamType::UnsignedInt(64)),
+        ]),
+        "free" => Some(&[("ptr", ParamType::Pointer)]),
+        "memcpy" | "memmove" => Some(&[
+            ("dst", ParamType::Pointer),
+            ("src", ParamType::Pointer),
+            ("n", ParamType::UnsignedInt(64)),
+        ]),
+        "memset" => Some(&[
+            ("s", ParamType::Pointer),
+            ("c", ParamType::SignedInt(32)),
+            ("n", ParamType::UnsignedInt(64)),
+        ]),
+        "memcmp" => Some(&[
+            ("s1", ParamType::Pointer),
+            ("s2", ParamType::Pointer),
+            ("n", ParamType::UnsignedInt(64)),
+        ]),
+        "memchr" => Some(&[
+            ("s", ParamType::Pointer),
+            ("c", ParamType::SignedInt(32)),
+            ("n", ParamType::UnsignedInt(64)),
+        ]),
+        "bzero" => Some(&[("s", ParamType::Pointer), ("n", ParamType::UnsignedInt(64))]),
+
+        // String functions
+        "strlen" | "wcslen" => Some(&[("s", ParamType::Pointer)]),
+        "strcpy" | "wcscpy" => Some(&[("dst", ParamType::Pointer), ("src", ParamType::Pointer)]),
+        "strncpy" | "wcsncpy" => Some(&[
+            ("dst", ParamType::Pointer),
+            ("src", ParamType::Pointer),
+            ("n", ParamType::UnsignedInt(64)),
+        ]),
+        "strcat" | "wcscat" => Some(&[("dst", ParamType::Pointer), ("src", ParamType::Pointer)]),
+        "strncat" | "wcsncat" => Some(&[
+            ("dst", ParamType::Pointer),
+            ("src", ParamType::Pointer),
+            ("n", ParamType::UnsignedInt(64)),
+        ]),
+        "strcmp" | "wcscmp" => Some(&[("s1", ParamType::Pointer), ("s2", ParamType::Pointer)]),
+        "strncmp" | "wcsncmp" => Some(&[
+            ("s1", ParamType::Pointer),
+            ("s2", ParamType::Pointer),
+            ("n", ParamType::UnsignedInt(64)),
+        ]),
+        "strchr" | "strrchr" | "wcschr" | "wcsrchr" => {
+            Some(&[("s", ParamType::Pointer), ("c", ParamType::SignedInt(32))])
+        }
+        "strstr" | "wcsstr" => Some(&[
+            ("haystack", ParamType::Pointer),
+            ("needle", ParamType::Pointer),
+        ]),
+        "strdup" | "strndup" => Some(&[("s", ParamType::Pointer)]),
+        "strtok" => Some(&[("str", ParamType::Pointer), ("delim", ParamType::Pointer)]),
+        "strtok_r" => Some(&[
+            ("str", ParamType::Pointer),
+            ("delim", ParamType::Pointer),
+            ("saveptr", ParamType::Pointer),
+        ]),
+
+        // String conversion
+        "atoi" | "atol" | "atoll" => Some(&[("nptr", ParamType::Pointer)]),
+        "strtol" | "strtoll" => Some(&[
+            ("nptr", ParamType::Pointer),
+            ("endptr", ParamType::Pointer),
+            ("base", ParamType::SignedInt(32)),
+        ]),
+        "strtoul" | "strtoull" => Some(&[
+            ("nptr", ParamType::Pointer),
+            ("endptr", ParamType::Pointer),
+            ("base", ParamType::SignedInt(32)),
+        ]),
+        "strtod" | "strtof" | "strtold" => {
+            Some(&[("nptr", ParamType::Pointer), ("endptr", ParamType::Pointer)])
+        }
+
+        // File I/O
+        "fopen" | "freopen" => Some(&[
+            ("filename", ParamType::Pointer),
+            ("mode", ParamType::Pointer),
+        ]),
+        "fclose" | "fflush" => Some(&[("stream", ParamType::Pointer)]),
+        "fread" => Some(&[
+            ("ptr", ParamType::Pointer),
+            ("size", ParamType::UnsignedInt(64)),
+            ("nmemb", ParamType::UnsignedInt(64)),
+            ("stream", ParamType::Pointer),
+        ]),
+        "fwrite" => Some(&[
+            ("ptr", ParamType::Pointer),
+            ("size", ParamType::UnsignedInt(64)),
+            ("nmemb", ParamType::UnsignedInt(64)),
+            ("stream", ParamType::Pointer),
+        ]),
+        "fgets" => Some(&[
+            ("s", ParamType::Pointer),
+            ("size", ParamType::SignedInt(32)),
+            ("stream", ParamType::Pointer),
+        ]),
+        "fputs" => Some(&[("s", ParamType::Pointer), ("stream", ParamType::Pointer)]),
+        "fgetc" | "getc" => Some(&[("stream", ParamType::Pointer)]),
+        "fputc" | "putc" => Some(&[
+            ("c", ParamType::SignedInt(32)),
+            ("stream", ParamType::Pointer),
+        ]),
+        "fseek" => Some(&[
+            ("stream", ParamType::Pointer),
+            ("offset", ParamType::SignedInt(64)),
+            ("whence", ParamType::SignedInt(32)),
+        ]),
+        "ftell" | "rewind" => Some(&[("stream", ParamType::Pointer)]),
+        "fprintf" => Some(&[
+            ("stream", ParamType::Pointer),
+            ("format", ParamType::Pointer),
+        ]),
+        "fscanf" => Some(&[
+            ("stream", ParamType::Pointer),
+            ("format", ParamType::Pointer),
+        ]),
+
+        // POSIX I/O
+        "open" => Some(&[
+            ("pathname", ParamType::Pointer),
+            ("flags", ParamType::SignedInt(32)),
+            ("mode", ParamType::UnsignedInt(32)),
+        ]),
+        "close" => Some(&[("fd", ParamType::SignedInt(32))]),
+        "read" => Some(&[
+            ("fd", ParamType::SignedInt(32)),
+            ("buf", ParamType::Pointer),
+            ("count", ParamType::UnsignedInt(64)),
+        ]),
+        "write" => Some(&[
+            ("fd", ParamType::SignedInt(32)),
+            ("buf", ParamType::Pointer),
+            ("count", ParamType::UnsignedInt(64)),
+        ]),
+        "lseek" => Some(&[
+            ("fd", ParamType::SignedInt(32)),
+            ("offset", ParamType::SignedInt(64)),
+            ("whence", ParamType::SignedInt(32)),
+        ]),
+        "dup" => Some(&[("oldfd", ParamType::SignedInt(32))]),
+        "dup2" => Some(&[
+            ("oldfd", ParamType::SignedInt(32)),
+            ("newfd", ParamType::SignedInt(32)),
+        ]),
+        "pipe" => Some(&[("pipefd", ParamType::Pointer)]),
+
+        // Directory functions
+        "opendir" => Some(&[("name", ParamType::Pointer)]),
+        "closedir" => Some(&[("dirp", ParamType::Pointer)]),
+        "readdir" => Some(&[("dirp", ParamType::Pointer)]),
+        "mkdir" => Some(&[
+            ("pathname", ParamType::Pointer),
+            ("mode", ParamType::UnsignedInt(32)),
+        ]),
+        "rmdir" | "chdir" => Some(&[("pathname", ParamType::Pointer)]),
+
+        // Process functions
+        "fork" | "vfork" | "getpid" | "getppid" => Some(&[]),
+        "exit" | "Exit" | "quick_exit" => Some(&[("status", ParamType::SignedInt(32))]),
+        "execve" => Some(&[
+            ("pathname", ParamType::Pointer),
+            ("argv", ParamType::Pointer),
+            ("envp", ParamType::Pointer),
+        ]),
+        "execv" | "execvp" => Some(&[
+            ("pathname", ParamType::Pointer),
+            ("argv", ParamType::Pointer),
+        ]),
+        "waitpid" => Some(&[
+            ("pid", ParamType::SignedInt(32)),
+            ("wstatus", ParamType::Pointer),
+            ("options", ParamType::SignedInt(32)),
+        ]),
+        "kill" => Some(&[
+            ("pid", ParamType::SignedInt(32)),
+            ("sig", ParamType::SignedInt(32)),
+        ]),
+
+        // Socket functions
+        "socket" => Some(&[
+            ("domain", ParamType::SignedInt(32)),
+            ("type_", ParamType::SignedInt(32)),
+            ("protocol", ParamType::SignedInt(32)),
+        ]),
+        "bind" | "connect" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("addr", ParamType::Pointer),
+            ("addrlen", ParamType::UnsignedInt(32)),
+        ]),
+        "listen" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("backlog", ParamType::SignedInt(32)),
+        ]),
+        "accept" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("addr", ParamType::Pointer),
+            ("addrlen", ParamType::Pointer),
+        ]),
+        "send" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("buf", ParamType::Pointer),
+            ("len", ParamType::UnsignedInt(64)),
+            ("flags", ParamType::SignedInt(32)),
+        ]),
+        "recv" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("buf", ParamType::Pointer),
+            ("len", ParamType::UnsignedInt(64)),
+            ("flags", ParamType::SignedInt(32)),
+        ]),
+        "sendto" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("buf", ParamType::Pointer),
+            ("len", ParamType::UnsignedInt(64)),
+            ("flags", ParamType::SignedInt(32)),
+            ("dest_addr", ParamType::Pointer),
+            ("addrlen", ParamType::UnsignedInt(32)),
+        ]),
+        "recvfrom" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("buf", ParamType::Pointer),
+            ("len", ParamType::UnsignedInt(64)),
+            ("flags", ParamType::SignedInt(32)),
+            ("src_addr", ParamType::Pointer),
+            ("addrlen", ParamType::Pointer),
+        ]),
+        "setsockopt" | "getsockopt" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("level", ParamType::SignedInt(32)),
+            ("optname", ParamType::SignedInt(32)),
+            ("optval", ParamType::Pointer),
+            ("optlen", ParamType::UnsignedInt(32)),
+        ]),
+        "shutdown" => Some(&[
+            ("sockfd", ParamType::SignedInt(32)),
+            ("how", ParamType::SignedInt(32)),
+        ]),
+
+        // Memory mapping
+        "mmap" => Some(&[
+            ("addr", ParamType::Pointer),
+            ("length", ParamType::UnsignedInt(64)),
+            ("prot", ParamType::SignedInt(32)),
+            ("flags", ParamType::SignedInt(32)),
+            ("fd", ParamType::SignedInt(32)),
+            ("offset", ParamType::SignedInt(64)),
+        ]),
+        "munmap" => Some(&[
+            ("addr", ParamType::Pointer),
+            ("length", ParamType::UnsignedInt(64)),
+        ]),
+        "mprotect" => Some(&[
+            ("addr", ParamType::Pointer),
+            ("len", ParamType::UnsignedInt(64)),
+            ("prot", ParamType::SignedInt(32)),
+        ]),
+
+        // printf/scanf family
+        "printf" | "puts" => Some(&[("format", ParamType::Pointer)]),
+        "sprintf" => Some(&[("str", ParamType::Pointer), ("format", ParamType::Pointer)]),
+        "snprintf" => Some(&[
+            ("str", ParamType::Pointer),
+            ("size", ParamType::UnsignedInt(64)),
+            ("format", ParamType::Pointer),
+        ]),
+        "scanf" => Some(&[("format", ParamType::Pointer)]),
+        "sscanf" => Some(&[("str", ParamType::Pointer), ("format", ParamType::Pointer)]),
+
+        // Environment
+        "getenv" => Some(&[("name", ParamType::Pointer)]),
+        "setenv" => Some(&[
+            ("name", ParamType::Pointer),
+            ("value", ParamType::Pointer),
+            ("overwrite", ParamType::SignedInt(32)),
+        ]),
+        "unsetenv" => Some(&[("name", ParamType::Pointer)]),
+
+        // Error handling
+        "perror" => Some(&[("s", ParamType::Pointer)]),
+        "strerror" => Some(&[("errnum", ParamType::SignedInt(32))]),
+
+        // Threading
+        "pthread_create" => Some(&[
+            ("thread", ParamType::Pointer),
+            ("attr", ParamType::Pointer),
+            ("start_routine", ParamType::Pointer),
+            ("arg", ParamType::Pointer),
+        ]),
+        "pthread_join" => Some(&[
+            ("thread", ParamType::UnsignedInt(64)),
+            ("retval", ParamType::Pointer),
+        ]),
+        "pthread_mutex_lock" | "pthread_mutex_unlock" | "pthread_mutex_trylock" => {
+            Some(&[("mutex", ParamType::Pointer)])
+        }
+        "pthread_mutex_init" => {
+            Some(&[("mutex", ParamType::Pointer), ("attr", ParamType::Pointer)])
+        }
+        "pthread_cond_wait" => Some(&[("cond", ParamType::Pointer), ("mutex", ParamType::Pointer)]),
+        "pthread_cond_signal" | "pthread_cond_broadcast" => Some(&[("cond", ParamType::Pointer)]),
+
+        // qsort/bsearch
+        "qsort" => Some(&[
+            ("base", ParamType::Pointer),
+            ("nmemb", ParamType::UnsignedInt(64)),
+            ("size", ParamType::UnsignedInt(64)),
+            ("compar", ParamType::Pointer),
+        ]),
+        "bsearch" => Some(&[
+            ("key", ParamType::Pointer),
+            ("base", ParamType::Pointer),
+            ("nmemb", ParamType::UnsignedInt(64)),
+            ("size", ParamType::UnsignedInt(64)),
+            ("compar", ParamType::Pointer),
+        ]),
+
+        // Signal handling
+        "signal" => Some(&[
+            ("signum", ParamType::SignedInt(32)),
+            ("handler", ParamType::Pointer),
+        ]),
+        "sigaction" => Some(&[
+            ("signum", ParamType::SignedInt(32)),
+            ("act", ParamType::Pointer),
+            ("oldact", ParamType::Pointer),
+        ]),
+
+        // Time functions
+        "time" => Some(&[("tloc", ParamType::Pointer)]),
+        "gettimeofday" => Some(&[("tv", ParamType::Pointer), ("tz", ParamType::Pointer)]),
+        "sleep" => Some(&[("seconds", ParamType::UnsignedInt(32))]),
+        "usleep" => Some(&[("usec", ParamType::UnsignedInt(32))]),
+        "nanosleep" => Some(&[("req", ParamType::Pointer), ("rem", ParamType::Pointer)]),
+
+        // Networking address functions
+        "inet_addr" | "inet_aton" => Some(&[("cp", ParamType::Pointer)]),
+        "inet_ntoa" => Some(&[("in", ParamType::UnsignedInt(32))]),
+        "htons" | "ntohs" => Some(&[("hostshort", ParamType::UnsignedInt(16))]),
+        "htonl" | "ntohl" => Some(&[("hostlong", ParamType::UnsignedInt(32))]),
+        "getaddrinfo" => Some(&[
+            ("node", ParamType::Pointer),
+            ("service", ParamType::Pointer),
+            ("hints", ParamType::Pointer),
+            ("res", ParamType::Pointer),
+        ]),
+        "freeaddrinfo" => Some(&[("res", ParamType::Pointer)]),
+
+        _ => None,
+    }
+}
+
 /// Signature recovery engine.
 ///
 /// Analyzes a structured CFG to recover function signatures by:
@@ -673,6 +1049,8 @@ pub struct SignatureRecovery {
     symbol_table: Option<SymbolTable>,
     /// Optional inter-procedural summary database for signature hints.
     summary_database: Option<Arc<super::interprocedural::SummaryDatabase>>,
+    /// Function name being analyzed (for known function lookup).
+    current_func_name: Option<String>,
 }
 
 impl SignatureRecovery {
@@ -708,7 +1086,14 @@ impl SignatureRecovery {
             relocation_table: None,
             symbol_table: None,
             summary_database: None,
+            current_func_name: None,
         }
+    }
+
+    /// Sets the function name for known function signature lookup.
+    pub fn with_function_name(mut self, name: &str) -> Self {
+        self.current_func_name = Some(name.to_string());
+        self
     }
 
     /// Provides relocation data for resolving indirect GOT call targets.
@@ -2197,6 +2582,12 @@ impl SignatureRecovery {
     fn build_signature(&self) -> FunctionSignature {
         let mut sig = FunctionSignature::new(self.convention);
 
+        // Check for known function signature first
+        let known_params = self
+            .current_func_name
+            .as_ref()
+            .and_then(|name| get_known_function_params(name));
+
         // Determine which argument registers were used
         let int_regs = self.convention.integer_arg_registers();
         let int_regs_32 = self.convention.integer_arg_registers_32();
@@ -2223,6 +2614,12 @@ impl SignatureRecovery {
             let reg64 = int_regs[idx].to_lowercase();
             let reg32 = int_regs_32[idx].to_lowercase();
 
+            // Check if we have a known parameter name/type for this index
+            let (known_name, known_type) = known_params
+                .and_then(|params| params.get(idx))
+                .map(|(name, ty)| (Some(*name), Some(ty.clone())))
+                .unwrap_or((None, None));
+
             // Determine the size from register usage
             let size = if let Some(s) = self.reg_sizes.get(&reg64) {
                 *s
@@ -2235,8 +2632,10 @@ impl SignatureRecovery {
             // Get usage hints for this parameter
             let hints = self.param_hints.get(&idx);
 
-            // Infer type from usage hints if available
-            let param_type = if let Some(hints) = hints {
+            // Use known type, or infer type from usage hints if available
+            let param_type = if let Some(known_ty) = known_type {
+                known_ty
+            } else if let Some(hints) = hints {
                 hints.infer_type(size)
             } else {
                 match size {
@@ -2247,8 +2646,10 @@ impl SignatureRecovery {
                 }
             };
 
-            // Use a custom name if we have one, or infer from hints
-            let name = if let Some(custom_name) = self.param_names.get(&idx) {
+            // Use known name, custom name, infer from hints, or default
+            let name = if let Some(known_nm) = known_name {
+                known_nm.to_string()
+            } else if let Some(custom_name) = self.param_names.get(&idx) {
                 custom_name.clone()
             } else if let Some(hints) = hints {
                 hints.suggest_name(idx)
@@ -2380,6 +2781,7 @@ fn is_frame_pointer(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::decompiler::expression::{CallTarget, Variable};
+    use hexray_core::BasicBlockId;
     use std::sync::Arc;
 
     #[test]
@@ -3956,5 +4358,151 @@ mod tests {
             sig.parameters[1].param_type,
             ParamType::SignedInt(32)
         ));
+    }
+
+    #[test]
+    fn test_known_function_params_main() {
+        // Test that main() gets argc and argv parameter names
+        let params = get_known_function_params("main").unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].0, "argc");
+        assert!(matches!(params[0].1, ParamType::SignedInt(32)));
+        assert_eq!(params[1].0, "argv");
+        assert!(matches!(params[1].1, ParamType::Pointer));
+
+        // Also test _main (macOS)
+        let params2 = get_known_function_params("_main").unwrap();
+        assert_eq!(params2.len(), 2);
+        assert_eq!(params2[0].0, "argc");
+    }
+
+    #[test]
+    fn test_known_function_params_memory() {
+        // Test malloc
+        let params = get_known_function_params("malloc").unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "size");
+        assert!(matches!(params[0].1, ParamType::UnsignedInt(64)));
+
+        // Test memcpy
+        let params = get_known_function_params("memcpy").unwrap();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].0, "dst");
+        assert_eq!(params[1].0, "src");
+        assert_eq!(params[2].0, "n");
+
+        // Test free
+        let params = get_known_function_params("free").unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "ptr");
+    }
+
+    #[test]
+    fn test_known_function_params_file_io() {
+        // Test open
+        let params = get_known_function_params("open").unwrap();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].0, "pathname");
+        assert_eq!(params[1].0, "flags");
+        assert_eq!(params[2].0, "mode");
+
+        // Test read
+        let params = get_known_function_params("read").unwrap();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].0, "fd");
+        assert_eq!(params[1].0, "buf");
+        assert_eq!(params[2].0, "count");
+
+        // Test close
+        let params = get_known_function_params("close").unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "fd");
+    }
+
+    #[test]
+    fn test_known_function_params_string() {
+        // Test strlen
+        let params = get_known_function_params("strlen").unwrap();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "s");
+
+        // Test strcmp
+        let params = get_known_function_params("strcmp").unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].0, "s1");
+        assert_eq!(params[1].0, "s2");
+
+        // Test strstr
+        let params = get_known_function_params("strstr").unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].0, "haystack");
+        assert_eq!(params[1].0, "needle");
+    }
+
+    #[test]
+    fn test_known_function_params_socket() {
+        // Test socket
+        let params = get_known_function_params("socket").unwrap();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].0, "domain");
+        assert_eq!(params[1].0, "type_");
+        assert_eq!(params[2].0, "protocol");
+
+        // Test bind
+        let params = get_known_function_params("bind").unwrap();
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0].0, "sockfd");
+        assert_eq!(params[1].0, "addr");
+        assert_eq!(params[2].0, "addrlen");
+    }
+
+    #[test]
+    fn test_known_function_params_unknown() {
+        // Unknown function should return None
+        assert!(get_known_function_params("my_custom_function").is_none());
+        assert!(get_known_function_params("foo_bar_baz").is_none());
+    }
+
+    #[test]
+    fn test_signature_recovery_with_known_function_name() {
+        // Create a simple CFG that reads rdi and rsi (first two args)
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let rsi = Expr::var(Variable::reg("rsi", 8));
+        let add = Expr::binop(BinOpKind::Add, rdi, rsi);
+        let ret_stmt = StructuredNode::Return(Some(add));
+
+        let cfg = StructuredCfg {
+            body: vec![ret_stmt],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        // Test with main function - should get argc/argv names
+        let mut recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_function_name("main");
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(sig.parameters[0].name, "argc");
+        assert_eq!(sig.parameters[1].name, "argv");
+    }
+
+    #[test]
+    fn test_signature_recovery_malloc_like() {
+        // Create a CFG that reads rdi (first arg)
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let ret_stmt = StructuredNode::Return(Some(rdi));
+
+        let cfg = StructuredCfg {
+            body: vec![ret_stmt],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        // Test with malloc function - should get "size" name
+        let mut recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_function_name("malloc");
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].name, "size");
     }
 }
