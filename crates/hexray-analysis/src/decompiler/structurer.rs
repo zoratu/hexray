@@ -4425,6 +4425,26 @@ fn try_extract_switch(
 
         // Need at least 2 cases for range-based switches (the range might cover many values)
         if cases.len() >= 2 || cases.iter().map(|(v, _)| v.len()).sum::<usize>() >= 3 {
+            // Reject switches where case values are duplicated.
+            let mut has_duplicates = false;
+            {
+                let mut seen_values = std::collections::HashSet::new();
+                for (vals, _) in &cases {
+                    for val in vals {
+                        if !seen_values.insert(*val) {
+                            has_duplicates = true;
+                            break;
+                        }
+                    }
+                    if has_duplicates {
+                        break;
+                    }
+                }
+            }
+            if has_duplicates {
+                return None;
+            }
+
             let default = current_else.map(detect_switch_statements);
             let final_cases = cases
                 .into_iter()
@@ -4512,6 +4532,21 @@ fn try_extract_switch(
     } else {
         (cases, None)
     };
+
+    // Reject switches where case values are duplicated.
+    // This catches false positives like: if (x == 0) ... else if (y = foo(); y == 0) ...
+    // where the same value appears multiple times due to variable reassignment.
+    {
+        let mut seen_values = std::collections::HashSet::new();
+        for (vals, _) in &final_cases {
+            for val in vals {
+                if !seen_values.insert(*val) {
+                    // Duplicate value found - this isn't a valid switch
+                    return None;
+                }
+            }
+        }
+    }
 
     // Process the default case
     let default = current_else.map(detect_switch_statements);
@@ -4603,6 +4638,19 @@ fn try_extract_switch_negated(
     // Need at least 3 cases to be worth converting to switch
     if cases.len() < 3 {
         return None;
+    }
+
+    // Reject switches where case values are duplicated.
+    {
+        let mut seen_values = std::collections::HashSet::new();
+        for (vals, _) in &cases {
+            for val in vals {
+                if !seen_values.insert(*val) {
+                    // Duplicate value found - this isn't a valid switch
+                    return None;
+                }
+            }
+        }
     }
 
     // The remaining then_body is the default case (when none of the values matched)

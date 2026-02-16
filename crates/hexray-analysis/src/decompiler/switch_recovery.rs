@@ -155,8 +155,13 @@ impl<'a> SwitchRecovery<'a> {
         // Analyze the block to find the comparison and table access pattern
         let (switch_var, bound_check, table_info) = self.analyze_jump_table_block(block)?;
 
-        // If we have possible targets from CFG analysis, use those
-        let cases = if !possible_targets.is_empty() {
+        // Try to read actual case values from the jump table (requires binary data).
+        // This gives us the correct case values instead of just sequential indices.
+        let cases = if let Some(cases) = self.read_jump_table(&table_info) {
+            cases
+        } else if !possible_targets.is_empty() {
+            // Fall back to using possible targets with sequential indices.
+            // This happens when binary data isn't available.
             possible_targets
                 .iter()
                 .enumerate()
@@ -165,8 +170,6 @@ impl<'a> SwitchRecovery<'a> {
                     (vec![value as i128], target)
                 })
                 .collect()
-        } else if let Some(cases) = self.read_jump_table(&table_info) {
-            cases
         } else {
             return None;
         };
