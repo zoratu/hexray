@@ -80,6 +80,72 @@ struct FunctionInfo {
     skip_statements: HashSet<(usize, usize)>,
 }
 
+/// Categorizes how a global address is used, enabling better fallback naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GlobalUsageHint {
+    /// Used via pointer dereference (suggests ptr_ prefix)
+    PointerDeref,
+    /// Used in bitwise operations (suggests flags_ prefix)
+    BitwiseOps,
+    /// Used as a function pointer (suggests func_ prefix)
+    FunctionPointer,
+    /// Default/unknown usage (uses data_ prefix)
+    #[default]
+    Unknown,
+}
+
+/// Tracks access frequency and usage hints for global addresses.
+#[derive(Debug, Clone, Default)]
+pub struct GlobalAccessTracker {
+    /// Maps global address to access count.
+    pub access_counts: std::collections::HashMap<u64, usize>,
+    /// Maps global address to detected usage hint.
+    pub usage_hints: std::collections::HashMap<u64, GlobalUsageHint>,
+}
+
+impl GlobalAccessTracker {
+    /// Creates a new empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records an access to a global address with optional usage hint.
+    pub fn record_access(&mut self, address: u64, hint: GlobalUsageHint) {
+        *self.access_counts.entry(address).or_insert(0) += 1;
+
+        // Update usage hint if current is Unknown or matches
+        self.usage_hints
+            .entry(address)
+            .and_modify(|h| {
+                // Only upgrade from Unknown, don't override more specific hints
+                if *h == GlobalUsageHint::Unknown && hint != GlobalUsageHint::Unknown {
+                    *h = hint;
+                }
+            })
+            .or_insert(hint);
+    }
+
+    /// Gets the access count for a global address.
+    pub fn get_count(&self, address: u64) -> usize {
+        self.access_counts.get(&address).copied().unwrap_or(0)
+    }
+
+    /// Gets the usage hint for a global address.
+    pub fn get_hint(&self, address: u64) -> GlobalUsageHint {
+        self.usage_hints
+            .get(&address)
+            .copied()
+            .unwrap_or(GlobalUsageHint::Unknown)
+    }
+
+    /// Returns addresses sorted by access frequency (most accessed first).
+    pub fn addresses_by_frequency(&self) -> Vec<(u64, usize)> {
+        let mut addrs: Vec<_> = self.access_counts.iter().map(|(&a, &c)| (a, c)).collect();
+        addrs.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by count
+        addrs
+    }
+}
+
 /// Emits pseudo-code from structured control flow.
 pub struct PseudoCodeEmitter {
     indent: String,
@@ -104,6 +170,9 @@ pub struct PseudoCodeEmitter {
     constant_database: Option<Arc<ConstantDatabase>>,
     /// Optional inter-procedural summary database for signature hints.
     summary_database: Option<Arc<SummaryDatabase>>,
+    /// Tracks global access frequency and usage patterns.
+    /// Uses RefCell for interior mutability during emission.
+    global_tracker: RefCell<GlobalAccessTracker>,
 }
 
 impl PseudoCodeEmitter {
@@ -137,6 +206,7 @@ impl PseudoCodeEmitter {
             type_database: None,
             constant_database: None,
             summary_database: None,
+            global_tracker: RefCell::new(GlobalAccessTracker::new()),
         }
     }
 
@@ -667,22 +737,136 @@ impl PseudoCodeEmitter {
     /// Normalizes known libc global symbols to user-friendly names.
     fn simplify_libc_global_name(&self, raw: &str) -> Option<&'static str> {
         let mut sym = raw;
+
+        // Strip common import prefixes (Windows/PE style)
         if let Some(rest) = sym.strip_prefix("__imp_") {
             sym = rest;
         }
         if let Some(rest) = sym.strip_prefix("imp_") {
             sym = rest;
         }
+
+        // Handle macOS-style triple-underscore prefixed stdio pointers
+        // These are ___stderrp, ___stdinp, ___stdoutp on macOS
+        if sym.starts_with("___std") {
+            match sym {
+                "___stderrp" => return Some("stderr"),
+                "___stdinp" => return Some("stdin"),
+                "___stdoutp" => return Some("stdout"),
+                _ => {}
+            }
+        }
+
+        // Strip leading underscores (common on macOS/ELF)
         while let Some(rest) = sym.strip_prefix('_') {
             sym = rest;
         }
 
         match sym {
+            // Standard I/O streams
             "stdin" | "stdinp" => Some("stdin"),
             "stdout" | "stdoutp" => Some("stdout"),
             "stderr" | "stderrp" => Some("stderr"),
+
+            // Error handling
             "errno" => Some("errno"),
+            "h_errno" => Some("h_errno"),
+
+            // Environment
+            "environ" | "_environ" => Some("environ"),
+            "__environ" => Some("environ"),
+
+            // Program name (GNU extensions)
+            "__progname" => Some("__progname"),
+            "program_invocation_name" => Some("program_invocation_name"),
+            "program_invocation_short_name" => Some("program_invocation_short_name"),
+
+            // getopt globals
+            "optind" => Some("optind"),
+            "opterr" => Some("opterr"),
+            "optarg" => Some("optarg"),
+            "optopt" => Some("optopt"),
+
+            // Time zone
+            "timezone" => Some("timezone"),
+            "daylight" => Some("daylight"),
+            "tzname" => Some("tzname"),
+
+            // Error message arrays
+            "sys_nerr" => Some("sys_nerr"),
+            "sys_errlist" => Some("sys_errlist"),
+
+            // Common libc functions that may appear as globals
+            "getenv" => Some("getenv"),
+            "setenv" => Some("setenv"),
+
             _ => None,
+        }
+    }
+
+    /// Generates a fallback name for an unknown global address based on usage context.
+    ///
+    /// The naming strategy is:
+    /// - `ptr_XXXX` - if accessed via pointer dereference
+    /// - `flags_XXXX` - if used in bitwise operations
+    /// - `func_XXXX` - if used as a function pointer
+    /// - `data_XXXX` - default fallback
+    fn format_global_fallback_name(&self, address: u64, hint: GlobalUsageHint) -> String {
+        let prefix = match hint {
+            GlobalUsageHint::PointerDeref => "ptr",
+            GlobalUsageHint::BitwiseOps => "flags",
+            GlobalUsageHint::FunctionPointer => "func",
+            GlobalUsageHint::Unknown => "data",
+        };
+        format!("{}_{:x}", prefix, address)
+    }
+
+    /// Records a global access and returns the appropriate fallback name.
+    fn record_and_name_global(&self, address: u64, hint: GlobalUsageHint) -> String {
+        self.global_tracker
+            .borrow_mut()
+            .record_access(address, hint);
+        self.format_global_fallback_name(address, hint)
+    }
+
+    /// Returns the global access tracker for analysis.
+    pub fn global_tracker(&self) -> std::cell::Ref<'_, GlobalAccessTracker> {
+        self.global_tracker.borrow()
+    }
+
+    /// Recursively marks any GotRef expressions as function pointers.
+    fn mark_gotref_as_funcptr(&self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::GotRef { address, .. } => {
+                self.global_tracker
+                    .borrow_mut()
+                    .record_access(*address, GlobalUsageHint::FunctionPointer);
+            }
+            ExprKind::Deref { addr, .. } => self.mark_gotref_as_funcptr(addr),
+            ExprKind::Cast { expr: inner, .. } => self.mark_gotref_as_funcptr(inner),
+            ExprKind::BinOp { left, right, .. } => {
+                self.mark_gotref_as_funcptr(left);
+                self.mark_gotref_as_funcptr(right);
+            }
+            _ => {}
+        }
+    }
+
+    /// Recursively marks any GotRef expressions used in bitwise operations.
+    fn mark_gotref_as_bitwise(&self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::GotRef { address, .. } => {
+                self.global_tracker
+                    .borrow_mut()
+                    .record_access(*address, GlobalUsageHint::BitwiseOps);
+            }
+            ExprKind::Deref { addr, .. } => self.mark_gotref_as_bitwise(addr),
+            ExprKind::Cast { expr: inner, .. } => self.mark_gotref_as_bitwise(inner),
+            ExprKind::BinOp { left, right, .. } => {
+                self.mark_gotref_as_bitwise(left);
+                self.mark_gotref_as_bitwise(right);
+            }
+            _ => {}
         }
     }
 
@@ -810,7 +994,7 @@ impl PseudoCodeEmitter {
                     }
                 }
                 // Skip string table lookup for lvalues - you can't write to string literals
-                // Fall back to data_XXXX naming
+                // Fall back to context-aware naming (lvalues are pointer derefs)
                 if *is_deref {
                     let prefix = match size {
                         1 => "*(uint8_t*)",
@@ -819,9 +1003,10 @@ impl PseudoCodeEmitter {
                         8 => "*(uint64_t*)",
                         _ => "*",
                     };
-                    format!("{}(&data_{:x})", prefix, address)
+                    let name = self.record_and_name_global(*address, GlobalUsageHint::PointerDeref);
+                    format!("{}(&{})", prefix, name)
                 } else {
-                    format!("data_{:x}", address)
+                    self.record_and_name_global(*address, GlobalUsageHint::PointerDeref)
                 }
             }
             // For other expression types, delegate to format_expr_with_strings
@@ -845,6 +1030,11 @@ impl PseudoCodeEmitter {
                 format_integer(*n)
             }
             ExprKind::BinOp { op, left, right } => {
+                // Mark globals involved in bitwise operations for better naming
+                if matches!(op, BinOpKind::Or | BinOpKind::And | BinOpKind::Xor) {
+                    self.mark_gotref_as_bitwise(left);
+                    self.mark_gotref_as_bitwise(right);
+                }
                 // For comparison operators, don't resolve the operands to strings
                 // because comparisons like `ptr == 0` should show the pointer variable,
                 // not the string it points to (e.g., "hello" == 0 doesn't make sense)
@@ -912,6 +1102,9 @@ impl PseudoCodeEmitter {
                 if let ExprKind::BinOp { op, left, right } = &rhs.kind {
                     if exprs_equal(lhs, left) {
                         if matches!(op, BinOpKind::Or | BinOpKind::And | BinOpKind::Xor) {
+                            // Mark globals used in bitwise ops for better naming
+                            self.mark_gotref_as_bitwise(lhs);
+                            self.mark_gotref_as_bitwise(right);
                             if let Some(flag_name) = self.try_format_flag_lvalue(lhs) {
                                 if let ExprKind::IntLit(mask) = right.kind {
                                     if let Some(compound_op) = op.compound_op_str() {
@@ -993,6 +1186,7 @@ impl PseudoCodeEmitter {
                     return format!("\"{}\"", escape_string(s));
                 }
                 // Fall back to showing computed address (better than "rip + offset")
+                // Use context-aware naming based on usage pattern
                 if *is_deref {
                     let prefix = match size {
                         1 => "*(uint8_t*)",
@@ -1001,12 +1195,12 @@ impl PseudoCodeEmitter {
                         8 => "*(uint64_t*)",
                         _ => "*",
                     };
-                    // Use computed address as data_XXXX instead of showing "rip + offset"
-                    format!("{}(&data_{:x})", prefix, address)
+                    // Pointer dereference pattern
+                    let name = self.record_and_name_global(*address, GlobalUsageHint::PointerDeref);
+                    format!("{}(&{})", prefix, name)
                 } else {
-                    // Address-of (LEA) - these are typically data addresses (strings, constants)
-                    // not function addresses, so use data_ prefix
-                    format!("data_{:x}", address)
+                    // Address-of (LEA) - use default naming, tracker will categorize later if needed
+                    self.record_and_name_global(*address, GlobalUsageHint::Unknown)
                 }
             }
             ExprKind::Call { target, args } => {
@@ -1049,9 +1243,15 @@ impl PseudoCodeEmitter {
                     }
                     super::expression::CallTarget::Named(name) => name.clone(),
                     super::expression::CallTarget::Indirect(e) => {
+                        // Mark any GotRef in the indirect target as a function pointer
+                        self.mark_gotref_as_funcptr(e);
                         format!("({})", self.format_expr_with_strings(e, table))
                     }
                     super::expression::CallTarget::IndirectGot { got_address, expr } => {
+                        // Mark this as a function pointer access
+                        self.global_tracker
+                            .borrow_mut()
+                            .record_access(*got_address, GlobalUsageHint::FunctionPointer);
                         // Try to resolve the GOT entry to a symbol name
                         if let Some(ref reloc_table) = self.relocation_table {
                             if let Some(name) = reloc_table.get_got(*got_address) {
