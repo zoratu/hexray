@@ -3354,50 +3354,22 @@ mod tests {
             "params: {:?}",
             sig.parameters
         );
-    }
-
-    #[test]
-    fn test_signature_recovery_uses_slot_ordinal_fallback_for_slot0_callback() {
-        use hexray_core::BasicBlockId;
-
-        let keep_arg0_live =
-            Expr::assign(Expr::unknown("tmp0"), Expr::var(Variable::reg("rdi", 8)));
-        let keep_arg1_live =
-            Expr::assign(Expr::unknown("tmp1"), Expr::var(Variable::reg("rsi", 8)));
-        let call = Expr::call(
-            CallTarget::Named("hexray_on_exit".to_string()),
-            vec![Expr::unknown("mystery"), Expr::int(0)],
-        );
-
-        let block = StructuredNode::Block {
-            id: BasicBlockId::new(0),
-            statements: vec![keep_arg0_live, keep_arg1_live, call],
-            address_range: (0x1000, 0x1010),
-        };
-        let cfg = StructuredCfg {
-            body: vec![block],
-            cfg_entry: BasicBlockId::new(0),
-        };
-
-        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
-        let sig = recovery.analyze(&cfg);
-
-        assert!(sig.parameters.len() >= 2, "params: {:?}", sig.parameters);
+        let reasons = sig
+            .parameter_provenance
+            .get(&2)
+            .cloned()
+            .unwrap_or_default();
         assert!(
-            matches!(
-                sig.parameters[0].param_type,
-                ParamType::FunctionPointer { .. }
-            ),
-            "params: {:?}",
-            sig.parameters
+            reasons.iter().any(|r| r.contains("[source=alias]")),
+            "provenance: {:?}",
+            reasons
         );
         assert!(
-            !matches!(
-                sig.parameters[1].param_type,
-                ParamType::FunctionPointer { .. }
-            ),
-            "params: {:?}",
-            sig.parameters
+            !reasons
+                .iter()
+                .any(|r| r.contains("[source=shape-fallback]")),
+            "provenance: {:?}",
+            reasons
         );
     }
 

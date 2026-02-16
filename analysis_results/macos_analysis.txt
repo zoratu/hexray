@@ -1,0 +1,68 @@
+=== macOS ARM64 System Binary Analysis ===
+
+Testing: /bin/ls
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /bin/cat
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /bin/cp
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /bin/mv
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /bin/rm
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /bin/mkdir
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /bin/chmod
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/grep
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/awk
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/sed
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/find
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/sort
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/uniq
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/wc
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/head
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+Testing: /usr/bin/tail
+  Function: __mh_execute_header
+(eval):14: command not found: timeout
+---
+
+=== macOS Dylibs ===
