@@ -952,10 +952,18 @@ impl PseudoCodeEmitter {
                         && matches!(index.kind, ExprKind::IntLit(_))
                     {
                         if let ExprKind::IntLit(idx) = &index.kind {
-                            if *idx >= 0 {
-                                let off = (*idx as usize) * *element_size;
-                                return format!("g_flags_rip_{:x}", off);
+                            let byte_offset = (*idx as u64) * (*element_size as u64);
+                            // Try to find a symbol at this relative offset
+                            if let Some(ref sym_table) = self.symbol_table {
+                                if let Some(name) = sym_table.get(byte_offset) {
+                                    if let Some(alias) = self.simplify_libc_global_name(name) {
+                                        return alias.to_string();
+                                    }
+                                    return name.to_string();
+                                }
                             }
+                            // Fall back to a generic global name with the offset
+                            return format!("_g_{:x}", byte_offset);
                         }
                     }
                 }
@@ -1398,10 +1406,11 @@ impl PseudoCodeEmitter {
                         }
                     }
                 }
-                // Check if base is a stack/frame pointer
+                // Check if base is a stack/frame pointer or RIP/EIP
                 if let ExprKind::Var(v) = &base.kind {
                     let is_stack_ptr = v.name == "sp" || v.name == "rsp";
                     let is_frame_ptr = v.name == "rbp" || v.name == "x29";
+                    let is_pc_relative = v.name == "rip" || v.name == "eip";
 
                     if is_stack_ptr || is_frame_ptr {
                         // Check if index is a constant
@@ -1427,6 +1436,26 @@ impl PseudoCodeEmitter {
                                 .get_name(actual_offset, is_param);
                             return name;
                         }
+                    } else if is_pc_relative {
+                        // RIP/EIP-relative array access - this is a global variable reference
+                        // Try to resolve using the symbol table if we have a constant index
+                        if let ExprKind::IntLit(idx) = &index.kind {
+                            let byte_offset = (*idx as u64) * (*element_size as u64);
+                            // Try to find a symbol at this relative offset
+                            if let Some(ref sym_table) = self.symbol_table {
+                                if let Some(name) = sym_table.get(byte_offset) {
+                                    if let Some(alias) = self.simplify_libc_global_name(name) {
+                                        return alias.to_string();
+                                    }
+                                    return name.to_string();
+                                }
+                            }
+                            // Fall back to a generic global name with the offset
+                            return format!("_g_{:x}", byte_offset);
+                        }
+                        // Non-constant index - use a generic global array name
+                        let index_str = self.format_expr_with_strings(index, table);
+                        return format!("_globals[{}]", index_str);
                     }
                 }
                 // Default array access formatting
@@ -2575,6 +2604,11 @@ impl PseudoCodeEmitter {
         }
     }
 
+    /// Checks if a body (list of nodes) ends with a control flow exit.
+    fn body_ends_with_control_exit(&self, body: &[StructuredNode]) -> bool {
+        body.last().is_some_and(|n| self.is_control_exit(n))
+    }
+
     /// Checks if a node is a control flow exit (goto, return, break, continue, noreturn call).
     fn is_control_exit(&self, node: &StructuredNode) -> bool {
         match node {
@@ -2958,7 +2992,10 @@ impl PseudoCodeEmitter {
                         }
                     }
                     self.emit_nodes(body, output, depth + 1);
-                    writeln!(output, "{}    break;", indent).unwrap();
+                    // Only emit break if the body doesn't already end with a control exit
+                    if !self.body_ends_with_control_exit(body) {
+                        writeln!(output, "{}    break;", indent).unwrap();
+                    }
                 }
                 if let Some(default_body) = default {
                     writeln!(output, "{}default:", indent).unwrap();
@@ -4557,6 +4594,105 @@ mod tests {
         assert_eq!(
             emitter.format_global_fallback_name(0xdef0, GlobalUsageHint::Unknown),
             "data_def0"
+        );
+    }
+
+    #[test]
+    fn test_switch_no_redundant_break_after_goto() {
+        // Test that break is not emitted after goto in switch cases
+        let node = StructuredNode::Switch {
+            value: Expr::unknown("x"),
+            cases: vec![
+                // Case 1: ends with goto - should NOT have break after
+                (
+                    vec![1],
+                    vec![
+                        StructuredNode::Expr(Expr::assign(Expr::unknown("y"), Expr::int(1))),
+                        StructuredNode::Goto(hexray_core::BasicBlockId::new(99)),
+                    ],
+                ),
+                // Case 2: ends with return - should NOT have break after
+                (
+                    vec![2],
+                    vec![
+                        StructuredNode::Expr(Expr::assign(Expr::unknown("y"), Expr::int(2))),
+                        StructuredNode::Return(Some(Expr::int(0))),
+                    ],
+                ),
+                // Case 3: no control exit - should have break
+                (
+                    vec![3],
+                    vec![StructuredNode::Expr(Expr::assign(
+                        Expr::unknown("y"),
+                        Expr::int(3),
+                    ))],
+                ),
+            ],
+            default: None,
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        // Case 1: goto without break after (bb99 is the target block)
+        assert!(
+            output.contains("goto bb99;") && !output.contains("goto bb99;\n        break;"),
+            "Case 1 should not have break after goto:\n{}",
+            output
+        );
+
+        // Case 2: return without break after
+        assert!(
+            output.contains("return 0;") && !output.contains("return 0;\n        break;"),
+            "Case 2 should not have break after return:\n{}",
+            output
+        );
+
+        // Case 3: should have break since it ends with normal expression
+        // Look for case 3 followed by break
+        let case3_section = output.split("case 3:").nth(1).unwrap_or("");
+        assert!(
+            case3_section.contains("break;"),
+            "Case 3 should have break:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_switch_no_redundant_break_after_break() {
+        // Test that break is not duplicated when case body already ends with break
+        let node = StructuredNode::Switch {
+            value: Expr::unknown("x"),
+            cases: vec![(
+                vec![1],
+                vec![
+                    StructuredNode::Expr(Expr::assign(Expr::unknown("y"), Expr::int(1))),
+                    StructuredNode::Break,
+                ],
+            )],
+            default: None,
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        // Count occurrences of "break;" in the case body section
+        let case_section = output.split("case 1:").nth(1).unwrap_or("");
+        let break_count = case_section.matches("break;").count();
+        assert_eq!(
+            break_count, 1,
+            "Should have exactly one break in case 1:\n{}",
+            output
         );
     }
 }

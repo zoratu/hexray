@@ -739,6 +739,14 @@ impl Expr {
                 if let Some(array_access) = try_detect_array_in_deref(&simplified_addr, size) {
                     return array_access;
                 }
+                // Check for spurious dereferences: if the address is a pure value computation
+                // (no memory references, pointers, or valid address bases), the Deref is likely
+                // incorrect and should be removed. This handles cases like:
+                //   *(uint32_t*)(_g * 2 + 1)  ->  _g * 2 + 1
+                // where _g is already a value, not an address.
+                if is_spurious_deref_address(&simplified_addr) {
+                    return simplified_addr;
+                }
                 Self::deref(simplified_addr, size)
             }
             ExprKind::ArrayAccess {
@@ -2712,6 +2720,88 @@ fn is_commutative(op: BinOpKind) -> bool {
     )
 }
 
+/// Checks if a dereference address is a spurious value computation.
+///
+/// This detects cases where an expression is incorrectly wrapped in a Deref
+/// when it should be a direct value. A Deref is spurious if its address is
+/// a pure arithmetic computation on values (not addresses), such as:
+///   *(uint32_t*)(_g * 2 + 1)
+/// where _g is already a loaded value, not a pointer.
+///
+/// Returns true if the Deref should be removed (address is a pure value).
+fn is_spurious_deref_address(addr: &Expr) -> bool {
+    // A spurious deref typically has a BinOp (arithmetic) at the top level
+    // where neither operand is a valid memory base (register, pointer variable,
+    // or another memory access).
+    match &addr.kind {
+        // BinOp with multiplication involving a variable is likely a value computation
+        // e.g., _g * 2, _g * 2 + 1
+        ExprKind::BinOp { op, left, right } => {
+            // If it's a multiplication where one side is a small constant
+            // and the other is a variable, this is likely a value computation
+            if *op == BinOpKind::Mul {
+                let left_is_var = matches!(&left.kind, ExprKind::Var(_));
+                let right_is_var = matches!(&right.kind, ExprKind::Var(_));
+                let left_is_small_const = matches!(&left.kind, ExprKind::IntLit(n) if *n <= 256);
+                let right_is_small_const = matches!(&right.kind, ExprKind::IntLit(n) if *n <= 256);
+
+                // Pattern: var * small_const or small_const * var
+                // This is typical for value arithmetic, not address calculation
+                if (left_is_var && right_is_small_const) || (right_is_var && left_is_small_const) {
+                    return true;
+                }
+            }
+
+            // For addition, check if it's adding to a multiplication result
+            // e.g., (_g * 2) + 1
+            if *op == BinOpKind::Add || *op == BinOpKind::Sub {
+                // Check if either side is a spurious multiplication
+                if is_spurious_deref_address(left) || is_spurious_deref_address(right) {
+                    // But only if we're not adding to a valid pointer base
+                    let left_is_ptr_base = is_valid_ptr_base(left);
+                    let right_is_ptr_base = is_valid_ptr_base(right);
+
+                    if !left_is_ptr_base && !right_is_ptr_base {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Checks if an expression looks like a valid pointer base for memory access.
+fn is_valid_ptr_base(expr: &Expr) -> bool {
+    match &expr.kind {
+        // Stack/frame pointers are valid bases
+        ExprKind::Var(v) => {
+            let name = v.name.to_lowercase();
+            name == "rsp"
+                || name == "rbp"
+                || name == "sp"
+                || name == "fp"
+                || name == "x29"
+                || name == "x30"
+                || name == "rip"
+                || name == "eip"
+                || name.starts_with("r")
+                || name.starts_with("x") // General registers
+        }
+        // GotRef is a valid pointer to global data
+        ExprKind::GotRef { .. } => true,
+        // Deref is already a memory access
+        ExprKind::Deref { .. } => true,
+        // AddressOf produces a pointer
+        ExprKind::AddressOf(_) => true,
+        // Array access produces a pointer
+        ExprKind::ArrayAccess { .. } => true,
+        _ => false,
+    }
+}
+
 /// Attempts to detect array access patterns in a dereference address.
 ///
 /// This function analyzes address expressions like:
@@ -4219,5 +4309,85 @@ mod tests {
         let var_w0 = Variable::from_register(&reg_w0);
         assert_eq!(var_w0.name, "w0");
         assert_eq!(var_w0.size, 4);
+    }
+
+    #[test]
+    fn test_spurious_deref_removal_var_times_const() {
+        // *(uint32_t*)(_g * 2) should simplify to _g * 2
+        // when _g is a plain variable (already a loaded value)
+        let var_g = Expr::var(Variable {
+            kind: VarKind::Register(0),
+            name: "_g".to_string(),
+            size: 4,
+        });
+        let mul = Expr::binop(BinOpKind::Mul, var_g, Expr::int(2));
+        let deref = Expr::deref(mul, 4);
+        let simplified = deref.simplify();
+
+        // Should remove the spurious Deref, leaving just the multiplication
+        assert!(
+            matches!(
+                simplified.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::Mul,
+                    ..
+                }
+            ),
+            "Expected BinOp(Mul), got {:?}",
+            simplified.kind
+        );
+    }
+
+    #[test]
+    fn test_spurious_deref_removal_computation_plus_const() {
+        // *(uint32_t*)((_g * 2) + 1) should simplify to (_g * 2) + 1
+        let var_g = Expr::var(Variable {
+            kind: VarKind::Register(0),
+            name: "_g".to_string(),
+            size: 4,
+        });
+        let mul = Expr::binop(BinOpKind::Mul, var_g, Expr::int(2));
+        let add = Expr::binop(BinOpKind::Add, mul, Expr::int(1));
+        let deref = Expr::deref(add, 4);
+        let simplified = deref.simplify();
+
+        // Should remove the spurious Deref, leaving just the addition
+        assert!(
+            matches!(
+                simplified.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::Add,
+                    ..
+                }
+            ),
+            "Expected BinOp(Add), got {:?}",
+            simplified.kind
+        );
+    }
+
+    #[test]
+    fn test_legitimate_deref_preserved_with_pointer_base() {
+        // *(uint32_t*)(rbp + 8) should NOT be simplified away
+        // because rbp is a valid pointer base (frame pointer)
+        let rbp = Expr::var(Variable {
+            kind: VarKind::Register(0),
+            name: "rbp".to_string(),
+            size: 8,
+        });
+        let addr = Expr::binop(BinOpKind::Add, rbp, Expr::int(8));
+        let deref = Expr::deref(addr, 4);
+        let simplified = deref.simplify();
+
+        // Should preserve the Deref (this is a valid stack access)
+        // Note: might be converted to ArrayAccess, but should not be plain BinOp
+        let is_memory_access = matches!(
+            simplified.kind,
+            ExprKind::Deref { .. } | ExprKind::ArrayAccess { .. }
+        );
+        assert!(
+            is_memory_access,
+            "Expected Deref or ArrayAccess, got {:?}",
+            simplified.kind
+        );
     }
 }

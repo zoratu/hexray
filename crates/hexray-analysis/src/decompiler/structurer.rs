@@ -237,6 +237,13 @@ impl StructuredCfg {
         // Post-process to convert gotos to break/continue where applicable
         if config.is_pass_enabled(OptimizationPass::GotoConversion) {
             body = convert_gotos_to_break_continue(body, None);
+            // Second pass: convert global gotos (in orphan labeled blocks) to continue
+            // when they target loop headers (common in getopt/switch patterns)
+            let loop_headers = collect_loop_headers(&body);
+            body = convert_global_gotos_to_continue(body, &loop_headers);
+            // Third pass: convert gotos in switch cases to break when they target
+            // a common exit point (common in option parsing switches)
+            body = convert_switch_gotos_to_break(body);
         }
 
         // Post-process to flatten nested if-else into guard clauses
@@ -351,6 +358,13 @@ impl StructuredCfg {
         // Post-process to convert gotos to break/continue where applicable
         if config.is_pass_enabled(OptimizationPass::GotoConversion) {
             body = convert_gotos_to_break_continue(body, None);
+            // Second pass: convert global gotos (in orphan labeled blocks) to continue
+            // when they target loop headers (common in getopt/switch patterns)
+            let loop_headers = collect_loop_headers(&body);
+            body = convert_global_gotos_to_continue(body, &loop_headers);
+            // Third pass: convert gotos in switch cases to break when they target
+            // a common exit point (common in option parsing switches)
+            body = convert_switch_gotos_to_break(body);
         }
 
         // Post-process to flatten nested if-else into guard clauses
@@ -4957,6 +4971,382 @@ fn convert_gotos_in_loop_body(
 ) -> Vec<StructuredNode> {
     // Use the provided loop context to detect break/continue opportunities.
     convert_gotos_to_break_continue(body, loop_ctx)
+}
+
+/// Collects all loop headers from the structured nodes.
+/// This is used for the global goto-to-continue conversion pass.
+fn collect_loop_headers(nodes: &[StructuredNode]) -> HashSet<BasicBlockId> {
+    let mut headers = HashSet::new();
+    for node in nodes {
+        collect_loop_headers_in_node(node, &mut headers);
+    }
+    headers
+}
+
+fn collect_loop_headers_in_node(node: &StructuredNode, headers: &mut HashSet<BasicBlockId>) {
+    match node {
+        StructuredNode::While { body, header, .. } => {
+            if let Some(h) = header {
+                headers.insert(*h);
+            }
+            for n in body {
+                collect_loop_headers_in_node(n, headers);
+            }
+        }
+        StructuredNode::DoWhile { body, header, .. } => {
+            if let Some(h) = header {
+                headers.insert(*h);
+            }
+            for n in body {
+                collect_loop_headers_in_node(n, headers);
+            }
+        }
+        StructuredNode::Loop { body, header, .. } => {
+            if let Some(h) = header {
+                headers.insert(*h);
+            }
+            for n in body {
+                collect_loop_headers_in_node(n, headers);
+            }
+        }
+        StructuredNode::For { body, header, .. } => {
+            if let Some(h) = header {
+                headers.insert(*h);
+            }
+            for n in body {
+                collect_loop_headers_in_node(n, headers);
+            }
+        }
+        StructuredNode::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for n in then_body {
+                collect_loop_headers_in_node(n, headers);
+            }
+            if let Some(eb) = else_body {
+                for n in eb {
+                    collect_loop_headers_in_node(n, headers);
+                }
+            }
+        }
+        StructuredNode::Switch { cases, default, .. } => {
+            for (_, body) in cases {
+                for n in body {
+                    collect_loop_headers_in_node(n, headers);
+                }
+            }
+            if let Some(d) = default {
+                for n in d {
+                    collect_loop_headers_in_node(n, headers);
+                }
+            }
+        }
+        StructuredNode::Sequence(nodes) => {
+            for n in nodes {
+                collect_loop_headers_in_node(n, headers);
+            }
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            for n in try_body {
+                collect_loop_headers_in_node(n, headers);
+            }
+            for handler in catch_handlers {
+                for n in &handler.body {
+                    collect_loop_headers_in_node(n, headers);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Converts gotos at the global level (orphan labeled blocks) to continue
+/// when they target loop headers.
+/// This handles patterns like getopt switch cases that goto back to the loop start.
+fn convert_global_gotos_to_continue(
+    nodes: Vec<StructuredNode>,
+    loop_headers: &HashSet<BasicBlockId>,
+) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .map(|node| convert_global_goto_in_node(node, loop_headers))
+        .collect()
+}
+
+fn convert_global_goto_in_node(
+    node: StructuredNode,
+    loop_headers: &HashSet<BasicBlockId>,
+) -> StructuredNode {
+    match node {
+        // Convert goto to continue if it targets a loop header
+        StructuredNode::Goto(target) => {
+            if loop_headers.contains(&target) {
+                StructuredNode::Continue
+            } else {
+                StructuredNode::Goto(target)
+            }
+        }
+        // Recursively process labeled blocks (these are the orphan switch cases)
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        },
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: convert_global_gotos_to_continue(then_body, loop_headers),
+            else_body: else_body.map(|e| convert_global_gotos_to_continue(e, loop_headers)),
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(convert_global_gotos_to_continue(nodes, loop_headers))
+        }
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| (vals, convert_global_gotos_to_continue(body, loop_headers)))
+                .collect(),
+            default: default.map(|d| convert_global_gotos_to_continue(d, loop_headers)),
+        },
+        // Other nodes pass through (loops are already handled by the normal pass)
+        other => other,
+    }
+}
+
+/// Converts gotos in switch cases to break statements when they target
+/// a block that comes after the switch.
+/// This handles patterns where switch cases use goto to exit to a common point.
+fn convert_switch_gotos_to_break(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    // First pass: identify switches followed by labels
+    // Those labels are switch exit points and gotos to them should be breaks
+    let mut switch_exits = HashSet::new();
+    let mut i = 0;
+    while i < nodes.len() {
+        if let StructuredNode::Switch { .. } = &nodes[i] {
+            // Check if there's a label after the switch
+            if i + 1 < nodes.len() {
+                if let StructuredNode::Label(label_id) = &nodes[i + 1] {
+                    switch_exits.insert(*label_id);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Also find common goto targets within switches
+    for node in &nodes {
+        if let StructuredNode::Switch { cases, default, .. } = node {
+            let common_target = find_common_goto_target(cases, default);
+            if let Some(target) = common_target {
+                switch_exits.insert(target);
+            }
+        }
+    }
+
+    // Second pass: convert gotos in switches
+    nodes
+        .into_iter()
+        .map(|node| convert_switch_gotos_in_node(node, &switch_exits))
+        .collect()
+}
+
+/// Finds a common goto target used by multiple switch cases.
+fn find_common_goto_target(
+    cases: &[(Vec<i128>, Vec<StructuredNode>)],
+    default: &Option<Vec<StructuredNode>>,
+) -> Option<BasicBlockId> {
+    let mut target_counts: HashMap<BasicBlockId, usize> = HashMap::new();
+
+    for (_, body) in cases {
+        if let Some(target) = get_trailing_goto(body) {
+            *target_counts.entry(target).or_insert(0) += 1;
+        }
+    }
+
+    if let Some(body) = default {
+        if let Some(target) = get_trailing_goto(body) {
+            *target_counts.entry(target).or_insert(0) += 1;
+        }
+    }
+
+    // Return the most common target if it appears in at least 2 cases
+    target_counts
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .max_by_key(|(_, count)| *count)
+        .map(|(target, _)| target)
+}
+
+/// Gets the trailing goto target from a node sequence.
+fn get_trailing_goto(nodes: &[StructuredNode]) -> Option<BasicBlockId> {
+    if let Some(last) = nodes.last() {
+        match last {
+            StructuredNode::Goto(target) => Some(*target),
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                // Check if both branches end with the same goto
+                let then_target = get_trailing_goto(then_body);
+                let else_target = else_body.as_ref().and_then(|e| get_trailing_goto(e));
+                if then_target == else_target {
+                    then_target
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn convert_switch_gotos_in_node(
+    node: StructuredNode,
+    switch_exits: &HashSet<BasicBlockId>,
+) -> StructuredNode {
+    match node {
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            // For each case, convert gotos to the switch exit into breaks
+            let converted_cases = cases
+                .into_iter()
+                .map(|(vals, body)| {
+                    let new_body = convert_gotos_to_break_in_body(body, switch_exits);
+                    (vals, new_body)
+                })
+                .collect();
+
+            let converted_default =
+                default.map(|d| convert_gotos_to_break_in_body(d, switch_exits));
+
+            StructuredNode::Switch {
+                value,
+                cases: converted_cases,
+                default: converted_default,
+            }
+        }
+        // Recurse into other structures
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: convert_switch_gotos_to_break(then_body),
+            else_body: else_body.map(convert_switch_gotos_to_break),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition,
+            body: convert_switch_gotos_to_break(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: convert_switch_gotos_to_break(body),
+            condition,
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: convert_switch_gotos_to_break(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: convert_switch_gotos_to_break(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(convert_switch_gotos_to_break(nodes))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: convert_switch_gotos_to_break(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| CatchHandler {
+                    body: convert_switch_gotos_to_break(h.body),
+                    ..h
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn convert_gotos_to_break_in_body(
+    nodes: Vec<StructuredNode>,
+    switch_exits: &HashSet<BasicBlockId>,
+) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .map(|node| match node {
+            StructuredNode::Goto(target) if switch_exits.contains(&target) => StructuredNode::Break,
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => StructuredNode::If {
+                condition,
+                then_body: convert_gotos_to_break_in_body(then_body, switch_exits),
+                else_body: else_body.map(|e| convert_gotos_to_break_in_body(e, switch_exits)),
+            },
+            StructuredNode::Sequence(nodes) => {
+                StructuredNode::Sequence(convert_gotos_to_break_in_body(nodes, switch_exits))
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// Simplifies all expressions in the structured nodes using constant folding
