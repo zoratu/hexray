@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use super::abi::{get_arg_register_index, is_callee_saved_register};
-use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
+use super::expression::{BinOpKind, CallTarget, Expr, ExprKind, UnaryOpKind};
 use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
 use super::structurer::{StructuredCfg, StructuredNode};
@@ -1584,6 +1584,12 @@ impl PseudoCodeEmitter {
                     self.mark_gotref_as_bitwise(left);
                     self.mark_gotref_as_bitwise(right);
                 }
+
+                // Simplify constant folding for chained operations: (a op c1) op c2 -> a op (c1 op c2)
+                if let Some(simplified) = self.try_fold_chained_constants(op, left, right, table) {
+                    return simplified;
+                }
+
                 // For comparison operators, don't resolve the operands to strings
                 // because comparisons like `ptr == 0` should show the pointer variable,
                 // not the string it points to (e.g., "hello" == 0 doesn't make sense)
@@ -3374,8 +3380,109 @@ impl PseudoCodeEmitter {
                 statements.is_empty() || statements.iter().all(|s| self.is_skippable_statement(s))
             }
             StructuredNode::Sequence(inner) => self.is_body_empty(inner),
+            // An If with empty bodies is itself empty
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.is_body_empty(then_body)
+                    && else_body.as_ref().map_or(true, |e| self.is_body_empty(e))
+            }
             _ => false,
         })
+    }
+
+    /// Try to evaluate an expression as a constant integer value.
+    /// Returns Some(value) if the expression is a constant, None otherwise.
+    fn try_eval_constant(&self, expr: &Expr) -> Option<i128> {
+        match &expr.kind {
+            ExprKind::IntLit(val) => Some(*val),
+            ExprKind::BinOp { op, left, right } => {
+                let l = self.try_eval_constant(left)?;
+                let r = self.try_eval_constant(right)?;
+                match op {
+                    BinOpKind::Add => Some(l.wrapping_add(r)),
+                    BinOpKind::Sub => Some(l.wrapping_sub(r)),
+                    BinOpKind::Mul => Some(l.wrapping_mul(r)),
+                    BinOpKind::Div if r != 0 => Some(l / r),
+                    BinOpKind::Mod if r != 0 => Some(l % r),
+                    BinOpKind::And => Some(l & r),
+                    BinOpKind::Or => Some(l | r),
+                    BinOpKind::Xor => Some(l ^ r),
+                    BinOpKind::Eq => Some(if l == r { 1 } else { 0 }),
+                    BinOpKind::Ne => Some(if l != r { 1 } else { 0 }),
+                    BinOpKind::Lt => Some(if l < r { 1 } else { 0 }),
+                    BinOpKind::Le => Some(if l <= r { 1 } else { 0 }),
+                    BinOpKind::Gt => Some(if l > r { 1 } else { 0 }),
+                    BinOpKind::Ge => Some(if l >= r { 1 } else { 0 }),
+                    BinOpKind::LogicalAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+                    BinOpKind::LogicalOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
+                    _ => None,
+                }
+            }
+            ExprKind::UnaryOp { op, operand } => {
+                let val = self.try_eval_constant(operand)?;
+                match op {
+                    UnaryOpKind::Neg => Some(-val),
+                    UnaryOpKind::Not => Some(!val),
+                    UnaryOpKind::LogicalNot => Some(if val == 0 { 1 } else { 0 }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to fold chained constant operations: (a op c1) op c2 -> a op (c1 op c2)
+    /// For associative operations like &, |, ^, +, * where constants can be folded together.
+    fn try_fold_chained_constants(
+        &self,
+        op: &BinOpKind,
+        left: &Expr,
+        right: &Expr,
+        table: &StringTable,
+    ) -> Option<String> {
+        // Only handle associative operations where constant folding makes sense
+        if !matches!(
+            op,
+            BinOpKind::And | BinOpKind::Or | BinOpKind::Xor | BinOpKind::Add | BinOpKind::Mul
+        ) {
+            return None;
+        }
+
+        // Pattern: (expr op c1) op c2 where c1 and c2 are constants
+        if let ExprKind::BinOp {
+            op: inner_op,
+            left: inner_left,
+            right: inner_right,
+        } = &left.kind
+        {
+            if inner_op == op {
+                // Both operations are the same type
+                if let (Some(c1), Some(c2)) = (
+                    self.try_eval_constant(inner_right),
+                    self.try_eval_constant(right),
+                ) {
+                    // Fold the constants
+                    let folded = match op {
+                        BinOpKind::And => c1 & c2,
+                        BinOpKind::Or => c1 | c2,
+                        BinOpKind::Xor => c1 ^ c2,
+                        BinOpKind::Add => c1.wrapping_add(c2),
+                        BinOpKind::Mul => c1.wrapping_mul(c2),
+                        _ => return None,
+                    };
+
+                    // Format as: inner_left op folded
+                    let left_str = self.format_expr_with_strings(inner_left, table);
+                    let right_str = format_integer(folded);
+                    return Some(format!("{} {} {}", left_str, op.as_str(), right_str));
+                }
+            }
+        }
+
+        None
     }
 
     /// Checks if a statement would be skipped during emission (prologue/epilogue/etc).
@@ -3500,6 +3607,21 @@ impl PseudoCodeEmitter {
                 }
                 if let Some(else_nodes) = else_body {
                     if is_stack_canary_check_body(else_nodes, self.symbol_table.as_ref()) {
+                        return;
+                    }
+                }
+
+                // Eliminate dead branches: if (0) { ... } or if (1) { ... }
+                if let Some(const_val) = self.try_eval_constant(condition) {
+                    if const_val == 0 {
+                        // Condition is always false - skip then, emit else if exists
+                        if let Some(else_nodes) = else_body {
+                            self.emit_nodes(else_nodes, output, depth);
+                        }
+                        return;
+                    } else {
+                        // Condition is always true - emit then, skip else
+                        self.emit_nodes(then_body, output, depth);
                         return;
                     }
                 }
