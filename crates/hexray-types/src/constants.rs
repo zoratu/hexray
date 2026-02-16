@@ -562,6 +562,55 @@ pub fn load_posix_constants(db: &mut ConstantDatabase) {
         category: Fcntl,
         description: Some("Set file status flags"),
     });
+    db.add(NamedConstant {
+        name: "F_GETOWN",
+        value: 5,
+        category: Fcntl,
+        description: Some("Get process/group ID receiving SIGIO"),
+    });
+    db.add(NamedConstant {
+        name: "F_SETOWN",
+        value: 6,
+        category: Fcntl,
+        description: Some("Set process/group ID to receive SIGIO"),
+    });
+    db.add(NamedConstant {
+        name: "F_GETLK",
+        value: 7,
+        category: Fcntl,
+        description: Some("Get record locking info"),
+    });
+    db.add(NamedConstant {
+        name: "F_SETLK",
+        value: 8,
+        category: Fcntl,
+        description: Some("Set record locking info"),
+    });
+    db.add(NamedConstant {
+        name: "F_SETLKW",
+        value: 9,
+        category: Fcntl,
+        description: Some("Set record locking info; wait if blocked"),
+    });
+    // macOS-specific fcntl commands
+    db.add(NamedConstant {
+        name: "F_ALLOCATECONTIG",
+        value: 0x02,
+        category: Fcntl,
+        description: Some("Allocate contiguous space"),
+    });
+    db.add(NamedConstant {
+        name: "F_NOCACHE",
+        value: 48,
+        category: Fcntl,
+        description: Some("Turn data caching off/on"),
+    });
+    db.add(NamedConstant {
+        name: "F_FULLFSYNC",
+        value: 51,
+        category: Fcntl,
+        description: Some("Full fsync including device flush"),
+    });
 
     // Poll events
     db.add(NamedConstant {
