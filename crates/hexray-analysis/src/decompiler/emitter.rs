@@ -4461,4 +4461,102 @@ mod tests {
         assert_eq!(normalize_variable_name("arg_xyz"), "arg_xyz");
         assert_eq!(emitter.format_expr(&expr), "local_4");
     }
+
+    #[test]
+    fn test_expanded_libc_globals_environ() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x3000, "__environ".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::got_ref(0x3000, 0, 8, Expr::unknown("rip_ref"));
+
+        assert_eq!(emitter.format_expr(&expr), "environ");
+    }
+
+    #[test]
+    fn test_expanded_libc_globals_optind() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x4000, "_optind".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::got_ref(0x4000, 0, 4, Expr::unknown("rip_ref"));
+
+        assert_eq!(emitter.format_expr(&expr), "optind");
+    }
+
+    #[test]
+    fn test_macos_triple_underscore_stdio_simplification() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x5000, "___stderrp".to_string());
+        sym.insert(0x5008, "___stdoutp".to_string());
+        sym.insert(0x5010, "___stdinp".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+
+        assert_eq!(
+            emitter.format_expr(&Expr::got_ref(0x5000, 0, 8, Expr::unknown("ref"))),
+            "stderr"
+        );
+        assert_eq!(
+            emitter.format_expr(&Expr::got_ref(0x5008, 0, 8, Expr::unknown("ref"))),
+            "stdout"
+        );
+        assert_eq!(
+            emitter.format_expr(&Expr::got_ref(0x5010, 0, 8, Expr::unknown("ref"))),
+            "stdin"
+        );
+    }
+
+    #[test]
+    fn test_global_access_tracking_frequency() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Access an unknown global multiple times via got_ref (is_deref: true by default)
+        let expr = Expr::got_ref(0x6000, 0, 8, Expr::unknown("ref"));
+        let _ = emitter.format_expr(&expr);
+        let _ = emitter.format_expr(&expr);
+        let _ = emitter.format_expr(&expr);
+
+        let tracker = emitter.global_tracker();
+        assert_eq!(tracker.get_count(0x6000), 3);
+    }
+
+    #[test]
+    fn test_global_usage_hint_pointer_deref() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Access via dereference (got_ref with is_deref: true) should mark as PointerDeref
+        let expr = Expr::got_ref(0x7000, 0, 8, Expr::unknown("ref"));
+        let formatted = emitter.format_expr(&expr);
+
+        // Should use ptr_ prefix for pointer dereference
+        assert!(
+            formatted.contains("ptr_7000"),
+            "Expected ptr_7000 in '{}' for pointer dereference",
+            formatted
+        );
+    }
+
+    #[test]
+    fn test_global_fallback_name_formats() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Test different naming hints
+        assert_eq!(
+            emitter.format_global_fallback_name(0x1234, GlobalUsageHint::PointerDeref),
+            "ptr_1234"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0x5678, GlobalUsageHint::BitwiseOps),
+            "flags_5678"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0x9abc, GlobalUsageHint::FunctionPointer),
+            "func_9abc"
+        );
+        assert_eq!(
+            emitter.format_global_fallback_name(0xdef0, GlobalUsageHint::Unknown),
+            "data_def0"
+        );
+    }
 }
