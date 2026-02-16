@@ -831,12 +831,233 @@ fn suggest_from_function_arg(func_name: &str, arg_index: usize) -> Option<String
     }
 }
 
+/// Reserved names that shouldn't be used for local variables.
+/// These are common libc globals that would shadow important symbols.
+const RESERVED_VARIABLE_NAMES: &[&str] = &[
+    "stdin",
+    "stdout",
+    "stderr",
+    "errno",
+    "optarg",
+    "optind",
+    "opterr",
+    "optopt",
+    "environ",
+    "tzname",
+    "daylight",
+    "timezone",
+    "signgam",
+    "getdate_err",
+    "h_errno",
+    "program_invocation_name",
+    "program_invocation_short_name",
+];
+
+/// Checks if a name is a reserved global name that shouldn't be used for variables.
+fn is_reserved_name(name: &str) -> bool {
+    RESERVED_VARIABLE_NAMES.contains(&name)
+}
+
+/// Generates a safe alternative name for a reserved name.
+fn safe_name_for_reserved(name: &str) -> String {
+    match name {
+        "stdin" | "stdout" | "stderr" => "result".to_string(),
+        "errno" => "err_code".to_string(),
+        "optarg" | "optind" | "opterr" | "optopt" => format!("{}_val", name),
+        _ => format!("{}_var", name),
+    }
+}
+
 /// Analyzes nodes and applies suggested variable names.
 ///
 /// This is the main entry point for the variable naming pass.
 pub fn suggest_variable_names(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     let hints = collect_naming_hints(&nodes);
-    apply_naming_hints(nodes, &hints)
+    let nodes = apply_naming_hints(nodes, &hints);
+    // Final pass: rename any variables that have reserved names
+    rename_reserved_variables(nodes)
+}
+
+/// Renames variables that use reserved names (libc globals).
+fn rename_reserved_variables(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    nodes.into_iter().map(rename_reserved_in_node).collect()
+}
+
+fn rename_reserved_in_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => StructuredNode::Block {
+            id,
+            statements: statements
+                .into_iter()
+                .map(rename_reserved_in_expr)
+                .collect(),
+            address_range,
+        },
+        StructuredNode::Expr(expr) => StructuredNode::Expr(rename_reserved_in_expr(expr)),
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition: rename_reserved_in_expr(condition),
+            then_body: rename_reserved_variables(then_body),
+            else_body: else_body.map(rename_reserved_variables),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition: rename_reserved_in_expr(condition),
+            body: rename_reserved_variables(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: rename_reserved_variables(body),
+            condition: rename_reserved_in_expr(condition),
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init: init.map(rename_reserved_in_expr),
+            condition: rename_reserved_in_expr(condition),
+            update: update.map(rename_reserved_in_expr),
+            body: rename_reserved_variables(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: rename_reserved_variables(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value: rename_reserved_in_expr(value),
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| (vals, rename_reserved_variables(body)))
+                .collect(),
+            default: default.map(rename_reserved_variables),
+        },
+        StructuredNode::Return(Some(expr)) => {
+            StructuredNode::Return(Some(rename_reserved_in_expr(expr)))
+        }
+        StructuredNode::Sequence(seq) => StructuredNode::Sequence(rename_reserved_variables(seq)),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: rename_reserved_variables(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| super::structurer::CatchHandler {
+                    body: rename_reserved_variables(h.body),
+                    ..h
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn rename_reserved_in_expr(expr: Expr) -> Expr {
+    use super::expression::Variable;
+
+    let kind = match expr.kind {
+        ExprKind::Var(ref v) if is_reserved_name(&v.name) => {
+            let new_name = safe_name_for_reserved(&v.name);
+            ExprKind::Var(Variable {
+                name: new_name,
+                kind: v.kind.clone(),
+                size: v.size,
+            })
+        }
+        ExprKind::BinOp { op, left, right } => ExprKind::BinOp {
+            op,
+            left: Box::new(rename_reserved_in_expr(*left)),
+            right: Box::new(rename_reserved_in_expr(*right)),
+        },
+        ExprKind::UnaryOp { op, operand } => ExprKind::UnaryOp {
+            op,
+            operand: Box::new(rename_reserved_in_expr(*operand)),
+        },
+        ExprKind::Deref { addr, size } => ExprKind::Deref {
+            addr: Box::new(rename_reserved_in_expr(*addr)),
+            size,
+        },
+        ExprKind::AddressOf(inner) => {
+            ExprKind::AddressOf(Box::new(rename_reserved_in_expr(*inner)))
+        }
+        ExprKind::Cast {
+            expr: inner,
+            to_size,
+            signed,
+        } => ExprKind::Cast {
+            expr: Box::new(rename_reserved_in_expr(*inner)),
+            to_size,
+            signed,
+        },
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => ExprKind::ArrayAccess {
+            base: Box::new(rename_reserved_in_expr(*base)),
+            index: Box::new(rename_reserved_in_expr(*index)),
+            element_size,
+        },
+        ExprKind::Assign { lhs, rhs } => ExprKind::Assign {
+            lhs: Box::new(rename_reserved_in_expr(*lhs)),
+            rhs: Box::new(rename_reserved_in_expr(*rhs)),
+        },
+        ExprKind::CompoundAssign { op, lhs, rhs } => ExprKind::CompoundAssign {
+            op,
+            lhs: Box::new(rename_reserved_in_expr(*lhs)),
+            rhs: Box::new(rename_reserved_in_expr(*rhs)),
+        },
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => ExprKind::Conditional {
+            cond: Box::new(rename_reserved_in_expr(*cond)),
+            then_expr: Box::new(rename_reserved_in_expr(*then_expr)),
+            else_expr: Box::new(rename_reserved_in_expr(*else_expr)),
+        },
+        ExprKind::Call { target, args } => ExprKind::Call {
+            target,
+            args: args.into_iter().map(rename_reserved_in_expr).collect(),
+        },
+        other => other,
+    };
+
+    Expr { kind }
 }
 
 /// Apply naming suggestions to nodes.
@@ -1236,5 +1457,38 @@ mod tests {
         let idx0 = hints.assigned_loop_indices.get("temp0").unwrap();
         let idx1 = hints.assigned_loop_indices.get("temp1").unwrap();
         assert_ne!(idx0, idx1);
+    }
+
+    #[test]
+    fn test_reserved_name_renaming() {
+        // Create a simple expression using the reserved name "stdin"
+        let stdin_var = make_var("stdin");
+        let comparison = Expr::binop(BinOpKind::Le, stdin_var, Expr::int(107));
+
+        // Create a condition using the comparison
+        let if_node = StructuredNode::If {
+            condition: comparison,
+            then_body: vec![],
+            else_body: None,
+        };
+
+        // Apply the full naming pass
+        let result = suggest_variable_names(vec![if_node]);
+
+        // Extract the condition from the result
+        if let StructuredNode::If { condition, .. } = &result[0] {
+            // The variable named "stdin" should be renamed to "result"
+            if let ExprKind::BinOp { left, .. } = &condition.kind {
+                if let ExprKind::Var(v) = &left.kind {
+                    assert_eq!(v.name, "result", "stdin should be renamed to result");
+                } else {
+                    panic!("Expected Var on left side of comparison");
+                }
+            } else {
+                panic!("Expected BinOp condition");
+            }
+        } else {
+            panic!("Expected If node");
+        }
     }
 }

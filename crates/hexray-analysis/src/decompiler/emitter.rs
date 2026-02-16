@@ -1031,11 +1031,20 @@ impl PseudoCodeEmitter {
         }
 
         // Get the best hint by combining explicit hint with inferred patterns
+        // PointerDeref is a low-priority default, so we still try inference
         let tracker = self.global_tracker.borrow();
-        let best_hint = if hint != GlobalUsageHint::Unknown {
+        let best_hint = if hint != GlobalUsageHint::Unknown && hint != GlobalUsageHint::PointerDeref
+        {
+            // Strong hint - use it directly
             hint
         } else {
-            tracker.infer_best_hint(address)
+            // Try inference first, fall back to provided hint
+            let inferred = tracker.infer_best_hint(address);
+            if inferred != GlobalUsageHint::Unknown {
+                inferred
+            } else {
+                hint
+            }
         };
         let size_hint = tracker.get_size_hint(address);
         drop(tracker);
@@ -1144,6 +1153,204 @@ impl PseudoCodeEmitter {
         self.global_tracker
             .borrow_mut()
             .record_access(address, GlobalUsageHint::ArrayBase);
+    }
+
+    /// Pre-scans structured nodes to gather global access patterns.
+    /// This must run before emission so naming can use the inferred patterns.
+    fn prescan_global_accesses(&self, nodes: &[StructuredNode]) {
+        for node in nodes {
+            self.prescan_node(node);
+        }
+    }
+
+    /// Pre-scans a single node for global accesses.
+    fn prescan_node(&self, node: &StructuredNode) {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    self.prescan_expr(stmt, false);
+                }
+            }
+            StructuredNode::Expr(expr) => {
+                // Check if this is an assignment
+                if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+                    // Left side is a write
+                    self.prescan_expr(lhs, true);
+                    // Check for increment pattern: x = x + 1
+                    if let Some(addr) = Self::extract_gotref_address(lhs) {
+                        if self.is_increment_pattern(lhs, rhs) {
+                            self.record_global_increment(addr);
+                        }
+                    }
+                    // Right side is a read
+                    self.prescan_expr(rhs, false);
+                } else {
+                    self.prescan_expr(expr, false);
+                }
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                self.prescan_expr(condition, false);
+                self.prescan_global_accesses(then_body);
+                if let Some(eb) = else_body {
+                    self.prescan_global_accesses(eb);
+                }
+            }
+            StructuredNode::While {
+                condition, body, ..
+            } => {
+                self.prescan_expr(condition, false);
+                self.prescan_global_accesses(body);
+            }
+            StructuredNode::DoWhile {
+                condition, body, ..
+            } => {
+                self.prescan_global_accesses(body);
+                self.prescan_expr(condition, false);
+            }
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(i) = init {
+                    self.prescan_expr(i, false);
+                }
+                self.prescan_expr(condition, false);
+                if let Some(u) = update {
+                    self.prescan_expr(u, false);
+                }
+                self.prescan_global_accesses(body);
+            }
+            StructuredNode::Loop { body, .. } => {
+                self.prescan_global_accesses(body);
+            }
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                self.prescan_expr(value, false);
+                for (_, case_body) in cases {
+                    self.prescan_global_accesses(case_body);
+                }
+                if let Some(d) = default {
+                    self.prescan_global_accesses(d);
+                }
+            }
+            StructuredNode::Return(Some(expr)) => {
+                self.prescan_expr(expr, false);
+            }
+            StructuredNode::Sequence(seq) => {
+                self.prescan_global_accesses(seq);
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                self.prescan_global_accesses(try_body);
+                for h in catch_handlers {
+                    self.prescan_global_accesses(&h.body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pre-scans an expression for global accesses.
+    fn prescan_expr(&self, expr: &Expr, is_write: bool) {
+        match &expr.kind {
+            ExprKind::GotRef {
+                address, is_deref, ..
+            } => {
+                if is_write {
+                    self.record_global_write(*address);
+                } else if *is_deref {
+                    self.record_global_read(*address);
+                }
+            }
+            ExprKind::Deref { addr, .. } => {
+                if let Some(address) = Self::extract_gotref_address(addr) {
+                    if is_write {
+                        self.record_global_write(address);
+                    } else {
+                        self.record_global_read(address);
+                    }
+                }
+                self.prescan_expr(addr, false);
+            }
+            ExprKind::Assign { lhs, rhs } => {
+                self.prescan_expr(lhs, true);
+                // Check for increment pattern
+                if let Some(addr) = Self::extract_gotref_address(lhs) {
+                    if self.is_increment_pattern(lhs, rhs) {
+                        self.record_global_increment(addr);
+                    }
+                }
+                self.prescan_expr(rhs, false);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.prescan_expr(left, false);
+                self.prescan_expr(right, false);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                self.prescan_expr(operand, false);
+            }
+            ExprKind::Cast { expr: inner, .. } => {
+                self.prescan_expr(inner, is_write);
+            }
+            ExprKind::Call { target, args } => {
+                if let CallTarget::Indirect(e) = target {
+                    self.prescan_expr(e, false);
+                }
+                for arg in args {
+                    self.prescan_expr(arg, false);
+                }
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.prescan_expr(base, false);
+                self.prescan_expr(index, false);
+            }
+            ExprKind::AddressOf(inner) => {
+                self.prescan_expr(inner, false);
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.prescan_expr(cond, false);
+                self.prescan_expr(then_expr, false);
+                self.prescan_expr(else_expr, false);
+            }
+            _ => {}
+        }
+    }
+
+    /// Checks if an assignment is an increment pattern (x = x + 1 or x = x - 1).
+    fn is_increment_pattern(&self, lhs: &Expr, rhs: &Expr) -> bool {
+        if let ExprKind::BinOp {
+            op: BinOpKind::Add | BinOpKind::Sub,
+            left,
+            right,
+        } = &rhs.kind
+        {
+            // Check if left operand matches lhs
+            let lhs_addr = Self::extract_gotref_address(lhs);
+            let left_addr = Self::extract_gotref_address(left);
+            if lhs_addr.is_some() && lhs_addr == left_addr {
+                // Check if right is a small constant
+                if let ExprKind::IntLit(val) = &right.kind {
+                    return *val >= -10 && *val <= 10;
+                }
+            }
+        }
+        false
     }
 
     /// Extracts the GotRef address from an expression, if present.
@@ -1888,6 +2095,10 @@ impl PseudoCodeEmitter {
 
         // Analyze function body for pattern-based variable naming (loop indices, etc.)
         self.naming_ctx.borrow_mut().analyze(&cfg.body);
+
+        // Pre-scan for global access patterns before emission
+        // This allows us to infer read-only, write-heavy, counter patterns
+        self.prescan_global_accesses(&cfg.body);
 
         // Use advanced signature recovery if enabled
         let (signature, func_info) = if self.use_signature_recovery {

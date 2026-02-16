@@ -256,6 +256,8 @@ impl StructuredCfg {
             body = remove_orphan_labels(body);
             // Final cleanup: remove gotos to non-existent labels
             body = remove_orphan_gotos(body);
+            // Remove orphan continues (outside any loop context)
+            body = remove_orphan_continues(body);
         }
 
         // Post-process to flatten nested if-else into guard clauses
@@ -389,6 +391,8 @@ impl StructuredCfg {
             body = remove_orphan_labels(body);
             // Final cleanup: remove gotos to non-existent labels
             body = remove_orphan_gotos(body);
+            // Remove orphan continues (outside any loop context)
+            body = remove_orphan_continues(body);
         }
 
         // Post-process to flatten nested if-else into guard clauses
@@ -2904,7 +2908,12 @@ fn collect_global_refs_from_node(node: &StructuredNode, global_refs: &mut HashMa
                 if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
                     if let ExprKind::GotRef { .. } = &rhs.kind {
                         if let ExprKind::Var(lhs_var) = &lhs.kind {
-                            global_refs.insert(lhs_var.name.clone(), (**rhs).clone());
+                            // Don't track GotRef assignments to return registers - they're
+                            // frequently clobbered by function calls, leading to incorrect
+                            // substitution of return values with global names.
+                            if !is_return_register(&lhs_var.name) {
+                                global_refs.insert(lhs_var.name.clone(), (**rhs).clone());
+                            }
                         }
                     }
                 }
@@ -2960,34 +2969,47 @@ fn substitute_globals_in_node(
         } => {
             // Build block-local GotRef aliases so per-block temporaries (e.g., x8)
             // are substituted correctly without leaking across sibling blocks.
+            // Process statements in order, invalidating refs when they're clobbered.
             let mut scoped_refs = global_refs.clone();
-            for stmt in &statements {
+            let mut result_stmts = Vec::with_capacity(statements.len());
+
+            for stmt in statements {
+                // First, check if this statement invalidates any refs
                 if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
                     if let ExprKind::GotRef { .. } = &rhs.kind {
+                        // This is a GotRef assignment - track it (but not for return regs)
                         if let ExprKind::Var(lhs_var) = &lhs.kind {
-                            scoped_refs.insert(lhs_var.name.clone(), (**rhs).clone());
+                            if !is_return_register(&lhs_var.name) {
+                                scoped_refs.insert(lhs_var.name.clone(), (**rhs).clone());
+                            }
                         }
+                    } else if let ExprKind::Var(lhs_var) = &lhs.kind {
+                        // Non-GotRef assignment to a variable - invalidate that var
+                        scoped_refs.remove(&lhs_var.name);
+                    }
+                } else if let ExprKind::Call { .. } = &stmt.kind {
+                    // Function calls clobber return registers - invalidate them
+                    // x86-64: rax/eax, ARM64: x0/w0, RISC-V: a0
+                    for reg in &["rax", "eax", "x0", "w0", "a0"] {
+                        scoped_refs.remove(*reg);
                     }
                 }
+
+                // Substitute refs in the statement
+                let subst_stmt = substitute_global_refs(&stmt, &scoped_refs);
+
+                // Remove GotRef assignments (they've been propagated)
+                if let ExprKind::Assign { rhs, .. } = &subst_stmt.kind {
+                    if let ExprKind::GotRef { .. } = &rhs.kind {
+                        continue;
+                    }
+                }
+                result_stmts.push(subst_stmt);
             }
 
-            // Substitute in statements and remove GotRef assignments
-            let statements: Vec<_> = statements
-                .into_iter()
-                .map(|stmt| substitute_global_refs(&stmt, &scoped_refs))
-                .filter(|stmt| {
-                    // Remove GotRef assignments (they've been propagated)
-                    if let ExprKind::Assign { rhs, .. } = &stmt.kind {
-                        if let ExprKind::GotRef { .. } = &rhs.kind {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .collect();
             StructuredNode::Block {
                 id,
-                statements,
+                statements: result_stmts,
                 address_range,
             }
         }
@@ -6803,6 +6825,148 @@ fn remove_gotos_without_labels(
 // ============================================================================
 // End of Goto Reduction Passes
 // ============================================================================
+
+/// Removes orphan continue statements that appear outside any loop context.
+/// These are typically from switch cases that weren't properly integrated
+/// into the switch structure.
+pub fn remove_orphan_continues(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    // At top level, we're not inside a loop
+    remove_continues_impl(nodes, false)
+}
+
+/// Implementation of orphan continue removal.
+/// `in_loop` tracks whether we're inside a loop context where continue is valid.
+fn remove_continues_impl(nodes: Vec<StructuredNode>, in_loop: bool) -> Vec<StructuredNode> {
+    let mut result = Vec::new();
+
+    for node in nodes {
+        match node {
+            // Skip continue if we're not in a loop - it's orphan
+            StructuredNode::Continue if !in_loop => {
+                // Also skip any remaining nodes after the orphan continue
+                // as they are unreachable
+                break;
+            }
+
+            // Skip break if we're not in a loop/switch - it's orphan
+            StructuredNode::Break if !in_loop => {
+                break;
+            }
+
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                result.push(StructuredNode::If {
+                    condition,
+                    then_body: remove_continues_impl(then_body, in_loop),
+                    else_body: else_body.map(|e| remove_continues_impl(e, in_loop)),
+                });
+            }
+
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+                exit_block,
+            } => {
+                // Inside while body, continue is valid
+                result.push(StructuredNode::While {
+                    condition,
+                    body: remove_continues_impl(body, true),
+                    header,
+                    exit_block,
+                });
+            }
+
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+                exit_block,
+            } => {
+                result.push(StructuredNode::DoWhile {
+                    body: remove_continues_impl(body, true),
+                    condition,
+                    header,
+                    exit_block,
+                });
+            }
+
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                header,
+                exit_block,
+            } => {
+                result.push(StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body: remove_continues_impl(body, true),
+                    header,
+                    exit_block,
+                });
+            }
+
+            StructuredNode::Loop {
+                body,
+                header,
+                exit_block,
+            } => {
+                result.push(StructuredNode::Loop {
+                    body: remove_continues_impl(body, true),
+                    header,
+                    exit_block,
+                });
+            }
+
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                // In switch cases, break is valid but continue is only valid if we're in a loop
+                result.push(StructuredNode::Switch {
+                    value,
+                    cases: cases
+                        .into_iter()
+                        .map(|(vals, body)| (vals, remove_continues_impl(body, in_loop)))
+                        .collect(),
+                    default: default.map(|d| remove_continues_impl(d, in_loop)),
+                });
+            }
+
+            StructuredNode::Sequence(seq) => {
+                let cleaned = remove_continues_impl(seq, in_loop);
+                result.extend(cleaned);
+            }
+
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                result.push(StructuredNode::TryCatch {
+                    try_body: remove_continues_impl(try_body, in_loop),
+                    catch_handlers: catch_handlers
+                        .into_iter()
+                        .map(|h| CatchHandler {
+                            body: remove_continues_impl(h.body, in_loop),
+                            ..h
+                        })
+                        .collect(),
+                });
+            }
+
+            other => result.push(other),
+        }
+    }
+
+    result
+}
 
 /// Simplifies all expressions in the structured nodes using constant folding
 /// and algebraic simplifications.
