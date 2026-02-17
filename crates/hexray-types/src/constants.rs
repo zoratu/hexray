@@ -62,6 +62,24 @@ pub enum ConstantCategory {
     Seccomp,
     /// Wait options (WNOHANG, WUNTRACED, etc.)
     WaitOptions,
+    /// access() mode flags (R_OK, W_OK, etc.)
+    AccessMode,
+    /// shutdown() how argument
+    ShutdownHow,
+    /// flock() operation flags
+    FlockOp,
+    /// msync() flags
+    MsyncFlags,
+    /// sigprocmask() how argument
+    SigprocmaskHow,
+    /// setitimer/getitimer which argument
+    ItimerWhich,
+    /// getrusage() who argument
+    RusageWho,
+    /// getrlimit/setrlimit resource argument
+    RlimitResource,
+    /// dup3/pipe2/etc flags
+    FdFlags,
 }
 
 /// A named constant with its value and category.
@@ -1919,6 +1937,234 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         category: CloneFlags,
         description: Some("Share I/O context"),
     });
+
+    // access() mode flags
+    db.add(NamedConstant {
+        name: "F_OK",
+        value: 0,
+        category: AccessMode,
+        description: Some("Test for existence"),
+    });
+    db.add(NamedConstant {
+        name: "X_OK",
+        value: 1,
+        category: AccessMode,
+        description: Some("Test for execute permission"),
+    });
+    db.add(NamedConstant {
+        name: "W_OK",
+        value: 2,
+        category: AccessMode,
+        description: Some("Test for write permission"),
+    });
+    db.add(NamedConstant {
+        name: "R_OK",
+        value: 4,
+        category: AccessMode,
+        description: Some("Test for read permission"),
+    });
+
+    // shutdown() how argument
+    db.add(NamedConstant {
+        name: "SHUT_RD",
+        value: 0,
+        category: ShutdownHow,
+        description: Some("Shutdown read side"),
+    });
+    db.add(NamedConstant {
+        name: "SHUT_WR",
+        value: 1,
+        category: ShutdownHow,
+        description: Some("Shutdown write side"),
+    });
+    db.add(NamedConstant {
+        name: "SHUT_RDWR",
+        value: 2,
+        category: ShutdownHow,
+        description: Some("Shutdown both sides"),
+    });
+
+    // flock() operations
+    db.add(NamedConstant {
+        name: "LOCK_SH",
+        value: 1,
+        category: FlockOp,
+        description: Some("Shared lock"),
+    });
+    db.add(NamedConstant {
+        name: "LOCK_EX",
+        value: 2,
+        category: FlockOp,
+        description: Some("Exclusive lock"),
+    });
+    db.add(NamedConstant {
+        name: "LOCK_UN",
+        value: 8,
+        category: FlockOp,
+        description: Some("Unlock"),
+    });
+    db.add(NamedConstant {
+        name: "LOCK_NB",
+        value: 4,
+        category: FlockOp,
+        description: Some("Non-blocking (OR with others)"),
+    });
+
+    // msync() flags
+    db.add(NamedConstant {
+        name: "MS_ASYNC",
+        value: 1,
+        category: MsyncFlags,
+        description: Some("Asynchronous sync"),
+    });
+    db.add(NamedConstant {
+        name: "MS_INVALIDATE",
+        value: 2,
+        category: MsyncFlags,
+        description: Some("Invalidate mappings"),
+    });
+    db.add(NamedConstant {
+        name: "MS_SYNC",
+        value: 4,
+        category: MsyncFlags,
+        description: Some("Synchronous sync"),
+    });
+
+    // sigprocmask() how argument
+    db.add(NamedConstant {
+        name: "SIG_BLOCK",
+        value: 0,
+        category: SigprocmaskHow,
+        description: Some("Block signals"),
+    });
+    db.add(NamedConstant {
+        name: "SIG_UNBLOCK",
+        value: 1,
+        category: SigprocmaskHow,
+        description: Some("Unblock signals"),
+    });
+    db.add(NamedConstant {
+        name: "SIG_SETMASK",
+        value: 2,
+        category: SigprocmaskHow,
+        description: Some("Set signal mask"),
+    });
+
+    // setitimer/getitimer which argument
+    db.add(NamedConstant {
+        name: "ITIMER_REAL",
+        value: 0,
+        category: ItimerWhich,
+        description: Some("Real-time timer"),
+    });
+    db.add(NamedConstant {
+        name: "ITIMER_VIRTUAL",
+        value: 1,
+        category: ItimerWhich,
+        description: Some("Virtual timer (user CPU)"),
+    });
+    db.add(NamedConstant {
+        name: "ITIMER_PROF",
+        value: 2,
+        category: ItimerWhich,
+        description: Some("Profiling timer"),
+    });
+
+    // getrusage() who argument
+    db.add(NamedConstant {
+        name: "RUSAGE_SELF",
+        value: 0,
+        category: RusageWho,
+        description: Some("Current process"),
+    });
+    db.add(NamedConstant {
+        name: "RUSAGE_CHILDREN",
+        value: -1,
+        category: RusageWho,
+        description: Some("Terminated children"),
+    });
+    db.add(NamedConstant {
+        name: "RUSAGE_THREAD",
+        value: 1,
+        category: RusageWho,
+        description: Some("Current thread (Linux)"),
+    });
+
+    // getrlimit/setrlimit resource argument
+    db.add(NamedConstant {
+        name: "RLIMIT_CPU",
+        value: 0,
+        category: RlimitResource,
+        description: Some("CPU time limit"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_FSIZE",
+        value: 1,
+        category: RlimitResource,
+        description: Some("File size limit"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_DATA",
+        value: 2,
+        category: RlimitResource,
+        description: Some("Data segment size"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_STACK",
+        value: 3,
+        category: RlimitResource,
+        description: Some("Stack size limit"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_CORE",
+        value: 4,
+        category: RlimitResource,
+        description: Some("Core file size limit"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_RSS",
+        value: 5,
+        category: RlimitResource,
+        description: Some("Resident set size"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_NPROC",
+        value: 6,
+        category: RlimitResource,
+        description: Some("Number of processes"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_NOFILE",
+        value: 7,
+        category: RlimitResource,
+        description: Some("Number of open files"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_MEMLOCK",
+        value: 8,
+        category: RlimitResource,
+        description: Some("Locked memory"),
+    });
+    db.add(NamedConstant {
+        name: "RLIMIT_AS",
+        value: 9,
+        category: RlimitResource,
+        description: Some("Address space limit"),
+    });
+
+    // File descriptor flags (dup3, pipe2, etc.)
+    db.add(NamedConstant {
+        name: "O_CLOEXEC",
+        value: 0x1000000, // Linux value
+        category: FdFlags,
+        description: Some("Close on exec"),
+    });
+    db.add(NamedConstant {
+        name: "O_NONBLOCK",
+        value: 0x800, // Linux value
+        category: FdFlags,
+        description: Some("Non-blocking I/O"),
+    });
 }
 
 /// Load macOS-specific constants.
@@ -2199,6 +2445,37 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
         "clone" | "_clone" | "clone3" | "_clone3" if arg_index == 0 => {
             Some(ConstantCategory::CloneFlags)
         }
+        // access/faccessat - mode argument
+        "access" | "_access" if arg_index == 1 => Some(ConstantCategory::AccessMode),
+        "faccessat" | "_faccessat" if arg_index == 2 => Some(ConstantCategory::AccessMode),
+        // shutdown
+        "shutdown" | "_shutdown" if arg_index == 1 => Some(ConstantCategory::ShutdownHow),
+        // flock
+        "flock" | "_flock" if arg_index == 1 => Some(ConstantCategory::FlockOp),
+        // msync
+        "msync" | "_msync" if arg_index == 2 => Some(ConstantCategory::MsyncFlags),
+        // sigprocmask/pthread_sigmask
+        "sigprocmask" | "_sigprocmask" | "pthread_sigmask" | "_pthread_sigmask"
+            if arg_index == 0 =>
+        {
+            Some(ConstantCategory::SigprocmaskHow)
+        }
+        // setitimer/getitimer
+        "setitimer" | "_setitimer" | "getitimer" | "_getitimer" if arg_index == 0 => {
+            Some(ConstantCategory::ItimerWhich)
+        }
+        // getrusage
+        "getrusage" | "_getrusage" if arg_index == 0 => Some(ConstantCategory::RusageWho),
+        // getrlimit/setrlimit/prlimit
+        "getrlimit" | "_getrlimit" | "setrlimit" | "_setrlimit" if arg_index == 0 => {
+            Some(ConstantCategory::RlimitResource)
+        }
+        "prlimit" | "_prlimit" | "prlimit64" | "_prlimit64" if arg_index == 1 => {
+            Some(ConstantCategory::RlimitResource)
+        }
+        // dup3, pipe2 (flags argument)
+        "dup3" | "_dup3" if arg_index == 2 => Some(ConstantCategory::FdFlags),
+        "pipe2" | "_pipe2" if arg_index == 1 => Some(ConstantCategory::FdFlags),
         _ => None,
     }
 }
