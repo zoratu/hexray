@@ -1497,8 +1497,15 @@ impl PseudoCodeEmitter {
                                     return name.to_string();
                                 }
                             }
-                            // Fall back to a generic global name with the offset
-                            return format!("_g_{:x}", byte_offset);
+                            // Fall back to a typed dereference of a global address (lvalue)
+                            let prefix = match element_size {
+                                1 => "*(uint8_t*)",
+                                2 => "*(uint16_t*)",
+                                4 => "*(uint32_t*)",
+                                8 => "*(uint64_t*)",
+                                _ => "*",
+                            };
+                            return format!("{}(&g_{:x})", prefix, byte_offset);
                         }
                     }
                 }
@@ -1647,8 +1654,15 @@ impl PseudoCodeEmitter {
                             return name.to_string();
                         }
                     }
-                    // Fall back to a generic global name with the offset
-                    return format!("_g_{:x}", offset);
+                    // Fall back to a typed dereference of a global address
+                    let prefix = match size {
+                        1 => "*(uint8_t*)",
+                        2 => "*(uint16_t*)",
+                        4 => "*(uint32_t*)",
+                        8 => "*(uint64_t*)",
+                        _ => "*",
+                    };
+                    return format!("{}(&g_{:x})", prefix, offset);
                 }
                 // Fall back to default deref formatting
                 let prefix = match size {
@@ -2040,8 +2054,15 @@ impl PseudoCodeEmitter {
                                     return name.to_string();
                                 }
                             }
-                            // Fall back to a generic global name with the offset
-                            return format!("_g_{:x}", byte_offset);
+                            // Fall back to a typed dereference of a global address
+                            let prefix = match element_size {
+                                1 => "*(uint8_t*)",
+                                2 => "*(uint16_t*)",
+                                4 => "*(uint32_t*)",
+                                8 => "*(uint64_t*)",
+                                _ => "*",
+                            };
+                            return format!("{}(&g_{:x})", prefix, byte_offset);
                         }
                         // Non-constant index - use a generic global array name
                         let index_str = self.format_expr_with_strings(index, table);
@@ -5731,13 +5752,16 @@ mod tests {
 
         let formatted = emitter.format_expr_with_strings(&deref, &table);
 
-        // Should resolve to _g_1aba (6842 in hex) instead of containing "unresolved_pc_relative"
+        // Should resolve to *(uint32_t*)(&g_1aba) (6842 in hex) instead of containing "unresolved_pc_relative"
         assert!(
             !formatted.contains("unresolved_pc_relative"),
             "Should not contain unresolved_pc_relative: {}",
             formatted
         );
-        assert_eq!(formatted, "_g_1aba", "Should format as _g_<hex_offset>");
+        assert_eq!(
+            formatted, "*(uint32_t*)(&g_1aba)",
+            "Should format as *(typeN*)(&g_<hex_offset>)"
+        );
 
         // Also test with eip
         let eip_var = Expr::var(Variable {
@@ -5755,8 +5779,8 @@ mod tests {
             formatted2
         );
         assert_eq!(
-            formatted2, "_g_1000",
-            "Should format as _g_<hex_offset> for eip"
+            formatted2, "*(uint64_t*)(&g_1000)",
+            "Should format as *(typeN*)(&g_<hex_offset>) for eip"
         );
     }
 
@@ -5765,7 +5789,7 @@ mod tests {
         use super::super::expression::{VarKind, Variable};
 
         // Test that compound assignment like `*(uint32_t*)(rip + 6842) |= 1`
-        // correctly resolves to `_g_1aba |= 1` instead of
+        // correctly resolves to `*(uint32_t*)(&g_1aba) |= 1` instead of
         // `*(uint32_t*)(/* unresolved_pc_relative */ + 6842) |= 1`
         let emitter = PseudoCodeEmitter::new("    ", false);
         let table = StringTable::new();
@@ -5786,15 +5810,15 @@ mod tests {
 
         let formatted = emitter.format_expr_with_strings(&assign, &table);
 
-        // Should resolve to `_g_1aba |= 1` instead of containing "unresolved_pc_relative"
+        // Should resolve to `*(uint32_t*)(&g_1aba) |= 1` instead of containing "unresolved_pc_relative"
         assert!(
             !formatted.contains("unresolved_pc_relative"),
             "Should not contain unresolved_pc_relative in compound assignment: {}",
             formatted
         );
         assert!(
-            formatted.contains("_g_1aba"),
-            "Should contain resolved global name _g_1aba: {}",
+            formatted.contains("g_1aba"),
+            "Should contain resolved global name g_1aba: {}",
             formatted
         );
         assert!(
