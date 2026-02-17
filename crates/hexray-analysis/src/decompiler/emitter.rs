@@ -4052,6 +4052,15 @@ impl PseudoCodeEmitter {
                             }
                         }
                     }
+                    // Prologue save to stack: var_N = callee_saved_reg
+                    // This saves a callee-saved register to the stack at function entry
+                    if lhs_var.name.starts_with("var_") {
+                        if let ExprKind::Var(rhs_var) = &rhs.kind {
+                            if is_callee_saved_or_renamed(&rhs_var.name) {
+                                return true;
+                            }
+                        }
+                    }
                 }
                 false
             }
