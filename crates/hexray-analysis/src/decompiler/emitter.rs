@@ -4669,6 +4669,22 @@ fn rename_register(name: &str) -> String {
         "d13" => "fp_saved5".to_string(),
         "d14" => "fp_saved6".to_string(),
         "d15" => "fp_saved7".to_string(),
+        // ARM64 frame pointer and link register (not user-visible but may leak through)
+        "x29" | "w29" => "fp".to_string(),
+        "x30" | "w30" => "lr".to_string(),
+        // ARM64 temporary/scratch registers (x8-x17) - used for intermediate computations
+        "x8" | "w8" => "tmp0".to_string(),
+        "x9" | "w9" => "tmp1".to_string(),
+        "x10" | "w10" => "tmp2".to_string(),
+        "x11" | "w11" => "tmp3".to_string(),
+        "x12" | "w12" => "tmp4".to_string(),
+        "x13" | "w13" => "tmp5".to_string(),
+        "x14" | "w14" => "tmp6".to_string(),
+        "x15" | "w15" => "tmp7".to_string(),
+        "x16" | "w16" => "tmp8".to_string(),
+        "x17" | "w17" => "tmp9".to_string(),
+        // x18 is the platform register (reserved on some OSes)
+        "x18" | "w18" => "platform_reg".to_string(),
         // ARM64 argument registers (x0 is both arg0 and return value - treat as arg0 here,
         // return value handling is done separately by the return statement)
         "x0" | "w0" => "arg0".to_string(),
@@ -5384,8 +5400,9 @@ mod tests {
 
         let emitter = PseudoCodeEmitter::new("    ", false);
         // Array access with constant index uses array notation for readability
+        // Note: x8 is renamed to tmp0 for ARM64 temporary registers
         let expr = Expr::array_access(Expr::var(Variable::reg("x8", 8)), Expr::int(2), 8);
-        assert_eq!(emitter.format_expr(&expr), "x8[2]");
+        assert_eq!(emitter.format_expr(&expr), "tmp0[2]");
     }
 
     #[test]
