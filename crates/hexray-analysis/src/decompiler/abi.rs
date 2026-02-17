@@ -376,6 +376,33 @@ pub fn is_callee_saved_register(name: &str) -> bool {
     )
 }
 
+/// Checks if a variable name is a renamed callee-saved register.
+///
+/// This matches the semantic names assigned by `rename_register` in the emitter.
+/// Used to filter epilogue register restores (e.g., `saved1 = var_20`).
+pub fn is_renamed_callee_saved(name: &str) -> bool {
+    matches!(
+        name,
+        // x86-64 and ARM64 callee-saved renamed registers
+        "err" | "result" |
+        "saved1" | "saved2" | "saved3" | "saved4" | "saved5" | "saved6" | "saved7" | "saved8" |
+        // ARM64 floating-point callee-saved
+        "fp_saved0" | "fp_saved1" | "fp_saved2" | "fp_saved3" |
+        "fp_saved4" | "fp_saved5" | "fp_saved6" | "fp_saved7" |
+        // Frame pointer and link register
+        "fp" | "lr"
+    )
+}
+
+/// Checks if a variable name is a callee-saved register or its renamed form.
+///
+/// This is used to filter epilogue patterns where callee-saved registers are
+/// restored from stack slots, regardless of whether they use original register
+/// names (x21, r14) or renamed versions (saved1, saved2).
+pub fn is_callee_saved_or_renamed(name: &str) -> bool {
+    is_callee_saved_register(name) || is_renamed_callee_saved(name)
+}
+
 /// Checks if a register is caller-saved (scratch register, not preserved).
 ///
 /// These registers can be freely modified by called functions without saving.

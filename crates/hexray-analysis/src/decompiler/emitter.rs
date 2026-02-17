@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use super::abi::{get_arg_register_index, is_callee_saved_register};
+use super::abi::{get_arg_register_index, is_callee_saved_or_renamed, is_callee_saved_register};
 use super::expression::{BinOpKind, CallTarget, Expr, ExprKind, UnaryOpKind};
 use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
@@ -4013,6 +4013,41 @@ impl PseudoCodeEmitter {
                             if let ExprKind::Var(inner_var) = &left.kind {
                                 if inner_var.name == "rsp" {
                                     return true;
+                                }
+                            }
+                        }
+                    }
+                    // Callee-saved register restore from stack: x21 = var_10, saved1 = sp[2], etc.
+                    // These are epilogue patterns that restore callee-saved registers before return
+                    // Check both original register names and renamed versions
+                    if is_callee_saved_or_renamed(&lhs_var.name) {
+                        // Check for plain var with var_ prefix
+                        if let ExprKind::Var(rhs_var) = &rhs.kind {
+                            if rhs_var.name.starts_with("var_") {
+                                return true;
+                            }
+                        }
+                        // Check for ArrayAccess of sp (ARM64 epilogue pattern: sp[N])
+                        if let ExprKind::ArrayAccess { base, index, .. } = &rhs.kind {
+                            if let ExprKind::Var(base_var) = &base.kind {
+                                if (base_var.name == "sp" || base_var.name == "rsp")
+                                    && matches!(index.kind, ExprKind::IntLit(_))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        // Also check for Deref of stack slot (x86-64 pattern)
+                        if let ExprKind::Deref { addr, .. } = &rhs.kind {
+                            if let ExprKind::BinOp { left, right, .. } = &addr.kind {
+                                if let ExprKind::Var(base) = &left.kind {
+                                    if (base.name == "x29"
+                                        || base.name == "fp"
+                                        || base.name == "rbp")
+                                        && matches!(right.kind, ExprKind::IntLit(_))
+                                    {
+                                        return true;
+                                    }
                                 }
                             }
                         }
