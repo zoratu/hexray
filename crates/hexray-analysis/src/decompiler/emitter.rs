@@ -867,6 +867,24 @@ impl PseudoCodeEmitter {
         self.format_expr_with_strings(expr, table)
     }
 
+    /// Formats a condition expression, handling degenerate condition comments.
+    /// When a condition is just a comment like /* signed_le */, we couldn't resolve
+    /// the actual comparison operands. In this case, output a placeholder that
+    /// makes it clear the condition couldn't be fully resolved.
+    fn format_condition_expr(&self, expr: &Expr) -> String {
+        let formatted = self.format_expr(expr);
+
+        // Check if this is a standalone condition comment (no operands found)
+        // These look like "/* signed_le */" or similar
+        if formatted.starts_with("/*") && formatted.ends_with("*/") {
+            // This is a degenerate condition - we couldn't find the comparison
+            // Output as true with the comment to preserve semantic information
+            format!("true {}", formatted)
+        } else {
+            formatted
+        }
+    }
+
     /// Formats an expression without resolving addresses to string literals.
     /// Used for comparisons and other contexts where string resolution doesn't make sense.
     fn format_expr_no_string_resolve(&self, expr: &Expr) -> String {
@@ -1897,7 +1915,18 @@ impl PseudoCodeEmitter {
                     normalize_variable_name(&rename_register(&var.name))
                 }
             }
-            ExprKind::Unknown(name) => normalize_variable_name(name),
+            ExprKind::Unknown(name) => {
+                // Check if this is a condition comment placeholder (e.g., /* signed_le */)
+                // These appear when we can't resolve the actual comparison operands
+                if name.starts_with("/*") && name.ends_with("*/") {
+                    // It's a comment - keep it but note it's a placeholder condition
+                    // In boolean context, this will evaluate as-is which isn't ideal,
+                    // but at least preserves the semantic information
+                    name.clone()
+                } else {
+                    normalize_variable_name(name)
+                }
+            }
             // Handle casts with potential elimination based on known types
             ExprKind::Cast {
                 expr: inner,
@@ -2866,7 +2895,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}if ({}) {{",
                     indent,
-                    self.format_expr(&actual_cond)
+                    self.format_condition_expr(&actual_cond)
                 )
                 .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
@@ -2892,7 +2921,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}while ({}) {{",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
@@ -2908,7 +2937,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}}} while ({});",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
             }
@@ -3037,7 +3066,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}if ({}) {{",
                     indent,
-                    self.format_expr(&actual_cond)
+                    self.format_condition_expr(&actual_cond)
                 )
                 .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
@@ -3063,7 +3092,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}while ({}) {{",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
                 self.emit_nodes_with_decls(body, output, depth + 1, declared_vars);
@@ -3079,7 +3108,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}}} while ({});",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
             }
@@ -3206,6 +3235,12 @@ impl PseudoCodeEmitter {
             return;
         }
 
+        // Skip stack adjustment patterns that result from ARM64 sp operations
+        // These appear as "0 -= N" or "0 += N" when the stack pointer isn't resolved
+        if expr_str.starts_with("0 -= ") || expr_str.starts_with("0 += ") {
+            return;
+        }
+
         if expr_str == "return" {
             writeln!(output, "{}return;", indent).unwrap();
             return;
@@ -3258,7 +3293,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}}} else if ({}) {{",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
                 self.emit_nodes(then_body, output, depth + 1);
@@ -3309,7 +3344,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}}} else if ({}) {{",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
                 self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
@@ -3684,7 +3719,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}if ({}) {{",
                     indent,
-                    self.format_expr(&actual_cond)
+                    self.format_condition_expr(&actual_cond)
                 )
                 .unwrap();
                 self.emit_nodes(&actual_then, output, depth + 1);
@@ -3706,7 +3741,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}while ({}) {{",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
                 self.emit_nodes(body, output, depth + 1);
@@ -3722,7 +3757,7 @@ impl PseudoCodeEmitter {
                     output,
                     "{}}} while ({});",
                     indent,
-                    self.format_expr(condition)
+                    self.format_condition_expr(condition)
                 )
                 .unwrap();
             }
@@ -3747,7 +3782,7 @@ impl PseudoCodeEmitter {
                     "{}for ({}; {}; {}) {{",
                     indent,
                     init_str,
-                    self.format_expr(condition),
+                    self.format_condition_expr(condition),
                     update_str
                 )
                 .unwrap();
@@ -3896,6 +3931,12 @@ impl PseudoCodeEmitter {
 
         // Skip empty/nop statements and trivial literal statements
         if expr_str.is_empty() || expr_str == "/* nop */" || expr_str == "0" || expr_str == "1" {
+            return;
+        }
+
+        // Skip stack adjustment patterns that result from ARM64 sp operations
+        // These appear as "0 -= N" or "0 += N" when the stack pointer isn't resolved
+        if expr_str.starts_with("0 -= ") || expr_str.starts_with("0 += ") {
             return;
         }
 
@@ -4608,11 +4649,26 @@ fn rename_register(name: &str) -> String {
         "rcx" => "arg3".to_string(),
         "r8" => "arg4".to_string(),
         "r9" => "arg5".to_string(),
-        // ARM64 callee-saved registers
+        // ARM64 callee-saved registers (x19-x28)
         "x19" | "w19" => "err".to_string(),
         "x20" | "w20" => "result".to_string(),
         "x21" | "w21" => "saved1".to_string(),
         "x22" | "w22" => "saved2".to_string(),
+        "x23" | "w23" => "saved3".to_string(),
+        "x24" | "w24" => "saved4".to_string(),
+        "x25" | "w25" => "saved5".to_string(),
+        "x26" | "w26" => "saved6".to_string(),
+        "x27" | "w27" => "saved7".to_string(),
+        "x28" | "w28" => "saved8".to_string(),
+        // ARM64 floating-point/SIMD callee-saved registers (d8-d15)
+        "d8" => "fp_saved0".to_string(),
+        "d9" => "fp_saved1".to_string(),
+        "d10" => "fp_saved2".to_string(),
+        "d11" => "fp_saved3".to_string(),
+        "d12" => "fp_saved4".to_string(),
+        "d13" => "fp_saved5".to_string(),
+        "d14" => "fp_saved6".to_string(),
+        "d15" => "fp_saved7".to_string(),
         // ARM64 argument registers (x0 is both arg0 and return value - treat as arg0 here,
         // return value handling is done separately by the return statement)
         "x0" | "w0" => "arg0".to_string(),
