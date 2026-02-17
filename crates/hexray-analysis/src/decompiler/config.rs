@@ -91,6 +91,8 @@ pub enum OptimizationPass {
     SwitchRecovery,
     /// Handle irreducible CFG regions (gotos, state machines).
     IrreducibleHandling,
+    /// Common subexpression elimination (replace duplicate expressions with references).
+    CommonSubexpressionElimination,
 }
 
 impl OptimizationPass {
@@ -121,6 +123,7 @@ impl OptimizationPass {
             TypeInference,
             SwitchRecovery,
             IrreducibleHandling,
+            CommonSubexpressionElimination,
         ]
     }
 
@@ -151,6 +154,7 @@ impl OptimizationPass {
             TypeInference => "type-inference",
             SwitchRecovery => "switch-recovery",
             IrreducibleHandling => "irreducible-handling",
+            CommonSubexpressionElimination => "cse",
         }
     }
 
@@ -181,6 +185,7 @@ impl OptimizationPass {
             TypeInference => "Type inference improvements",
             SwitchRecovery => "Improved switch statement recovery",
             IrreducibleHandling => "Handle irreducible CFG regions",
+            CommonSubexpressionElimination => "Eliminate duplicate expressions",
         }
     }
 
@@ -211,6 +216,7 @@ impl OptimizationPass {
             "type-inference" => Some(TypeInference),
             "switch-recovery" => Some(SwitchRecovery),
             "irreducible-handling" => Some(IrreducibleHandling),
+            "cse" | "common-subexpression-elimination" => Some(CommonSubexpressionElimination),
             _ => None,
         }
     }
@@ -330,6 +336,7 @@ impl DecompilerConfig {
                     | ConstantPropagation
                     | LoopCanonicalization
                     | IrreducibleHandling
+                    | CommonSubexpressionElimination
             ),
             Aggressive => {
                 // All passes enabled at aggressive level

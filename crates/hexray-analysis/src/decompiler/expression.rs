@@ -119,7 +119,7 @@ pub enum ExprKind {
 }
 
 /// Binary operation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOpKind {
     // Arithmetic
     Add,
@@ -262,7 +262,7 @@ impl BinOpKind {
 }
 
 /// Unary operation kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOpKind {
     Neg,        // -x
     Not,        // ~x (bitwise)

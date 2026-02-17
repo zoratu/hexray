@@ -14,6 +14,7 @@ pub mod benchmark;
 pub mod comparison;
 pub mod config;
 mod constant_propagation;
+mod cse;
 mod dead_store;
 mod emitter;
 mod expression;

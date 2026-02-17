@@ -291,6 +291,11 @@ impl StructuredCfg {
             body = super::dead_store::eliminate_dead_stores(body);
         }
 
+        // Post-process to eliminate common subexpressions
+        if config.is_pass_enabled(OptimizationPass::CommonSubexpressionElimination) {
+            body = super::cse::eliminate_common_subexpressions(body);
+        }
+
         // Post-process to infer better variable names
         if config.is_pass_enabled(OptimizationPass::VariableNaming) {
             body = super::variable_naming::suggest_variable_names(body);
@@ -430,6 +435,11 @@ impl StructuredCfg {
         // Post-process to eliminate dead stores
         if config.is_pass_enabled(OptimizationPass::DeadStoreElimination) {
             body = super::dead_store::eliminate_dead_stores(body);
+        }
+
+        // Post-process to eliminate common subexpressions
+        if config.is_pass_enabled(OptimizationPass::CommonSubexpressionElimination) {
+            body = super::cse::eliminate_common_subexpressions(body);
         }
 
         // Post-process to infer better variable names
