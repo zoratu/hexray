@@ -3201,7 +3201,8 @@ impl PseudoCodeEmitter {
         let indent = self.indent.repeat(depth);
         let expr_str = self.format_expr(expr);
 
-        if expr_str.is_empty() || expr_str == "/* nop */" {
+        // Skip empty/nop statements and trivial literal statements
+        if expr_str.is_empty() || expr_str == "/* nop */" || expr_str == "0" || expr_str == "1" {
             return;
         }
 
@@ -3519,6 +3520,8 @@ impl PseudoCodeEmitter {
         use super::expression::ExprKind;
 
         match &expr.kind {
+            // Trivial integer literals (0, 1) - often from ARM64 wzr/xzr zero register
+            ExprKind::IntLit(n) if *n == 0 || *n == 1 => true,
             // pop(reg) - epilogue
             ExprKind::Call { target, .. } => {
                 if let super::expression::CallTarget::Named(name) = target {
@@ -3891,8 +3894,8 @@ impl PseudoCodeEmitter {
         let indent = self.indent.repeat(depth);
         let expr_str = self.format_expr(expr);
 
-        // Skip empty/nop statements
-        if expr_str.is_empty() || expr_str == "/* nop */" {
+        // Skip empty/nop statements and trivial literal statements
+        if expr_str.is_empty() || expr_str == "/* nop */" || expr_str == "0" || expr_str == "1" {
             return;
         }
 

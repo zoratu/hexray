@@ -1783,20 +1783,30 @@ fn condition_to_expr_before_address(
         }
     }
 
-    // Fallback: show condition check on flags if no compare found
-    // This is more informative than generic placeholders
-    let flag_name = match cond {
-        Condition::Equal | Condition::NotEqual => "ZF",
-        Condition::Less | Condition::GreaterOrEqual => "SF^OF",
-        Condition::Greater | Condition::LessOrEqual => "SF^OF|ZF",
-        Condition::Below | Condition::AboveOrEqual => "CF",
-        Condition::Above | Condition::BelowOrEqual => "CF|ZF",
-        Condition::Sign | Condition::NotSign => "SF",
-        Condition::Overflow | Condition::NotOverflow => "OF",
-        Condition::Parity | Condition::NotParity => "PF",
-        _ => "flags",
+    // Fallback: show a descriptive condition name when compare not found
+    // Use readable condition names instead of raw flag expressions
+    let cond_name = match cond {
+        Condition::Equal => "/* equal */",
+        Condition::NotEqual => "/* not_equal */",
+        Condition::Less => "/* signed_lt */",
+        Condition::LessOrEqual => "/* signed_le */",
+        Condition::Greater => "/* signed_gt */",
+        Condition::GreaterOrEqual => "/* signed_ge */",
+        Condition::Below => "/* unsigned_lt */",
+        Condition::BelowOrEqual => "/* unsigned_le */",
+        Condition::Above => "/* unsigned_gt */",
+        Condition::AboveOrEqual => "/* unsigned_ge */",
+        Condition::Sign => "/* negative */",
+        Condition::NotSign => "/* non_negative */",
+        Condition::Overflow => "/* overflow */",
+        Condition::NotOverflow => "/* no_overflow */",
+        Condition::Parity => "/* parity_even */",
+        Condition::NotParity => "/* parity_odd */",
+        _ => "/* condition */",
     };
-    Expr::binop(op, Expr::unknown(flag_name), Expr::int(0))
+    // Return just the condition name as an unknown expression
+    // The operator and 0 comparison are implicit
+    Expr::unknown(cond_name)
 }
 
 /// Builds a map of register names to their values from MOV/LDR instructions in a block.
@@ -1951,32 +1961,27 @@ fn substitute_register_in_expr(expr: Expr, reg_values: &HashMap<String, Expr>) -
 
 /// Simple condition conversion without block context (fallback).
 fn condition_to_expr(cond: Condition) -> Expr {
-    let op = match cond {
-        Condition::Equal => BinOpKind::Eq,
-        Condition::NotEqual => BinOpKind::Ne,
-        Condition::Less => BinOpKind::Lt,
-        Condition::LessOrEqual => BinOpKind::Le,
-        Condition::Greater => BinOpKind::Gt,
-        Condition::GreaterOrEqual => BinOpKind::Ge,
-        Condition::Below => BinOpKind::ULt,
-        Condition::BelowOrEqual => BinOpKind::ULe,
-        Condition::Above => BinOpKind::UGt,
-        Condition::AboveOrEqual => BinOpKind::UGe,
-        _ => BinOpKind::Ne,
+    // Use readable condition names instead of raw flag expressions
+    let cond_name = match cond {
+        Condition::Equal => "/* equal */",
+        Condition::NotEqual => "/* not_equal */",
+        Condition::Less => "/* signed_lt */",
+        Condition::LessOrEqual => "/* signed_le */",
+        Condition::Greater => "/* signed_gt */",
+        Condition::GreaterOrEqual => "/* signed_ge */",
+        Condition::Below => "/* unsigned_lt */",
+        Condition::BelowOrEqual => "/* unsigned_le */",
+        Condition::Above => "/* unsigned_gt */",
+        Condition::AboveOrEqual => "/* unsigned_ge */",
+        Condition::Sign => "/* negative */",
+        Condition::NotSign => "/* non_negative */",
+        Condition::Overflow => "/* overflow */",
+        Condition::NotOverflow => "/* no_overflow */",
+        Condition::Parity => "/* parity_even */",
+        Condition::NotParity => "/* parity_odd */",
+        _ => "/* condition */",
     };
-    // Fallback: show condition check on flags
-    let flag_name = match cond {
-        Condition::Equal | Condition::NotEqual => "ZF",
-        Condition::Less | Condition::GreaterOrEqual => "SF^OF",
-        Condition::Greater | Condition::LessOrEqual => "SF^OF|ZF",
-        Condition::Below | Condition::AboveOrEqual => "CF",
-        Condition::Above | Condition::BelowOrEqual => "CF|ZF",
-        Condition::Sign | Condition::NotSign => "SF",
-        Condition::Overflow | Condition::NotOverflow => "OF",
-        Condition::Parity | Condition::NotParity => "PF",
-        _ => "flags",
-    };
-    Expr::binop(op, Expr::unknown(flag_name), Expr::int(0))
+    Expr::unknown(cond_name)
 }
 
 /// Negates a condition expression.
@@ -2001,6 +2006,29 @@ fn negate_condition(expr: Expr) -> Expr {
             } else {
                 Expr::unary(super::expression::UnaryOpKind::LogicalNot, expr)
             }
+        }
+        // Handle negation of condition comment placeholders
+        super::expression::ExprKind::Unknown(s) => {
+            let negated = match s.as_str() {
+                "/* equal */" => "/* not_equal */",
+                "/* not_equal */" => "/* equal */",
+                "/* signed_lt */" => "/* signed_ge */",
+                "/* signed_le */" => "/* signed_gt */",
+                "/* signed_gt */" => "/* signed_le */",
+                "/* signed_ge */" => "/* signed_lt */",
+                "/* unsigned_lt */" => "/* unsigned_ge */",
+                "/* unsigned_le */" => "/* unsigned_gt */",
+                "/* unsigned_gt */" => "/* unsigned_le */",
+                "/* unsigned_ge */" => "/* unsigned_lt */",
+                "/* negative */" => "/* non_negative */",
+                "/* non_negative */" => "/* negative */",
+                "/* overflow */" => "/* no_overflow */",
+                "/* no_overflow */" => "/* overflow */",
+                "/* parity_even */" => "/* parity_odd */",
+                "/* parity_odd */" => "/* parity_even */",
+                _ => return Expr::unary(super::expression::UnaryOpKind::LogicalNot, expr),
+            };
+            Expr::unknown(negated)
         }
         _ => Expr::unary(super::expression::UnaryOpKind::LogicalNot, expr),
     }

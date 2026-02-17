@@ -364,6 +364,10 @@ fn negate_condition(condition: Expr) -> Expr {
                 BinOpKind::Le => Some(BinOpKind::Gt),
                 BinOpKind::Gt => Some(BinOpKind::Le),
                 BinOpKind::Ge => Some(BinOpKind::Lt),
+                BinOpKind::ULt => Some(BinOpKind::UGe),
+                BinOpKind::ULe => Some(BinOpKind::UGt),
+                BinOpKind::UGt => Some(BinOpKind::ULe),
+                BinOpKind::UGe => Some(BinOpKind::ULt),
                 _ => None,
             };
 
@@ -372,6 +376,30 @@ fn negate_condition(condition: Expr) -> Expr {
             } else {
                 Expr::unary(super::expression::UnaryOpKind::Not, condition)
             }
+        }
+
+        // Handle negation of condition comment placeholders
+        ExprKind::Unknown(s) => {
+            let negated = match s.as_str() {
+                "/* equal */" => "/* not_equal */",
+                "/* not_equal */" => "/* equal */",
+                "/* signed_lt */" => "/* signed_ge */",
+                "/* signed_le */" => "/* signed_gt */",
+                "/* signed_gt */" => "/* signed_le */",
+                "/* signed_ge */" => "/* signed_lt */",
+                "/* unsigned_lt */" => "/* unsigned_ge */",
+                "/* unsigned_le */" => "/* unsigned_gt */",
+                "/* unsigned_gt */" => "/* unsigned_le */",
+                "/* unsigned_ge */" => "/* unsigned_lt */",
+                "/* negative */" => "/* non_negative */",
+                "/* non_negative */" => "/* negative */",
+                "/* overflow */" => "/* no_overflow */",
+                "/* no_overflow */" => "/* overflow */",
+                "/* parity_even */" => "/* parity_odd */",
+                "/* parity_odd */" => "/* parity_even */",
+                _ => return Expr::unary(super::expression::UnaryOpKind::Not, condition),
+            };
+            Expr::unknown(negated)
         }
 
         // For other expressions, wrap in logical not

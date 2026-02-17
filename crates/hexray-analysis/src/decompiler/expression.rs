@@ -541,6 +541,29 @@ impl Expr {
                 // Double negation: !!x -> x
                 *operand
             }
+            // Handle negation of condition comment placeholders
+            ExprKind::Unknown(ref s) => {
+                let negated = match s.as_str() {
+                    "/* equal */" => "/* not_equal */",
+                    "/* not_equal */" => "/* equal */",
+                    "/* signed_lt */" => "/* signed_ge */",
+                    "/* signed_le */" => "/* signed_gt */",
+                    "/* signed_gt */" => "/* signed_le */",
+                    "/* signed_ge */" => "/* signed_lt */",
+                    "/* unsigned_lt */" => "/* unsigned_ge */",
+                    "/* unsigned_le */" => "/* unsigned_gt */",
+                    "/* unsigned_gt */" => "/* unsigned_le */",
+                    "/* unsigned_ge */" => "/* unsigned_lt */",
+                    "/* negative */" => "/* non_negative */",
+                    "/* non_negative */" => "/* negative */",
+                    "/* overflow */" => "/* no_overflow */",
+                    "/* no_overflow */" => "/* overflow */",
+                    "/* parity_even */" => "/* parity_odd */",
+                    "/* parity_odd */" => "/* parity_even */",
+                    _ => return Self::unary(UnaryOpKind::LogicalNot, self),
+                };
+                Self::unknown(negated)
+            }
             _ => Self::unary(UnaryOpKind::LogicalNot, self),
         }
     }
@@ -1345,6 +1368,137 @@ impl Expr {
                 }
             }
             Operation::Other(_) => {
+                let mnem_lower = inst.mnemonic.to_lowercase();
+
+                // Handle ARM64 bitfield operations
+                if (mnem_lower == "sbfm" || mnem_lower == "ubfm" || mnem_lower == "bfm")
+                    && ops.len() >= 4
+                {
+                    // Format: sbfm/ubfm rd, rn, #immr, #imms
+                    let dst = Self::from_operand(&ops[0]);
+                    let src = Self::from_operand(&ops[1]);
+                    let immr = match &ops[2] {
+                        Operand::Immediate(imm) => imm.value as i64,
+                        _ => -1,
+                    };
+                    let imms = match &ops[3] {
+                        Operand::Immediate(imm) => imm.value as i64,
+                        _ => -1,
+                    };
+
+                    if immr >= 0 && imms >= 0 {
+                        let is_signed = mnem_lower == "sbfm";
+
+                        // Check for common sign/zero extension patterns
+                        if immr == 0 {
+                            // Sign/zero extend from bit position imms
+                            let ext_expr = match imms {
+                                7 => {
+                                    // Extend from byte
+                                    if is_signed {
+                                        // (int8_t)(src)
+                                        Self::call(
+                                            CallTarget::Named("(int8_t)".to_string()),
+                                            vec![src],
+                                        )
+                                    } else {
+                                        Self::binop(BinOpKind::And, src, Self::int(0xFF))
+                                    }
+                                }
+                                15 => {
+                                    // Extend from halfword
+                                    if is_signed {
+                                        Self::call(
+                                            CallTarget::Named("(int16_t)".to_string()),
+                                            vec![src],
+                                        )
+                                    } else {
+                                        Self::binop(BinOpKind::And, src, Self::int(0xFFFF))
+                                    }
+                                }
+                                31 => {
+                                    // Extend from word
+                                    if is_signed {
+                                        Self::call(
+                                            CallTarget::Named("(int32_t)".to_string()),
+                                            vec![src],
+                                        )
+                                    } else {
+                                        Self::binop(BinOpKind::And, src, Self::int(0xFFFFFFFF))
+                                    }
+                                }
+                                _ => {
+                                    // General bitfield extract from bit 0 to imms
+                                    let width = imms + 1;
+                                    let mask = (1i128 << width) - 1;
+                                    Self::binop(BinOpKind::And, src, Self::int(mask))
+                                }
+                            };
+                            return Self::assign(dst, ext_expr);
+                        } else if imms >= immr {
+                            // Bitfield extract: extract bits [imms:immr]
+                            let width = imms - immr + 1;
+                            let mask = (1i128 << width) - 1;
+                            let shift = immr;
+                            let shifted =
+                                Self::binop(BinOpKind::Shr, src, Self::int(shift as i128));
+                            let masked = Self::binop(BinOpKind::And, shifted, Self::int(mask));
+                            return Self::assign(dst, masked);
+                        } else {
+                            // immr > imms: left shift and mask pattern
+                            // LSL is encoded as UBFM with immr = datasize - shift_amount
+                            // Shift amount = datasize - immr (assuming 64-bit)
+                            let datasize = 64i64;
+                            let shift_amount = datasize - immr;
+                            let width = imms + 1;
+                            let mask = (1i128 << width) - 1;
+
+                            // src << shift_amount, then mask to width bits
+                            let shifted =
+                                Self::binop(BinOpKind::Shl, src, Self::int(shift_amount as i128));
+                            let masked = Self::binop(BinOpKind::And, shifted, Self::int(mask));
+                            return Self::assign(dst, masked);
+                        }
+                    }
+                }
+
+                // Handle ARM64 sign/zero extension pseudo-ops (if recognized)
+                if ops.len() >= 2 {
+                    let ext_expr = match mnem_lower.as_str() {
+                        "sxtb" => Some(Self::call(
+                            CallTarget::Named("(int8_t)".to_string()),
+                            vec![Self::from_operand(&ops[1])],
+                        )),
+                        "sxth" => Some(Self::call(
+                            CallTarget::Named("(int16_t)".to_string()),
+                            vec![Self::from_operand(&ops[1])],
+                        )),
+                        "sxtw" => Some(Self::call(
+                            CallTarget::Named("(int32_t)".to_string()),
+                            vec![Self::from_operand(&ops[1])],
+                        )),
+                        "uxtb" => Some(Self::binop(
+                            BinOpKind::And,
+                            Self::from_operand(&ops[1]),
+                            Self::int(0xFF),
+                        )),
+                        "uxth" => Some(Self::binop(
+                            BinOpKind::And,
+                            Self::from_operand(&ops[1]),
+                            Self::int(0xFFFF),
+                        )),
+                        "uxtw" => Some(Self::binop(
+                            BinOpKind::And,
+                            Self::from_operand(&ops[1]),
+                            Self::int(0xFFFFFFFF),
+                        )),
+                        _ => None,
+                    };
+                    if let Some(expr) = ext_expr {
+                        return Self::assign(Self::from_operand(&ops[0]), expr);
+                    }
+                }
+
                 // Unknown operation - emit the mnemonic as a function call if it has operands
                 if !ops.is_empty() {
                     Self::call(
