@@ -2542,12 +2542,13 @@ impl PseudoCodeEmitter {
     fn collect_vars_from_expr(&self, expr: &Expr, vars: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Var(v) => {
-                // Collect simple variable references
-                if v.name.starts_with("var_")
-                    || v.name.starts_with("local_")
-                    || v.name.starts_with("arg_")
-                {
-                    vars.insert(v.name.clone());
+                // Collect simple variable references that need declaration
+                // This includes both original names (var_N, local_N, arg_N) and
+                // semantically renamed variables (iter, idx, tmp0, saved1, etc.)
+                if is_declarable_variable(&v.name) {
+                    // Use the renamed name for declaration (e.g., x8 → tmp0)
+                    let display_name = rename_register(&v.name);
+                    vars.insert(display_name);
                 }
             }
             ExprKind::Deref { addr, .. } => {
@@ -4130,15 +4131,14 @@ impl PseudoCodeEmitter {
     }
 
     /// Try to get a variable name from an expression (either Var or Deref of stack slot).
-    /// Uses DWARF names when available.
+    /// Uses DWARF names when available. Returns the display name (after renaming).
     fn try_get_var_name(&self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Var(v) => {
-                if v.name.starts_with("var_")
-                    || v.name.starts_with("arg_")
-                    || v.name.starts_with("local_")
-                {
-                    Some(v.name.clone())
+                // Include both original and semantically renamed variables
+                if is_declarable_variable(&v.name) {
+                    // Return the renamed name for consistency with format_expr
+                    Some(rename_register(&v.name))
                 } else {
                     None
                 }
@@ -4935,6 +4935,124 @@ fn is_arm64_temp_register_expr(expr: &Expr) -> bool {
         return is_arm64_temp_register(&v.name);
     }
     false
+}
+
+/// Determines if a variable name represents a local variable that needs declaration.
+/// This includes both original names (var_N, local_N, arg_N) and semantically renamed
+/// variables (iter, idx, tmp0, saved1, result, err, etc.).
+///
+/// Also handles the case where register names will be renamed during formatting:
+/// e.g., x8 → tmp0, x19 → err, etc. These need declarations too.
+///
+/// Returns false for:
+/// - Argument registers (x0-x7, rdi, rsi, etc.) - these become function parameters
+/// - Numeric literals and addresses (0x...)
+/// - Empty names
+fn is_declarable_variable(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+
+    // Original variable patterns that always need declaration
+    if name.starts_with("var_")
+        || name.starts_with("local_")
+        || name.starts_with("arg_")
+        || name.starts_with("tmp")
+    {
+        return true;
+    }
+
+    // Semantically renamed variables that need declaration
+    // These are the names assigned by variable_naming.rs
+    if matches!(
+        name,
+        "iter"
+            | "idx"
+            | "idx2"
+            | "idx3"
+            | "result"
+            | "err"
+            | "size"
+            | "flag"
+            | "str"
+            | "ptr"
+            | "len"
+            | "buf"
+            | "count"
+            | "offset"
+            | "pos"
+            | "ret"
+            | "status"
+            | "rc"
+            | "fd"
+            | "handle"
+            | "stream"
+            | "file"
+            | "path"
+            | "name"
+            | "data"
+            | "addr"
+            | "base"
+            | "end"
+            | "start"
+            | "limit"
+            | "cmp_result"
+            | "thread_result"
+            | "err_msg"
+            | "err_result"
+            | "addr_result"
+    ) {
+        return true;
+    }
+
+    // Callee-saved register renames (saved1, saved2, ..., saved8)
+    if name.starts_with("saved") {
+        if let Some(suffix) = name.strip_prefix("saved") {
+            if suffix.parse::<u32>().is_ok() {
+                return true;
+            }
+        }
+    }
+
+    // Loop index variables (i, j, k, etc.)
+    if matches!(name, "i" | "j" | "k" | "l" | "m" | "n" | "ii" | "jj" | "kk") {
+        return true;
+    }
+
+    // Check if this is a register that will be renamed to something declarable.
+    // We need to get the renamed name and check if that needs declaration.
+    let renamed = rename_register(name);
+    if renamed != name {
+        // The register was renamed - check if the renamed name needs declaration
+        // Exclude argument registers (arg0-arg7) and return value (ret)
+        if renamed.starts_with("tmp")
+            || renamed.starts_with("saved")
+            || renamed.starts_with("fp_saved")
+            || matches!(renamed.as_str(), "err" | "result")
+        {
+            return true;
+        }
+        // arg0-arg7, ret, etc. don't need declaration here (handled as params)
+        return false;
+    }
+
+    // ARM64/x86-64 register names that aren't renamed - don't declare
+    // Frame pointer, stack pointer, link register, etc.
+    if matches!(
+        name,
+        "sp" | "fp" | "lr" | "pc" | "xzr" | "wzr" | "rbp" | "rsp"
+    ) {
+        return false;
+    }
+
+    // Numeric literals and addresses - don't declare
+    if name.starts_with("0x") || name.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    // Default: if not a register and not a literal, likely a local variable
+    // This catches any other semantic names we might have missed
+    true
 }
 
 /// Attempts to extract array access components from an address expression.

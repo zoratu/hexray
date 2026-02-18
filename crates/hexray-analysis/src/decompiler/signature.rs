@@ -317,7 +317,7 @@ impl ParameterUsageHints {
             return match index {
                 0 => "str".to_string(),
                 1 => "str2".to_string(),
-                _ => format!("str{}", index),
+                _ => format!("str{}", index + 1),
             };
         }
 
@@ -325,7 +325,7 @@ impl ParameterUsageHints {
             return match index {
                 0 => "ptr".to_string(),
                 1 => "ptr2".to_string(),
-                _ => format!("ptr{}", index),
+                _ => format!("ptr{}", index + 1),
             };
         }
 
