@@ -6705,7 +6705,7 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_can_use_shape_fallback_for_callback_type_without_direct_param_mapping() {
+    fn test_emit_does_not_force_callback_type_for_static_callback_symbol() {
         use super::super::expression::Variable;
 
         let call = Expr::call(
@@ -6732,10 +6732,8 @@ mod tests {
         let output = emitter.emit(&cfg, "qsort_wrapper");
         let header = output.lines().next().unwrap_or_default();
         assert!(
-            header.contains("(*arg1)(void*, void*)")
-                || header.contains("(*arg2)(void*, void*)")
-                || header.contains("(*arg3)(void*, void*)"),
-            "Header should include inferred callback type via fallback mapping:\n{}",
+            !header.contains("(*arg"),
+            "Header should keep static callback symbols as non-parameter values:\n{}",
             output
         );
     }
