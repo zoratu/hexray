@@ -2723,6 +2723,20 @@ impl SignatureRecovery {
             sig.return_type = ParamType::Void;
         }
 
+        if matches!(self.current_func_name.as_deref(), Some("main" | "_main")) {
+            sig.has_return = true;
+            sig.return_type = ParamType::SignedInt(32);
+            if !sig
+                .return_provenance
+                .iter()
+                .any(|r| r == "main ABI default return type")
+            {
+                sig.return_provenance
+                    .push("main ABI default return type".to_string());
+            }
+            sig.return_confidence = sig.return_confidence.max(220);
+        }
+
         sig
     }
 
@@ -3019,6 +3033,44 @@ mod tests {
         assert!(sig.has_return);
         // Return type should be detected
         assert!(!matches!(sig.return_type, ParamType::Void));
+    }
+
+    #[test]
+    fn test_main_signature_forces_int32_return_type() {
+        use hexray_core::BasicBlockId;
+
+        let narrow_cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(Expr::int(0)),
+                to_size: 1,
+                signed: false,
+            },
+        };
+        let set_ret = Expr::assign(Expr::var(Variable::reg("w0", 4)), narrow_cast);
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![set_ret],
+            address_range: (0x1000, 0x1010),
+        };
+        let ret = StructuredNode::Return(None);
+        let cfg = StructuredCfg {
+            body: vec![block, ret],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery =
+            SignatureRecovery::new(CallingConvention::Aarch64).with_function_name("_main");
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert!(matches!(sig.return_type, ParamType::SignedInt(32)));
+        assert!(
+            sig.return_provenance
+                .iter()
+                .any(|r| r == "main ABI default return type"),
+            "provenance: {:?}",
+            sig.return_provenance
+        );
     }
 
     #[test]

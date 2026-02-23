@@ -24,6 +24,12 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - Slot-0 callback APIs now use slot-ordinal fallback, stabilizing wrappers like `on_exit` on canonical callback parameters without ABI-shape heuristics.
 - Strict CLI callback snapshot regressions now enforce canonical typed headers for `register_on_exit` and `register_atfork`, including slot-0 fallback provenance coverage.
 - Callback benchmark index-stability gates now include `hexray_on_exit` and `hexray_pthread_atfork` (including alias-reuse forms), with strict precision/recall thresholds.
+- Emitter now applies parameter display-name overrides through the function body (not just headers), reducing `ptr`/`argc` vs `argN` mismatches in emitted statements.
+- Main-like functions now default to `int32_t` return typing in signature recovery, preventing narrow transient register casts from forcing `int8_t`/`int16_t` main signatures.
+- Loop-condition variables that are counter-like and never assigned in the recovered body are now declared with explicit `= 0` initialization to avoid obvious use-before-write artifacts.
+- Loop-condition zero-init analysis is now order-aware (pre-loop assignment tracking), so writes that occur only inside loop bodies no longer suppress needed first-iteration initialization.
+- Local declaration recovery now merges emitted-body assignment identifiers and canonicalizes array-suffixed names (e.g., `tmp1[idx]` -> `tmp1`), preventing missing/invalid declarations in loop-heavy corpus functions.
+- Top-level emission now stops after control-exit statements unless later labels exist, reducing stray unreachable statements after `return` in decompiled output.
 
 Remaining high-value follow-up:
 - Continue reducing shape-fallback reliance in callback wrappers by expanding precise alias resolution for lifted temporaries.

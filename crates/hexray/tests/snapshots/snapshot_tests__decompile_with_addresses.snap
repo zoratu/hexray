@@ -1,5 +1,6 @@
 ---
 source: crates/hexray/tests/snapshot_tests.rs
+assertion_line: 337
 expression: normalized
 ---
 (auto-selected 'main' at [ADDR])
@@ -8,6 +9,8 @@ Decompiling _main at [ADDR]
 
 int32_t _main(void)
 {
+    int ret;
+    int ret2;
     int var_0;
 
     // bb0 [[ADDR]..[ADDR]]
