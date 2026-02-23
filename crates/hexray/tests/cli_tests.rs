@@ -770,7 +770,7 @@ fn test_decompile_callback_header_snapshots() {
     if strict {
         assert_eq!(
             static_cmp_header,
-            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)",
             "Strict mode mismatch for symbol sort_with_static_cmp"
         );
     } else {
@@ -787,7 +787,7 @@ fn test_decompile_callback_header_snapshots() {
         .unwrap_or_else(|| panic!("missing decompile header for symbol spawn_with_static_start"));
     if strict {
         assert_eq!(
-            static_spawn_header, "int32_t _spawn_with_static_start(void* (*arg0)(void*))",
+            static_spawn_header, "int32_t _spawn_with_static_start(int64_t arg0)",
             "Strict mode mismatch for symbol spawn_with_static_start"
         );
     } else {

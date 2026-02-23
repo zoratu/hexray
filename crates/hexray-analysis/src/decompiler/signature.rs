@@ -1055,6 +1055,8 @@ pub struct SignatureRecovery {
     function_pointer_aliases: HashMap<String, BTreeSet<usize>>,
     /// Most recently observed alias-to-parameter mapping for flow-sensitive disambiguation.
     function_pointer_alias_latest: HashMap<String, usize>,
+    /// Names assigned within the recovered body (for local alias affinity checks).
+    assigned_value_names: HashSet<String>,
     /// Function-pointer typed locals derived from assignments/returns.
     value_function_pointer_types: HashMap<String, ParamType>,
     /// String functions for detection.
@@ -1098,6 +1100,7 @@ impl SignatureRecovery {
             param_hints: HashMap::new(),
             function_pointer_aliases: HashMap::new(),
             function_pointer_alias_latest: HashMap::new(),
+            assigned_value_names: HashSet::new(),
             value_function_pointer_types: HashMap::new(),
             string_functions,
             relocation_table: None,
@@ -1152,6 +1155,7 @@ impl SignatureRecovery {
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
         self.function_pointer_alias_latest.clear();
+        self.assigned_value_names.clear();
         self.value_function_pointer_types.clear();
 
         // Analyze the function body
@@ -1479,8 +1483,13 @@ impl SignatureRecovery {
                 }
 
                 if let Some(lhs_name) = self.extract_var_name(lhs) {
+                    self.assigned_value_names.insert(lhs_name.clone());
                     if let Some(idx) = self.resolve_param_index_from_expr_precise(rhs) {
                         self.insert_function_pointer_alias(&lhs_name, idx);
+                    } else if let Some(rhs_name) = self.extract_var_name(rhs) {
+                        if let Some(idx) = self.resolve_latest_alias_param_index(&rhs_name) {
+                            self.insert_function_pointer_alias(&lhs_name, idx);
+                        }
                     }
                     if let Some(rhs_name) = self.extract_var_name(rhs) {
                         if let Some(ty) = self.value_function_pointer_types.get(&rhs_name).cloned()
@@ -1745,6 +1754,13 @@ impl SignatureRecovery {
                                         .or_else(|| self.fallback_callback_param_index());
                                     used_shape_fallback = resolved_param_idx.is_some();
                                 }
+                            }
+                            if used_shape_fallback
+                                && !self
+                                    .should_use_shape_callback_fallback(arg, var_name.as_deref())
+                            {
+                                used_shape_fallback = false;
+                                resolved_param_idx = None;
                             }
                         }
                         if is_callback_slot {
@@ -2268,6 +2284,18 @@ impl SignatureRecovery {
         (0..8)
             .filter(|idx| ParameterUsageHints::callback_signature(function_name, *idx).is_some())
             .collect()
+    }
+
+    fn should_use_shape_callback_fallback(&self, expr: &Expr, var_name: Option<&str>) -> bool {
+        let Some(name) = var_name else {
+            return !matches!(expr.kind, ExprKind::IntLit(_));
+        };
+        let lowered = name.to_lowercase();
+        self.may_alias_parameter(&lowered)
+            || self.assigned_value_names.contains(&lowered)
+            || self.resolve_alias_param_index(&lowered).is_some()
+            || self.resolve_latest_alias_param_index(&lowered).is_some()
+            || !self.alias_candidate_indices(&lowered).is_empty()
     }
 
     fn prefer_slot_ordinal_callback_fallback(function_name: &str) -> bool {
@@ -3960,6 +3988,69 @@ mod tests {
                 sig.parameters
             );
         }
+    }
+
+    #[test]
+    fn test_signature_recovery_resolves_multihop_lifted_alias_chain_for_qsort_callback() {
+        use hexray_core::BasicBlockId;
+
+        let bind0 = Expr::assign(Expr::unknown("arg_8"), Expr::unknown("arg0"));
+        let bind1 = Expr::assign(Expr::unknown("arg_10"), Expr::unknown("arg1"));
+        let bind2 = Expr::assign(Expr::unknown("var_18"), Expr::unknown("arg2"));
+        let bind3 = Expr::assign(Expr::unknown("arg_10"), Expr::unknown("var_18"));
+        let bind4 = Expr::assign(Expr::unknown("arg_8"), Expr::unknown("arg_10"));
+        let bind5 = Expr::assign(Expr::unknown("var_0"), Expr::unknown("arg_8"));
+        let call = Expr::call(
+            CallTarget::Named("_qsort".to_string()),
+            vec![
+                Expr::unknown("arg_8"),
+                Expr::unknown("arg_10"),
+                Expr::int(4),
+                Expr::unknown("var_0"),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![bind0, bind1, bind2, bind3, bind4, bind5, call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(
+            sig.parameters.iter().any(|p| {
+                matches!(p.param_type, ParamType::FunctionPointer { .. })
+                    && matches!(
+                        p.location,
+                        ParameterLocation::IntegerRegister { index: 2, .. }
+                    )
+            }),
+            "params: {:?}",
+            sig.parameters
+        );
+        let reasons = sig
+            .parameter_provenance
+            .get(&2)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            reasons.iter().any(|r| r.contains("[source=alias]")),
+            "provenance: {:?}",
+            reasons
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.contains("[source=shape-fallback]")),
+            "provenance: {:?}",
+            reasons
+        );
     }
 
     #[test]

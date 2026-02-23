@@ -24,6 +24,8 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - Slot-0 callback APIs now use slot-ordinal fallback, stabilizing wrappers like `on_exit` on canonical callback parameters without ABI-shape heuristics.
 - Strict CLI callback snapshot regressions now enforce canonical typed headers for `register_on_exit` and `register_atfork`, including slot-0 fallback provenance coverage.
 - Callback benchmark index-stability gates now include `hexray_on_exit` and `hexray_pthread_atfork` (including alias-reuse forms), with strict precision/recall thresholds.
+- Shape fallback is now gated by parameter-affinity evidence, which removes false callback-slot tagging on literal/static callback arguments (for example `bsearch` size-slot and static wrapper symbols).
+- Lifted multihop callback alias chains now have dedicated regression coverage to keep qsort callback typing stable while reducing fallback noise.
 - Emitter now applies parameter display-name overrides through the function body (not just headers), reducing `ptr`/`argc` vs `argN` mismatches in emitted statements.
 - Main-like functions now default to `int32_t` return typing in signature recovery, preventing narrow transient register casts from forcing `int8_t`/`int16_t` main signatures.
 - Loop-condition variables that are counter-like and never assigned in the recovered body are now declared with explicit `= 0` initialization to avoid obvious use-before-write artifacts.
