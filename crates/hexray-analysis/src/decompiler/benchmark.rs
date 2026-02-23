@@ -62,6 +62,8 @@ pub struct BenchmarkCase {
     pub min_callback_index_precision: Option<f64>,
     /// Minimum recall threshold for callback parameter-index stability.
     pub min_callback_index_recall: Option<f64>,
+    /// Maximum allowed share of callback provenance that comes from shape fallback.
+    pub max_callback_shape_fallback_ratio: Option<f64>,
 }
 
 impl BenchmarkCase {
@@ -84,6 +86,7 @@ impl BenchmarkCase {
             expected_callback_param_indices: Vec::new(),
             min_callback_index_precision: None,
             min_callback_index_recall: None,
+            max_callback_shape_fallback_ratio: None,
         }
     }
 
@@ -174,6 +177,12 @@ impl BenchmarkCase {
     /// Requires callback parameter-index recall at or above threshold.
     pub fn with_min_callback_index_recall(mut self, min_recall: f64) -> Self {
         self.min_callback_index_recall = Some(min_recall.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Caps the allowed fraction of callback provenance attributed to shape fallback.
+    pub fn with_max_callback_shape_fallback_ratio(mut self, max_ratio: f64) -> Self {
+        self.max_callback_shape_fallback_ratio = Some(max_ratio.clamp(0.0, 1.0));
         self
     }
 }
@@ -269,6 +278,12 @@ pub struct BenchmarkResult {
     pub callback_index_precision: f64,
     /// Callback parameter-index recall.
     pub callback_index_recall: f64,
+    /// Callback provenance entries tagged as shape-fallback.
+    pub callback_shape_fallback_count: usize,
+    /// Total callback provenance entries with explicit source tags.
+    pub callback_provenance_total: usize,
+    /// Share of callback provenance entries coming from shape-fallback.
+    pub callback_shape_fallback_ratio: f64,
     /// Execution time.
     pub duration: Duration,
     /// The decompiled output.
@@ -488,6 +503,9 @@ impl BenchmarkSuite {
                     callback_index_expected: 0,
                     callback_index_precision: 0.0,
                     callback_index_recall: 0.0,
+                    callback_shape_fallback_count: 0,
+                    callback_provenance_total: 0,
+                    callback_shape_fallback_ratio: 0.0,
                     duration: start.elapsed(),
                     output: String::new(),
                     pattern_results: Vec::new(),
@@ -544,6 +562,13 @@ impl BenchmarkSuite {
             }
         } else {
             callback_index_true_positives as f64 / callback_index_predicted as f64
+        };
+        let callback_shape_fallback_count = count_callback_shape_fallback_provenance(&output);
+        let callback_provenance_total = count_callback_provenance_sources(&output);
+        let callback_shape_fallback_ratio = if callback_provenance_total == 0 {
+            0.0
+        } else {
+            callback_shape_fallback_count as f64 / callback_provenance_total as f64
         };
 
         // Check for forbidden patterns
@@ -630,6 +655,25 @@ impl BenchmarkSuite {
                 )),
             });
         }
+        if let Some(max_ratio) = case.max_callback_shape_fallback_ratio {
+            let matched = callback_shape_fallback_ratio <= max_ratio;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(callback_shape_fallback_ratio<={:.2})", max_ratio),
+                matched,
+                location: output
+                    .lines()
+                    .position(|line| line.contains("[source=shape-fallback]")),
+                details: Some(format!(
+                    "ratio {:.3} ({}/{})",
+                    callback_shape_fallback_ratio,
+                    callback_shape_fallback_count,
+                    callback_provenance_total
+                )),
+            });
+        }
 
         // Calculate score
         let pattern_score = if !case.expected_patterns.is_empty() {
@@ -663,6 +707,9 @@ impl BenchmarkSuite {
             callback_index_expected,
             callback_index_precision,
             callback_index_recall,
+            callback_shape_fallback_count,
+            callback_provenance_total,
+            callback_shape_fallback_ratio,
             duration: start.elapsed(),
             output,
             pattern_results,
@@ -962,6 +1009,16 @@ fn extract_callback_param_indices(output: &str) -> Vec<usize> {
     indices.sort_unstable();
     indices.dedup();
     indices
+}
+
+/// Count callback provenance entries that include explicit source tags.
+fn count_callback_provenance_sources(output: &str) -> usize {
+    output.matches("[source=").count()
+}
+
+/// Count callback provenance entries that came from ABI-shape fallback.
+fn count_callback_shape_fallback_provenance(output: &str) -> usize {
+    output.matches("[source=shape-fallback]").count()
 }
 
 /// Create the standard benchmark suite with common test cases.
@@ -1811,6 +1868,13 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .forbid_pattern(ForbiddenPattern::Goto),
     );
 
+    // Callback cases should avoid shape-fallback provenance where possible.
+    for case in &mut suite.cases {
+        if case.id.starts_with("callback_") {
+            case.max_callback_shape_fallback_ratio = Some(0.0);
+        }
+    }
+
     suite
 }
 
@@ -1846,7 +1910,7 @@ impl BenchmarkSuiteResults {
         for result in &self.case_results {
             let status = if result.passed { "PASS" } else { "FAIL" };
             report.push_str(&format!(
-                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos, fp P/R {:.2}/{:.2}, cb-idx P/R {:.2}/{:.2})\n",
+                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos, fp P/R {:.2}/{:.2}, cb-idx P/R {:.2}/{:.2}, cb-shape {:.2} [{}/{}])\n",
                 status,
                 result.case_id,
                 result.score * 100.0,
@@ -1858,7 +1922,10 @@ impl BenchmarkSuiteResults {
                 result.fp_precision,
                 result.fp_recall,
                 result.callback_index_precision,
-                result.callback_index_recall
+                result.callback_index_recall,
+                result.callback_shape_fallback_ratio,
+                result.callback_shape_fallback_count,
+                result.callback_provenance_total
             ));
             if let Some(ref err) = result.error {
                 report.push_str(&format!("       Error: {}\n", err));
@@ -1895,6 +1962,7 @@ mod tests {
         assert!(case.expected_callback_param_indices.is_empty());
         assert!(case.min_callback_index_precision.is_none());
         assert!(case.min_callback_index_recall.is_none());
+        assert!(case.max_callback_shape_fallback_ratio.is_none());
     }
 
     #[test]
@@ -2082,6 +2150,12 @@ mod tests {
                 "{} should require strong quality floor",
                 id
             );
+            assert_eq!(
+                case.max_callback_shape_fallback_ratio,
+                Some(0.0),
+                "{} should require zero shape-fallback provenance ratio",
+                id
+            );
         }
 
         let callback_index_ids = [
@@ -2117,6 +2191,12 @@ mod tests {
                 case.max_gotos,
                 Some(0),
                 "{} should disallow goto fallback",
+                id
+            );
+            assert_eq!(
+                case.max_callback_shape_fallback_ratio,
+                Some(0.0),
+                "{} should require zero shape-fallback provenance ratio",
                 id
             );
         }
@@ -2198,6 +2278,42 @@ mod tests {
         assert_eq!(fail.callback_index_predicted, 2);
         assert_eq!(fail.callback_index_precision, 1.0);
         assert_eq!(fail.callback_index_recall, 2.0 / 3.0);
+    }
+
+    #[test]
+    fn test_callback_shape_fallback_ratio_metric() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(
+            BenchmarkCase::new("callback_shape_ratio").with_max_callback_shape_fallback_ratio(0.5),
+        );
+
+        let pass_results = suite.run_all(|_| {
+            Ok("\
+// [diag] [source=alias] callback slot qsort arg3
+// [diag] [source=alias-latest] callback slot qsort arg3
+// [diag] [source=shape-fallback] callback slot qsort arg3
+int32_t f(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*)) { return 0; }"
+                .to_string())
+        });
+        assert_eq!(pass_results.passed, 1);
+        let pass = &pass_results.case_results[0];
+        assert_eq!(pass.callback_provenance_total, 3);
+        assert_eq!(pass.callback_shape_fallback_count, 1);
+        assert!((pass.callback_shape_fallback_ratio - (1.0 / 3.0)).abs() < 1e-9);
+
+        let fail_results = suite.run_all(|_| {
+            Ok("\
+// [diag] [source=shape-fallback] callback slot qsort arg3
+// [diag] [source=shape-fallback] callback slot qsort arg3
+// [diag] [source=alias] callback slot qsort arg3
+int32_t f(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*)) { return 0; }"
+                .to_string())
+        });
+        assert_eq!(fail_results.failed, 1);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.callback_provenance_total, 3);
+        assert_eq!(fail.callback_shape_fallback_count, 2);
+        assert!((fail.callback_shape_fallback_ratio - (2.0 / 3.0)).abs() < 1e-9);
     }
 
     #[test]

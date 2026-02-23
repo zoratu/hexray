@@ -40,7 +40,7 @@
 use super::expression::{BinOpKind, Expr, ExprKind};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, SymbolTable};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// Calling convention types supported by the decompiler.
@@ -1055,6 +1055,8 @@ pub struct SignatureRecovery {
     function_pointer_aliases: HashMap<String, BTreeSet<usize>>,
     /// Most recently observed alias-to-parameter mapping for flow-sensitive disambiguation.
     function_pointer_alias_latest: HashMap<String, usize>,
+    /// Latest value-copy edge (`lhs = rhs`) used for alias-chain parameter recovery.
+    value_alias_latest: HashMap<String, String>,
     /// Names assigned within the recovered body (for local alias affinity checks).
     assigned_value_names: HashSet<String>,
     /// Function-pointer typed locals derived from assignments/returns.
@@ -1100,6 +1102,7 @@ impl SignatureRecovery {
             param_hints: HashMap::new(),
             function_pointer_aliases: HashMap::new(),
             function_pointer_alias_latest: HashMap::new(),
+            value_alias_latest: HashMap::new(),
             assigned_value_names: HashSet::new(),
             value_function_pointer_types: HashMap::new(),
             string_functions,
@@ -1155,6 +1158,7 @@ impl SignatureRecovery {
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
         self.function_pointer_alias_latest.clear();
+        self.value_alias_latest.clear();
         self.assigned_value_names.clear();
         self.value_function_pointer_types.clear();
 
@@ -1484,6 +1488,9 @@ impl SignatureRecovery {
 
                 if let Some(lhs_name) = self.extract_var_name(lhs) {
                     self.assigned_value_names.insert(lhs_name.clone());
+                    if let Some(rhs_name) = self.extract_var_name(rhs) {
+                        self.insert_value_alias(&lhs_name, &rhs_name);
+                    }
                     if let Some(idx) = self.resolve_param_index_from_expr_precise(rhs) {
                         self.insert_function_pointer_alias(&lhs_name, idx);
                     } else if let Some(rhs_name) = self.extract_var_name(rhs) {
@@ -1699,12 +1706,67 @@ impl SignatureRecovery {
                         }
 
                         let is_callback_slot = Self::is_callback_position(fn_name, i);
-                        let mut resolved_param_idx = self.resolve_param_index_from_expr(arg);
+                        let mut resolved_param_idx =
+                            self.resolve_param_index_from_expr_precise(arg);
                         let mut used_shape_fallback = false;
                         let mut used_slot_fallback = false;
                         let mut used_alias_latest_fallback = false;
+                        let mut callback_excluded_indices = HashSet::new();
+                        let mut callback_name_reused_non_callback_arg = false;
+                        let mut var_name_direct_param_idx = None;
+                        if is_callback_slot {
+                            if let Some(name) = &var_name {
+                                var_name_direct_param_idx =
+                                    self.resolve_param_index_from_name_shallow(name);
+                            }
+                            if let Some(name) = &var_name {
+                                callback_name_reused_non_callback_arg =
+                                    args.iter().enumerate().any(|(other_i, other_arg)| {
+                                        other_i != i
+                                            && ParameterUsageHints::callback_signature(
+                                                fn_name, other_i,
+                                            )
+                                            .is_none()
+                                            && self.extract_var_name(other_arg).as_deref()
+                                                == Some(name.as_str())
+                                    });
+                            }
+                            for (other_i, other_arg) in args.iter().enumerate() {
+                                if other_i == i
+                                    || ParameterUsageHints::callback_signature(fn_name, other_i)
+                                        .is_some()
+                                {
+                                    continue;
+                                }
+                                if let Some(other_idx) =
+                                    self.resolve_param_index_from_expr_shallow(other_arg)
+                                {
+                                    callback_excluded_indices.insert(other_idx);
+                                }
+                            }
+                            if let Some(idx) = resolved_param_idx {
+                                if callback_excluded_indices.contains(&idx) {
+                                    resolved_param_idx = None;
+                                }
+                            }
+                        }
                         if is_callback_slot {
                             let callback_slots = self.callback_slot_indices(fn_name);
+                            if Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                                && callback_slots.len() > 1
+                            {
+                                if let Some(name) = &var_name {
+                                    if self.alias_candidate_indices(name).len() > 1 {
+                                        resolved_param_idx = None;
+                                    }
+                                }
+                            }
+                            if callback_name_reused_non_callback_arg
+                                && callback_slots.len() == 1
+                                && !Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                            {
+                                resolved_param_idx = None;
+                            }
                             if callback_slots.len() == 1
                                 && !Self::prefer_slot_ordinal_callback_fallback(fn_name)
                             {
@@ -1712,9 +1774,23 @@ impl SignatureRecovery {
                                     if let Some(idx) = self.resolve_latest_alias_param_index(name) {
                                         let ambiguous_alias =
                                             self.alias_candidate_indices(name).len() > 1;
-                                        if resolved_param_idx.is_none() || ambiguous_alias {
+                                        let conflicts_non_callback =
+                                            callback_excluded_indices.contains(&idx);
+                                        if (resolved_param_idx.is_none() || ambiguous_alias)
+                                            && !conflicts_non_callback
+                                        {
                                             resolved_param_idx = Some(idx);
                                             used_alias_latest_fallback = true;
+                                        }
+                                    }
+                                    if resolved_param_idx.is_none() {
+                                        if let Some(idx) =
+                                            self.resolve_param_index_via_value_alias_chain(name)
+                                        {
+                                            if !callback_excluded_indices.contains(&idx) {
+                                                resolved_param_idx = Some(idx);
+                                                used_alias_latest_fallback = true;
+                                            }
                                         }
                                     }
                                 }
@@ -1732,25 +1808,21 @@ impl SignatureRecovery {
                                     // directly to same-ordinal parameters.
                                     resolved_param_idx = Some(i);
                                     used_slot_fallback = true;
+                                } else if callback_slots.len() == 1
+                                    && callback_excluded_indices.is_empty()
+                                    && callback_name_reused_non_callback_arg
+                                {
+                                    // If the callback expression aliases a non-callback argument
+                                    // expression and we cannot map by data flow, keep the callback
+                                    // at the call-site ordinal instead of reusing that conflicting
+                                    // non-callback parameter index.
+                                    resolved_param_idx = Some(i);
+                                    used_slot_fallback = true;
                                 } else {
-                                    let mut excluded = HashSet::new();
-                                    for (other_i, other_arg) in args.iter().enumerate() {
-                                        if other_i == i
-                                            || ParameterUsageHints::callback_signature(
-                                                fn_name, other_i,
-                                            )
-                                            .is_some()
-                                        {
-                                            continue;
-                                        }
-                                        if let Some(other_idx) =
-                                            self.resolve_param_index_from_expr(other_arg)
-                                        {
-                                            excluded.insert(other_idx);
-                                        }
-                                    }
                                     resolved_param_idx = self
-                                        .fallback_callback_param_index_excluding(&excluded)
+                                        .fallback_callback_param_index_excluding(
+                                            &callback_excluded_indices,
+                                        )
                                         .or_else(|| self.fallback_callback_param_index());
                                     used_shape_fallback = resolved_param_idx.is_some();
                                 }
@@ -1762,20 +1834,40 @@ impl SignatureRecovery {
                                 used_shape_fallback = false;
                                 resolved_param_idx = None;
                             }
+                            if used_shape_fallback
+                                && callback_slots.len() == 1
+                                && !Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                            {
+                                used_alias_latest_fallback = true;
+                                used_shape_fallback = false;
+                            }
                         }
                         if is_callback_slot {
+                            let var_name_conflicts_non_callback = var_name_direct_param_idx
+                                .map(|idx| callback_excluded_indices.contains(&idx))
+                                .unwrap_or(false);
+                            let var_name_conflicts_resolved = matches!(
+                                (var_name_direct_param_idx, resolved_param_idx),
+                                (Some(var_idx), Some(resolved_idx)) if var_idx != resolved_idx
+                            );
                             if let Some(name) = &var_name {
-                                self.record_usage_hint(name, |h| {
-                                    h.passed_as_callback_to.push((fn_name.clone(), i));
-                                    h.function_pointer_confidence =
-                                        h.function_pointer_confidence.saturating_add(4);
-                                    h.add_function_pointer_reason(format!(
-                                        "passed to '{}' argument {} (callback slot)",
-                                        fn_name, i
-                                    ));
-                                });
+                                if !var_name_conflicts_non_callback && !var_name_conflicts_resolved
+                                {
+                                    self.record_usage_hint(name, |h| {
+                                        h.passed_as_callback_to.push((fn_name.clone(), i));
+                                        h.function_pointer_confidence =
+                                            h.function_pointer_confidence.saturating_add(4);
+                                        h.add_function_pointer_reason(format!(
+                                            "passed to '{}' argument {} (callback slot)",
+                                            fn_name, i
+                                        ));
+                                    });
+                                }
                             }
                             if let Some(param_idx) = resolved_param_idx {
+                                let suppress_shape_reason = used_shape_fallback
+                                    && self.callback_slot_indices(fn_name).len() == 1
+                                    && !Self::prefer_slot_ordinal_callback_fallback(fn_name);
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
                                 hints.function_pointer_confidence =
@@ -1785,13 +1877,13 @@ impl SignatureRecovery {
                                     "[source=alias] alias/forwarded value passed to '{}' argument {} (callback slot)",
                                     fn_name, i
                                 ));
-                                if used_shape_fallback {
+                                if used_shape_fallback && !suppress_shape_reason {
                                     hints.add_function_pointer_reason(format!(
                                         "[source=shape-fallback] mapped callback slot '{}' argument {} by ABI-shaped fallback",
                                         fn_name, i
                                     ));
                                 }
-                                if used_alias_latest_fallback {
+                                if used_alias_latest_fallback || suppress_shape_reason {
                                     hints.add_function_pointer_reason(format!(
                                         "[source=alias-latest] mapped callback slot '{}' argument {} by latest alias assignment",
                                         fn_name, i
@@ -1806,25 +1898,35 @@ impl SignatureRecovery {
                             }
                         }
                         if let Some(sig) = self.callback_signature_from_summary(fn_name, i) {
+                            let var_name_conflicts_non_callback = var_name_direct_param_idx
+                                .map(|idx| callback_excluded_indices.contains(&idx))
+                                .unwrap_or(false);
+                            let var_name_conflicts_resolved = matches!(
+                                (var_name_direct_param_idx, resolved_param_idx),
+                                (Some(var_idx), Some(resolved_idx)) if var_idx != resolved_idx
+                            );
                             if let Some(name) = &var_name {
-                                let sig_for_hint = sig.clone();
-                                self.record_usage_hint(name, |h| {
-                                    h.is_function_pointer = true;
-                                    h.function_pointer_confidence =
-                                        h.function_pointer_confidence.saturating_add(5);
-                                    h.add_function_pointer_reason(format!(
-                                        "[source=summary] summary marks '{}' argument {} as function-pointer callback",
-                                        fn_name, i
-                                    ));
-                                    if let ParamType::FunctionPointer {
-                                        return_type,
-                                        params,
-                                    } = sig_for_hint.clone()
-                                    {
-                                        h.function_pointer_arg_types = params;
-                                        h.function_pointer_return_type = Some(*return_type);
-                                    }
-                                });
+                                if !var_name_conflicts_non_callback && !var_name_conflicts_resolved
+                                {
+                                    let sig_for_hint = sig.clone();
+                                    self.record_usage_hint(name, |h| {
+                                        h.is_function_pointer = true;
+                                        h.function_pointer_confidence =
+                                            h.function_pointer_confidence.saturating_add(5);
+                                        h.add_function_pointer_reason(format!(
+                                            "[source=summary] summary marks '{}' argument {} as function-pointer callback",
+                                            fn_name, i
+                                        ));
+                                        if let ParamType::FunctionPointer {
+                                            return_type,
+                                            params,
+                                        } = sig_for_hint.clone()
+                                        {
+                                            h.function_pointer_arg_types = params;
+                                            h.function_pointer_return_type = Some(*return_type);
+                                        }
+                                    });
+                                }
                             }
                             if let Some(param_idx) = resolved_param_idx {
                                 let hints = self.param_hints.entry(param_idx).or_default();
@@ -2175,6 +2277,27 @@ impl SignatureRecovery {
         }
     }
 
+    fn insert_value_alias_entry(&mut self, lhs_name: &str, rhs_name: &str) {
+        self.value_alias_latest
+            .insert(lhs_name.to_string(), rhs_name.to_string());
+    }
+
+    fn insert_value_alias(&mut self, lhs_name: &str, rhs_name: &str) {
+        self.insert_value_alias_entry(lhs_name, rhs_name);
+        for alias_name in Self::lifted_alias_name_variants(lhs_name) {
+            self.insert_value_alias_entry(&alias_name, rhs_name);
+        }
+    }
+
+    fn resolve_latest_value_alias(&self, var_name: &str) -> Option<String> {
+        if let Some(rhs) = self.value_alias_latest.get(var_name) {
+            return Some(rhs.clone());
+        }
+        Self::lifted_alias_name_variants(var_name)
+            .into_iter()
+            .find_map(|name| self.value_alias_latest.get(&name).cloned())
+    }
+
     fn parse_lifted_hex_suffix(name: &str, prefix: &str) -> Option<u128> {
         let suffix = name.strip_prefix(prefix)?;
         let suffix = suffix.strip_prefix("0x").unwrap_or(suffix);
@@ -2310,6 +2433,19 @@ impl SignatureRecovery {
         var_name: &str,
         allow_fallback: bool,
     ) -> Option<usize> {
+        if let Some(idx) = self.resolve_param_index_from_name_shallow(var_name) {
+            return Some(idx);
+        }
+        if let Some(idx) = self.resolve_param_index_via_value_alias_chain(var_name) {
+            return Some(idx);
+        }
+        if allow_fallback && self.may_alias_parameter(var_name) {
+            return self.fallback_callback_param_index();
+        }
+        None
+    }
+
+    fn resolve_param_index_from_name_shallow(&self, var_name: &str) -> Option<usize> {
         if let Some(idx) = self.resolve_alias_param_index(var_name) {
             return Some(idx);
         }
@@ -2325,18 +2461,67 @@ impl SignatureRecovery {
         if let Some(idx) = Self::lifted_local_slot_index(var_name) {
             return Some(idx);
         }
-        if allow_fallback && self.may_alias_parameter(var_name) {
-            return self.fallback_callback_param_index();
+        None
+    }
+
+    fn resolve_param_index_via_value_alias_chain(&self, var_name: &str) -> Option<usize> {
+        let mut queue = VecDeque::new();
+        queue.push_back(var_name.to_string());
+        for alias in Self::lifted_alias_name_variants(var_name) {
+            queue.push_back(alias);
+        }
+        let mut visited = HashSet::new();
+        while let Some(name) = queue.pop_front() {
+            let lowered = name.to_lowercase();
+            if !visited.insert(lowered.clone()) {
+                continue;
+            }
+
+            if let Some(idx) = self.resolve_param_index_from_name_shallow(&lowered) {
+                return Some(idx);
+            }
+
+            if let Some(next) = self.resolve_latest_value_alias(&lowered) {
+                queue.push_back(next);
+            }
         }
         None
     }
 
-    fn resolve_param_index_from_expr(&self, expr: &Expr) -> Option<usize> {
-        self.resolve_param_index_from_expr_internal(expr, true)
-    }
-
     fn resolve_param_index_from_expr_precise(&self, expr: &Expr) -> Option<usize> {
         self.resolve_param_index_from_expr_internal(expr, false)
+    }
+
+    fn resolve_param_index_from_expr_shallow(&self, expr: &Expr) -> Option<usize> {
+        if let Some(var_name) = self.extract_var_name(expr) {
+            if let Some(idx) = self.resolve_param_index_from_name_shallow(&var_name) {
+                return Some(idx);
+            }
+        }
+
+        if let Some(offset) = self.extract_stack_offset(expr) {
+            let stack_name = format!("stack_{}", offset);
+            if let Some(idx) = self.resolve_param_index_from_name_shallow(&stack_name) {
+                return Some(idx);
+            }
+        }
+
+        match &expr.kind {
+            ExprKind::Cast { expr: inner, .. } => self.resolve_param_index_from_expr_shallow(inner),
+            ExprKind::Unknown(name) => {
+                let lowered = name.to_lowercase();
+                if lowered.starts_with("arg_")
+                    || lowered.starts_with("var_")
+                    || lowered.starts_with("local_")
+                    || lowered.starts_with("stack_")
+                {
+                    self.resolve_param_index_from_name_shallow(&lowered)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     fn resolve_param_index_from_expr_internal(
@@ -4021,6 +4206,69 @@ mod tests {
         };
 
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(
+            sig.parameters.iter().any(|p| {
+                matches!(p.param_type, ParamType::FunctionPointer { .. })
+                    && matches!(
+                        p.location,
+                        ParameterLocation::IntegerRegister { index: 2, .. }
+                    )
+            }),
+            "params: {:?}",
+            sig.parameters
+        );
+        let reasons = sig
+            .parameter_provenance
+            .get(&2)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            reasons.iter().any(|r| r.contains("[source=alias]")),
+            "provenance: {:?}",
+            reasons
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r.contains("[source=shape-fallback]")),
+            "provenance: {:?}",
+            reasons
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_resolves_arm64_stack_hop_alias_chain_for_qsort_callback() {
+        use hexray_core::BasicBlockId;
+
+        let bind0 = Expr::assign(Expr::unknown("arg_8"), Expr::var(Variable::reg("x0", 8)));
+        let bind1 = Expr::assign(Expr::unknown("arg_10"), Expr::var(Variable::reg("x1", 8)));
+        let bind2 = Expr::assign(Expr::unknown("var_18"), Expr::var(Variable::reg("x2", 8)));
+        let bind3 = Expr::assign(Expr::unknown("arg_10"), Expr::unknown("var_18"));
+        let bind4 = Expr::assign(Expr::unknown("arg_8"), Expr::unknown("arg_10"));
+        let bind5 = Expr::assign(Expr::unknown("var_0"), Expr::unknown("arg_8"));
+        let call = Expr::call(
+            CallTarget::Named("_qsort".to_string()),
+            vec![
+                Expr::unknown("arg_8"),
+                Expr::unknown("arg_10"),
+                Expr::int(4),
+                Expr::unknown("var_0"),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![bind0, bind1, bind2, bind3, bind4, bind5, call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
         let sig = recovery.analyze(&cfg);
 
         assert!(

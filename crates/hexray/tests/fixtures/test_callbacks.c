@@ -110,6 +110,15 @@ int sort_with_cmp_multihop(int* arr, size_t n, cmp_fn_t cmp) {
     return arr[0];
 }
 
+int sort_with_cmp_stack_spill(int* arr, size_t n, cmp_fn_t cmp) {
+    cmp_fn_t spill0 = cmp;
+    cmp_fn_t* spill_ptr = &spill0;
+    cmp_fn_t spill1 = *spill_ptr;
+    cmp_fn_t spill2 = spill1;
+    qsort(arr, n, sizeof(int), spill2);
+    return arr[0];
+}
+
 int sort_mixed_forwarding(int* arr, size_t n, cmp_fn_t cmp, int use_dynamic) {
     cmp_fn_t selected = use_dynamic ? cmp : cmp_ints;
     qsort(arr, n, sizeof(int), selected);
@@ -121,6 +130,14 @@ int spawn_with_start_multihop(thread_start_t start_routine, void* arg) {
     thread_start_t level1 = level0;
     pthread_t tid;
     return pthread_create(&tid, 0, level1, arg);
+}
+
+int spawn_with_start_stack_spill(thread_start_t start_routine, void* arg) {
+    thread_start_t spill0 = start_routine;
+    thread_start_t* spill_ptr = &spill0;
+    thread_start_t spill1 = *spill_ptr;
+    pthread_t tid;
+    return pthread_create(&tid, 0, spill1, arg);
 }
 
 int spawn_mixed_forwarding(thread_start_t start_routine, void* arg, int use_dynamic) {
@@ -179,12 +196,14 @@ int run_callbacks(int* arr, size_t n, handler_fn_t h) {
     int first = sort_with_cmp(arr, n, cmp_ints);
     int looked = lookup_with_cmp(arr, n, 3, cmp_ints);
     int spawned = spawn_with_start(thread_trampoline, arr);
+    int stacked = sort_with_cmp_stack_spill(arr, n, cmp_ints);
+    int spawned_stacked = spawn_with_start_stack_spill(thread_trampoline, arr);
     int glibc_like = sort_with_qsort_r_glibc(arr, n, cmp_ints_with_ctx, 0);
     int bsd_like = sort_with_qsort_r_bsd(arr, n, cmp_ints_with_ctx, 0);
     int reg_exit = register_on_exit(on_exit_trampoline, arr);
     int reg_atfork = register_atfork(atfork_prepare, atfork_parent, atfork_child);
     return first + looked + spawned + glibc_like + bsd_like + reg_exit + reg_atfork
-        + (install_handler(h) != 0);
+        + stacked + spawned_stacked + (install_handler(h) != 0);
 }
 
 int main(void) {
