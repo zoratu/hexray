@@ -681,9 +681,42 @@ impl Decompiler {
         let expr_types = expr_type_propagation.export_for_decompiler();
 
         // Merge expression-level types into merged_types
-        // Expression-level types are lower priority than SSA/IPC types
+        // Expression-level types are generally lower priority than SSA/IPC types,
+        // but pointer-like evidence from deref/index usage should override generic
+        // scalar fallback guesses (e.g., int64_t from register width).
+        let is_pointer_like = |ty: &str| {
+            let ty = ty.trim();
+            ty.contains("(*)") || ty.contains('*') || ty.ends_with("[]")
+        };
+        let is_scalar_fallback = |ty: &str| {
+            matches!(
+                ty.trim(),
+                "int"
+                    | "unsigned int"
+                    | "int64_t"
+                    | "uint64_t"
+                    | "int32_t"
+                    | "uint32_t"
+                    | "int16_t"
+                    | "uint16_t"
+                    | "int8_t"
+                    | "uint8_t"
+            )
+        };
         for (k, v) in expr_types {
-            merged_types.entry(k).or_insert(v);
+            match merged_types.get(&k) {
+                None => {
+                    merged_types.insert(k, v);
+                }
+                Some(existing)
+                    if is_pointer_like(&v)
+                        && !is_pointer_like(existing)
+                        && is_scalar_fallback(existing) =>
+                {
+                    merged_types.insert(k, v);
+                }
+                _ => {}
+            }
         }
 
         // Step 3: Apply exception handling if available

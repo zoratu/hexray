@@ -82,6 +82,19 @@ impl ExprType {
         matches!(self, ExprType::Pointer(_) | ExprType::CString)
     }
 
+    /// Returns true if this type should be treated as pointer-like for emission.
+    ///
+    /// Arrays are included because they decay to pointers in many declaration contexts.
+    pub fn is_pointer_like(&self) -> bool {
+        matches!(
+            self,
+            ExprType::Pointer(_)
+                | ExprType::Array { .. }
+                | ExprType::FunctionPointer { .. }
+                | ExprType::CString
+        )
+    }
+
     /// Returns true if this is a character type.
     pub fn is_char(&self) -> bool {
         matches!(self, ExprType::Char { .. })
@@ -1323,7 +1336,15 @@ impl ExpressionTypePropagation {
     /// Sets or merges a variable type.
     fn set_variable_type(&mut self, name: &str, ty: ExprType) {
         if let Some(existing) = self.variable_types.get(name) {
-            let merged = existing.merge(&ty);
+            // Prefer pointer-like evidence (deref/index/fn-pointer usage) over
+            // default scalar guesses from register width.
+            let merged = if existing.is_numeric() && ty.is_pointer_like() {
+                ty
+            } else if existing.is_pointer_like() && ty.is_numeric() {
+                existing.clone()
+            } else {
+                existing.merge(&ty)
+            };
             self.variable_types.insert(name.to_string(), merged);
         } else {
             self.variable_types.insert(name.to_string(), ty);
@@ -1357,10 +1378,17 @@ impl ExpressionTypePropagation {
     /// Exports inferred types as a HashMap<String, String> for the decompiler.
     pub fn export_for_decompiler(&self) -> HashMap<String, String> {
         let mut result = HashMap::new();
+        let to_decl_type = |ty: &ExprType| -> String {
+            match ty {
+                // Keep exported declarations valid C by decaying unsized arrays to pointers.
+                ExprType::Array { element, .. } => format!("{}*", element.to_c_string()),
+                _ => ty.to_c_string(),
+            }
+        };
 
         // Export variable types
         for (name, ty) in &self.variable_types {
-            let type_str = ty.to_c_string();
+            let type_str = to_decl_type(ty);
             // Only export meaningful types (not just "int")
             if type_str != "int" && type_str != "unknown" {
                 result.insert(name.clone(), type_str);
@@ -1370,7 +1398,7 @@ impl ExpressionTypePropagation {
         // Export context hints
         for (name, ty) in &self.context_hints {
             if !result.contains_key(name) {
-                let type_str = ty.to_c_string();
+                let type_str = to_decl_type(ty);
                 if type_str != "int" && type_str != "unknown" {
                     result.insert(name.clone(), type_str);
                 }
@@ -1560,6 +1588,42 @@ mod tests {
 
         assert_eq!(exported.get("ptr"), Some(&"char*".to_string()));
         assert_eq!(exported.get("ch"), Some(&"char".to_string()));
+    }
+
+    #[test]
+    fn test_export_for_decompiler_decays_array_to_pointer() {
+        let mut engine = ExpressionTypePropagation::new();
+        engine.variable_types.insert(
+            "arr".to_string(),
+            ExprType::Array {
+                element: Box::new(ExprType::sint(4)),
+                count: None,
+            },
+        );
+
+        let exported = engine.export_for_decompiler();
+        assert_eq!(exported.get("arr"), Some(&"int*".to_string()));
+    }
+
+    #[test]
+    fn test_set_variable_type_prefers_pointer_like_over_numeric() {
+        let mut engine = ExpressionTypePropagation::new();
+
+        engine.set_variable_type("arg0", ExprType::sint(8));
+        engine.set_variable_type(
+            "arg0",
+            ExprType::Array {
+                element: Box::new(ExprType::sint(4)),
+                count: None,
+            },
+        );
+        // Later scalar guesses should not clobber pointer-like evidence.
+        engine.set_variable_type("arg0", ExprType::sint(8));
+
+        assert!(matches!(
+            engine.variable_types.get("arg0"),
+            Some(ExprType::Array { .. })
+        ));
     }
 
     #[test]

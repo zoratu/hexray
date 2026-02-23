@@ -282,6 +282,15 @@ fn test_decompiler_no_crash_on_various_patterns() {
             "Decompilation of {} should contain function name",
             name
         );
+        let header = code.lines().next().unwrap_or_default().trim_start();
+        if !header.starts_with("void ") {
+            assert!(
+                !code.contains("return;"),
+                "Non-void function emitted bare return in {}:\n{}",
+                name,
+                code
+            );
+        }
 
         println!("Pattern '{}' decompiled to:\n{}\n", name, code);
     }

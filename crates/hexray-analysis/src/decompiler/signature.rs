@@ -348,6 +348,20 @@ impl ParameterUsageHints {
 
         format!("arg{}", index)
     }
+
+    fn has_strong_signal(&self) -> bool {
+        self.is_dereferenced
+            || self.is_pointer_arithmetic
+            || self.is_array_index
+            || self.is_loop_bound
+            || self.is_size_param
+            || self.is_null_checked
+            || self.is_signed_comparison
+            || self.is_unsigned_ops
+            || self.is_string_arg
+            || self.is_function_pointer
+            || !self.passed_as_callback_to.is_empty()
+    }
 }
 
 /// Location where a parameter is passed.
@@ -1014,6 +1028,8 @@ pub struct SignatureRecovery {
     written_regs: HashSet<String>,
     /// Size hints for registers (from memory operations).
     reg_sizes: HashMap<String, u8>,
+    /// Best-effort value-width hints for lifted locals/temporaries.
+    value_sizes: HashMap<String, u8>,
     /// Whether a return register was set before return.
     return_value_set: bool,
     /// Size of the return value.
@@ -1070,6 +1086,7 @@ impl SignatureRecovery {
             read_regs: HashSet::new(),
             written_regs: HashSet::new(),
             reg_sizes: HashMap::new(),
+            value_sizes: HashMap::new(),
             return_value_set: false,
             return_size: 8,
             float_return: false,
@@ -1123,6 +1140,7 @@ impl SignatureRecovery {
         self.read_regs.clear();
         self.written_regs.clear();
         self.reg_sizes.clear();
+        self.value_sizes.clear();
         self.return_value_set = false;
         self.return_size = 8;
         self.float_return = false;
@@ -1166,7 +1184,18 @@ impl SignatureRecovery {
         reg_name: &str,
         hint_fn: impl FnOnce(&mut ParameterUsageHints),
     ) {
-        if let Some(idx) = self.arg_register_index(reg_name) {
+        let name = reg_name.to_lowercase();
+        let alias_candidates = self.alias_candidate_indices(&name);
+        let lifted_idx = if alias_candidates.is_empty() {
+            Self::lifted_arg_slot_index(&name)
+        } else {
+            None
+        };
+        if let Some(idx) = self
+            .direct_arg_register_index(&name)
+            .or_else(|| self.resolve_alias_param_index(&name))
+            .or(lifted_idx)
+        {
             let hints = self.param_hints.entry(idx).or_default();
             hint_fn(hints);
         }
@@ -1332,6 +1361,14 @@ impl SignatureRecovery {
             ExprKind::Assign { lhs, rhs } => {
                 // First, analyze the RHS for reads
                 self.analyze_expr_reads(rhs);
+                if let Some(lhs_name) = self.extract_var_name(lhs) {
+                    if let Some(size) = self.infer_expr_size(rhs) {
+                        if size > 0 {
+                            let key = lhs_name.to_lowercase();
+                            self.record_value_size_hint(&key, size);
+                        }
+                    }
+                }
                 if near_return && !self.return_value_set {
                     if let Some(candidate) = self.infer_tail_call_return_type(rhs) {
                         self.tail_call_return_type = Some(candidate);
@@ -1371,7 +1408,27 @@ impl SignatureRecovery {
                             self.return_provenance.push(reason);
                         }
                         self.return_confidence = self.return_confidence.max(160);
-                        if let Some(size) = self.infer_expr_size(rhs) {
+                        let reg_size = self.reg_size_from_name(&reg_lower);
+                        if reg_size > 0 {
+                            let mut inferred_size = reg_size;
+                            if let Some(rhs_size) = self.infer_expr_size(rhs) {
+                                if rhs_size > 0
+                                    && rhs_size < reg_size
+                                    && !matches!(rhs.kind, ExprKind::IntLit(0))
+                                {
+                                    inferred_size = rhs_size;
+                                }
+                            }
+                            self.return_size = inferred_size;
+                            let reason = format!(
+                                "return register value width inferred as {} byte(s)",
+                                inferred_size
+                            );
+                            if !self.return_provenance.iter().any(|r| r == &reason) {
+                                self.return_provenance.push(reason);
+                            }
+                            self.return_confidence = self.return_confidence.max(170);
+                        } else if let Some(size) = self.infer_expr_size(rhs) {
                             self.return_size = size;
                             let reason =
                                 format!("return register value width inferred as {} byte(s)", size);
@@ -1445,6 +1502,18 @@ impl SignatureRecovery {
                 }
                 self.analyze_expr_reads(expr);
             }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.analyze_expr_reads_with_context(lhs, false, false);
+                self.analyze_expr_reads(rhs);
+                if let Some(lhs_name) = self.extract_var_name(lhs) {
+                    if let Some(size) = self.infer_expr_size(rhs) {
+                        if size > 0 {
+                            let key = lhs_name.to_lowercase();
+                            self.record_value_size_hint(&key, size);
+                        }
+                    }
+                }
+            }
             _ => {
                 self.analyze_expr_reads(expr);
             }
@@ -1475,14 +1544,14 @@ impl SignatureRecovery {
                     if size > 0 {
                         self.reg_sizes.insert(name.clone(), size);
                     }
+                }
 
-                    // Record usage hints
-                    if is_dereferenced {
-                        self.record_usage_hint(&name, |h| h.is_dereferenced = true);
-                    }
-                    if is_comparison {
-                        self.record_usage_hint(&name, |h| h.is_signed_comparison = true);
-                    }
+                // Record context hints for direct arguments and aliased arguments.
+                if is_dereferenced {
+                    self.record_usage_hint(&name, |h| h.is_dereferenced = true);
+                }
+                if is_comparison {
+                    self.record_usage_hint(&name, |h| h.is_signed_comparison = true);
                 }
             }
             ExprKind::BinOp { op, left, right } => {
@@ -2416,7 +2485,7 @@ impl SignatureRecovery {
     }
 
     /// Returns the argument index for a register, or None.
-    fn arg_register_index(&self, name: &str) -> Option<usize> {
+    fn direct_arg_register_index(&self, name: &str) -> Option<usize> {
         let name_lower = name.to_lowercase();
 
         // Check for renamed argument variables (arg0, arg1, etc.)
@@ -2424,9 +2493,6 @@ impl SignatureRecovery {
             if let Ok(idx) = suffix.parse::<usize>() {
                 return Some(idx);
             }
-        }
-        if let Some(idx) = Self::lifted_arg_slot_index(&name_lower) {
-            return Some(idx);
         }
 
         // Check 64-bit integer registers
@@ -2450,6 +2516,11 @@ impl SignatureRecovery {
         }
 
         None
+    }
+
+    fn arg_register_index(&self, name: &str) -> Option<usize> {
+        self.direct_arg_register_index(name)
+            .or_else(|| Self::lifted_arg_slot_index(&name.to_lowercase()))
     }
 
     fn lifted_arg_slot_index(name: &str) -> Option<usize> {
@@ -2518,6 +2589,53 @@ impl SignatureRecovery {
             return 1; // 8-bit
         }
 
+        // RISC-V register aliases (a0..a7, t0..t6, s0..s11, etc.).
+        if matches!(self.convention, CallingConvention::RiscV) {
+            let is_xn = name_lower
+                .strip_prefix('x')
+                .is_some_and(|suffix| suffix.parse::<u8>().is_ok());
+            if is_xn
+                || matches!(
+                    name_lower.as_str(),
+                    "zero"
+                        | "ra"
+                        | "sp"
+                        | "gp"
+                        | "tp"
+                        | "t0"
+                        | "t1"
+                        | "t2"
+                        | "t3"
+                        | "t4"
+                        | "t5"
+                        | "t6"
+                        | "s0"
+                        | "s1"
+                        | "s2"
+                        | "s3"
+                        | "s4"
+                        | "s5"
+                        | "s6"
+                        | "s7"
+                        | "s8"
+                        | "s9"
+                        | "s10"
+                        | "s11"
+                        | "a0"
+                        | "a1"
+                        | "a2"
+                        | "a3"
+                        | "a4"
+                        | "a5"
+                        | "a6"
+                        | "a7"
+                        | "fp"
+                )
+            {
+                return 8;
+            }
+        }
+
         // ARM64 register naming
         if name_lower.starts_with('x') {
             return 8; // 64-bit
@@ -2532,18 +2650,57 @@ impl SignatureRecovery {
             return 4; // 32-bit float
         }
 
-        // RISC-V: all registers are typically full width
-        8
+        // Not a recognized register name.
+        0
+    }
+
+    fn value_size_alias_names(name_lower: &str) -> Vec<String> {
+        if let Some(suffix) = name_lower.strip_prefix('w') {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return vec![format!("x{}", suffix)];
+            }
+        }
+        if let Some(suffix) = name_lower.strip_prefix('x') {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return vec![format!("w{}", suffix)];
+            }
+        }
+        Vec::new()
+    }
+
+    fn record_value_size_hint(&mut self, name_lower: &str, size: u8) {
+        let merged = self
+            .value_sizes
+            .get(name_lower)
+            .copied()
+            .unwrap_or(0)
+            .max(size);
+        self.value_sizes.insert(name_lower.to_string(), merged);
+        for alias in Self::value_size_alias_names(name_lower) {
+            let alias_merged = self.value_sizes.get(&alias).copied().unwrap_or(0).max(size);
+            self.value_sizes.insert(alias, alias_merged);
+        }
     }
 
     /// Infers the size of an expression result.
     fn infer_expr_size(&self, expr: &Expr) -> Option<u8> {
         match &expr.kind {
             ExprKind::Var(var) => {
+                let var_name_lower = var.name.to_lowercase();
+                if let Some(size) = self.value_sizes.get(&var_name_lower) {
+                    // Prefer tracked value width for non-ABI temporaries/registers.
+                    if !self.is_arg_register(&var_name_lower)
+                        && !self.is_return_register(&var_name_lower)
+                    {
+                        return Some(*size);
+                    }
+                }
                 // First try to infer from register name (w0 = 4, x0 = 8, etc.)
                 let size = self.reg_size_from_name(&var.name);
                 if size > 0 {
                     Some(size)
+                } else if let Some(size) = self.value_sizes.get(&var_name_lower) {
+                    Some(*size)
                 } else if var.size > 0 {
                     // Fall back to variable's stored size (for stack variables, etc.)
                     Some(var.size)
@@ -2603,7 +2760,10 @@ impl SignatureRecovery {
             if self.read_regs.contains(&reg64_lower)
                 || self.read_regs.contains(&reg32_lower)
                 || self.read_regs.contains(&pseudo_arg)
-                || self.param_hints.contains_key(&idx)
+                || self
+                    .param_hints
+                    .get(&idx)
+                    .is_some_and(ParameterUsageHints::has_strong_signal)
             {
                 used_args.push(idx);
             }
@@ -2794,7 +2954,7 @@ fn is_frame_pointer(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompiler::expression::{CallTarget, Variable};
+    use crate::decompiler::expression::{CallTarget, VarKind, Variable};
     use hexray_core::BasicBlockId;
     use std::sync::Arc;
 
@@ -2909,6 +3069,16 @@ mod tests {
         assert_eq!(recovery.reg_size_from_name("w0"), 4);
         assert_eq!(recovery.reg_size_from_name("x19"), 8);
         assert_eq!(recovery.reg_size_from_name("w19"), 4);
+        assert_eq!(recovery.reg_size_from_name("tmp0"), 0);
+    }
+
+    #[test]
+    fn test_riscv_reg_size_from_name() {
+        let recovery = SignatureRecovery::new(CallingConvention::RiscV);
+        assert_eq!(recovery.reg_size_from_name("a0"), 8);
+        assert_eq!(recovery.reg_size_from_name("x10"), 8);
+        assert_eq!(recovery.reg_size_from_name("s1"), 8);
+        assert_eq!(recovery.reg_size_from_name("tmp0"), 0);
     }
 
     #[test]
@@ -3109,6 +3279,43 @@ mod tests {
             sig.parameters[2].param_type,
             ParamType::SignedInt(32)
         ));
+    }
+
+    #[test]
+    fn test_alias_dereference_marks_arm64_param_as_pointer() {
+        use hexray_core::BasicBlockId;
+
+        // Simulate:
+        //   var_18 = x0;
+        //   tmp = var_18[0];
+        let assign_alias = Expr::assign(Expr::unknown("var_18"), Expr::var(Variable::reg("x0", 8)));
+        let base = Expr::var(Variable::reg("var_18", 8));
+        let load_indexed = Expr::assign(
+            Expr::unknown("tmp"),
+            Expr::array_access(base, Expr::int(0), 4),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![assign_alias, load_indexed],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
+        let sig = recovery.analyze(&cfg);
+        assert!(
+            !sig.parameters.is_empty(),
+            "expected at least one recovered parameter"
+        );
+        assert!(
+            matches!(sig.parameters[0].param_type, ParamType::Pointer),
+            "expected arg0 to be inferred as pointer, got {:?}",
+            sig.parameters[0].param_type
+        );
     }
 
     #[test]
@@ -3621,14 +3828,15 @@ mod tests {
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
         let sig = recovery.analyze(&cfg);
 
-        // With use-before-def: only 2 registers detected (rdi=0, rdx=2) -> 2 params
-        assert!(sig.parameters.len() >= 2, "params: {:?}", sig.parameters);
-        // The callback (rdx, register index 2) is now at params[1]
+        // Callback should resolve to the rdx/x2 slot (register index 2).
         assert!(
-            matches!(
-                sig.parameters[1].param_type,
-                ParamType::FunctionPointer { .. }
-            ),
+            sig.parameters.iter().any(|p| {
+                matches!(p.param_type, ParamType::FunctionPointer { .. })
+                    && matches!(
+                        p.location,
+                        ParameterLocation::IntegerRegister { index: 2, .. }
+                    )
+            }),
             "params: {:?}",
             sig.parameters
         );
@@ -4261,6 +4469,128 @@ mod tests {
         };
 
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_tracks_temp_value_width_for_return() {
+        use hexray_core::BasicBlockId;
+
+        let tmp0 = Expr::var(Variable {
+            kind: VarKind::Temp(0),
+            name: "tmp0".to_string(),
+            size: 8,
+        });
+        let acc_init = Expr::assign(tmp0.clone(), Expr::int(0));
+        let acc_add = Expr::assign(
+            tmp0.clone(),
+            Expr::binop(
+                BinOpKind::Add,
+                tmp0.clone(),
+                Expr::deref(Expr::var(Variable::reg("x1", 8)), 4),
+            ),
+        );
+        let move_ret = Expr::assign(Expr::var(Variable::reg("x0", 8)), tmp0.clone());
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![acc_init, acc_add, move_ret],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(
+            sig.return_type,
+            ParamType::SignedInt(32),
+            "expected 32-bit return width from tmp accumulator, got {:?}",
+            sig.return_type
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_prefers_return_register_width_for_literal_return() {
+        use hexray_core::BasicBlockId;
+
+        let set_ret = Expr::assign(Expr::var(Variable::reg("w0", 4)), Expr::int(0));
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![set_ret],
+            address_range: (0x1000, 0x1008),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_keeps_x0_width_for_literal_zero_return() {
+        use hexray_core::BasicBlockId;
+
+        let set_ret = Expr::assign(Expr::var(Variable::reg("x0", 8)), Expr::int(0));
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![set_ret],
+            address_range: (0x2000, 0x2008),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(64));
+    }
+
+    #[test]
+    fn test_signature_recovery_propagates_w_to_x_temp_width_for_return() {
+        use hexray_core::BasicBlockId;
+
+        let w8 = Expr::var(Variable::reg("w8", 4));
+        let init = Expr::assign(w8.clone(), Expr::int(0));
+        let add = Expr::assign(
+            w8.clone(),
+            Expr::binop(
+                BinOpKind::Add,
+                w8.clone(),
+                Expr::deref(Expr::var(Variable::reg("x0", 8)), 4),
+            ),
+        );
+        let set_ret = Expr::assign(
+            Expr::var(Variable::reg("x0", 8)),
+            Expr::var(Variable::reg("x8", 8)),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![init, add, set_ret],
+            address_range: (0x3000, 0x3010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
         let sig = recovery.analyze(&cfg);
 
         assert!(sig.has_return);

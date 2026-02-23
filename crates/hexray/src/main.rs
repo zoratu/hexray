@@ -821,6 +821,24 @@ fn resolve_decompile_target(binary: &Binary, target: Option<String>) -> Result<S
 /// Find a symbol by name, preferring exact matches over partial matches.
 /// For function decompilation, we want the most specific match.
 fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
+    let symbol_priority = |s: &hexray_core::Symbol| {
+        let is_func = if s.is_function() { 1u8 } else { 0u8 };
+        let binding_rank = match s.binding {
+            hexray_core::SymbolBinding::Global => 2u8,
+            hexray_core::SymbolBinding::Weak => 1u8,
+            _ => 0u8,
+        };
+        (is_func, binding_rank, s.size)
+    };
+    let pick_best = |mut candidates: Vec<hexray_core::Symbol>| {
+        candidates.sort_by(|a, b| {
+            symbol_priority(b)
+                .cmp(&symbol_priority(a))
+                .then_with(|| a.name.len().cmp(&b.name.len()))
+        });
+        candidates.into_iter().next()
+    };
+
     // Collect symbols into owned values, filtering out undefined/external symbols
     let symbols: Vec<hexray_core::Symbol> = fmt
         .symbols()
@@ -829,16 +847,19 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
         .collect();
 
     // 1. Try exact match first (highest priority)
-    if let Some(sym) = symbols.iter().find(|s| s.name == name) {
-        return Some(sym.clone());
+    let exact_matches: Vec<_> = symbols.iter().filter(|s| s.name == name).cloned().collect();
+    if !exact_matches.is_empty() {
+        return pick_best(exact_matches);
     }
 
     // 2. Try exact match on demangled name
-    if let Some(sym) = symbols
+    let demangled_exact_matches: Vec<_> = symbols
         .iter()
-        .find(|s| demangle_or_original(&s.name) == name)
-    {
-        return Some(sym.clone());
+        .filter(|s| demangle_or_original(&s.name) == name)
+        .cloned()
+        .collect();
+    if !demangled_exact_matches.is_empty() {
+        return pick_best(demangled_exact_matches);
     }
 
     // 3. Try prefix match (e.g., "nfsd_open" matches "nfsd_open.cold")
@@ -990,37 +1011,47 @@ fn disassemble_cfg(
         u64::from_str_radix(target, 16).ok()
     };
 
-    let (start_addr, name) = if let Some(addr) = address {
-        (addr, format!("sub_{:x}", addr))
+    let (start_addr, name, max_bytes, stop_after_first_return) = if let Some(addr) = address {
+        (addr, format!("sub_{:x}", addr), 4096usize, true)
     } else {
         // Find symbol using improved search
         let symbol =
             find_symbol(fmt, target).with_context(|| format!("Symbol '{}' not found", target))?;
-        (symbol.address, demangle_or_original(&symbol.name))
+        let max_bytes = if symbol.size > 0 {
+            symbol.size as usize
+        } else {
+            4096usize
+        };
+        (
+            symbol.address,
+            demangle_or_original(&symbol.name),
+            max_bytes,
+            symbol.size == 0,
+        )
     };
 
     // Disassemble instructions
     let bytes = fmt
-        .bytes_at(start_addr, 4096)
+        .bytes_at(start_addr, max_bytes)
         .context("Cannot read bytes")?;
 
     let arch = fmt.architecture();
     let instructions = match arch {
         Architecture::X86_64 | Architecture::X86 => {
             let disasm = X86_64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         Architecture::Arm64 => {
             let disasm = Arm64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV64 => {
             let disasm = RiscVDisassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV32 => {
             let disasm = RiscVDisassembler::new_rv32();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         _ => {
             bail!("Unsupported architecture: {:?}", arch);
@@ -1073,6 +1104,7 @@ fn disassemble_for_cfg<D: Disassembler>(
     disasm: &D,
     bytes: &[u8],
     start_addr: u64,
+    stop_after_first_return: bool,
 ) -> Vec<hexray_core::Instruction> {
     let mut instructions = Vec::new();
     let mut offset = 0;
@@ -1087,7 +1119,14 @@ fn disassemble_for_cfg<D: Disassembler>(
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
-                if is_ret {
+                // If we only have a fallback byte window (unknown function size),
+                // stop at the first return to avoid spilling into neighboring functions.
+                if stop_after_first_return && is_ret {
+                    break;
+                }
+                // With known function bounds, allow early returns and continue.
+                // Stop once returns appear in the latter half to avoid trailing junk.
+                if !stop_after_first_return && is_ret && offset >= bytes.len() / 2 {
                     break;
                 }
             }
@@ -1118,23 +1157,28 @@ fn decompile_function(
         u64::from_str_radix(target, 16).ok()
     };
 
-    let (start_addr, name) = if let Some(addr) = address {
+    let (start_addr, name, max_bytes, stop_after_first_return) = if let Some(addr) = address {
         // Check if project has a custom name for this address
         let name = project
             .and_then(|p| p.get_function_name(addr))
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("sub_{:x}", addr));
-        (addr, name)
+        (addr, name, 4096usize, true)
     } else {
         // Find symbol using improved search
         let symbol = find_symbol(fmt, target)
             .with_context(|| format!("Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).", target))?;
+        let max_bytes = if symbol.size > 0 {
+            symbol.size as usize
+        } else {
+            4096usize
+        };
         // Check if project has a custom name for this address
         let name = project
             .and_then(|p| p.get_function_name(symbol.address))
             .map(|n| n.to_string())
             .unwrap_or_else(|| demangle_or_original(&symbol.name));
-        (symbol.address, name)
+        (symbol.address, name, max_bytes, symbol.size == 0)
     };
 
     // Validate the address is reasonable
@@ -1159,26 +1203,26 @@ fn decompile_function(
 
     // Disassemble instructions
     let bytes = fmt
-        .bytes_at(start_addr, 4096)
+        .bytes_at(start_addr, max_bytes)
         .context("Cannot read bytes")?;
 
     let arch = fmt.architecture();
     let instructions = match arch {
         Architecture::X86_64 | Architecture::X86 => {
             let disasm = X86_64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         Architecture::Arm64 => {
             let disasm = Arm64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV64 => {
             let disasm = RiscVDisassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV32 => {
             let disasm = RiscVDisassembler::new_rv32();
-            disassemble_for_cfg(&disasm, bytes, start_addr)
+            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
         }
         _ => {
             bail!("Unsupported architecture: {:?}", arch);
@@ -2043,19 +2087,19 @@ fn decompile_with_follow(
         let instructions = match arch {
             Architecture::X86_64 | Architecture::X86 => {
                 let disasm = X86_64Disassembler::new();
-                disassemble_for_cfg(&disasm, bytes, func_addr)
+                disassemble_for_cfg(&disasm, bytes, func_addr, true)
             }
             Architecture::Arm64 => {
                 let disasm = Arm64Disassembler::new();
-                disassemble_for_cfg(&disasm, bytes, func_addr)
+                disassemble_for_cfg(&disasm, bytes, func_addr, true)
             }
             Architecture::RiscV64 => {
                 let disasm = RiscVDisassembler::new();
-                disassemble_for_cfg(&disasm, bytes, func_addr)
+                disassemble_for_cfg(&disasm, bytes, func_addr, true)
             }
             Architecture::RiscV32 => {
                 let disasm = RiscVDisassembler::new_rv32();
-                disassemble_for_cfg(&disasm, bytes, func_addr)
+                disassemble_for_cfg(&disasm, bytes, func_addr, true)
             }
             _ => continue,
         };
@@ -2448,22 +2492,23 @@ fn build_xrefs(
             256
         };
         if let Some(bytes) = fmt.bytes_at(func.address, size) {
+            let stop_after_first_return = func.size == 0;
             let instructions = match arch {
                 Architecture::X86_64 | Architecture::X86 => {
                     let disasm = X86_64Disassembler::new();
-                    disassemble_for_cfg(&disasm, bytes, func.address)
+                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
                 }
                 Architecture::Arm64 => {
                     let disasm = Arm64Disassembler::new();
-                    disassemble_for_cfg(&disasm, bytes, func.address)
+                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
                 }
                 Architecture::RiscV64 => {
                     let disasm = RiscVDisassembler::new();
-                    disassemble_for_cfg(&disasm, bytes, func.address)
+                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
                 }
                 Architecture::RiscV32 => {
                     let disasm = RiscVDisassembler::new_rv32();
-                    disassemble_for_cfg(&disasm, bytes, func.address)
+                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
                 }
                 _ => Vec::new(),
             };

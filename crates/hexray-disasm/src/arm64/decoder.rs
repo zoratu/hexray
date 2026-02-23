@@ -685,7 +685,6 @@ impl Arm64Disassembler {
         bytes: Vec<u8>,
     ) -> Result<DecodedInstruction, DecodeError> {
         let op0 = (insn >> 29) & 0x7;
-        let op1 = (insn >> 22) & 0xF;
 
         match op0 {
             // Unconditional branch immediate
@@ -720,79 +719,82 @@ impl Arm64Disassembler {
                 })
             }
 
-            // Compare and branch
+            // Compare-and-branch or test-and-branch immediate.
+            // Both families share op0 in {001, 101}; bit 25 disambiguates:
+            // - 0 => cbz/cbnz
+            // - 1 => tbz/tbnz
             0b001 | 0b101 => {
-                let is_cbnz = (insn >> 24) & 1 == 1;
-                let sf = (insn >> 31) & 1 == 1;
-                let rt = (insn & 0x1F) as u16;
-                let imm19 = ((insn >> 5) & 0x7FFFF) as i64;
-                let offset = sign_extend((imm19 << 2) as u64, 21);
-                let target = (address as i64 + offset) as u64;
+                let is_test_branch = ((insn >> 25) & 1) == 1;
+                if !is_test_branch {
+                    let is_cbnz = (insn >> 24) & 1 == 1;
+                    let sf = (insn >> 31) & 1 == 1;
+                    let rt = (insn & 0x1F) as u16;
+                    let imm19 = ((insn >> 5) & 0x7FFFF) as i64;
+                    let offset = sign_extend((imm19 << 2) as u64, 21);
+                    let target = (address as i64 + offset) as u64;
 
-                let mnemonic = if is_cbnz { "cbnz" } else { "cbz" };
-                let reg = if sf { Self::xreg(rt) } else { Self::wreg(rt) };
-                let condition = if is_cbnz {
-                    Condition::NotEqual
+                    let mnemonic = if is_cbnz { "cbnz" } else { "cbz" };
+                    let reg = if sf { Self::xreg(rt) } else { Self::wreg(rt) };
+                    let condition = if is_cbnz {
+                        Condition::NotEqual
+                    } else {
+                        Condition::Equal
+                    };
+
+                    let inst = Instruction::new(address, 4, bytes, mnemonic)
+                        .with_operation(Operation::ConditionalJump)
+                        .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)])
+                        .with_control_flow(ControlFlow::ConditionalBranch {
+                            target,
+                            condition,
+                            fallthrough: address + 4,
+                        });
+
+                    Ok(DecodedInstruction {
+                        instruction: inst,
+                        size: 4,
+                    })
                 } else {
-                    Condition::Equal
-                };
+                    let is_tbnz = (insn >> 24) & 1 == 1;
+                    let b5 = (insn >> 31) & 1;
+                    let b40 = (insn >> 19) & 0x1F;
+                    let bit_pos = (b5 << 5) | b40;
+                    let rt = (insn & 0x1F) as u16;
+                    let imm14 = ((insn >> 5) & 0x3FFF) as i64;
+                    let offset = sign_extend((imm14 << 2) as u64, 16);
+                    let target = (address as i64 + offset) as u64;
 
-                let inst = Instruction::new(address, 4, bytes, mnemonic)
-                    .with_operation(Operation::ConditionalJump)
-                    .with_operands(vec![Operand::reg(reg), Operand::pc_rel(offset, target)])
-                    .with_control_flow(ControlFlow::ConditionalBranch {
-                        target,
-                        condition,
-                        fallthrough: address + 4,
-                    });
+                    let mnemonic = if is_tbnz { "tbnz" } else { "tbz" };
+                    let is_64bit = b5 == 1;
+                    let reg = if is_64bit {
+                        Self::xreg(rt)
+                    } else {
+                        Self::wreg(rt)
+                    };
+                    let condition = if is_tbnz {
+                        Condition::NotEqual
+                    } else {
+                        Condition::Equal
+                    };
 
-                Ok(DecodedInstruction {
-                    instruction: inst,
-                    size: 4,
-                })
-            }
+                    let inst = Instruction::new(address, 4, bytes, mnemonic)
+                        .with_operation(Operation::ConditionalJump)
+                        .with_operands(vec![
+                            Operand::reg(reg),
+                            Operand::imm_unsigned(bit_pos as u64, 8),
+                            Operand::pc_rel(offset, target),
+                        ])
+                        .with_control_flow(ControlFlow::ConditionalBranch {
+                            target,
+                            condition,
+                            fallthrough: address + 4,
+                        });
 
-            // Test and branch
-            0b011 | 0b111 => {
-                let is_tbnz = (insn >> 24) & 1 == 1;
-                let b5 = (insn >> 31) & 1;
-                let b40 = (insn >> 19) & 0x1F;
-                let bit_pos = (b5 << 5) | b40;
-                let rt = (insn & 0x1F) as u16;
-                let imm14 = ((insn >> 5) & 0x3FFF) as i64;
-                let offset = sign_extend((imm14 << 2) as u64, 16);
-                let target = (address as i64 + offset) as u64;
-
-                let mnemonic = if is_tbnz { "tbnz" } else { "tbz" };
-                let is_64bit = b5 == 1;
-                let reg = if is_64bit {
-                    Self::xreg(rt)
-                } else {
-                    Self::wreg(rt)
-                };
-                let condition = if is_tbnz {
-                    Condition::NotEqual
-                } else {
-                    Condition::Equal
-                };
-
-                let inst = Instruction::new(address, 4, bytes, mnemonic)
-                    .with_operation(Operation::ConditionalJump)
-                    .with_operands(vec![
-                        Operand::reg(reg),
-                        Operand::imm_unsigned(bit_pos as u64, 8),
-                        Operand::pc_rel(offset, target),
-                    ])
-                    .with_control_flow(ControlFlow::ConditionalBranch {
-                        target,
-                        condition,
-                        fallthrough: address + 4,
-                    });
-
-                Ok(DecodedInstruction {
-                    instruction: inst,
-                    size: 4,
-                })
+                    Ok(DecodedInstruction {
+                        instruction: inst,
+                        size: 4,
+                    })
+                }
             }
 
             // Conditional branch
@@ -3478,6 +3480,47 @@ mod tests {
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "bl");
         assert!(result.instruction.is_call());
+    }
+
+    #[test]
+    fn test_cbz_decode() {
+        let disasm = Arm64Disassembler::new();
+        // CBZ W8, label: 0x34000008
+        let bytes = [0x08, 0x00, 0x00, 0x34];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "cbz");
+        assert_eq!(result.instruction.operands.len(), 2);
+    }
+
+    #[test]
+    fn test_cbnz_decode() {
+        let disasm = Arm64Disassembler::new();
+        // CBNZ W8, label: 0x35000008
+        let bytes = [0x08, 0x00, 0x00, 0x35];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "cbnz");
+        assert_eq!(result.instruction.operands.len(), 2);
+    }
+
+    #[test]
+    fn test_tbz_decode_regression() {
+        let disasm = Arm64Disassembler::new();
+        // TBZ W8, #31, label: 0x36F80068
+        // This opcode previously mis-decoded as cbz due to classifier overlap.
+        let bytes = [0x68, 0x00, 0xF8, 0x36];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "tbz");
+        assert_eq!(result.instruction.operands.len(), 3);
+    }
+
+    #[test]
+    fn test_tbnz_decode() {
+        let disasm = Arm64Disassembler::new();
+        // TBNZ W8, #31, label: 0x37F80068
+        let bytes = [0x68, 0x00, 0xF8, 0x37];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "tbnz");
+        assert_eq!(result.instruction.operands.len(), 3);
     }
 
     #[test]

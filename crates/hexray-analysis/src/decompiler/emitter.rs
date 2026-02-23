@@ -369,6 +369,9 @@ pub struct PseudoCodeEmitter {
     /// Per-function parameter display-name overrides (e.g., arg0 -> argc).
     /// Uses RefCell for interior mutability during emission.
     param_name_overrides: RefCell<HashMap<String, String>>,
+    /// Fallback expression for bare returns when signature is non-void.
+    /// Uses RefCell for interior mutability during emission.
+    return_fallback_expr: RefCell<Option<String>>,
 }
 
 impl PseudoCodeEmitter {
@@ -384,6 +387,58 @@ impl PseudoCodeEmitter {
         } else {
             p.param_type.format_with_name(rendered_name)
         }
+    }
+
+    fn is_pointer_like_type_hint(type_hint: &str) -> bool {
+        let ty = type_hint.trim();
+        ty.contains("(*)") || ty.contains('*') || ty.ends_with("[]")
+    }
+
+    fn should_apply_signature_type_hint(
+        param_type: &super::signature::ParamType,
+        type_hint: &str,
+    ) -> bool {
+        if matches!(
+            param_type,
+            super::signature::ParamType::FunctionPointer { .. }
+        ) {
+            return false;
+        }
+        Self::is_pointer_like_type_hint(type_hint)
+    }
+
+    fn find_param_type_hint(
+        &self,
+        param_index: usize,
+        source_name: &str,
+        rendered_name: &str,
+    ) -> Option<String> {
+        let arg_fallback = format!("arg{}", param_index);
+        let candidates = [source_name, rendered_name, arg_fallback.as_str()];
+        for candidate in candidates {
+            if let Some(ty) = self.type_info.get(candidate) {
+                return Some(ty.clone());
+            }
+            let candidate_lower = candidate.to_lowercase();
+            if let Some(ty) = self.type_info.get(&candidate_lower) {
+                return Some(ty.clone());
+            }
+        }
+        None
+    }
+
+    fn format_signature_param_with_type_hint(
+        &self,
+        p: &super::signature::Parameter,
+        rendered_name: &str,
+        type_hint: Option<&str>,
+    ) -> String {
+        if let Some(type_hint) = type_hint {
+            if Self::should_apply_signature_type_hint(&p.param_type, type_hint) {
+                return format!("{} {}", type_hint.trim(), rendered_name);
+            }
+        }
+        Self::format_signature_param(p, rendered_name)
     }
 
     /// Creates a new emitter.
@@ -404,7 +459,50 @@ impl PseudoCodeEmitter {
             summary_database: None,
             global_tracker: RefCell::new(GlobalAccessTracker::new()),
             param_name_overrides: RefCell::new(HashMap::new()),
+            return_fallback_expr: RefCell::new(None),
         }
+    }
+
+    fn fallback_return_expr_for_type(return_type: &str) -> Option<String> {
+        let ty = return_type.trim();
+        if ty == "void" {
+            None
+        } else if ty.contains("float") || ty.contains("double") {
+            Some("0.0".to_string())
+        } else {
+            Some("0".to_string())
+        }
+    }
+
+    fn set_return_fallback_expr_for_type(&self, return_type: &str) {
+        *self.return_fallback_expr.borrow_mut() = Self::fallback_return_expr_for_type(return_type);
+    }
+
+    fn clear_return_fallback_expr(&self) {
+        *self.return_fallback_expr.borrow_mut() = None;
+    }
+
+    fn emit_return_line(&self, output: &mut String, indent: &str, expr: Option<&Expr>) {
+        if let Some(e) = expr {
+            writeln!(output, "{}return {};", indent, self.format_expr(e)).unwrap();
+            return;
+        }
+        if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
+            writeln!(output, "{}return {};", indent, fallback).unwrap();
+        } else {
+            writeln!(output, "{}return;", indent).unwrap();
+        }
+    }
+
+    fn output_ends_with_return_stmt(output: &str) -> bool {
+        output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| {
+                let trimmed = line.trim_start();
+                trimmed == "return;" || trimmed.starts_with("return ")
+            })
     }
 
     fn clear_param_name_overrides(&self) {
@@ -2260,6 +2358,7 @@ impl PseudoCodeEmitter {
             } else {
                 "void".to_string()
             };
+            self.set_return_fallback_expr_for_type(&return_type);
 
             if sig.parameters.is_empty() && func_info.parameters.is_empty() {
                 writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
@@ -2269,8 +2368,14 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, p)| {
+                        let source_name = &param_override_sources[idx];
                         let rendered_name = rendered_param_names[idx].clone();
-                        Self::format_signature_param(p, &rendered_name)
+                        let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
+                        self.format_signature_param_with_type_hint(
+                            p,
+                            &rendered_name,
+                            type_hint.as_deref(),
+                        )
                     })
                     .collect();
                 writeln!(
@@ -2308,6 +2413,7 @@ impl PseudoCodeEmitter {
             } else {
                 "void"
             };
+            self.set_return_fallback_expr_for_type(return_type);
             if func_info.parameters.is_empty() {
                 writeln!(output, "{} {}()", return_type, func_name).unwrap();
             } else {
@@ -2356,6 +2462,13 @@ impl PseudoCodeEmitter {
             &func_info.skip_statements,
             &mut declared_vars,
         );
+        if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
+            if !self.body_ends_with_control_exit(&cfg.body)
+                && !Self::output_ends_with_return_stmt(&body_output)
+            {
+                writeln!(body_output, "{}return {};", self.indent, fallback).unwrap();
+            }
+        }
 
         let mut all_vars_set: HashSet<String> = all_vars
             .into_iter()
@@ -2385,6 +2498,7 @@ impl PseudoCodeEmitter {
 
         write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
+        self.clear_return_fallback_expr();
         output
     }
 
@@ -2438,6 +2552,7 @@ impl PseudoCodeEmitter {
         } else {
             "void".to_string()
         };
+        self.set_return_fallback_expr_for_type(&return_type);
 
         if signature.parameters.is_empty() {
             writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
@@ -2446,7 +2561,16 @@ impl PseudoCodeEmitter {
                 .parameters
                 .iter()
                 .enumerate()
-                .map(|(idx, p)| p.param_type.format_with_name(&rendered_param_names[idx]))
+                .map(|(idx, p)| {
+                    let source_name = &signature_param_names[idx];
+                    let rendered_name = rendered_param_names[idx].clone();
+                    let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
+                    self.format_signature_param_with_type_hint(
+                        p,
+                        &rendered_name,
+                        type_hint.as_deref(),
+                    )
+                })
                 .collect();
             writeln!(
                 output,
@@ -2486,6 +2610,13 @@ impl PseudoCodeEmitter {
             &func_info.skip_statements,
             &mut declared_vars,
         );
+        if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
+            if !self.body_ends_with_control_exit(&cfg.body)
+                && !Self::output_ends_with_return_stmt(&body_output)
+            {
+                writeln!(body_output, "{}return {};", self.indent, fallback).unwrap();
+            }
+        }
 
         let mut all_vars_set: HashSet<String> = all_vars
             .into_iter()
@@ -2515,6 +2646,7 @@ impl PseudoCodeEmitter {
 
         write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
+        self.clear_return_fallback_expr();
         output
     }
 
@@ -2698,13 +2830,22 @@ impl PseudoCodeEmitter {
         match node {
             StructuredNode::Block { statements, .. } => {
                 for stmt in statements {
-                    if self.is_prologue_epilogue(stmt) {
+                    if self.is_prologue_epilogue(stmt)
+                        || self.is_noop_assignment(stmt)
+                        || self.is_skippable_statement(stmt)
+                    {
                         continue;
                     }
                     self.collect_assigned_vars_from_expr(stmt, definitely_assigned);
                 }
             }
             StructuredNode::Expr(expr) => {
+                if self.is_prologue_epilogue(expr)
+                    || self.is_noop_assignment(expr)
+                    || self.is_skippable_statement(expr)
+                {
+                    return;
+                }
                 self.collect_assigned_vars_from_expr(expr, definitely_assigned)
             }
             StructuredNode::If {
@@ -3833,7 +3974,7 @@ impl PseudoCodeEmitter {
         }
 
         if expr_str == "return" {
-            writeln!(output, "{}return;", indent).unwrap();
+            self.emit_return_line(output, &indent, None);
             return;
         }
 
@@ -4396,11 +4537,7 @@ impl PseudoCodeEmitter {
             }
 
             StructuredNode::Return(expr) => {
-                if let Some(e) = expr {
-                    writeln!(output, "{}return {};", indent, self.format_expr(e)).unwrap();
-                } else {
-                    writeln!(output, "{}return;", indent).unwrap();
-                }
+                self.emit_return_line(output, &indent, expr.as_ref());
             }
 
             StructuredNode::Goto(target) => {
@@ -4533,7 +4670,7 @@ impl PseudoCodeEmitter {
 
         // Check if it's a return
         if expr_str == "return" {
-            writeln!(output, "{}return;", indent).unwrap();
+            self.emit_return_line(output, &indent, None);
             return;
         }
 
@@ -6122,6 +6259,35 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_zero_init_when_only_pre_loop_assign_is_skipped_temp_setup() {
+        use super::super::expression::Variable;
+
+        let pre_loop = StructuredNode::Expr(Expr::assign(
+            Expr::unknown("iter"),
+            Expr::var(Variable::reg("w9", 4)),
+        ));
+        let cond = Expr::binop(BinOpKind::Lt, Expr::unknown("iter"), Expr::int(8));
+        let loop_node = StructuredNode::While {
+            condition: cond,
+            body: Vec::new(),
+            header: None,
+            exit_block: None,
+        };
+        let cfg = StructuredCfg {
+            body: vec![pre_loop, loop_node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+        assert!(
+            output.contains("int iter = 0;"),
+            "Expected skipped temp-setup assign not to suppress loop iterator zero-init:\n{}",
+            output
+        );
+    }
+
+    #[test]
     fn test_emit_main_param_name_matches_body_usage() {
         use super::super::expression::Variable;
 
@@ -6395,6 +6561,146 @@ mod tests {
         assert_eq!(
             PseudoCodeEmitter::format_signature_param(&param, "compar"),
             "void* compar"
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_applies_pointer_type_hint_to_generic_param() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::int(0)))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+        sig.parameters
+            .push(super::super::signature::Parameter::from_int_register(
+                0,
+                "rdi",
+                super::super::signature::ParamType::SignedInt(64),
+            ));
+
+        let mut type_info = HashMap::new();
+        type_info.insert("arg0".to_string(), "int*".to_string());
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+        let output = emitter.emit_with_signature(&cfg, "typed_arg", &sig);
+        let header = output.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("int* arg0"),
+            "expected pointer type hint in header, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_non_void_bare_return_uses_zero_fallback() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "ret_fixup", &sig);
+        assert!(
+            output.contains("return 0;"),
+            "non-void bare return should emit value fallback:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return;"),
+            "non-void output must not emit bare return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_void_bare_return_stays_void() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "void_ret_ok", &sig);
+        assert!(
+            output.contains("return;"),
+            "void bare return should be preserved:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_appends_fallback_return_on_top_level_fallthrough() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::If {
+                condition: Expr::unknown("cond"),
+                then_body: vec![StructuredNode::Return(Some(Expr::int(1)))],
+                else_body: None,
+            }],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "fallthrough_fixup", &sig);
+        assert!(
+            output.contains("return 0;"),
+            "non-void fallthrough should emit fallback return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_keeps_function_pointer_param_shape() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::int(0)))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "arg0",
+            super::super::signature::ParamType::FunctionPointer {
+                return_type: Box::new(super::super::signature::ParamType::SignedInt(32)),
+                params: vec![
+                    super::super::signature::ParamType::Pointer,
+                    super::super::signature::ParamType::Pointer,
+                ],
+            },
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+
+        let mut type_info = HashMap::new();
+        type_info.insert("arg0".to_string(), "void*".to_string());
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+        let output = emitter.emit_with_signature(&cfg, "typed_cb", &sig);
+        let header = output.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("(*arg0)("),
+            "function-pointer signature should be preserved, got:\n{}",
+            output
         );
     }
 
