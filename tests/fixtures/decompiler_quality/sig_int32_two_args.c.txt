@@ -1,0 +1,4 @@
+int32_t add(int32_t arg0, int32_t arg1)
+{
+    return arg0 + arg1;
+}

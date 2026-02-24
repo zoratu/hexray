@@ -64,6 +64,10 @@ pub struct BenchmarkCase {
     pub min_callback_index_recall: Option<f64>,
     /// Maximum allowed share of callback provenance that comes from shape fallback.
     pub max_callback_shape_fallback_ratio: Option<f64>,
+    /// Expected function argument count for signature quality checks.
+    pub expected_arg_count: Option<usize>,
+    /// Expected return type for signature quality checks.
+    pub expected_return_type: Option<String>,
 }
 
 impl BenchmarkCase {
@@ -87,6 +91,8 @@ impl BenchmarkCase {
             min_callback_index_precision: None,
             min_callback_index_recall: None,
             max_callback_shape_fallback_ratio: None,
+            expected_arg_count: None,
+            expected_return_type: None,
         }
     }
 
@@ -183,6 +189,18 @@ impl BenchmarkCase {
     /// Caps the allowed fraction of callback provenance attributed to shape fallback.
     pub fn with_max_callback_shape_fallback_ratio(mut self, max_ratio: f64) -> Self {
         self.max_callback_shape_fallback_ratio = Some(max_ratio.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Requires the recovered function signature to use exactly this argument count.
+    pub fn with_expected_arg_count(mut self, expected_arg_count: usize) -> Self {
+        self.expected_arg_count = Some(expected_arg_count);
+        self
+    }
+
+    /// Requires the recovered function signature to use this return type.
+    pub fn expect_return_type(mut self, expected_return_type: impl Into<String>) -> Self {
+        self.expected_return_type = Some(normalize_type_name(&expected_return_type.into()));
         self
     }
 }
@@ -675,6 +693,48 @@ impl BenchmarkSuite {
             });
         }
 
+        // Validate function signature if specified
+        if case.expected_arg_count.is_some() || case.expected_return_type.is_some() {
+            if let Some((actual_arg_count, actual_return_type)) =
+                extract_signature_components(&output)
+            {
+                if let Some(expected_count) = case.expected_arg_count {
+                    let matched = actual_arg_count == expected_count;
+                    if !matched {
+                        violations_found += 1;
+                    }
+                    pattern_results.push(PatternMatchResult {
+                        pattern: format!("Signature(arg_count=={})", expected_count),
+                        matched,
+                        location: Some(0),
+                        details: Some(format!("actual arg_count {}", actual_arg_count)),
+                    });
+                }
+
+                if let Some(ref expected_type) = case.expected_return_type {
+                    let matched = &actual_return_type == expected_type;
+                    if !matched {
+                        violations_found += 1;
+                    }
+                    pattern_results.push(PatternMatchResult {
+                        pattern: format!("Signature(return_type=={})", expected_type),
+                        matched,
+                        location: Some(0),
+                        details: Some(format!("actual return_type {}", actual_return_type)),
+                    });
+                }
+            } else {
+                // Could not extract signature - mark as violation
+                violations_found += 1;
+                pattern_results.push(PatternMatchResult {
+                    pattern: "Signature(parseable)".to_string(),
+                    matched: false,
+                    location: None,
+                    details: Some("Could not extract function signature".to_string()),
+                });
+            }
+        }
+
         // Calculate score
         let pattern_score = if !case.expected_patterns.is_empty() {
             patterns_found as f64 / case.expected_patterns.len() as f64
@@ -1021,6 +1081,74 @@ fn count_callback_shape_fallback_provenance(output: &str) -> usize {
     output.matches("[source=shape-fallback]").count()
 }
 
+/// Normalize a C type name for comparison (removes spaces, etc.).
+fn normalize_type_name(type_name: &str) -> String {
+    type_name
+        .trim()
+        .replace(" *", "*")
+        .replace("* ", "*")
+        .replace(" (", "(")
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace(") ", ")")
+        .to_lowercase()
+}
+
+/// Extract function signature components from decompiled output.
+/// Returns (arg_count, return_type) if a function signature is found.
+fn extract_signature_components(output: &str) -> Option<(usize, String)> {
+    // Join consecutive lines to handle multi-line signatures
+    let lines: Vec<&str> = output.lines().collect();
+    for i in 0..lines.len() {
+        let mut combined = lines[i].trim().to_string();
+
+        // If line has '(' but no ')', try joining with next line
+        if combined.contains('(') && !combined.contains(')') && i + 1 < lines.len() {
+            combined.push(' ');
+            combined.push_str(lines[i + 1].trim());
+        }
+
+        // Look for function signature pattern: "type fname(...)"
+        if combined.contains('(') && combined.contains(')') {
+            // Extract return type and parameters
+            if let Some(paren_start) = combined.find('(') {
+                if let Some(paren_end) = combined.rfind(')') {
+                    // Extract parameters
+                    let params_str = &combined[paren_start + 1..paren_end];
+
+                    // Count parameters (handle "void" as 0 params)
+                    let arg_count = if params_str.trim().is_empty() || params_str.trim() == "void" {
+                        0
+                    } else {
+                        // Count commas + 1, but handle function pointers carefully
+                        let mut depth = 0;
+                        let mut comma_count = 0;
+                        for ch in params_str.chars() {
+                            match ch {
+                                '(' => depth += 1,
+                                ')' => depth -= 1,
+                                ',' if depth == 0 => comma_count += 1,
+                                _ => {}
+                            }
+                        }
+                        comma_count + 1
+                    };
+
+                    // Extract return type (everything before the function name)
+                    let before_paren = &combined[..paren_start];
+                    if let Some(last_space) = before_paren.rfind(' ') {
+                        let return_type = before_paren[..last_space].trim();
+                        if !return_type.is_empty() {
+                            return Some((arg_count, normalize_type_name(return_type)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Create the standard benchmark suite with common test cases.
 pub fn create_standard_suite() -> BenchmarkSuite {
     let mut suite = BenchmarkSuite::new();
@@ -1172,6 +1300,37 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .forbid_pattern(ForbiddenPattern::Goto)
             .forbid_pattern(ForbiddenPattern::Label)
             .with_min_quality(0.8),
+    );
+
+    // Signature quality cases
+    suite.add_case(
+        BenchmarkCase::new("sig_void_no_args")
+            .with_description("Function with void return and no arguments")
+            .with_category("signature_quality")
+            .with_difficulty(1)
+            .with_source("void no_args() { return; }")
+            .expect_return_type("void")
+            .with_expected_arg_count(0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("sig_int32_two_args")
+            .with_description("Function with int32_t return and two arguments")
+            .with_category("signature_quality")
+            .with_difficulty(1)
+            .with_source("int32_t add(int32_t a, int32_t b) { return a + b; }")
+            .expect_return_type("int32_t")
+            .with_expected_arg_count(2),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("sig_ptr_return")
+            .with_description("Function with pointer return")
+            .with_category("signature_quality")
+            .with_difficulty(2)
+            .with_source("void* get_ptr(int64_t offset) { return (void*)offset; }")
+            .expect_return_type("void*")
+            .with_expected_arg_count(1),
     );
 
     suite.add_case(
@@ -2460,5 +2619,82 @@ int32_t f(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*)) { return 0;
         assert!(!contains_label_pattern("case 1:"));
         assert!(!contains_label_pattern("default:"));
         assert!(!contains_label_pattern("int x = 5;"));
+    }
+
+    #[test]
+    fn test_signature_arg_count_validation() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(BenchmarkCase::new("correct_arg_count").with_expected_arg_count(2));
+
+        // Test passing case
+        let pass_results = suite.run_all(|_| {
+            Ok("int32_t fn(int32_t arg0, int32_t arg1) {\n    return 0;\n}\n".to_string())
+        });
+        assert_eq!(pass_results.passed, 1);
+
+        // Test failing case - wrong arg count
+        let fail_results =
+            suite.run_all(|_| Ok("int32_t fn(int32_t arg0) {\n    return 0;\n}\n".to_string()));
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.violations_found, 1);
+    }
+
+    #[test]
+    fn test_signature_return_type_validation() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(BenchmarkCase::new("correct_return_type").expect_return_type("int32_t"));
+
+        // Test passing case
+        let pass_results =
+            suite.run_all(|_| Ok("int32_t fn(int32_t arg0) {\n    return 0;\n}\n".to_string()));
+        assert_eq!(pass_results.passed, 1);
+
+        // Test failing case - wrong return type
+        let fail_results =
+            suite.run_all(|_| Ok("void fn(int32_t arg0) {\n    return;\n}\n".to_string()));
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.violations_found, 1);
+    }
+
+    #[test]
+    fn test_normalize_type_name() {
+        assert_eq!(normalize_type_name("int32_t"), "int32_t");
+        assert_eq!(normalize_type_name("int32_t *"), "int32_t*");
+        assert_eq!(normalize_type_name("void * "), "void*");
+        assert_eq!(normalize_type_name(" int64_t  "), "int64_t");
+        assert_eq!(normalize_type_name("INT32_T"), "int32_t"); // lowercased
+    }
+
+    #[test]
+    fn test_extract_signature_components() {
+        // Simple function with 2 args
+        let sig1 = "int32_t foo(int32_t arg0, void* arg1) {\n";
+        assert_eq!(
+            extract_signature_components(sig1),
+            Some((2, "int32_t".to_string()))
+        );
+
+        // Function with no args
+        let sig2 = "void bar() {\n";
+        assert_eq!(
+            extract_signature_components(sig2),
+            Some((0, "void".to_string()))
+        );
+
+        // Function with explicit void
+        let sig3 = "int32_t baz(void) {\n";
+        assert_eq!(
+            extract_signature_components(sig3),
+            Some((0, "int32_t".to_string()))
+        );
+
+        // Function with function pointer parameter
+        let sig4 = "int32_t qsort(void* base, int32_t (*compar)(void*, void*)) {\n";
+        assert_eq!(
+            extract_signature_components(sig4),
+            Some((2, "int32_t".to_string()))
+        );
     }
 }
