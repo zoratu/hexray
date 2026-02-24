@@ -1,0 +1,7 @@
+int32_t double_until(int32_t x)
+{
+    do {
+        x *= 2;
+    } while (x < 100);
+    return x;
+}

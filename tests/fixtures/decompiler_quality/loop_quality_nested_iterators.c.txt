@@ -1,0 +1,8 @@
+void init_matrix(int32_t** matrix, int32_t n, int32_t m)
+{
+    for (int32_t i = 0; i < n; i++) {
+        for (int32_t j = 0; j < m; j++) {
+            matrix[i][j] = 0;
+        }
+    }
+}
