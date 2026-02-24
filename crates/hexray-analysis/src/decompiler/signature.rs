@@ -1321,8 +1321,16 @@ impl SignatureRecovery {
                 self.return_confidence = self.return_confidence.max(200);
                 // Infer return type from expression
                 if let Some(size) = self.infer_expr_size(expr) {
-                    self.return_size = size;
-                    let reason = format!("return expression width inferred as {} byte(s)", size);
+                    let inferred_size = if matches!(expr.kind, ExprKind::IntLit(_)) {
+                        size.max(4)
+                    } else {
+                        size
+                    };
+                    self.return_size = inferred_size;
+                    let reason = format!(
+                        "return expression width inferred as {} byte(s)",
+                        inferred_size
+                    );
                     if !self.return_provenance.iter().any(|r| r == &reason) {
                         self.return_provenance.push(reason);
                     }
@@ -5149,6 +5157,32 @@ mod tests {
 
         assert!(sig.has_return);
         assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_defaults_literal_return_node_to_int32() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![],
+            address_range: (0x6000, 0x6004),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(Some(Expr::int(1)))],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(
+            sig.return_type,
+            ParamType::SignedInt(32),
+            "expected direct literal return node to default to int32_t, got {:?}",
+            sig.return_type
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - Non-void emission now injects a fallback `return 0;` only when top-level control can fall through and no terminal return line is already emitted.
 - Signature recovery now tracks value-width hints for lifted temporaries/locals and uses those hints during return-width inference.
 - Signature recovery now prefers destination return-register width (e.g., `w0` => 32-bit) for near-return assignments, preventing literal-zero paths from collapsing to `int8_t`.
-- Signature recovery now preserves return-register width for all integer literal returns (not only zero), preventing `x0/eax = 1` style returns from collapsing to `int8_t`.
+- Signature recovery now preserves return-register width for all integer literal returns (not only zero), and direct literal return nodes default to C `int` width, preventing `x0/eax = 1` / `return 1;` paths from collapsing to `int8_t`.
 - Register-size inference now treats unknown names as non-registers (`0` width) and handles RISC-V aliases explicitly, reducing accidental 64-bit widening from temporary names.
 
 Remaining high-value follow-up:
