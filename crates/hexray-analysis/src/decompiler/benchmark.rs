@@ -1456,12 +1456,48 @@ pub fn create_standard_suite() -> BenchmarkSuite {
     );
 
     suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_qsort_stack_spill")
+            .with_description("qsort callback typing survives stack-spill forwarding aliases")
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = compar; spill_ptr = &spill0; spill1 = *spill_ptr; qsort(base, n, elem_size, spill1);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
         BenchmarkCase::new("callback_fp_typing_pthread_mixed")
             .with_description("pthread callback typing survives mixed direct/indirect forwarding")
             .with_category("functions")
             .with_difficulty(4)
             .with_source(
                 "selected = cond ? start_routine : trampoline; pthread_create(&thread, attr, selected, arg);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "pthread_create".to_string(),
+            })
+            .expect_fp_decl("void* (*start_routine)(void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_pthread_stack_spill")
+            .with_description("pthread callback typing survives stack-spill forwarding aliases")
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = start_routine; spill_ptr = &spill0; spill1 = *spill_ptr; pthread_create(&thread, attr, spill1, arg);",
             )
             .with_min_quality(0.95)
             .with_max_gotos(0)
@@ -1587,6 +1623,46 @@ pub fn create_standard_suite() -> BenchmarkSuite {
                 name: "hexray_on_exit".to_string(),
             })
             .expect_fp_decl("void (*arg0)(int32_t, void*)")
+            .expect_callback_param_index(0)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_qsort_stack_spill_arg2")
+            .with_description("qsort callback index stability survives stack-spill forwarding")
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = compar; spill_ptr = &spill0; spill1 = *spill_ptr; qsort(base, n, elem_size, spill1);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg2)(void*, void*)")
+            .expect_callback_param_index(2)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_pthread_stack_spill_arg0")
+            .with_description(
+                "pthread callback index stability survives stack-spill forwarding aliases",
+            )
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = start_routine; spill_ptr = &spill0; spill1 = *spill_ptr; pthread_create(&thread, attr, spill1, arg);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "pthread_create".to_string(),
+            })
+            .expect_fp_decl("void* (*arg0)(void*)")
             .expect_callback_param_index(0)
             .with_min_callback_index_precision(1.0)
             .with_min_callback_index_recall(1.0),
@@ -2119,6 +2195,8 @@ mod tests {
             "callback_fp_typing_qsort_alias",
             "callback_fp_typing_qsort_multihop",
             "callback_fp_typing_pthread_mixed",
+            "callback_fp_typing_qsort_stack_spill",
+            "callback_fp_typing_pthread_stack_spill",
         ];
 
         for id in expected_ids {
@@ -2166,6 +2244,8 @@ mod tests {
             "callback_index_stability_hexray_qsort_r_arg3",
             "callback_index_stability_hexray_bsd_qsort_r_arg4",
             "callback_index_stability_hexray_on_exit_arg0",
+            "callback_index_stability_qsort_stack_spill_arg2",
+            "callback_index_stability_pthread_stack_spill_arg0",
             "callback_index_stability_hexray_pthread_atfork_args012",
             "callback_index_stability_hexray_pthread_atfork_alias_reuse",
         ];
