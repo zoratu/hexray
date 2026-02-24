@@ -1,0 +1,4 @@
+char* get_char_ptr(char* str)
+{
+    return str;
+}

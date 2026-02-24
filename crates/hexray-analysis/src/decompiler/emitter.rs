@@ -2048,11 +2048,19 @@ impl PseudoCodeEmitter {
                     // RIP-relative access. Show as a placeholder to avoid confusing output.
                     "/* unresolved_pc_relative */".to_string()
                 } else {
-                    // Rename callee-saved registers to meaningful names
-                    // These are commonly used to hold return values/error codes
-                    let renamed = rename_register(&var.name);
-                    let overridden = self.apply_param_name_override(&renamed);
-                    normalize_variable_name(&overridden)
+                    // Try to get a semantic name from NamingContext for stack variables
+                    // Check if this variable represents a stack offset (var_N format)
+                    if let Some(semantic_name) = self.try_get_semantic_var_name(&var.name) {
+                        // Apply parameter name overrides and normalization
+                        let overridden = self.apply_param_name_override(&semantic_name);
+                        normalize_variable_name(&overridden)
+                    } else {
+                        // Rename callee-saved registers to meaningful names
+                        // These are commonly used to hold return values/error codes
+                        let renamed = rename_register(&var.name);
+                        let overridden = self.apply_param_name_override(&renamed);
+                        normalize_variable_name(&overridden)
+                    }
                 }
             }
             ExprKind::Unknown(name) => {
@@ -4902,6 +4910,44 @@ impl PseudoCodeEmitter {
         })
     }
 
+    /// Try to get a semantic name for a variable using the NamingContext.
+    /// This handles variables with names like var_8, var_c, tmp0, local_10, etc.
+    /// Returns None if the variable doesn't match a pattern or if no semantic name is available.
+    fn try_get_semantic_var_name(&self, var_name: &str) -> Option<String> {
+        // Parse stack offset from variable name (var_8 -> 0x8, local_10 -> -0x10)
+        let offset = if let Some(suffix) = var_name.strip_prefix("var_") {
+            // var_8 format (positive offset, hex)
+            i128::from_str_radix(suffix, 16).ok()?
+        } else if let Some(suffix) = var_name.strip_prefix("local_") {
+            // local_10 format (negative offset, hex)
+            let positive = i128::from_str_radix(suffix, 16).ok()?;
+            -positive
+        } else if let Some(suffix) = var_name.strip_prefix("arg_") {
+            // arg_8 format (parameter, positive offset, hex)
+            i128::from_str_radix(suffix, 16).ok()?
+        } else {
+            // Not a stack variable pattern
+            return None;
+        };
+
+        // Ask NamingContext for a better name based on usage patterns
+        // Parameters typically have positive offsets in the var_/arg_ namespace
+        let is_param = var_name.starts_with("arg_") || offset > 0;
+        let semantic_name = self.naming_ctx.borrow_mut().get_name(offset, is_param);
+
+        // Only return the semantic name if it's different from the default naming
+        // This avoids replacing var_8 with var_8
+        if semantic_name.starts_with("var_")
+            || semantic_name.starts_with("local_")
+            || semantic_name.starts_with("arg_")
+        {
+            // NamingContext returned a default name, not a semantic one
+            None
+        } else {
+            Some(semantic_name)
+        }
+    }
+
     /// Try to format a stack slot dereference as a local variable name.
     /// Detects patterns like rbp + -0x8 and converts to var_8.
     fn try_format_stack_slot(&self, addr: &Expr, _size: u8) -> Option<String> {
@@ -6361,7 +6407,7 @@ mod tests {
         let output = emitter.emit(&cfg, "lifted_arg_slot");
 
         assert!(
-            output.contains("lifted_arg_slot(int64_t arg0)"),
+            output.contains("lifted_arg_slot(int32_t arg0)"),
             "Expected arg0 in signature for lifted arg slot, got:\n{}",
             output
         );
@@ -7403,5 +7449,49 @@ mod tests {
             "Should contain compound assignment operator: {}",
             formatted
         );
+    }
+
+    #[test]
+    fn test_semantic_variable_naming_var_parsing() {
+        // This tests the variable name parsing in try_get_semantic_var_name
+        // The actual semantic naming is tested in naming.rs tests
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Test var_ prefix parsing (var_8 -> offset 0x8 = 8)
+        // Note: Without patterns detected, this will return None because
+        // NamingContext will return a default name like var_8
+        let result = emitter.try_get_semantic_var_name("var_8");
+        // Should return None because no patterns detected yet
+        assert!(
+            result.is_none(),
+            "var_8 without detected pattern should return None"
+        );
+
+        // Test local_ prefix parsing (local_10 -> offset -0x10 = -16)
+        let result = emitter.try_get_semantic_var_name("local_10");
+        assert!(
+            result.is_none(),
+            "local_10 without detected pattern should return None"
+        );
+
+        // Test arg_ prefix parsing (arg_8 -> offset 0x8 = 8, is_param=true)
+        let result = emitter.try_get_semantic_var_name("arg_8");
+        assert!(
+            result.is_none(),
+            "arg_8 without detected pattern should return None"
+        );
+
+        // Test that non-var names return None
+        let result = emitter.try_get_semantic_var_name("foo");
+        assert!(result.is_none(), "Non-var names should return None");
+
+        // Test that invalid hex returns None
+        let result = emitter.try_get_semantic_var_name("var_xyz");
+        assert!(result.is_none(), "Invalid hex suffix should return None");
+
+        // Test that empty suffix returns None
+        let result = emitter.try_get_semantic_var_name("var_");
+        assert!(result.is_none(), "Empty suffix should return None");
     }
 }

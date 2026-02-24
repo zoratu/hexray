@@ -1,0 +1,4 @@
+struct Node* get_next(struct Node* node)
+{
+    return node->next;
+}

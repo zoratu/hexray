@@ -1,0 +1,4 @@
+int32_t* get_int_ptr(int32_t* arr, int32_t idx)
+{
+    return &arr[idx];
+}

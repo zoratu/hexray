@@ -6,6 +6,7 @@
 //! - `i = 0; while (i < n) { ... i++; }` → `for (i = 0; i < n; i++) { ... }`
 
 use super::expression::{BinOpKind, Expr, ExprKind, UnaryOpKind};
+use super::loop_condition_analysis::normalize_loop_condition;
 use super::structurer::StructuredNode;
 
 /// Detect and convert while loops with init/update patterns to for loops.
@@ -162,10 +163,19 @@ fn try_extract_for_loop(
     // Find update: look for increment/decrement of the loop variable in the body
     let (update, new_body) = extract_update_from_body(body, &loop_var)?;
 
+    // Normalize the condition for cleaner output (e.g., i != 10 → i < 10)
+    let normalized_condition = normalize_loop_condition(condition, Some(&init), Some(&update));
+
     // Remaining statements from the block (everything before the init)
     let remaining_stmts: Vec<_> = block_stmts[..init_idx].to_vec();
 
-    Some((init, condition.clone(), update, new_body, remaining_stmts))
+    Some((
+        init,
+        normalized_condition,
+        update,
+        new_body,
+        remaining_stmts,
+    ))
 }
 
 /// Extract the loop variable name from a comparison condition.

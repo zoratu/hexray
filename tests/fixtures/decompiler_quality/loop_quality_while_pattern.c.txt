@@ -1,0 +1,8 @@
+int32_t count_to_limit(int32_t limit)
+{
+    int32_t count = 0;
+    while (count < limit) {
+        count++;
+    }
+    return count;
+}
