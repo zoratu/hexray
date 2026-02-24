@@ -1563,7 +1563,7 @@ impl SignatureRecovery {
             ExprKind::Unknown(name) => {
                 let lowered = name.to_lowercase();
                 // Lifted IR often represents argument aliases as unknown identifiers
-                // (e.g., arg0/arg_8/stack_-8); treat them as reads for use-before-def.
+                // (e.g., arg0/arg_8); treat them as reads for use-before-def.
                 if self.is_arg_register(&lowered) && !self.written_regs.contains(&lowered) {
                     self.read_regs.insert(lowered.clone());
                     let size = self.reg_size_from_name(name);
@@ -2317,7 +2317,9 @@ impl SignatureRecovery {
             if let Ok(offset) = offset_str.parse::<i128>() {
                 if offset < 0 {
                     let abs = (-offset) as u128;
-                    variants.push(format!("arg_{:x}", abs));
+                    // Negative stack slots are frequently locals in lifted IR.
+                    // Keep only local-name aliases here to avoid spurious ABI
+                    // parameter inference from stack-local traffic.
                     variants.push(format!("local_{:x}", abs));
                 } else {
                     variants.push(format!("var_{:x}", offset as u128));
@@ -2460,9 +2462,6 @@ impl SignatureRecovery {
             return None;
         }
         if let Some(idx) = self.arg_register_index(var_name) {
-            return Some(idx);
-        }
-        if let Some(idx) = Self::lifted_stack_slot_index(var_name) {
             return Some(idx);
         }
         None
@@ -2744,19 +2743,6 @@ impl SignatureRecovery {
         let suffix = name.strip_prefix("arg_")?;
         let suffix = suffix.strip_prefix("0x").unwrap_or(suffix);
         let offset = u64::from_str_radix(suffix, 16).ok()?;
-        if offset < 8 || offset % 8 != 0 {
-            return None;
-        }
-        Some(((offset - 8) / 8) as usize)
-    }
-
-    fn lifted_stack_slot_index(name: &str) -> Option<usize> {
-        let suffix = name.strip_prefix("stack_")?;
-        let raw = suffix.parse::<i64>().ok()?;
-        if raw >= 0 {
-            return None;
-        }
-        let offset = (-raw) as u64;
         if offset < 8 || offset % 8 != 0 {
             return None;
         }
@@ -3291,14 +3277,6 @@ mod tests {
         assert_eq!(SignatureRecovery::lifted_arg_slot_index("arg_8"), Some(0));
         assert_eq!(SignatureRecovery::lifted_arg_slot_index("arg_10"), Some(1));
         assert_eq!(SignatureRecovery::lifted_arg_slot_index("arg_18"), Some(2));
-        assert_eq!(
-            SignatureRecovery::lifted_stack_slot_index("stack_-8"),
-            Some(0)
-        );
-        assert_eq!(
-            SignatureRecovery::lifted_stack_slot_index("stack_-16"),
-            Some(1)
-        );
     }
 
     #[test]
@@ -3589,6 +3567,40 @@ mod tests {
             matches!(sig.parameters[0].param_type, ParamType::Pointer),
             "expected arg0 to be inferred as pointer, got {:?}",
             sig.parameters[0].param_type
+        );
+    }
+
+    #[test]
+    fn test_lifted_stack_local_alias_does_not_create_spurious_param() {
+        use hexray_core::BasicBlockId;
+
+        // Simulate a lifted local-stack flow:
+        //   var_18 = stack_-8;
+        //   tmp = var_18[iter];
+        //
+        // stack_-8 should not be treated as an implicit ABI parameter by itself.
+        let bind_local = Expr::assign(Expr::unknown("var_18"), Expr::unknown("stack_-8"));
+        let load_indexed = Expr::assign(
+            Expr::unknown("tmp"),
+            Expr::array_access(Expr::unknown("var_18"), Expr::unknown("iter"), 4),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![bind_local, load_indexed],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        assert!(
+            sig.parameters.is_empty(),
+            "expected no inferred parameters for local stack alias, got {:?}",
+            sig.parameters
         );
     }
 

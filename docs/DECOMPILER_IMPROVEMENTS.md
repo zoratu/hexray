@@ -33,6 +33,7 @@ Recent iterations tightened callback typing in both analysis and CLI output:
 - Loop-condition zero-init analysis now ignores statements that are dropped during emission (prologue/no-op/temp-setup noise), preventing false "initialized" signals from hidden setup assignments.
 - Local declaration recovery now merges emitted-body assignment identifiers and canonicalizes array-suffixed names (e.g., `tmp1[idx]` -> `tmp1`), preventing missing/invalid declarations in loop-heavy corpus functions.
 - Top-level emission now stops after control-exit statements unless later labels exist, reducing stray unreachable statements after `return` in decompiled output.
+- Signature recovery no longer maps lifted negative stack slots (for example `stack_-8`) directly to ABI parameters, reducing spurious extra-argument inference in local-stack-heavy functions.
 - Pure return-chain structuring no longer synthesizes implicit `x0` return expressions when no explicit return-register assignment exists; this improves void-return recovery on ABI-overlap architectures.
 - Non-void emission now injects a fallback `return 0;` only when top-level control can fall through and no terminal return line is already emitted.
 - Signature recovery now tracks value-width hints for lifted temporaries/locals and uses those hints during return-width inference.
