@@ -1412,7 +1412,7 @@ impl SignatureRecovery {
                             if let Some(rhs_size) = self.infer_expr_size(rhs) {
                                 if rhs_size > 0
                                     && rhs_size < reg_size
-                                    && !matches!(rhs.kind, ExprKind::IntLit(0))
+                                    && !matches!(rhs.kind, ExprKind::IntLit(_))
                                 {
                                     inferred_size = rhs_size;
                                 }
@@ -4973,6 +4973,50 @@ mod tests {
 
         assert!(sig.has_return);
         assert_eq!(sig.return_type, ParamType::SignedInt(64));
+    }
+
+    #[test]
+    fn test_signature_recovery_keeps_x0_width_for_literal_nonzero_return() {
+        use hexray_core::BasicBlockId;
+
+        let set_ret = Expr::assign(Expr::var(Variable::reg("x0", 8)), Expr::int(1));
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![set_ret],
+            address_range: (0x2100, 0x2108),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::Aarch64);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(64));
+    }
+
+    #[test]
+    fn test_signature_recovery_keeps_eax_width_for_literal_nonzero_return() {
+        use hexray_core::BasicBlockId;
+
+        let set_ret = Expr::assign(Expr::var(Variable::reg("eax", 4)), Expr::int(1));
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![set_ret],
+            address_range: (0x2200, 0x2208),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
     }
 
     #[test]
