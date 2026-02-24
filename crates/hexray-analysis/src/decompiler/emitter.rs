@@ -519,6 +519,20 @@ impl PseudoCodeEmitter {
             .insert(from_lower, to.to_string());
     }
 
+    fn set_lifted_param_slot_overrides(&self, index: usize, rendered_name: &str) {
+        let slot = 8 * (index + 1);
+        let aliases = [
+            format!("arg_{:x}", slot),
+            format!("arg_0x{:x}", slot),
+            format!("local_{:x}", slot),
+            format!("local_0x{:x}", slot),
+            format!("stack_-{}", slot),
+        ];
+        for alias in aliases {
+            self.set_param_name_override(&alias, rendered_name);
+        }
+    }
+
     fn apply_param_name_override(&self, name: &str) -> String {
         self.param_name_overrides
             .borrow()
@@ -2346,6 +2360,7 @@ impl PseudoCodeEmitter {
             let rendered_name = &rendered_param_names[idx];
             self.set_param_name_override(source_name, rendered_name);
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
+            self.set_lifted_param_slot_overrides(idx, rendered_name);
         }
 
         // Function header with detected signature
@@ -2544,6 +2559,7 @@ impl PseudoCodeEmitter {
             let rendered_name = &rendered_param_names[idx];
             self.set_param_name_override(source_name, rendered_name);
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
+            self.set_lifted_param_slot_overrides(idx, rendered_name);
         }
 
         // Use provided signature for header
@@ -6320,6 +6336,48 @@ mod tests {
         assert!(
             !output.contains(" arg0"),
             "Did not expect leaked arg0 names in output:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_lifted_arg_slot_name_matches_body_usage() {
+        // Lifted IR may refer to the first argument as arg_8.
+        // Header/body should stay aligned on arg0 naming, not leak local_8.
+        let read_lifted_arg = Expr::assign(Expr::unknown("tmp"), Expr::unknown("arg_8"));
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![read_lifted_arg],
+            address_range: (0x1100, 0x1110),
+        };
+        let ret = StructuredNode::Return(Some(Expr::int(0)));
+        let cfg = StructuredCfg {
+            body: vec![block, ret],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_calling_convention(CallingConvention::SystemV);
+        let output = emitter.emit(&cfg, "lifted_arg_slot");
+
+        assert!(
+            output.contains("lifted_arg_slot(int64_t arg0)"),
+            "Expected arg0 in signature for lifted arg slot, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("tmp = arg0;"),
+            "Expected body usage to align with signature parameter name, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("arg_8"),
+            "Did not expect raw lifted arg name leak, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("local_8"),
+            "Did not expect lifted arg slot to normalize into local_8, got:\n{}",
             output
         );
     }

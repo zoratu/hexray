@@ -2947,10 +2947,15 @@ impl SignatureRecovery {
             let reg64_lower = reg64.to_lowercase();
             let reg32_lower = reg32.to_lowercase();
             let pseudo_arg = format!("arg{}", idx);
+            let lifted_slot = 8 * (idx + 1);
+            let lifted_arg = format!("arg_{:x}", lifted_slot);
+            let lifted_arg_prefixed = format!("arg_0x{:x}", lifted_slot);
 
             if self.read_regs.contains(&reg64_lower)
                 || self.read_regs.contains(&reg32_lower)
                 || self.read_regs.contains(&pseudo_arg)
+                || self.read_regs.contains(&lifted_arg)
+                || self.read_regs.contains(&lifted_arg_prefixed)
                 || self
                     .param_hints
                     .get(&idx)
@@ -3602,6 +3607,36 @@ mod tests {
             "expected no inferred parameters for local stack alias, got {:?}",
             sig.parameters
         );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_lifted_arg_slot_read_as_param() {
+        use hexray_core::BasicBlockId;
+
+        let read_lifted_arg = Expr::assign(Expr::unknown("tmp"), Expr::unknown("arg_8"));
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![read_lifted_arg],
+            address_range: (0x1200, 0x1210),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(
+            sig.parameters.len(),
+            1,
+            "expected lifted arg slot read to recover arg0, got {:?}",
+            sig.parameters
+        );
+        assert!(matches!(
+            sig.parameters[0].location,
+            ParameterLocation::IntegerRegister { index: 0, .. }
+        ));
     }
 
     #[test]
