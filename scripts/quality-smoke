@@ -45,6 +45,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 cargo test -p hexray-analysis --test control_flow_quality_smoke -- --nocapture
+cargo test -p hexray-analysis --test signature_quality_smoke -- --nocapture
 
 if [[ "$RUN_CALLBACK" == "yes" ]]; then
     if [[ "$STRICT_CALLBACK" == "yes" ]]; then

@@ -746,6 +746,14 @@ fn test_decompile_callback_header_snapshots() {
             "int32_t _spawn_with_start_multihop(void* (*arg0)(void*), int64_t arg1)",
         ),
         (
+            "sort_with_cmp_stack_spill",
+            "int32_t _sort_with_cmp_stack_spill(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+        ),
+        (
+            "spawn_with_start_stack_spill",
+            "int32_t _spawn_with_start_stack_spill(void* (*arg0)(void*), int64_t arg1)",
+        ),
+        (
             "register_on_exit",
             "int32_t _register_on_exit(void (*arg0)(int32_t, void*), int64_t arg1)",
         ),
@@ -770,7 +778,7 @@ fn test_decompile_callback_header_snapshots() {
     if strict {
         assert_eq!(
             static_cmp_header,
-            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)",
             "Strict mode mismatch for symbol sort_with_static_cmp"
         );
     } else {
@@ -787,7 +795,7 @@ fn test_decompile_callback_header_snapshots() {
         .unwrap_or_else(|| panic!("missing decompile header for symbol spawn_with_static_start"));
     if strict {
         assert_eq!(
-            static_spawn_header, "int32_t _spawn_with_static_start(void* (*arg0)(void*))",
+            static_spawn_header, "int32_t _spawn_with_static_start(int64_t arg0)",
             "Strict mode mismatch for symbol spawn_with_static_start"
         );
     } else {
@@ -962,6 +970,29 @@ fn test_decompile_callback_diagnostics() {
     assert!(
         !stdout.contains("[source=shape-fallback] mapped callback slot '_qsort'"),
         "qsort callback should no longer require ABI-shape fallback:\n{}",
+        stdout
+    );
+
+    let output = run_hexray(&[
+        &binary,
+        "decompile",
+        "sort_with_cmp_stack_spill",
+        "--diagnostics",
+    ]);
+    assert!(
+        output.status.success(),
+        "decompile diagnostics should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[source=alias]"),
+        "Stack-spill callback wrapper should include alias callback provenance:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("[source=shape-fallback] mapped callback slot '_qsort'"),
+        "Stack-spill qsort callback should not require ABI-shape fallback:\n{}",
         stdout
     );
 

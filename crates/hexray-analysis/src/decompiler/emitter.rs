@@ -12,7 +12,7 @@ use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, StringTable, SummaryDatabase, SymbolTable};
 use hexray_types::{get_argument_category, ConstantCategory, ConstantDatabase, TypeDatabase};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -366,6 +366,12 @@ pub struct PseudoCodeEmitter {
     /// Tracks global access frequency and usage patterns.
     /// Uses RefCell for interior mutability during emission.
     global_tracker: RefCell<GlobalAccessTracker>,
+    /// Per-function parameter display-name overrides (e.g., arg0 -> argc).
+    /// Uses RefCell for interior mutability during emission.
+    param_name_overrides: RefCell<HashMap<String, String>>,
+    /// Fallback expression for bare returns when signature is non-void.
+    /// Uses RefCell for interior mutability during emission.
+    return_fallback_expr: RefCell<Option<String>>,
 }
 
 impl PseudoCodeEmitter {
@@ -381,6 +387,58 @@ impl PseudoCodeEmitter {
         } else {
             p.param_type.format_with_name(rendered_name)
         }
+    }
+
+    fn is_pointer_like_type_hint(type_hint: &str) -> bool {
+        let ty = type_hint.trim();
+        ty.contains("(*)") || ty.contains('*') || ty.ends_with("[]")
+    }
+
+    fn should_apply_signature_type_hint(
+        param_type: &super::signature::ParamType,
+        type_hint: &str,
+    ) -> bool {
+        if matches!(
+            param_type,
+            super::signature::ParamType::FunctionPointer { .. }
+        ) {
+            return false;
+        }
+        Self::is_pointer_like_type_hint(type_hint)
+    }
+
+    fn find_param_type_hint(
+        &self,
+        param_index: usize,
+        source_name: &str,
+        rendered_name: &str,
+    ) -> Option<String> {
+        let arg_fallback = format!("arg{}", param_index);
+        let candidates = [source_name, rendered_name, arg_fallback.as_str()];
+        for candidate in candidates {
+            if let Some(ty) = self.type_info.get(candidate) {
+                return Some(ty.clone());
+            }
+            let candidate_lower = candidate.to_lowercase();
+            if let Some(ty) = self.type_info.get(&candidate_lower) {
+                return Some(ty.clone());
+            }
+        }
+        None
+    }
+
+    fn format_signature_param_with_type_hint(
+        &self,
+        p: &super::signature::Parameter,
+        rendered_name: &str,
+        type_hint: Option<&str>,
+    ) -> String {
+        if let Some(type_hint) = type_hint {
+            if Self::should_apply_signature_type_hint(&p.param_type, type_hint) {
+                return format!("{} {}", type_hint.trim(), rendered_name);
+            }
+        }
+        Self::format_signature_param(p, rendered_name)
     }
 
     /// Creates a new emitter.
@@ -400,7 +458,87 @@ impl PseudoCodeEmitter {
             constant_database: None,
             summary_database: None,
             global_tracker: RefCell::new(GlobalAccessTracker::new()),
+            param_name_overrides: RefCell::new(HashMap::new()),
+            return_fallback_expr: RefCell::new(None),
         }
+    }
+
+    fn fallback_return_expr_for_type(return_type: &str) -> Option<String> {
+        let ty = return_type.trim();
+        if ty == "void" {
+            None
+        } else if ty.contains("float") || ty.contains("double") {
+            Some("0.0".to_string())
+        } else {
+            Some("0".to_string())
+        }
+    }
+
+    fn set_return_fallback_expr_for_type(&self, return_type: &str) {
+        *self.return_fallback_expr.borrow_mut() = Self::fallback_return_expr_for_type(return_type);
+    }
+
+    fn clear_return_fallback_expr(&self) {
+        *self.return_fallback_expr.borrow_mut() = None;
+    }
+
+    fn emit_return_line(&self, output: &mut String, indent: &str, expr: Option<&Expr>) {
+        if let Some(e) = expr {
+            writeln!(output, "{}return {};", indent, self.format_expr(e)).unwrap();
+            return;
+        }
+        if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
+            writeln!(output, "{}return {};", indent, fallback).unwrap();
+        } else {
+            writeln!(output, "{}return;", indent).unwrap();
+        }
+    }
+
+    fn output_ends_with_return_stmt(output: &str) -> bool {
+        output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| {
+                let trimmed = line.trim_start();
+                trimmed == "return;" || trimmed.starts_with("return ")
+            })
+    }
+
+    fn clear_param_name_overrides(&self) {
+        self.param_name_overrides.borrow_mut().clear();
+    }
+
+    fn set_param_name_override(&self, from: &str, to: &str) {
+        let from_lower = from.to_lowercase();
+        if from_lower == to.to_lowercase() {
+            return;
+        }
+        self.param_name_overrides
+            .borrow_mut()
+            .insert(from_lower, to.to_string());
+    }
+
+    fn set_lifted_param_slot_overrides(&self, index: usize, rendered_name: &str) {
+        let slot = 8 * (index + 1);
+        let aliases = [
+            format!("arg_{:x}", slot),
+            format!("arg_0x{:x}", slot),
+            format!("local_{:x}", slot),
+            format!("local_0x{:x}", slot),
+            format!("stack_-{}", slot),
+        ];
+        for alias in aliases {
+            self.set_param_name_override(&alias, rendered_name);
+        }
+    }
+
+    fn apply_param_name_override(&self, name: &str) -> String {
+        self.param_name_overrides
+            .borrow()
+            .get(&name.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// Sets the calling convention for signature recovery.
@@ -1912,7 +2050,9 @@ impl PseudoCodeEmitter {
                 } else {
                     // Rename callee-saved registers to meaningful names
                     // These are commonly used to hold return values/error codes
-                    normalize_variable_name(&rename_register(&var.name))
+                    let renamed = rename_register(&var.name);
+                    let overridden = self.apply_param_name_override(&renamed);
+                    normalize_variable_name(&overridden)
                 }
             }
             ExprKind::Unknown(name) => {
@@ -1924,7 +2064,8 @@ impl PseudoCodeEmitter {
                     // but at least preserves the semantic information
                     name.clone()
                 } else {
-                    normalize_variable_name(name)
+                    let overridden = self.apply_param_name_override(name);
+                    normalize_variable_name(&overridden)
                 }
             }
             // Handle casts with potential elimination based on known types
@@ -2199,6 +2340,29 @@ impl PseudoCodeEmitter {
             (None, self.analyze_function(&cfg.body))
         };
 
+        let param_override_sources: Vec<String> = if let Some(ref sig) = signature {
+            if sig.parameters.is_empty() {
+                func_info.parameters.clone()
+            } else {
+                sig.parameters.iter().map(|p| p.name.clone()).collect()
+            }
+        } else {
+            func_info.parameters.clone()
+        };
+        let rendered_param_names: Vec<String> = param_override_sources
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| rename_main_param(name, idx))
+            .collect();
+
+        self.clear_param_name_overrides();
+        for (idx, source_name) in param_override_sources.iter().enumerate() {
+            let rendered_name = &rendered_param_names[idx];
+            self.set_param_name_override(source_name, rendered_name);
+            self.set_param_name_override(&format!("arg{}", idx), rendered_name);
+            self.set_lifted_param_slot_overrides(idx, rendered_name);
+        }
+
         // Function header with detected signature
         if let Some(ref sig) = signature {
             // Use the recovered signature for type information
@@ -2209,6 +2373,7 @@ impl PseudoCodeEmitter {
             } else {
                 "void".to_string()
             };
+            self.set_return_fallback_expr_for_type(&return_type);
 
             if sig.parameters.is_empty() && func_info.parameters.is_empty() {
                 writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
@@ -2218,8 +2383,14 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, p)| {
-                        let rendered_name = rename_main_param(&p.name, idx);
-                        Self::format_signature_param(p, &rendered_name)
+                        let source_name = &param_override_sources[idx];
+                        let rendered_name = rendered_param_names[idx].clone();
+                        let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
+                        self.format_signature_param_with_type_hint(
+                            p,
+                            &rendered_name,
+                            type_hint.as_deref(),
+                        )
                     })
                     .collect();
                 writeln!(
@@ -2237,7 +2408,7 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, p)| {
-                        let name = rename_main_param(p, idx);
+                        let name = rendered_param_names[idx].clone();
                         format!("{} {}", self.get_type(p), name)
                     })
                     .collect();
@@ -2257,6 +2428,7 @@ impl PseudoCodeEmitter {
             } else {
                 "void"
             };
+            self.set_return_fallback_expr_for_type(return_type);
             if func_info.parameters.is_empty() {
                 writeln!(output, "{} {}()", return_type, func_name).unwrap();
             } else {
@@ -2265,7 +2437,7 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, p)| {
-                        let name = rename_main_param(p, idx);
+                        let name = rendered_param_names[idx].clone();
                         format!("{} {}", self.get_type(p), name)
                     })
                     .collect();
@@ -2281,33 +2453,67 @@ impl PseudoCodeEmitter {
         }
         writeln!(output, "{{").unwrap();
 
+        let mut param_exclusion_names = HashSet::new();
+        for (idx, name) in param_override_sources.iter().enumerate() {
+            param_exclusion_names.insert(name.clone());
+            param_exclusion_names.insert(rendered_param_names[idx].clone());
+            param_exclusion_names.insert(format!("arg{}", idx));
+        }
+        let param_exclusion_list: Vec<String> = param_exclusion_names.into_iter().collect();
+
         // Collect all local variables used in the function (excluding parameters)
-        let all_vars = self.collect_local_variables(&cfg.body, &func_info.parameters);
+        let all_vars = self.collect_local_variables(&cfg.body, &param_exclusion_list);
+        let loop_zero_init_vars = self.find_loop_condition_vars_needing_init(&cfg.body);
+
+        // Emit body into a temporary buffer first so declarations can be filtered
+        // to only identifiers that actually appear after skip/noise pruning.
+        let mut body_output = String::new();
+        let mut declared_vars: HashSet<String> = param_exclusion_list.clone().into_iter().collect();
+        declared_vars.extend(all_vars.iter().cloned());
+        self.emit_nodes_with_skip_and_decls(
+            &cfg.body,
+            &mut body_output,
+            1,
+            &func_info.skip_statements,
+            &mut declared_vars,
+        );
+        if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
+            if !self.body_ends_with_control_exit(&cfg.body)
+                && !Self::output_ends_with_return_stmt(&body_output)
+            {
+                writeln!(body_output, "{}return {};", self.indent, fallback).unwrap();
+            }
+        }
+
+        let mut all_vars_set: HashSet<String> = all_vars
+            .into_iter()
+            .filter(|var| contains_identifier_token(&body_output, var))
+            .collect();
+        for inferred in collect_decl_identifiers_from_emitted_body(&body_output) {
+            if !param_exclusion_list.contains(&inferred) {
+                all_vars_set.insert(inferred);
+            }
+        }
+        let mut all_vars: Vec<String> = all_vars_set.into_iter().collect();
+        all_vars.sort();
 
         // Emit variable declarations at the top (C89 style)
         if !all_vars.is_empty() {
             let indent = &self.indent;
             for var in &all_vars {
                 let var_type = self.get_type(var);
-                writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
+                if loop_zero_init_vars.contains(var) {
+                    writeln!(output, "{}{} {} = 0;", indent, var_type, var).unwrap();
+                } else {
+                    writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
+                }
             }
             writeln!(output).unwrap(); // Blank line after declarations
         }
 
-        // Track declared variables (parameters + locals)
-        let mut declared_vars: HashSet<String> = func_info.parameters.iter().cloned().collect();
-        declared_vars.extend(all_vars);
-
-        // Emit body, skipping parameter assignment statements
-        self.emit_nodes_with_skip_and_decls(
-            &cfg.body,
-            &mut output,
-            1,
-            &func_info.skip_statements,
-            &mut declared_vars,
-        );
-
+        write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
+        self.clear_return_fallback_expr();
         output
     }
 
@@ -2322,9 +2528,39 @@ impl PseudoCodeEmitter {
         signature: &FunctionSignature,
     ) -> String {
         let mut output = String::new();
+        let rename_main_param = |name: &str, index: usize| -> String {
+            if func_name == "main" || func_name == "_main" {
+                match (index, name) {
+                    (0, "arg0") => "argc".to_string(),
+                    (1, "arg1") => "argv".to_string(),
+                    _ => name.to_string(),
+                }
+            } else {
+                name.to_string()
+            }
+        };
 
         // Analyze function body for pattern-based variable naming
         self.naming_ctx.borrow_mut().analyze(&cfg.body);
+        let signature_param_names: Vec<String> = signature
+            .parameters
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        let rendered_param_names: Vec<String> = signature
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| rename_main_param(&p.name, idx))
+            .collect();
+
+        self.clear_param_name_overrides();
+        for (idx, source_name) in signature_param_names.iter().enumerate() {
+            let rendered_name = &rendered_param_names[idx];
+            self.set_param_name_override(source_name, rendered_name);
+            self.set_param_name_override(&format!("arg{}", idx), rendered_name);
+            self.set_lifted_param_slot_overrides(idx, rendered_name);
+        }
 
         // Use provided signature for header
         let return_type = if signature.has_return {
@@ -2332,6 +2568,7 @@ impl PseudoCodeEmitter {
         } else {
             "void".to_string()
         };
+        self.set_return_fallback_expr_for_type(&return_type);
 
         if signature.parameters.is_empty() {
             writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
@@ -2339,7 +2576,17 @@ impl PseudoCodeEmitter {
             let params: Vec<_> = signature
                 .parameters
                 .iter()
-                .map(|p| p.param_type.format_with_name(&p.name))
+                .enumerate()
+                .map(|(idx, p)| {
+                    let source_name = &signature_param_names[idx];
+                    let rendered_name = rendered_param_names[idx].clone();
+                    let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
+                    self.format_signature_param_with_type_hint(
+                        p,
+                        &rendered_name,
+                        type_hint.as_deref(),
+                    )
+                })
                 .collect();
             writeln!(
                 output,
@@ -2355,40 +2602,67 @@ impl PseudoCodeEmitter {
         // Legacy analysis for skipping parameter statements
         let func_info = self.analyze_function(&cfg.body);
 
-        // Collect parameter names from signature
-        let param_names: Vec<String> = signature
-            .parameters
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
+        let mut param_exclusion_names = HashSet::new();
+        for (idx, name) in signature_param_names.iter().enumerate() {
+            param_exclusion_names.insert(name.clone());
+            param_exclusion_names.insert(rendered_param_names[idx].clone());
+            param_exclusion_names.insert(format!("arg{}", idx));
+        }
+        let param_exclusion_list: Vec<String> = param_exclusion_names.into_iter().collect();
 
         // Collect all local variables used in the function (excluding parameters)
-        let all_vars = self.collect_local_variables(&cfg.body, &param_names);
+        let all_vars = self.collect_local_variables(&cfg.body, &param_exclusion_list);
+        let loop_zero_init_vars = self.find_loop_condition_vars_needing_init(&cfg.body);
+
+        // Emit body into a temporary buffer first so declarations can be filtered
+        // to only identifiers that survive statement skipping.
+        let mut body_output = String::new();
+        let mut declared_vars: HashSet<String> = param_exclusion_list.clone().into_iter().collect();
+        declared_vars.extend(all_vars.iter().cloned());
+        self.emit_nodes_with_skip_and_decls(
+            &cfg.body,
+            &mut body_output,
+            1,
+            &func_info.skip_statements,
+            &mut declared_vars,
+        );
+        if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
+            if !self.body_ends_with_control_exit(&cfg.body)
+                && !Self::output_ends_with_return_stmt(&body_output)
+            {
+                writeln!(body_output, "{}return {};", self.indent, fallback).unwrap();
+            }
+        }
+
+        let mut all_vars_set: HashSet<String> = all_vars
+            .into_iter()
+            .filter(|var| contains_identifier_token(&body_output, var))
+            .collect();
+        for inferred in collect_decl_identifiers_from_emitted_body(&body_output) {
+            if !param_exclusion_list.contains(&inferred) {
+                all_vars_set.insert(inferred);
+            }
+        }
+        let mut all_vars: Vec<String> = all_vars_set.into_iter().collect();
+        all_vars.sort();
 
         // Emit variable declarations at the top (C89 style)
         if !all_vars.is_empty() {
             let indent = &self.indent;
             for var in &all_vars {
                 let var_type = self.get_type(var);
-                writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
+                if loop_zero_init_vars.contains(var) {
+                    writeln!(output, "{}{} {} = 0;", indent, var_type, var).unwrap();
+                } else {
+                    writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
+                }
             }
             writeln!(output).unwrap();
         }
 
-        // Track declared variables (parameters + locals)
-        let mut declared_vars: HashSet<String> = param_names.into_iter().collect();
-        declared_vars.extend(all_vars);
-
-        // Emit body
-        self.emit_nodes_with_skip_and_decls(
-            &cfg.body,
-            &mut output,
-            1,
-            &func_info.skip_statements,
-            &mut declared_vars,
-        );
-
+        write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
+        self.clear_return_fallback_expr();
         output
     }
 
@@ -2423,6 +2697,11 @@ impl PseudoCodeEmitter {
     fn collect_local_variables(&self, nodes: &[StructuredNode], params: &[String]) -> Vec<String> {
         let mut vars = HashSet::new();
         self.collect_vars_from_nodes(nodes, &mut vars);
+        self.collect_display_assigned_names(nodes, &mut vars);
+        vars = vars
+            .into_iter()
+            .filter_map(|name| canonical_decl_var_name(&name))
+            .collect();
 
         // Remove parameters
         for p in params {
@@ -2445,10 +2724,6 @@ impl PseudoCodeEmitter {
         match node {
             StructuredNode::Block { statements, .. } => {
                 for stmt in statements {
-                    // Skip prologue/epilogue
-                    if self.is_prologue_epilogue(stmt) {
-                        continue;
-                    }
                     // Collect variables from entire statement expression
                     self.collect_vars_from_expr(stmt, vars);
                 }
@@ -2537,6 +2812,465 @@ impl PseudoCodeEmitter {
         }
     }
 
+    fn find_loop_condition_vars_needing_init(&self, nodes: &[StructuredNode]) -> HashSet<String> {
+        let mut needed = HashSet::new();
+        let mut definitely_assigned = HashSet::new();
+        self.collect_loop_condition_uninitialized_vars(
+            nodes,
+            &mut definitely_assigned,
+            &mut needed,
+        );
+        needed
+            .into_iter()
+            .filter(|name| is_declarable_variable(name) && is_loop_counter_like_name(name))
+            .collect()
+    }
+
+    fn collect_loop_condition_uninitialized_vars(
+        &self,
+        nodes: &[StructuredNode],
+        definitely_assigned: &mut HashSet<String>,
+        needed: &mut HashSet<String>,
+    ) {
+        for node in nodes {
+            self.collect_loop_condition_uninitialized_in_node(node, definitely_assigned, needed);
+        }
+    }
+
+    fn collect_loop_condition_uninitialized_in_node(
+        &self,
+        node: &StructuredNode,
+        definitely_assigned: &mut HashSet<String>,
+        needed: &mut HashSet<String>,
+    ) {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    if self.is_prologue_epilogue(stmt)
+                        || self.is_noop_assignment(stmt)
+                        || self.is_skippable_statement(stmt)
+                    {
+                        continue;
+                    }
+                    self.collect_assigned_vars_from_expr(stmt, definitely_assigned);
+                }
+            }
+            StructuredNode::Expr(expr) => {
+                if self.is_prologue_epilogue(expr)
+                    || self.is_noop_assignment(expr)
+                    || self.is_skippable_statement(expr)
+                {
+                    return;
+                }
+                self.collect_assigned_vars_from_expr(expr, definitely_assigned)
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+                ..
+            } => {
+                // Condition executes before either branch.
+                self.collect_assigned_vars_from_expr(condition, definitely_assigned);
+                let mut then_assigned = definitely_assigned.clone();
+                self.collect_loop_condition_uninitialized_vars(
+                    then_body,
+                    &mut then_assigned,
+                    needed,
+                );
+
+                let mut else_assigned = definitely_assigned.clone();
+                if let Some(else_nodes) = else_body {
+                    self.collect_loop_condition_uninitialized_vars(
+                        else_nodes,
+                        &mut else_assigned,
+                        needed,
+                    );
+                }
+
+                *definitely_assigned = then_assigned
+                    .intersection(&else_assigned)
+                    .cloned()
+                    .collect();
+            }
+            StructuredNode::While {
+                condition, body, ..
+            } => {
+                let mut condition_vars = HashSet::new();
+                self.collect_vars_from_expr(condition, &mut condition_vars);
+                for var in condition_vars {
+                    if !definitely_assigned.contains(&var) {
+                        needed.insert(var);
+                    }
+                }
+
+                // While conditions execute at least once.
+                self.collect_assigned_vars_from_expr(condition, definitely_assigned);
+
+                // Body assignments are not guaranteed (zero iterations), but nested loops still
+                // need analysis for their own uninitialized condition variables.
+                let mut body_assigned = definitely_assigned.clone();
+                self.collect_loop_condition_uninitialized_vars(body, &mut body_assigned, needed);
+            }
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
+                // For init executes before the first condition check.
+                if let Some(init_expr) = init {
+                    self.collect_assigned_vars_from_expr(init_expr, definitely_assigned);
+                }
+
+                let mut condition_vars = HashSet::new();
+                self.collect_vars_from_expr(condition, &mut condition_vars);
+                for var in condition_vars {
+                    if !definitely_assigned.contains(&var) {
+                        needed.insert(var);
+                    }
+                }
+
+                // For condition executes when loop is reached.
+                self.collect_assigned_vars_from_expr(condition, definitely_assigned);
+
+                // Body/update assignments are not guaranteed to run.
+                let mut body_assigned = definitely_assigned.clone();
+                self.collect_loop_condition_uninitialized_vars(body, &mut body_assigned, needed);
+                if let Some(update_expr) = update {
+                    self.collect_assigned_vars_from_expr(update_expr, &mut body_assigned);
+                }
+            }
+            StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
+                // Do-while body executes before first condition.
+                self.collect_loop_condition_uninitialized_vars(body, definitely_assigned, needed);
+
+                let mut condition_vars = HashSet::new();
+                self.collect_vars_from_expr(condition, &mut condition_vars);
+                for var in condition_vars {
+                    if !definitely_assigned.contains(&var) {
+                        needed.insert(var);
+                    }
+                }
+                self.collect_assigned_vars_from_expr(condition, definitely_assigned);
+            }
+            StructuredNode::Loop { body, .. } => {
+                let mut body_assigned = definitely_assigned.clone();
+                self.collect_loop_condition_uninitialized_vars(body, &mut body_assigned, needed);
+            }
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+                ..
+            } => {
+                self.collect_assigned_vars_from_expr(value, definitely_assigned);
+
+                let mut merged: Option<HashSet<String>> = None;
+                for (_, case_body) in cases {
+                    let mut case_assigned = definitely_assigned.clone();
+                    self.collect_loop_condition_uninitialized_vars(
+                        case_body,
+                        &mut case_assigned,
+                        needed,
+                    );
+                    merged = Some(match merged {
+                        Some(current) => current.intersection(&case_assigned).cloned().collect(),
+                        None => case_assigned,
+                    });
+                }
+
+                if let Some(default_nodes) = default {
+                    let mut default_assigned = definitely_assigned.clone();
+                    self.collect_loop_condition_uninitialized_vars(
+                        default_nodes,
+                        &mut default_assigned,
+                        needed,
+                    );
+                    merged = Some(match merged {
+                        Some(current) => current.intersection(&default_assigned).cloned().collect(),
+                        None => default_assigned,
+                    });
+                } else if let Some(current) = merged.take() {
+                    // No default means no case may execute.
+                    merged = Some(current.intersection(definitely_assigned).cloned().collect());
+                }
+
+                if let Some(result) = merged {
+                    *definitely_assigned = result;
+                }
+            }
+            StructuredNode::Sequence(inner) => {
+                self.collect_loop_condition_uninitialized_vars(inner, definitely_assigned, needed);
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                let mut try_assigned = definitely_assigned.clone();
+                self.collect_loop_condition_uninitialized_vars(try_body, &mut try_assigned, needed);
+
+                let mut merged = try_assigned;
+                for handler in catch_handlers {
+                    let mut catch_assigned = definitely_assigned.clone();
+                    self.collect_loop_condition_uninitialized_vars(
+                        &handler.body,
+                        &mut catch_assigned,
+                        needed,
+                    );
+                    merged = merged.intersection(&catch_assigned).cloned().collect();
+                }
+                *definitely_assigned = merged;
+            }
+            StructuredNode::Break
+            | StructuredNode::Continue
+            | StructuredNode::Return(_)
+            | StructuredNode::Goto(_)
+            | StructuredNode::Label(_) => {}
+        }
+    }
+
+    fn collect_assigned_vars_from_expr(&self, expr: &Expr, assigned: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Assign { lhs, rhs } => {
+                if let Some(name) = self.try_get_assigned_var_name(lhs) {
+                    assigned.insert(name);
+                }
+                self.collect_assigned_vars_from_expr(rhs, assigned);
+            }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                if let Some(name) = self.try_get_assigned_var_name(lhs) {
+                    assigned.insert(name);
+                }
+                self.collect_assigned_vars_from_expr(rhs, assigned);
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.collect_assigned_vars_from_expr(arg, assigned);
+                }
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.collect_assigned_vars_from_expr(left, assigned);
+                self.collect_assigned_vars_from_expr(right, assigned);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                self.collect_assigned_vars_from_expr(operand, assigned);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.collect_assigned_vars_from_expr(base, assigned);
+                self.collect_assigned_vars_from_expr(index, assigned);
+            }
+            ExprKind::Deref { addr, .. } => {
+                self.collect_assigned_vars_from_expr(addr, assigned);
+            }
+            ExprKind::AddressOf(inner) | ExprKind::Cast { expr: inner, .. } => {
+                self.collect_assigned_vars_from_expr(inner, assigned);
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_assigned_vars_from_expr(cond, assigned);
+                self.collect_assigned_vars_from_expr(then_expr, assigned);
+                self.collect_assigned_vars_from_expr(else_expr, assigned);
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                self.collect_assigned_vars_from_expr(base, assigned);
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    self.collect_assigned_vars_from_expr(value, assigned);
+                }
+            }
+            ExprKind::BitField { expr: inner, .. } => {
+                self.collect_assigned_vars_from_expr(inner, assigned);
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                self.collect_assigned_vars_from_expr(display_expr, assigned);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_display_assigned_names(&self, nodes: &[StructuredNode], vars: &mut HashSet<String>) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        if self.is_prologue_epilogue(stmt)
+                            || self.is_noop_assignment(stmt)
+                            || self.is_skippable_statement(stmt)
+                        {
+                            continue;
+                        }
+                        self.collect_display_assigned_names_from_expr(stmt, vars);
+                    }
+                }
+                StructuredNode::Expr(expr) => {
+                    if self.is_prologue_epilogue(expr)
+                        || self.is_noop_assignment(expr)
+                        || self.is_skippable_statement(expr)
+                    {
+                        continue;
+                    }
+                    self.collect_display_assigned_names_from_expr(expr, vars);
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    self.collect_display_assigned_names_from_expr(condition, vars);
+                    self.collect_display_assigned_names(then_body, vars);
+                    if let Some(else_nodes) = else_body {
+                        self.collect_display_assigned_names(else_nodes, vars);
+                    }
+                }
+                StructuredNode::While {
+                    condition, body, ..
+                } => {
+                    self.collect_display_assigned_names_from_expr(condition, vars);
+                    self.collect_display_assigned_names(body, vars);
+                }
+                StructuredNode::DoWhile {
+                    body, condition, ..
+                } => {
+                    self.collect_display_assigned_names(body, vars);
+                    self.collect_display_assigned_names_from_expr(condition, vars);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(init_expr) = init {
+                        self.collect_display_assigned_names_from_expr(init_expr, vars);
+                    }
+                    self.collect_display_assigned_names_from_expr(condition, vars);
+                    if let Some(update_expr) = update {
+                        self.collect_display_assigned_names_from_expr(update_expr, vars);
+                    }
+                    self.collect_display_assigned_names(body, vars);
+                }
+                StructuredNode::Loop { body, .. } => {
+                    self.collect_display_assigned_names(body, vars);
+                }
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    self.collect_display_assigned_names_from_expr(value, vars);
+                    for (_, case_body) in cases {
+                        self.collect_display_assigned_names(case_body, vars);
+                    }
+                    if let Some(default_nodes) = default {
+                        self.collect_display_assigned_names(default_nodes, vars);
+                    }
+                }
+                StructuredNode::Sequence(inner) => {
+                    self.collect_display_assigned_names(inner, vars);
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    self.collect_display_assigned_names(try_body, vars);
+                    for handler in catch_handlers {
+                        self.collect_display_assigned_names(&handler.body, vars);
+                    }
+                }
+                StructuredNode::Break
+                | StructuredNode::Continue
+                | StructuredNode::Return(_)
+                | StructuredNode::Goto(_)
+                | StructuredNode::Label(_) => {}
+            }
+        }
+    }
+
+    fn collect_display_assigned_names_from_expr(&self, expr: &Expr, vars: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                if let Some(name) = self.extract_display_assigned_identifier(lhs) {
+                    vars.insert(name);
+                }
+                self.collect_display_assigned_names_from_expr(lhs, vars);
+                self.collect_display_assigned_names_from_expr(rhs, vars);
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.collect_display_assigned_names_from_expr(arg, vars);
+                }
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.collect_display_assigned_names_from_expr(left, vars);
+                self.collect_display_assigned_names_from_expr(right, vars);
+            }
+            ExprKind::UnaryOp { operand, .. } => {
+                self.collect_display_assigned_names_from_expr(operand, vars);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.collect_display_assigned_names_from_expr(base, vars);
+                self.collect_display_assigned_names_from_expr(index, vars);
+            }
+            ExprKind::Deref { addr, .. } => {
+                self.collect_display_assigned_names_from_expr(addr, vars);
+            }
+            ExprKind::AddressOf(inner) | ExprKind::Cast { expr: inner, .. } => {
+                self.collect_display_assigned_names_from_expr(inner, vars);
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_display_assigned_names_from_expr(cond, vars);
+                self.collect_display_assigned_names_from_expr(then_expr, vars);
+                self.collect_display_assigned_names_from_expr(else_expr, vars);
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                self.collect_display_assigned_names_from_expr(base, vars);
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    self.collect_display_assigned_names_from_expr(value, vars);
+                }
+            }
+            ExprKind::BitField { expr: inner, .. } => {
+                self.collect_display_assigned_names_from_expr(inner, vars);
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                self.collect_display_assigned_names_from_expr(display_expr, vars);
+            }
+            ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => {}
+        }
+    }
+
+    fn extract_display_assigned_identifier(&self, lhs: &Expr) -> Option<String> {
+        let raw = match &lhs.kind {
+            ExprKind::Unknown(name) => self.apply_param_name_override(name),
+            ExprKind::Var(var) => {
+                let renamed = rename_register(&var.name);
+                self.apply_param_name_override(&renamed)
+            }
+            _ => return None,
+        };
+        let normalized = normalize_variable_name(&raw);
+        let canonical = canonical_decl_var_name(&normalized)?;
+        if is_likely_global_identifier(&canonical) {
+            return None;
+        }
+        Some(canonical)
+    }
+
     /// Recursively collects all variable names used in an expression.
     /// This includes variables on both LHS and RHS of assignments, in conditions, etc.
     fn collect_vars_from_expr(&self, expr: &Expr, vars: &mut HashSet<String>) {
@@ -2583,7 +3317,7 @@ impl PseudoCodeEmitter {
             }
             ExprKind::Assign { lhs, rhs } => {
                 // Collect from LHS (for variable declarations)
-                if let Some(var_name) = self.try_get_var_name(lhs) {
+                if let Some(var_name) = self.try_get_assigned_var_name(lhs) {
                     vars.insert(var_name);
                 }
                 // Also collect variables used in LHS address computation
@@ -2592,7 +3326,7 @@ impl PseudoCodeEmitter {
                 self.collect_vars_from_expr(rhs, vars);
             }
             ExprKind::CompoundAssign { lhs, rhs, .. } => {
-                if let Some(var_name) = self.try_get_var_name(lhs) {
+                if let Some(var_name) = self.try_get_assigned_var_name(lhs) {
                     vars.insert(var_name);
                 }
                 self.collect_vars_from_expr(lhs, vars);
@@ -2621,8 +3355,13 @@ impl PseudoCodeEmitter {
             ExprKind::GotRef { display_expr, .. } => {
                 self.collect_vars_from_expr(display_expr, vars);
             }
-            // Literals don't contain variables
-            ExprKind::IntLit(_) | ExprKind::Unknown(_) => {}
+            // Literals don't contain variables.
+            ExprKind::IntLit(_) => {}
+            ExprKind::Unknown(name) => {
+                if is_assignable_unknown_name(name) {
+                    vars.insert(name.clone());
+                }
+            }
         }
     }
 
@@ -2780,10 +3519,18 @@ impl PseudoCodeEmitter {
     ) {
         for (block_idx, node) in nodes.iter().enumerate() {
             self.emit_node_with_skip_and_decls(node, output, depth, block_idx, skip, declared_vars);
-            // At top level, don't break on control exits - labeled sections after gotos
-            // are reachable. Only break within nested structures (if/while bodies).
-            if !is_top_level && self.is_control_exit(node) {
-                break;
+            if self.is_control_exit(node) {
+                if !is_top_level {
+                    break;
+                }
+                // At top-level, keep scanning only when there are labels ahead that
+                // can still be reached via explicit gotos.
+                let has_later_label = nodes[block_idx + 1..]
+                    .iter()
+                    .any(|n| matches!(n, StructuredNode::Label(_)));
+                if !has_later_label {
+                    break;
+                }
             }
         }
     }
@@ -3243,7 +3990,7 @@ impl PseudoCodeEmitter {
         }
 
         if expr_str == "return" {
-            writeln!(output, "{}return;", indent).unwrap();
+            self.emit_return_line(output, &indent, None);
             return;
         }
 
@@ -3806,11 +4553,7 @@ impl PseudoCodeEmitter {
             }
 
             StructuredNode::Return(expr) => {
-                if let Some(e) = expr {
-                    writeln!(output, "{}return {};", indent, self.format_expr(e)).unwrap();
-                } else {
-                    writeln!(output, "{}return;", indent).unwrap();
-                }
+                self.emit_return_line(output, &indent, expr.as_ref());
             }
 
             StructuredNode::Goto(target) => {
@@ -3943,7 +4686,7 @@ impl PseudoCodeEmitter {
 
         // Check if it's a return
         if expr_str == "return" {
-            writeln!(output, "{}return;", indent).unwrap();
+            self.emit_return_line(output, &indent, None);
             return;
         }
 
@@ -4146,6 +4889,17 @@ impl PseudoCodeEmitter {
             ExprKind::Deref { addr, size } => self.try_format_stack_slot(addr, *size),
             _ => None,
         }
+    }
+
+    fn try_get_assigned_var_name(&self, expr: &Expr) -> Option<String> {
+        self.try_get_var_name(expr).or_else(|| {
+            if let ExprKind::Unknown(name) = &expr.kind {
+                if is_assignable_unknown_name(name) {
+                    return Some(name.clone());
+                }
+            }
+            None
+        })
     }
 
     /// Try to format a stack slot dereference as a local variable name.
@@ -5055,6 +5809,170 @@ fn is_declarable_variable(name: &str) -> bool {
     true
 }
 
+fn is_assignable_unknown_name(name: &str) -> bool {
+    if is_declarable_variable(name) {
+        return true;
+    }
+
+    // Avoid treating linker/compiler helper symbols as locals.
+    if name.starts_with("__") {
+        return false;
+    }
+
+    // Accept generic identifier-shaped names on assignment LHS (e.g., sum, total, value).
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return false;
+    }
+
+    true
+}
+
+fn is_likely_global_identifier(name: &str) -> bool {
+    name.starts_with("g_")
+        || name.starts_with("data_")
+        || name.starts_with("__")
+        || matches!(name, "stdin" | "stdout" | "stderr" | "errno")
+}
+
+fn contains_identifier_token(text: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while let Some(found) = text[start..].find(ident) {
+        let pos = start + found;
+        let end = pos + ident.len();
+
+        let before_is_ident = pos > 0 && is_identifier_char(bytes[pos - 1] as char);
+        let after_is_ident = end < bytes.len() && is_identifier_char(bytes[end] as char);
+        if !before_is_ident && !after_is_ident {
+            return true;
+        }
+
+        start = end;
+    }
+
+    false
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn collect_decl_identifiers_from_emitted_body(body: &str) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("if ")
+            || trimmed.starts_with("if(")
+            || trimmed.starts_with("while ")
+            || trimmed.starts_with("while(")
+            || trimmed.starts_with("for ")
+            || trimmed.starts_with("for(")
+            || trimmed.starts_with("switch ")
+            || trimmed.starts_with("switch(")
+            || trimmed.starts_with("return")
+        {
+            continue;
+        }
+
+        if let Some(lhs) = extract_assignment_lhs(trimmed) {
+            if let Some(name) = canonical_decl_var_name(lhs) {
+                if !is_likely_global_identifier(&name) && !looks_like_parameter_name(&name) {
+                    vars.insert(name);
+                }
+            }
+        }
+    }
+    vars
+}
+
+fn extract_assignment_lhs(line: &str) -> Option<&str> {
+    const OPS: [&str; 10] = ["<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "="];
+
+    let mut best: Option<(usize, &str)> = None;
+    for op in OPS {
+        if let Some(pos) = line.find(op) {
+            if op == "=" {
+                let bytes = line.as_bytes();
+                let prev = pos.checked_sub(1).map(|i| bytes[i] as char);
+                let next = bytes.get(pos + 1).copied().map(char::from);
+                if matches!(prev, Some('=' | '!' | '<' | '>')) || next == Some('=') {
+                    continue;
+                }
+            }
+
+            if best.map_or(true, |(best_pos, _)| pos < best_pos) {
+                best = Some((pos, op));
+            }
+        }
+    }
+
+    best.map(|(pos, _)| line[..pos].trim().trim_end_matches(';').trim())
+}
+
+fn looks_like_parameter_name(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("arg") {
+        if !rest.is_empty() {
+            return rest.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    if let Some(rest) = name.strip_prefix("arg_") {
+        if !rest.is_empty() {
+            return rest.chars().all(|c| c.is_ascii_hexdigit());
+        }
+    }
+    false
+}
+
+fn canonical_decl_var_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let base = trimmed.split('[').next().unwrap_or(trimmed).trim();
+    if is_assignable_unknown_name(base) {
+        Some(base.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_loop_counter_like_name(name: &str) -> bool {
+    matches!(
+        name,
+        "i" | "j"
+            | "k"
+            | "l"
+            | "m"
+            | "n"
+            | "ii"
+            | "jj"
+            | "kk"
+            | "iter"
+            | "idx"
+            | "idx2"
+            | "idx3"
+            | "count"
+            | "pos"
+            | "offset"
+    ) || name.ends_with("_idx")
+        || name.ends_with("_iter")
+}
+
 /// Attempts to extract array access components from an address expression.
 /// Matches patterns like `base + index * element_size` where `element_size == size`.
 /// Returns `Some((base, index))` if the pattern matches, `None` otherwise.
@@ -5234,6 +6152,289 @@ mod tests {
             "Expected increment, got: {}",
             output
         );
+    }
+
+    #[test]
+    fn test_emit_stops_after_top_level_return_without_labels() {
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Return(Some(Expr::int(0))),
+                StructuredNode::Expr(Expr::assign(Expr::unknown("x"), Expr::int(1))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+        assert!(
+            output.contains("return 0;"),
+            "Expected return statement:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("x = 1;"),
+            "Did not expect statements after top-level return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_initializes_unassigned_loop_iterator() {
+        use super::super::expression::Variable;
+
+        let cond = Expr::binop(
+            BinOpKind::Lt,
+            Expr::var(Variable::reg("iter", 4)),
+            Expr::int(8),
+        );
+        let node = StructuredNode::While {
+            condition: cond,
+            body: Vec::new(),
+            header: None,
+            exit_block: None,
+        };
+        let cfg = StructuredCfg {
+            body: vec![node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+        assert!(
+            output.contains("int iter = 0;"),
+            "Expected loop iterator zero-init declaration, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_initializes_iterator_when_only_assigned_in_while_body() {
+        use super::super::expression::Variable;
+
+        let cond = Expr::binop(
+            BinOpKind::Lt,
+            Expr::var(Variable::reg("iter", 4)),
+            Expr::int(8),
+        );
+        let body_stmt = Expr::assign(
+            Expr::var(Variable::reg("iter", 4)),
+            Expr::binop(
+                BinOpKind::Add,
+                Expr::var(Variable::reg("iter", 4)),
+                Expr::int(1),
+            ),
+        );
+        let loop_node = StructuredNode::While {
+            condition: cond,
+            body: vec![StructuredNode::Expr(body_stmt)],
+            header: None,
+            exit_block: None,
+        };
+        let cfg = StructuredCfg {
+            body: vec![loop_node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+        assert!(
+            output.contains("int iter = 0;"),
+            "Expected zero-init for condition iterator even when assigned in loop body, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_does_not_zero_init_for_loop_counter_with_init() {
+        let init = Expr::assign(Expr::unknown("iter"), Expr::int(0));
+        let cond = Expr::binop(BinOpKind::Lt, Expr::unknown("iter"), Expr::int(8));
+        let update = Expr::assign(
+            Expr::unknown("iter"),
+            Expr::binop(BinOpKind::Add, Expr::unknown("iter"), Expr::int(1)),
+        );
+        let loop_node = StructuredNode::For {
+            init: Some(init),
+            condition: cond,
+            update: Some(update),
+            body: Vec::new(),
+            header: None,
+            exit_block: None,
+        };
+        let cfg = StructuredCfg {
+            body: vec![loop_node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+        assert!(
+            !output.contains("int iter = 0;"),
+            "Expected for-loop init to satisfy iterator initialization, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_zero_init_when_only_pre_loop_assign_is_skipped_temp_setup() {
+        use super::super::expression::Variable;
+
+        let pre_loop = StructuredNode::Expr(Expr::assign(
+            Expr::unknown("iter"),
+            Expr::var(Variable::reg("w9", 4)),
+        ));
+        let cond = Expr::binop(BinOpKind::Lt, Expr::unknown("iter"), Expr::int(8));
+        let loop_node = StructuredNode::While {
+            condition: cond,
+            body: Vec::new(),
+            header: None,
+            exit_block: None,
+        };
+        let cfg = StructuredCfg {
+            body: vec![pre_loop, loop_node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+        assert!(
+            output.contains("int iter = 0;"),
+            "Expected skipped temp-setup assign not to suppress loop iterator zero-init:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_main_param_name_matches_body_usage() {
+        use super::super::expression::Variable;
+
+        let read_arg0 = Expr::assign(Expr::unknown("tmp"), Expr::var(Variable::reg("x0", 8)));
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![read_arg0],
+            address_range: (0x1000, 0x1010),
+        };
+        let ret = StructuredNode::Return(Some(Expr::int(0)));
+        let cfg = StructuredCfg {
+            body: vec![block, ret],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_calling_convention(CallingConvention::Aarch64);
+        let output = emitter.emit(&cfg, "_main");
+
+        assert!(
+            output.contains("_main(int32_t argc)"),
+            "Expected argc in main signature, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("tmp = argc;"),
+            "Expected body usage to align with renamed parameter, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains(" arg0"),
+            "Did not expect leaked arg0 names in output:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_lifted_arg_slot_name_matches_body_usage() {
+        // Lifted IR may refer to the first argument as arg_8.
+        // Header/body should stay aligned on arg0 naming, not leak local_8.
+        let read_lifted_arg = Expr::assign(Expr::unknown("tmp"), Expr::unknown("arg_8"));
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![read_lifted_arg],
+            address_range: (0x1100, 0x1110),
+        };
+        let ret = StructuredNode::Return(Some(Expr::int(0)));
+        let cfg = StructuredCfg {
+            body: vec![block, ret],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_calling_convention(CallingConvention::SystemV);
+        let output = emitter.emit(&cfg, "lifted_arg_slot");
+
+        assert!(
+            output.contains("lifted_arg_slot(int64_t arg0)"),
+            "Expected arg0 in signature for lifted arg slot, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("tmp = arg0;"),
+            "Expected body usage to align with signature parameter name, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("arg_8"),
+            "Did not expect raw lifted arg name leak, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("local_8"),
+            "Did not expect lifted arg slot to normalize into local_8, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_declares_unknown_lhs_local_names() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("sum"), Expr::int(0)),
+                Expr::assign(
+                    Expr::unknown("sum"),
+                    Expr::binop(BinOpKind::Add, Expr::unknown("sum"), Expr::int(5)),
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(Some(Expr::unknown("sum")))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "accumulate");
+        assert!(
+            output.contains("int sum;"),
+            "Expected declaration for inferred local 'sum', got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_canonical_decl_var_name_strips_array_suffix() {
+        assert_eq!(
+            canonical_decl_var_name("tmp1[idx]"),
+            Some("tmp1".to_string())
+        );
+        assert_eq!(canonical_decl_var_name("sum"), Some("sum".to_string()));
+    }
+
+    #[test]
+    fn test_collect_decl_identifiers_from_emitted_body_parses_assignments_only() {
+        let body = r#"
+    sum = 0;
+    ptr[idx] = value;
+    if (sum == 0) {
+        sum += ptr[idx];
+    }
+    while (ptr != 0) {
+        ptr = next;
+    }
+"#;
+        let vars = collect_decl_identifiers_from_emitted_body(body);
+        assert!(vars.contains("sum"));
+        assert!(vars.contains("ptr"));
+        assert!(!vars.contains("if"));
+        assert!(!vars.contains("while"));
     }
 
     #[test]
@@ -5422,7 +6623,147 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_can_use_shape_fallback_for_callback_type_without_direct_param_mapping() {
+    fn test_emit_with_signature_applies_pointer_type_hint_to_generic_param() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::int(0)))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+        sig.parameters
+            .push(super::super::signature::Parameter::from_int_register(
+                0,
+                "rdi",
+                super::super::signature::ParamType::SignedInt(64),
+            ));
+
+        let mut type_info = HashMap::new();
+        type_info.insert("arg0".to_string(), "int*".to_string());
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+        let output = emitter.emit_with_signature(&cfg, "typed_arg", &sig);
+        let header = output.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("int* arg0"),
+            "expected pointer type hint in header, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_non_void_bare_return_uses_zero_fallback() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "ret_fixup", &sig);
+        assert!(
+            output.contains("return 0;"),
+            "non-void bare return should emit value fallback:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return;"),
+            "non-void output must not emit bare return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_void_bare_return_stays_void() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "void_ret_ok", &sig);
+        assert!(
+            output.contains("return;"),
+            "void bare return should be preserved:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_appends_fallback_return_on_top_level_fallthrough() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::If {
+                condition: Expr::unknown("cond"),
+                then_body: vec![StructuredNode::Return(Some(Expr::int(1)))],
+                else_body: None,
+            }],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "fallthrough_fixup", &sig);
+        assert!(
+            output.contains("return 0;"),
+            "non-void fallthrough should emit fallback return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_keeps_function_pointer_param_shape() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::int(0)))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "arg0",
+            super::super::signature::ParamType::FunctionPointer {
+                return_type: Box::new(super::super::signature::ParamType::SignedInt(32)),
+                params: vec![
+                    super::super::signature::ParamType::Pointer,
+                    super::super::signature::ParamType::Pointer,
+                ],
+            },
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+
+        let mut type_info = HashMap::new();
+        type_info.insert("arg0".to_string(), "void*".to_string());
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+        let output = emitter.emit_with_signature(&cfg, "typed_cb", &sig);
+        let header = output.lines().next().unwrap_or_default();
+        assert!(
+            header.contains("(*arg0)("),
+            "function-pointer signature should be preserved, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_does_not_force_callback_type_for_static_callback_symbol() {
         use super::super::expression::Variable;
 
         let call = Expr::call(
@@ -5449,10 +6790,8 @@ mod tests {
         let output = emitter.emit(&cfg, "qsort_wrapper");
         let header = output.lines().next().unwrap_or_default();
         assert!(
-            header.contains("(*arg1)(void*, void*)")
-                || header.contains("(*arg2)(void*, void*)")
-                || header.contains("(*arg3)(void*, void*)"),
-            "Header should include inferred callback type via fallback mapping:\n{}",
+            !header.contains("(*arg"),
+            "Header should keep static callback symbols as non-parameter values:\n{}",
             output
         );
     }

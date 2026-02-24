@@ -574,8 +574,12 @@ impl<'a> Structurer<'a> {
     }
 
     /// Checks if a block (and its successors) eventually return with just cleanup calls.
-    /// Returns the return value expression if it does, None otherwise.
-    fn get_return_expr_if_pure_return(&self, block_id: BasicBlockId) -> Option<Expr> {
+    ///
+    /// Returns:
+    /// - `Some(Some(expr))` for pure return chains with an explicit return value
+    /// - `Some(None)` for pure return chains with a void return
+    /// - `None` when the chain is not a pure return
+    fn get_return_expr_if_pure_return(&self, block_id: BasicBlockId) -> Option<Option<Expr>> {
         self.get_return_expr_following_chain(block_id, &mut HashSet::new())
     }
 
@@ -584,7 +588,7 @@ impl<'a> Structurer<'a> {
         &self,
         block_id: BasicBlockId,
         visited: &mut HashSet<BasicBlockId>,
-    ) -> Option<Expr> {
+    ) -> Option<Option<Expr>> {
         // Prevent infinite loops
         if visited.contains(&block_id) {
             return None;
@@ -597,7 +601,7 @@ impl<'a> Structurer<'a> {
         match &block.terminator {
             BlockTerminator::Return => {
                 // This is a pure return block - extract return value
-                self.extract_return_value(block)
+                Some(self.extract_return_value(block))
             }
             BlockTerminator::Call { return_block, .. } => {
                 // This is a cleanup call block - check if the next block eventually returns
@@ -621,6 +625,9 @@ impl<'a> Structurer<'a> {
     }
 
     /// Extracts the return value from a pure return block.
+    ///
+    /// Returns `None` when the block is a pure `return;` without an explicit
+    /// return-register assignment.
     fn extract_return_value(&self, block: &BasicBlock) -> Option<Expr> {
         let mut return_value: Option<Expr> = None;
 
@@ -665,14 +672,8 @@ impl<'a> Structurer<'a> {
             return None;
         }
 
-        // Return the captured value, or default to the return register
-        Some(return_value.unwrap_or_else(|| {
-            Expr::var(super::expression::Variable {
-                name: "x0".to_string(),
-                kind: super::expression::VarKind::Register(0),
-                size: 8,
-            })
-        }))
+        // Only return an expression when we saw an explicit return-register assignment.
+        return_value
     }
 
     /// Checks if a block is a cleanup block (just a call, no other logic).
@@ -804,7 +805,7 @@ impl<'a> Structurer<'a> {
             {
                 // Check if target is a pure return block - if so, emit return instead of goto
                 if let Some(ret_expr) = self.get_return_expr_if_pure_return(block_id) {
-                    result.push(StructuredNode::Return(Some(ret_expr)));
+                    result.push(StructuredNode::Return(ret_expr));
                 } else {
                     result.push(StructuredNode::Goto(block_id));
                 }
@@ -815,7 +816,7 @@ impl<'a> Structurer<'a> {
             if self.processed.contains(&block_id) {
                 // Check if target is a pure return block - if so, emit return instead of goto
                 if let Some(ret_expr) = self.get_return_expr_if_pure_return(block_id) {
-                    result.push(StructuredNode::Return(Some(ret_expr)));
+                    result.push(StructuredNode::Return(ret_expr));
                 } else {
                     result.push(StructuredNode::Goto(block_id));
                 }
@@ -1528,14 +1529,29 @@ fn try_extract_arm64_branch_condition(
     if mnemonic == "tbz" || mnemonic == "tbnz" {
         // Operands: [reg, bit_pos, pc_rel_target]
         if branch_inst.operands.len() >= 2 {
-            let reg_expr = substitute_register_in_expr(
-                Expr::from_operand_with_inst(&branch_inst.operands[0], branch_inst),
-                reg_values,
-            );
-
             // Extract bit position
             if let hexray_core::Operand::Immediate(imm) = &branch_inst.operands[1] {
                 let bit_pos = imm.value;
+                let reg_expr = substitute_register_in_expr(
+                    Expr::from_operand_with_inst(&branch_inst.operands[0], branch_inst),
+                    reg_values,
+                );
+
+                // Common signed-compare lowering:
+                // tbz wN,#31 => wN >= 0, tbnz wN,#31 => wN < 0
+                // tbz xN,#63 => xN >= 0, tbnz xN,#63 => xN < 0
+                if let Operand::Register(reg) = &branch_inst.operands[0] {
+                    let sign_bit = (reg.size as i128).saturating_sub(1);
+                    if bit_pos == sign_bit {
+                        let cmp_op = if mnemonic == "tbz" {
+                            BinOpKind::Ge
+                        } else {
+                            BinOpKind::Lt
+                        };
+                        return Some(Expr::binop(cmp_op, reg_expr, Expr::int(0)));
+                    }
+                }
+
                 // Create bit test expression: (reg >> bit_pos) & 1
                 let shifted = Expr::binop(BinOpKind::Shr, reg_expr, Expr::int(bit_pos));
                 let masked = Expr::binop(BinOpKind::And, shifted, Expr::int(1));
@@ -7441,7 +7457,10 @@ fn is_noreturn_function(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{BasicBlock, BlockTerminator, Condition};
+    use hexray_core::{
+        Architecture, BasicBlock, BlockTerminator, Condition, Operand, Operation, Register,
+        RegisterClass,
+    };
 
     // --- Helper functions to create test CFGs ---
 
@@ -7714,6 +7733,87 @@ mod tests {
         cfg.add_edge(BasicBlockId::new(4), BasicBlockId::new(1));
 
         cfg
+    }
+
+    #[test]
+    fn test_extract_tbz_sign_bit_as_signed_ge_zero() {
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let reg_w8 = Register::new(Architecture::Arm64, RegisterClass::General, 8, 32);
+        let inst = Instruction::new(0x1000, 4, vec![], "tbz")
+            .with_operation(Operation::ConditionalJump)
+            .with_operands(vec![
+                Operand::Register(reg_w8),
+                Operand::imm_unsigned(31, 8),
+                Operand::pc_rel(16, 0x1010),
+            ]);
+        block.instructions.push(inst);
+
+        let cond = try_extract_arm64_branch_condition(&block, BinOpKind::Eq, &HashMap::new())
+            .expect("tbz sign-bit condition should be extracted");
+        assert!(matches!(
+            cond.kind,
+            super::super::expression::ExprKind::BinOp {
+                op: BinOpKind::Ge,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_tbnz_sign_bit_as_signed_lt_zero() {
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let reg_w8 = Register::new(Architecture::Arm64, RegisterClass::General, 8, 32);
+        let inst = Instruction::new(0x1000, 4, vec![], "tbnz")
+            .with_operation(Operation::ConditionalJump)
+            .with_operands(vec![
+                Operand::Register(reg_w8),
+                Operand::imm_unsigned(31, 8),
+                Operand::pc_rel(16, 0x1010),
+            ]);
+        block.instructions.push(inst);
+
+        let cond = try_extract_arm64_branch_condition(&block, BinOpKind::Ne, &HashMap::new())
+            .expect("tbnz sign-bit condition should be extracted");
+        assert!(matches!(
+            cond.kind,
+            super::super::expression::ExprKind::BinOp {
+                op: BinOpKind::Lt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_extract_tbz_non_sign_bit_keeps_bit_test() {
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let reg_w8 = Register::new(Architecture::Arm64, RegisterClass::General, 8, 32);
+        let inst = Instruction::new(0x1000, 4, vec![], "tbz")
+            .with_operation(Operation::ConditionalJump)
+            .with_operands(vec![
+                Operand::Register(reg_w8),
+                Operand::imm_unsigned(5, 8),
+                Operand::pc_rel(16, 0x1010),
+            ]);
+        block.instructions.push(inst);
+
+        let cond = try_extract_arm64_branch_condition(&block, BinOpKind::Eq, &HashMap::new())
+            .expect("tbz bit-test condition should be extracted");
+        if let super::super::expression::ExprKind::BinOp { op, left, right } = &cond.kind {
+            assert_eq!(*op, BinOpKind::Eq);
+            assert!(matches!(
+                right.kind,
+                super::super::expression::ExprKind::IntLit(0)
+            ));
+            assert!(matches!(
+                left.kind,
+                super::super::expression::ExprKind::BinOp {
+                    op: BinOpKind::And,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected eq(bit-test, 0), got {:?}", cond.kind);
+        }
     }
 
     // --- LoopKind Tests ---

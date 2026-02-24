@@ -1,0 +1,4 @@
+void* get_ptr(int64_t arg0)
+{
+    return (void*)arg0;
+}

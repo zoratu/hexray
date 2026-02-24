@@ -62,6 +62,12 @@ pub struct BenchmarkCase {
     pub min_callback_index_precision: Option<f64>,
     /// Minimum recall threshold for callback parameter-index stability.
     pub min_callback_index_recall: Option<f64>,
+    /// Maximum allowed share of callback provenance that comes from shape fallback.
+    pub max_callback_shape_fallback_ratio: Option<f64>,
+    /// Expected function argument count for signature quality checks.
+    pub expected_arg_count: Option<usize>,
+    /// Expected return type for signature quality checks.
+    pub expected_return_type: Option<String>,
 }
 
 impl BenchmarkCase {
@@ -84,6 +90,9 @@ impl BenchmarkCase {
             expected_callback_param_indices: Vec::new(),
             min_callback_index_precision: None,
             min_callback_index_recall: None,
+            max_callback_shape_fallback_ratio: None,
+            expected_arg_count: None,
+            expected_return_type: None,
         }
     }
 
@@ -174,6 +183,24 @@ impl BenchmarkCase {
     /// Requires callback parameter-index recall at or above threshold.
     pub fn with_min_callback_index_recall(mut self, min_recall: f64) -> Self {
         self.min_callback_index_recall = Some(min_recall.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Caps the allowed fraction of callback provenance attributed to shape fallback.
+    pub fn with_max_callback_shape_fallback_ratio(mut self, max_ratio: f64) -> Self {
+        self.max_callback_shape_fallback_ratio = Some(max_ratio.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Requires the recovered function signature to use exactly this argument count.
+    pub fn with_expected_arg_count(mut self, expected_arg_count: usize) -> Self {
+        self.expected_arg_count = Some(expected_arg_count);
+        self
+    }
+
+    /// Requires the recovered function signature to use this return type.
+    pub fn expect_return_type(mut self, expected_return_type: impl Into<String>) -> Self {
+        self.expected_return_type = Some(normalize_type_name(&expected_return_type.into()));
         self
     }
 }
@@ -269,6 +296,12 @@ pub struct BenchmarkResult {
     pub callback_index_precision: f64,
     /// Callback parameter-index recall.
     pub callback_index_recall: f64,
+    /// Callback provenance entries tagged as shape-fallback.
+    pub callback_shape_fallback_count: usize,
+    /// Total callback provenance entries with explicit source tags.
+    pub callback_provenance_total: usize,
+    /// Share of callback provenance entries coming from shape-fallback.
+    pub callback_shape_fallback_ratio: f64,
     /// Execution time.
     pub duration: Duration,
     /// The decompiled output.
@@ -488,6 +521,9 @@ impl BenchmarkSuite {
                     callback_index_expected: 0,
                     callback_index_precision: 0.0,
                     callback_index_recall: 0.0,
+                    callback_shape_fallback_count: 0,
+                    callback_provenance_total: 0,
+                    callback_shape_fallback_ratio: 0.0,
                     duration: start.elapsed(),
                     output: String::new(),
                     pattern_results: Vec::new(),
@@ -544,6 +580,13 @@ impl BenchmarkSuite {
             }
         } else {
             callback_index_true_positives as f64 / callback_index_predicted as f64
+        };
+        let callback_shape_fallback_count = count_callback_shape_fallback_provenance(&output);
+        let callback_provenance_total = count_callback_provenance_sources(&output);
+        let callback_shape_fallback_ratio = if callback_provenance_total == 0 {
+            0.0
+        } else {
+            callback_shape_fallback_count as f64 / callback_provenance_total as f64
         };
 
         // Check for forbidden patterns
@@ -630,6 +673,67 @@ impl BenchmarkSuite {
                 )),
             });
         }
+        if let Some(max_ratio) = case.max_callback_shape_fallback_ratio {
+            let matched = callback_shape_fallback_ratio <= max_ratio;
+            if !matched {
+                violations_found += 1;
+            }
+            pattern_results.push(PatternMatchResult {
+                pattern: format!("Metric(callback_shape_fallback_ratio<={:.2})", max_ratio),
+                matched,
+                location: output
+                    .lines()
+                    .position(|line| line.contains("[source=shape-fallback]")),
+                details: Some(format!(
+                    "ratio {:.3} ({}/{})",
+                    callback_shape_fallback_ratio,
+                    callback_shape_fallback_count,
+                    callback_provenance_total
+                )),
+            });
+        }
+
+        // Validate function signature if specified
+        if case.expected_arg_count.is_some() || case.expected_return_type.is_some() {
+            if let Some((actual_arg_count, actual_return_type)) =
+                extract_signature_components(&output)
+            {
+                if let Some(expected_count) = case.expected_arg_count {
+                    let matched = actual_arg_count == expected_count;
+                    if !matched {
+                        violations_found += 1;
+                    }
+                    pattern_results.push(PatternMatchResult {
+                        pattern: format!("Signature(arg_count=={})", expected_count),
+                        matched,
+                        location: Some(0),
+                        details: Some(format!("actual arg_count {}", actual_arg_count)),
+                    });
+                }
+
+                if let Some(ref expected_type) = case.expected_return_type {
+                    let matched = &actual_return_type == expected_type;
+                    if !matched {
+                        violations_found += 1;
+                    }
+                    pattern_results.push(PatternMatchResult {
+                        pattern: format!("Signature(return_type=={})", expected_type),
+                        matched,
+                        location: Some(0),
+                        details: Some(format!("actual return_type {}", actual_return_type)),
+                    });
+                }
+            } else {
+                // Could not extract signature - mark as violation
+                violations_found += 1;
+                pattern_results.push(PatternMatchResult {
+                    pattern: "Signature(parseable)".to_string(),
+                    matched: false,
+                    location: None,
+                    details: Some("Could not extract function signature".to_string()),
+                });
+            }
+        }
 
         // Calculate score
         let pattern_score = if !case.expected_patterns.is_empty() {
@@ -663,6 +767,9 @@ impl BenchmarkSuite {
             callback_index_expected,
             callback_index_precision,
             callback_index_recall,
+            callback_shape_fallback_count,
+            callback_provenance_total,
+            callback_shape_fallback_ratio,
             duration: start.elapsed(),
             output,
             pattern_results,
@@ -964,6 +1071,84 @@ fn extract_callback_param_indices(output: &str) -> Vec<usize> {
     indices
 }
 
+/// Count callback provenance entries that include explicit source tags.
+fn count_callback_provenance_sources(output: &str) -> usize {
+    output.matches("[source=").count()
+}
+
+/// Count callback provenance entries that came from ABI-shape fallback.
+fn count_callback_shape_fallback_provenance(output: &str) -> usize {
+    output.matches("[source=shape-fallback]").count()
+}
+
+/// Normalize a C type name for comparison (removes spaces, etc.).
+fn normalize_type_name(type_name: &str) -> String {
+    type_name
+        .trim()
+        .replace(" *", "*")
+        .replace("* ", "*")
+        .replace(" (", "(")
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace(") ", ")")
+        .to_lowercase()
+}
+
+/// Extract function signature components from decompiled output.
+/// Returns (arg_count, return_type) if a function signature is found.
+fn extract_signature_components(output: &str) -> Option<(usize, String)> {
+    // Join consecutive lines to handle multi-line signatures
+    let lines: Vec<&str> = output.lines().collect();
+    for i in 0..lines.len() {
+        let mut combined = lines[i].trim().to_string();
+
+        // If line has '(' but no ')', try joining with next line
+        if combined.contains('(') && !combined.contains(')') && i + 1 < lines.len() {
+            combined.push(' ');
+            combined.push_str(lines[i + 1].trim());
+        }
+
+        // Look for function signature pattern: "type fname(...)"
+        if combined.contains('(') && combined.contains(')') {
+            // Extract return type and parameters
+            if let Some(paren_start) = combined.find('(') {
+                if let Some(paren_end) = combined.rfind(')') {
+                    // Extract parameters
+                    let params_str = &combined[paren_start + 1..paren_end];
+
+                    // Count parameters (handle "void" as 0 params)
+                    let arg_count = if params_str.trim().is_empty() || params_str.trim() == "void" {
+                        0
+                    } else {
+                        // Count commas + 1, but handle function pointers carefully
+                        let mut depth = 0;
+                        let mut comma_count = 0;
+                        for ch in params_str.chars() {
+                            match ch {
+                                '(' => depth += 1,
+                                ')' => depth -= 1,
+                                ',' if depth == 0 => comma_count += 1,
+                                _ => {}
+                            }
+                        }
+                        comma_count + 1
+                    };
+
+                    // Extract return type (everything before the function name)
+                    let before_paren = &combined[..paren_start];
+                    if let Some(last_space) = before_paren.rfind(' ') {
+                        let return_type = before_paren[..last_space].trim();
+                        if !return_type.is_empty() {
+                            return Some((arg_count, normalize_type_name(return_type)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Create the standard benchmark suite with common test cases.
 pub fn create_standard_suite() -> BenchmarkSuite {
     let mut suite = BenchmarkSuite::new();
@@ -1115,6 +1300,37 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .forbid_pattern(ForbiddenPattern::Goto)
             .forbid_pattern(ForbiddenPattern::Label)
             .with_min_quality(0.8),
+    );
+
+    // Signature quality cases
+    suite.add_case(
+        BenchmarkCase::new("sig_void_no_args")
+            .with_description("Function with void return and no arguments")
+            .with_category("signature_quality")
+            .with_difficulty(1)
+            .with_source("void no_args() { return; }")
+            .expect_return_type("void")
+            .with_expected_arg_count(0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("sig_int32_two_args")
+            .with_description("Function with int32_t return and two arguments")
+            .with_category("signature_quality")
+            .with_difficulty(1)
+            .with_source("int32_t add(int32_t a, int32_t b) { return a + b; }")
+            .expect_return_type("int32_t")
+            .with_expected_arg_count(2),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("sig_ptr_return")
+            .with_description("Function with pointer return")
+            .with_category("signature_quality")
+            .with_difficulty(2)
+            .with_source("void* get_ptr(int64_t offset) { return (void*)offset; }")
+            .expect_return_type("void*")
+            .with_expected_arg_count(1),
     );
 
     suite.add_case(
@@ -1399,12 +1615,48 @@ pub fn create_standard_suite() -> BenchmarkSuite {
     );
 
     suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_qsort_stack_spill")
+            .with_description("qsort callback typing survives stack-spill forwarding aliases")
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = compar; spill_ptr = &spill0; spill1 = *spill_ptr; qsort(base, n, elem_size, spill1);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort".to_string(),
+            })
+            .expect_fp_decl("int32_t (*compar)(void*, void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
         BenchmarkCase::new("callback_fp_typing_pthread_mixed")
             .with_description("pthread callback typing survives mixed direct/indirect forwarding")
             .with_category("functions")
             .with_difficulty(4)
             .with_source(
                 "selected = cond ? start_routine : trampoline; pthread_create(&thread, attr, selected, arg);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "pthread_create".to_string(),
+            })
+            .expect_fp_decl("void* (*start_routine)(void*)")
+            .with_min_fp_precision(1.0)
+            .with_min_fp_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_fp_typing_pthread_stack_spill")
+            .with_description("pthread callback typing survives stack-spill forwarding aliases")
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = start_routine; spill_ptr = &spill0; spill1 = *spill_ptr; pthread_create(&thread, attr, spill1, arg);",
             )
             .with_min_quality(0.95)
             .with_max_gotos(0)
@@ -1530,6 +1782,46 @@ pub fn create_standard_suite() -> BenchmarkSuite {
                 name: "hexray_on_exit".to_string(),
             })
             .expect_fp_decl("void (*arg0)(int32_t, void*)")
+            .expect_callback_param_index(0)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_qsort_stack_spill_arg2")
+            .with_description("qsort callback index stability survives stack-spill forwarding")
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = compar; spill_ptr = &spill0; spill1 = *spill_ptr; qsort(base, n, elem_size, spill1);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "qsort".to_string(),
+            })
+            .expect_fp_decl("int32_t (*arg2)(void*, void*)")
+            .expect_callback_param_index(2)
+            .with_min_callback_index_precision(1.0)
+            .with_min_callback_index_recall(1.0),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("callback_index_stability_pthread_stack_spill_arg0")
+            .with_description(
+                "pthread callback index stability survives stack-spill forwarding aliases",
+            )
+            .with_category("functions")
+            .with_difficulty(5)
+            .with_source(
+                "spill0 = start_routine; spill_ptr = &spill0; spill1 = *spill_ptr; pthread_create(&thread, attr, spill1, arg);",
+            )
+            .with_min_quality(0.95)
+            .with_max_gotos(0)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "pthread_create".to_string(),
+            })
+            .expect_fp_decl("void* (*arg0)(void*)")
             .expect_callback_param_index(0)
             .with_min_callback_index_precision(1.0)
             .with_min_callback_index_recall(1.0),
@@ -1811,6 +2103,13 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             .forbid_pattern(ForbiddenPattern::Goto),
     );
 
+    // Callback cases should avoid shape-fallback provenance where possible.
+    for case in &mut suite.cases {
+        if case.id.starts_with("callback_") {
+            case.max_callback_shape_fallback_ratio = Some(0.0);
+        }
+    }
+
     suite
 }
 
@@ -1846,7 +2145,7 @@ impl BenchmarkSuiteResults {
         for result in &self.case_results {
             let status = if result.passed { "PASS" } else { "FAIL" };
             report.push_str(&format!(
-                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos, fp P/R {:.2}/{:.2}, cb-idx P/R {:.2}/{:.2})\n",
+                "  [{}] {} - {:.1}% ({}/{} patterns, {} violations, {} switches, {} gotos, fp P/R {:.2}/{:.2}, cb-idx P/R {:.2}/{:.2}, cb-shape {:.2} [{}/{}])\n",
                 status,
                 result.case_id,
                 result.score * 100.0,
@@ -1858,7 +2157,10 @@ impl BenchmarkSuiteResults {
                 result.fp_precision,
                 result.fp_recall,
                 result.callback_index_precision,
-                result.callback_index_recall
+                result.callback_index_recall,
+                result.callback_shape_fallback_ratio,
+                result.callback_shape_fallback_count,
+                result.callback_provenance_total
             ));
             if let Some(ref err) = result.error {
                 report.push_str(&format!("       Error: {}\n", err));
@@ -1895,6 +2197,7 @@ mod tests {
         assert!(case.expected_callback_param_indices.is_empty());
         assert!(case.min_callback_index_precision.is_none());
         assert!(case.min_callback_index_recall.is_none());
+        assert!(case.max_callback_shape_fallback_ratio.is_none());
     }
 
     #[test]
@@ -2051,6 +2354,8 @@ mod tests {
             "callback_fp_typing_qsort_alias",
             "callback_fp_typing_qsort_multihop",
             "callback_fp_typing_pthread_mixed",
+            "callback_fp_typing_qsort_stack_spill",
+            "callback_fp_typing_pthread_stack_spill",
         ];
 
         for id in expected_ids {
@@ -2082,6 +2387,12 @@ mod tests {
                 "{} should require strong quality floor",
                 id
             );
+            assert_eq!(
+                case.max_callback_shape_fallback_ratio,
+                Some(0.0),
+                "{} should require zero shape-fallback provenance ratio",
+                id
+            );
         }
 
         let callback_index_ids = [
@@ -2092,6 +2403,8 @@ mod tests {
             "callback_index_stability_hexray_qsort_r_arg3",
             "callback_index_stability_hexray_bsd_qsort_r_arg4",
             "callback_index_stability_hexray_on_exit_arg0",
+            "callback_index_stability_qsort_stack_spill_arg2",
+            "callback_index_stability_pthread_stack_spill_arg0",
             "callback_index_stability_hexray_pthread_atfork_args012",
             "callback_index_stability_hexray_pthread_atfork_alias_reuse",
         ];
@@ -2117,6 +2430,12 @@ mod tests {
                 case.max_gotos,
                 Some(0),
                 "{} should disallow goto fallback",
+                id
+            );
+            assert_eq!(
+                case.max_callback_shape_fallback_ratio,
+                Some(0.0),
+                "{} should require zero shape-fallback provenance ratio",
                 id
             );
         }
@@ -2201,6 +2520,42 @@ mod tests {
     }
 
     #[test]
+    fn test_callback_shape_fallback_ratio_metric() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(
+            BenchmarkCase::new("callback_shape_ratio").with_max_callback_shape_fallback_ratio(0.5),
+        );
+
+        let pass_results = suite.run_all(|_| {
+            Ok("\
+// [diag] [source=alias] callback slot qsort arg3
+// [diag] [source=alias-latest] callback slot qsort arg3
+// [diag] [source=shape-fallback] callback slot qsort arg3
+int32_t f(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*)) { return 0; }"
+                .to_string())
+        });
+        assert_eq!(pass_results.passed, 1);
+        let pass = &pass_results.case_results[0];
+        assert_eq!(pass.callback_provenance_total, 3);
+        assert_eq!(pass.callback_shape_fallback_count, 1);
+        assert!((pass.callback_shape_fallback_ratio - (1.0 / 3.0)).abs() < 1e-9);
+
+        let fail_results = suite.run_all(|_| {
+            Ok("\
+// [diag] [source=shape-fallback] callback slot qsort arg3
+// [diag] [source=shape-fallback] callback slot qsort arg3
+// [diag] [source=alias] callback slot qsort arg3
+int32_t f(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*)) { return 0; }"
+                .to_string())
+        });
+        assert_eq!(fail_results.failed, 1);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.callback_provenance_total, 3);
+        assert_eq!(fail.callback_shape_fallback_count, 2);
+        assert!((fail.callback_shape_fallback_ratio - (2.0 / 3.0)).abs() < 1e-9);
+    }
+
+    #[test]
     fn test_function_pointer_precision_recall_metrics() {
         let mut suite = BenchmarkSuite::new();
         suite.add_case(
@@ -2264,5 +2619,82 @@ mod tests {
         assert!(!contains_label_pattern("case 1:"));
         assert!(!contains_label_pattern("default:"));
         assert!(!contains_label_pattern("int x = 5;"));
+    }
+
+    #[test]
+    fn test_signature_arg_count_validation() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(BenchmarkCase::new("correct_arg_count").with_expected_arg_count(2));
+
+        // Test passing case
+        let pass_results = suite.run_all(|_| {
+            Ok("int32_t fn(int32_t arg0, int32_t arg1) {\n    return 0;\n}\n".to_string())
+        });
+        assert_eq!(pass_results.passed, 1);
+
+        // Test failing case - wrong arg count
+        let fail_results =
+            suite.run_all(|_| Ok("int32_t fn(int32_t arg0) {\n    return 0;\n}\n".to_string()));
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.violations_found, 1);
+    }
+
+    #[test]
+    fn test_signature_return_type_validation() {
+        let mut suite = BenchmarkSuite::new();
+        suite.add_case(BenchmarkCase::new("correct_return_type").expect_return_type("int32_t"));
+
+        // Test passing case
+        let pass_results =
+            suite.run_all(|_| Ok("int32_t fn(int32_t arg0) {\n    return 0;\n}\n".to_string()));
+        assert_eq!(pass_results.passed, 1);
+
+        // Test failing case - wrong return type
+        let fail_results =
+            suite.run_all(|_| Ok("void fn(int32_t arg0) {\n    return;\n}\n".to_string()));
+        assert_eq!(fail_results.passed, 0);
+        let fail = &fail_results.case_results[0];
+        assert_eq!(fail.violations_found, 1);
+    }
+
+    #[test]
+    fn test_normalize_type_name() {
+        assert_eq!(normalize_type_name("int32_t"), "int32_t");
+        assert_eq!(normalize_type_name("int32_t *"), "int32_t*");
+        assert_eq!(normalize_type_name("void * "), "void*");
+        assert_eq!(normalize_type_name(" int64_t  "), "int64_t");
+        assert_eq!(normalize_type_name("INT32_T"), "int32_t"); // lowercased
+    }
+
+    #[test]
+    fn test_extract_signature_components() {
+        // Simple function with 2 args
+        let sig1 = "int32_t foo(int32_t arg0, void* arg1) {\n";
+        assert_eq!(
+            extract_signature_components(sig1),
+            Some((2, "int32_t".to_string()))
+        );
+
+        // Function with no args
+        let sig2 = "void bar() {\n";
+        assert_eq!(
+            extract_signature_components(sig2),
+            Some((0, "void".to_string()))
+        );
+
+        // Function with explicit void
+        let sig3 = "int32_t baz(void) {\n";
+        assert_eq!(
+            extract_signature_components(sig3),
+            Some((0, "int32_t".to_string()))
+        );
+
+        // Function with function pointer parameter
+        let sig4 = "int32_t qsort(void* base, int32_t (*compar)(void*, void*)) {\n";
+        assert_eq!(
+            extract_signature_components(sig4),
+            Some((2, "int32_t".to_string()))
+        );
     }
 }
