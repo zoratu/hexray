@@ -1,0 +1,5 @@
+int32_t no_duplicate_assign()
+{
+    int32_t x = compute();
+    return x;
+}

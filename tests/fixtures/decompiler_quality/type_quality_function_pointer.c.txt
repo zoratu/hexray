@@ -1,0 +1,4 @@
+void call_fn(void (*callback)(int32_t))
+{
+    callback(42);
+}

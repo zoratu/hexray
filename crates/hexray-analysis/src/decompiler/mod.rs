@@ -24,6 +24,7 @@ pub mod interprocedural;
 mod irreducible_cfg;
 mod linked_list;
 mod loop_canonicalization;
+mod loop_condition_analysis;
 mod loop_invariant;
 mod loop_pattern_detection;
 mod memset_idiom;

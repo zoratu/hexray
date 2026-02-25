@@ -46,6 +46,10 @@ done
 
 cargo test -p hexray-analysis --test control_flow_quality_smoke -- --nocapture
 cargo test -p hexray-analysis --test signature_quality_smoke -- --nocapture
+cargo test -p hexray-analysis --test loop_quality_smoke -- --nocapture
+cargo test -p hexray-analysis --test type_quality_smoke -- --nocapture
+cargo test -p hexray-analysis --test variable_naming_smoke -- --nocapture
+cargo test -p hexray-analysis --test dead_code_smoke -- --nocapture
 
 if [[ "$RUN_CALLBACK" == "yes" ]]; then
     if [[ "$STRICT_CALLBACK" == "yes" ]]; then

@@ -236,6 +236,18 @@ pub enum ExpectedPattern {
     MathFunction(String),
     /// An operator pattern (++, --, +=, etc.).
     Operator(String),
+    /// Loop iterator variable with expected name (e.g., "i", "j", "k").
+    LoopIterator { name: String },
+    /// Loop increment pattern (e.g., "i++", "++i", "i += 1").
+    LoopIncrement,
+    /// Typed pointer (not void*) with specific type.
+    TypedPointer { type_name: String },
+    /// Struct pointer with specific type.
+    StructPointer { struct_name: String },
+    /// Function pointer declaration.
+    FunctionPointer,
+    /// Variable with semantic name pattern (e.g., sum, count, arr, buf).
+    SemanticVariable { name: String },
 }
 
 /// A pattern that should NOT appear in decompiled output.
@@ -255,6 +267,12 @@ pub enum ForbiddenPattern {
     Label,
     /// Dead code that shouldn't be present.
     DeadCode,
+    /// Unreachable code after return/break/continue.
+    UnreachableCode,
+    /// Duplicate assignments to the same variable in sequence.
+    DuplicateAssignment,
+    /// Void pointer when specific type is expected.
+    VoidPointer,
 }
 
 /// Result of running a single benchmark case.
@@ -885,6 +903,67 @@ impl BenchmarkSuite {
                 let matched = output.contains(op);
                 (matched, None, None)
             }
+
+            ExpectedPattern::LoopIterator { name } => {
+                // Look for loop iterator declarations like "int i = 0" or "i++"
+                let patterns = [
+                    format!("int {} =", name),
+                    format!("{}++", name),
+                    format!("++{}", name),
+                    format!("{} +=", name),
+                    format!("{} <", name),
+                    format!("{} >", name),
+                ];
+                let matched = patterns.iter().any(|p| output.contains(p));
+                (matched, None, Some(format!("iterator '{}'", name)))
+            }
+
+            ExpectedPattern::LoopIncrement => {
+                // Look for common loop increment patterns
+                let patterns = ["++", "+="];
+                let matched = patterns.iter().any(|p| output.contains(p));
+                (matched, None, None)
+            }
+
+            ExpectedPattern::TypedPointer { type_name } => {
+                // Look for typed pointer declarations (e.g., "int*", "char*")
+                let patterns = [format!("{}*", type_name), format!("{} *", type_name)];
+                let matched = patterns.iter().any(|p| output.contains(p));
+                let not_void = !output.contains("void*");
+                (
+                    matched && not_void,
+                    None,
+                    Some(format!("typed pointer: {}", type_name)),
+                )
+            }
+
+            ExpectedPattern::StructPointer { struct_name } => {
+                // Look for struct pointer declarations (e.g., "struct node*", "Node*")
+                let patterns = [
+                    format!("struct {}*", struct_name),
+                    format!("struct {} *", struct_name),
+                    format!("{}*", struct_name),
+                    format!("{} *", struct_name),
+                ];
+                let matched = patterns.iter().any(|p| output.contains(p));
+                (
+                    matched,
+                    None,
+                    Some(format!("struct pointer: {}", struct_name)),
+                )
+            }
+
+            ExpectedPattern::FunctionPointer => {
+                // Look for function pointer patterns like "(*callback)" or "void (*fn)()"
+                let has_fn_ptr = output.contains("(*") || output.contains("(*)");
+                (has_fn_ptr, None, None)
+            }
+
+            ExpectedPattern::SemanticVariable { name } => {
+                // Look for semantic variable names
+                let matched = output.contains(name);
+                (matched, None, Some(format!("semantic name: {}", name)))
+            }
         }
     }
 
@@ -929,6 +1008,27 @@ impl BenchmarkSuite {
                 ForbiddenPattern::DeadCode => {
                     // Check for obvious dead code patterns
                     if output.contains("/* unreachable */") || output.contains("// dead code") {
+                        count += 1;
+                    }
+                }
+
+                ForbiddenPattern::UnreachableCode => {
+                    // Check for unreachable code after return/break/continue
+                    if contains_unreachable_code(output) {
+                        count += 1;
+                    }
+                }
+
+                ForbiddenPattern::DuplicateAssignment => {
+                    // Check for duplicate assignments
+                    if contains_duplicate_assignment(output) {
+                        count += 1;
+                    }
+                }
+
+                ForbiddenPattern::VoidPointer => {
+                    // Check for void* usage when specific types are expected
+                    if output.contains("void*") || output.contains("void *") {
                         count += 1;
                     }
                 }
@@ -1018,6 +1118,55 @@ fn contains_label_pattern(output: &str) -> bool {
             // Exclude switch case labels
             if !trimmed.starts_with("case ") && !trimmed.starts_with("default") {
                 return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if output contains unreachable code after return/break/continue.
+fn contains_unreachable_code(output: &str) -> bool {
+    let lines: Vec<&str> = output.lines().collect();
+    for i in 0..lines.len().saturating_sub(1) {
+        let line = lines[i].trim();
+        // Check if line ends with return/break/continue
+        if line.ends_with("return;")
+            || line.starts_with("return ")
+            || line.ends_with("break;")
+            || line.ends_with("continue;")
+        {
+            // Check if next line has code (not just closing brace)
+            if let Some(next_line) = lines.get(i + 1) {
+                let next = next_line.trim();
+                if !next.is_empty()
+                    && !next.starts_with('}')
+                    && !next.starts_with("case ")
+                    && !next.starts_with("default:")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if output contains duplicate assignments to the same variable.
+fn contains_duplicate_assignment(output: &str) -> bool {
+    let lines: Vec<&str> = output.lines().collect();
+    for i in 0..lines.len().saturating_sub(1) {
+        let line = lines[i].trim();
+        if line.contains(" = ") && !line.contains("==") {
+            // Extract variable name before '='
+            if let Some(var_name) = line.split('=').next() {
+                let var = var_name.split_whitespace().last().unwrap_or("");
+                // Check if next line assigns to same variable
+                if let Some(next_line) = lines.get(i + 1) {
+                    let next = next_line.trim();
+                    if next.starts_with(&format!("{} =", var)) {
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -2109,6 +2258,193 @@ pub fn create_standard_suite() -> BenchmarkSuite {
             case.max_callback_shape_fallback_ratio = Some(0.0);
         }
     }
+
+    // Loop Quality Gates
+    suite.add_case(
+        BenchmarkCase::new("loop_quality_for_iterator")
+            .with_description("For loop with proper iterator naming")
+            .with_category("loop_quality")
+            .with_difficulty(2)
+            .with_source("for (int i = 0; i < n; i++) { sum += arr[i]; }")
+            .expect_pattern(ExpectedPattern::ForLoop)
+            .expect_pattern(ExpectedPattern::LoopIterator {
+                name: "i".to_string(),
+            })
+            .expect_pattern(ExpectedPattern::LoopIncrement)
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("loop_quality_nested_iterators")
+            .with_description("Nested loops with i/j iterator names")
+            .with_category("loop_quality")
+            .with_difficulty(3)
+            .with_source(
+                "for (int i = 0; i < n; i++) { for (int j = 0; j < m; j++) { matrix[i][j] = 0; } }",
+            )
+            .expect_pattern(ExpectedPattern::ForLoop)
+            .expect_pattern(ExpectedPattern::LoopIterator {
+                name: "i".to_string(),
+            })
+            .expect_pattern(ExpectedPattern::LoopIterator {
+                name: "j".to_string(),
+            })
+            .expect_pattern(ExpectedPattern::LoopIncrement)
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("loop_quality_while_pattern")
+            .with_description("While loop pattern detection")
+            .with_category("loop_quality")
+            .with_difficulty(2)
+            .with_source("while (count < limit) { count++; }")
+            .expect_pattern(ExpectedPattern::WhileLoop)
+            .expect_pattern(ExpectedPattern::LoopIncrement)
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("loop_quality_do_while")
+            .with_description("Do-while loop recognition")
+            .with_category("loop_quality")
+            .with_difficulty(2)
+            .with_source("do { x *= 2; } while (x < 100);")
+            .expect_pattern(ExpectedPattern::DoWhileLoop)
+            .forbid_pattern(ForbiddenPattern::Goto),
+    );
+
+    // Type Accuracy Gates
+    suite.add_case(
+        BenchmarkCase::new("type_quality_int_pointer")
+            .with_description("Typed int pointer (not void*)")
+            .with_category("type_quality")
+            .with_difficulty(2)
+            .with_source("int32_t* get_int_ptr(int32_t* arr, int32_t idx) { return &arr[idx]; }")
+            .expect_pattern(ExpectedPattern::TypedPointer {
+                type_name: "int32_t".to_string(),
+            })
+            .forbid_pattern(ForbiddenPattern::VoidPointer),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("type_quality_char_pointer")
+            .with_description("Typed char pointer for strings")
+            .with_category("type_quality")
+            .with_difficulty(2)
+            .with_source("char* get_char_ptr(char* str) { return str; }")
+            .expect_pattern(ExpectedPattern::TypedPointer {
+                type_name: "char".to_string(),
+            })
+            .forbid_pattern(ForbiddenPattern::VoidPointer),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("type_quality_struct_pointer")
+            .with_description("Struct pointer recognition")
+            .with_category("type_quality")
+            .with_difficulty(3)
+            .with_source("struct Node* get_next(struct Node* node) { return node->next; }")
+            .expect_pattern(ExpectedPattern::StructPointer {
+                struct_name: "Node".to_string(),
+            })
+            .expect_pattern(ExpectedPattern::StructAccess)
+            .forbid_pattern(ForbiddenPattern::VoidPointer),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("type_quality_function_pointer")
+            .with_description("Function pointer type detection")
+            .with_category("type_quality")
+            .with_difficulty(3)
+            .with_source("void call_fn(void (*callback)(int)) { callback(42); }")
+            .expect_pattern(ExpectedPattern::FunctionPointer)
+            .expect_pattern(ExpectedPattern::FunctionCall {
+                name: "callback".to_string(),
+            }),
+    );
+
+    // Variable Naming Gates
+    suite.add_case(
+        BenchmarkCase::new("var_naming_loop_counter")
+            .with_description("Loop counter named i")
+            .with_category("variable_naming")
+            .with_difficulty(1)
+            .with_source("for (int i = 0; i < 10; i++) { x += i; }")
+            .expect_pattern(ExpectedPattern::SemanticVariable {
+                name: "i".to_string(),
+            })
+            .forbid_pattern(ForbiddenPattern::GenericVarNames),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("var_naming_accumulator")
+            .with_description("Accumulator named sum")
+            .with_category("variable_naming")
+            .with_difficulty(2)
+            .with_source("int sum = 0; for (int i = 0; i < n; i++) { sum += arr[i]; }")
+            .expect_pattern(ExpectedPattern::SemanticVariable {
+                name: "sum".to_string(),
+            })
+            .forbid_pattern(ForbiddenPattern::GenericVarNames),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("var_naming_array_param")
+            .with_description("Array parameter named arr")
+            .with_category("variable_naming")
+            .with_difficulty(1)
+            .with_source("int sum_arr(int* arr, int n) { int sum = 0; for (int i = 0; i < n; i++) sum += arr[i]; return sum; }")
+            .expect_pattern(ExpectedPattern::SemanticVariable { name: "arr".to_string() })
+            .forbid_pattern(ForbiddenPattern::GenericVarNames),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("var_naming_buffer")
+            .with_description("Buffer parameter named buf")
+            .with_category("variable_naming")
+            .with_difficulty(1)
+            .with_source(
+                "void fill_buf(char* buf, int size) { for (int i = 0; i < size; i++) buf[i] = 0; }",
+            )
+            .expect_pattern(ExpectedPattern::SemanticVariable {
+                name: "buf".to_string(),
+            })
+            .forbid_pattern(ForbiddenPattern::GenericVarNames),
+    );
+
+    // Dead Code Gates
+    suite.add_case(
+        BenchmarkCase::new("dead_code_no_unreachable")
+            .with_description("No unreachable code after return")
+            .with_category("dead_code")
+            .with_difficulty(2)
+            .with_source("if (x > 0) { return 1; } return 0;")
+            .expect_pattern(ExpectedPattern::Return)
+            .forbid_pattern(ForbiddenPattern::UnreachableCode)
+            .forbid_pattern(ForbiddenPattern::DeadCode),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("dead_code_no_duplicate_assign")
+            .with_description("No duplicate assignments")
+            .with_category("dead_code")
+            .with_difficulty(2)
+            .with_source("int x = compute(); return x;")
+            .expect_pattern(ExpectedPattern::Assignment)
+            .forbid_pattern(ForbiddenPattern::DuplicateAssignment),
+    );
+
+    suite.add_case(
+        BenchmarkCase::new("dead_code_clean_control_flow")
+            .with_description("Clean control flow without spurious jumps")
+            .with_category("dead_code")
+            .with_difficulty(3)
+            .with_source("if (x > 0) { return x; } else { return -x; }")
+            .expect_pattern(ExpectedPattern::IfElse)
+            .forbid_pattern(ForbiddenPattern::Goto)
+            .forbid_pattern(ForbiddenPattern::Label),
+    );
 
     suite
 }

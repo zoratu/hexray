@@ -1,0 +1,8 @@
+int32_t clean_control_flow(int32_t x)
+{
+    if (x > 0) {
+        return x;
+    } else {
+        return -x;
+    }
+}

@@ -1,0 +1,8 @@
+int32_t sum_arr(int32_t* arr, int32_t n)
+{
+    int32_t sum = 0;
+    for (int32_t i = 0; i < n; i++) {
+        sum += arr[i];
+    }
+    return sum;
+}

@@ -1040,6 +1040,8 @@ pub struct SignatureRecovery {
     return_function_pointer: Option<ParamType>,
     /// Candidate return type inferred from tail-position call forwarding.
     tail_call_return_type: Option<ParamType>,
+    /// Whether the return value is likely a pointer based on usage patterns.
+    return_is_pointer: bool,
     /// Human-readable reasons that led to return type inference.
     return_provenance: Vec<String>,
     /// Confidence in return type inference.
@@ -1096,6 +1098,7 @@ impl SignatureRecovery {
             float_return: false,
             return_function_pointer: None,
             tail_call_return_type: None,
+            return_is_pointer: false,
             return_provenance: Vec::new(),
             return_confidence: 0,
             param_names: HashMap::new(),
@@ -1152,6 +1155,7 @@ impl SignatureRecovery {
         self.float_return = false;
         self.return_function_pointer = None;
         self.tail_call_return_type = None;
+        self.return_is_pointer = false;
         self.return_provenance.clear();
         self.return_confidence = 0;
         self.param_names.clear();
@@ -1335,6 +1339,19 @@ impl SignatureRecovery {
                         self.return_provenance.push(reason);
                     }
                 }
+                // Check if return value is a pointer
+                if self.is_expr_likely_pointer(expr) {
+                    self.return_is_pointer = true;
+                    if !self
+                        .return_provenance
+                        .iter()
+                        .any(|r| r == "return expression inferred as pointer")
+                    {
+                        self.return_provenance
+                            .push("return expression inferred as pointer".to_string());
+                    }
+                    self.return_confidence = self.return_confidence.max(210);
+                }
                 if let Some(fp) = self.infer_return_function_pointer(expr) {
                     self.return_function_pointer = Some(fp);
                     if !self
@@ -1442,6 +1459,20 @@ impl SignatureRecovery {
                                 self.return_provenance.push(reason);
                             }
                             self.return_confidence = self.return_confidence.max(170);
+                        }
+                        // Check if return value is a pointer
+                        if self.is_expr_likely_pointer(rhs) {
+                            self.return_is_pointer = true;
+                            if !self
+                                .return_provenance
+                                .iter()
+                                .any(|r| r == "return register assignment inferred as pointer")
+                            {
+                                self.return_provenance.push(
+                                    "return register assignment inferred as pointer".to_string(),
+                                );
+                            }
+                            self.return_confidence = self.return_confidence.max(190);
                         }
                         if let Some(fp) = self.infer_return_function_pointer(rhs) {
                             self.return_function_pointer = Some(fp);
@@ -2934,6 +2965,90 @@ impl SignatureRecovery {
         }
     }
 
+    /// Checks if an expression is likely a pointer based on its structure and context.
+    fn is_expr_likely_pointer(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // Address-of operations definitely produce pointers
+            ExprKind::AddressOf(_) => true,
+
+            // Array accesses produce the element, but the base is a pointer
+            ExprKind::ArrayAccess { .. } => false, // The result is the element, not a pointer
+
+            // Field access suggests struct pointer usage
+            ExprKind::FieldAccess { .. } => false, // Result is the field value, not necessarily a pointer
+
+            // Dereferences produce values, but if being returned, the source might be a pointer
+            ExprKind::Deref { .. } => false,
+
+            // Variables - check if they're parameters that were used as pointers
+            ExprKind::Var(var) => {
+                // Check if this is a parameter that's been used as a pointer
+                let var_name_lower = var.name.to_lowercase();
+                if let Some(idx) = self.arg_register_index(&var_name_lower) {
+                    if let Some(hints) = self.param_hints.get(&idx) {
+                        // If parameter was dereferenced, used in pointer arithmetic, or null-checked, it's a pointer
+                        return hints.is_dereferenced
+                            || hints.is_pointer_arithmetic
+                            || hints.is_null_checked
+                            || hints.is_string_arg;
+                    }
+                }
+                false
+            }
+
+            // Calls to known pointer-returning functions
+            ExprKind::Call { target, .. } => {
+                if let Some(name) = self.extract_call_name(target) {
+                    let clean = name.strip_prefix('_').unwrap_or(&name);
+                    // Check for common pointer-returning functions
+                    matches!(
+                        clean,
+                        "malloc"
+                            | "calloc"
+                            | "realloc"
+                            | "strdup"
+                            | "strndup"
+                            | "strchr"
+                            | "strrchr"
+                            | "strstr"
+                            | "getenv"
+                            | "getcwd"
+                            | "fopen"
+                            | "mmap"
+                            | "bsearch"
+                    )
+                } else {
+                    false
+                }
+            }
+
+            // Casts - check the inner expression
+            ExprKind::Cast {
+                expr: inner,
+                to_size,
+                ..
+            } => {
+                // If casting to 8 bytes and inner is pointer-like, likely a pointer
+                *to_size == 8 && self.is_expr_likely_pointer(inner)
+            }
+
+            // Binary operations - pointer arithmetic suggests pointer result
+            ExprKind::BinOp { op, left, right } => {
+                matches!(op, BinOpKind::Add | BinOpKind::Sub)
+                    && (self.is_expr_likely_pointer(left) || self.is_expr_likely_pointer(right))
+            }
+
+            // Null/zero is ambiguous - could be NULL pointer or 0
+            ExprKind::IntLit(0) => false,
+
+            // Non-zero integer literals are not pointers
+            ExprKind::IntLit(_) => false,
+
+            // Unknown expressions might be pointers
+            _ => false,
+        }
+    }
+
     /// Builds the final signature from collected information.
     fn build_signature(&self) -> FunctionSignature {
         let mut sig = FunctionSignature::new(self.convention);
@@ -2984,17 +3099,31 @@ impl SignatureRecovery {
                 .map(|(name, ty)| (Some(*name), Some(ty.clone())))
                 .unwrap_or((None, None));
 
+            // Get usage hints for this parameter
+            let hints = self.param_hints.get(&idx);
+
             // Determine the size from register usage
             let size = if let Some(s) = self.reg_sizes.get(&reg64) {
                 *s
             } else if let Some(s) = self.reg_sizes.get(&reg32) {
                 *s
             } else {
-                8 // Default to 64-bit
+                // If no size information, prefer int32 for simple integer parameters
+                // unless hints suggest this should be a pointer (8 bytes) or larger type
+                if let Some(h) = hints {
+                    if h.is_dereferenced
+                        || h.is_pointer_arithmetic
+                        || h.is_null_checked
+                        || h.is_string_arg
+                    {
+                        8 // Pointer-like usage, use 8 bytes
+                    } else {
+                        4 // Default to int32 for simple integer usage
+                    }
+                } else {
+                    4 // Default to int32 when no hints available
+                }
             };
-
-            // Get usage hints for this parameter
-            let hints = self.param_hints.get(&idx);
 
             // Use known type, or infer type from usage hints if available
             let param_type = if let Some(known_ty) = known_type {
@@ -3075,11 +3204,16 @@ impl SignatureRecovery {
                 sig.return_type = fp_ty.clone();
             } else if self.float_return {
                 sig.return_type = ParamType::Float(64);
+            } else if self.return_is_pointer && self.return_size == 8 {
+                // Return value is a pointer
+                sig.return_type = ParamType::Pointer;
             } else {
+                // Infer return type based on size
                 sig.return_type = match self.return_size {
                     1 => ParamType::SignedInt(8),
                     2 => ParamType::SignedInt(16),
                     4 => ParamType::SignedInt(32),
+                    8 => ParamType::SignedInt(64),
                     _ => ParamType::SignedInt(64),
                 };
             }

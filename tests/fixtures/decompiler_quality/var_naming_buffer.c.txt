@@ -1,0 +1,6 @@
+void fill_buf(char* buf, int32_t size)
+{
+    for (int32_t i = 0; i < size; i++) {
+        buf[i] = 0;
+    }
+}
