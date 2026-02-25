@@ -100,6 +100,83 @@ goto bb38;      // Could be fall-through to next case
 
 ---
 
+### 1.3 Loop Variable Tracking with Register Aliasing (CRITICAL IMPACT) ✅ IMPLEMENTED
+
+**Problem**: Loop variable updates were being eliminated from decompiled output, causing infinite loops and use-before-initialization errors.
+
+**Example** (from bit counting function):
+```c
+// Broken output (BEFORE fix):
+int32_t _count_bits(uint32_t arg0) {
+    int32_t tmp0 = 0;
+    while (arg0 > 3) {
+        tmp0 += arg0 & 1;
+        arg0 = tmp1;        // ❌ tmp1 never assigned!
+    }
+    return tmp0;
+}
+// Missing statement: tmp1 = arg0 >> 1;
+
+// Fixed output (AFTER):
+int32_t _count_bits(uint32_t arg0) {
+    int32_t tmp0 = 0;
+    while (arg0 > 3) {
+        tmp0 += arg0 & 1;
+        arg0 = arg0 >> 1;   // ✅ Correct!
+    }
+    return tmp0;
+}
+```
+
+**Root Cause**: ARM64 and x86 architectures have register aliasing where smaller registers are part of larger registers:
+- **ARM64**: `w0`-`w30` (32-bit) are the lower 32 bits of `x0`-`x30` (64-bit)
+- **x86-64**: `eax`, `ebx`, etc. (32-bit) are the lower 32 bits of `rax`, `rbx`, etc. (64-bit)
+
+The decompiler's optimization passes didn't understand this aliasing, causing two critical bugs:
+
+1. **Copy Propagation Issue**: When a value was stored in `w9`, lookups for `x9` failed to find it, breaking variable substitution
+2. **Dead Store Elimination Issue**: When checking if `w9 = arg0 >> 1` was a dead store, only `w9` usage was checked, not `x9` usage
+
+**Impact**: Any optimized loop using register aliasing would decompile incorrectly, producing:
+- Uninitialized variable usage
+- Infinite loops (variable never updated)
+- Non-compilable C code
+- Completely wrong control flow
+
+**Solution Implemented**:
+
+Modified two optimization passes to be register-aliasing aware:
+
+1. **Copy Propagation** (`structurer.rs`):
+   - Added `get_register_aliases()` function mapping all ARM64/x86 register aliases
+   - Store values under ALL aliased register names
+   - Example: When storing to `w9`, also store to `x9`
+
+2. **Dead Store Elimination** (`dead_store.rs`):
+   - Added `get_aliased_registers()` function
+   - Check ALL aliased registers before marking assignment as dead
+   - Example: Before eliminating `w9 = expr`, check if `x9` is used
+
+**Files Modified**:
+- `crates/hexray-analysis/src/decompiler/structurer.rs` (+74 lines)
+- `crates/hexray-analysis/src/decompiler/dead_store.rs` (+112 lines)
+
+**Testing**:
+- Created comprehensive test suite with 15+ different loop patterns
+- Tested on ARM64 and x86-64 architectures
+- Verified all 1040+ existing tests still pass
+- All loop variable updates now correctly preserved
+
+**Architectures Fixed**:
+- ✅ ARM64 (w0-w30 ↔ x0-x30)
+- ✅ x86-64 (eax/ebx/ecx/edx/esi/edi/ebp/esp ↔ rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp)
+
+**Commits**:
+- Initial fix: `ae6326c93` (Fixed emission phase skip logic)
+- Register aliasing: `39e6156e5` (Made optimization passes aliasing-aware)
+
+---
+
 ## Priority 2: Readability Issues
 
 ### 2.1 Global Variable Access Patterns (MEDIUM IMPACT) ✅ IMPLEMENTED
