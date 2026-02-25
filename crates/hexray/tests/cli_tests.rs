@@ -836,7 +836,7 @@ fn test_decompile_callback_header_snapshots() {
     if strict {
         assert_eq!(
             mixed_sort_header,
-            "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
+            "int32_t _sort_mixed_forwarding(int64_t arr, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
             "Strict mode mismatch for symbol sort_mixed_forwarding"
         );
     } else {
@@ -844,7 +844,11 @@ fn test_decompile_callback_header_snapshots() {
             mixed_sort_header
                 == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*), int32_t arg3)"
                 || mixed_sort_header
-                    == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
+                    == "int32_t _sort_mixed_forwarding(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*), int32_t arg3)"
+                || mixed_sort_header
+                    == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))"
+                || mixed_sort_header
+                    == "int32_t _sort_mixed_forwarding(int64_t arr, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
             "Header snapshot mismatch for symbol sort_mixed_forwarding: {}",
             mixed_sort_header
         );
