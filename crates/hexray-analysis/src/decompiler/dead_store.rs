@@ -197,10 +197,122 @@ fn collect_uses_in_lhs(expr: &Expr, uses: &mut HashSet<String>) {
 }
 
 /// Check if a variable assignment can be eliminated.
+/// Get the aliased register name for ARM64/x86 registers.
+/// On ARM64: w0-w30 are lower 32 bits of x0-x30
+/// On x86: eax/ax/al are parts of rax
+fn get_aliased_registers(name: &str) -> Vec<&'static str> {
+    match name {
+        // ARM64: wN <-> xN aliasing
+        "w0" => vec!["x0"],
+        "x0" => vec!["w0"],
+        "w1" => vec!["x1"],
+        "x1" => vec!["w1"],
+        "w2" => vec!["x2"],
+        "x2" => vec!["w2"],
+        "w3" => vec!["x3"],
+        "x3" => vec!["w3"],
+        "w4" => vec!["x4"],
+        "x4" => vec!["w4"],
+        "w5" => vec!["x5"],
+        "x5" => vec!["w5"],
+        "w6" => vec!["x6"],
+        "x6" => vec!["w6"],
+        "w7" => vec!["x7"],
+        "x7" => vec!["w7"],
+        "w8" => vec!["x8"],
+        "x8" => vec!["w8"],
+        "w9" => vec!["x9"],
+        "x9" => vec!["w9"],
+        "w10" => vec!["x10"],
+        "x10" => vec!["w10"],
+        "w11" => vec!["x11"],
+        "x11" => vec!["w11"],
+        "w12" => vec!["x12"],
+        "x12" => vec!["w12"],
+        "w13" => vec!["x13"],
+        "x13" => vec!["w13"],
+        "w14" => vec!["x14"],
+        "x14" => vec!["w14"],
+        "w15" => vec!["x15"],
+        "x15" => vec!["w15"],
+        "w16" => vec!["x16"],
+        "x16" => vec!["w16"],
+        "w17" => vec!["x17"],
+        "x17" => vec!["w17"],
+        "w18" => vec!["x18"],
+        "x18" => vec!["w18"],
+        "w19" => vec!["x19"],
+        "x19" => vec!["w19"],
+        "w20" => vec!["x20"],
+        "x20" => vec!["w20"],
+        "w21" => vec!["x21"],
+        "x21" => vec!["w21"],
+        "w22" => vec!["x22"],
+        "x22" => vec!["w22"],
+        "w23" => vec!["x23"],
+        "x23" => vec!["w23"],
+        "w24" => vec!["x24"],
+        "x24" => vec!["w24"],
+        "w25" => vec!["x25"],
+        "x25" => vec!["w25"],
+        "w26" => vec!["x26"],
+        "x26" => vec!["w26"],
+        "w27" => vec!["x27"],
+        "x27" => vec!["w27"],
+        "w28" => vec!["x28"],
+        "x28" => vec!["w28"],
+        "w29" => vec!["x29"],
+        "x29" => vec!["w29"],
+        "w30" => vec!["x30"],
+        "x30" => vec!["w30"],
+        // x86: rax/eax/ax/al aliasing
+        "rax" => vec!["eax", "ax", "al"],
+        "eax" => vec!["rax", "ax", "al"],
+        "rbx" => vec!["ebx", "bx", "bl"],
+        "ebx" => vec!["rbx", "bx", "bl"],
+        "rcx" => vec!["ecx", "cx", "cl"],
+        "ecx" => vec!["rcx", "cx", "cl"],
+        "rdx" => vec!["edx", "dx", "dl"],
+        "edx" => vec!["rdx", "dx", "dl"],
+        "rsi" => vec!["esi", "si", "sil"],
+        "esi" => vec!["rsi", "si", "sil"],
+        "rdi" => vec!["edi", "di", "dil"],
+        "edi" => vec!["rdi", "di", "dil"],
+        "rsp" => vec!["esp", "sp", "spl"],
+        "esp" => vec!["rsp", "sp", "spl"],
+        "rbp" => vec!["ebp", "bp", "bpl"],
+        "ebp" => vec!["rbp", "bp", "bpl"],
+        "r8" => vec!["r8d", "r8w", "r8b"],
+        "r8d" => vec!["r8", "r8w", "r8b"],
+        "r9" => vec!["r9d", "r9w", "r9b"],
+        "r9d" => vec!["r9", "r9w", "r9b"],
+        "r10" => vec!["r10d", "r10w", "r10b"],
+        "r10d" => vec!["r10", "r10w", "r10b"],
+        "r11" => vec!["r11d", "r11w", "r11b"],
+        "r11d" => vec!["r11", "r11w", "r11b"],
+        "r12" => vec!["r12d", "r12w", "r12b"],
+        "r12d" => vec!["r12", "r12w", "r12b"],
+        "r13" => vec!["r13d", "r13w", "r13b"],
+        "r13d" => vec!["r13", "r13w", "r13b"],
+        "r14" => vec!["r14d", "r14w", "r14b"],
+        "r14d" => vec!["r14", "r14w", "r14b"],
+        "r15" => vec!["r15d", "r15w", "r15b"],
+        "r15d" => vec!["r15", "r15w", "r15b"],
+        _ => vec![],
+    }
+}
+
 fn is_eliminable_var(name: &str, uses: &HashSet<String>) -> bool {
     // Don't eliminate if the variable is used somewhere
     if uses.contains(name) {
         return false;
+    }
+
+    // Also check if any aliased register is used (ARM64 w/x aliasing, x86 rax/eax/ax/al aliasing)
+    for alias in get_aliased_registers(name) {
+        if uses.contains(alias) {
+            return false;
+        }
     }
 
     // Don't eliminate stack variables (could be used by called functions)

@@ -3259,6 +3259,75 @@ fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
     }
 }
 
+/// Normalize register names for aliasing (ARM64 w->x, x86 32->64 bit).
+/// Returns all aliases that should be tracked together.
+fn get_register_aliases(name: &str) -> Vec<String> {
+    match name {
+        // ARM64: wN and xN are aliases (w is lower 32 bits of x)
+        // Store both so lookups work for either variant
+        "w0" => vec!["w0".to_string(), "x0".to_string()],
+        "w1" => vec!["w1".to_string(), "x1".to_string()],
+        "w2" => vec!["w2".to_string(), "x2".to_string()],
+        "w3" => vec!["w3".to_string(), "x3".to_string()],
+        "w4" => vec!["w4".to_string(), "x4".to_string()],
+        "w5" => vec!["w5".to_string(), "x5".to_string()],
+        "w6" => vec!["w6".to_string(), "x6".to_string()],
+        "w7" => vec!["w7".to_string(), "x7".to_string()],
+        "w8" => vec!["w8".to_string(), "x8".to_string()],
+        "w9" => vec!["w9".to_string(), "x9".to_string()],
+        "w10" => vec!["w10".to_string(), "x10".to_string()],
+        "w11" => vec!["w11".to_string(), "x11".to_string()],
+        "w12" => vec!["w12".to_string(), "x12".to_string()],
+        "w13" => vec!["w13".to_string(), "x13".to_string()],
+        "w14" => vec!["w14".to_string(), "x14".to_string()],
+        "w15" => vec!["w15".to_string(), "x15".to_string()],
+        "w16" => vec!["w16".to_string(), "x16".to_string()],
+        "w17" => vec!["w17".to_string(), "x17".to_string()],
+        "w18" => vec!["w18".to_string(), "x18".to_string()],
+        "x0" => vec!["w0".to_string(), "x0".to_string()],
+        "x1" => vec!["w1".to_string(), "x1".to_string()],
+        "x2" => vec!["w2".to_string(), "x2".to_string()],
+        "x3" => vec!["w3".to_string(), "x3".to_string()],
+        "x4" => vec!["w4".to_string(), "x4".to_string()],
+        "x5" => vec!["w5".to_string(), "x5".to_string()],
+        "x6" => vec!["w6".to_string(), "x6".to_string()],
+        "x7" => vec!["w7".to_string(), "x7".to_string()],
+        "x8" => vec!["w8".to_string(), "x8".to_string()],
+        "x9" => vec!["w9".to_string(), "x9".to_string()],
+        "x10" => vec!["w10".to_string(), "x10".to_string()],
+        "x11" => vec!["w11".to_string(), "x11".to_string()],
+        "x12" => vec!["w12".to_string(), "x12".to_string()],
+        "x13" => vec!["w13".to_string(), "x13".to_string()],
+        "x14" => vec!["w14".to_string(), "x14".to_string()],
+        "x15" => vec!["w15".to_string(), "x15".to_string()],
+        "x16" => vec!["w16".to_string(), "x16".to_string()],
+        "x17" => vec!["w17".to_string(), "x17".to_string()],
+        "x18" => vec!["w18".to_string(), "x18".to_string()],
+        // x86: 32-bit and 64-bit register aliasing
+        "eax" => vec!["eax".to_string(), "rax".to_string()],
+        "rax" => vec!["eax".to_string(), "rax".to_string()],
+        "ebx" => vec!["ebx".to_string(), "rbx".to_string()],
+        "rbx" => vec!["ebx".to_string(), "rbx".to_string()],
+        "ecx" => vec!["ecx".to_string(), "rcx".to_string()],
+        "rcx" => vec!["ecx".to_string(), "rcx".to_string()],
+        "edx" => vec!["edx".to_string(), "rdx".to_string()],
+        "rdx" => vec!["edx".to_string(), "rdx".to_string()],
+        "esi" => vec!["esi".to_string(), "rsi".to_string()],
+        "rsi" => vec!["esi".to_string(), "rsi".to_string()],
+        "edi" => vec!["edi".to_string(), "rdi".to_string()],
+        "rdi" => vec!["edi".to_string(), "rdi".to_string()],
+        "r8d" => vec!["r8d".to_string(), "r8".to_string()],
+        "r8" => vec!["r8d".to_string(), "r8".to_string()],
+        "r9d" => vec!["r9d".to_string(), "r9".to_string()],
+        "r9" => vec!["r9d".to_string(), "r9".to_string()],
+        "r10d" => vec!["r10d".to_string(), "r10".to_string()],
+        "r10" => vec!["r10d".to_string(), "r10".to_string()],
+        "r11d" => vec!["r11d".to_string(), "r11".to_string()],
+        "r11" => vec!["r11d".to_string(), "r11".to_string()],
+        _ => vec![name.to_string()],
+    }
+}
+
 /// Performs copy propagation on a list of statements.
 /// Transforms patterns like `eax = x; y = eax;` into `y = x;`.
 /// Note: Temp register assignments are kept for now so that propagate_temps_to_conditions
@@ -3278,8 +3347,11 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             // Check if LHS is a temp register
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 if is_temp_register(&lhs_var.name) {
-                    // Track this assignment for future substitution
-                    reg_values.insert(lhs_var.name.clone(), new_rhs.clone());
+                    // Track this assignment for all aliased register names
+                    // (e.g., w9 and x9 on ARM64, eax and rax on x86)
+                    for alias in get_register_aliases(&lhs_var.name) {
+                        reg_values.insert(alias, new_rhs.clone());
+                    }
                     // Emit with substituted RHS (keep the assignment for now)
                     result.push(Expr::assign((**lhs).clone(), new_rhs));
                     continue;
