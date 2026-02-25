@@ -3076,7 +3076,7 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
         let left_is_simple_var = !matches!(left.kind, ExprKind::IntLit(_) | ExprKind::BinOp { .. });
 
         // BOTH must be simple for this pattern to apply
-        if right_is_simple_var && left_is_simple_var && size >= 1 && size <= 8 {
+        if right_is_simple_var && left_is_simple_var && (1..=8).contains(&size) {
             return Some(Expr::array_access(
                 (**left).clone(),
                 (**right).clone(),
