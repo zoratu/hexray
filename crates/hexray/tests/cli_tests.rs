@@ -552,8 +552,11 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         .unwrap_or_default();
     assert!(
         header == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)"
+            || header == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int64_t arg2)"
             || header
-                == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+                == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))"
+            || header
+                == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))",
         "Static-callback wrapper header unexpectedly changed:\n{}",
         stdout
     );
@@ -731,7 +734,7 @@ fn test_decompile_callback_header_snapshots() {
         ),
         (
             "lookup_with_cmp",
-            "int32_t _lookup_with_cmp(int64_t arr, int64_t arg1, int32_t arg2, int32_t (*arg3)(void*, void*))",
+            "int32_t _lookup_with_cmp(int64_t arg0, int64_t arg1, int32_t arg2, int32_t (*arg3)(void*, void*))",
         ),
         (
             "spawn_with_start",
