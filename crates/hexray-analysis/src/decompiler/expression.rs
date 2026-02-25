@@ -3064,6 +3064,26 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
             }
         }
 
+        // Try unscaled index: base + index (no multiplication)
+        // This handles patterns like *(ptr + i) where the deref size implies element size
+        // Only apply when BOTH sides are simple (not constants, not BinOps)
+        // This avoids matching:
+        // - constant offsets (handled above)
+        // - mismatched scaled patterns (e.g., ptr + i * 4 with 8-byte deref)
+        // - unaligned offsets (e.g., ptr + 5 with 4-byte deref)
+        let right_is_simple_var =
+            !matches!(right.kind, ExprKind::IntLit(_) | ExprKind::BinOp { .. });
+        let left_is_simple_var = !matches!(left.kind, ExprKind::IntLit(_) | ExprKind::BinOp { .. });
+
+        // BOTH must be simple for this pattern to apply
+        if right_is_simple_var && left_is_simple_var && size >= 1 && size <= 8 {
+            return Some(Expr::array_access(
+                (**left).clone(),
+                (**right).clone(),
+                size as usize,
+            ));
+        }
+
         // Try struct array pattern: (base + index * stride) + field_offset
         // This handles cases where the inner expression already has scaled access
         if let ExprKind::IntLit(field_offset) = &right.kind {
@@ -3987,6 +4007,60 @@ mod tests {
             "Expected Deref for size mismatch, got {:?}",
             simplified.kind
         );
+    }
+
+    #[test]
+    fn test_array_access_unscaled_index() {
+        // *(ptr + i) with 4-byte deref -> ptr[i]
+        // No multiplication, index is used directly
+        let ptr = Expr::unknown("ptr");
+        let i = Expr::unknown("i");
+
+        let addr = Expr::binop(BinOpKind::Add, ptr.clone(), i.clone());
+        let deref = Expr::deref(addr, 4);
+        let simplified = deref.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                assert_eq!(*element_size, 4);
+                assert!(matches!(base.kind, ExprKind::Unknown(ref s) if s == "ptr"));
+                assert!(matches!(index.kind, ExprKind::Unknown(ref s) if s == "i"));
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "ptr[i]");
+    }
+
+    #[test]
+    fn test_array_access_unscaled_byte_array() {
+        // *(arr + i) with 1-byte deref -> arr[i]
+        // Common pattern for char arrays and byte buffers
+        let arr = Expr::unknown("arr");
+        let i = Expr::unknown("i");
+
+        let addr = Expr::binop(BinOpKind::Add, arr.clone(), i.clone());
+        let deref = Expr::deref(addr, 1);
+        let simplified = deref.simplify();
+
+        match &simplified.kind {
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                assert_eq!(*element_size, 1);
+                assert!(matches!(base.kind, ExprKind::Unknown(ref s) if s == "arr"));
+                assert!(matches!(index.kind, ExprKind::Unknown(ref s) if s == "i"));
+            }
+            other => panic!("Expected ArrayAccess, got {:?}", other),
+        }
+
+        assert_eq!(simplified.to_string(), "arr[i]");
     }
 
     #[test]
