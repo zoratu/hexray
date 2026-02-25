@@ -10,6 +10,7 @@ use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, StringTable, SummaryDatabase, SymbolTable};
+use hexray_core::BasicBlockId;
 use hexray_types::{get_argument_category, ConstantCategory, ConstantDatabase, TypeDatabase};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -76,8 +77,8 @@ struct FunctionInfo {
     parameters: Vec<String>,
     /// Whether the function has a return value.
     has_return_value: bool,
-    /// Statements to skip (block_idx, stmt_idx) - these are parameter assignments.
-    skip_statements: HashSet<(usize, usize)>,
+    /// Statements to skip (BasicBlockId, stmt_idx) - these are parameter/prologue/epilogue assignments.
+    skip_statements: HashSet<(BasicBlockId, usize)>,
 }
 
 /// Categorizes how a global address is used, enabling better fallback naming.
@@ -3382,7 +3383,8 @@ impl PseudoCodeEmitter {
         };
 
         // Check first block for parameter patterns and prologue
-        if let Some(StructuredNode::Block { statements, .. }) = body.first() {
+        if let Some(StructuredNode::Block { id, statements, .. }) = body.first() {
+            let block_id = *id;
             for (idx, stmt) in statements.iter().enumerate() {
                 // Parameter setup should happen before any real call in prologue.
                 // If we already reached a call, stop scanning to avoid treating
@@ -3393,7 +3395,7 @@ impl PseudoCodeEmitter {
 
                 // Skip prologue statements
                 if is_prologue_statement(stmt) {
-                    info.skip_statements.insert((0, idx));
+                    info.skip_statements.insert((block_id, idx));
                     continue;
                 }
 
@@ -3413,7 +3415,7 @@ impl PseudoCodeEmitter {
                                         info.parameters.push(String::new());
                                     }
                                     info.parameters[arg_idx] = var_name;
-                                    info.skip_statements.insert((0, idx));
+                                    info.skip_statements.insert((block_id, idx));
                                     continue;
                                 }
                             }
@@ -3427,12 +3429,13 @@ impl PseudoCodeEmitter {
             }
         }
 
-        // Check last block for epilogue
-        for (block_idx, node) in body.iter().enumerate() {
-            if let StructuredNode::Block { statements, .. } = node {
+        // Check all blocks for epilogue statements
+        for node in body.iter() {
+            if let StructuredNode::Block { id, statements, .. } = node {
+                let block_id = *id;
                 for (idx, stmt) in statements.iter().enumerate() {
                     if is_epilogue_statement(stmt) {
-                        info.skip_statements.insert((block_idx, idx));
+                        info.skip_statements.insert((block_id, idx));
                     }
                 }
             }
@@ -3510,7 +3513,7 @@ impl PseudoCodeEmitter {
         nodes: &[StructuredNode],
         output: &mut String,
         depth: usize,
-        skip: &HashSet<(usize, usize)>,
+        skip: &HashSet<(BasicBlockId, usize)>,
         declared_vars: &mut HashSet<String>,
     ) {
         self.emit_nodes_with_skip_and_decls_inner(nodes, output, depth, skip, declared_vars, true)
@@ -3521,12 +3524,12 @@ impl PseudoCodeEmitter {
         nodes: &[StructuredNode],
         output: &mut String,
         depth: usize,
-        skip: &HashSet<(usize, usize)>,
+        skip: &HashSet<(BasicBlockId, usize)>,
         declared_vars: &mut HashSet<String>,
         is_top_level: bool,
     ) {
         for (block_idx, node) in nodes.iter().enumerate() {
-            self.emit_node_with_skip_and_decls(node, output, depth, block_idx, skip, declared_vars);
+            self.emit_node_with_skip_and_decls(node, output, depth, skip, declared_vars);
             if self.is_control_exit(node) {
                 if !is_top_level {
                     break;
@@ -3548,8 +3551,7 @@ impl PseudoCodeEmitter {
         node: &StructuredNode,
         output: &mut String,
         depth: usize,
-        block_idx: usize,
-        skip: &HashSet<(usize, usize)>,
+        skip: &HashSet<(BasicBlockId, usize)>,
         declared_vars: &mut HashSet<String>,
     ) {
         match node {
@@ -3558,11 +3560,12 @@ impl PseudoCodeEmitter {
                 statements,
                 address_range,
             } => {
-                // Filter out skipped statements
+                let block_id = *id;
+                // Filter out skipped statements using BasicBlockId
                 let filtered: Vec<_> = statements
                     .iter()
                     .enumerate()
-                    .filter(|(stmt_idx, _)| !skip.contains(&(block_idx, *stmt_idx)))
+                    .filter(|(stmt_idx, _)| !skip.contains(&(block_id, *stmt_idx)))
                     .map(|(_, stmt)| stmt)
                     .collect();
 
@@ -4325,9 +4328,14 @@ impl PseudoCodeEmitter {
             // Return value setup: rax/eax = something
             // Also skip ARM64 argument setup patterns
             ExprKind::Assign { lhs, rhs } => {
+                // Note: We DON'T skip all return register assignments here because
+                // return registers (x0, rax) are also parameter registers that may be
+                // used as loop variables. Only epilogue return register setups should
+                // be skipped, which are handled by the skip_statements mechanism.
                 if let ExprKind::Var(v) = &lhs.kind {
-                    // Return register assignments at end of block are skipped
-                    if matches!(v.name.as_str(), "eax" | "rax" | "x0" | "w0" | "a0") {
+                    // Skip eax/rax assignments (x86 return registers) but NOT x0/w0/a0
+                    // because those are ARM/RISC-V parameter registers that may be loop variables
+                    if matches!(v.name.as_str(), "eax" | "rax") {
                         return true;
                     }
                 }
@@ -4340,8 +4348,34 @@ impl PseudoCodeEmitter {
                     }
                 }
                 // ARM64: var = w9 or similar (sign extension artifact)
+                // BUT: Don't skip if LHS is a parameter register that may be a loop variable
                 if let ExprKind::Var(rhs_var) = &rhs.kind {
                     if is_arm64_temp_register(&rhs_var.name) {
+                        // Don't skip if LHS is a parameter register (x0-x7/w0-w7)
+                        // because those may be loop variables being updated
+                        if let ExprKind::Var(lhs_var) = &lhs.kind {
+                            if matches!(
+                                lhs_var.name.as_str(),
+                                "x0" | "x1"
+                                    | "x2"
+                                    | "x3"
+                                    | "x4"
+                                    | "x5"
+                                    | "x6"
+                                    | "x7"
+                                    | "w0"
+                                    | "w1"
+                                    | "w2"
+                                    | "w3"
+                                    | "w4"
+                                    | "w5"
+                                    | "w6"
+                                    | "w7"
+                            ) {
+                                return false; // Don't skip - preserve this assignment
+                            }
+                        }
+                        // For all other LHS (locals, unknowns, etc.), skip it
                         return true;
                     }
                 }
