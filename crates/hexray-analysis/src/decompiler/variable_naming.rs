@@ -474,42 +474,49 @@ fn should_rename(var: &str) -> bool {
 }
 
 /// Check if name is a generic register name.
+///
+/// Returns true for registers that should be renamed for readability,
+/// but returns false for calling convention parameter registers which
+/// must be preserved for signature recovery.
 fn is_generic_register(var: &str) -> bool {
     let lower = var.to_lowercase();
-    // x86 registers
+
+    // x86-64 calling conventions:
+    // System V (Linux/macOS): rdi, rsi, rdx, rcx, r8, r9
+    // Windows x64: rcx, rdx, r8, r9
+    // We exclude ALL potential parameter registers to be safe across conventions
     if matches!(
         lower.as_str(),
-        "eax"
-            | "ebx"
-            | "ecx"
-            | "edx"
-            | "esi"
-            | "edi"
-            | "rax"
-            | "rbx"
-            | "rcx"
-            | "rdx"
-            | "rsi"
-            | "rdi"
-            | "r8"
-            | "r9"
-            | "r10"
-            | "r11"
-            | "r12"
-            | "r13"
-            | "r14"
-            | "r15"
+        // System V parameter registers (don't rename - used for signature recovery)
+        "rdi" | "edi" | "rsi" | "esi" | "rdx" | "edx" | "rcx" | "ecx" | "r8" | "r8d" | "r9" | "r9d"
+    ) {
+        return false;
+    }
+
+    // x86-64 non-parameter registers (OK to rename)
+    if matches!(
+        lower.as_str(),
+        "eax" | "ebx" | "rax" | "rbx" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15"
     ) {
         return true;
     }
-    // ARM registers
-    if lower.starts_with('x') || lower.starts_with('w') {
-        if let Some(num_str) = lower.get(1..) {
-            if num_str.parse::<u32>().is_ok() {
+
+    // ARM64 AAPCS calling convention:
+    // x0-x7 / w0-w7 are parameter registers
+    // x8-x30 / w8-w30 are general purpose (x8 is indirect result, x9-x15 temporary, x16-x17 linker, x18 platform, x19-x29 callee-saved, x30 link register)
+    if (lower.starts_with('x') || lower.starts_with('w')) && lower.len() >= 2 {
+        if let Ok(num) = lower[1..].parse::<u32>() {
+            // x0-x7 / w0-w7 are parameter registers - don't rename
+            if num <= 7 {
+                return false;
+            }
+            // x8-x30 / w8-w30 can be renamed (except x30/LR which is handled elsewhere)
+            if (8..=30).contains(&num) {
                 return true;
             }
         }
     }
+
     false
 }
 
@@ -1278,12 +1285,23 @@ mod tests {
 
     #[test]
     fn test_should_rename() {
+        // Temporary variables should be renamed
         assert!(should_rename("temp0"));
         assert!(should_rename("tmp_val"));
         assert!(should_rename("var_8"));
-        assert!(should_rename("eax"));
-        assert!(should_rename("x0"));
 
+        // Non-parameter registers should be renamed
+        assert!(should_rename("eax")); // Return register, not a parameter
+        assert!(should_rename("x8")); // ARM temporary register
+        assert!(should_rename("r10")); // x86 temporary register
+
+        // Parameter registers should NOT be renamed (preserved for signature recovery)
+        assert!(!should_rename("x0")); // ARM first parameter
+        assert!(!should_rename("w0")); // ARM first parameter (32-bit)
+        assert!(!should_rename("rdi")); // x86 System V first parameter
+        assert!(!should_rename("rcx")); // x86 Windows first parameter
+
+        // Meaningful names should not be renamed
         assert!(!should_rename("size"));
         assert!(!should_rename("count"));
         assert!(!should_rename("ptr"));
