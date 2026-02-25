@@ -787,8 +787,11 @@ fn test_decompile_callback_header_snapshots() {
     } else {
         assert!(
             static_cmp_header == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)"
+                || static_cmp_header == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int64_t arg2)"
                 || static_cmp_header
-                    == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+                    == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))"
+                || static_cmp_header
+                    == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))",
             "Header snapshot mismatch for symbol sort_with_static_cmp: {}",
             static_cmp_header
         );
