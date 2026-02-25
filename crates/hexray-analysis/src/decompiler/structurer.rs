@@ -1440,10 +1440,13 @@ impl<'a> Structurer<'a> {
         // Find the index of the compare instruction if the block ends with a conditional
         let compare_idx = if has_conditional_branch {
             block.instructions.iter().rposition(|inst| {
-                matches!(
-                    inst.operation,
-                    Operation::Compare | Operation::Test | Operation::Sub
-                )
+                match inst.operation {
+                    Operation::Compare | Operation::Test => true,
+                    // Only treat Sub as pure comparison if it has < 3 operands
+                    // SUBS with 3 operands (dst, src1, src2) writes to dst, so keep it
+                    Operation::Sub => inst.operands.len() < 3,
+                    _ => false,
+                }
             })
         } else {
             None

@@ -552,8 +552,11 @@ fn test_decompile_callback_apis_via_compiled_fixture() {
         .unwrap_or_default();
     assert!(
         header == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)"
+            || header == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int64_t arg2)"
             || header
-                == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+                == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))"
+            || header
+                == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))",
         "Static-callback wrapper header unexpectedly changed:\n{}",
         stdout
     );
@@ -727,7 +730,7 @@ fn test_decompile_callback_header_snapshots() {
     let strict_expected = [
         (
             "sort_with_cmp",
-            "int32_t _sort_with_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+            "int32_t _sort_with_cmp(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))",
         ),
         (
             "lookup_with_cmp",
@@ -739,7 +742,7 @@ fn test_decompile_callback_header_snapshots() {
         ),
         (
             "sort_with_cmp_multihop",
-            "int32_t _sort_with_cmp_multihop(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+            "int32_t _sort_with_cmp_multihop(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))",
         ),
         (
             "spawn_with_start_multihop",
@@ -747,7 +750,7 @@ fn test_decompile_callback_header_snapshots() {
         ),
         (
             "sort_with_cmp_stack_spill",
-            "int32_t _sort_with_cmp_stack_spill(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+            "int32_t _sort_with_cmp_stack_spill(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))",
         ),
         (
             "spawn_with_start_stack_spill",
@@ -778,14 +781,17 @@ fn test_decompile_callback_header_snapshots() {
     if strict {
         assert_eq!(
             static_cmp_header,
-            "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)",
+            "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int64_t arg2)",
             "Strict mode mismatch for symbol sort_with_static_cmp"
         );
     } else {
         assert!(
             static_cmp_header == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int64_t arg2)"
+                || static_cmp_header == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int64_t arg2)"
                 || static_cmp_header
-                    == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))",
+                    == "int32_t _sort_with_static_cmp(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))"
+                || static_cmp_header
+                    == "int32_t _sort_with_static_cmp(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))",
             "Header snapshot mismatch for symbol sort_with_static_cmp: {}",
             static_cmp_header
         );
@@ -833,7 +839,7 @@ fn test_decompile_callback_header_snapshots() {
     if strict {
         assert_eq!(
             mixed_sort_header,
-            "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
+            "int32_t _sort_mixed_forwarding(int64_t arr, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
             "Strict mode mismatch for symbol sort_mixed_forwarding"
         );
     } else {
@@ -841,7 +847,11 @@ fn test_decompile_callback_header_snapshots() {
             mixed_sort_header
                 == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*), int32_t arg3)"
                 || mixed_sort_header
-                    == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
+                    == "int32_t _sort_mixed_forwarding(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*), int32_t arg3)"
+                || mixed_sort_header
+                    == "int32_t _sort_mixed_forwarding(int64_t arg0, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))"
+                || mixed_sort_header
+                    == "int32_t _sort_mixed_forwarding(int64_t arr, int64_t arg1, int64_t arg2, int32_t (*arg3)(void*, void*))",
             "Header snapshot mismatch for symbol sort_mixed_forwarding: {}",
             mixed_sort_header
         );
@@ -1033,7 +1043,7 @@ fn test_decompile_callback_golden_multihop_with_diagnostics() {
         .find(|l| l.contains("_sort_with_cmp_multihop("));
     assert_eq!(
         header,
-        Some("int32_t _sort_with_cmp_multihop(int64_t arg0, int64_t arg1, int32_t (*arg2)(void*, void*))"),
+        Some("int32_t _sort_with_cmp_multihop(int64_t arr, int64_t arg1, int32_t (*arg2)(void*, void*))"),
         "Golden callback header mismatch:\n{}",
         stdout
     );

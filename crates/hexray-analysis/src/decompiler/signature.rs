@@ -191,6 +191,12 @@ pub struct ParameterUsageHints {
     pub function_pointer_confidence: u8,
     /// Human-readable reasons that led to function-pointer typing.
     pub function_pointer_reasons: Vec<String>,
+    /// Parameter is accessed as an array (indexed dereference).
+    pub is_array_access: bool,
+    /// Element type inferred from dereference operations.
+    pub deref_element_type: Option<ParamType>,
+    /// Number of dereferences observed.
+    pub deref_count: usize,
 }
 
 impl ParameterUsageHints {
@@ -287,6 +293,13 @@ impl ParameterUsageHints {
             };
         }
 
+        // If we have inferred an element type from dereferences, return typed pointer
+        if let Some(elem_type) = &self.deref_element_type {
+            if self.is_dereferenced || self.is_pointer_arithmetic || self.is_array_access {
+                return ParamType::TypedPointer(Box::new(elem_type.clone()));
+            }
+        }
+
         // If dereferenced, it's a pointer
         if self.is_dereferenced || self.is_pointer_arithmetic || self.is_null_checked {
             return ParamType::Pointer;
@@ -318,6 +331,14 @@ impl ParameterUsageHints {
                 0 => "str".to_string(),
                 1 => "str2".to_string(),
                 _ => format!("str{}", index + 1),
+            };
+        }
+
+        if self.is_array_access || self.deref_element_type.is_some() {
+            return match index {
+                0 => "arr".to_string(),
+                1 => "arr2".to_string(),
+                _ => format!("arr{}", index + 1),
             };
         }
 
@@ -404,6 +425,8 @@ pub enum ParamType {
     UnsignedInt(u8),
     /// Pointer type.
     Pointer,
+    /// Typed pointer (e.g., int32_t*, uint8_t*).
+    TypedPointer(Box<ParamType>),
     /// Floating-point type (32 = float, 64 = double).
     Float(u8),
     /// Function pointer type.
@@ -433,6 +456,7 @@ impl ParamType {
             ParamType::UnsignedInt(64) => "uint64_t".to_string(),
             ParamType::UnsignedInt(_) => "unsigned int".to_string(),
             ParamType::Pointer => "void*".to_string(),
+            ParamType::TypedPointer(inner) => format!("{}*", inner.to_c_string()),
             ParamType::Float(32) => "float".to_string(),
             ParamType::Float(64) => "double".to_string(),
             ParamType::Float(_) => "double".to_string(),
@@ -479,7 +503,7 @@ impl ParamType {
     /// Returns the size in bytes.
     pub fn size(&self) -> u8 {
         match self {
-            ParamType::Unknown | ParamType::Pointer => 8,
+            ParamType::Unknown | ParamType::Pointer | ParamType::TypedPointer(_) => 8,
             ParamType::Void => 0,
             ParamType::Bool | ParamType::SignedInt(8) | ParamType::UnsignedInt(8) => 1,
             ParamType::SignedInt(16) | ParamType::UnsignedInt(16) => 2,
@@ -1208,6 +1232,17 @@ impl SignatureRecovery {
         matches!(expr.kind, ExprKind::IntLit(0))
     }
 
+    /// Infers a basic type from a dereference/element size.
+    fn infer_type_from_size(size: usize) -> ParamType {
+        match size {
+            1 => ParamType::SignedInt(8),  // int8_t
+            2 => ParamType::SignedInt(16), // int16_t
+            4 => ParamType::SignedInt(32), // int32_t
+            8 => ParamType::SignedInt(64), // int64_t
+            _ => ParamType::SignedInt(32), // Default to int32_t
+        }
+    }
+
     /// Extracts a function name from a call target.
     fn extract_call_name(&self, target: &super::expression::CallTarget) -> Option<String> {
         match target {
@@ -1679,13 +1714,41 @@ impl SignatureRecovery {
             ExprKind::UnaryOp { operand, .. } => {
                 self.analyze_expr_reads_with_context(operand, false, is_comparison);
             }
-            ExprKind::Deref { addr, .. } => {
+            ExprKind::Deref { addr, size } => {
                 // The address expression is being dereferenced
                 self.analyze_expr_reads_with_context(addr, true, false);
+
+                // Track element type and dereference count for base variables
+                if let Some(base_name) = self.extract_var_name(addr) {
+                    let elem_type = Self::infer_type_from_size(*size as usize);
+                    self.record_usage_hint(&base_name, |h| {
+                        h.deref_count += 1;
+                        if h.deref_element_type.is_none() {
+                            h.deref_element_type = Some(elem_type.clone());
+                        }
+                    });
+                }
             }
-            ExprKind::ArrayAccess { base, index, .. } => {
-                // Base is being used as a pointer
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                // Base is being used as a pointer/array
                 self.analyze_expr_reads_with_context(base, true, false);
+
+                // Mark base as array access and track element type
+                if let Some(base_name) = self.extract_var_name(base) {
+                    let elem_type = Self::infer_type_from_size(*element_size);
+                    self.record_usage_hint(&base_name, |h| {
+                        h.is_array_access = true;
+                        h.deref_count += 1;
+                        if h.deref_element_type.is_none() {
+                            h.deref_element_type = Some(elem_type.clone());
+                        }
+                    });
+                }
+
                 // Index might be an array index parameter
                 if let ExprKind::Var(var) = &index.kind {
                     self.record_usage_hint(&var.name.to_lowercase(), |h| h.is_array_index = true);
@@ -3634,8 +3697,11 @@ mod tests {
             "expected at least one recovered parameter"
         );
         assert!(
-            matches!(sig.parameters[0].param_type, ParamType::Pointer),
-            "expected arg0 to be inferred as pointer, got {:?}",
+            matches!(
+                sig.parameters[0].param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "expected arg0 to be inferred as pointer or typed pointer, got {:?}",
             sig.parameters[0].param_type
         );
     }
@@ -3675,8 +3741,11 @@ mod tests {
             "expected at least one recovered parameter"
         );
         assert!(
-            matches!(sig.parameters[0].param_type, ParamType::Pointer),
-            "expected arg0 to be inferred as pointer, got {:?}",
+            matches!(
+                sig.parameters[0].param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "expected arg0 to be inferred as pointer or typed pointer, got {:?}",
             sig.parameters[0].param_type
         );
     }
@@ -3711,8 +3780,11 @@ mod tests {
             "expected at least one recovered parameter"
         );
         assert!(
-            matches!(sig.parameters[0].param_type, ParamType::Pointer),
-            "expected arg0 to be inferred as pointer, got {:?}",
+            matches!(
+                sig.parameters[0].param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "expected arg0 to be inferred as pointer or typed pointer, got {:?}",
             sig.parameters[0].param_type
         );
     }
