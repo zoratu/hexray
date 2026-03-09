@@ -67,6 +67,10 @@ let affected = analyzer.apply_patches(&patches);
 println!("total affected: {}", affected.total_affected());
 ```
 
+For insertions, deletions, and other size-changing patches, `apply_patches` returns the
+rewritten function entry addresses after the dependency tracker applies the same conservative
+interval transform modeled in `specs/tla/IncrementalInvalidation.tla`.
+
 ## 4) Cache key generation after patch update
 
 ```rust
@@ -84,5 +88,6 @@ Use `get_cache_key` for stable lookup of recomputed function analyses after patc
 
 - Keep `DependencyTracker` warm between patch runs.
 - Coalesce `PatchSet` before analysis to reduce duplicate invalidation.
+- Run `scripts/check-tla` after changing incremental invalidation logic or patch semantics.
 - Enable inter-procedural propagation for release/validation runs.
 - Disable propagation for very fast local edit/test loops where false negatives are acceptable.

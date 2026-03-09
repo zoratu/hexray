@@ -13,11 +13,11 @@ verification command all pass.
 | Missing fuzz targets for `pe`, `dwarf`, `hexray-types`, and `hexray-signatures` | Resolved | `pr/feature-gates-security` |
 | Missing cache-persistence failure injection outside the emulator | Resolved | `pr/feature-gates-security` |
 | Missing crate-level `unsafe` policy despite no first-party `unsafe` usage | Resolved | `pr/feature-gates-security` |
-| Mach-O parser accepts load commands beyond declared `sizeofcmds` and tests mask panics | Open | `pr/macho-hardening` |
-| Missing parser truncation/fault-injection coverage for Mach-O load command bounds | Open | `pr/macho-hardening` |
-| Incremental invalidation is unsound for insertions/size shifts and lacks a formal model | Open | `pr/incremental-tla` |
-| Missing incremental adversarial coverage for shifted-layout patches | Open | `pr/incremental-tla` |
-| Missing formal model artifact and code-to-model check step | Open | `pr/incremental-tla` |
+| Mach-O parser accepts load commands beyond declared `sizeofcmds` and tests mask panics | Resolved | `pr/macho-hardening` |
+| Missing parser truncation/fault-injection coverage for Mach-O load command bounds | Resolved | `pr/macho-hardening` |
+| Incremental invalidation is unsound for insertions/size shifts and lacks a formal model | Resolved | `pr/incremental-tla` |
+| Missing incremental adversarial coverage for shifted-layout patches | Resolved | `pr/incremental-tla` |
+| Missing formal model artifact and code-to-model check step | Resolved | `pr/incremental-tla` |
 
 ## Verification Loop
 
@@ -31,6 +31,9 @@ Each branch follows the same closeout loop:
 
 ## Latest Verification
 
-- `scripts/ci-local --tier medium --no-quality-smoke`: passed
-- `scripts/check-security`: passed
-- `scripts/check-coverage`: passed with `TOTAL` line coverage `71.68%`
+- `cargo test -p hexray-formats`: passed
+- `cargo test -p hexray-analysis`: passed
+- `scripts/check-fuzz-targets`: passed
+- `scripts/check-tla`: passed
+- `scripts/ci-local --tier full --no-cross --no-perf`: passed
+- `scripts/check-coverage`: passed with `TOTAL` line coverage `71.85%`

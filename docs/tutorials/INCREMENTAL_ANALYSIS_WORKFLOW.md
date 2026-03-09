@@ -28,6 +28,8 @@ Core flow:
 ## 4) Invalidate stale cache ranges
 
 When patches overlap a function range, invalidate cached entries for that range before recomputing.
+For insertions, deletions, and other size-changing patches, treat every later function as affected too:
+their addresses may shift even if the byte edit does not overlap their original range directly.
 
 ```rust
 cache.invalidate_range(changed_start, changed_end);
@@ -38,6 +40,7 @@ cache.invalidate_range(changed_start, changed_end);
 ```bash
 scripts/ci-local --tier medium --no-cross --no-perf
 scripts/quality-smoke
+scripts/check-tla
 ```
 
 If patch touches control-flow-heavy code, compare benchmark quality counters before/after.

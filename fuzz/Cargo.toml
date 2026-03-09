@@ -115,3 +115,10 @@ path = "fuzz_targets/cache_persistence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "incremental_layout"
+path = "fuzz_targets/incremental_layout.rs"
+test = false
+doc = false
+bench = false

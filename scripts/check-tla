@@ -1,0 +1,54 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+run() {
+    echo ""
+    echo "=== $1 ==="
+    shift
+    "$@"
+}
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required for TLA+ checks." >&2
+    exit 1
+fi
+
+JAVA_BIN="${JAVA_BIN:-}"
+if [[ -z "$JAVA_BIN" ]]; then
+    if command -v java >/dev/null 2>&1 && java -version >/dev/null 2>&1; then
+        JAVA_BIN="$(command -v java)"
+    elif command -v brew >/dev/null 2>&1; then
+        BREW_JAVA="$(brew --prefix openjdk 2>/dev/null || true)"
+        if [[ -n "$BREW_JAVA" && -x "$BREW_JAVA/bin/java" ]]; then
+            JAVA_BIN="$BREW_JAVA/bin/java"
+        fi
+    fi
+fi
+
+if [[ -z "$JAVA_BIN" ]]; then
+    echo "A working Java runtime is required for TLA+ checks." >&2
+    echo "Set JAVA_BIN or install a JDK (for example: brew install openjdk)." >&2
+    exit 1
+fi
+
+TLA_JAR="${TLA2TOOLS_JAR:-$ROOT_DIR/.cache/tla2tools.jar}"
+if [[ ! -f "$TLA_JAR" ]]; then
+    mkdir -p "$(dirname "$TLA_JAR")"
+    curl -fsSL \
+        -o "$TLA_JAR" \
+        "https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar"
+fi
+
+run "TLC: incremental invalidation model" \
+    "$JAVA_BIN" -cp "$TLA_JAR" tlc2.TLC \
+    -cleanup \
+    -deadlock \
+    -workers 1 \
+    -config "$ROOT_DIR/specs/tla/IncrementalInvalidation.cfg" \
+    "$ROOT_DIR/specs/tla/IncrementalInvalidation.tla"
+
+run "Rust conformance: incremental invalidation model" \
+    cargo test -p hexray-analysis test_tla_model_conformance_for_incremental_layout
