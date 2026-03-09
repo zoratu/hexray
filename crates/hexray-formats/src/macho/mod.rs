@@ -82,13 +82,26 @@ impl<'a> MachO<'a> {
         let is_64 = header.is_64bit();
 
         // Parse load commands
-        let lc_offset = offset + header.header_size();
-        let load_commands = Self::parse_load_commands(
-            &data[lc_offset..],
-            header.ncmds as usize,
-            header.sizeofcmds as usize,
-            is_64,
-        )?;
+        let lc_offset = offset
+            .checked_add(header.header_size())
+            .ok_or(ParseError::Overflow {
+                context: "Mach-O load commands",
+            })?;
+        let lc_end =
+            lc_offset
+                .checked_add(header.sizeofcmds as usize)
+                .ok_or(ParseError::Overflow {
+                    context: "Mach-O load commands",
+                })?;
+        if lc_end > data.len() {
+            return Err(ParseError::TruncatedData {
+                expected: lc_end,
+                actual: data.len(),
+                context: "Mach-O load commands",
+            });
+        }
+        let load_commands =
+            Self::parse_load_commands(&data[lc_offset..lc_end], header.ncmds as usize, is_64)?;
 
         // Extract segments and populate section data
         let mut segments: Vec<Segment> = load_commands
@@ -225,15 +238,28 @@ impl<'a> MachO<'a> {
     fn parse_load_commands(
         data: &[u8],
         ncmds: usize,
-        total_size: usize,
         is_64: bool,
     ) -> Result<Vec<LoadCommand>, ParseError> {
         let mut commands = Vec::with_capacity(ncmds.min(1000));
         let mut offset: usize = 0;
 
-        for _ in 0..ncmds {
-            if offset.saturating_add(8) > data.len() || offset >= total_size {
-                break;
+        for command_index in 0..ncmds {
+            if offset == data.len() {
+                return Err(ParseError::invalid_structure(
+                    "load commands",
+                    offset as u64,
+                    format!(
+                        "expected {ncmds} load commands, parsed only {command_index} before the declared load-command region ended"
+                    ),
+                ));
+            }
+
+            if offset.saturating_add(8) > data.len() {
+                return Err(ParseError::TruncatedData {
+                    expected: offset.saturating_add(8),
+                    actual: data.len(),
+                    context: "Mach-O load command header",
+                });
             }
 
             let cmd = u32::from_le_bytes([
@@ -249,16 +275,34 @@ impl<'a> MachO<'a> {
                 data[offset + 7],
             ]) as usize;
 
-            if cmdsize < 8 || offset.saturating_add(cmdsize) > data.len() {
-                break;
+            if cmdsize < 8 {
+                return Err(ParseError::invalid_structure(
+                    "load command",
+                    offset as u64,
+                    format!("cmdsize {cmdsize} is smaller than the 8-byte load-command header"),
+                ));
             }
 
-            let cmd_data = &data[offset..offset + cmdsize];
+            let command_end = offset.checked_add(cmdsize).ok_or(ParseError::Overflow {
+                context: "Mach-O load command size",
+            })?;
+            if command_end > data.len() {
+                return Err(ParseError::invalid_structure(
+                    "load command",
+                    offset as u64,
+                    format!(
+                        "cmdsize {cmdsize} extends beyond declared sizeofcmds region (remaining bytes: {})",
+                        data.len().saturating_sub(offset)
+                    ),
+                ));
+            }
+
+            let cmd_data = &data[offset..command_end];
             if let Some(lc) = LoadCommand::parse(cmd, cmd_data, is_64)? {
                 commands.push(lc);
             }
 
-            offset += cmdsize;
+            offset = command_end;
         }
 
         Ok(commands)
@@ -765,5 +809,81 @@ impl BinaryFormat for MachO<'_> {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::header::{CPU_TYPE_X86_64, MH_EXECUTE, MH_MAGIC_64};
+    use super::*;
+    use crate::ParseError;
+
+    fn minimal_macho64_header(ncmds: u32, sizeofcmds: u32) -> Vec<u8> {
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+        data[4..8].copy_from_slice(&CPU_TYPE_X86_64.to_le_bytes());
+        data[12..16].copy_from_slice(&MH_EXECUTE.to_le_bytes());
+        data[16..20].copy_from_slice(&ncmds.to_le_bytes());
+        data[20..24].copy_from_slice(&sizeofcmds.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn parse_accepts_load_commands_within_declared_region() {
+        let mut data = minimal_macho64_header(1, 8);
+        data.extend_from_slice(&0x99u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+
+        let macho = MachO::parse(&data).expect("single in-bounds load command should parse");
+        assert_eq!(macho.load_commands.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_truncated_declared_load_command_region() {
+        let mut data = minimal_macho64_header(1, 24);
+        data.extend_from_slice(&0x99u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+
+        let err = MachO::parse(&data).expect_err("declared load-command region should be present");
+        assert!(matches!(
+            err,
+            ParseError::TruncatedData {
+                context: "Mach-O load commands",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_load_command_extending_past_sizeofcmds() {
+        let mut data = minimal_macho64_header(1, 8);
+        data.extend_from_slice(&0x99u32.to_le_bytes());
+        data.extend_from_slice(&24u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 16]);
+
+        let err = MachO::parse(&data).expect_err("cmdsize larger than sizeofcmds must be rejected");
+        assert!(matches!(
+            err,
+            ParseError::InvalidStructure {
+                kind: "load command",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_missing_declared_load_commands() {
+        let mut data = minimal_macho64_header(2, 8);
+        data.extend_from_slice(&0x99u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+
+        let err = MachO::parse(&data).expect_err("missing second load command should be rejected");
+        assert!(matches!(
+            err,
+            ParseError::InvalidStructure {
+                kind: "load commands",
+                ..
+            }
+        ));
     }
 }

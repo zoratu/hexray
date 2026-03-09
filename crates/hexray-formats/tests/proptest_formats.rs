@@ -97,35 +97,28 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(5000))]
 
     /// Mach-O parsing never panics on arbitrary input.
-    /// Note: Limited size due to potential stack overflow in complex inputs
     #[test]
     fn macho_parse_never_panics(data in prop::collection::vec(any::<u8>(), 0..256)) {
-        // Use catch_unwind to handle potential stack overflows gracefully
-        let _ = std::panic::catch_unwind(|| {
-            let _ = MachO::parse(&data);
-        });
+        let _ = MachO::parse(&data);
     }
 
     /// Mach-O parsing is deterministic.
     #[test]
     fn macho_parse_is_deterministic(data in prop::collection::vec(any::<u8>(), 32..128)) {
-        // Limited size due to potential stack overflow
-        let result1 = std::panic::catch_unwind(|| MachO::parse(&data));
-        let result2 = std::panic::catch_unwind(|| MachO::parse(&data));
+        let result1 = MachO::parse(&data);
+        let result2 = MachO::parse(&data);
 
         match (&result1, &result2) {
-            (Ok(Ok(m1)), Ok(Ok(m2))) => {
+            (Ok(m1), Ok(m2)) => {
                 prop_assert_eq!(m1.entry_point(), m2.entry_point());
                 prop_assert_eq!(m1.architecture(), m2.architecture());
             }
-            (Ok(Err(_)), Ok(Err(_))) => {}
-            (Err(_), Err(_)) => {} // Both panicked - still consistent
+            (Err(_), Err(_)) => {}
             _ => prop_assert!(false, "Results should be consistent"),
         }
     }
 
     /// Mach-O magic number handling.
-    /// Note: Reduced test cases due to potential recursion in parser
     #[test]
     fn macho_magic_handling(
         magic in prop::sample::select(vec![
@@ -139,16 +132,13 @@ proptest! {
         data.extend_from_slice(&magic_bytes);
         data.extend_from_slice(&rest);
 
-        // Should not panic - use catch_unwind for safety
-        let _ = std::panic::catch_unwind(|| {
-            let _ = MachO::parse(&data);
-        });
+        let _ = MachO::parse(&data);
     }
 
     /// Mach-O load command count handling.
     #[test]
     fn macho_load_cmd_count_handling(
-        cmd_count in 0u32..100,  // Reduced to avoid stack overflow
+        cmd_count in 0u32..100,
         data in prop::collection::vec(any::<u8>(), 32..128)
     ) {
         let mut modified = data.clone();
@@ -157,9 +147,7 @@ proptest! {
             let bytes = cmd_count.to_le_bytes();
             modified[16..20].copy_from_slice(&bytes);
         }
-        let _ = std::panic::catch_unwind(|| {
-            let _ = MachO::parse(&modified);
-        });
+        let _ = MachO::parse(&modified);
     }
 }
 
