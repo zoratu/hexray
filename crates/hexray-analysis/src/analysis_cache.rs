@@ -39,7 +39,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(not(miri))]
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Cache file format version (reserved for future compatibility checks).
@@ -882,6 +884,17 @@ pub fn create_shared_cache(config: CacheConfig) -> SharedAnalysisCache {
 }
 
 /// Get current Unix timestamp.
+#[cfg(miri)]
+fn current_timestamp() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MIRI_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+    MIRI_TIMESTAMP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Get current Unix timestamp.
+#[cfg(not(miri))]
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
