@@ -13,6 +13,7 @@ verification command all pass.
 | Missing fuzz targets for `pe`, `dwarf`, `hexray-types`, and `hexray-signatures` | Resolved | `pr/feature-gates-security` |
 | Missing cache-persistence failure injection outside the emulator | Resolved | `pr/feature-gates-security` |
 | Missing crate-level `unsafe` policy despite no first-party `unsafe` usage | Resolved | `pr/feature-gates-security` |
+| Missing explicit Miri memory-safety gate in local CI | Resolved | `pr/memory-safety-gate` |
 | Mach-O parser accepts load commands beyond declared `sizeofcmds` and tests mask panics | Resolved | `pr/macho-hardening` |
 | Missing parser truncation/fault-injection coverage for Mach-O load command bounds | Resolved | `pr/macho-hardening` |
 | Incremental invalidation is unsound for insertions/size shifts and lacks a formal model | Resolved | `pr/incremental-tla` |
@@ -35,5 +36,6 @@ Each branch follows the same closeout loop:
 - `cargo test -p hexray-analysis`: passed
 - `scripts/check-fuzz-targets`: passed
 - `scripts/check-tla`: passed
+- `scripts/check-memory-safety`: passed
 - `scripts/ci-local --tier full --no-cross --no-perf`: passed
-- `scripts/check-coverage`: passed with `TOTAL` line coverage `71.85%`
+- `scripts/check-coverage`: passed with `TOTAL` line coverage `71.79%`

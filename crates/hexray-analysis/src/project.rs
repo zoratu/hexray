@@ -809,6 +809,17 @@ pub struct ProjectStats {
 }
 
 /// Get current Unix timestamp.
+#[cfg(miri)]
+fn current_timestamp() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MIRI_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+    MIRI_TIMESTAMP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Get current Unix timestamp.
+#[cfg(not(miri))]
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

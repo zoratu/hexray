@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+run() {
+    echo ""
+    echo "=== $1 ==="
+    shift
+    "$@"
+}
+
+if ! command -v rustup >/dev/null 2>&1; then
+    echo "rustup is required for memory-safety checks." >&2
+    exit 1
+fi
+
+if ! rustup toolchain list | grep -q '^nightly'; then
+    echo "The nightly toolchain is required for memory-safety checks." >&2
+    echo "Install it with: rustup toolchain install nightly --component miri" >&2
+    exit 1
+fi
+
+CARGO_MIRI_BIN="$(rustup which cargo-miri --toolchain nightly 2>/dev/null || true)"
+if [[ -z "$CARGO_MIRI_BIN" || ! -x "$CARGO_MIRI_BIN" ]]; then
+    echo "cargo-miri is required for memory-safety checks." >&2
+    echo "Install it with: rustup component add miri --toolchain nightly" >&2
+    exit 1
+fi
+
+export PATH="$(dirname "$CARGO_MIRI_BIN"):$PATH"
+
+run "Miri: Mach-O load-command bounds" \
+    rustup run nightly cargo miri test -p hexray-formats \
+    macho::tests::parse_rejects_load_command_extending_past_sizeofcmds \
+    -- --exact
+
+run "Miri: incremental invalidation model conformance" \
+    rustup run nightly cargo miri test -p hexray-analysis \
+    incremental::tests::test_tla_model_conformance_for_incremental_layout \
+    -- --exact
