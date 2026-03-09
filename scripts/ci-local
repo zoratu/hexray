@@ -22,10 +22,14 @@ RUN_CROSS="auto"
 RUN_PERF="no"
 RUN_QUALITY_SMOKE="yes"
 RUN_STRICT_CALLBACK="yes"
+RUN_FEATURE_MATRIX="yes"
+RUN_FUZZ_TARGETS="yes"
+RUN_SECURITY="yes"
+RUN_COVERAGE="yes"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf] [--no-perf] [--quality-smoke] [--no-quality-smoke] [--strict-callback] [--no-strict-callback] [--help]
+Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf] [--no-perf] [--quality-smoke] [--no-quality-smoke] [--strict-callback] [--no-strict-callback] [--feature-matrix] [--no-feature-matrix] [--fuzz-targets] [--no-fuzz-targets] [--security] [--no-security] [--coverage] [--no-coverage] [--help]
 
   --tier      Select workflow tier (default: medium)
   --cross     Force docker cross-arch matrix during full tier
@@ -36,6 +40,14 @@ Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf
   --no-quality-smoke  Skip fast fixture-backed decompiler quality smoke test
   --strict-callback     Enforce strict callback typing snapshot checks (default)
   --no-strict-callback  Skip strict callback typing snapshot checks
+  --feature-matrix     Check non-default feature combinations (default)
+  --no-feature-matrix  Skip non-default feature checks
+  --fuzz-targets     Check that fuzz targets compile (default)
+  --no-fuzz-targets  Skip fuzz target compile checks
+  --security     Run `cargo audit` during full tier (default)
+  --no-security  Skip security auditing during full tier
+  --coverage     Run `cargo llvm-cov` during full tier (default)
+  --no-coverage  Skip coverage gate during full tier
   --help      Show this message
 EOF
 }
@@ -78,6 +90,38 @@ while [[ $# -gt 0 ]]; do
             RUN_STRICT_CALLBACK="no"
             shift
             ;;
+        --feature-matrix)
+            RUN_FEATURE_MATRIX="yes"
+            shift
+            ;;
+        --no-feature-matrix)
+            RUN_FEATURE_MATRIX="no"
+            shift
+            ;;
+        --fuzz-targets)
+            RUN_FUZZ_TARGETS="yes"
+            shift
+            ;;
+        --no-fuzz-targets)
+            RUN_FUZZ_TARGETS="no"
+            shift
+            ;;
+        --security)
+            RUN_SECURITY="yes"
+            shift
+            ;;
+        --no-security)
+            RUN_SECURITY="no"
+            shift
+            ;;
+        --coverage)
+            RUN_COVERAGE="yes"
+            shift
+            ;;
+        --no-coverage)
+            RUN_COVERAGE="no"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -105,6 +149,12 @@ run_fast() {
 run_medium() {
     run_fast
     run "Clippy (warnings as errors)" cargo clippy --workspace --all-targets --all-features -- -D warnings
+    if [[ "$RUN_FEATURE_MATRIX" == "yes" ]]; then
+        run "Feature matrix" "$ROOT_DIR/scripts/check-feature-matrix"
+    fi
+    if [[ "$RUN_FUZZ_TARGETS" == "yes" ]]; then
+        run "Fuzz target build" "$ROOT_DIR/scripts/check-fuzz-targets"
+    fi
     if [[ "$RUN_QUALITY_SMOKE" == "yes" ]]; then
         if [[ "$RUN_STRICT_CALLBACK" == "yes" ]]; then
             run "Decompiler quality smoke (control-flow + strict callback)" "$ROOT_DIR/scripts/quality-smoke" --strict-callback
@@ -119,6 +169,14 @@ run_medium() {
 
 run_full() {
     run_medium
+
+    if [[ "$RUN_SECURITY" == "yes" ]]; then
+        run "Security audit" "$ROOT_DIR/scripts/check-security"
+    fi
+
+    if [[ "$RUN_COVERAGE" == "yes" ]]; then
+        run "Coverage gate" "$ROOT_DIR/scripts/check-coverage"
+    fi
 
     if [[ "$RUN_PERF" == "yes" ]]; then
         run "Deterministic benchmark gate" "$ROOT_DIR/scripts/bench-deterministic"

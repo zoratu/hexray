@@ -29,6 +29,8 @@
 //! }
 //! ```
 
+#![forbid(unsafe_code)]
+
 pub mod builtin;
 pub mod constants;
 pub mod database;

@@ -141,7 +141,7 @@ impl<'a> SignatureMatcher<'a> {
     pub fn scan(&self, bytes: &[u8]) -> Vec<MatchResult<'a>> {
         let mut matches = Vec::new();
 
-        for offset in 0..bytes.len().saturating_sub(4) {
+        for offset in 0..=bytes.len().saturating_sub(4) {
             for result in self.match_bytes_all(&bytes[offset..]) {
                 matches.push(MatchResult::new(
                     result.signature,

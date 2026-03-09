@@ -29,6 +29,8 @@
 //! let rax = emu.get_register(0);
 //! ```
 
+#![forbid(unsafe_code)]
+
 pub mod executor;
 pub mod flags;
 pub mod memory;

@@ -26,3 +26,4 @@ criterion.workspace = true
 [[bench]]
 name = "disassembly"
 harness = false
+required-features = ["x86_64"]

@@ -8,6 +8,8 @@
 //!
 //! These parsers are built from scratch for educational purposes.
 
+#![forbid(unsafe_code)]
+
 pub mod dwarf;
 pub mod elf;
 pub mod error;

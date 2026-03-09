@@ -6,15 +6,20 @@
 //! - Decoded instructions have valid structure
 //! - Deterministic decoding (same input → same output)
 
+#[cfg(any(feature = "x86_64", feature = "arm64", feature = "riscv"))]
 use proptest::prelude::*;
 
+#[cfg(any(feature = "x86_64", feature = "arm64", feature = "riscv"))]
 use hexray_disasm::traits::Disassembler;
+
+#[cfg(feature = "x86_64")]
 use hexray_disasm::x86_64::X86_64Disassembler;
 
 // =============================================================================
 // X86_64 Decoder Properties
 // =============================================================================
 
+#[cfg(feature = "x86_64")]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10000))]
 
@@ -123,6 +128,7 @@ proptest! {
 // Specific Instruction Pattern Tests
 // =============================================================================
 
+#[cfg(feature = "x86_64")]
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
 

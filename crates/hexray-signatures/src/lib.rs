@@ -23,6 +23,8 @@
 //! }
 //! ```
 
+#![forbid(unsafe_code)]
+
 pub mod builtin;
 mod database;
 mod matcher;
