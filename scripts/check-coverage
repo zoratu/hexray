@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if ! cargo llvm-cov --version >/dev/null 2>&1; then
+    echo "cargo-llvm-cov is required for coverage checks." >&2
+    echo "Install it with: cargo install cargo-llvm-cov --locked" >&2
+    exit 1
+fi
+
+rustup component add llvm-tools-preview >/dev/null
+
+HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+RUSTUP_RUSTC="$(rustup which rustc 2>/dev/null || true)"
+if [[ -n "$RUSTUP_RUSTC" ]]; then
+    TOOLCHAIN_ROOT="$(cd "$(dirname "$RUSTUP_RUSTC")/.." && pwd)"
+    LLVM_TOOLS_DIR="$TOOLCHAIN_ROOT/lib/rustlib/$HOST_TRIPLE/bin"
+    if [[ -x "$LLVM_TOOLS_DIR/llvm-profdata" ]]; then
+        export LLVM_PROFDATA="$LLVM_TOOLS_DIR/llvm-profdata"
+    fi
+    if [[ -x "$LLVM_TOOLS_DIR/llvm-cov" ]]; then
+        export LLVM_COV="$LLVM_TOOLS_DIR/llvm-cov"
+    fi
+fi
+
+if [[ -z "${LLVM_PROFDATA:-}" ]] || [[ ! -x "$LLVM_PROFDATA" ]]; then
+    echo "llvm-profdata was not found in the active rustup toolchain." >&2
+    exit 1
+fi
+
+THRESHOLD="${HEXRAY_COVERAGE_LINES:-70}"
+
+cargo llvm-cov clean --workspace
+cargo llvm-cov \
+    --workspace \
+    --all-features \
+    --all-targets \
+    --summary-only \
+    --fail-under-lines "${THRESHOLD}"

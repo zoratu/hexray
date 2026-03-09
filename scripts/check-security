@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if ! command -v cargo-audit >/dev/null 2>&1; then
+    echo "cargo-audit is required for security checks." >&2
+    echo "Install it with: cargo install cargo-audit --locked" >&2
+    exit 1
+fi
+
+cargo audit

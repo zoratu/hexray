@@ -33,7 +33,12 @@ scripts/ci-local --tier fast
 scripts/ci-local --tier medium
 scripts/ci-local --tier medium --no-strict-callback
 scripts/ci-local --tier full
+scripts/ci-local --tier full --no-coverage
 scripts/ci-local --tier full --perf
+scripts/check-feature-matrix
+scripts/check-fuzz-targets
+scripts/check-security
+HEXRAY_COVERAGE_LINES=70 scripts/check-coverage
 scripts/quality-smoke
 scripts/quality-smoke --with-callback
 scripts/quality-smoke --strict-callback
@@ -43,6 +48,9 @@ For stable benchmark comparisons and parallelism tuning guidance, see `/Volumes/
 
 `scripts/quality-smoke` runs fixture-backed control-flow quality cases (switch/goto recovery gates) for a cheap fail-fast signal; `--with-callback` adds callback CLI smoke checks and `--strict-callback` enforces strict callback snapshots.
 `scripts/ci-local --tier medium` now routes strict callback checks through `scripts/quality-smoke --strict-callback` by default; use `--no-strict-callback` to disable during exploratory work.
+`scripts/check-feature-matrix` compiles the non-default `hexray-disasm` architecture feature combinations plus `hexray-core/serde`, so feature flags stay honest instead of only working through the default workspace path.
+`scripts/check-fuzz-targets` compiles every cargo-fuzz target from the stable toolchain path used by local CI, so newly added fuzz entrypoints cannot silently rot.
+`scripts/check-security` runs `cargo audit`; `scripts/check-coverage` runs `cargo llvm-cov` with a configurable line threshold via `HEXRAY_COVERAGE_LINES`.
 Standard decompiler benchmarks now include strict callback API quality/index gates for `qsort`, `qsort_r`, `bsd_qsort_r`, `bsearch`, `signal`, `on_exit`, `pthread_create`, and `pthread_atfork`, including stack-spill forwarding callback cases for `qsort` and `pthread_create` (callback-index precision and recall are enforced where index stability is expected).
 Callback benchmark cases also enforce a callback provenance quality gate: shape-fallback provenance ratio must remain zero (`max_callback_shape_fallback_ratio = 0.0`) for all `callback_*` cases.
 Callback CLI fixture regressions also exercise shim-backed callback APIs (`hexray_qsort_r`, `hexray_bsd_qsort_r`, `hexray_on_exit`, `hexray_pthread_atfork`) to keep end-to-end typed callback output portable across toolchains.

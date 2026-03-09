@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+run() {
+    echo ""
+    echo "=== $1 ==="
+    shift
+    "$@"
+}
+
+run "hexray-core serde feature" \
+    cargo test -p hexray-core --features serde
+
+run "hexray-disasm without default features" \
+    cargo check -p hexray-disasm --no-default-features --all-targets
+
+for feature in x86_64 arm64 riscv; do
+    run "hexray-disasm feature matrix: ${feature}" \
+        cargo check -p hexray-disasm --no-default-features --features "${feature}" --all-targets
+done
+
+run "hexray-disasm feature matrix: all-archs" \
+    cargo check -p hexray-disasm --no-default-features --features all-archs --all-targets

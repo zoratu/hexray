@@ -48,6 +48,8 @@ cargo install cargo-fuzz
 | `riscv_decoder` | Fuzzes the RISC-V instruction decoder with arbitrary byte sequences |
 | `elf_parser` | Fuzzes the ELF binary format parser |
 | `macho_parser` | Fuzzes the Mach-O binary format parser |
+| `pe_parser` | Fuzzes the PE binary format parser |
+| `dwarf_parser` | Fuzzes DWARF debug info and `.eh_frame` parsing |
 
 ### Analysis Targets
 
@@ -55,6 +57,9 @@ cargo install cargo-fuzz
 |--------|-------------|
 | `cfg_builder` | Fuzzes the control flow graph construction from disassembled instructions |
 | `decompiler` | Fuzzes the full decompilation pipeline with various configurations |
+| `type_parser` | Fuzzes raw and generated C header parsing |
+| `signature_matcher` | Fuzzes signature pattern parsing, matching, and scanning |
+| `cache_persistence` | Fuzzes corrupted on-disk cache reload paths |
 
 ### Structure-Aware Targets (Recommended for Deep Testing)
 
@@ -157,7 +162,7 @@ For CI integration, run fuzz tests with a time limit and fail on crashes:
 #!/bin/bash
 set -e
 cd fuzz
-for target in x86_64_decoder arm64_decoder elf_parser macho_parser; do
+for target in x86_64_decoder arm64_decoder riscv_decoder elf_parser macho_parser pe_parser dwarf_parser type_parser signature_matcher cache_persistence; do
     echo "Fuzzing $target..."
     cargo +nightly fuzz run "$target" -- -max_total_time=300 || exit 1
 done

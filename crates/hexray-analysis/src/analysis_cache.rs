@@ -989,6 +989,22 @@ mod tests {
     }
 
     #[test]
+    fn test_corrupted_disk_cache_is_ignored() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = AnalysisCache::with_disk(temp_dir.path());
+        let key = FunctionCacheKey::new(0x3000, b"corrupted");
+        let path = temp_dir
+            .path()
+            .join("disasm")
+            .join(format!("{}.json", key.to_disk_key()));
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{ definitely not valid json").unwrap();
+
+        assert!(cache.get_disassembly(&key).is_none());
+    }
+
+    #[test]
     fn test_cache_invalidation() {
         let cache = AnalysisCache::memory_only();
 

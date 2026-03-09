@@ -15,6 +15,8 @@
 //! - Qualifiers (const, volatile, pointers, references)
 //! - Thunks and virtual thunks
 
+#![forbid(unsafe_code)]
+
 use std::fmt::Write;
 
 /// Attempt to demangle a symbol name.

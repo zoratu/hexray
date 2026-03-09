@@ -4,6 +4,8 @@
 //! architecture-agnostic types for instructions, operands, registers,
 //! basic blocks, and control flow graphs.
 
+#![forbid(unsafe_code)]
+
 pub mod arch;
 pub mod basic_block;
 pub mod cfg;

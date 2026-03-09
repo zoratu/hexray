@@ -9,6 +9,8 @@
 //! hexray <binary> --symbols    List symbols
 //! ```
 
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{

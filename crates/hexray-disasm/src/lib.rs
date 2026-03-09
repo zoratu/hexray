@@ -7,6 +7,8 @@
 //! - ARM64 (AArch64)
 //! - RISC-V (RV64I/RV32I)
 
+#![forbid(unsafe_code)]
+
 pub mod error;
 pub mod traits;
 

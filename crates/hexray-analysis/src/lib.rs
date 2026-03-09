@@ -17,6 +17,8 @@
 //! - C++ class reconstruction
 //! - Analysis result caching
 
+#![forbid(unsafe_code)]
+
 pub mod analysis_cache;
 pub mod callgraph;
 pub mod cfg_builder;

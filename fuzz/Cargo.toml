@@ -13,7 +13,10 @@ hexray-core = { path = "../crates/hexray-core" }
 hexray-disasm = { path = "../crates/hexray-disasm", features = ["all-archs"] }
 hexray-formats = { path = "../crates/hexray-formats" }
 hexray-analysis = { path = "../crates/hexray-analysis" }
+hexray-signatures = { path = "../crates/hexray-signatures" }
+hexray-types = { path = "../crates/hexray-types" }
 arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
 
 [[bin]]
 name = "x86_64_decoder"
@@ -51,6 +54,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "pe_parser"
+path = "fuzz_targets/pe_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dwarf_parser"
+path = "fuzz_targets/dwarf_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "elf_structured"
 path = "fuzz_targets/elf_structured.rs"
 test = false
@@ -74,6 +91,27 @@ bench = false
 [[bin]]
 name = "decompiler"
 path = "fuzz_targets/decompiler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature_matcher"
+path = "fuzz_targets/signature_matcher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "type_parser"
+path = "fuzz_targets/type_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cache_persistence"
+path = "fuzz_targets/cache_persistence.rs"
 test = false
 doc = false
 bench = false
