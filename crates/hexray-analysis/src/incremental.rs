@@ -111,6 +111,15 @@ impl Patch {
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.address < end && self.old_end() > start
     }
+
+    /// Check if this patch affects an address range after accounting for layout shifts.
+    pub fn affects_range(&self, start: u64, end: u64) -> bool {
+        if self.size_delta() != 0 {
+            end > self.address
+        } else {
+            self.overlaps(start, end)
+        }
+    }
 }
 
 /// Type of patch.
@@ -158,13 +167,13 @@ impl PatchSet {
     pub fn patches_in_range(&self, start: u64, end: u64) -> Vec<&Patch> {
         self.patches
             .iter()
-            .filter(|p| p.overlaps(start, end))
+            .filter(|p| p.affects_range(start, end))
             .collect()
     }
 
     /// Check if any patches affect a given address range.
     pub fn affects_range(&self, start: u64, end: u64) -> bool {
-        self.patches.iter().any(|p| p.overlaps(start, end))
+        self.patches.iter().any(|p| p.affects_range(start, end))
     }
 
     /// Get the number of patches.
@@ -383,6 +392,14 @@ impl FunctionInfo {
     }
 }
 
+fn apply_delta(address: u64, delta: i64) -> u64 {
+    if delta >= 0 {
+        address.saturating_add(delta as u64)
+    } else {
+        address.saturating_sub(delta.unsigned_abs())
+    }
+}
+
 /// Tracks analysis dependencies for incremental updates.
 #[derive(Debug, Default)]
 pub struct DependencyTracker {
@@ -429,6 +446,25 @@ impl DependencyTracker {
             .filter(|(s, e, _)| *s < end && *e > start)
             .map(|(_, _, addr)| *addr)
             .collect()
+    }
+
+    /// Find functions affected by a patch.
+    ///
+    /// Size-changing patches conservatively affect the containing function and every
+    /// later function because their addresses may shift.
+    pub fn functions_affected_by_patch(&self, patch: &Patch) -> Vec<u64> {
+        if patch.size_delta() != 0 {
+            let mut functions: Vec<u64> = self
+                .functions
+                .values()
+                .filter(|info| info.end_address() > patch.address)
+                .map(|info| info.address)
+                .collect();
+            functions.sort_unstable();
+            functions
+        } else {
+            self.functions_in_range(patch.address, patch.old_end())
+        }
     }
 
     /// Get all functions that transitively depend on a given function.
@@ -492,6 +528,113 @@ impl DependencyTracker {
     pub fn function_count(&self) -> usize {
         self.functions.len()
     }
+
+    fn rebuild_address_map(&mut self) {
+        self.address_map = self
+            .functions
+            .values()
+            .map(|info| (info.address, info.end_address(), info.address))
+            .collect();
+        self.address_map.sort_by_key(|(start, _, _)| *start);
+    }
+
+    /// Apply conservative layout updates after patches are committed.
+    ///
+    /// The returned map translates old function addresses to their rewritten
+    /// addresses. Functions fully deleted by the patch set are omitted.
+    pub fn apply_patch_layout(&mut self, patches: &PatchSet) -> HashMap<u64, u64> {
+        let mut infos: Vec<(u64, FunctionInfo)> = self
+            .functions
+            .values()
+            .cloned()
+            .map(|info| (info.address, info))
+            .collect();
+
+        if !patches.patches.iter().any(|patch| patch.size_delta() != 0) {
+            return infos.into_iter().map(|(addr, _)| (addr, addr)).collect();
+        }
+
+        let mut cumulative_delta = 0i64;
+        for patch in &patches.patches {
+            let delta = patch.size_delta();
+            if delta == 0 {
+                continue;
+            }
+
+            let patch_start = apply_delta(patch.address, cumulative_delta);
+            let patch_end = patch_start.saturating_add(patch.old_bytes.len() as u64);
+            let replacement_end = patch_start.saturating_add(patch.new_bytes.len() as u64);
+
+            for (_, info) in &mut infos {
+                let start = info.address;
+                let end = info.end_address();
+
+                if end <= patch_start {
+                    continue;
+                }
+
+                let new_start = if start < patch_start {
+                    start
+                } else if start >= patch_end {
+                    apply_delta(start, delta)
+                } else {
+                    patch_start
+                };
+
+                let new_end = if end <= patch_start {
+                    end
+                } else if end >= patch_end {
+                    apply_delta(end, delta)
+                } else {
+                    replacement_end
+                };
+
+                info.address = new_start;
+                info.size = new_end.saturating_sub(new_start) as usize;
+            }
+
+            cumulative_delta += delta;
+        }
+
+        let old_to_new: HashMap<u64, u64> = infos
+            .iter()
+            .filter(|(_, info)| info.size > 0)
+            .map(|(old_addr, info)| (*old_addr, info.address))
+            .collect();
+
+        let mut new_functions: HashMap<u64, FunctionInfo> = HashMap::new();
+        for (_, mut info) in infos {
+            if info.size == 0 {
+                continue;
+            }
+
+            info.callers = info
+                .callers
+                .into_iter()
+                .filter_map(|addr| old_to_new.get(&addr).copied())
+                .collect();
+            info.callees = info
+                .callees
+                .into_iter()
+                .filter_map(|addr| old_to_new.get(&addr).copied())
+                .collect();
+
+            if let Some(existing) = new_functions.get_mut(&info.address) {
+                existing.size = existing.size.max(info.size);
+                existing.callers.extend(info.callers);
+                existing.callees.extend(info.callees);
+                if existing.content_hash == 0 {
+                    existing.content_hash = info.content_hash;
+                }
+            } else {
+                new_functions.insert(info.address, info);
+            }
+        }
+
+        self.functions = new_functions;
+        self.rebuild_address_map();
+        old_to_new
+    }
 }
 
 /// Level of analysis invalidation.
@@ -551,6 +694,20 @@ impl AffectedAnalysis {
     pub fn total_affected(&self) -> usize {
         self.all_affected().len()
     }
+
+    fn remap_addresses(&mut self, address_map: &HashMap<u64, u64>) {
+        fn remap(entries: &mut HashSet<u64>, address_map: &HashMap<u64, u64>) {
+            *entries = entries
+                .iter()
+                .filter_map(|addr| address_map.get(addr).copied())
+                .collect();
+        }
+
+        remap(&mut self.full_reanalysis, address_map);
+        remap(&mut self.dataflow_reanalysis, address_map);
+        remap(&mut self.type_reanalysis, address_map);
+        remap(&mut self.interprocedural_reanalysis, address_map);
+    }
 }
 
 /// Manages incremental analysis updates.
@@ -606,21 +763,10 @@ impl IncrementalAnalyzer {
 
         // Find directly affected functions
         for patch in &patches.patches {
-            let functions = self
-                .dependencies
-                .functions_in_range(patch.address, patch.old_end());
+            let functions = self.dependencies.functions_affected_by_patch(patch);
 
             for func_addr in functions {
-                // Size changes require full reanalysis
-                if patch.patch_type == PatchType::SizeChange
-                    || patch.patch_type == PatchType::Insertion
-                    || patch.patch_type == PatchType::Deletion
-                {
-                    affected.full_reanalysis.insert(func_addr);
-                } else {
-                    // Simple replacement might only need local reanalysis
-                    affected.full_reanalysis.insert(func_addr);
-                }
+                affected.full_reanalysis.insert(func_addr);
             }
         }
 
@@ -653,7 +799,7 @@ impl IncrementalAnalyzer {
 
     /// Apply patches and invalidate affected cache entries.
     pub fn apply_patches(&mut self, patches: &PatchSet) -> AffectedAnalysis {
-        let affected = self.analyze_affected(patches);
+        let mut affected = self.analyze_affected(patches);
 
         // Invalidate cache entries for affected functions
         for &func_addr in &affected.full_reanalysis {
@@ -663,6 +809,9 @@ impl IncrementalAnalyzer {
                 self.stats.cache_invalidations += 1;
             }
         }
+
+        let address_map = self.dependencies.apply_patch_layout(patches);
+        affected.remap_addresses(&address_map);
 
         // Calculate estimated time saved
         let total_functions = self.dependencies.function_count();
@@ -739,10 +888,65 @@ impl IncrementalAnalyzerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis_cache::CacheConfig;
+    use crate::analysis_cache::{CacheConfig, CachedDisassembly};
 
     fn create_test_cache() -> Arc<AnalysisCache> {
         Arc::new(AnalysisCache::new(CacheConfig::default()))
+    }
+
+    fn test_disassembly() -> CachedDisassembly {
+        CachedDisassembly {
+            instructions: vec![],
+            instruction_count: 0,
+            success: true,
+            error: None,
+        }
+    }
+
+    fn patch_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|idx| idx as u8).collect()
+    }
+
+    fn expected_model_affects(start: u64, size: usize, patch: &Patch) -> bool {
+        if patch.size_delta() != 0 {
+            start + size as u64 > patch.address
+        } else {
+            start < patch.old_end() && start + size as u64 > patch.address
+        }
+    }
+
+    fn expected_model_transform(start: u64, size: usize, patch: &Patch) -> Option<(u64, usize)> {
+        if patch.size_delta() == 0 {
+            return Some((start, size));
+        }
+
+        let end = start + size as u64;
+        let patch_end = patch.old_end();
+        let replacement_end = patch.new_end();
+
+        let new_start = if end <= patch.address {
+            start
+        } else if start >= patch_end {
+            apply_delta(start, patch.size_delta())
+        } else if start < patch.address {
+            start
+        } else {
+            patch.address
+        };
+
+        let new_end = if end <= patch.address {
+            end
+        } else if end >= patch_end {
+            apply_delta(end, patch.size_delta())
+        } else {
+            replacement_end
+        };
+
+        if new_end <= new_start {
+            None
+        } else {
+            Some((new_start, (new_end - new_start) as usize))
+        }
     }
 
     #[test]
@@ -785,6 +989,18 @@ mod tests {
 
         assert!(!patch.overlaps(0x0F00, 0x1000)); // Before
         assert!(!patch.overlaps(0x1010, 0x2000)); // After
+    }
+
+    #[test]
+    fn test_patch_affects_shifted_ranges() {
+        let insertion = Patch::new(0x1000, vec![], vec![0xCC, 0xCC]);
+        assert!(insertion.affects_range(0x1000, 0x1100));
+        assert!(insertion.affects_range(0x1100, 0x1200));
+        assert!(!insertion.affects_range(0x0F00, 0x1000));
+
+        let replacement = Patch::new(0x1000, vec![0x90], vec![0xCC]);
+        assert!(replacement.affects_range(0x1000, 0x1010));
+        assert!(!replacement.affects_range(0x1100, 0x1200));
     }
 
     #[test]
@@ -951,6 +1167,26 @@ mod tests {
     }
 
     #[test]
+    fn test_incremental_analyzer_insertion_affects_tail() {
+        let cache = create_test_cache();
+        let mut tracker = DependencyTracker::new();
+
+        tracker.add_function(FunctionInfo::new(0x1000, 0x40));
+        tracker.add_function(FunctionInfo::new(0x1100, 0x30));
+        tracker.add_function(FunctionInfo::new(0x1200, 0x20));
+
+        let analyzer = IncrementalAnalyzer::new(cache, tracker);
+
+        let mut patches = PatchSet::new();
+        patches.add_patch(Patch::new(0x1010, vec![], vec![0xCC, 0xCC, 0xCC]));
+
+        let affected = analyzer.analyze_affected(&patches);
+        assert!(affected.full_reanalysis.contains(&0x1000));
+        assert!(affected.full_reanalysis.contains(&0x1100));
+        assert!(affected.full_reanalysis.contains(&0x1200));
+    }
+
+    #[test]
     fn test_incremental_analyzer_no_propagation() {
         let cache = create_test_cache();
         let mut tracker = DependencyTracker::new();
@@ -1026,6 +1262,83 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_patches_invalidates_shifted_cache_entries() {
+        let cache = create_test_cache();
+        let mut tracker = DependencyTracker::new();
+
+        tracker.add_function(FunctionInfo::new(0x1000, 0x40));
+        tracker.add_function(FunctionInfo::new(0x1100, 0x30));
+
+        let first_key = FunctionCacheKey::new(0x1000, &[0xAA; 8]);
+        let second_key = FunctionCacheKey::new(0x1100, &[0xBB; 8]);
+        cache.store_disassembly(&first_key, &test_disassembly());
+        cache.store_disassembly(&second_key, &test_disassembly());
+
+        let mut analyzer = IncrementalAnalyzer::new(cache.clone(), tracker);
+        let mut patches = PatchSet::new();
+        patches.add_patch(Patch::new(0x1010, vec![], vec![0xCC, 0xCC, 0xCC, 0xCC]));
+
+        let affected = analyzer.apply_patches(&patches);
+
+        assert!(cache.get_disassembly(&first_key).is_none());
+        assert!(cache.get_disassembly(&second_key).is_none());
+        assert!(affected.full_reanalysis.contains(&0x1000));
+        assert!(affected.full_reanalysis.contains(&0x1104));
+    }
+
+    #[test]
+    fn test_apply_patches_rewrites_shifted_addresses_and_edges() {
+        let cache = create_test_cache();
+        let mut tracker = DependencyTracker::new();
+
+        tracker.add_function(FunctionInfo::new(0x1000, 0x40));
+        tracker.add_function(FunctionInfo::new(0x1100, 0x30));
+        tracker.add_call_edge(0x1000, 0x1100);
+
+        let mut analyzer = IncrementalAnalyzer::new(cache, tracker);
+        let mut patches = PatchSet::new();
+        patches.add_patch(Patch::new(0x1010, vec![], vec![0xCC, 0xCC, 0xCC, 0xCC]));
+
+        let affected = analyzer.apply_patches(&patches);
+
+        let first = analyzer
+            .dependencies()
+            .get_function(0x1000)
+            .expect("first function should retain its entry point");
+        assert_eq!(first.size, 0x44);
+        assert!(first.callees.contains(&0x1104));
+
+        let second = analyzer
+            .dependencies()
+            .get_function(0x1104)
+            .expect("later function should shift by the insertion delta");
+        assert_eq!(second.size, 0x30);
+        assert!(second.callers.contains(&0x1000));
+
+        assert!(affected.full_reanalysis.contains(&0x1000));
+        assert!(affected.full_reanalysis.contains(&0x1104));
+    }
+
+    #[test]
+    fn test_apply_patches_shifts_function_at_insertion_boundary() {
+        let cache = create_test_cache();
+        let mut tracker = DependencyTracker::new();
+        tracker.add_function(FunctionInfo::new(0x1000, 0x20));
+
+        let mut analyzer = IncrementalAnalyzer::new(cache, tracker);
+        let mut patches = PatchSet::new();
+        patches.add_patch(Patch::new(0x1000, vec![], vec![0xCC, 0xCC, 0xCC]));
+
+        let affected = analyzer.apply_patches(&patches);
+        let shifted = analyzer
+            .dependencies()
+            .get_function(0x1003)
+            .expect("function starting at insertion point should shift");
+        assert_eq!(shifted.size, 0x20);
+        assert!(affected.full_reanalysis.contains(&0x1003));
+    }
+
+    #[test]
     fn test_patch_set_coalesce() {
         let mut set = PatchSet::new();
         set.add_patch(Patch::new(0x1000, vec![0x90], vec![0xCC]));
@@ -1062,6 +1375,85 @@ mod tests {
         assert!(diff.stats.changed_regions > 0);
         assert!(diff.stats.similarity > 0.0);
         assert!(diff.stats.similarity < 1.0);
+    }
+
+    #[test]
+    fn test_tla_model_conformance_for_incremental_layout() {
+        let patch_addresses = [10u64, 12, 20, 27];
+        let lengths = [0usize, 1, 3];
+        let new_lengths = [0usize, 1, 4];
+        let initial_functions = [(10u64, 5usize), (20u64, 6usize), (30u64, 4usize)];
+
+        for patch_address in patch_addresses {
+            for old_len in lengths {
+                for new_len in new_lengths {
+                    if old_len == 0 && new_len == 0 {
+                        continue;
+                    }
+
+                    let cache = create_test_cache();
+                    let mut tracker = DependencyTracker::new();
+                    let mut old_keys = Vec::new();
+                    for (address, size) in initial_functions {
+                        tracker.add_function(FunctionInfo::new(address, size));
+                        let key = FunctionCacheKey::new(address, &patch_bytes(size.max(1)));
+                        cache.store_disassembly(&key, &test_disassembly());
+                        old_keys.push((address, size, key));
+                    }
+
+                    let mut analyzer = IncrementalAnalyzer::new(cache.clone(), tracker);
+                    let patch =
+                        Patch::new(patch_address, patch_bytes(old_len), patch_bytes(new_len));
+                    let mut patch_set = PatchSet::new();
+                    patch_set.add_patch(patch.clone());
+
+                    let affected = analyzer.apply_patches(&patch_set);
+
+                    for (address, size, key) in &old_keys {
+                        let expected_affected = expected_model_affects(*address, *size, &patch);
+                        assert_eq!(
+                            cache.get_disassembly(key).is_some(),
+                            !expected_affected,
+                            "cache invalidation mismatch for patch @ {patch_address:#x} old_len={old_len} new_len={new_len}"
+                        );
+
+                        let expected = expected_model_transform(*address, *size, &patch);
+                        match expected {
+                            Some((new_address, new_size)) => {
+                                let info = analyzer
+                                    .dependencies()
+                                    .get_function(new_address)
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "missing remapped function {new_address:#x} for patch @ {patch_address:#x} old_len={old_len} new_len={new_len}"
+                                        )
+                                    });
+                                assert_eq!(
+                                    info.size, new_size,
+                                    "size mismatch for patch @ {patch_address:#x} old_len={old_len} new_len={new_len}"
+                                );
+                                if expected_affected {
+                                    assert!(
+                                        affected.full_reanalysis.contains(&new_address),
+                                        "affected set missing remapped address {new_address:#x}"
+                                    );
+                                }
+                            }
+                            None => {
+                                assert!(
+                                    analyzer
+                                        .dependencies()
+                                        .functions
+                                        .values()
+                                        .all(|info| info.address != *address || info.size != *size),
+                                    "deleted function unexpectedly remained at {address:#x}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

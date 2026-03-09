@@ -60,6 +60,7 @@ cargo install cargo-fuzz
 | `type_parser` | Fuzzes raw and generated C header parsing |
 | `signature_matcher` | Fuzzes signature pattern parsing, matching, and scanning |
 | `cache_persistence` | Fuzzes corrupted on-disk cache reload paths |
+| `incremental_layout` | Fuzzes shifted-layout invalidation and dependency rewriting |
 
 ### Structure-Aware Targets (Recommended for Deep Testing)
 
@@ -162,7 +163,7 @@ For CI integration, run fuzz tests with a time limit and fail on crashes:
 #!/bin/bash
 set -e
 cd fuzz
-for target in x86_64_decoder arm64_decoder riscv_decoder elf_parser macho_parser pe_parser dwarf_parser type_parser signature_matcher cache_persistence; do
+for target in x86_64_decoder arm64_decoder riscv_decoder elf_parser macho_parser pe_parser dwarf_parser type_parser signature_matcher cache_persistence incremental_layout; do
     echo "Fuzzing $target..."
     cargo +nightly fuzz run "$target" -- -max_total_time=300 || exit 1
 done

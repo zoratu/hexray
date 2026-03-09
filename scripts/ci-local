@@ -26,10 +26,11 @@ RUN_FEATURE_MATRIX="yes"
 RUN_FUZZ_TARGETS="yes"
 RUN_SECURITY="yes"
 RUN_COVERAGE="yes"
+RUN_TLA="yes"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf] [--no-perf] [--quality-smoke] [--no-quality-smoke] [--strict-callback] [--no-strict-callback] [--feature-matrix] [--no-feature-matrix] [--fuzz-targets] [--no-fuzz-targets] [--security] [--no-security] [--coverage] [--no-coverage] [--help]
+Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf] [--no-perf] [--quality-smoke] [--no-quality-smoke] [--strict-callback] [--no-strict-callback] [--feature-matrix] [--no-feature-matrix] [--fuzz-targets] [--no-fuzz-targets] [--security] [--no-security] [--coverage] [--no-coverage] [--tla] [--no-tla] [--help]
 
   --tier      Select workflow tier (default: medium)
   --cross     Force docker cross-arch matrix during full tier
@@ -48,6 +49,8 @@ Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf
   --no-security  Skip security auditing during full tier
   --coverage     Run `cargo llvm-cov` during full tier (default)
   --no-coverage  Skip coverage gate during full tier
+  --tla     Run the TLA+ model/conformance gate during full tier (default)
+  --no-tla  Skip the TLA+ model/conformance gate during full tier
   --help      Show this message
 EOF
 }
@@ -122,6 +125,14 @@ while [[ $# -gt 0 ]]; do
             RUN_COVERAGE="no"
             shift
             ;;
+        --tla)
+            RUN_TLA="yes"
+            shift
+            ;;
+        --no-tla)
+            RUN_TLA="no"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -176,6 +187,10 @@ run_full() {
 
     if [[ "$RUN_COVERAGE" == "yes" ]]; then
         run "Coverage gate" "$ROOT_DIR/scripts/check-coverage"
+    fi
+
+    if [[ "$RUN_TLA" == "yes" ]]; then
+        run "TLA+ gate" "$ROOT_DIR/scripts/check-tla"
     fi
 
     if [[ "$RUN_PERF" == "yes" ]]; then
