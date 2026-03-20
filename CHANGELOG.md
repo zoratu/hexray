@@ -5,6 +5,27 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-03-19
+
+### Testing
+
+- **Swarm Testing**: Added swarm testing infrastructure for decompiler (Groce et al., ISSTA 2012)
+  - Randomly omit optimization passes to find bugs through feature-omission diversity
+  - `DecompilerConfig::from_swarm_bits()` for coin-toss pass selection
+  - proptest suite: crash safety, determinism, monotonicity, loop robustness
+  - Per-pass trigger/suppressor analysis (coverage report)
+  - Verified on x86_64 and aarch64 with 0 failures across 1,200+ random configs
+
+- **Miri Memory-Safety Gate**: Added Miri to pre-push validation (e76fc4b3a)
+
+- **Feature, Security, and Coverage Gates**: Added comprehensive test gates (400afdfb8)
+
+### Hardening
+
+- **Mach-O Parser**: Hardened load command parsing against malformed inputs (67f6952f9)
+
+- **Incremental Analysis**: Hardened invalidation logic and modeled it (9d25e3db9)
+
 ## [1.2.0] - 2026-02-25
 
 ### Critical Fixes
