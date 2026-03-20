@@ -361,6 +361,70 @@ impl DecompilerConfig {
             .map(|&p| (p, self.is_pass_enabled(p), p.description()))
             .collect()
     }
+
+    /// Creates a swarm configuration from a bitmask.
+    ///
+    /// Each bit in `bits` determines whether the corresponding pass from
+    /// [`OptimizationPass::all()`] is enabled. This is the core primitive for
+    /// *swarm testing* (Groce et al., ISSTA 2012): instead of running with a
+    /// single "default" configuration that enables every pass, generate a
+    /// diverse set of configurations that each *omit* a random subset of
+    /// passes. Feature-omission diversity leads to better coverage and fault
+    /// detection because some passes actively suppress behaviors that would
+    /// otherwise expose bugs, and passes compete for "space" in each test,
+    /// limiting exploration depth.
+    ///
+    /// Use with proptest to generate random `u32` values:
+    ///
+    /// ```ignore
+    /// proptest! {
+    ///     #[test]
+    ///     fn swarm(bits in proptest::bits::u32::ANY) {
+    ///         let config = DecompilerConfig::from_swarm_bits(bits);
+    ///         // ...run decompilation with config...
+    ///     }
+    /// }
+    /// ```
+    pub fn from_swarm_bits(bits: u32) -> Self {
+        let all = OptimizationPass::all();
+        debug_assert!(
+            all.len() <= 32,
+            "more than 32 passes; from_swarm_bits needs a wider type"
+        );
+        let mut config = Self::new(OptimizationLevel::None);
+        for (i, &pass) in all.iter().enumerate() {
+            if bits & (1 << i) != 0 {
+                config.enabled_passes.insert(pass);
+            }
+        }
+        config
+    }
+
+    /// Returns the bitmask representation of the currently-enabled passes.
+    ///
+    /// Inverse of [`from_swarm_bits`](Self::from_swarm_bits).
+    pub fn to_swarm_bits(&self) -> u32 {
+        let all = OptimizationPass::all();
+        let mut bits = 0u32;
+        for (i, &pass) in all.iter().enumerate() {
+            if self.is_pass_enabled(pass) {
+                bits |= 1 << i;
+            }
+        }
+        bits
+    }
+
+    /// Returns a human-readable summary of the enabled passes.
+    pub fn describe(&self) -> String {
+        let enabled = self.enabled_passes();
+        let names: Vec<&str> = enabled.iter().map(|p| p.name()).collect();
+        format!(
+            "{}/{} passes enabled: [{}]",
+            enabled.len(),
+            OptimizationPass::all().len(),
+            names.join(", ")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +493,39 @@ mod tests {
                 pass
             );
         }
+    }
+
+    #[test]
+    fn test_swarm_bits_roundtrip() {
+        // All bits set → all passes enabled
+        let config = DecompilerConfig::from_swarm_bits(0x00FF_FFFF);
+        assert_eq!(config.enabled_passes().len(), OptimizationPass::all().len());
+
+        // Zero bits → no passes enabled
+        let config = DecompilerConfig::from_swarm_bits(0);
+        assert!(config.enabled_passes().is_empty());
+
+        // Roundtrip: bits → config → bits
+        let bits: u32 = 0b1010_1010_1010_1010_1010_1010;
+        let config = DecompilerConfig::from_swarm_bits(bits);
+        let mask = (1u32 << OptimizationPass::all().len()) - 1;
+        assert_eq!(config.to_swarm_bits(), bits & mask);
+    }
+
+    #[test]
+    fn test_swarm_bits_individual_passes() {
+        // Bit 0 → first pass (CallArgPropagation)
+        let config = DecompilerConfig::from_swarm_bits(1);
+        assert!(config.is_pass_enabled(OptimizationPass::CallArgPropagation));
+        assert!(!config.is_pass_enabled(OptimizationPass::ReturnValueMerge));
+    }
+
+    #[test]
+    fn test_swarm_describe() {
+        let config = DecompilerConfig::from_swarm_bits(0);
+        assert!(config.describe().starts_with("0/"));
+
+        let config = DecompilerConfig::from_swarm_bits(0x00FF_FFFF);
+        assert!(config.describe().starts_with("24/"));
     }
 }
