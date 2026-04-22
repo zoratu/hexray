@@ -602,7 +602,10 @@ fn print_info(binary: &Binary) {
     println!("Binary Information");
     println!("==================");
     println!("Format:        {}", binary.format_name());
-    println!("Architecture:  {:?}", fmt.architecture());
+    println!(
+        "Architecture:  {}",
+        format_arch_for_info(fmt.architecture())
+    );
     println!("Endianness:    {:?}", fmt.endianness());
     println!("Bitness:       {:?}", fmt.bitness());
 
@@ -4016,7 +4019,12 @@ fn parse_address_str(s: &str) -> Result<u64> {
     u64::from_str_radix(s, 16).context("Invalid address")
 }
 
-/// Helper function to disassemble a block of bytes using the appropriate architecture
+/// Helper function to disassemble a block of bytes using the appropriate architecture.
+///
+/// Returns an empty vector for architectures we do not have a decoder for
+/// (notably CUDA SASS until M3 lands). The previous behaviour silently
+/// delegated to `X86_64Disassembler`, which would happily emit plausible-but-
+/// wrong instructions from a CUBIN's `.text.*` bytes.
 fn disassemble_block_for_arch(
     arch: Architecture,
     bytes: &[u8],
@@ -4029,6 +4037,33 @@ fn disassemble_block_for_arch(
         Architecture::Arm64 => Arm64Disassembler::new().disassemble_block(bytes, start_addr),
         Architecture::RiscV64 => RiscVDisassembler::new().disassemble_block(bytes, start_addr),
         Architecture::RiscV32 => RiscVDisassembler::new_rv32().disassemble_block(bytes, start_addr),
-        _ => X86_64Disassembler::new().disassemble_block(bytes, start_addr),
+        Architecture::Arm | Architecture::Cuda(_) | Architecture::Unknown(_) => Vec::new(),
+    }
+}
+
+/// Pretty-print an Architecture for `hexray info`. CUDA targets expand to
+/// canonical SM names (`sm_80`, `sm_90a`); other architectures fall back to
+/// their short name plus any ABI-specific detail we'd otherwise lose.
+fn format_arch_for_info(arch: Architecture) -> String {
+    match arch {
+        Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
+            format!(
+                "cuda-sass ({}, family={:?})",
+                sm.canonical_name(),
+                sm.family
+            )
+        }
+        Architecture::Cuda(hexray_core::CudaArchitecture::Ptx(ptx)) => {
+            let target = ptx
+                .target
+                .map(|t| format!(", target={}", t.canonical_name()))
+                .unwrap_or_default();
+            format!(
+                "cuda-ptx (v{}.{}, address_size={}{})",
+                ptx.major, ptx.minor, ptx.address_size, target
+            )
+        }
+        Architecture::Unknown(m) => format!("unknown (machine={})", m),
+        other => other.name().to_string(),
     }
 }

@@ -16,7 +16,10 @@ pub mod output;
 pub mod register;
 pub mod symbol;
 
-pub use arch::{Architecture, Bitness, Endianness};
+pub use arch::{
+    Architecture, Bitness, CudaArchitecture, Endianness, PtxVersion, SmArchitecture, SmFamily,
+    SmVariant,
+};
 pub use basic_block::{BasicBlock, BasicBlockId, BlockTerminator};
 pub use cfg::ControlFlowGraph;
 pub use error::Error;

@@ -5,7 +5,7 @@ expression: normalized
 Binary Information
 ==================
 Format:        PE
-Architecture:  X86_64
+Architecture:  x86_64
 Endianness:    Little
 Bitness:       Bits64
 Type:          Executable

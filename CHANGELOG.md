@@ -5,6 +5,21 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### GPU Support (in progress on `feature/gpu-support`)
+
+- **M1 – CUDA arch recognition**: `Architecture::Cuda(CudaArchitecture)` in
+  `hexray-core`, carrying `SmArchitecture { family, major, minor, variant }`
+  for SASS targets (`sm_80`, `sm_86`, `sm_89`, `sm_90a`, …) and `PtxVersion`
+  for PTX sidecars. ELF `EM_CUDA = 190` is recognised with correct `e_flags`
+  decoding for both ABI V1 (Ampere/Ada/Hopper) and ABI V2 (Blackwell+)
+  layouts, including the `a` accelerator bit. `hexray info foo.cubin` now
+  reports e.g. `cuda-sass (sm_80, family=Ampere)`. The previous
+  `disassemble_block_for_arch` fallback that silently fed unknown-arch bytes
+  to the x86 decoder has been removed — unsupported architectures now return
+  an empty block rather than plausible-but-wrong disassembly.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing
