@@ -20,6 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the x86 decoder has been removed — unsupported architectures now return
   an empty block rather than plausible-but-wrong disassembly.
 
+- **M2 – raw CUBIN code-object view**: `Elf::cubin_view()` returns a typed
+  `CubinView` over an EM_CUDA ELF, enumerating kernels, memory regions,
+  module-wide `.nv.info`, and parsing diagnostics. Kernel detection uses
+  the `STO_CUDA_ENTRY` bit in `st_other` (preserved from the raw symbol
+  table), falling back to a sibling `.nv.info.<kernel>` section; ambiguous
+  `.text.<name>` sections (e.g. out-of-line `__device__` helpers) are
+  flagged rather than surfaced as kernels. `.nv.constantN`, `.nv.shared`,
+  and `.nv.local` sections are classified into `MemoryRegion`s with the
+  constant bank number preserved. `.nv.info` TLV framing is parsed into
+  `NvInfoBlob { raw, entries: Vec<NvInfoEntryRef>, truncated }` with
+  attribute IDs mapped to an `NvInfoAttribute` enum (unknown bytes are
+  preserved verbatim). Payload semantics are intentionally left for M5.
+  `hexray info foo.cubin` now lists kernels, memory regions, and any
+  diagnostics. 18 new unit tests cover TLV framing, kernel detection,
+  memory-region classification, and the edge cases called out in the M2
+  design review.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing

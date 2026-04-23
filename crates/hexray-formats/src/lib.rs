@@ -17,7 +17,11 @@ pub mod macho;
 pub mod pe;
 pub mod traits;
 
-pub use elf::{Elf, ElfType, KernelModuleInfo, Relocation, RelocationType};
+pub use elf::{
+    CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Elf, ElfType, Kernel,
+    KernelModuleInfo, MemoryRegion, MemorySpace, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef,
+    NvInfoFormat, Relocation, RelocationType,
+};
 pub use error::ParseError;
 pub use macho::MachO;
 pub use pe::Pe;

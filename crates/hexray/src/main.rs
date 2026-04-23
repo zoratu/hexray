@@ -619,6 +619,11 @@ fn print_info(binary: &Binary) {
             println!("\nSections:      {}", elf.sections.len());
             println!("Segments:      {}", elf.segments.len());
 
+            // Display CUDA CUBIN info if this is an EM_CUDA ELF.
+            if let Ok(view) = elf.cubin_view() {
+                print_cubin_info(&view);
+            }
+
             // Display kernel module info if present
             if let Some(modinfo) = &elf.modinfo {
                 println!("\nKernel Module Information");
@@ -4038,6 +4043,77 @@ fn disassemble_block_for_arch(
         Architecture::RiscV64 => RiscVDisassembler::new().disassemble_block(bytes, start_addr),
         Architecture::RiscV32 => RiscVDisassembler::new_rv32().disassemble_block(bytes, start_addr),
         Architecture::Arm | Architecture::Cuda(_) | Architecture::Unknown(_) => Vec::new(),
+    }
+}
+
+/// Print the CUDA-specific summary block for a CUBIN: kernels, memory
+/// regions, module-level .nv.info, and any parsing diagnostics.
+fn print_cubin_info(view: &hexray_formats::CubinView<'_>) {
+    println!("\nCUDA CUBIN View");
+    println!("---------------");
+    println!("Kernels:       {}", view.kernels().len());
+    for k in view.kernels() {
+        let info_note = if k.nv_info.is_some() {
+            " (+nv_info)"
+        } else {
+            ""
+        };
+        println!(
+            "  - {name}  size={size}  section=#{idx}{info}",
+            name = k.name,
+            size = k.size,
+            idx = k.section_index,
+            info = info_note,
+        );
+    }
+    if !view.memory_regions().is_empty() {
+        println!("Memory Regions: {}", view.memory_regions().len());
+        for r in view.memory_regions() {
+            let space = match r.space {
+                hexray_formats::MemorySpace::Constant { bank } => format!("constant[{}]", bank),
+                hexray_formats::MemorySpace::Shared => "shared".to_string(),
+                hexray_formats::MemorySpace::Local => "local".to_string(),
+            };
+            let owner = r
+                .owner_kernel
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            println!(
+                "  - {space}{owner}  {name}  size={size}",
+                space = space,
+                owner = owner,
+                name = r.name,
+                size = r.size,
+            );
+        }
+    }
+    if let Some(module) = view.module_info() {
+        println!(
+            "Module .nv.info: {} entries{}",
+            module.entries.len(),
+            if module.truncated { " (truncated)" } else { "" }
+        );
+    }
+    if !view.diagnostics().is_empty() {
+        println!("Diagnostics:    {}", view.diagnostics().len());
+        for d in view.diagnostics() {
+            let kind = match d.kind {
+                hexray_formats::CubinDiagnosticKind::AmbiguousTextSection => {
+                    "ambiguous .text.<name> section"
+                }
+                hexray_formats::CubinDiagnosticKind::OrphanNvInfoSection => {
+                    "orphan .nv.info.<name> with no matching .text"
+                }
+                hexray_formats::CubinDiagnosticKind::DuplicateKernelName => "duplicate kernel name",
+                hexray_formats::CubinDiagnosticKind::MalformedNvInfo => {
+                    "malformed .nv.info TLV framing"
+                }
+            };
+            match d.section_index {
+                Some(idx) => println!("  - section #{}: {}", idx, kind),
+                None => println!("  - {}", kind),
+            }
+        }
     }
 }
 
