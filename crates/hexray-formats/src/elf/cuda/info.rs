@@ -49,26 +49,37 @@ impl NvInfoFormat {
     }
 }
 
-/// `EIATTR_*` attribute identifiers. Values come from CuAssembler and
-/// `cuda_parsers`; NVIDIA does not document these publicly. Unknown values
-/// are preserved as [`NvInfoAttribute::Unknown`] rather than rejected.
+/// `EIATTR_*` attribute identifiers. Values come from CuAssembler's
+/// `CuAsm/CuNVInfo.py` attribute map; NVIDIA does not document these
+/// publicly. Unknown values are preserved as [`NvInfoAttribute::Unknown`]
+/// rather than rejected.
 ///
 /// Only attributes M5 will care about are named explicitly. Keep adding as
 /// corpus evidence comes in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvInfoAttribute {
-    /// `EIATTR_PAD`
+    /// `EIATTR_PAD` — padding entry used to align following records.
     Pad,
-    /// `EIATTR_MAX_REG_COUNT`
-    MaxRegCount,
+    /// `EIATTR_IMAGE_SLOT`
+    ImageSlot,
+    /// `EIATTR_JUMPTABLE_RELOCS`
+    JumptableRelocs,
+    /// `EIATTR_CTAIDZ_USED` — kernel reads `%ctaid.z`.
+    CtaidzUsed,
+    /// `EIATTR_MAX_THREADS` — launch bound maximum thread count.
+    MaxThreads,
     /// `EIATTR_PARAM_CBANK` — constant-bank region holding kernel params.
     ParamCbank,
     /// `EIATTR_EXTERNS`
     Externs,
-    /// `EIATTR_FRAME_SIZE`
+    /// `EIATTR_REQNTID` — `__launch_bounds__(blockDim)`.
+    ReqNtid,
+    /// `EIATTR_FRAME_SIZE` — per-thread stack frame size.
     FrameSize,
     /// `EIATTR_MIN_STACK_SIZE`
     MinStackSize,
+    /// `EIATTR_MAX_REG_COUNT`
+    MaxRegCount,
     /// `EIATTR_KPARAM_INFO` — one-per-parameter layout record.
     KparamInfo,
     /// `EIATTR_CBANK_PARAM_SIZE` — total size of param cbank.
@@ -77,15 +88,11 @@ pub enum NvInfoAttribute {
     ExitInstrOffsets,
     /// `EIATTR_S2RCTAID_INSTR_OFFSETS`
     S2RCtaidInstrOffsets,
-    /// `EIATTR_MAX_THREADS` — launch bound.
-    MaxThreads,
-    /// `EIATTR_REQNTID` — `__launch_bounds__(blockDim)`.
-    ReqNtid,
     /// `EIATTR_MAXNTID`
     MaxNtid,
-    /// `EIATTR_CTAIDZ_USED`
-    CtaidzUsed,
-    /// `EIATTR_SW_WAR`
+    /// `EIATTR_MAX_STACK_SIZE`
+    MaxStackSize,
+    /// `EIATTR_SW_WAR` — software workaround marker.
     SwWar,
     /// Any attribute byte we don't recognise — stored verbatim so callers
     /// can still iterate and surface diagnostics.
@@ -93,23 +100,29 @@ pub enum NvInfoAttribute {
 }
 
 impl NvInfoAttribute {
+    // Attribute IDs from CuAssembler `CuAsm/CuNVInfo.py` and corroborated by
+    // the cuda_parsers Rust crate. Not an NVIDIA-published spec — any drift
+    // should be caught by the M6 differential harness against real cubins.
     fn from_byte(b: u8) -> Self {
         match b {
             0x01 => Self::Pad,
-            0x1b => Self::MaxRegCount,
+            0x02 => Self::ImageSlot,
+            0x03 => Self::JumptableRelocs,
+            0x04 => Self::CtaidzUsed,
+            0x05 => Self::MaxThreads,
             0x0a => Self::ParamCbank,
             0x0f => Self::Externs,
+            0x10 => Self::ReqNtid,
             0x11 => Self::FrameSize,
             0x12 => Self::MinStackSize,
+            0x1b => Self::MaxRegCount,
             0x17 => Self::KparamInfo,
             0x19 => Self::CbankParamSize,
             0x1c => Self::ExitInstrOffsets,
             0x1d => Self::S2RCtaidInstrOffsets,
-            0x04 => Self::MaxThreads,
-            0x10 => Self::ReqNtid,
-            0x05 => Self::MaxNtid,
-            0x23 => Self::CtaidzUsed,
-            0x24 => Self::SwWar,
+            0x1f => Self::MaxNtid,
+            0x23 => Self::MaxStackSize,
+            0x36 => Self::SwWar,
             other => Self::Unknown(other),
         }
     }
@@ -118,20 +131,23 @@ impl NvInfoAttribute {
     pub fn as_byte(self) -> u8 {
         match self {
             Self::Pad => 0x01,
-            Self::MaxRegCount => 0x1b,
+            Self::ImageSlot => 0x02,
+            Self::JumptableRelocs => 0x03,
+            Self::CtaidzUsed => 0x04,
+            Self::MaxThreads => 0x05,
             Self::ParamCbank => 0x0a,
             Self::Externs => 0x0f,
+            Self::ReqNtid => 0x10,
             Self::FrameSize => 0x11,
             Self::MinStackSize => 0x12,
+            Self::MaxRegCount => 0x1b,
             Self::KparamInfo => 0x17,
             Self::CbankParamSize => 0x19,
             Self::ExitInstrOffsets => 0x1c,
             Self::S2RCtaidInstrOffsets => 0x1d,
-            Self::MaxThreads => 0x04,
-            Self::ReqNtid => 0x10,
-            Self::MaxNtid => 0x05,
-            Self::CtaidzUsed => 0x23,
-            Self::SwWar => 0x24,
+            Self::MaxNtid => 0x1f,
+            Self::MaxStackSize => 0x23,
+            Self::SwWar => 0x36,
             Self::Unknown(b) => b,
         }
     }
@@ -287,13 +303,13 @@ mod tests {
     #[test]
     fn parses_mixed_blob() {
         let mut blob = Vec::new();
-        blob.extend(hval_entry(0x04, 0x0100)); // MaxThreads = 256
+        blob.extend(hval_entry(0x05, 0x0100)); // MaxThreads = 256
         blob.extend(bval_entry(0x1b, 64)); // MaxRegCount = 64
         blob.extend(sval_entry(
             0x17,                                  // KparamInfo
             &[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0], // mock 12-byte payload
         ));
-        blob.extend(nval_entry(0x23)); // CtaidzUsed (no payload)
+        blob.extend(nval_entry(0x04)); // CtaidzUsed (no payload)
 
         let parsed = parse_nv_info(&blob);
         assert!(!parsed.truncated);

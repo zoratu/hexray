@@ -173,13 +173,22 @@ impl<'elf> CubinView<'elf> {
                 .find(|(_, n)| *n == kernel_name)
                 .map(|(idx, _)| *idx);
 
-            if !entry_marker && sibling_info.is_none() {
-                diagnostics.push(CubinDiagnostic {
-                    kind: CubinDiagnosticKind::AmbiguousTextSection,
-                    section_index: Some(sec_idx),
-                });
-                continue;
-            }
+            // Decide kernel confidence. A `.nv.info.<name>` sibling is not
+            // by itself sufficient on real cubins — out-of-line `__device__`
+            // functions can also carry per-function info sections. So we
+            // still surface those as candidates, but with `SiblingInfoOnly`
+            // confidence so callers can filter before they trust them.
+            let confidence = match (entry_marker, sibling_info.is_some()) {
+                (true, _) => KernelConfidence::EntryMarker,
+                (false, true) => KernelConfidence::SiblingInfoOnly,
+                (false, false) => {
+                    diagnostics.push(CubinDiagnostic {
+                        kind: CubinDiagnosticKind::AmbiguousTextSection,
+                        section_index: Some(sec_idx),
+                    });
+                    continue;
+                }
+            };
 
             if seen_names.contains(&kernel_name) {
                 diagnostics.push(CubinDiagnostic {
@@ -216,6 +225,7 @@ impl<'elf> CubinView<'elf> {
                 symbol: sym,
                 size,
                 nv_info,
+                confidence,
             });
         }
 
@@ -246,9 +256,22 @@ impl<'elf> CubinView<'elf> {
         self.elf
     }
 
-    /// All recognised kernels.
+    /// All recognised kernel *candidates*. Mixes high-confidence entries
+    /// (`STO_CUDA_ENTRY` bit set) with ambiguous ones promoted only by the
+    /// sibling-`.nv.info.<name>` heuristic. Inspect [`Kernel::confidence`]
+    /// or use [`CubinView::entry_kernels`] when only the strict set is
+    /// wanted.
     pub fn kernels(&self) -> &[Kernel<'elf>] {
         &self.kernels
+    }
+
+    /// Iterate kernels that satisfy the strongest classification test
+    /// (`STO_CUDA_ENTRY`). On real cubins emitted by current `ptxas`,
+    /// these are the actual `__global__` entries.
+    pub fn entry_kernels(&self) -> impl Iterator<Item = &Kernel<'elf>> {
+        self.kernels
+            .iter()
+            .filter(|k| k.confidence == KernelConfidence::EntryMarker)
     }
 
     /// Look up a kernel by exact (symbol) name. O(n).
@@ -273,7 +296,12 @@ impl<'elf> CubinView<'elf> {
     }
 }
 
-/// A kernel (a `__global__` entry) recovered from the CUBIN.
+/// A kernel candidate recovered from the CUBIN.
+///
+/// "Candidate" because the `sibling_info_only` path cannot distinguish a
+/// real `__global__` entry from an out-of-line `__device__` function; use
+/// [`Kernel::confidence`] or [`CubinView::entry_kernels`] to filter down
+/// to the strict set when needed.
 #[derive(Debug, Clone)]
 pub struct Kernel<'elf> {
     /// Kernel symbol name (mangled — we do no demangling here).
@@ -291,6 +319,24 @@ pub struct Kernel<'elf> {
     pub size: u64,
     /// Parsed `.nv.info.<name>` sidecar, if present.
     pub nv_info: Option<NvInfoBlob<'elf>>,
+    /// Why this candidate was promoted. Callers who want to match
+    /// `nvdisasm`'s `__global__` listing should filter to
+    /// [`KernelConfidence::EntryMarker`].
+    pub confidence: KernelConfidence,
+}
+
+/// How confident we are that a promoted `.text.<name>` section really is a
+/// kernel entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelConfidence {
+    /// Defining symbol has `STO_CUDA_ENTRY` set in `st_other`. Matches
+    /// `nvdisasm`'s notion of a kernel entry point.
+    EntryMarker,
+    /// Only a sibling `.nv.info.<name>` section promoted this candidate.
+    /// May be a real kernel or an out-of-line `__device__` function. See
+    /// [`CubinDiagnosticKind::AmbiguousTextSection`] for cases that are
+    /// ambiguous enough to skip entirely.
+    SiblingInfoOnly,
 }
 
 /// Memory-space classification for CUBIN sections.

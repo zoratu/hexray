@@ -4051,15 +4051,26 @@ fn disassemble_block_for_arch(
 fn print_cubin_info(view: &hexray_formats::CubinView<'_>) {
     println!("\nCUDA CUBIN View");
     println!("---------------");
-    println!("Kernels:       {}", view.kernels().len());
+    let strong = view.entry_kernels().count();
+    println!(
+        "Kernels:       {} ({} entry, {} candidate)",
+        view.kernels().len(),
+        strong,
+        view.kernels().len() - strong,
+    );
     for k in view.kernels() {
         let info_note = if k.nv_info.is_some() {
             " (+nv_info)"
         } else {
             ""
         };
+        let conf = match k.confidence {
+            hexray_formats::KernelConfidence::EntryMarker => "entry",
+            hexray_formats::KernelConfidence::SiblingInfoOnly => "candidate",
+        };
         println!(
-            "  - {name}  size={size}  section=#{idx}{info}",
+            "  [{conf}] {name}  size={size}  section=#{idx}{info}",
+            conf = conf,
             name = k.name,
             size = k.size,
             idx = k.section_index,

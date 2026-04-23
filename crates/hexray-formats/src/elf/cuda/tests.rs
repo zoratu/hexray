@@ -107,6 +107,21 @@ impl CubinBuilder {
         self.sections.len() - 1
     }
 
+    fn local_region(&mut self, owner: Option<&str>, logical: u64) -> usize {
+        let name = match owner {
+            Some(k) => format!(".nv.local.{}", k),
+            None => ".nv.local".to_string(),
+        };
+        self.sections.push(SectionBuild {
+            name,
+            sh_type: SHT_NOBITS,
+            sh_flags: SHF_ALLOC | SHF_WRITE,
+            data: Vec::new(),
+            nobits_logical_size: logical,
+        });
+        self.sections.len() - 1
+    }
+
     fn kernel_symbol(&mut self, name: &str, section: usize, size: u64, entry: bool) {
         // STT_FUNC | STB_GLOBAL = 0x12; optional STO_CUDA_ENTRY in st_other.
         self.symbols.push(SymbolBuild {
@@ -358,15 +373,22 @@ fn sto_cuda_entry_symbol_promotes_to_kernel() {
     assert_eq!(k.name, "_Z3fooPi");
     assert_eq!(k.code, &[0x00, 0x11, 0x22, 0x33]);
     assert_eq!(k.size, 4);
+    assert_eq!(k.confidence, KernelConfidence::EntryMarker);
     assert!(k.symbol.is_some());
     assert!(view.diagnostics().is_empty(), "{:?}", view.diagnostics());
+    assert_eq!(view.entry_kernels().count(), 1);
 }
 
 #[test]
-fn nv_info_sidecar_promotes_to_kernel_even_without_entry_marker() {
+fn nv_info_sidecar_promotes_to_kernel_but_with_weak_confidence() {
+    // A `.nv.info.<name>` sibling alone is *not* a reliable kernel marker
+    // on real cubins — an out-of-line __device__ function can also have a
+    // per-function info section. We still surface the candidate so M5
+    // semantic decoding can refine it, but flag confidence so strict
+    // consumers can filter.
     let mut b = CubinBuilder::new();
     let ti = b.text("myKernel", &[0xde, 0xad, 0xbe, 0xef]);
-    let _info = b.nv_info_kernel("myKernel", &[0x03, 0x04, 0x00, 0x01]); // one HVAL entry
+    let _info = b.nv_info_kernel("myKernel", &[0x03, 0x05, 0x00, 0x01]); // HVAL MaxThreads
     b.kernel_symbol("myKernel", ti, 4, false); // NO entry marker
     let bytes = b.build();
 
@@ -375,8 +397,11 @@ fn nv_info_sidecar_promotes_to_kernel_even_without_entry_marker() {
     assert_eq!(view.kernels().len(), 1);
     let k = &view.kernels()[0];
     assert_eq!(k.name, "myKernel");
+    assert_eq!(k.confidence, KernelConfidence::SiblingInfoOnly);
     assert!(k.nv_info.is_some());
     assert_eq!(k.nv_info.as_ref().unwrap().entries.len(), 1);
+    // entry_kernels() excludes weak matches.
+    assert_eq!(view.entry_kernels().count(), 0);
 }
 
 #[test]
@@ -526,4 +551,62 @@ fn accessor_by_name_works() {
     let view = elf.cubin_view().unwrap();
     assert!(view.kernel_by_name("kernelA").is_some());
     assert!(view.kernel_by_name("nope").is_none());
+}
+
+#[test]
+fn nv_local_region_is_classified_with_owner() {
+    let mut b = CubinBuilder::new();
+    let ti = b.text("kernel", &[0]);
+    let _info = b.nv_info_kernel("kernel", &[0x01, 0x01]);
+    let _ = b.local_region(Some("kernel"), 64);
+    let _ = b.local_region(None, 128);
+    b.kernel_symbol("kernel", ti, 1, true);
+    let bytes = b.build();
+
+    let elf = Elf::parse(&bytes).unwrap();
+    let view = elf.cubin_view().unwrap();
+
+    let locals: Vec<(&str, Option<&str>, u64)> = view
+        .memory_regions()
+        .iter()
+        .filter(|r| matches!(r.space, MemorySpace::Local))
+        .map(|r| (r.name, r.owner_kernel, r.size))
+        .collect();
+
+    assert!(
+        locals.contains(&(".nv.local.kernel", Some("kernel"), 64)),
+        "{:?}",
+        locals
+    );
+    assert!(locals.contains(&(".nv.local", None, 128)), "{:?}", locals);
+}
+
+#[test]
+fn entry_kernels_filters_out_weak_matches() {
+    // One kernel with STO_CUDA_ENTRY + one "device function" with only a
+    // sibling .nv.info. kernels() returns both; entry_kernels() returns
+    // only the strong one.
+    let mut b = CubinBuilder::new();
+    let k_idx = b.text("_Z9realKerneli", &[0xaa; 8]);
+    b.kernel_symbol("_Z9realKerneli", k_idx, 8, true);
+
+    let h_idx = b.text("_Z8helperFni", &[0xbb; 8]);
+    let _info = b.nv_info_kernel("_Z8helperFni", &[0x01, 0x01]); // bare NVAL PAD
+    b.kernel_symbol("_Z8helperFni", h_idx, 8, false); // NO entry marker
+
+    let bytes = b.build();
+    let elf = Elf::parse(&bytes).unwrap();
+    let view = elf.cubin_view().unwrap();
+
+    assert_eq!(view.kernels().len(), 2);
+    assert_eq!(view.entry_kernels().count(), 1);
+    assert_eq!(view.entry_kernels().next().unwrap().name, "_Z9realKerneli");
+
+    let weak: Vec<&Kernel> = view
+        .kernels()
+        .iter()
+        .filter(|k| k.confidence == KernelConfidence::SiblingInfoOnly)
+        .collect();
+    assert_eq!(weak.len(), 1);
+    assert_eq!(weak[0].name, "_Z8helperFni");
 }
