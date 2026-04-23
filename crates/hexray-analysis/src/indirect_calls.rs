@@ -838,6 +838,8 @@ mod tests {
             },
             reads: vec![make_register(reg_id)],
             writes: vec![],
+
+            guard: None,
         }
     }
 
@@ -858,12 +860,15 @@ mod tests {
                 segment: None,
                 broadcast: false,
                 index_mode: IndexMode::None,
+                space: hexray_core::MemorySpace::Generic,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 3,
             },
             reads: vec![base_reg],
             writes: vec![],
+
+            guard: None,
         }
     }
 
@@ -884,12 +889,15 @@ mod tests {
                 segment: None,
                 broadcast: false,
                 index_mode: IndexMode::None,
+                space: hexray_core::MemorySpace::Generic,
             })],
             control_flow: ControlFlow::IndirectCall {
                 return_addr: addr + 6,
             },
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         }
     }
 
@@ -911,6 +919,8 @@ mod tests {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![make_register(dest_id)],
+
+            guard: None,
         }
     }
 

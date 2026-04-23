@@ -490,6 +490,8 @@ mod tests {
             control_flow: ControlFlow::Sequential,
             reads: Vec::new(),
             writes: Vec::new(),
+
+            guard: None,
         }
     }
 

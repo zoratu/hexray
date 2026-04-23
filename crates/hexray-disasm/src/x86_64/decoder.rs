@@ -743,6 +743,8 @@ impl Disassembler for X86_64Disassembler {
             control_flow,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -836,6 +838,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -916,6 +920,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -997,6 +1003,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1081,6 +1089,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1156,6 +1166,8 @@ impl X86_64Disassembler {
             control_flow,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1217,6 +1229,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1315,6 +1329,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1559,6 +1575,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1619,6 +1637,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1681,6 +1701,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1766,6 +1788,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -1872,6 +1896,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -2322,6 +2348,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -2373,6 +2401,8 @@ impl X86_64Disassembler {
                 control_flow: ControlFlow::Sequential,
                 reads: vec![],
                 writes: vec![],
+
+                guard: None,
             };
             return Ok(DecodedInstruction {
                 instruction,
@@ -2444,6 +2474,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -2519,6 +2551,8 @@ impl X86_64Disassembler {
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         Ok(DecodedInstruction {
@@ -2607,6 +2641,8 @@ impl X86_64Disassembler {
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
+
+                    guard: None,
                 };
 
                 Ok(DecodedInstruction {
@@ -2646,6 +2682,8 @@ impl X86_64Disassembler {
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
+
+                    guard: None,
                 };
 
                 Ok(DecodedInstruction {
@@ -2679,6 +2717,8 @@ impl X86_64Disassembler {
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
+
+                    guard: None,
                 };
 
                 Ok(DecodedInstruction {
@@ -2712,6 +2752,8 @@ impl X86_64Disassembler {
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
+
+                    guard: None,
                 };
 
                 Ok(DecodedInstruction {
@@ -2766,6 +2808,8 @@ impl X86_64Disassembler {
                             control_flow: ControlFlow::Sequential,
                             reads: vec![],
                             writes: vec![],
+
+                            guard: None,
                         };
                         Ok(DecodedInstruction {
                             instruction,
@@ -2784,6 +2828,8 @@ impl X86_64Disassembler {
                             control_flow: ControlFlow::Sequential,
                             reads: vec![],
                             writes: vec![],
+
+                            guard: None,
                         };
                         Ok(DecodedInstruction {
                             instruction,
@@ -2804,6 +2850,8 @@ impl X86_64Disassembler {
                             control_flow: ControlFlow::Sequential,
                             reads: vec![],
                             writes: vec![],
+
+                            guard: None,
                         };
                         Ok(DecodedInstruction {
                             instruction,
@@ -2822,6 +2870,8 @@ impl X86_64Disassembler {
                             control_flow: ControlFlow::Sequential,
                             reads: vec![],
                             writes: vec![],
+
+                            guard: None,
                         };
                         Ok(DecodedInstruction {
                             instruction,
@@ -2845,6 +2895,8 @@ impl X86_64Disassembler {
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
+
+                    guard: None,
                 };
                 Ok(DecodedInstruction {
                     instruction,
@@ -2883,6 +2935,8 @@ impl X86_64Disassembler {
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
+
+                    guard: None,
                 };
                 Ok(DecodedInstruction {
                     instruction,
@@ -2906,6 +2960,8 @@ impl X86_64Disassembler {
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
+
+                    guard: None,
                 };
                 Ok(DecodedInstruction {
                     instruction,

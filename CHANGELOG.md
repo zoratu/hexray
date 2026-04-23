@@ -37,6 +37,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory-region classification, and the edge cases called out in the M2
   design review.
 
+- **M3 – SASS decode skeleton**: New `hexray-disasm/src/cuda/sass/` module
+  (feature-gated on `cuda`) with a `SassDisassembler` targeting Volta
+  through Blackwell (16-byte fixed-width encoding). The decoder walks
+  code in lockstep 16-byte strides — overriding the default trait
+  `disassemble_block` so a decode failure never desyncs the stream, which
+  the byte-by-byte default would do catastrophically on a fixed-width
+  ISA. `ControlBits` extracts the top 23 bits of each word (stall /
+  yield / read-barrier / write-barrier / wait-mask / reuse).
+  `registers.rs` handles the five SASS register files (R/P/UR/UP/SR)
+  with RZ / PT / URZ / UPT aliases and `RegisterSpan` for `R0:R1`-style
+  pairs rendered at display time rather than faked as register IDs.
+  The M3 opcode table contains exactly one entry — the canonical
+  Volta+ `NOP` (`0x7918` in the low 16 bits) — to prove end-to-end
+  plumbing; real opcodes land in M4.
+
+  Core IR extensions needed by the SASS decoder also landed:
+  `Instruction.guard: Option<PredicateGuard>` for per-instruction
+  predicate guards (`@P0` / `@!P0` on SASS); `MemoryRef.space:
+  MemorySpace` with variants `Generic / Global / Shared / Local /
+  Constant(u8) / Param`. Both default cleanly so CPU decoders compile
+  unchanged. 29 new SASS tests plus tests for the IR extensions.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing

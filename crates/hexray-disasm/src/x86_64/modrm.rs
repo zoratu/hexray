@@ -227,6 +227,7 @@ pub fn decode_modrm_rm(
                 segment: None,
                 broadcast: false,
                 index_mode: IndexMode::None,
+                space: hexray_core::MemorySpace::Generic,
             }),
             offset,
         ));
@@ -267,6 +268,7 @@ pub fn decode_modrm_rm(
             segment: None,
             broadcast: false,
             index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
         }),
         offset,
     ))

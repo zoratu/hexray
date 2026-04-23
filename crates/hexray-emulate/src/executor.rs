@@ -401,6 +401,8 @@ mod tests {
             control_flow: hexray_core::ControlFlow::Sequential,
             reads: Vec::new(),
             writes: Vec::new(),
+
+            guard: None,
         }
     }
 

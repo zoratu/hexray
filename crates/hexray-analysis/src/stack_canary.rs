@@ -870,6 +870,7 @@ mod tests {
             segment: Some(fs_reg),
             broadcast: false,
             index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
         };
 
         let mut instr = Instruction::new(
@@ -912,6 +913,7 @@ mod tests {
             segment: None,
             broadcast: false,
             index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
         };
 
         let mut instr = Instruction::new(0x1007, 4, vec![0x48, 0x89, 0x45, 0xf8], "mov");
@@ -978,6 +980,7 @@ mod tests {
             segment: Some(fs_reg),
             broadcast: false,
             index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
         };
         let mut load_instr = Instruction::new(0x1000, 7, vec![0; 7], "mov");
         load_instr.operation = Operation::Move;
@@ -997,6 +1000,7 @@ mod tests {
             segment: None,
             broadcast: false,
             index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
         };
         let mut store_instr = Instruction::new(0x1007, 4, vec![0; 4], "mov");
         store_instr.operation = Operation::Move;

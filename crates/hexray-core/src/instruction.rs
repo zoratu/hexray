@@ -2,6 +2,39 @@
 
 use crate::{Operand, Register};
 
+/// A guard predicate attached to an instruction.
+///
+/// Used by GPU ISAs (CUDA SASS, AMDGPU) where most instructions can be
+/// predicated on a 1-bit register. `None` on [`Instruction::guard`] means
+/// the instruction executes unconditionally (the default for CPU ISAs and
+/// for SASS instructions guarded by `@PT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PredicateGuard {
+    /// The 1-bit register controlling execution.
+    pub register: Register,
+    /// True when the guard is negated (`@!P0` rather than `@P0`).
+    pub negate: bool,
+}
+
+impl PredicateGuard {
+    /// Constructs a positive (non-negated) guard.
+    pub fn positive(register: Register) -> Self {
+        Self {
+            register,
+            negate: false,
+        }
+    }
+
+    /// Constructs a negated (`@!Pn`) guard.
+    pub fn negated(register: Register) -> Self {
+        Self {
+            register,
+            negate: true,
+        }
+    }
+}
+
 /// An architecture-agnostic instruction.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -24,6 +57,9 @@ pub struct Instruction {
     pub reads: Vec<Register>,
     /// Registers written by this instruction.
     pub writes: Vec<Register>,
+    /// Optional predicate guard (GPU ISAs). `None` means the instruction
+    /// executes unconditionally.
+    pub guard: Option<PredicateGuard>,
 }
 
 impl Instruction {
@@ -39,7 +75,14 @@ impl Instruction {
             control_flow: ControlFlow::Sequential,
             reads: Vec::new(),
             writes: Vec::new(),
+            guard: None,
         }
+    }
+
+    /// Attach a predicate guard (builder style).
+    pub fn with_guard(mut self, guard: PredicateGuard) -> Self {
+        self.guard = Some(guard);
+        self
     }
 
     /// Sets the operation.

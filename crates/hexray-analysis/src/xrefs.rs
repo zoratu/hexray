@@ -300,6 +300,8 @@ mod tests {
             },
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         builder.analyze_instruction(&instr);
@@ -325,6 +327,8 @@ mod tests {
             control_flow: ControlFlow::UnconditionalBranch { target: 0x1012 },
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         };
 
         builder.analyze_instruction(&instr);

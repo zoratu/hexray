@@ -400,6 +400,8 @@ mod tests {
             bytes: vec![0xe8, 0, 0, 0, 0],
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         }
     }
 
@@ -414,6 +416,8 @@ mod tests {
             bytes: vec![0xc3],
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         }
     }
 
@@ -428,6 +432,8 @@ mod tests {
             bytes: vec![0x90],
             reads: vec![],
             writes: vec![],
+
+            guard: None,
         }
     }
 
