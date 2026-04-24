@@ -32,6 +32,13 @@ NVDISASM_FLAGS := --print-instruction-encoding --print-line-info -json
 .PHONY: all clean check dirs
 .SUFFIXES:
 
+# Keep cubins and PTX around after sass.json is produced — without this,
+# `make` treats them as intermediate and deletes them once the JSON is
+# built. Both are needed downstream for hexray's own decoder to run
+# against them.
+.PRECIOUS: $(BUILD_DIR)/sm_%.cubin $(BUILD_DIR)/sm_%.ptx
+.SECONDARY:
+
 all: $(foreach sm,$(SM_ARCHS),$(foreach n,$(NAMES),$(BUILD_DIR)/sm_$(sm)/$(n).sass.json))
 
 dirs:

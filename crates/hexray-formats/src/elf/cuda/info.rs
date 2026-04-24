@@ -3,26 +3,31 @@
 //! The `.nv.info` family of ELF sections carries per-module and per-kernel
 //! attributes (parameter layout, register count, shared/local/const sizes,
 //! exit offsets, launch bounds, …). Each section is a packed sequence of
-//! *entries*, and each entry uses a tiny tag-length-value framing:
+//! *entries* on a 4-byte grid. Each entry is:
 //!
 //! ```text
-//!   u8  format  (EIFMT_NVAL | EIFMT_BVAL | EIFMT_HVAL | EIFMT_SVAL)
-//!   u8  attribute (EIATTR_*)
-//!   payload...    (size depends on `format`)
+//!   u8  format       (EIFMT_NVAL | EIFMT_BVAL | EIFMT_HVAL | EIFMT_SVAL)
+//!   u8  attribute    (EIATTR_*)
+//!   payload...       (size depends on `format`)
+//!   padding to next 4-byte boundary
 //! ```
 //!
-//! Payload sizes per format:
+//! Payload sizes per format (the logical payload — the 4-byte alignment
+//! is applied on top, not included):
 //!
-//! - `EIFMT_NVAL` (0x01) — no payload
-//! - `EIFMT_BVAL` (0x02) — 1 byte
-//! - `EIFMT_HVAL` (0x03) — 2 bytes
-//! - `EIFMT_SVAL` (0x04) — `u16 length` followed by `length` bytes
+//! - `EIFMT_NVAL` (0x01) — no payload (2-byte entry, 2 bytes padding)
+//! - `EIFMT_BVAL` (0x02) — 1 byte (3-byte entry, 1 byte padding)
+//! - `EIFMT_HVAL` (0x03) — 2 bytes (4-byte entry, 0 padding)
+//! - `EIFMT_SVAL` (0x04) — `u16 length` + `length` bytes, then padding
 //!
-//! M2 captures framing only. Payload *semantics* (how to read a
-//! KPARAM_INFO record, what each launch-bound field means) is M5.
+//! The 4-byte grid is critical: without it, an NVAL or BVAL entry
+//! throws the parser out of sync on the next header byte. Confirmed on
+//! real CUDA 13.2 sm_80 cubins (cuobjdump dump of the same sections
+//! shows the padding).
 //!
-//! Reference: CuAssembler `CuAsm/CuNVInfo.py` and public reverse
-//! engineering of `.nv.info`. NVIDIA does not publish a spec for this.
+//! Reference: CuAssembler `CuAsm/CuNVInfo.py` (attribute IDs), plus
+//! empirical verification against cubins emitted by `nvcc 13.2`
+//! (`tests/corpus/cuda/`). NVIDIA does not publish a spec for this.
 
 /// The four `.nv.info` framing formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +260,16 @@ pub fn parse_nv_info(raw: &[u8]) -> NvInfoBlob<'_> {
             payload_offset,
             payload_size,
         });
+
+        // Advance past the 4-byte alignment padding. NVAL entries need
+        // 2 bytes of padding, BVAL 1 byte, HVAL 0, SVAL varies with its
+        // `length` field. Running past the end is fine — the outer
+        // while-loop will exit on the next iteration's header check.
+        let rem = offset % 4;
+        if rem != 0 {
+            let pad = 4 - rem;
+            offset = offset.saturating_add(pad).min(raw.len());
+        }
     }
 
     if offset != raw.len() {
@@ -275,13 +290,23 @@ pub fn parse_nv_info(raw: &[u8]) -> NvInfoBlob<'_> {
 mod tests {
     use super::*;
 
+    /// Pad an entry's encoded bytes up to the next 4-byte boundary so a
+    /// chain of entries stays aligned on the wire, matching what real
+    /// cubins do.
+    fn pad4(mut v: Vec<u8>) -> Vec<u8> {
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        v
+    }
+
     fn sval_entry(attr: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
         v.push(0x04); // EIFMT_SVAL
         v.push(attr);
         v.extend_from_slice(&(payload.len() as u16).to_le_bytes());
         v.extend_from_slice(payload);
-        v
+        pad4(v)
     }
 
     fn hval_entry(attr: u8, payload: u16) -> Vec<u8> {
@@ -289,15 +314,15 @@ mod tests {
         v.push(0x03); // EIFMT_HVAL
         v.push(attr);
         v.extend_from_slice(&payload.to_le_bytes());
-        v
+        pad4(v)
     }
 
     fn bval_entry(attr: u8, b: u8) -> Vec<u8> {
-        vec![0x02, attr, b] // EIFMT_BVAL
+        pad4(vec![0x02, attr, b]) // EIFMT_BVAL + 1 byte padding
     }
 
     fn nval_entry(attr: u8) -> Vec<u8> {
-        vec![0x01, attr] // EIFMT_NVAL
+        pad4(vec![0x01, attr]) // EIFMT_NVAL + 2 bytes padding
     }
 
     #[test]
