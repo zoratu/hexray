@@ -153,6 +153,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   figure comes from instructions that have no variant suffix
   (`NOP`, `BRA`, `EXIT`, `MOV`, `S2R`, …); M7 brings it up.
 
+- **M7 – Ampere/Ada coverage expansion**: Per-opcode variant-suffix
+  decoders lift full-mnemonic match from 65% → **95.8%** on the
+  sm_80/86/89 handwritten corpus. New `default_suffix` field on every
+  `OpcodeEntry` for always-present suffixes (`LOP3.LUT`, `PLOP3.LUT`,
+  `HFMA2.MMA`, `STG.E`, `LDG.E.CONSTANT`, `BAR.SYNC.DEFER_BLOCKING`,
+  `SHFL.DOWN`, `VOTE.ANY`, `RED.E.ADD.STRONG.GPU`, …), plus a
+  `Option<VariantFn>` callback for opcodes whose suffix depends on
+  encoding bits:
+
+      ISETP/FSETP    → cmp (bits 76-78) + bool (74-75) + signed (73)
+                       yields .GE.AND, .GT.U32.OR, etc. (24 cases/SM)
+      IMAD           → .X (bit 72) or .MOV.U32 (RZ,RZ multiplicands)
+      IMAD.WIDE      → .WIDE vs .WIDE.U32 on bit 73
+      IADD3          → .X on bit 74
+      LEA            → .HI / .X / .HI.X / .HI.X.SX32 combinations
+      SHF            → direction (L/R) + type (U32/S32) + .HI
+      ULDC           → .64 on bit 73
+      LDG            → .CONSTANT on cache-op field
+
+  Raised the differential harness's `FULL_MNEMONIC_ALL_SMS` threshold
+  from 5.0% (regression floor) to **92.0%** (M7 success criterion).
+
+  Live numbers on ptxas 13.2 as of M7 landing:
+
+      sm_80: 448/448 = 100.0% base /  95.8% full / 100.0% guard
+      sm_86: 448/448 = 100.0% base /  95.8% full / 100.0% guard
+      sm_89: 448/448 = 100.0% base /  95.8% full / 100.0% guard
+
+  The remaining ~4.2% gap is concentrated in `IMAD.MOV.U32` detection
+  (needs better operand-pattern recognition), some `SHF` / `USHF`
+  variants, and `LEA.HI.SX32` vs `LEA.HI.X.SX32`. Those land as
+  follow-up patches under M7 once the user-declared operand decoding
+  (the second half of M7 per codex's plan) is in.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing

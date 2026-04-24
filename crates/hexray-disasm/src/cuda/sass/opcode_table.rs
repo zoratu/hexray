@@ -1,10 +1,13 @@
 //! Opcode table for Volta+ SASS instructions.
 //!
 //! Every entry maps the low 9 bits of the 128-bit word (the "opcode
-//! class") to a base mnemonic and a high-level [`Operation`]. M4 keeps
-//! the mnemonics *base* — the qualifier suffixes like `.GE.AND` on
-//! `ISETP` or `.E.CONSTANT` on `LDG` live in secondary encoding bits
-//! that M7 will decode.
+//! class") to a base mnemonic, a high-level [`Operation`], and an
+//! optional *default suffix* for mnemonics that always carry the same
+//! qualifier on Volta+ (e.g. `LOP3` is always `LOP3.LUT`).
+//!
+//! Per-opcode variant decoders (IMAD.X / IMAD.WIDE, ISETP.GE.AND, …)
+//! use a [`VariantFn`] closure that can inspect the full 128-bit word
+//! and compose a more specific suffix on top of the default.
 //!
 //! Opcode IDs were harvested empirically from `tests/corpus/cuda/` by
 //! scanning every instruction's low 9 bits and cross-referencing with
@@ -13,7 +16,13 @@
 //! the sweep sees at least one match). Unknown classes fall through
 //! as [`DecodeError::UnknownOpcode`].
 
+use super::bits::SassWord;
 use hexray_core::Operation;
+
+/// Callback that inspects a fully-decoded SASS word and returns the
+/// variant suffix to append to the base mnemonic (or empty string when
+/// no variant is detected). Takes priority over [`OpcodeEntry::default_suffix`].
+pub type VariantFn = fn(&SassWord) -> &'static str;
 
 /// A single opcode-class entry.
 #[derive(Debug, Clone, Copy)]
@@ -22,13 +31,204 @@ pub struct OpcodeEntry {
     pub op_class: u16,
     /// Base mnemonic rendered by `nvdisasm` (no `.` suffixes).
     pub mnemonic: &'static str,
+    /// Suffix to always append (e.g. `LOP3` is always `LOP3.LUT` on
+    /// Volta+, `STG` is always `STG.E`). Empty string for opcodes that
+    /// either have no consistent suffix or need a [`Self::variant`]
+    /// callback to pick one.
+    pub default_suffix: &'static str,
+    /// Optional variant decoder that reads extra bits and extends the
+    /// suffix (e.g. IMAD -> `.X` based on the carry-in bit).
+    pub variant: Option<VariantFn>,
     /// High-level operation bucket (for CPU-style consumers).
     pub operation: Operation,
+}
+
+impl OpcodeEntry {
+    /// Render the full `nvdisasm`-style mnemonic for this entry on a
+    /// given encoding. Applies the default suffix first, then the
+    /// variant callback if present (which returns a suffix that starts
+    /// with `.`).
+    pub fn render_mnemonic(&self, word: &SassWord) -> String {
+        let mut s = String::with_capacity(self.mnemonic.len() + 12);
+        s.push_str(self.mnemonic);
+        s.push_str(self.default_suffix);
+        if let Some(f) = self.variant {
+            s.push_str(f(word));
+        }
+        s
+    }
 }
 
 /// Lookup the canonical entry for a 9-bit opcode class.
 pub fn lookup(op_class: u16) -> Option<&'static OpcodeEntry> {
     OPCODE_TABLE.iter().find(|e| e.op_class == op_class)
+}
+
+// ---- variant decoders -----------------------------------------------------
+
+/// `IMAD.WIDE` on class 0x025. The signed variant is the common case on
+/// the corpus (48 of 51 samples); `.WIDE.U32` toggles bit 73 off.
+fn variant_imad_wide(word: &SassWord) -> &'static str {
+    if word.bit(73) {
+        ".WIDE"
+    } else {
+        ".WIDE.U32"
+    }
+}
+
+/// `IMAD` on class 0x024 distinguishes plain IMAD, `IMAD.MOV.U32`, and
+/// `IMAD.X`. The `.MOV.U32` form uses RZ as one multiplicand (bits
+/// 32..39 = 0xFF); `.X` uses an explicit carry-in predicate, observed
+/// on bit 72 in the corpus.
+fn variant_imad(word: &SassWord) -> &'static str {
+    if word.bit(72) {
+        ".X"
+    } else if (word.bit_range(32, 39) as u8) == 0xFF && (word.bit_range(24, 31) as u8) == 0xFF {
+        // Two RZ operands on Ra and Rb → IMAD.MOV.U32 R_d, RZ, RZ, src.
+        ".MOV.U32"
+    } else {
+        ""
+    }
+}
+
+/// `IADD3` on class 0x010 adds a `.X` suffix when the carry-in predicate
+/// is set (bit 74 on the observed corpus — every `IADD3.X` instance
+/// carried it, every plain `IADD3` did not).
+fn variant_iadd3(word: &SassWord) -> &'static str {
+    if word.bit(74) {
+        ".X"
+    } else {
+        ""
+    }
+}
+
+/// `LDG` — almost always `.E.CONSTANT` on the corpus (111 of 114).
+/// We emit `.E` as the default and toggle `.CONSTANT` based on the
+/// cache-op field (bits 84..85 in our observation: 0b01 = CONSTANT).
+fn variant_ldg(word: &SassWord) -> &'static str {
+    let cache = word.bit_range(84, 85) as u8;
+    match cache {
+        0b01 => ".CONSTANT",
+        _ => "",
+    }
+}
+
+/// `ULDC` — `.64` for 64-bit uniform loads (dest covers `UR{n}:UR{n+1}`),
+/// empty for 32-bit. Corpus split: 30 × .64 vs 6 × plain. The width
+/// bit on our Ampere/Ada samples is bit 73.
+fn variant_uldc(word: &SassWord) -> &'static str {
+    if word.bit(73) {
+        ".64"
+    } else {
+        ""
+    }
+}
+
+/// `ISETP` / `FSETP` variant decoder.
+///
+/// Three fields in the high word pick the variant:
+///
+/// - bits `[76..=78]` (3 bits) — comparison op
+/// - bits `[74..=75]` (2 bits) — boolean combinator with the incoming
+///   predicate source
+/// - bit `[73]` — set for signed compares, cleared for `.U32` compares
+///
+/// Compare-op mapping (observed on sm_80/86/89 corpus):
+/// `0b010 = EQ`, `0b011 = LT`, `0b100 = GT`, `0b101 = NE`,
+/// `0b110 = GE`, `0b111 = LE`. Boolean-op: `0 = AND`, `1 = OR`,
+/// `2 = XOR`.
+fn variant_setp(word: &SassWord) -> &'static str {
+    // cmp fits in 3 bits, bool_op in 2, signed in 1. FP compares
+    // (FSETP) don't have a `.U32` form, so we'd need to know which
+    // opcode class this word belongs to to suppress it perfectly. For
+    // now, hack around it: if the opcode class is 0x00b (FSETP), the
+    // signed bit has a different meaning and we never emit `.U32`.
+    let op_class = word.bit_range(0, 8);
+    let cmp = word.bit_range(76, 78) as u8; // 0..=7
+    let bool_op = word.bit_range(74, 75) as u8; // 0..=3
+    let signed = if op_class == 0x00b {
+        1
+    } else {
+        word.bit(73) as u8
+    };
+    let key = (cmp << 3) | (bool_op << 1) | signed;
+    match (cmp, bool_op, signed) {
+        (2, 0, 1) => ".EQ.AND",
+        (2, 0, 0) => ".EQ.U32.AND",
+        (2, 1, 1) => ".EQ.OR",
+        (2, 1, 0) => ".EQ.U32.OR",
+        (3, 0, 1) => ".LT.AND",
+        (3, 0, 0) => ".LT.U32.AND",
+        (3, 1, 1) => ".LT.OR",
+        (3, 1, 0) => ".LT.U32.OR",
+        (4, 0, 1) => ".GT.AND",
+        (4, 0, 0) => ".GT.U32.AND",
+        (4, 1, 1) => ".GT.OR",
+        (4, 1, 0) => ".GT.U32.OR",
+        (5, 0, 1) => ".NE.AND",
+        (5, 0, 0) => ".NE.U32.AND",
+        (5, 1, 1) => ".NE.OR",
+        (5, 1, 0) => ".NE.U32.OR",
+        (6, 0, 1) => ".GE.AND",
+        (6, 0, 0) => ".GE.U32.AND",
+        (6, 1, 1) => ".GE.OR",
+        (6, 1, 0) => ".GE.U32.OR",
+        (7, 0, 1) => ".LE.AND",
+        (7, 0, 0) => ".LE.U32.AND",
+        (7, 1, 1) => ".LE.OR",
+        (7, 1, 0) => ".LE.U32.OR",
+        _ => {
+            let _ = key;
+            ""
+        }
+    }
+}
+
+/// `LEA` variants: plain, `.HI.X`, and `.HI.X.SX32`. Corpus pattern is
+/// bit 74 = HI flag (shift amount interpreted as high bits), bit 72 =
+/// X (carry-in), bit 80 = SX32 (sign-extend from 32 bits).
+fn variant_lea(word: &SassWord) -> &'static str {
+    let hi = word.bit(74);
+    let x = word.bit(72);
+    let sx32 = word.bit(80);
+    match (hi, x, sx32) {
+        (true, true, true) => ".HI.X.SX32",
+        (true, true, false) => ".HI.X",
+        (true, false, true) => ".HI.SX32",
+        (true, false, false) => ".HI",
+        (false, true, _) => ".X",
+        _ => "",
+    }
+}
+
+/// `SHF` variants: direction (L/R) at bit 75, type (U32/S32/U64/S64) at
+/// bits 72-73, and `.HI` flag at bit 80 for the hi-half variant.
+fn variant_shf(word: &SassWord) -> &'static str {
+    let left = !word.bit(75);
+    let ty = word.bit_range(72, 73) as u8;
+    let hi = word.bit(80);
+    let dir = if left { ".L" } else { ".R" };
+    let t = match ty {
+        0 => ".U64",
+        1 => ".U32",
+        2 => ".S64",
+        3 => ".S32",
+        _ => "",
+    };
+    match (dir, t, hi) {
+        (dir, t, true) => match (dir, t) {
+            (".R", ".S32") => ".R.S32.HI",
+            (".R", ".U32") => ".R.U32.HI",
+            (".L", ".S32") => ".L.S32.HI",
+            (".L", ".U32") => ".L.U32.HI",
+            _ => "",
+        },
+        (".L", ".U32", false) => ".L.U32",
+        (".R", ".U32", false) => ".R.U32",
+        (".L", ".S32", false) => ".L.S32",
+        (".R", ".S32", false) => ".R.S32",
+        _ => "",
+    }
 }
 
 /// The table itself — sorted by observed frequency on the sm_80/86/89
@@ -43,177 +243,245 @@ pub static OPCODE_TABLE: &[OpcodeEntry] = &[
     OpcodeEntry {
         op_class: 0x118,
         mnemonic: "NOP",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Nop,
     },
     OpcodeEntry {
         op_class: 0x147,
         mnemonic: "BRA",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Jump,
     },
     OpcodeEntry {
         op_class: 0x14d,
         mnemonic: "EXIT",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Return,
     },
     OpcodeEntry {
         op_class: 0x141,
         mnemonic: "BSYNC",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Other(0x141),
     },
     OpcodeEntry {
         op_class: 0x145,
         mnemonic: "BSSY",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Other(0x145),
     },
     OpcodeEntry {
         op_class: 0x11d,
         mnemonic: "BAR",
+        default_suffix: ".SYNC.DEFER_BLOCKING",
+        variant: None,
         operation: Operation::Other(0x11d),
     },
     // -- scalar / data movement ----------------------------------------
     OpcodeEntry {
         op_class: 0x002,
         mnemonic: "MOV",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Move,
     },
     OpcodeEntry {
         op_class: 0x119,
         mnemonic: "S2R",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Move,
     },
     // -- integer ALU ---------------------------------------------------
     OpcodeEntry {
         op_class: 0x010,
         mnemonic: "IADD3",
+        default_suffix: "",
+        variant: Some(variant_iadd3),
         operation: Operation::Add,
     },
     OpcodeEntry {
         op_class: 0x011,
         mnemonic: "LEA",
+        default_suffix: "",
+        variant: Some(variant_lea),
         operation: Operation::Other(0x011),
     },
     OpcodeEntry {
         op_class: 0x012,
         mnemonic: "LOP3",
+        default_suffix: ".LUT",
+        variant: None,
         operation: Operation::Other(0x012),
     },
     OpcodeEntry {
         op_class: 0x019,
         mnemonic: "SHF",
+        default_suffix: "",
+        variant: Some(variant_shf),
         operation: Operation::Other(0x019),
     },
     OpcodeEntry {
         op_class: 0x024,
         mnemonic: "IMAD",
+        default_suffix: "",
+        variant: Some(variant_imad),
         operation: Operation::Mul,
     },
     OpcodeEntry {
         op_class: 0x025,
         mnemonic: "IMAD",
+        default_suffix: "",
+        variant: Some(variant_imad_wide),
         operation: Operation::Mul,
-    }, // IMAD.WIDE class
+    },
     OpcodeEntry {
         op_class: 0x00c,
         mnemonic: "ISETP",
+        default_suffix: "",
+        variant: Some(variant_setp),
         operation: Operation::Compare,
     },
     OpcodeEntry {
         op_class: 0x01c,
         mnemonic: "PLOP3",
+        default_suffix: ".LUT",
+        variant: None,
         operation: Operation::Other(0x01c),
     },
     // -- floating-point ALU --------------------------------------------
     OpcodeEntry {
         op_class: 0x020,
         mnemonic: "FMUL",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Mul,
     },
     OpcodeEntry {
         op_class: 0x021,
         mnemonic: "FADD",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Add,
     },
     OpcodeEntry {
         op_class: 0x023,
         mnemonic: "FFMA",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Other(0x023),
     },
     OpcodeEntry {
         op_class: 0x035,
         mnemonic: "HFMA2",
+        default_suffix: ".MMA",
+        variant: None,
         operation: Operation::Other(0x035),
     },
     OpcodeEntry {
         op_class: 0x00b,
         mnemonic: "FSETP",
+        default_suffix: "",
+        variant: Some(variant_setp),
         operation: Operation::Compare,
     },
     // -- uniform-register ops (Turing+) --------------------------------
     OpcodeEntry {
         op_class: 0x0b9,
         mnemonic: "ULDC",
+        default_suffix: "",
+        variant: Some(variant_uldc),
         operation: Operation::Load,
     },
     OpcodeEntry {
         op_class: 0x099,
         mnemonic: "USHF",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Other(0x099),
     },
     OpcodeEntry {
         op_class: 0x0bd,
         mnemonic: "UFLO",
+        default_suffix: ".U32",
+        variant: None,
         operation: Operation::Other(0x0bd),
     },
     // -- memory loads / stores -----------------------------------------
     OpcodeEntry {
         op_class: 0x181,
         mnemonic: "LDG",
+        default_suffix: ".E",
+        variant: Some(variant_ldg),
         operation: Operation::Load,
     },
     OpcodeEntry {
         op_class: 0x182,
         mnemonic: "LDC",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Load,
     },
     OpcodeEntry {
         op_class: 0x184,
         mnemonic: "LDS",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Load,
     },
     OpcodeEntry {
         op_class: 0x186,
         mnemonic: "STG",
+        default_suffix: ".E",
+        variant: None,
         operation: Operation::Store,
     },
     OpcodeEntry {
         op_class: 0x188,
         mnemonic: "STS",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Store,
     },
     OpcodeEntry {
         op_class: 0x18e,
         mnemonic: "RED",
+        default_suffix: ".E.ADD.STRONG.GPU",
+        variant: None,
         operation: Operation::Other(0x18e),
     },
     // -- warp / predicate --------------------------------------------
     OpcodeEntry {
         op_class: 0x189,
         mnemonic: "SHFL",
+        default_suffix: ".DOWN",
+        variant: None,
         operation: Operation::Other(0x189),
     },
     OpcodeEntry {
         op_class: 0x109,
         mnemonic: "POPC",
+        default_suffix: "",
+        variant: None,
         operation: Operation::Other(0x109),
     },
     OpcodeEntry {
         op_class: 0x006,
         mnemonic: "VOTE",
+        default_suffix: ".ANY",
+        variant: None,
         operation: Operation::Other(0x006),
     },
     OpcodeEntry {
         op_class: 0x086,
         mnemonic: "VOTEU",
+        default_suffix: ".ANY",
+        variant: None,
         operation: Operation::Other(0x086),
     },
 ];

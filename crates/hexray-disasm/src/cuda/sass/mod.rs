@@ -109,11 +109,12 @@ impl SassDisassembler {
         let entry = lookup_opcode(op_class)
             .ok_or_else(|| DecodeError::unknown_opcode(address, &word.to_bytes()))?;
 
+        let mnemonic = entry.render_mnemonic(&word);
         let mut instr = Instruction::new(
             address,
             SASS_INSTRUCTION_SIZE,
             word.to_bytes().to_vec(),
-            entry.mnemonic,
+            mnemonic,
         );
         instr.operation = entry.operation;
         instr.guard = decode_predicate_guard(&word, self.sm);
