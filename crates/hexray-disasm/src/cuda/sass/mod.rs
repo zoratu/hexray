@@ -14,14 +14,17 @@
 
 pub mod bits;
 pub mod control;
+pub mod opcode_table;
 pub mod registers;
 
 pub use bits::SassWord;
 pub use control::ControlBits;
+pub use opcode_table::{lookup as lookup_opcode, OpcodeEntry};
 
 use crate::{DecodeError, DecodedInstruction, Disassembler};
 use hexray_core::{
-    Architecture, ControlFlow, CudaArchitecture, Instruction, Operation, SmArchitecture, SmFamily,
+    Architecture, ControlFlow, CudaArchitecture, Instruction, Operand, Operation, PredicateGuard,
+    SmArchitecture, SmFamily,
 };
 
 /// Instruction width on Volta and newer. Fixed, always 16 bytes.
@@ -100,33 +103,116 @@ impl SassDisassembler {
             ));
         }
 
-        let control = ControlBits::from_word(&word);
-        let opcode = word.bit_range(0, 15);
+        let _control = ControlBits::from_word(&word);
+        let op_class = word.bit_range(0, 8) as u16;
 
-        let (mnemonic, operation) = classify_opcode(opcode)
+        let entry = lookup_opcode(op_class)
             .ok_or_else(|| DecodeError::unknown_opcode(address, &word.to_bytes()))?;
 
         let mut instr = Instruction::new(
             address,
             SASS_INSTRUCTION_SIZE,
             word.to_bytes().to_vec(),
-            mnemonic,
+            entry.mnemonic,
         );
-        instr.operation = operation;
-        instr.control_flow = match operation {
-            Operation::Return => ControlFlow::Return,
-            _ => ControlFlow::Sequential,
-        };
-
-        // Stash the control bits in the encoded instruction bytes — M4 /
-        // M7 will add a typed arch-specific metadata slot. For now the
-        // raw bytes preserve everything losslessly.
-        let _ = control;
+        instr.operation = entry.operation;
+        instr.guard = decode_predicate_guard(&word, self.sm);
+        instr.control_flow = derive_control_flow(entry, &word, address);
+        populate_basic_operands(&mut instr, &word, self.sm);
 
         Ok(DecodedInstruction {
             instruction: instr,
             size: SASS_INSTRUCTION_SIZE,
         })
+    }
+}
+
+/// Decode the 4-bit predicate-guard field in bits `[12..=15]`.
+///
+/// The low 3 bits select `P0..P6` (or `P7 = PT`); the high bit inverts.
+/// A value of `0b0111 = PT` means "no guard" — we return `None` so that
+/// `nvdisasm`-style output doesn't print `@PT` noise everywhere.
+fn decode_predicate_guard(word: &SassWord, sm: SmArchitecture) -> Option<PredicateGuard> {
+    let field = word.bit_range(12, 15) as u8;
+    let idx = field & 0x7;
+    let invert = (field & 0x8) != 0;
+    if idx == registers::id::PT as u8 && !invert {
+        return None;
+    }
+    let reg = registers::p(sm, idx as u16);
+    Some(if invert {
+        PredicateGuard::negated(reg)
+    } else {
+        PredicateGuard::positive(reg)
+    })
+}
+
+/// Emit a minimal operand list so CPU-style callers that just want
+/// "does this instruction touch R6" get something useful. We surface:
+///
+/// - the destination register from bits `[16..=23]` (common slot),
+/// - the first source register from bits `[24..=31]` where present.
+///
+/// Values equal to `255` render as `RZ` (the zero register) via the
+/// register module's canonical name logic.
+///
+/// This is deliberately conservative for M4. M7 will replace this with
+/// per-opcode field tables so memory references, const-bank references,
+/// and immediate values land correctly.
+fn populate_basic_operands(instr: &mut Instruction, word: &SassWord, sm: SmArchitecture) {
+    let op_class = instr
+        .bytes
+        .first()
+        .copied()
+        .map(|b| (b as u16) & 0xFF)
+        .unwrap_or(0)
+        | ((instr.bytes.get(1).copied().unwrap_or(0) as u16) & 0x1) << 8;
+    let _ = op_class;
+
+    let rd = word.bit_range(16, 23) as u16;
+    let ra = word.bit_range(24, 31) as u16;
+
+    // Destination: applies to most ALU / load / MOV / S2R opcodes.
+    if needs_destination(instr) {
+        instr.operands.push(Operand::reg(registers::r(sm, rd)));
+        instr.writes.push(registers::r(sm, rd));
+    }
+    // Source register A: applies whenever bits [24..=31] are meaningful.
+    if needs_source_a(instr) {
+        instr.operands.push(Operand::reg(registers::r(sm, ra)));
+        instr.reads.push(registers::r(sm, ra));
+    }
+}
+
+/// Does this opcode class write to the register nibble at bits 16..23?
+fn needs_destination(instr: &Instruction) -> bool {
+    matches!(
+        instr.operation,
+        Operation::Add | Operation::Mul | Operation::Move | Operation::Load | Operation::Compare
+    )
+}
+
+/// Does this opcode class treat bits 24..31 as a source register?
+fn needs_source_a(instr: &Instruction) -> bool {
+    matches!(
+        instr.operation,
+        Operation::Add | Operation::Mul | Operation::Compare | Operation::Store | Operation::Load
+    )
+}
+
+/// Derive a conservative [`ControlFlow`] label from the opcode entry.
+///
+/// Branch targets are in a signed PC-relative field for `BRA`; M4 emits
+/// `UnconditionalBranch { target: address }` as a placeholder (no
+/// resolve of the offset yet — M7 handles it) so the CFG builder at
+/// least sees a non-sequential instruction.
+fn derive_control_flow(entry: &OpcodeEntry, _word: &SassWord, address: u64) -> ControlFlow {
+    match entry.mnemonic {
+        "EXIT" => ControlFlow::Return,
+        "BRA" => ControlFlow::UnconditionalBranch { target: address },
+        "BSYNC" | "BSSY" => ControlFlow::Sequential,
+        "BAR" => ControlFlow::Sequential,
+        _ => ControlFlow::Sequential,
     }
 }
 
@@ -194,19 +280,6 @@ impl Disassembler for SassDisassembler {
             offset += SASS_INSTRUCTION_SIZE;
         }
         out
-    }
-}
-
-/// Maps the low 16 opcode bits to a (mnemonic, core [`Operation`])
-/// pair. M3 covers only `NOP`; everything else is `UnknownOpcode` so the
-/// block walker can continue past decode failures instead of desyncing.
-fn classify_opcode(opcode_low16: u64) -> Option<(&'static str, Operation)> {
-    match opcode_low16 {
-        // `NOP` on Volta+ is encoded as opcode 0x7918 in the low bits —
-        // the same literal is embedded in every Ampere/Ada/Hopper NOP we
-        // have seen in public corpora. This is the one golden M3 needs.
-        0x7918 => Some(("NOP", Operation::Nop)),
-        _ => None,
     }
 }
 

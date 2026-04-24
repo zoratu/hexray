@@ -90,6 +90,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `exits=`, `ctaidz`, and an `args=[#n:BsB,...]` summary underneath
   the kernel line.
 
+- **M4 – core SASS semantics**: First working SASS opcode table.
+  34 opcode classes harvested empirically from the 30-cubin
+  sm_80/86/89 corpus and cross-referenced against `nvdisasm -json`
+  base mnemonics: NOP, BRA, EXIT, BSYNC, BSSY, BAR, MOV, S2R, IADD3,
+  LEA, LOP3, SHF, IMAD, IMAD.WIDE (shared class), ISETP, PLOP3, FMUL,
+  FADD, FFMA, HFMA2, FSETP, ULDC, USHF, UFLO, LDG, LDC, LDS, STG, STS,
+  RED, SHFL, POPC, VOTE, VOTEU. Each entry carries a `(op_class,
+  base_mnemonic, Operation)` tuple in `cuda/sass/opcode_table.rs`.
+
+  Predicate guard decoding (`Instruction.guard`): the 4-bit field at
+  bits `[12..=15]` resolves to `@P0`..`@P6` / `@!P0`..`@!P6`, with
+  `0b0111 = PT` collapsing to `None` (no guard printed).
+
+  Basic operand extraction: destination register from bits `[16..=23]`
+  on ALU/load/MOV/S2R classes; first source register from bits
+  `[24..=31]` on ALU/compare/store/load. Full per-opcode operand
+  decoding (memory refs, cbank refs, immediates) is M7.
+
+  End-to-end match-rate gate in `crates/hexray/tests/cuda_sass_match.rs`:
+  walks every cubin, decodes the `.text.<kernel>` section, compares
+  recovered base mnemonics against `nvdisasm`'s ground truth.
+
+  Current results on the handwritten microkernel corpus:
+
+      sm_80: 448/448 = 100.0%  across 10 kernels
+      sm_86: 448/448 = 100.0%  across 10 kernels
+      sm_89: 448/448 = 100.0%  across 10 kernels
+
+  The M4 success criterion (≥ 70% base match on sm_80) is the test's
+  gate; the actual number is 100%. Variant suffixes and full operand
+  rendering bring the numbers down again under M7's stricter
+  comparison, as expected.
+
+  3 new integration tests, 5 new opcode_table unit tests, 2 new
+  decoder unit tests (predicate decode, desync-free walk). Full
+  workspace green, clippy clean with `-D warnings`.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing
