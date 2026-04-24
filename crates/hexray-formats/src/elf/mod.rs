@@ -18,7 +18,8 @@ mod symbol;
 pub use cuda::{
     CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Kernel, KernelConfidence,
     KernelResourceUsage, MemoryRegion, MemorySpace, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef,
-    NvInfoFormat, ParamCbank, ParamInfo, SchemaError,
+    NvInfoFormat, ParamCbank, ParamInfo, PtxFunction, PtxFunctionKind, PtxIndex, PtxModuleHeader,
+    SchemaError,
 };
 pub use header::{ElfClass, ElfHeader, ElfType, Machine};
 pub use relocation::{Relocation, RelocationType};

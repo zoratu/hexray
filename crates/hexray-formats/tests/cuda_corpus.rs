@@ -319,3 +319,46 @@ fn constant_bias_uses_constant_bank_3() {
 }
 
 fn _witness(_: KernelResourceUsage) {}
+
+#[test]
+fn every_cubin_exposes_ptx_sidecar_matching_the_kernel() {
+    use hexray_formats::PtxFunctionKind;
+    let Some(_) = corpus_root() else {
+        return;
+    };
+    for (sm, kname, path) in enumerate_cubins() {
+        let bytes = fs::read(&path).unwrap();
+        let elf = Elf::parse(&bytes).unwrap();
+        let view = elf.cubin_view().unwrap();
+        let Some(ptx) = view.ptx_sidecar() else {
+            panic!("{sm}/{kname}: missing .nv_debug_ptx_txt sidecar on nvcc -lineinfo build");
+        };
+        // Module header populated.
+        assert!(
+            ptx.header.version.is_some(),
+            "{sm}/{kname}: PTX .version missing"
+        );
+        assert!(
+            ptx.header
+                .target
+                .as_deref()
+                .map(|t| t.starts_with("sm_"))
+                .unwrap_or(false),
+            "{sm}/{kname}: PTX .target missing or malformed"
+        );
+        assert_eq!(
+            ptx.header.address_size,
+            Some(64),
+            "{sm}/{kname}: PTX address_size should be 64"
+        );
+        // The kernel we decoded from SASS should appear as a .entry
+        // directive in the PTX side.
+        let f = ptx
+            .function_by_name(&kname)
+            .unwrap_or_else(|| panic!("{sm}/{kname}: PTX entry for this kernel name missing"));
+        assert_eq!(f.kind, PtxFunctionKind::Entry);
+        assert!(f.visible, "{sm}/{kname}: PTX entry should be .visible");
+        let body = ptx.function_body(f);
+        assert!(!body.is_empty(), "{sm}/{kname}: PTX body span empty");
+    }
+}

@@ -24,6 +24,7 @@
 //!    [`CubinDiagnosticKind::AmbiguousTextSection`] diagnostic.
 
 mod info;
+mod ptx;
 mod schema;
 
 use crate::elf::section::SHT_NOBITS;
@@ -32,6 +33,7 @@ use crate::Section;
 use hexray_core::Symbol;
 
 pub use info::{parse_nv_info, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat};
+pub use ptx::{PtxFunction, PtxFunctionKind, PtxIndex, PtxModuleHeader};
 pub use schema::{KernelResourceUsage, ParamCbank, ParamInfo, SchemaError};
 
 /// NVIDIA's `STO_CUDA_ENTRY` bit in the low nibble of `st_other`. Marks a
@@ -289,6 +291,26 @@ impl<'elf> CubinView<'elf> {
     /// Module-wide `.nv.info`, if present.
     pub fn module_info(&self) -> Option<&NvInfoBlob<'elf>> {
         self.module_info.as_ref()
+    }
+
+    /// Extract the embedded PTX sidecar (the textual virtual-ISA source
+    /// ptxas fed into the SASS assembler), if the CUBIN has one.
+    ///
+    /// CUBINs emitted by `nvcc -lineinfo` or `nvcc --ptx` carry this
+    /// section (`.nv_debug_ptx_txt`). It's a compact way to recover the
+    /// kernel's high-level PTX without re-running the compiler.
+    ///
+    /// Returns `None` when the section is missing (common for release
+    /// cubins built without `-lineinfo`). Ownership is tied to the
+    /// `CubinView`'s underlying ELF, so the PTX index stays valid for
+    /// the lifetime of the view.
+    pub fn ptx_sidecar(&self) -> Option<PtxIndex<'elf>> {
+        for s in &self.elf.sections {
+            if s.name() == ".nv_debug_ptx_txt" {
+                return PtxIndex::from_nul_delimited_bytes(s.data());
+            }
+        }
+        None
     }
 
     /// Diagnostics collected while building the view. M2 emits them; M3+

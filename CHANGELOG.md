@@ -187,6 +187,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up patches under M7 once the user-declared operand decoding
   (the second half of M7 per codex's plan) is in.
 
+- **M8 – fatbin + PTX sidecar**: Two new modules land:
+
+  - `crates/hexray-formats/src/elf/cuda/ptx.rs` — cheap PTX text
+    parser. `PtxIndex::parse(&str)` for standalone `.ptx` files,
+    `PtxIndex::from_nul_delimited_bytes(&[u8])` for the
+    `.nv_debug_ptx_txt` section `nvcc -lineinfo` embeds inside
+    CUBINs (which separates directives with `\0` instead of `\n`).
+    Extracts the module header (`.version` / `.target` /
+    `.address_size`) and indexes every `.entry` / `.func`
+    directive with its body span — enough for a UI to render PTX
+    side-by-side with SASS or for name-based kernel linking. No
+    AST, per codex's design note.
+
+    Accessed via `Kernel::resource_usage()`-style sugar on the
+    CubinView: `view.ptx_sidecar() -> Option<PtxIndex<'_>>`. A
+    corpus regression test confirms every ptxas-13.2 cubin in
+    `tests/corpus/cuda/build/` exposes a valid PTX sidecar whose
+    `.entry` directive matches the SASS kernel name.
+
+  - `crates/hexray-formats/src/cuda/fatbin.rs` — fatbin wrapper
+    parser. `FatbinWrapper::parse(&[u8])` reads the 16-byte
+    wrapper (`magic 0xBA55_ED50`) + packed entry table; surfaces
+    `FatbinEntry { kind, sm, payload, compressed }` for each
+    embedded cubin / PTX blob, with `cubins()` / `ptx_entries()`
+    convenience iterators. Tolerant against malformed input —
+    returns `FatbinError::{Truncated, BadMagic, EntryOverflow,
+    PayloadOverflow}` rather than panicking. Tests synthesise
+    wrappers around real sm_80 cubins from the corpus and
+    round-trip them byte-for-byte; `host-binary-embedded fatbin`
+    validation is deferred to a future corpus rebuild (needs a
+    host ELF that `nvcc` produced with `-rdc=true`).
+
+  PTX↔SASS linking for the single-kernel-per-cubin case is
+  already implicit: both sides use the same (mangled) name, so
+  `ptx.function_by_name(&sass_kernel.name)` just works.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing
