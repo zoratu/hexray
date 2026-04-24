@@ -59,6 +59,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Constant(u8) / Param`. Both default cleanly so CPU decoders compile
   unchanged. 29 new SASS tests plus tests for the IR extensions.
 
+- **M5 – kernel metadata MVP**: Typed decoding of `.nv.info` record
+  payloads. New `KernelResourceUsage` summary on `hexray-formats`:
+  `max_reg_count`, `min_stack_size`, `frame_size`, `max_stack_size`,
+  `cbank_param_size`, `param_cbank` (bank/offset/size),
+  `params: Vec<ParamInfo>` with ordinal / offset / size_dwords /
+  raw_trailer, `exit_offsets` (for CFG bookkeeping),
+  `s2r_ctaid_offsets`, `max_threads`, `req_ntid` / `max_ntid` launch
+  bounds, `ctaidz_used`. Accessed via `Kernel::resource_usage()`.
+
+  Decoding is grounded in the 30-cubin handwritten corpus: every
+  field matches the values `cuobjdump --dump-resource-usage` reports
+  for the same cubin. `vector_add` → `regs=255 params@c[0][0x160]
+  size=28 args=[#3:4B,#2:8B,#1:8B,#0:8B]`. `shared_transpose` →
+  `args=[#2:4B,#1:8B,#0:8B]` + 4 KB static shared region.
+  `constant_bias` → constant bank 3 surfaced as a dedicated memory
+  region.
+
+  Corpus-driven regression tests (`hexray-formats/tests/cuda_corpus.rs`)
+  walk every cubin under `tests/corpus/cuda/build/`, asserting:
+  (a) every kernel promotes via `STO_CUDA_ENTRY`, (b) no
+  `MalformedNvInfo` diagnostics fire, (c) `PARAM_CBANK.size >=
+  max(param_offset + param_size)`, (d) every EXIT offset lands on a
+  16-byte boundary, (e) `constant_bias` exposes constant bank 3, (f)
+  `shared_transpose` exposes its `.nv.shared.<kernel>` region. Tests
+  no-op when the corpus isn't built locally, so CI (which doesn't
+  ship a CUDA toolkit) stays green.
+
+  `hexray info foo.cubin` now prints per-kernel `regs=`, `params@c[]`,
+  `exits=`, `ctaidz`, and an `args=[#n:BsB,...]` summary underneath
+  the kernel line.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing

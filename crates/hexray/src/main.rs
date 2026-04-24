@@ -4076,6 +4076,34 @@ fn print_cubin_info(view: &hexray_formats::CubinView<'_>) {
             idx = k.section_index,
             info = info_note,
         );
+        if let Some(usage) = k.resource_usage() {
+            if let Some(rc) = usage.max_reg_count {
+                print!("      regs={}", rc);
+            }
+            if let Some(cb) = usage.param_cbank {
+                print!("  params@c[{}][{:#x}] size={}", cb.bank, cb.offset, cb.size);
+            }
+            if let Some(ntid) = usage.req_ntid {
+                print!("  req_ntid=({},{},{})", ntid.0, ntid.1, ntid.2);
+            }
+            if !usage.exit_offsets.is_empty() {
+                print!("  exits={}", usage.exit_offsets.len());
+            }
+            if usage.ctaidz_used {
+                print!("  ctaidz");
+            }
+            if !usage.params.is_empty() {
+                print!("  args=[");
+                for (i, p) in usage.params.iter().enumerate() {
+                    if i > 0 {
+                        print!(",");
+                    }
+                    print!("#{}:{}B", p.ordinal, p.size_bytes());
+                }
+                print!("]");
+            }
+            println!();
+        }
     }
     if !view.memory_regions().is_empty() {
         println!("Memory Regions: {}", view.memory_regions().len());

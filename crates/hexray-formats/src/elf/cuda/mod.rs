@@ -24,6 +24,7 @@
 //!    [`CubinDiagnosticKind::AmbiguousTextSection`] diagnostic.
 
 mod info;
+mod schema;
 
 use crate::elf::section::SHT_NOBITS;
 use crate::elf::{Elf, SectionHeader};
@@ -31,6 +32,7 @@ use crate::Section;
 use hexray_core::Symbol;
 
 pub use info::{parse_nv_info, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat};
+pub use schema::{KernelResourceUsage, ParamCbank, ParamInfo, SchemaError};
 
 /// NVIDIA's `STO_CUDA_ENTRY` bit in the low nibble of `st_other`. Marks a
 /// symbol as a kernel entry (`__global__` function).
@@ -323,6 +325,15 @@ pub struct Kernel<'elf> {
     /// `nvdisasm`'s `__global__` listing should filter to
     /// [`KernelConfidence::EntryMarker`].
     pub confidence: KernelConfidence,
+}
+
+impl<'elf> Kernel<'elf> {
+    /// Decode every recognised `.nv.info.<kernel>` attribute into a
+    /// typed [`KernelResourceUsage`]. Returns `None` if this kernel
+    /// has no sidecar info blob attached.
+    pub fn resource_usage(&self) -> Option<KernelResourceUsage> {
+        self.nv_info.as_ref().map(KernelResourceUsage::from_nv_info)
+    }
 }
 
 /// How confident we are that a promoted `.text.<name>` section really is a

@@ -19,8 +19,9 @@ pub mod traits;
 
 pub use elf::{
     CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Elf, ElfType, Kernel,
-    KernelConfidence, KernelModuleInfo, MemoryRegion, MemorySpace, NvInfoAttribute, NvInfoBlob,
-    NvInfoEntryRef, NvInfoFormat, Relocation, RelocationType,
+    KernelConfidence, KernelModuleInfo, KernelResourceUsage, MemoryRegion, MemorySpace,
+    NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat, ParamCbank, ParamInfo, Relocation,
+    RelocationType, SchemaError,
 };
 pub use error::ParseError;
 pub use macho::MachO;
