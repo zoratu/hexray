@@ -127,6 +127,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoder unit tests (predicate decode, desync-free walk). Full
   workspace green, clippy clean with `-D warnings`.
 
+- **M6 – differential harness + corpus pipeline**: Proper SASS diff
+  module at `crates/hexray/tests/differential/sass_compare.rs`,
+  wired into the existing `differential_tests` integration surface
+  alongside the objdump / nm / strings gates. Tracks match rates at
+  three tightening levels — base mnemonic, full mnemonic (with
+  `.`-suffix variants), and predicate guard. Results serialise to
+  JSON (`/tmp/hexray-sass-diff-report.json`) for CI artefact
+  tracking. Skips silently when the corpus isn't built on the box.
+
+  Live gates (floors, not targets):
+
+      sm_80 base mnemonic ≥ 70%
+      every SM predicate guard ≥ 95%
+      every SM full mnemonic ≥ 5% (regression floor only)
+
+  Current numbers on ptxas 13.2 / sm_80/86/89:
+
+      sm_80  kernels=10  insts=448  base=100.0%  full=65.2%  guard=100.0%
+      sm_86  kernels=10  insts=448  base=100.0%  full=67.9%  guard=100.0%
+      sm_89  kernels=10  insts=448  base=100.0%  full=67.9%  guard=100.0%
+
+  The full-mnemonic floor is set low because variant suffixes
+  (`.E.CONSTANT`, `.WIDE`, `.GE.AND`) land in M7. The current 65-68%
+  figure comes from instructions that have no variant suffix
+  (`NOP`, `BRA`, `EXIT`, `MOV`, `S2R`, …); M7 brings it up.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing

@@ -44,6 +44,8 @@ mod differential;
 // Include submodules from the differential directory
 #[path = "differential/disasm_compare.rs"]
 pub mod disasm_compare;
+#[path = "differential/sass_compare.rs"]
+pub mod sass_compare;
 #[path = "differential/strings_compare.rs"]
 pub mod strings_compare;
 #[path = "differential/symbols_compare.rs"]
@@ -53,6 +55,74 @@ pub mod symbols_compare;
 pub use differential::*;
 
 use std::path::Path;
+
+// =============================================================================
+// SASS (CUDA) Differential Tests
+// =============================================================================
+
+#[test]
+fn sass_corpus_differential_gate() {
+    let Some((per_kernel, per_sm)) = sass_compare::run_corpus() else {
+        eprintln!(
+            "SKIP: no CUDA corpus at tests/corpus/cuda/build/ (run scripts/build-cuda-corpus.sh)"
+        );
+        return;
+    };
+
+    let report = sass_compare::format_report(&per_kernel, &per_sm);
+    eprintln!("\n{report}");
+
+    // Gate 1: sm_80 base mnemonic ≥ 70% (M4 success criterion).
+    if let Some(sm80) = per_sm.get("sm_80") {
+        assert!(
+            sm80.base_rate() >= sass_compare::threshold::BASE_MNEMONIC_SM80,
+            "sm_80 base-mnemonic match {:.1}% < {:.1}% threshold",
+            sm80.base_rate(),
+            sass_compare::threshold::BASE_MNEMONIC_SM80,
+        );
+    }
+
+    // Gate 2: predicate guards should be > 95% across every SM — this
+    // is nearly decoder-independent since the guard field layout is
+    // stable on Volta+.
+    for (sm, agg) in &per_sm {
+        assert!(
+            agg.guard_rate() >= sass_compare::threshold::GUARD_ALL_SMS,
+            "{sm} guard match {:.1}% < {:.1}% threshold",
+            agg.guard_rate(),
+            sass_compare::threshold::GUARD_ALL_SMS,
+        );
+    }
+
+    // Gate 3: full-mnemonic rate just has to exceed a regression floor
+    // (M7 lifts the number dramatically).
+    for (sm, agg) in &per_sm {
+        assert!(
+            agg.full_rate() >= sass_compare::threshold::FULL_MNEMONIC_ALL_SMS,
+            "{sm} full-mnemonic match {:.1}% < {:.1}% floor",
+            agg.full_rate(),
+            sass_compare::threshold::FULL_MNEMONIC_ALL_SMS,
+        );
+    }
+}
+
+#[test]
+fn sass_corpus_report_writes_json() {
+    // The harness is useful beyond the gate — CI may want the per-kernel
+    // numbers as a machine-readable artefact. Write one to /tmp on each
+    // run so humans can inspect, but don't fail if writing fails (this
+    // is observational, not a test assertion).
+    let Some((per_kernel, per_sm)) = sass_compare::run_corpus() else {
+        return;
+    };
+    let doc = serde_json::json!({
+        "per_kernel": per_kernel,
+        "per_sm": per_sm,
+    });
+    let out_path = std::env::temp_dir().join("hexray-sass-diff-report.json");
+    let _ = std::fs::write(&out_path, serde_json::to_string_pretty(&doc).unwrap());
+    eprintln!("SASS diff JSON report written to {}", out_path.display());
+}
 
 // =============================================================================
 // Integration Tests
