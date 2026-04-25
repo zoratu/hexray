@@ -1,11 +1,12 @@
 ---
 source: crates/hexray/tests/snapshot_tests.rs
+assertion_line: 215
 expression: normalized
 ---
 Binary Information
 ==================
 Format:        ELF
-Architecture:  X86_64
+Architecture:  x86_64
 Endianness:    Little
 Bitness:       Bits64
 Type:          Executable

@@ -105,6 +105,33 @@ pub enum IndexMode {
     Post,
 }
 
+/// Memory-space tag on a [`MemoryRef`].
+///
+/// CPU targets always use [`MemorySpace::Generic`]. GPU targets (CUDA SASS
+/// today, potentially SPIR-V / AMDGPU later) distinguish multiple disjoint
+/// address spaces at the ISA level and need this to stay accurate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MemorySpace {
+    /// No architectural tag — the default for CPU targets and for CUDA
+    /// generic-address-space operations where the runtime resolves the
+    /// actual space dynamically.
+    #[default]
+    Generic,
+    /// `.global` — device DRAM, visible to every thread in every block.
+    Global,
+    /// `.shared` — on-chip workgroup-local memory.
+    Shared,
+    /// `.local` — per-thread stack/spill memory.
+    Local,
+    /// `.const[N]` — read-only constant bank. Bank `0` is conventionally
+    /// used for kernel parameters on current ptxas.
+    Constant(u8),
+    /// `.param` — kernel parameter space (typically aliased onto `.const[0]`
+    /// at the hardware level but kept distinct at the PTX level).
+    Param,
+}
+
 /// Memory reference operand.
 ///
 /// Represents complex memory addressing like `[base + index*scale + disp]`.
@@ -127,6 +154,9 @@ pub struct MemoryRef {
     pub broadcast: bool,
     /// ARM64 index mode (pre/post-indexed with writeback).
     pub index_mode: IndexMode,
+    /// Architectural memory space. Defaults to [`MemorySpace::Generic`] so
+    /// every existing CPU constructor site stays correct.
+    pub space: MemorySpace,
 }
 
 impl MemoryRef {
@@ -141,6 +171,7 @@ impl MemoryRef {
             segment: None,
             broadcast: false,
             index_mode: IndexMode::None,
+            space: MemorySpace::Generic,
         }
     }
 
@@ -155,6 +186,7 @@ impl MemoryRef {
             segment: None,
             broadcast: false,
             index_mode: IndexMode::None,
+            space: MemorySpace::Generic,
         }
     }
 
@@ -174,6 +206,7 @@ impl MemoryRef {
             segment: None,
             broadcast: false,
             index_mode,
+            space: MemorySpace::Generic,
         }
     }
 
@@ -188,6 +221,7 @@ impl MemoryRef {
             segment: None,
             broadcast: false,
             index_mode: IndexMode::None,
+            space: MemorySpace::Generic,
         }
     }
 
@@ -208,6 +242,7 @@ impl MemoryRef {
             segment: None,
             broadcast: false,
             index_mode: IndexMode::None,
+            space: MemorySpace::Generic,
         }
     }
 
@@ -220,6 +255,12 @@ impl MemoryRef {
     /// Sets EVEX-style broadcast indicator.
     pub fn with_broadcast(mut self, broadcast: bool) -> Self {
         self.broadcast = broadcast;
+        self
+    }
+
+    /// Sets the architectural memory space (for GPU decoders).
+    pub fn with_space(mut self, space: MemorySpace) -> Self {
+        self.space = space;
         self
     }
 }

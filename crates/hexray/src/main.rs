@@ -602,7 +602,10 @@ fn print_info(binary: &Binary) {
     println!("Binary Information");
     println!("==================");
     println!("Format:        {}", binary.format_name());
-    println!("Architecture:  {:?}", fmt.architecture());
+    println!(
+        "Architecture:  {}",
+        format_arch_for_info(fmt.architecture())
+    );
     println!("Endianness:    {:?}", fmt.endianness());
     println!("Bitness:       {:?}", fmt.bitness());
 
@@ -615,6 +618,11 @@ fn print_info(binary: &Binary) {
             }
             println!("\nSections:      {}", elf.sections.len());
             println!("Segments:      {}", elf.segments.len());
+
+            // Display CUDA CUBIN info if this is an EM_CUDA ELF.
+            if let Ok(view) = elf.cubin_view() {
+                print_cubin_info(&view);
+            }
 
             // Display kernel module info if present
             if let Some(modinfo) = &elf.modinfo {
@@ -4016,7 +4024,12 @@ fn parse_address_str(s: &str) -> Result<u64> {
     u64::from_str_radix(s, 16).context("Invalid address")
 }
 
-/// Helper function to disassemble a block of bytes using the appropriate architecture
+/// Helper function to disassemble a block of bytes using the appropriate architecture.
+///
+/// Returns an empty vector for architectures we do not have a decoder for
+/// (notably CUDA SASS until M3 lands). The previous behaviour silently
+/// delegated to `X86_64Disassembler`, which would happily emit plausible-but-
+/// wrong instructions from a CUBIN's `.text.*` bytes.
 fn disassemble_block_for_arch(
     arch: Architecture,
     bytes: &[u8],
@@ -4029,6 +4042,143 @@ fn disassemble_block_for_arch(
         Architecture::Arm64 => Arm64Disassembler::new().disassemble_block(bytes, start_addr),
         Architecture::RiscV64 => RiscVDisassembler::new().disassemble_block(bytes, start_addr),
         Architecture::RiscV32 => RiscVDisassembler::new_rv32().disassemble_block(bytes, start_addr),
-        _ => X86_64Disassembler::new().disassemble_block(bytes, start_addr),
+        Architecture::Arm | Architecture::Cuda(_) | Architecture::Unknown(_) => Vec::new(),
+    }
+}
+
+/// Print the CUDA-specific summary block for a CUBIN: kernels, memory
+/// regions, module-level .nv.info, and any parsing diagnostics.
+fn print_cubin_info(view: &hexray_formats::CubinView<'_>) {
+    println!("\nCUDA CUBIN View");
+    println!("---------------");
+    let strong = view.entry_kernels().count();
+    println!(
+        "Kernels:       {} ({} entry, {} candidate)",
+        view.kernels().len(),
+        strong,
+        view.kernels().len() - strong,
+    );
+    for k in view.kernels() {
+        let info_note = if k.nv_info.is_some() {
+            " (+nv_info)"
+        } else {
+            ""
+        };
+        let conf = match k.confidence {
+            hexray_formats::KernelConfidence::EntryMarker => "entry",
+            hexray_formats::KernelConfidence::SiblingInfoOnly => "candidate",
+        };
+        println!(
+            "  [{conf}] {name}  size={size}  section=#{idx}{info}",
+            conf = conf,
+            name = k.name,
+            size = k.size,
+            idx = k.section_index,
+            info = info_note,
+        );
+        if let Some(usage) = k.resource_usage() {
+            if let Some(rc) = usage.max_reg_count {
+                print!("      regs={}", rc);
+            }
+            if let Some(cb) = usage.param_cbank {
+                print!("  params@c[{}][{:#x}] size={}", cb.bank, cb.offset, cb.size);
+            }
+            if let Some(ntid) = usage.req_ntid {
+                print!("  req_ntid=({},{},{})", ntid.0, ntid.1, ntid.2);
+            }
+            if !usage.exit_offsets.is_empty() {
+                print!("  exits={}", usage.exit_offsets.len());
+            }
+            if usage.ctaidz_used {
+                print!("  ctaidz");
+            }
+            if !usage.params.is_empty() {
+                print!("  args=[");
+                for (i, p) in usage.params.iter().enumerate() {
+                    if i > 0 {
+                        print!(",");
+                    }
+                    print!("#{}:{}B", p.ordinal, p.size_bytes());
+                }
+                print!("]");
+            }
+            println!();
+        }
+    }
+    if !view.memory_regions().is_empty() {
+        println!("Memory Regions: {}", view.memory_regions().len());
+        for r in view.memory_regions() {
+            let space = match r.space {
+                hexray_formats::MemorySpace::Constant { bank } => format!("constant[{}]", bank),
+                hexray_formats::MemorySpace::Shared => "shared".to_string(),
+                hexray_formats::MemorySpace::Local => "local".to_string(),
+            };
+            let owner = r
+                .owner_kernel
+                .map(|n| format!(" ({})", n))
+                .unwrap_or_default();
+            println!(
+                "  - {space}{owner}  {name}  size={size}",
+                space = space,
+                owner = owner,
+                name = r.name,
+                size = r.size,
+            );
+        }
+    }
+    if let Some(module) = view.module_info() {
+        println!(
+            "Module .nv.info: {} entries{}",
+            module.entries.len(),
+            if module.truncated { " (truncated)" } else { "" }
+        );
+    }
+    if !view.diagnostics().is_empty() {
+        println!("Diagnostics:    {}", view.diagnostics().len());
+        for d in view.diagnostics() {
+            let kind = match d.kind {
+                hexray_formats::CubinDiagnosticKind::AmbiguousTextSection => {
+                    "ambiguous .text.<name> section"
+                }
+                hexray_formats::CubinDiagnosticKind::OrphanNvInfoSection => {
+                    "orphan .nv.info.<name> with no matching .text"
+                }
+                hexray_formats::CubinDiagnosticKind::DuplicateKernelName => "duplicate kernel name",
+                hexray_formats::CubinDiagnosticKind::MalformedNvInfo => {
+                    "malformed .nv.info TLV framing"
+                }
+            };
+            match d.section_index {
+                Some(idx) => println!("  - section #{}: {}", idx, kind),
+                None => println!("  - {}", kind),
+            }
+        }
+    }
+}
+
+/// Pretty-print an Architecture for `hexray info`. CUDA targets expand to
+/// canonical SM names (`sm_80`, `sm_90a`); other architectures fall back to
+/// their short name plus any ABI-specific detail we'd otherwise lose.
+fn format_arch_for_info(arch: Architecture) -> String {
+    match arch {
+        Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
+            format!(
+                "cuda-sass ({}, family={:?})",
+                sm.canonical_name(),
+                sm.family
+            )
+        }
+        Architecture::Cuda(hexray_core::CudaArchitecture::Ptx(ptx)) => {
+            let target = ptx
+                .target
+                .map(|t| format!(", target={}", t.canonical_name()))
+                .unwrap_or_default();
+            format!(
+                "cuda-ptx (v{}.{}, address_size={}{})",
+                ptx.major, ptx.minor, ptx.address_size, target
+            )
+        }
+        Architecture::Unknown(m) => format!("unknown (machine={})", m),
+        other => other.name().to_string(),
     }
 }

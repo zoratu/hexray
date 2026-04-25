@@ -8,12 +8,19 @@
 //! - Shared objects (ET_DYN)
 //! - Relocatable objects (ET_REL) - including Linux kernel modules (.ko)
 
+pub mod cuda;
 mod header;
 mod relocation;
 mod section;
 mod segment;
 mod symbol;
 
+pub use cuda::{
+    CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Kernel, KernelConfidence,
+    KernelResourceUsage, MemoryRegion, MemorySpace, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef,
+    NvInfoFormat, ParamCbank, ParamInfo, PtxFunction, PtxFunctionKind, PtxIndex, PtxModuleHeader,
+    SchemaError,
+};
 pub use header::{ElfClass, ElfHeader, ElfType, Machine};
 pub use relocation::{Relocation, RelocationType};
 pub use section::SectionHeader;
@@ -37,6 +44,10 @@ pub struct Elf<'a> {
     pub segments: Vec<ProgramHeader>,
     /// Parsed symbols.
     symbols: Vec<Symbol>,
+    /// Raw symbol entries, preserved so downstream views (e.g. CUDA) can
+    /// read `st_other` bits like `STO_CUDA_ENTRY` that the simplified
+    /// `Symbol` strips. Indexed in lockstep with `symbols`.
+    raw_symbols: Vec<SymbolEntry>,
     /// Section name string table.
     section_names: StringTable<'a>,
     /// Relocations (for ET_REL files).
@@ -119,8 +130,11 @@ impl<'a> Elf<'a> {
             }
         }
 
-        // Parse symbols (with section base address adjustment for ET_REL)
-        let symbols = Self::parse_symbols(data, &sections, &header, &section_names)?;
+        // Parse symbols (with section base address adjustment for ET_REL).
+        // We keep the raw `SymbolEntry`s alongside the simplified `Symbol`s
+        // so downstream ELF-specific views (e.g. CUDA) can inspect fields
+        // like `st_other` that the simplified form discards.
+        let (symbols, raw_symbols) = Self::parse_symbols(data, &sections, &header, &section_names)?;
 
         // Parse relocations for relocatable files and dynamic binaries
         // - Relocatable files: need relocations for symbol resolution in decompilation
@@ -136,10 +150,31 @@ impl<'a> Elf<'a> {
             sections,
             segments,
             symbols,
+            raw_symbols,
             section_names,
             relocations,
             modinfo,
         })
+    }
+
+    /// Raw ELF symbol entries, preserving fields (`st_other`, raw `st_info`)
+    /// that the simplified [`Symbol`] form discards. Crate-private — exposed
+    /// for the CUDA ELF view.
+    pub(crate) fn raw_symbols(&self) -> &[SymbolEntry] {
+        &self.raw_symbols
+    }
+
+    /// Flattened symbol slice for indexed access from the CUDA view, which
+    /// walks `symbols` and `raw_symbols` in lockstep. Crate-private because
+    /// the public API surface is [`BinaryFormat::symbols`].
+    pub(crate) fn symbols_slice(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// Returns a typed CUDA code-object view of this ELF, or
+    /// [`cuda::CubinError::NotCuda`] if the ELF is not EM_CUDA.
+    pub fn cubin_view(&self) -> Result<cuda::CubinView<'_>, cuda::CubinError> {
+        cuda::CubinView::from_elf(self)
     }
 
     fn parse_section_headers(
@@ -191,8 +226,9 @@ impl<'a> Elf<'a> {
         sections: &[SectionHeader],
         header: &ElfHeader,
         section_names: &StringTable,
-    ) -> Result<Vec<Symbol>, ParseError> {
+    ) -> Result<(Vec<Symbol>, Vec<SymbolEntry>), ParseError> {
         let mut symbols = Vec::new();
+        let mut raw_symbols = Vec::new();
         let is_relocatable = header.file_type == ElfType::Relocatable;
 
         // Find symbol table sections (.symtab and .dynsym)
@@ -257,12 +293,13 @@ impl<'a> Elf<'a> {
                 }
 
                 symbols.push(sym);
+                raw_symbols.push(entry);
 
                 offset += entry_size;
             }
         }
 
-        Ok(symbols)
+        Ok((symbols, raw_symbols))
     }
 
     fn parse_relocations(

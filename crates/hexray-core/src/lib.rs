@@ -16,12 +16,15 @@ pub mod output;
 pub mod register;
 pub mod symbol;
 
-pub use arch::{Architecture, Bitness, Endianness};
+pub use arch::{
+    Architecture, Bitness, CudaArchitecture, Endianness, PtxVersion, SmArchitecture, SmFamily,
+    SmVariant,
+};
 pub use basic_block::{BasicBlock, BasicBlockId, BlockTerminator};
 pub use cfg::ControlFlowGraph;
 pub use error::Error;
-pub use instruction::{Condition, ControlFlow, Instruction, Operation};
-pub use operand::{Immediate, IndexMode, MemoryRef, Operand};
+pub use instruction::{Condition, ControlFlow, Instruction, Operation, PredicateGuard};
+pub use operand::{Immediate, IndexMode, MemoryRef, MemorySpace, Operand};
 pub use output::{escape_dot_string, DotConfig};
 pub use register::{Register, RegisterClass};
 pub use symbol::{Symbol, SymbolBinding, SymbolKind};

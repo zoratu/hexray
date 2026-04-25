@@ -150,6 +150,14 @@ void process_input(char *input)
 | ARM64 | ✅ | ✅ | NEON, SVE/SVE2, Crypto, Atomics |
 | RISC-V 64 | ✅ | ✅ | M, A, C extensions |
 | RISC-V 32 | ✅ | ✅ | M, A, C extensions |
+| NVIDIA SASS (CUDA) | ✅ | — | Volta+ 16-byte; Ampere/Ada/Hopper |
+
+CUDA support covers CUBIN ELF recognition (sm_70..sm_120 including
+`a` accelerator suffix), per-kernel resource metadata (`.nv.info`),
+SASS disassembly with 100% base-mnemonic / 95.8% full-mnemonic match
+against `nvdisasm -json` on the handwritten corpus, fatbin
+extraction, and PTX sidecar parsing. See [docs/CUDA.md](docs/CUDA.md)
+for the full picture.
 
 ### Binary Formats
 
@@ -159,6 +167,8 @@ void process_input(char *input)
 | Mach-O | ✅ | ✅ | DWARF |
 | Fat/Universal | ✅ | ✅ | DWARF |
 | PE/COFF | ✅ | ✅ | - |
+| NVIDIA CUBIN (EM_CUDA) | ✅ | ✅ | `.nv.info`, PTX sidecar |
+| NVIDIA fatbin | ✅ | — | wrapper extraction |
 
 ## Project Structure
 

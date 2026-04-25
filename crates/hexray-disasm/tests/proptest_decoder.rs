@@ -321,3 +321,142 @@ mod riscv_tests {
         }
     }
 }
+
+// =============================================================================
+// CUDA SASS Decoder Properties
+// =============================================================================
+
+#[cfg(feature = "cuda")]
+mod cuda_props {
+    use proptest::prelude::*;
+
+    use hexray_disasm::cuda::sass::{
+        bits::SassWord, control::ControlBits, SassDisassembler, SASS_INSTRUCTION_SIZE,
+    };
+    use hexray_disasm::traits::Disassembler;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// `SassWord::from_bytes(x).to_bytes() == x` on any 16-byte input.
+        #[test]
+        fn sass_word_byte_roundtrip(bytes in prop::array::uniform16(any::<u8>())) {
+            let w = SassWord::from_bytes(&bytes);
+            prop_assert_eq!(w.to_bytes(), bytes);
+        }
+
+        /// The 21 meaningful bits of the control slot round-trip cleanly.
+        /// Bits 21..=22 are observed zero in real cubins; the decoder
+        /// intentionally discards them, so the round-trip property holds
+        /// only over the low 21 bits.
+        #[test]
+        fn control_bits_roundtrip(raw in 0u32..(1 << 21)) {
+            let cb = ControlBits::from_raw(raw);
+            prop_assert_eq!(cb.to_raw(), raw);
+        }
+
+        /// from_raw masks reserved bits — any 32-bit input round-trips as
+        /// from_raw(x).to_raw() == x & 0x1F_FFFF.
+        #[test]
+        fn control_bits_masks_reserved(raw in any::<u32>()) {
+            let cb = ControlBits::from_raw(raw);
+            prop_assert_eq!(cb.to_raw(), raw & 0x1F_FFFF);
+        }
+
+        /// `ControlBits::from_raw` is total — no panics on any 32-bit input,
+        /// even though only 23 bits are meaningful.
+        #[test]
+        fn control_bits_from_raw_total(raw in any::<u32>()) {
+            let _ = ControlBits::from_raw(raw);
+        }
+
+        /// `bit_range` is total over any contiguous slice with width ≤ 64.
+        /// Tests random low/high pairs along with random 128-bit words.
+        #[test]
+        fn bit_range_total(low_high in any::<u64>(), high in any::<u64>(), lo in 0u32..128, width in 1u32..=64) {
+            let hi = (lo + width - 1).min(127);
+            if hi < lo { return Ok(()); }
+            let w = SassWord { low: low_high, high };
+            let _ = w.bit_range(lo, hi);
+        }
+
+        /// Decoder never panics on arbitrary 16-byte input.
+        #[test]
+        fn sass_decode_never_panics(bytes in prop::array::uniform16(any::<u8>())) {
+            let d = SassDisassembler::ampere();
+            // Ok or Err — never panic.
+            let _ = d.decode_instruction(&bytes, 0x1000);
+        }
+
+        /// `disassemble_block` produces exactly `bytes.len() / 16` results
+        /// when the input is 16-aligned, and never desyncs (every result
+        /// represents one 16-byte slot).
+        #[test]
+        fn block_walker_strides_by_16(blocks in 1usize..32) {
+            // Synthesise random byte streams that are exact multiples of 16.
+            let mut bytes = Vec::with_capacity(blocks * 16);
+            for i in 0..(blocks * 16) {
+                bytes.push((i as u32).wrapping_mul(2654435761) as u8);
+            }
+            let d = SassDisassembler::ampere();
+            let results = d.disassemble_block(&bytes, 0);
+            prop_assert_eq!(
+                results.len(),
+                blocks,
+                "16-aligned input must produce exactly len/16 result slots"
+            );
+            for (i, r) in results.iter().enumerate() {
+                if let Ok(ins) = r {
+                    prop_assert_eq!(ins.size, SASS_INSTRUCTION_SIZE);
+                    prop_assert_eq!(ins.address, (i * SASS_INSTRUCTION_SIZE) as u64);
+                }
+            }
+        }
+
+        /// On non-16-aligned input, `disassemble_block` reports a single
+        /// trailing Truncated error rather than skipping bytes silently.
+        #[test]
+        fn block_walker_flags_trailing_partial(suffix_len in 1usize..16) {
+            let mut bytes = vec![0u8; 16 + suffix_len];
+            for (i, slot) in bytes.iter_mut().enumerate() {
+                *slot = (i as u32).wrapping_mul(0x9E37_79B1) as u8;
+            }
+            let d = SassDisassembler::ampere();
+            let results = d.disassemble_block(&bytes, 0);
+            prop_assert_eq!(results.len(), 2);
+            let truncated = matches!(
+                results[1],
+                Err(hexray_disasm::DecodeError::Truncated { .. })
+            );
+            prop_assert!(truncated, "expected trailing Truncated error");
+        }
+
+        /// Decoding is deterministic.
+        #[test]
+        fn sass_decode_is_deterministic(bytes in prop::array::uniform16(any::<u8>())) {
+            let d = SassDisassembler::ampere();
+            let a = d.decode_instruction(&bytes, 0x1000);
+            let b = d.decode_instruction(&bytes, 0x1000);
+            match (&a, &b) {
+                (Ok(x), Ok(y)) => {
+                    prop_assert_eq!(&x.instruction.mnemonic, &y.instruction.mnemonic);
+                    prop_assert_eq!(&x.instruction.bytes, &y.instruction.bytes);
+                    prop_assert_eq!(x.instruction.guard.is_some(), y.instruction.guard.is_some());
+                }
+                (Err(_), Err(_)) => {}
+                _ => prop_assert!(false, "decode determinism violated"),
+            }
+        }
+
+        /// Decoded instructions always have `size == 16` when Ok.
+        #[test]
+        fn sass_decoded_size_is_16(bytes in prop::array::uniform16(any::<u8>())) {
+            let d = SassDisassembler::ampere();
+            if let Ok(decoded) = d.decode_instruction(&bytes, 0x1000) {
+                prop_assert_eq!(decoded.size, SASS_INSTRUCTION_SIZE);
+                prop_assert_eq!(decoded.instruction.size, SASS_INSTRUCTION_SIZE);
+                prop_assert_eq!(decoded.instruction.bytes.len(), SASS_INSTRUCTION_SIZE);
+            }
+        }
+    }
+}

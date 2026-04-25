@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cuda;
 pub mod dwarf;
 pub mod elf;
 pub mod error;
@@ -17,7 +18,13 @@ pub mod macho;
 pub mod pe;
 pub mod traits;
 
-pub use elf::{Elf, ElfType, KernelModuleInfo, Relocation, RelocationType};
+pub use cuda::{FatbinEntry, FatbinEntryKind, FatbinError, FatbinWrapper};
+pub use elf::{
+    CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Elf, ElfType, Kernel,
+    KernelConfidence, KernelModuleInfo, KernelResourceUsage, MemoryRegion, MemorySpace,
+    NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat, ParamCbank, ParamInfo, PtxFunction,
+    PtxFunctionKind, PtxIndex, PtxModuleHeader, Relocation, RelocationType, SchemaError,
+};
 pub use error::ParseError;
 pub use macho::MachO;
 pub use pe::Pe;

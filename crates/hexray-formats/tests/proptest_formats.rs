@@ -340,3 +340,109 @@ proptest! {
         }
     }
 }
+
+// =============================================================================
+// CUDA Container Properties
+// =============================================================================
+//
+// These cover the new CUDA-specific surfaces that landed under the
+// gpu-support work: NvInfo TLV framing, fatbin wrapper parsing, PTX
+// sidecar parsing, and the CubinView heuristics. Every property has the
+// same shape: feed adversarial input and assert the parser never panics
+// and behaves deterministically.
+
+mod cuda {
+    use proptest::prelude::*;
+
+    use hexray_formats::{elf::cuda::parse_nv_info, FatbinError, FatbinWrapper, PtxIndex};
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// `parse_nv_info` is total — never panics.
+        #[test]
+        fn nv_info_parse_total(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let _ = parse_nv_info(&bytes);
+        }
+
+        /// `parse_nv_info` is deterministic.
+        #[test]
+        fn nv_info_parse_deterministic(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let a = parse_nv_info(&bytes);
+            let b = parse_nv_info(&bytes);
+            prop_assert_eq!(a.entries.len(), b.entries.len());
+            prop_assert_eq!(a.truncated, b.truncated);
+        }
+
+        /// Every NvInfo entry's payload range stays inside the input.
+        #[test]
+        fn nv_info_entry_payloads_in_bounds(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let blob = parse_nv_info(&bytes);
+            for entry in &blob.entries {
+                let start = entry.payload_offset as usize;
+                let end = start.saturating_add(entry.payload_size as usize);
+                prop_assert!(end <= bytes.len(),
+                    "entry payload out of bounds: {start}..{end} vs {}", bytes.len());
+            }
+        }
+
+        /// Fatbin parsing is total — every input either parses cleanly or
+        /// returns a typed FatbinError; never panics.
+        #[test]
+        fn fatbin_parse_total(bytes in prop::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = FatbinWrapper::parse(&bytes);
+        }
+
+        /// When fatbin parsing succeeds, every entry's payload slice is
+        /// strictly inside the input buffer.
+        #[test]
+        fn fatbin_entry_payloads_in_bounds(bytes in prop::collection::vec(any::<u8>(), 0..1024)) {
+            if let Ok(w) = FatbinWrapper::parse(&bytes) {
+                for entry in &w.entries {
+                    // The entry's payload is a sub-slice of `bytes`.
+                    let payload_ptr = entry.payload.as_ptr() as usize;
+                    let buffer_start = bytes.as_ptr() as usize;
+                    let buffer_end = buffer_start + bytes.len();
+                    prop_assert!(payload_ptr >= buffer_start && payload_ptr <= buffer_end);
+                    prop_assert!(payload_ptr + entry.payload.len() <= buffer_end);
+                }
+            }
+        }
+
+        /// `FatbinError::Truncated` always fires for inputs shorter than 16 bytes.
+        #[test]
+        fn fatbin_short_input_truncated(bytes in prop::collection::vec(any::<u8>(), 0..16)) {
+            match FatbinWrapper::parse(&bytes) {
+                Err(FatbinError::Truncated { needed: 16, have }) => {
+                    prop_assert_eq!(have, bytes.len());
+                }
+                other => prop_assert!(false, "expected Truncated, got {other:?}"),
+            }
+        }
+
+        /// PTX parsing is total over arbitrary UTF-8.
+        #[test]
+        fn ptx_parse_total(text in any::<String>()) {
+            let _ = PtxIndex::parse(&text);
+        }
+
+        /// PTX parsing of NUL-delimited byte streams is total.
+        #[test]
+        fn ptx_nul_delimited_total(bytes in prop::collection::vec(any::<u8>(), 0..1024)) {
+            let _ = PtxIndex::from_nul_delimited_bytes(&bytes);
+        }
+
+        /// PTX function spans always lie within the parsed text.
+        #[test]
+        fn ptx_function_spans_in_bounds(text in any::<String>()) {
+            let idx = PtxIndex::parse(&text);
+            let len = idx.raw.len();
+            for f in &idx.functions {
+                prop_assert!(f.body_start <= f.body_end);
+                prop_assert!(f.body_end <= len);
+                prop_assert!(f.header.start <= f.header.end);
+                prop_assert!(f.header.end <= len);
+            }
+        }
+    }
+}

@@ -1,0 +1,6 @@
+# Build outputs are regenerated per-box; never commit.
+build/
+*.cubin
+*.ptx
+*.sass.json
+*.json

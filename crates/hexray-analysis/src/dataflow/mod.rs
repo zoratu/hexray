@@ -669,6 +669,7 @@ mod tests {
                 segment: None,
                 broadcast: false,
                 index_mode: IndexMode::None,
+                space: hexray_core::MemorySpace::Generic,
             }),
         ];
 
@@ -698,6 +699,7 @@ mod tests {
                 segment: None,
                 broadcast: false,
                 index_mode: IndexMode::None,
+                space: hexray_core::MemorySpace::Generic,
             }),
         ];
 

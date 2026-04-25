@@ -6,6 +6,7 @@
 //! - x86_64 (AMD64)
 //! - ARM64 (AArch64)
 //! - RISC-V (RV64I/RV32I)
+//! - CUDA SASS (Volta+, feature-gated, in-progress)
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +22,9 @@ pub mod arm64;
 #[cfg(feature = "riscv")]
 pub mod riscv;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
 pub use error::DecodeError;
 pub use traits::{DecodedInstruction, Disassembler};
 
@@ -32,3 +36,6 @@ pub use arm64::Arm64Disassembler;
 
 #[cfg(feature = "riscv")]
 pub use riscv::RiscVDisassembler;
+
+#[cfg(feature = "cuda")]
+pub use cuda::SassDisassembler;
