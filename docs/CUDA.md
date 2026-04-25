@@ -20,6 +20,22 @@ Kernels:       1 (1 entry, 0 candidate)
       args=[#3:4B,#2:8B,#1:8B,#0:8B]
 ```
 
+Disassemble a single kernel by name with `-s`:
+
+```bash
+hexray -s vector_add my_kernel.cubin
+```
+
+```
+<.text.vector_add>:
+0x00000d00:  02 7a 01 00 …  MOV R1
+0x00000d10:  19 79 06 00 …  S2R R6
+0x00000d20:  19 79 03 00 …  S2R R3
+0x00000d30:  24 7a 06 06 …  IMAD R6, R6
+0x00000d40:  0c 7a 00 06 …  ISETP.GE.AND R0, R6
+0x00000d50:  4d 09 00 00 …  EXIT
+```
+
 ## Supported targets
 
 | Family    | Compute capability | Status        |
@@ -67,7 +83,7 @@ hexray-disasm/cuda/sass/  SassDisassembler (feature `cuda`)
 ```
 
 Public CLI surface: `hexray <cubin> info`, `hexray <cubin> sections`,
-`hexray <cubin> symbols`.
+`hexray <cubin> symbols`, `hexray -s <kernel> <cubin>`.
 
 ## Test corpus
 
