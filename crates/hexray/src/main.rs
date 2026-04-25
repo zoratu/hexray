@@ -624,6 +624,11 @@ fn print_info(binary: &Binary) {
                 print_cubin_info(&view);
             }
 
+            // Display AMDGPU code-object info if this is an EM_AMDGPU ELF.
+            if let Ok(view) = elf.code_object_view() {
+                print_amdgpu_info(&view);
+            }
+
             // Display kernel module info if present
             if let Some(modinfo) = &elf.modinfo {
                 println!("\nKernel Module Information");
@@ -957,6 +962,10 @@ fn disassemble_at(fmt: &dyn BinaryFormat, address: u64, max_bytes: usize) -> Res
         }
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
             let disasm = hexray_disasm::cuda::SassDisassembler::for_sm(sm);
+            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+        }
+        Architecture::Amdgpu(target) => {
+            let disasm = hexray_disasm::amdgpu::AmdgpuDisassembler::for_target(target);
             disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
         }
         _ => {
@@ -4048,8 +4057,11 @@ fn disassemble_block_for_arch(
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
             hexray_disasm::cuda::SassDisassembler::for_sm(sm).disassemble_block(bytes, start_addr)
         }
+        Architecture::Amdgpu(target) => {
+            hexray_disasm::amdgpu::AmdgpuDisassembler::for_target(target)
+                .disassemble_block(bytes, start_addr)
+        }
         Architecture::Cuda(hexray_core::CudaArchitecture::Ptx(_))
-        | Architecture::Amdgpu(_)
         | Architecture::Arm
         | Architecture::Unknown(_) => Vec::new(),
     }
@@ -4165,9 +4177,38 @@ fn print_cubin_info(view: &hexray_formats::CubinView<'_>) {
     }
 }
 
+/// Print the AMDGPU-specific summary block for a code object:
+/// kernels, decoded resource usage, and any soft diagnostics.
+fn print_amdgpu_info(view: &hexray_formats::CodeObjectView<'_>) {
+    println!("\nAMDGPU Code Object View");
+    println!("-----------------------");
+    println!("Target:        {}", view.target.target_id());
+    println!("Kernels:       {}", view.kernels.len());
+    for k in &view.kernels {
+        let r = &k.resource_usage;
+        let wave = if r.wave32 { "wave32" } else { "wave64" };
+        println!("  {}", k.name);
+        println!(
+            "    entry=0x{:x}  kd=0x{:x}  {}  vgprs={}  sgprs={}",
+            k.entry_addr, k.descriptor_addr, wave, r.vgpr_count, r.sgpr_count,
+        );
+        println!(
+            "    kernarg={}B  lds={}B  scratch={}B  user_sgprs={}",
+            r.kernarg_size, r.lds_bytes, r.scratch_bytes, r.user_sgpr_count,
+        );
+    }
+    if !view.diagnostics.is_empty() {
+        println!("\n  Diagnostics:");
+        for d in &view.diagnostics {
+            println!("    [{:?}] {}", d.kind, d.detail);
+        }
+    }
+}
+
 /// Pretty-print an Architecture for `hexray info`. CUDA targets expand to
-/// canonical SM names (`sm_80`, `sm_90a`); other architectures fall back to
-/// their short name plus any ABI-specific detail we'd otherwise lose.
+/// canonical SM names (`sm_80`, `sm_90a`); AMDGPU targets render as full
+/// target IDs (`gfx906`, `gfx90a:xnack+`); other architectures fall back
+/// to their short name plus any ABI-specific detail we'd otherwise lose.
 fn format_arch_for_info(arch: Architecture) -> String {
     match arch {
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
@@ -4187,6 +4228,7 @@ fn format_arch_for_info(arch: Architecture) -> String {
                 ptx.major, ptx.minor, ptx.address_size, target
             )
         }
+        Architecture::Amdgpu(g) => format!("amdgpu ({}, family={:?})", g.target_id(), g.family),
         Architecture::Unknown(m) => format!("unknown (machine={})", m),
         other => other.name().to_string(),
     }

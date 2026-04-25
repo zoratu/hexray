@@ -20,10 +20,12 @@ pub mod traits;
 
 pub use cuda::{FatbinEntry, FatbinEntryKind, FatbinError, FatbinWrapper};
 pub use elf::{
-    CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Elf, ElfType, Kernel,
-    KernelConfidence, KernelModuleInfo, KernelResourceUsage, MemoryRegion, MemorySpace,
-    NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat, ParamCbank, ParamInfo, PtxFunction,
-    PtxFunctionKind, PtxIndex, PtxModuleHeader, Relocation, RelocationType, SchemaError,
+    AmdKernel, AmdKernelResourceUsage, CodeObjectDiagnostic, CodeObjectDiagnosticKind,
+    CodeObjectError, CodeObjectView, CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView,
+    Elf, ElfType, Kernel, KernelConfidence, KernelDescriptor, KernelModuleInfo,
+    KernelResourceUsage, MemoryRegion, MemorySpace, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef,
+    NvInfoFormat, ParamCbank, ParamInfo, PtxFunction, PtxFunctionKind, PtxIndex, PtxModuleHeader,
+    Relocation, RelocationType, SchemaError, KERNEL_DESCRIPTOR_SIZE,
 };
 pub use error::ParseError;
 pub use macho::MachO;
