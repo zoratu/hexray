@@ -4,9 +4,10 @@ fuzz/target/
 **/*.rs.bk
 Cargo.lock
 
-# IDE
+# IDE / agent local state
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 *~

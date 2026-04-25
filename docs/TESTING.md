@@ -72,7 +72,7 @@ scripts/quality-smoke --with-callback
 scripts/quality-smoke --strict-callback
 ```
 
-For stable benchmark comparisons and parallelism tuning guidance, see `/Volumes/OWC 1M2/Users/isaiah/src/hexray/docs/PERFORMANCE.md`.
+For stable benchmark comparisons and parallelism tuning guidance, see [`PERFORMANCE.md`](PERFORMANCE.md).
 
 `scripts/quality-smoke` runs fixture-backed control-flow quality cases (switch/goto recovery gates) for a cheap fail-fast signal; `--with-callback` adds callback CLI smoke checks and `--strict-callback` enforces strict callback snapshots.
 `scripts/ci-local --tier medium` now routes strict callback checks through `scripts/quality-smoke --strict-callback` by default; use `--no-strict-callback` to disable during exploratory work.

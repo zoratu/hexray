@@ -265,7 +265,7 @@ critcmp main pr
 scripts/bench-deterministic --main-label main --change-label pr --jobs 8 --test-threads 1
 ```
 
-See `/Volumes/OWC 1M2/Users/isaiah/src/hexray/docs/PERFORMANCE.md` for deterministic benchmark and parallelism guidance.
+See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for deterministic benchmark and parallelism guidance.
 
 ## Use Cases
 
