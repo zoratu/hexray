@@ -436,3 +436,98 @@
 | `c.swsp/sdsp` | `sw/sd rs, offset(sp)` |
 | `c.nop` | `addi x0, x0, 0` |
 | `c.ebreak` | `ebreak` |
+
+---
+
+## CUDA SASS
+
+NVIDIA SASS (Volta and newer, 16-byte fixed-width encoding). Recognised
+on `EM_CUDA` ELFs (cubins) when the `hexray-disasm` crate is built with
+the `cuda` feature. `nvdisasm`-style mnemonics with variant suffixes
+(`.GE.AND`, `.WIDE`, `.E.CONSTANT`, …) decoded inline; per-instruction
+predicate guards (`@P0` / `@!P3`) printed when present.
+
+### Control Flow
+| Instruction | Description |
+|-------------|-------------|
+| `NOP` | No operation |
+| `BRA` | Unconditional / predicated branch |
+| `EXIT` | Kernel exit |
+| `BSYNC` | Convergence barrier sync |
+| `BSSY` | Convergence barrier set |
+| `BAR` | Barrier (default `.SYNC.DEFER_BLOCKING`) |
+
+### Data Movement
+| Instruction | Description |
+|-------------|-------------|
+| `MOV` | Move register / immediate |
+| `S2R` | Read special register (`SR_TID`, `SR_CTAID`, …) |
+| `S2UR` | Read special register into uniform datapath |
+| `BMOV` | Barrier move (default `.32.CLEAR`) |
+
+### Integer Arithmetic
+| Instruction | Description |
+|-------------|-------------|
+| `IADD3` | 3-input integer add (`.X` for carry-in chains) |
+| `LEA` | Load effective address (`.HI` / `.X` / `.HI.X.SX32`) |
+| `IMAD` | Multiply-add (`.X`, `.MOV.U32` recognised) |
+| `IMAD.WIDE` | 32×32→64 multiply-add (`.WIDE` / `.WIDE.U32`) |
+| `VIADD` | Vector integer add |
+
+### Bitwise / Shift
+| Instruction | Description |
+|-------------|-------------|
+| `LOP3` | 3-input bitwise op (always `.LUT`) |
+| `PLOP3` | 3-input predicate logic (always `.LUT`) |
+| `SHF` | Funnel shift (direction L/R, type U32/S32, optional `.HI`) |
+| `USHF` | Uniform funnel shift |
+
+### Compare / Predicate
+| Instruction | Description |
+|-------------|-------------|
+| `ISETP` | Integer compare-and-set-predicate (24 cmp/bool/signed combos) |
+| `FSETP` | Float compare-and-set-predicate |
+
+### Floating Point
+| Instruction | Description |
+|-------------|-------------|
+| `FMUL` | FP32 multiply |
+| `FADD` | FP32 add |
+| `FFMA` | FP32 fused multiply-add |
+| `HFMA2` | FP16×2 fused multiply-add (always `.MMA`) |
+
+### Uniform Datapath
+| Instruction | Description |
+|-------------|-------------|
+| `ULDC` | Uniform load constant (`.64` recognised) |
+| `UFLO` | Uniform find-leading-one (always `.U32`) |
+
+### Memory
+| Instruction | Description |
+|-------------|-------------|
+| `LDG` | Load global (default `.E`; `.CONSTANT` recognised) |
+| `LDC` | Load constant bank |
+| `LDS` | Load shared |
+| `STG` | Store global (default `.E`) |
+| `STS` | Store shared |
+| `RED` | Atomic reduce (default `.E.ADD.STRONG.GPU`) |
+
+### Warp Operations
+| Instruction | Description |
+|-------------|-------------|
+| `SHFL` | Warp shuffle (default `.DOWN`) |
+| `POPC` | Population count |
+| `VOTE` | Warp vote (default `.ANY`) |
+| `VOTEU` | Uniform warp vote (default `.ANY`) |
+
+### Coverage notes
+
+- ~36 opcode classes → 95.8% full-mnemonic match against `nvdisasm`
+  on the in-repo sm_80/86/89 corpus (10 microkernels × 3 SMs,
+  1,344 instructions). Base-mnemonic match is 100%.
+- Operand decoding in v1.3.0 emits destination + first source only;
+  full memory-ref / cbank-ref rendering is follow-up work.
+- Maxwell / Pascal (sm_5x / sm_6x, 8-byte encoding) explicitly
+  rejected — Volta's 16-byte encoding is the supported floor.
+- See [`CUDA.md`](CUDA.md) for the user-facing CUBIN walkthrough and
+  the per-SM match-rate table.
