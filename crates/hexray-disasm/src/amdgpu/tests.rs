@@ -47,11 +47,11 @@ fn vop1_v_mov_b32_decodes_end_to_end() {
 }
 
 #[test]
-fn sop2_s_add_u32_classified_as_sop2() {
+fn sop2_s_add_u32_resolves_to_real_mnemonic() {
     let d = AmdgpuDisassembler::gfx906();
     let decoded = d.decode_instruction(&S_ADD_U32, 0x1000).unwrap();
     assert_eq!(decoded.size, 4);
-    assert_eq!(decoded.instruction.mnemonic, "sop2");
+    assert_eq!(decoded.instruction.mnemonic, "s_add_u32");
 }
 
 #[test]
@@ -93,7 +93,10 @@ fn block_walker_advances_dword_at_a_time() {
         .iter()
         .map(|r| r.as_ref().unwrap().mnemonic.as_str())
         .collect();
-    assert_eq!(mnemonics, vec!["v_mov_b32_e32", "sop2", "vop2", "sopp"]);
+    assert_eq!(
+        mnemonics,
+        vec!["v_mov_b32_e32", "s_add_u32", "v_add_f32_e32", "s_endpgm"]
+    );
 }
 
 #[test]

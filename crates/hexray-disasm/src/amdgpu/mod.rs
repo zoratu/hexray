@@ -19,12 +19,14 @@
 //! (`110001` → `111110`).
 
 pub mod encoding;
+pub mod opcodes;
 pub mod registers;
 
 #[cfg(test)]
 mod tests;
 
 pub use encoding::{decode_class, EncodingClass, EncodingFamily};
+pub use opcodes::{lookup as lookup_opcode, OpcodeEntry, TableClass};
 
 use crate::{DecodeError, DecodedInstruction, Disassembler};
 use hexray_core::{Architecture, ControlFlow, GfxArchitecture, GfxFamily, Instruction, Operation};
@@ -118,7 +120,7 @@ impl Disassembler for AmdgpuDisassembler {
         };
 
         let mnemonic = render_mnemonic(class, dword0, dword1, self.family_band);
-        let operation = derive_operation(class);
+        let operation = derive_operation(class, dword0, self.family_band);
         let control_flow = derive_control_flow(class, dword0);
         let raw = bytes[..size].to_vec();
         let mut instr = Instruction::new(address, size, raw, mnemonic);
@@ -192,45 +194,114 @@ impl Disassembler for AmdgpuDisassembler {
     }
 }
 
-/// Render a placeholder mnemonic. M10.3 only knows `v_mov_b32` — every
-/// other class returns its raw class name (`vop1`, `sop2`, …) so the
-/// stream is still walkable end-to-end. M10.4 wires up the real
-/// per-opcode tables.
+/// Render the mnemonic for a decoded instruction by consulting the
+/// per-class, per-family opcode table. Falls back to
+/// `<class>.op<id>` for OPs not yet in the table — the walker keeps
+/// running and the differential gate (M10.5) can quantify the gap.
 fn render_mnemonic(
     class: EncodingClass,
     dword0: u32,
     _dword1: Option<u32>,
     family: EncodingFamily,
 ) -> String {
-    match class {
-        EncodingClass::Vop1 => {
-            // VOP1 layout (per LLVM SIInstrFormats.td):
-            //   [8:0]   SRC0
-            //   [16:9]  OP
-            //   [24:17] VDST
-            //   [31:25] encoding (0b0111111)
-            let op = ((dword0 >> 9) & 0xff) as u16;
-            // The opcode for v_mov_b32_e32 differs between families:
-            // GFX9 = 0x01, GFX10+ = 0x00. M10.4 grows this into a
-            // proper per-family table; the smoke test just needs to
-            // confirm the dispatch + size-walking work end-to-end.
-            let v_mov_op = match family {
-                EncodingFamily::Gfx9 => 0x01,
-                EncodingFamily::Gfx10Plus => 0x00,
-            };
-            if op == v_mov_op {
-                "v_mov_b32_e32".to_string()
-            } else {
-                format!("vop1.op{op}")
-            }
+    let (table_class, op) = match class {
+        // VOP1 layout (per LLVM SIInstrFormats.td):
+        //   [8:0]   SRC0
+        //   [16:9]  OP
+        //   [24:17] VDST
+        //   [31:25] encoding (0b0111111)
+        EncodingClass::Vop1 => (
+            Some(opcodes::TableClass::Vop1),
+            ((dword0 >> 9) & 0xff) as u16,
+        ),
+        // VOP2 layout: [30:25] OP (6 bits), [16:9] VDST, [8:0] SRC0,
+        // [24:17] VSRC1.
+        EncodingClass::Vop2 => (
+            Some(opcodes::TableClass::Vop2),
+            ((dword0 >> 25) & 0x3f) as u16,
+        ),
+        // VOPC layout: [24:17] OP, [16:9] VSRC1, [8:0] SRC0.
+        EncodingClass::Vopc => (
+            Some(opcodes::TableClass::Vopc),
+            ((dword0 >> 17) & 0xff) as u16,
+        ),
+        // SOP1 layout: [22:16] is special (sub-encoding marker), OP
+        // is at [15:8]. SDST at [22:16].
+        EncodingClass::Sop1 => (
+            Some(opcodes::TableClass::Sop1),
+            ((dword0 >> 8) & 0xff) as u16,
+        ),
+        // SOP2 layout: [29:23] OP, [22:16] SDST, [15:8] SSRC1, [7:0]
+        // SSRC0.
+        EncodingClass::Sop2 => (
+            Some(opcodes::TableClass::Sop2),
+            ((dword0 >> 23) & 0x7f) as u16,
+        ),
+        // SOPP layout: [22:16] OP (7 bits), [15:0] SIMM16.
+        EncodingClass::Sopp => (
+            Some(opcodes::TableClass::Sopp),
+            ((dword0 >> 16) & 0x7f) as u16,
+        ),
+        // SMEM layout: [25:18] OP (8 bits) on GFX10+; GFX9 has OP at
+        // [25:18] as well (verified against codex llvm-mc samples).
+        EncodingClass::Smem => (
+            Some(opcodes::TableClass::Smem),
+            ((dword0 >> 18) & 0xff) as u16,
+        ),
+        _ => (None, 0),
+    };
+
+    if let Some(tc) = table_class {
+        if let Some(entry) = opcodes::lookup(tc, family, op) {
+            return entry.mnemonic.to_string();
         }
-        other => other.short_name().to_string(),
+        return format!("{}.op{op:#x}", class.short_name());
     }
+    class.short_name().to_string()
 }
 
-/// Map an encoding class to a high-level operation. Conservative — we
-/// have no operand info yet, so most classes go to `Other`.
-fn derive_operation(class: EncodingClass) -> Operation {
+/// Map an encoding class + opcode to a high-level operation. Consults
+/// the opcode table for known OPs (so `s_endpgm` becomes `Return`,
+/// `s_branch` becomes `Jump`, etc.); falls back to a class-level
+/// default for OPs not in the table.
+fn derive_operation(class: EncodingClass, dword0: u32, family: EncodingFamily) -> Operation {
+    let (table_class, op) = match class {
+        EncodingClass::Vop1 => (
+            Some(opcodes::TableClass::Vop1),
+            ((dword0 >> 9) & 0xff) as u16,
+        ),
+        EncodingClass::Vop2 => (
+            Some(opcodes::TableClass::Vop2),
+            ((dword0 >> 25) & 0x3f) as u16,
+        ),
+        EncodingClass::Vopc => (
+            Some(opcodes::TableClass::Vopc),
+            ((dword0 >> 17) & 0xff) as u16,
+        ),
+        EncodingClass::Sop1 => (
+            Some(opcodes::TableClass::Sop1),
+            ((dword0 >> 8) & 0xff) as u16,
+        ),
+        EncodingClass::Sop2 => (
+            Some(opcodes::TableClass::Sop2),
+            ((dword0 >> 23) & 0x7f) as u16,
+        ),
+        EncodingClass::Sopp => (
+            Some(opcodes::TableClass::Sopp),
+            ((dword0 >> 16) & 0x7f) as u16,
+        ),
+        EncodingClass::Smem => (
+            Some(opcodes::TableClass::Smem),
+            ((dword0 >> 18) & 0xff) as u16,
+        ),
+        _ => (None, 0),
+    };
+    if let Some(tc) = table_class {
+        if let Some(entry) = opcodes::lookup(tc, family, op) {
+            return entry.operation;
+        }
+    }
+    // Class-level default for opcodes not yet in the table.
     match class {
         EncodingClass::Vop1 | EncodingClass::Vop2 => Operation::Move,
         EncodingClass::Vop3a | EncodingClass::Vop3b => Operation::Other(0),
@@ -238,11 +309,12 @@ fn derive_operation(class: EncodingClass) -> Operation {
         EncodingClass::Sopk => Operation::Other(0),
         EncodingClass::Sopc | EncodingClass::Vopc => Operation::Compare,
         EncodingClass::Sopp => Operation::Other(0),
-        EncodingClass::Smem => Operation::Load,
-        EncodingClass::Mubuf | EncodingClass::Mtbuf => Operation::Load,
-        EncodingClass::Mimg => Operation::Load,
-        EncodingClass::Ds => Operation::Load,
-        EncodingClass::Flat => Operation::Load,
+        EncodingClass::Smem
+        | EncodingClass::Mubuf
+        | EncodingClass::Mtbuf
+        | EncodingClass::Mimg
+        | EncodingClass::Ds
+        | EncodingClass::Flat => Operation::Load,
         EncodingClass::Exp => Operation::Other(0),
         EncodingClass::Unknown => Operation::Other(0),
     }
