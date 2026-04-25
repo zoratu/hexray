@@ -5,9 +5,109 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-04-25
 
-### GPU Support (in progress on `feature/gpu-support`)
+### Highlights — CUDA / NVIDIA GPU support
+
+This release adds first-class support for inspecting NVIDIA CUDA
+binaries. `hexray` now reads CUBINs end-to-end: identifying the SM
+architecture, listing kernels and their resource usage, decoding SASS
+instructions (Volta through Blackwell, 16-byte fixed-width encoding),
+and surfacing PTX sidecars and fatbin-wrapped payloads.
+
+Quick tour:
+
+```bash
+# Compile a kernel for sm_80
+nvcc --cubin -arch=sm_80 vector_add.cu -o vector_add.cubin
+
+# Inspect: arch, kernels, resource usage, memory regions
+hexray info vector_add.cubin
+
+# Disassemble a single kernel by name
+hexray -s vector_add vector_add.cubin
+```
+
+```
+<.text.vector_add>:
+0x00000d00:  …  MOV R1
+0x00000d10:  …  S2R R6
+0x00000d20:  …  S2R R3
+0x00000d30:  …  IMAD R6, R6
+0x00000d40:  …  ISETP.GE.AND R0, R6
+0x00000d50:  …  EXIT
+```
+
+What's in the box:
+
+- **CUBIN parser** — ELF `EM_CUDA = 190` recognised with both ABI V1
+  (Ampere / Ada / Hopper) and ABI V2 (Blackwell+) `e_flags` layouts.
+  `Architecture::Cuda(SmArchitecture { … })` for SASS targets and
+  `PtxVersion` for PTX sidecars; the kernel-level accelerator bit
+  (`a` in `sm_90a`) round-trips correctly.
+- **Kernel metadata** — typed `.nv.info` decode: register count, frame
+  size, param-cbank layout, per-arg `(ordinal, offset, size)` table,
+  EXIT offsets, `__launch_bounds__`, `ctaidz_used`. Surfaced via
+  `Kernel::resource_usage()` and printed under each kernel by
+  `hexray info`.
+- **SASS disassembler** (`hexray-disasm` feature `cuda`) — 34 opcode
+  classes covering the bulk of the sm_80/86/89 instruction stream:
+  NOP, BRA, EXIT, MOV, S2R, IADD3, LEA, LOP3, SHF, IMAD(.WIDE), ISETP,
+  PLOP3, FMUL/FADD/FFMA, HFMA2, FSETP, ULDC, LDG/LDC/LDS, STG/STS, RED,
+  SHFL, POPC, VOTE(U), and more. Predicate guards (`@P0` / `@!P3`)
+  and variant suffixes (`.GE.AND`, `.WIDE`, `.E.CONSTANT`,
+  `.SYNC.DEFER_BLOCKING`, …) decoded inline.
+- **Match rates against `nvdisasm`** on the in-repo corpus
+  (10 microkernels × 3 SMs, 1,344 instructions, ptxas 13.2):
+
+      sm_80 / sm_86 / sm_89:  100.0% base / 95.8% full / 100.0% guard
+      sm_90 (Hopper):         97.2% full
+      sm_75 (Turing):         softer 70% floor (incremental coverage)
+
+  CI gates lock these floors at 70% / 92% / 95% so regressions are
+  caught the moment they land.
+- **Memory regions** — `.nv.constantN` (with bank number),
+  `.nv.shared`, `.nv.local` classified into typed `MemoryRegion`s.
+  `MemoryRef.space` (`Generic / Global / Shared / Local /
+  Constant(u8) / Param`) flows through to the IR.
+- **PTX sidecar parser** — `.nv_debug_ptx_txt` extracted into
+  `PtxIndex` (header + every `.entry` / `.func` directive); also
+  parses standalone `.ptx` files. Name-based linking to SASS kernels
+  is implicit (same mangled name on both sides).
+- **Fatbin wrapper extractor** — `magic 0xBA55_ED50` parsed into
+  per-SM cubin / PTX entries (`FatbinEntry { kind, sm, payload,
+  compressed }`). Compressed (LZ4) entries are flagged but not
+  decompressed yet. Tolerant against malformed input — returns typed
+  errors rather than panicking.
+- **CLI** — `hexray info <cubin>`, `hexray <cubin> sections`,
+  `hexray <cubin> symbols`, `hexray -s <kernel> <cubin>`.
+
+Quality bar:
+
+- 100+ new unit tests, 19 proptest properties, 5 cargo-fuzz targets,
+  13 chaos / fault-injection tests run under both the regular suite
+  and Miri (strict UB interpreter).
+- `cargo-mutants` swept the SASS modules: `registers.rs` ends at 0
+  missed of 57 viable; `opcode_table.rs` gained direct unit tests for
+  every variant decoder.
+- Workspace coverage 73.36%; new CUDA files 83-100% lines.
+- Criterion benchmark for SASS decode (single NOP ≈ 43 ns; throughput
+  ≈ 1.4 GB/s).
+- `Send + Sync` compile-time witnesses on every owned CUDA type.
+
+Known gaps (called out in `docs/CUDA.md`):
+
+- Operand decoding emits destination + first source only; full memory-
+  ref / cbank-ref rendering is follow-up work.
+- LZ4-compressed fatbin entries are flagged but not decompressed.
+- PTX is parsed at the sidecar level only — no AST.
+- Maxwell / Pascal (sm_5x / sm_6x, 8-byte encoding) explicitly rejected.
+
+See `docs/CUDA.md` for the user-facing guide and `crates/hexray-disasm/
+src/cuda/sass/` for the decoder internals. Milestone-by-milestone
+detail follows below.
+
+### GPU Support — milestone-by-milestone detail
 
 - **M1 – CUDA arch recognition**: `Architecture::Cuda(CudaArchitecture)` in
   `hexray-core`, carrying `SmArchitecture { family, major, minor, variant }`
@@ -222,6 +322,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PTX↔SASS linking for the single-kernel-per-cubin case is
   already implicit: both sides use the same (mangled) name, so
   `ptx.function_by_name(&sass_kernel.name)` just works.
+
+- **GPU testing batch**: closes the quality bar items the rest of the
+  repo holds new code to.
+  - CUDA-info snapshot test (hermetic synthetic stub).
+  - `Send + Sync` compile-time witnesses on the SASS decoder, owned
+    record types, and the fatbin wrapper.
+  - CFG smoke test that feeds real SASS instructions through the
+    existing `CfgBuilder`.
+  - Miri now runs the CUDA fault-injection suite (13 tests pass under
+    the strict UB interpreter).
+  - Coverage check passes: workspace 73.36%, every new CUDA file
+    83-100% lines.
+  - Mutation testing run with `cargo-mutants` on the SASS modules;
+    surfaced gaps closed in `registers.rs` (now 0 missed of 57
+    viable) and tightened tests on `variant_setp` / `variant_lea`
+    / `variant_shf`.
+  - Criterion benchmark for SASS decode (single NOP ≈ 43 ns;
+    1024-instruction throughput ≈ 1.4 GB/s).
+  - Corpus extended to sm_75 and sm_90 (Turing + Hopper). The
+    differential gate is SM-band-aware: v1 SMs (sm_80/86/89) keep
+    the 92% full-mnemonic floor; sm_75 / sm_90 track a softer 70%
+    floor while we incrementally add their SM-specific opcodes.
+  - New opcode entries: `S2UR`, `VIADD`, `BMOV`, plus `LDC.64`
+    variant. sm_90 full-mnemonic match: 91.3% → 97.2%.
+
+- **CLI dispatch fixes (surfaced by hands-on cubin testing)**:
+  driving `hexray -s vector_add vector_add.cubin` end-to-end exposed
+  four integration gaps the parser-level tests couldn't see — every
+  test covered the data plane; nothing covered the CLI dispatch path.
+  - `find_symbol` filtered `s.address != 0`, which hid every CUBIN
+    kernel (CUBIN symbol addresses are section-relative 0 until the
+    driver maps the module). Now filters only on `is_defined()`.
+  - `disassemble_block_for_arch` and `disassemble_at` had no CUDA
+    arms — `Architecture::Cuda(_)` was matched alongside `Arm` and
+    `Unknown` and returned an empty Vec / bailed. Wired both to
+    `SassDisassembler::for_sm(sm)`.
+  - `Elf::bytes_at` and `parse_symbols` didn't treat CUBINs as
+    needing section-relative addressing. CUBINs are ET_EXEC but
+    every `sh_addr = 0`; symbol lookups landed in the wrong place.
+    `header.machine == Machine::Cuda` now participates in the
+    `is_relocatable` flag everywhere it matters.
+  - `Register::name()` returned `"unknown"` for every CUDA register.
+    Added a `cuda_reg_name` dispatcher with static lookup tables
+    for `R0..R255` (RZ at 255), `P0..P7` (PT at 7), `UR0..UR63`
+    (URZ at 63), `UP0..UP7` (UPT at 7), and the SR special-register
+    set. The `0x1000` marker bit set by the SASS uniform-register
+    decoders disambiguates UR/R and UP/P inside the same
+    `RegisterClass`.
 
 ## [1.2.1] - 2026-03-19
 

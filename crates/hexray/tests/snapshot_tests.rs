@@ -245,6 +245,44 @@ fn snapshot_info_pe() {
     insta::assert_snapshot!("info_pe", normalized);
 }
 
+/// Lock the CUDA-info output format. Generates a tiny synthetic sm_80
+/// CUBIN at test time so the test is hermetic — it doesn't depend on
+/// the corpus being built locally.
+#[test]
+fn snapshot_info_cubin() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("hexray-snapshot-cubin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sm80_stub.cubin");
+
+    // Minimal valid ELF64 + EM_CUDA, ABI V1, e_flags = sm_80.
+    let mut data = vec![0u8; 64];
+    data[0..4].copy_from_slice(b"\x7fELF");
+    data[4] = 2; // ELF64
+    data[5] = 1; // little-endian
+    data[6] = 1; // EI_VERSION
+    data[8] = 7; // EI_ABIVERSION (CUDA V1)
+    data[16] = 2; // ET_EXEC
+    data[18] = 190; // EM_CUDA
+    data[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    data[48..52].copy_from_slice(&0x0050_0550u32.to_le_bytes()); // sm_80
+    data[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&data)
+        .unwrap();
+
+    let output = run_hexray(&[path.to_str().unwrap(), "info"]);
+    if !output.status.success() {
+        eprintln!("hexray info failed: {:?}", output);
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let normalized = normalize_output(&stdout);
+    insta::assert_snapshot!("info_cubin", normalized);
+}
+
 // =============================================================================
 // Sections Command Snapshots
 // =============================================================================

@@ -7,6 +7,20 @@
 use super::*;
 use crate::{DecodeError, Disassembler};
 
+/// Compile-time witness that key SASS types stay `Send + Sync`. If any
+/// future change pulls in interior mutability or a non-thread-safe
+/// handle, this stops compiling — the test framework never runs, but
+/// the assertion fires at build time.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SassDisassembler>();
+    assert_send_sync::<SassWord>();
+    assert_send_sync::<ControlBits>();
+    assert_send_sync::<bits::SassWord>();
+    assert_send_sync::<control::ControlBits>();
+    assert_send_sync::<opcode_table::OpcodeEntry>();
+};
+
 /// The canonical 7x/8x NOP bytes from CuAssembler (`CuSMVersion.py`). All
 /// sm_75 / sm_80 / sm_86 / sm_89 cubins emit this exact encoding for a
 /// zero-operand, zero-guard `NOP`.

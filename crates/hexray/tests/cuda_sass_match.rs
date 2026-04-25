@@ -11,6 +11,7 @@
 //! `scripts/build-cuda-corpus.sh`; when it's absent the test no-ops so
 //! CI (without a CUDA toolkit) stays green.
 
+use hexray_analysis::cfg_builder::CfgBuilder;
 use hexray_disasm::cuda::SassDisassembler;
 use hexray_disasm::Disassembler;
 use hexray_formats::{Elf, Section};
@@ -233,6 +234,42 @@ fn every_decoded_instruction_is_16_bytes_and_never_desyncs() {
                 assert_eq!(ins.address, (i * 16) as u64);
             }
         }
+    }
+}
+
+#[test]
+fn cfg_builder_accepts_sass_instructions_without_panicking() {
+    // Smoke test: decode every corpus kernel, hand the SASS instructions
+    // to the existing CPU-side CfgBuilder, and assert it produces a
+    // non-empty CFG with at least one block. This guards against future
+    // CFG-builder changes that assume CPU-style fall-through semantics
+    // and choke on SASS BRA/EXIT shapes.
+    let cubins = enumerate_corpus();
+    if cubins.is_empty() {
+        return;
+    }
+    for (sm, kname, cubin_path) in &cubins {
+        let bytes = fs::read(cubin_path).unwrap();
+        let elf = Elf::parse(&bytes).unwrap();
+        let text = kernel_text_bytes(&elf, kname).unwrap();
+        let sm_arch = match elf.header.architecture() {
+            hexray_core::Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => sm,
+            _ => continue,
+        };
+        let d = SassDisassembler::for_sm(sm_arch);
+        let instructions: Vec<_> = d
+            .disassemble_block(text, 0)
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            !instructions.is_empty(),
+            "{sm}/{kname}: no decodable instructions"
+        );
+
+        let cfg = CfgBuilder::build(&instructions, 0);
+        assert!(cfg.blocks().count() >= 1, "{sm}/{kname}: CFG has no blocks");
     }
 }
 

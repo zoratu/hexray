@@ -356,16 +356,28 @@ pub fn run_corpus() -> Option<(
 
 /// Match-rate thresholds the CI gate enforces. These are the *floors*:
 /// actual rates can be higher and usually are.
+///
+/// The decoder's v1 scope is Ampere/Ada (sm_80/86/89). Older Turing
+/// (sm_75) and newer Hopper (sm_90) get softer floors because each
+/// introduces SM-specific opcodes / suffixes the table doesn't fully
+/// cover yet. They're still tracked so a real regression below the
+/// soft floor breaks CI.
 pub mod threshold {
     /// M4 success criterion on sm_80 (base mnemonic only).
     pub const BASE_MNEMONIC_SM80: f64 = 70.0;
-    /// Predicate guards should decode reliably today.
+    /// Predicate guards should decode reliably on every SM — the bit
+    /// layout doesn't change between Volta and Blackwell.
     pub const GUARD_ALL_SMS: f64 = 95.0;
-    /// Full-mnemonic (with variant suffixes) — M7 success criterion.
-    /// Measured 95.8% on ptxas 13.2 sm_80/86/89 at commit time; set
-    /// floor at 92% so normal drift doesn't break the build while a
-    /// real regression still trips.
-    pub const FULL_MNEMONIC_ALL_SMS: f64 = 92.0;
+    /// Full-mnemonic floor for the v1 band (Ampere/Ada). M7 lifted the
+    /// actual number to 95.8%; floor at 92.0% catches regressions.
+    pub const FULL_MNEMONIC_V1_BAND: f64 = 92.0;
+    /// Full-mnemonic soft floor for non-v1 SMs (Turing/Hopper) where
+    /// the corpus exposes opcodes the v1 table doesn't fully cover.
+    pub const FULL_MNEMONIC_OTHER_SMS: f64 = 70.0;
+    /// Base-mnemonic soft floor for non-v1 SMs.
+    pub const BASE_MNEMONIC_OTHER_SMS: f64 = 90.0;
+    /// SMs that are part of the v1 differential gate.
+    pub const V1_SMS: &[&str] = &["sm_80", "sm_86", "sm_89"];
 }
 
 #[cfg(test)]

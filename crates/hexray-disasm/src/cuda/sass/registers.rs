@@ -283,4 +283,100 @@ mod tests {
         assert_eq!(RegisterSpan::pair(4).canonical_name(), "R4:R5");
         assert_eq!(RegisterSpan::single(255).canonical_name(), "RZ");
     }
+
+    #[test]
+    fn register_span_quad_and_octet_alignment() {
+        assert!(RegisterSpan { base: 4, width: 4 }.is_aligned());
+        assert!(!RegisterSpan { base: 5, width: 4 }.is_aligned());
+        assert!(RegisterSpan { base: 8, width: 8 }.is_aligned());
+        assert!(!RegisterSpan { base: 9, width: 8 }.is_aligned());
+        assert!(!RegisterSpan { base: 0, width: 3 }.is_aligned()); // unsupported width
+        assert_eq!(RegisterSpan { base: 4, width: 4 }.canonical_name(), "R4:R7");
+        assert_eq!(
+            RegisterSpan { base: 8, width: 8 }.canonical_name(),
+            "R8:R15"
+        );
+    }
+
+    #[test]
+    fn predicate_register_naming_full_range() {
+        // P0..P6 + PT.
+        for i in 0..7 {
+            assert_eq!(render(&p(sm80(), i)), format!("P{i}"));
+        }
+        assert_eq!(render(&p(sm80(), id::PT)), "PT");
+    }
+
+    #[test]
+    fn uniform_predicate_naming() {
+        for i in 0..7 {
+            let reg = up(sm80(), i);
+            assert_eq!(render(&reg), format!("UP{i}"));
+        }
+        assert_eq!(render(&up(sm80(), id::UPT)), "UPT");
+    }
+
+    #[test]
+    fn uniform_marker_bit_is_set_via_or() {
+        // The marker bit must be combined with the raw ID via bitwise OR
+        // so the raw ID is recoverable. To distinguish OR from XOR
+        // (which would clear the bit when both inputs have it), drive
+        // with raw IDs whose marker bit is already set as well as
+        // unset — the OR path produces the same result for both,
+        // while XOR diverges.
+        for raw_id in [0u16, 1, 0x42, UNIFORM_REG_MARKER, UNIFORM_REG_MARKER | 0x1] {
+            let stored = ur(sm80(), raw_id).id;
+            assert_eq!(
+                stored & UNIFORM_REG_MARKER,
+                UNIFORM_REG_MARKER,
+                "ur({raw_id:#x}) did not set the marker bit"
+            );
+        }
+        for raw_id in [0u16, 5, UNIFORM_PRED_MARKER, UNIFORM_PRED_MARKER | 0x4] {
+            let stored = up(sm80(), raw_id).id;
+            assert_eq!(
+                stored & UNIFORM_PRED_MARKER,
+                UNIFORM_PRED_MARKER,
+                "up({raw_id:#x}) did not set the marker bit"
+            );
+        }
+    }
+
+    #[test]
+    fn register_span_single_aligned_always() {
+        // RegisterSpan::single(N) for any N must report aligned. Catches a
+        // `1 => true` arm deletion in is_aligned.
+        for base in 0..=255u16 {
+            assert!(
+                RegisterSpan::single(base).is_aligned(),
+                "single span at base {base} should be aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn special_register_full_table_coverage() {
+        let sm = sm80();
+        // All named slots in the SR table.
+        for (id, want) in &[
+            (0u16, "SR_LANEID"),
+            (1, "SR_CLOCK"),
+            (2, "SR_VIRTCFG"),
+            (3, "SR_VIRTID"),
+            (32, "SR_TID.X"),
+            (33, "SR_TID.Y"),
+            (34, "SR_TID.Z"),
+            (36, "SR_CTAID.X"),
+            (37, "SR_CTAID.Y"),
+            (38, "SR_CTAID.Z"),
+            (40, "SR_NTID.X"),
+            (41, "SR_NTID.Y"),
+            (42, "SR_NTID.Z"),
+            (44, "SR_NCTAID.X"),
+            (45, "SR_NCTAID.Y"),
+            (46, "SR_NCTAID.Z"),
+        ] {
+            assert_eq!(render(&sr(sm, *id)), *want);
+        }
+    }
 }

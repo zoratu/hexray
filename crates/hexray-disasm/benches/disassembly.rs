@@ -111,10 +111,61 @@ fn bench_arm64_disassembly(c: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(feature = "arm64")]
+#[cfg(feature = "cuda")]
+fn bench_sass_disassembly(c: &mut Criterion) {
+    use hexray_disasm::cuda::SassDisassembler;
+
+    let d = SassDisassembler::ampere();
+    let mut group = c.benchmark_group("sass_disassembly");
+
+    // Canonical Volta+ NOP — a deterministic 16-byte input we know
+    // decodes successfully.
+    const NOP: [u8; 16] = [
+        0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x0F,
+        0x00,
+    ];
+
+    group.bench_function("single_nop", |b| {
+        b.iter(|| {
+            let _ = d.decode_instruction(black_box(&NOP), 0x1000);
+        })
+    });
+
+    for instructions in [64usize, 256, 1024, 4096] {
+        let mut block = Vec::with_capacity(instructions * 16);
+        for _ in 0..instructions {
+            block.extend_from_slice(&NOP);
+        }
+        group.throughput(Throughput::Bytes(block.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("nop_throughput", instructions),
+            &block,
+            |b, block| {
+                b.iter(|| {
+                    let _ = d.disassemble_block(black_box(block), 0x1000);
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(all(feature = "arm64", feature = "cuda"))]
+criterion_group!(
+    benches,
+    bench_x86_64_disassembly,
+    bench_arm64_disassembly,
+    bench_sass_disassembly
+);
+
+#[cfg(all(feature = "arm64", not(feature = "cuda")))]
 criterion_group!(benches, bench_x86_64_disassembly, bench_arm64_disassembly);
 
-#[cfg(not(feature = "arm64"))]
+#[cfg(all(not(feature = "arm64"), feature = "cuda"))]
+criterion_group!(benches, bench_x86_64_disassembly, bench_sass_disassembly);
+
+#[cfg(all(not(feature = "arm64"), not(feature = "cuda")))]
 criterion_group!(benches, bench_x86_64_disassembly);
 
 criterion_main!(benches);
