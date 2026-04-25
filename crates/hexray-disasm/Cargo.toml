@@ -16,11 +16,13 @@ default = ["x86_64"]
 x86_64 = []
 arm64 = []
 riscv = []
-# CUDA SASS (NVIDIA GPU) decoder. Volta+ 16-byte fixed-width. In progress —
-# see the `feature/gpu-support` branch and the CHANGELOG entries for the
-# GPU milestones. Not part of `all-archs` yet because the decoder is still
-# skeletal.
+# CUDA SASS (NVIDIA GPU) decoder. Volta+ 16-byte fixed-width.
 cuda = []
+# AMDGPU GCN/CDNA/RDNA decoder. Variable-length 32/64-bit. In progress —
+# see the `feature/amdgpu-support` branch and the CHANGELOG entries for the
+# AMDGPU milestones. Not part of `all-archs` yet because the decoder is still
+# building out its opcode table.
+amdgpu = []
 all-archs = ["x86_64", "arm64", "riscv"]
 
 [dev-dependencies]

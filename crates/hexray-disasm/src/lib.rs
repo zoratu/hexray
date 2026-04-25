@@ -25,6 +25,9 @@ pub mod riscv;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "amdgpu")]
+pub mod amdgpu;
+
 pub use error::DecodeError;
 pub use traits::{DecodedInstruction, Disassembler};
 
@@ -39,3 +42,6 @@ pub use riscv::RiscVDisassembler;
 
 #[cfg(feature = "cuda")]
 pub use cuda::SassDisassembler;
+
+#[cfg(feature = "amdgpu")]
+pub use amdgpu::AmdgpuDisassembler;
