@@ -199,7 +199,6 @@ hexray/
 - [Module Dependency Diagrams](docs/MODULE_DEPENDENCIES.md) - Crate and analysis-layer dependency maps
 - [Tutorials](docs/tutorials/GETTING_STARTED.md) - Getting started, API usage, incremental workflow, and extension guide
 - [API Examples](docs/examples/ANALYSIS_CACHE_EXAMPLES.md) - Analysis cache, incremental analysis, C++/EH/devirtualization examples
-- [Architecture Decision Records](docs/adr/README.md) - Decision log for CI/process and architecture choices
 - [Development Roadmap](docs/ROADMAP.md) - Feature status and plans
 
 ## Development

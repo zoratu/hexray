@@ -344,7 +344,6 @@ hexray session export project.hrp --format json
 - [x] "Extending hexray" - Adding new analysis passes (`docs/tutorials/EXTENDING_HEXRAY.md`)
 
 **Reference Documentation:**
-- [x] Architecture decision records (ADRs) (`docs/adr/`)
 - [x] Module dependency diagrams (`docs/MODULE_DEPENDENCIES.md`)
 - [x] Performance tuning guide (`docs/PERFORMANCE_TUNING.md`)
 
