@@ -4049,6 +4049,7 @@ fn disassemble_block_for_arch(
             hexray_disasm::cuda::SassDisassembler::for_sm(sm).disassemble_block(bytes, start_addr)
         }
         Architecture::Cuda(hexray_core::CudaArchitecture::Ptx(_))
+        | Architecture::Amdgpu(_)
         | Architecture::Arm
         | Architecture::Unknown(_) => Vec::new(),
     }
