@@ -8,6 +8,7 @@
 //! - Shared objects (ET_DYN)
 //! - Relocatable objects (ET_REL) - including Linux kernel modules (.ko)
 
+pub mod amdgpu;
 pub mod cuda;
 mod header;
 mod relocation;
@@ -15,6 +16,10 @@ mod section;
 mod segment;
 mod symbol;
 
+pub use amdgpu::{
+    AmdKernelResourceUsage, CodeObjectDiagnostic, CodeObjectDiagnosticKind, CodeObjectError,
+    CodeObjectView, Kernel as AmdKernel, KernelDescriptor, KERNEL_DESCRIPTOR_SIZE,
+};
 pub use cuda::{
     CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Kernel, KernelConfidence,
     KernelResourceUsage, MemoryRegion, MemorySpace, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef,
@@ -179,6 +184,13 @@ impl<'a> Elf<'a> {
     /// [`cuda::CubinError::NotCuda`] if the ELF is not EM_CUDA.
     pub fn cubin_view(&self) -> Result<cuda::CubinView<'_>, cuda::CubinError> {
         cuda::CubinView::from_elf(self)
+    }
+
+    /// Returns a typed AMDGPU code-object view of this ELF, or
+    /// [`amdgpu::CodeObjectError::NotAmdgpu`] if the ELF is not
+    /// EM_AMDGPU.
+    pub fn code_object_view(&self) -> Result<amdgpu::CodeObjectView<'_>, amdgpu::CodeObjectError> {
+        amdgpu::CodeObjectView::from_elf(self)
     }
 
     fn parse_section_headers(
