@@ -99,6 +99,14 @@ pub trait Disassembler {
   - M extension (multiply/divide)
   - A extension (atomics)
   - C extension (compressed)
+- NVIDIA SASS (Volta+ 16-byte fixed width, feature `cuda`)
+  - 34 opcode classes (NOP, MOV, S2R, IMAD, ISETP, LDG/STG, BRA,
+    EXIT, FFMA, ULDC, …)
+  - Variant-suffix decoders (`ISETP.GE.AND`, `IMAD.WIDE`, `LDG.E.CONSTANT`)
+  - 23-bit scheduling control field (stall, yield, barriers, reuse)
+  - Predicate guards (`@P0` / `@!P3`) round-tripped via `Instruction.guard`
+  - Block walker with hard 16-byte stride (never desyncs on decode failure)
+  - See [CUDA.md](CUDA.md) for full coverage details
 
 ### hexray-analysis
 

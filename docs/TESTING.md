@@ -16,6 +16,31 @@ Hexray uses a multi-layered testing approach:
 | Benchmark Suite | Ground truth validation | `hexray-analysis/src/decompiler/benchmark.rs` |
 | Fuzz Tests | Crash resistance | `fuzz/fuzz_targets/` |
 | Miri Gate | Targeted UB-focused interpreter checks | `scripts/check-memory-safety` |
+| CUDA differential | SASS decode vs `nvdisasm -json` | `tests/differential/sass_compare.rs` |
+| CUDA corpus regression | Real-cubin invariants (kernel, params, exits) | `crates/hexray-formats/tests/cuda_corpus.rs` |
+| CUDA fault injection | Truncation / bit-flip / framing chaos | `crates/hexray-formats/tests/cuda_fault_injection.rs` |
+
+## CUDA / GPU Testing
+
+A handwritten CUDA corpus (`tests/corpus/cuda/sources/`, BSD-3-Clause)
+is compiled against `sm_80`, `sm_86`, and `sm_89` via
+`scripts/build-cuda-corpus.sh` to produce the differential ground
+truth (`nvdisasm -json`). The corpus is gitignored — CI without a
+CUDA toolkit no-ops the dependent tests silently.
+
+CI gates enforced when the corpus is present:
+
+| Gate | Threshold |
+|------|-----------|
+| sm_80 base mnemonic match | ≥ 70.0% (current: 100.0%) |
+| every SM predicate guard match | ≥ 95.0% (current: 100.0%) |
+| every SM full mnemonic match | ≥ 92.0% (current: 95.8%) |
+
+Five new fuzz targets target the CUDA parsers: `sass_decoder`,
+`cubin_view`, `nv_info_parser`, `ptx_parser`, `fatbin_parser`. They
+register through the standard `cargo fuzz` workflow and are validated
+on every push by `scripts/check-fuzz-targets`. See
+[docs/CUDA.md](CUDA.md) for the architecture-level picture.
 
 ## Local Tiered Workflow
 

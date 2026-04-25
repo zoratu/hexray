@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 hexray-core = { path = "../crates/hexray-core" }
-hexray-disasm = { path = "../crates/hexray-disasm", features = ["all-archs"] }
+hexray-disasm = { path = "../crates/hexray-disasm", features = ["all-archs", "cuda"] }
 hexray-formats = { path = "../crates/hexray-formats" }
 hexray-analysis = { path = "../crates/hexray-analysis" }
 hexray-signatures = { path = "../crates/hexray-signatures" }
@@ -119,6 +119,41 @@ bench = false
 [[bin]]
 name = "incremental_layout"
 path = "fuzz_targets/incremental_layout.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sass_decoder"
+path = "fuzz_targets/sass_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cubin_view"
+path = "fuzz_targets/cubin_view.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nv_info_parser"
+path = "fuzz_targets/nv_info_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ptx_parser"
+path = "fuzz_targets/ptx_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fatbin_parser"
+path = "fuzz_targets/fatbin_parser.rs"
 test = false
 doc = false
 bench = false
