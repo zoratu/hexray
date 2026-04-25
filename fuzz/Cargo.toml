@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 hexray-core = { path = "../crates/hexray-core" }
-hexray-disasm = { path = "../crates/hexray-disasm", features = ["all-archs", "cuda"] }
+hexray-disasm = { path = "../crates/hexray-disasm", features = ["all-archs", "cuda", "amdgpu"] }
 hexray-formats = { path = "../crates/hexray-formats" }
 hexray-analysis = { path = "../crates/hexray-analysis" }
 hexray-signatures = { path = "../crates/hexray-signatures" }
@@ -154,6 +154,13 @@ bench = false
 [[bin]]
 name = "fatbin_parser"
 path = "fuzz_targets/fatbin_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amdgpu_decoder"
+path = "fuzz_targets/amdgpu_decoder.rs"
 test = false
 doc = false
 bench = false
