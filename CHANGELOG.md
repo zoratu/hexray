@@ -5,7 +5,7 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-04-25
 
 ### Highlights — CUDA / NVIDIA GPU support
 
@@ -107,7 +107,7 @@ See `docs/CUDA.md` for the user-facing guide and `crates/hexray-disasm/
 src/cuda/sass/` for the decoder internals. Milestone-by-milestone
 detail follows below.
 
-### GPU Support (in progress on `feature/gpu-support`)
+### GPU Support — milestone-by-milestone detail
 
 - **M1 – CUDA arch recognition**: `Architecture::Cuda(CudaArchitecture)` in
   `hexray-core`, carrying `SmArchitecture { family, major, minor, variant }`
