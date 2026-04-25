@@ -322,6 +322,47 @@ fn snapshot_info_amdgpu() {
     insta::assert_snapshot!("info_amdgpu", normalized);
 }
 
+/// Lock the `hexray cmp` output for two identical AMDGPU code
+/// objects — every row should report `✓`. Hermetic, no ROCm
+/// required.
+#[test]
+fn snapshot_cmp_amdgpu_self() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("hexray-snapshot-cmp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path_a = dir.join("a.co");
+    let path_b = dir.join("b.co");
+
+    let bytes = synth_amdgpu_codeobject(
+        "vector_add",
+        DescriptorParams {
+            vgpr_raw: 2,
+            sgpr_raw: 1,
+            kernarg: 24,
+            lds_granulated: 4,
+        },
+        0x2F,
+    );
+
+    std::fs::File::create(&path_a)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+    std::fs::File::create(&path_b)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+
+    let output = run_hexray(&[path_a.to_str().unwrap(), "cmp", path_b.to_str().unwrap()]);
+    if !output.status.success() {
+        eprintln!("hexray cmp failed: {:?}", output);
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let normalized = normalize_output(&stdout);
+    insta::assert_snapshot!("cmp_amdgpu_self", normalized);
+}
+
 struct DescriptorParams {
     vgpr_raw: u32,
     sgpr_raw: u32,
