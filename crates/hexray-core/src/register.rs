@@ -74,10 +74,131 @@ impl Register {
             Architecture::X86_64 | Architecture::X86 => x86_reg_name(self.id, self.size),
             Architecture::Arm64 => arm64_reg_name(self.id, self.size),
             Architecture::RiscV64 | Architecture::RiscV32 => riscv_reg_name(self.id),
+            Architecture::Cuda(_) => cuda_reg_name(self.class, self.id),
             _ => "unknown",
         }
     }
 }
+
+fn cuda_reg_name(class: RegisterClass, id: u16) -> &'static str {
+    // Marker bit set by `hexray-disasm::cuda::sass::registers::ur` /
+    // `up` to disambiguate uniform regs from regular ones, since both
+    // share the General/Predicate `RegisterClass`.
+    const UNIFORM_MARKER: u16 = 0x1000;
+
+    match class {
+        RegisterClass::General => {
+            if id & UNIFORM_MARKER != 0 {
+                ur_name(id & !UNIFORM_MARKER)
+            } else {
+                r_name(id)
+            }
+        }
+        RegisterClass::Predicate => {
+            if id & UNIFORM_MARKER != 0 {
+                up_name(id & !UNIFORM_MARKER)
+            } else {
+                p_name(id)
+            }
+        }
+        RegisterClass::Other => sr_name(id),
+        _ => "?",
+    }
+}
+
+fn r_name(id: u16) -> &'static str {
+    match id {
+        255 => "RZ",
+        n if (n as usize) < CUDA_R_NAMES.len() => CUDA_R_NAMES[n as usize],
+        _ => "R?",
+    }
+}
+
+fn p_name(id: u16) -> &'static str {
+    match id {
+        7 => "PT",
+        n if (n as usize) < CUDA_P_NAMES.len() => CUDA_P_NAMES[n as usize],
+        _ => "P?",
+    }
+}
+
+fn ur_name(id: u16) -> &'static str {
+    match id {
+        63 => "URZ",
+        n if (n as usize) < CUDA_UR_NAMES.len() => CUDA_UR_NAMES[n as usize],
+        _ => "UR?",
+    }
+}
+
+fn up_name(id: u16) -> &'static str {
+    match id {
+        7 => "UPT",
+        n if (n as usize) < CUDA_UP_NAMES.len() => CUDA_UP_NAMES[n as usize],
+        _ => "UP?",
+    }
+}
+
+fn sr_name(id: u16) -> &'static str {
+    match id {
+        0 => "SR_LANEID",
+        1 => "SR_CLOCK",
+        2 => "SR_VIRTCFG",
+        3 => "SR_VIRTID",
+        32 => "SR_TID.X",
+        33 => "SR_TID.Y",
+        34 => "SR_TID.Z",
+        36 => "SR_CTAID.X",
+        37 => "SR_CTAID.Y",
+        38 => "SR_CTAID.Z",
+        40 => "SR_NTID.X",
+        41 => "SR_NTID.Y",
+        42 => "SR_NTID.Z",
+        44 => "SR_NCTAID.X",
+        45 => "SR_NCTAID.Y",
+        46 => "SR_NCTAID.Z",
+        _ => "SR?",
+    }
+}
+
+// Static lookup table so `Register::name()` can keep its `&'static str`
+// return type without per-call allocation. `R255` is shadowed to `RZ`
+// by the `r_name` wrapper.
+const CUDA_R_NAMES: &[&str] = &[
+    "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9", "R10", "R11", "R12", "R13", "R14",
+    "R15", "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23", "R24", "R25", "R26", "R27",
+    "R28", "R29", "R30", "R31", "R32", "R33", "R34", "R35", "R36", "R37", "R38", "R39", "R40",
+    "R41", "R42", "R43", "R44", "R45", "R46", "R47", "R48", "R49", "R50", "R51", "R52", "R53",
+    "R54", "R55", "R56", "R57", "R58", "R59", "R60", "R61", "R62", "R63", "R64", "R65", "R66",
+    "R67", "R68", "R69", "R70", "R71", "R72", "R73", "R74", "R75", "R76", "R77", "R78", "R79",
+    "R80", "R81", "R82", "R83", "R84", "R85", "R86", "R87", "R88", "R89", "R90", "R91", "R92",
+    "R93", "R94", "R95", "R96", "R97", "R98", "R99", "R100", "R101", "R102", "R103", "R104",
+    "R105", "R106", "R107", "R108", "R109", "R110", "R111", "R112", "R113", "R114", "R115", "R116",
+    "R117", "R118", "R119", "R120", "R121", "R122", "R123", "R124", "R125", "R126", "R127", "R128",
+    "R129", "R130", "R131", "R132", "R133", "R134", "R135", "R136", "R137", "R138", "R139", "R140",
+    "R141", "R142", "R143", "R144", "R145", "R146", "R147", "R148", "R149", "R150", "R151", "R152",
+    "R153", "R154", "R155", "R156", "R157", "R158", "R159", "R160", "R161", "R162", "R163", "R164",
+    "R165", "R166", "R167", "R168", "R169", "R170", "R171", "R172", "R173", "R174", "R175", "R176",
+    "R177", "R178", "R179", "R180", "R181", "R182", "R183", "R184", "R185", "R186", "R187", "R188",
+    "R189", "R190", "R191", "R192", "R193", "R194", "R195", "R196", "R197", "R198", "R199", "R200",
+    "R201", "R202", "R203", "R204", "R205", "R206", "R207", "R208", "R209", "R210", "R211", "R212",
+    "R213", "R214", "R215", "R216", "R217", "R218", "R219", "R220", "R221", "R222", "R223", "R224",
+    "R225", "R226", "R227", "R228", "R229", "R230", "R231", "R232", "R233", "R234", "R235", "R236",
+    "R237", "R238", "R239", "R240", "R241", "R242", "R243", "R244", "R245", "R246", "R247", "R248",
+    "R249", "R250", "R251", "R252", "R253", "R254", "RZ",
+];
+
+const CUDA_P_NAMES: &[&str] = &["P0", "P1", "P2", "P3", "P4", "P5", "P6", "PT"];
+
+const CUDA_UR_NAMES: &[&str] = &[
+    "UR0", "UR1", "UR2", "UR3", "UR4", "UR5", "UR6", "UR7", "UR8", "UR9", "UR10", "UR11", "UR12",
+    "UR13", "UR14", "UR15", "UR16", "UR17", "UR18", "UR19", "UR20", "UR21", "UR22", "UR23", "UR24",
+    "UR25", "UR26", "UR27", "UR28", "UR29", "UR30", "UR31", "UR32", "UR33", "UR34", "UR35", "UR36",
+    "UR37", "UR38", "UR39", "UR40", "UR41", "UR42", "UR43", "UR44", "UR45", "UR46", "UR47", "UR48",
+    "UR49", "UR50", "UR51", "UR52", "UR53", "UR54", "UR55", "UR56", "UR57", "UR58", "UR59", "UR60",
+    "UR61", "UR62", "URZ",
+];
+
+const CUDA_UP_NAMES: &[&str] = &["UP0", "UP1", "UP2", "UP3", "UP4", "UP5", "UP6", "UPT"];
 
 // x86/x86_64 register IDs
 pub mod x86 {

@@ -849,12 +849,11 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
         candidates.into_iter().next()
     };
 
-    // Collect symbols into owned values, filtering out undefined/external symbols
-    let symbols: Vec<hexray_core::Symbol> = fmt
-        .symbols()
-        .filter(|s| s.is_defined() && s.address != 0)
-        .cloned()
-        .collect();
+    // CUDA CUBIN kernels have section-relative addresses (the driver
+    // relocates them at module-load time), so address==0 is normal —
+    // filter only on `is_defined()`.
+    let symbols: Vec<hexray_core::Symbol> =
+        fmt.symbols().filter(|s| s.is_defined()).cloned().collect();
 
     // 1. Try exact match first (highest priority)
     let exact_matches: Vec<_> = symbols.iter().filter(|s| s.name == name).cloned().collect();
@@ -954,6 +953,10 @@ fn disassemble_at(fmt: &dyn BinaryFormat, address: u64, max_bytes: usize) -> Res
         }
         Architecture::RiscV32 => {
             let disasm = RiscVDisassembler::new_rv32();
+            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+        }
+        Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
+            let disasm = hexray_disasm::cuda::SassDisassembler::for_sm(sm);
             disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
         }
         _ => {
@@ -4042,7 +4045,12 @@ fn disassemble_block_for_arch(
         Architecture::Arm64 => Arm64Disassembler::new().disassemble_block(bytes, start_addr),
         Architecture::RiscV64 => RiscVDisassembler::new().disassemble_block(bytes, start_addr),
         Architecture::RiscV32 => RiscVDisassembler::new_rv32().disassemble_block(bytes, start_addr),
-        Architecture::Arm | Architecture::Cuda(_) | Architecture::Unknown(_) => Vec::new(),
+        Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
+            hexray_disasm::cuda::SassDisassembler::for_sm(sm).disassemble_block(bytes, start_addr)
+        }
+        Architecture::Cuda(hexray_core::CudaArchitecture::Ptx(_))
+        | Architecture::Arm
+        | Architecture::Unknown(_) => Vec::new(),
     }
 }
 

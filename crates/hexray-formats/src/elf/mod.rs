@@ -110,7 +110,11 @@ impl<'a> Elf<'a> {
 
         // Populate section name and data caches for the Section trait
         let mut sections = sections;
-        let is_relocatable = header.file_type == ElfType::Relocatable;
+        // CUDA cubins are ET_EXEC but every section has sh_addr = 0
+        // (the driver relocates them at module-load time), so they
+        // behave like relocatable files for symbol/section addressing.
+        let is_relocatable =
+            header.file_type == ElfType::Relocatable || header.machine == Machine::Cuda;
         for section in &mut sections {
             if let Some(name) = section_names.get(section.sh_name as usize) {
                 section.set_name(name.to_string());
@@ -229,7 +233,10 @@ impl<'a> Elf<'a> {
     ) -> Result<(Vec<Symbol>, Vec<SymbolEntry>), ParseError> {
         let mut symbols = Vec::new();
         let mut raw_symbols = Vec::new();
-        let is_relocatable = header.file_type == ElfType::Relocatable;
+        // CUDA cubins also need section-base relocation — see the
+        // matching comment at the top of `parse`.
+        let is_relocatable =
+            header.file_type == ElfType::Relocatable || header.machine == Machine::Cuda;
 
         // Find symbol table sections (.symtab and .dynsym)
         for section in sections.iter() {
@@ -550,8 +557,10 @@ impl BinaryFormat for Elf<'_> {
     }
 
     fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
-        // For relocatable files (including kernel modules), use section-based lookup
-        if self.header.file_type == ElfType::Relocatable {
+        // For relocatable files (including kernel modules and cubins —
+        // see the `is_relocatable` flag in `parse_symbols`), use
+        // section-based lookup.
+        if self.header.file_type == ElfType::Relocatable || self.header.machine == Machine::Cuda {
             return self.bytes_at_relocatable(addr, len);
         }
 
