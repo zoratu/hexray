@@ -5,6 +5,158 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-04-25
+
+### Highlights — AMDGPU / AMD GPU support + scale-lang interop
+
+v1.4.0 adds first-class support for AMDGPU code objects (the ELF
+binaries `clang -target=amdgcn-amd-amdhsa`, `hipcc --genco`, and
+[SCALE](https://scale-lang.com/) emit for AMD targets) and a new
+`hexray cmp` subcommand that compares two GPU binaries kernel-by-
+kernel. Together these make cross-vendor equivalence demoable: the
+same CUDA source compiled by SCALE for both NVIDIA (cubin, v1.3.0)
+and AMD (code object, v1.4.0) can now be diffed inside hexray.
+
+Quick tour:
+
+```bash
+clang -target=amdgcn-amd-amdhsa --offload-arch=gfx906 -c kernel.cu -o k.co
+hexray k.co info                 # kernel listing + vgpr/sgpr/lds/kernarg
+hexray -s vector_add k.co        # disasm by name (v_mov_b32, s_endpgm, ...)
+hexray nvcc.cubin cmp scale.co   # cross-vendor signature diff
+```
+
+```
+Kernel: vector_add
+  primary regs    a=12         b=12         ✓
+  scalar regs     a=—          b=16         differ
+  kernarg/param   a=24B        b=24B        ✓
+  shared/LDS      a=—          b=768B       n/a
+  exit count      a=2          b=—          n/a
+```
+
+What's in the box:
+
+- **AMDGPU ELF recognition** — `EM_AMDGPU = 224` in
+  `hexray-formats/src/elf/header.rs`. Both V3 ABI (1-bit feature
+  fields) and V4 ABI (2-bit TriState xnack/sramecc) `e_flags`
+  decoded. Mach table covers gfx8xx (GCN3/4), gfx9xx (GCN5/CDNA1/2/3),
+  gfx10xx (RDNA1/2), gfx11xx (RDNA3), gfx12xx (RDNA4).
+  `Architecture::Amdgpu(GfxArchitecture)` carries family + major +
+  minor + stepping + xnack + sramecc; renders the LLVM canonical
+  target id (`gfx906`, `gfx90a:xnack+:sramecc-`).
+- **Code-object view** — `Elf::code_object_view()` analogue of
+  `cubin_view()`. Walks the symbol table for `<kernel>.kd`
+  STT_OBJECT entries, pairs them with `<kernel>` STT_FUNC entries,
+  parses the 64-byte `amdhsa_kernel_descriptor_t` block per LLVM
+  `AMDHSAKernelDescriptor.h`. Decoded fields: `vgpr_count` (with
+  wave32 granule split), `sgpr_count`, `user_sgpr_count`,
+  `lds_bytes` (static + dynamic), `scratch_bytes`, `kernarg_size`,
+  `is_wave32`. Raw `compute_pgm_rsrc1/2/3` words preserved for
+  callers that need to diff them directly.
+- **AMDGPU disassembler** (`hexray-disasm` feature `amdgpu`) —
+  variable-length 32/64-bit walker. Family-aware encoding-class
+  dispatch covering VOP1/VOP2/VOPC, VOP3A/B, SOP1/SOP2/SOPC/SOPK/
+  SOPP, SMEM, MUBUF, MTBUF, MIMG, DS, FLAT, EXP. GFX9 vs GFX10+
+  prefix layouts both supported (the most visible shifts: VOP3
+  `110100` → `110101`, SMEM `110000` → `111101`, EXP `110001` →
+  `111110`). First-pass opcode tables for the dozen-ish OPs per
+  class that show up in every realistic kernel: `v_mov_b32`,
+  `v_add_*`, `v_cmp_*`, `s_mov_b32`, `s_add_u32`, `s_endpgm`,
+  `s_branch`, `s_load_dword*`, `v_lshlrev_b32`, etc. M10.4
+  documents the strategy (LLVM tablegen sources +
+  `llvm-mc --show-encoding` cross-checks) and leaves the tail
+  for organic growth driven by the differential gate.
+- **`hexray cmp <a> <b>`** — the cross-vendor comparator
+  subcommand. Walks kernel summaries on both sides, matches by
+  mangled name, and reports a per-kernel resource diff. Two
+  field kinds: Structural mismatches (kernarg / param size —
+  the same source must produce the same signature) exit non-zero
+  and are flagged `MISMATCH`; informational differences
+  (register pressure, codegen detail) are noted as `differ`.
+  Suitable for CI: identical kernels exit 0, signature
+  inconsistencies exit 1.
+- **CLI integration** — `hexray info` prints an "AMDGPU Code
+  Object View" block (target id, kernels, vgpr/sgpr/lds/kernarg)
+  alongside the existing CUDA CUBIN block. `hexray -s <kernel>`
+  and the disasm block path both have AMDGPU arms wiring
+  `AmdgpuDisassembler::for_target(target)`.
+
+Quality bar:
+
+- 22 AMDGPU decoder unit tests, 6 proptest properties (walker
+  never desyncs, classification deterministic, sizes always 4
+  or 8, etc.), 1 fuzz target (`fuzz/fuzz_targets/amdgpu_decoder.rs`).
+- Code-object view: 11 integration tests synthesising AMDGPU
+  ELFs at test time (no ROCm required).
+- Hermetic snapshot tests: `snapshot_info_amdgpu` locks the
+  `hexray info` format, `snapshot_cmp_amdgpu_self` locks the
+  `hexray cmp` format.
+- Workspace: 2338 tests pass with `--features amdgpu cuda`.
+  Clippy clean with `-D warnings`.
+
+Known gaps (called out in `docs/AMDGPU.md`):
+
+- Operand decoding for the disassembler is mnemonic-only; SRC0 /
+  VDST register-name rendering is follow-up.
+- The opcode tables are first-pass — covering common opcodes only.
+  CDNA MFMA / WMMA matrix instructions, VOP3P packed math, DPP /
+  SDWA modifiers are deferred.
+- `NT_AMDGPU_METADATA` MessagePack notes (kernel arg layout, max
+  workgroup size) not decoded yet — descriptor block is the only
+  metadata source today. Doesn't affect cmp.
+- HIP host fatbin extraction deferred — hexray reads AMDGPU code
+  objects directly; HIP host wrappers are M11+ work.
+
+See `docs/AMDGPU.md` for the user-facing guide,
+`docs/AMDGPU_DESIGN.md` for the original M10 RFC, and
+`crates/hexray-disasm/src/amdgpu/` for the decoder internals.
+
+### AMDGPU Support — milestone-by-milestone detail
+
+- **M10.1 — ELF recognition + Architecture::Amdgpu**:
+  `Machine::Amdgpu` for `EM_AMDGPU = 224`,
+  `gfx_from_amdgpu_elf(abi_version, e_flags)` decodes both V3
+  and V4 ABI layouts, mach table covers every gfx target
+  shipping today. `GfxFamily { Gcn3, Gcn4, Gcn5, Cdna1, Cdna2,
+  Cdna3, Rdna1, Rdna2, Rdna3, Rdna4, Unknown }` with
+  forward-compatible `from_target`. `TriState { Unspecified,
+  Off, On }` matches LLVM's V4 "any" semantics. 9 unit tests.
+- **M10.2 — Code-object view**: `CodeObjectView` mirroring
+  `CubinView`. `KernelDescriptor::parse(&[u8; 64])` decodes the
+  amdhsa kernel descriptor with both raw `compute_pgm_rsrc*`
+  words and decoded counts. Wave32 reads from
+  `kernel_code_properties[10]` (`ENABLE_WAVEFRONT_SIZE32`),
+  matching `AMDHSAKernelDescriptor.h`. Symbol-pair detection for
+  `<kernel>` / `<kernel>.kd`. Orphan descriptors / orphan entries
+  surface as soft diagnostics. 11 unit tests + a synthetic-ELF
+  builder for hermetic integration tests.
+- **M10.3 — Decoder skeleton**: variable-length 32/64-bit
+  walker. `decode_class(dword, family) -> EncodingClass`
+  classifies by inspecting top bits of the first dword. Caught
+  one self-inflicted bug: SOP1/SOPC/SOPP top9 patterns share
+  top4 = `1011` with SOPK; dispatch order matters
+  (most-specific first). 22 decoder unit tests, family-aware
+  prefixes (GFX9 vs GFX10+).
+- **M10.4 — Opcode tables**: per-family tables for VOP1/VOP2/
+  VOPC, SOP1/SOP2/SOPP, SMEM. Hand-curated from LLVM
+  AMDGPU tablegen + `llvm-mc --show-encoding` cross-checks
+  produced for gfx906, gfx1030, gfx1100, gfx1200. Bit-layout
+  WHY-comments cover OP-extraction shifts. Coverage is
+  intentionally partial — a corpus-driven differential gate
+  drives organic growth.
+- **M10.5 + M10.6 — Quality bar**: snapshot test, 6 proptest
+  properties, 1 fuzz target. Corpus / `llvm-objdump` differential
+  gate scaffolding deferred until a Linux + ROCm box is
+  available; the proptest + fuzz layer covers the
+  ROCm-independent half.
+- **M10.7 — Docs**: `docs/AMDGPU.md` (modest user-facing guide),
+  `docs/AMDGPU_DESIGN.md` (M10 RFC).
+- **M11 — `hexray cmp`**: cross-vendor comparator subcommand.
+  Vendor-agnostic `KernelSummary` collected from CubinView and
+  CodeObjectView; structural vs informational field kinds; CI-
+  friendly exit codes.
+
 ## [1.3.0] - 2026-04-25
 
 ### Highlights — CUDA / NVIDIA GPU support
