@@ -16,6 +16,17 @@ NVCC      ?= nvcc
 NVDISASM  ?= nvdisasm
 SM_ARCHS  ?= 80 86 89
 
+# Default SM list above is the M7 differential gate. Override on the
+# command line to extend coverage:
+#
+#   make SM_ARCHS="70 75 80 86 89 90"      # add Volta/Turing/Hopper
+#   make SM_ARCHS="80 86 89 90 90a"        # include Hopper accelerators
+#
+# Or pin a different toolkit version (the differential JSON shape can
+# drift between minors — keep one toolkit per build directory):
+#
+#   PATH=/usr/local/cuda-12.6/bin:$PATH make BUILD_DIR=build-cu126 all
+
 SRC_DIR   := sources
 BUILD_DIR := build
 

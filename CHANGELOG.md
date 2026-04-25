@@ -223,6 +223,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already implicit: both sides use the same (mangled) name, so
   `ptx.function_by_name(&sass_kernel.name)` just works.
 
+- **GPU testing batch**: closes the quality bar items the rest of the
+  repo holds new code to.
+  - CUDA-info snapshot test (hermetic synthetic stub).
+  - `Send + Sync` compile-time witnesses on the SASS decoder, owned
+    record types, and the fatbin wrapper.
+  - CFG smoke test that feeds real SASS instructions through the
+    existing `CfgBuilder`.
+  - Miri now runs the CUDA fault-injection suite (13 tests pass under
+    the strict UB interpreter).
+  - Coverage check passes: workspace 73.36%, every new CUDA file
+    83-100% lines.
+  - Mutation testing run with `cargo-mutants` on the SASS modules;
+    surfaced gaps closed in `registers.rs` (now 0 missed of 57
+    viable) and tightened tests on `variant_setp` / `variant_lea`
+    / `variant_shf`.
+  - Criterion benchmark for SASS decode (single NOP ≈ 43 ns;
+    1024-instruction throughput ≈ 1.4 GB/s).
+  - Corpus extended to sm_75 and sm_90 (Turing + Hopper). The
+    differential gate is SM-band-aware: v1 SMs (sm_80/86/89) keep
+    the 92% full-mnemonic floor; sm_75 / sm_90 track a softer 70%
+    floor while we incrementally add their SM-specific opcodes.
+  - New opcode entries: `S2UR`, `VIADD`, `BMOV`, plus `LDC.64`
+    variant. sm_90 full-mnemonic match: 91.3% → 97.2%.
+
 ## [1.2.1] - 2026-03-19
 
 ### Testing

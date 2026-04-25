@@ -82,9 +82,8 @@ fn sass_corpus_differential_gate() {
         );
     }
 
-    // Gate 2: predicate guards should be > 95% across every SM — this
-    // is nearly decoder-independent since the guard field layout is
-    // stable on Volta+.
+    // Gate 2: predicate guards should decode reliably across every SM —
+    // the bit layout is stable on Volta+.
     for (sm, agg) in &per_sm {
         assert!(
             agg.guard_rate() >= sass_compare::threshold::GUARD_ALL_SMS,
@@ -94,14 +93,38 @@ fn sass_corpus_differential_gate() {
         );
     }
 
-    // Gate 3: full-mnemonic rate just has to exceed a regression floor
-    // (M7 lifts the number dramatically).
+    // Gate 3: full-mnemonic rate. The v1 band (sm_80/86/89) gets the
+    // strict 92% floor; other SMs get a softer 70% floor since they
+    // expose SM-specific opcode variants the v1 table doesn't yet
+    // cover. Both still trip on real regressions.
     for (sm, agg) in &per_sm {
+        let is_v1 = sass_compare::threshold::V1_SMS
+            .iter()
+            .any(|target| target == sm);
+        let floor = if is_v1 {
+            sass_compare::threshold::FULL_MNEMONIC_V1_BAND
+        } else {
+            sass_compare::threshold::FULL_MNEMONIC_OTHER_SMS
+        };
         assert!(
-            agg.full_rate() >= sass_compare::threshold::FULL_MNEMONIC_ALL_SMS,
+            agg.full_rate() >= floor,
             "{sm} full-mnemonic match {:.1}% < {:.1}% floor",
             agg.full_rate(),
-            sass_compare::threshold::FULL_MNEMONIC_ALL_SMS,
+            floor,
+        );
+
+        let base_floor = if is_v1 {
+            // V1 SMs already covered by Gate 1 (sm_80) or implicitly by
+            // the ≥92% full match (which requires base ≥ full).
+            0.0
+        } else {
+            sass_compare::threshold::BASE_MNEMONIC_OTHER_SMS
+        };
+        assert!(
+            agg.base_rate() >= base_floor,
+            "{sm} base-mnemonic match {:.1}% < {:.1}% floor",
+            agg.base_rate(),
+            base_floor,
         );
     }
 }

@@ -1,0 +1,22 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+assertion_line: 283
+expression: normalized
+---
+Binary Information
+==================
+Format:        ELF
+Architecture:  cuda-sass (sm_80, family=Ampere)
+Endianness:    Little
+Bitness:       Bits64
+Type:          Executable
+Machine:       Cuda
+
+Sections:      0
+Segments:      0
+
+CUDA CUBIN View
+---------------
+Kernels:       0 (0 entry, 0 candidate)
+
+Symbols:       0

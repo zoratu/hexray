@@ -40,3 +40,18 @@ run "Miri: incremental invalidation model conformance" \
     rustup run nightly cargo miri test -p hexray-analysis \
     incremental::tests::test_tla_model_conformance_for_incremental_layout \
     -- --exact
+
+# CUDA fault-injection: the parser surface mutates real cubins
+# (truncation sweeps, bit flips, malformed TLV framing, fatbin
+# overflow attempts, PTX edge cases). Running it under Miri is the
+# strongest UB test we have for the new CUDA code — every assertion
+# in the file double-checks bounds in the parser path.
+#
+# `-Zmiri-disable-isolation` is needed because the seed-cubin path
+# stat()s `tests/corpus/cuda/build/` to decide whether to use a real
+# cubin or a synthetic stub. Filesystem reads are read-only and
+# don't compromise UB detection.
+run "Miri: CUDA parser fault-injection sweep" \
+    env MIRIFLAGS="-Zmiri-disable-isolation" \
+    rustup run nightly cargo miri test -p hexray-formats \
+    --test cuda_fault_injection -- --test-threads=1

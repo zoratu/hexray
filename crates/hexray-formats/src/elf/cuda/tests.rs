@@ -4,7 +4,31 @@
 //! text sections, and helper symbols inside a kernel section.
 
 use super::*;
+use crate::cuda::FatbinWrapper;
 use crate::elf::Elf;
+
+/// Compile-time witness that owned-data CUDA types stay `Send + Sync`.
+/// View / borrow types (CubinView, Kernel, MemoryRegion, NvInfoBlob,
+/// PtxIndex) are intentionally not asserted — they hold short-lived
+/// borrows from a `&Elf` and aren't expected to cross threads. Owned
+/// records that *can* legitimately move between threads are.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<KernelResourceUsage>();
+    assert_send_sync::<ParamCbank>();
+    assert_send_sync::<ParamInfo>();
+    assert_send_sync::<MemorySpace>();
+    assert_send_sync::<NvInfoAttribute>();
+    assert_send_sync::<NvInfoEntryRef>();
+    assert_send_sync::<PtxModuleHeader>();
+    assert_send_sync::<PtxFunction>();
+    assert_send_sync::<PtxFunctionKind>();
+    assert_send_sync::<CubinError>();
+    assert_send_sync::<CubinDiagnostic>();
+    assert_send_sync::<CubinDiagnosticKind>();
+    assert_send_sync::<KernelConfidence>();
+    assert_send_sync::<FatbinWrapper<'static>>();
+};
 
 /// A minimal ELF64 + EM_CUDA builder. Everything is little-endian; we keep
 /// sections contiguous right after the section header table.
