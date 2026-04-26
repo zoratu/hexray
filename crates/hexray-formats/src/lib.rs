@@ -18,7 +18,10 @@ pub mod macho;
 pub mod pe;
 pub mod traits;
 
-pub use cuda::{FatbinEntry, FatbinEntryKind, FatbinError, FatbinWrapper};
+pub use cuda::{
+    FatbinEntry, FatbinEntryKind, FatbinError, FatbinWrapper, HipBundleEntry, HipBundleEntryKind,
+    HipBundleError, HipBundleWrapper,
+};
 pub use elf::{
     AmdKernel, AmdKernelResourceUsage, AmdMetadata, AmdMetadataArg, AmdMetadataKernel,
     CodeObjectDiagnostic, CodeObjectDiagnosticKind, CodeObjectError, CodeObjectView,
