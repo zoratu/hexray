@@ -17,8 +17,9 @@ mod segment;
 mod symbol;
 
 pub use amdgpu::{
-    AmdKernelResourceUsage, CodeObjectDiagnostic, CodeObjectDiagnosticKind, CodeObjectError,
-    CodeObjectView, Kernel as AmdKernel, KernelDescriptor, KERNEL_DESCRIPTOR_SIZE,
+    AmdKernelResourceUsage, AmdMetadata, AmdMetadataArg, AmdMetadataKernel, CodeObjectDiagnostic,
+    CodeObjectDiagnosticKind, CodeObjectError, CodeObjectView, Kernel as AmdKernel,
+    KernelDescriptor, ScaleKinfo, ScaleKinfoArg, ScaleKinfoError, KERNEL_DESCRIPTOR_SIZE,
 };
 pub use cuda::{
     CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Kernel, KernelConfidence,

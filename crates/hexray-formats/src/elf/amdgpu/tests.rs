@@ -522,6 +522,191 @@ fn metadata_note_attaches_to_matching_kernel() {
     assert_eq!(m.sgpr_count, Some(16));
 }
 
+/// Encode a minimal `.AMDGPU.kinfo` record for one kernel, in the
+/// SCALE-free 1.4.x layout reverse-engineered from the corpus.
+/// `args` is `[(offset, size)]`.
+fn build_scale_kinfo(flags: u32, args: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + args.len() * 8);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(args.len() as u32).to_le_bytes());
+    for (off, size) in args {
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn scale_kinfo_section_synthesises_kernel_metadata() {
+    // Synthesise an AMDGPU ELF with NO `NT_AMDGPU_METADATA` note but
+    // WITH a `.AMDGPU.kinfo` section + a `vector_add.ki` symbol. The
+    // view should fall back to kinfo and populate kernel.metadata
+    // with the per-arg layout.
+    let desc = descriptor_with_vgpr_sgpr(2, 1, 28);
+    let elf_bytes = AmdElfBuilder::new()
+        .push_kernel("vector_add", &[0u8; 4], desc)
+        .build();
+
+    // Append a `.AMDGPU.kinfo` section + a `.ki` symbol, surgically.
+    let kinfo = build_scale_kinfo(0x400, &[(0, 8), (8, 8), (16, 8), (24, 4)]);
+    let extra_sym_name = b"vector_add.ki\0";
+
+    // Read existing offsets from the ELF header.
+    let e_shoff = u64::from_le_bytes(elf_bytes[40..48].try_into().unwrap());
+    let e_shnum = u16::from_le_bytes(elf_bytes[60..62].try_into().unwrap());
+    let e_shstrndx = u16::from_le_bytes(elf_bytes[62..64].try_into().unwrap());
+
+    // Section 3 is `.shstrtab`, section 4 is `.strtab`, section 5 is
+    // `.symtab` (see AmdElfBuilder::build). We'll grow `.shstrtab`
+    // and `.strtab` to add the new names, append a kinfo section
+    // header, and add a new symbol entry for `vector_add.ki`.
+    //
+    // To keep the surgery simple we re-lay-out the file from the
+    // ELF header forward: pre-shdr region is everything except the
+    // shdr table; we patch what we need and rebuild.
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let mut shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+
+    // Build a new shstrtab containing ".AMDGPU.kinfo".
+    let shstr_idx = e_shstrndx as usize;
+    let shstr_shdr_off = shstr_idx * 64;
+    let shstr_off = u64::from_le_bytes(
+        shdrs[shstr_shdr_off + 24..shstr_shdr_off + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let shstr_size = u64::from_le_bytes(
+        shdrs[shstr_shdr_off + 32..shstr_shdr_off + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut new_shstr = pre_shdrs[shstr_off..shstr_off + shstr_size].to_vec();
+    let kinfo_name_off = new_shstr.len() as u32;
+    new_shstr.extend_from_slice(b".AMDGPU.kinfo\0");
+
+    // Grow `.strtab` for the `.ki` symbol name.
+    let strtab_idx = 4usize;
+    let strtab_shdr_off = strtab_idx * 64;
+    let strtab_off = u64::from_le_bytes(
+        shdrs[strtab_shdr_off + 24..strtab_shdr_off + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let strtab_size = u64::from_le_bytes(
+        shdrs[strtab_shdr_off + 32..strtab_shdr_off + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut new_strtab = pre_shdrs[strtab_off..strtab_off + strtab_size].to_vec();
+    let ki_name_off = new_strtab.len() as u32;
+    new_strtab.extend_from_slice(extra_sym_name);
+
+    // Lay out the new file:
+    //   [pre-shstrtab bytes]
+    //   [new_shstr]
+    //   [new_strtab]
+    //   [old symtab bytes... + extra symbol]
+    //   [kinfo bytes]
+    //   [shdrs (patched)]
+    //
+    // Pull the existing symtab body out of `pre_shdrs`.
+    let symtab_idx = 5usize;
+    let symtab_shdr_off = symtab_idx * 64;
+    let symtab_off = u64::from_le_bytes(
+        shdrs[symtab_shdr_off + 24..symtab_shdr_off + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let symtab_size = u64::from_le_bytes(
+        shdrs[symtab_shdr_off + 32..symtab_shdr_off + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut new_symtab = pre_shdrs[symtab_off..symtab_off + symtab_size].to_vec();
+
+    // Compose the rebuilt file. We assume layout is:
+    //   [ehdr][text][rodata][shstrtab][strtab][symtab][shdrs]
+    // — exactly what AmdElfBuilder::build emits.
+    let new_shstr_off = shstr_off as u64;
+    let new_shstr_size = new_shstr.len() as u64;
+    let new_strtab_off = new_shstr_off + new_shstr_size;
+    let new_strtab_size = new_strtab.len() as u64;
+    let new_symtab_off = new_strtab_off + new_strtab_size;
+
+    // Append a new symbol entry for `vector_add.ki`. STT_OBJECT (1) +
+    // STB_GLOBAL (1) → info = 0x11. shndx = 6 (the new kinfo section).
+    let mut sym_entry = [0u8; 24];
+    sym_entry[0..4].copy_from_slice(&ki_name_off.to_le_bytes());
+    sym_entry[4] = 0x11;
+    sym_entry[6..8].copy_from_slice(&6u16.to_le_bytes()); // section index
+    sym_entry[8..16].copy_from_slice(&0u64.to_le_bytes()); // value (offset within section)
+    sym_entry[16..24].copy_from_slice(&(kinfo.len() as u64).to_le_bytes());
+    new_symtab.extend_from_slice(&sym_entry);
+    let new_symtab_size = new_symtab.len() as u64;
+
+    let kinfo_off = new_symtab_off + new_symtab_size;
+    let kinfo_size = kinfo.len() as u64;
+    let new_shoff = kinfo_off + kinfo_size;
+
+    // Patch the shdrs in place: shstrtab size, strtab size, symtab
+    // size + kinfo offsets are baked into the shdr table.
+    shdrs[shstr_shdr_off + 32..shstr_shdr_off + 40].copy_from_slice(&new_shstr_size.to_le_bytes());
+    shdrs[strtab_shdr_off + 24..strtab_shdr_off + 32]
+        .copy_from_slice(&new_strtab_off.to_le_bytes());
+    shdrs[strtab_shdr_off + 32..strtab_shdr_off + 40]
+        .copy_from_slice(&new_strtab_size.to_le_bytes());
+    shdrs[symtab_shdr_off + 24..symtab_shdr_off + 32]
+        .copy_from_slice(&new_symtab_off.to_le_bytes());
+    shdrs[symtab_shdr_off + 32..symtab_shdr_off + 40]
+        .copy_from_slice(&new_symtab_size.to_le_bytes());
+
+    // Build a new shdr for `.AMDGPU.kinfo` (SHT_PROGBITS, no flags).
+    let mut kinfo_shdr = [0u8; 64];
+    kinfo_shdr[0..4].copy_from_slice(&kinfo_name_off.to_le_bytes());
+    kinfo_shdr[4..8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+    kinfo_shdr[24..32].copy_from_slice(&kinfo_off.to_le_bytes());
+    kinfo_shdr[32..40].copy_from_slice(&kinfo_size.to_le_bytes());
+    kinfo_shdr[48..56].copy_from_slice(&4u64.to_le_bytes()); // align
+
+    // Reassemble the file.
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs[..shstr_off]);
+    rebuilt.extend_from_slice(&new_shstr);
+    rebuilt.extend_from_slice(&new_strtab);
+    rebuilt.extend_from_slice(&new_symtab);
+    rebuilt.extend_from_slice(&kinfo);
+    rebuilt.extend_from_slice(&shdrs);
+    rebuilt.extend_from_slice(&kinfo_shdr);
+
+    // Update ehdr: e_shoff and e_shnum.
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF with kinfo parses");
+    let view = elf.code_object_view().expect("view builds");
+
+    // No standard metadata note → fallback path runs.
+    assert!(view.metadata.is_none());
+    assert_eq!(view.kernels.len(), 1);
+    let k = &view.kernels[0];
+    assert!(k.metadata.is_some(), "metadata should be synthesised");
+    let m = k.metadata.as_ref().unwrap();
+    assert_eq!(m.name.as_deref(), Some("vector_add"));
+    assert_eq!(m.symbol.as_deref(), Some("vector_add.kd"));
+    assert_eq!(m.args.len(), 4);
+    assert_eq!(m.args[0].size, Some(8));
+    assert_eq!(m.args[3].size, Some(4));
+    assert_eq!(m.args[0].offset, Some(0));
+    assert_eq!(m.args[3].offset, Some(24));
+    // Synthesised metadata never reports kernarg_segment_size — see
+    // the comment on `synthesise_metadata_kernel`.
+    assert_eq!(m.kernarg_segment_size, None);
+    assert_eq!(m.vgpr_count, None);
+}
+
 #[test]
 fn target_id_carries_through_view() {
     // Build with gfx1030 mach.

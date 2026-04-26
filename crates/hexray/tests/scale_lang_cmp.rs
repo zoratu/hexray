@@ -71,6 +71,15 @@ fn cmp_reports_kernel_equivalence_across_amd_targets() {
     // and RDNA3 codegen).
     assert!(stdout.contains("primary regs    a=8"), "got {stdout}");
 
+    // Per-arg layout, sourced from the SCALE-private `.AMDGPU.kinfo`
+    // section (no `NT_AMDGPU_METADATA` note is present — see
+    // `crates/hexray-formats/src/elf/amdgpu/scale_kinfo.rs`).
+    // vector_add has 4 args: `(const float* a, const float* b,
+    // float* c, int n)` → sizes `[8, 8, 8, 4]`.
+    assert!(stdout.contains("arg count       a=4"), "got {stdout}");
+    assert!(stdout.contains("arg [0] size    a=8B"), "got {stdout}");
+    assert!(stdout.contains("arg [3] size    a=4B"), "got {stdout}");
+
     // Matched at least one kernel cleanly.
     assert!(stdout.contains("Matched 1 kernel(s)."), "got {stdout}");
 }
