@@ -44,13 +44,26 @@
 //! gfx1200.
 
 /// Encoding family bands the dispatcher knows about.
+///
+/// The encoding-*class* prefix layout is shared across GFX10 / GFX11
+/// / GFX12 (only OP numbers within each class change). This enum
+/// drives both prefix dispatch (`decode_class`) and the per-class
+/// opcode-table lookup (`opcodes::table_for`). RDNA3 (GFX11)
+/// renumbered VOP2 / VOP3 / SOPP / SOP1 / SMEM / FLAT *substantially*
+/// from RDNA2 — most visibly `s_endpgm` shifted from SOPP OP=0x01 to
+/// 0x30 and `v_mad_u64_u32` shifted from VOP3 OP=0x176 to 0x2fe — so
+/// it gets its own band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EncodingFamily {
     /// GFX6-9 (GCN3/4/5, CDNA1/2/3) — uses the older VOP3/SMEM/EXP
-    /// prefix layout.
+    /// prefix layout and GFX9 OP numbering.
     Gfx9,
-    /// GFX10+ (RDNA1/2/3/4) — VOP3, SMEM, EXP prefixes shifted.
+    /// GFX10 (RDNA1, RDNA2 — gfx10xx). Shares the GFX10+ prefix
+    /// layout with GFX11/GFX12 but has RDNA2-specific OP numbering.
     Gfx10Plus,
+    /// GFX11 (RDNA3 — gfx11xx) and GFX12 (RDNA4 — gfx12xx). Shares
+    /// the GFX10+ prefix layout but uses RDNA3+ OP numbering.
+    Gfx11Plus,
 }
 
 /// Top-level instruction class.
@@ -214,7 +227,7 @@ pub fn decode_class(dword: u32, family: EncodingFamily) -> EncodingClass {
                 0b111100 => return EncodingClass::Mimg,
                 _ => {}
             },
-            EncodingFamily::Gfx10Plus => match top6 {
+            EncodingFamily::Gfx10Plus | EncodingFamily::Gfx11Plus => match top6 {
                 0b110101 => return EncodingClass::Vop3a,
                 0b110110 => return EncodingClass::Ds,
                 0b110111 => return EncodingClass::Flat,

@@ -82,7 +82,12 @@ impl AmdgpuDisassembler {
     }
 }
 
-/// Map a `GfxFamily` to the encoding-prefix family band it follows.
+/// Map a `GfxFamily` to the encoding/opcode-table band it follows.
+///
+/// RDNA1/RDNA2 (gfx10xx) get the `Gfx10Plus` band; RDNA3/RDNA4
+/// (gfx11xx/gfx12xx) get `Gfx11Plus` because RDNA3 substantially
+/// renumbered VOP2/VOP3/SOPP/SOP1/SMEM/FLAT opcode tables relative
+/// to RDNA2.
 fn encoding_family_for(family: GfxFamily) -> EncodingFamily {
     match family {
         GfxFamily::Gcn3
@@ -91,9 +96,8 @@ fn encoding_family_for(family: GfxFamily) -> EncodingFamily {
         | GfxFamily::Cdna1
         | GfxFamily::Cdna2
         | GfxFamily::Cdna3 => EncodingFamily::Gfx9,
-        GfxFamily::Rdna1 | GfxFamily::Rdna2 | GfxFamily::Rdna3 | GfxFamily::Rdna4 => {
-            EncodingFamily::Gfx10Plus
-        }
+        GfxFamily::Rdna1 | GfxFamily::Rdna2 => EncodingFamily::Gfx10Plus,
+        GfxFamily::Rdna3 | GfxFamily::Rdna4 => EncodingFamily::Gfx11Plus,
         // Default to Gfx9 for unknown — pre-RDNA hardware is the
         // older / more conservative target band.
         GfxFamily::Unknown => EncodingFamily::Gfx9,
@@ -124,7 +128,7 @@ impl Disassembler for AmdgpuDisassembler {
 
         let mnemonic = render_mnemonic(class, dword0, dword1, self.family_band);
         let operation = derive_operation(class, dword0, self.family_band);
-        let control_flow = derive_control_flow(class, dword0);
+        let control_flow = derive_control_flow(class, dword0, self.family_band);
         let raw = bytes[..size].to_vec();
         let mut instr = Instruction::new(address, size, raw, mnemonic);
         instr.operation = operation;
@@ -208,12 +212,19 @@ fn render_mnemonic(
     _dword1: Option<u32>,
     family: EncodingFamily,
 ) -> String {
-    // FLAT is special: the `seg` bit field at [16:14] selects
-    // flat/scratch/global and rewrites the rendered prefix.
+    // FLAT is special: on GFX10 (RDNA1/RDNA2) the `seg` bit field at
+    // [16:14] selects flat/scratch/global and we rewrite the rendered
+    // prefix. On GFX11+ (RDNA3+) the FLAT/GLOBAL/SCRATCH variants
+    // occupy distinct OP slots — the table entries already carry the
+    // right `global_*`/`flat_*`/`scratch_*` mnemonic, so we skip the
+    // seg rewrite.
     if matches!(class, EncodingClass::Flat) {
         let op = ((dword0 >> 18) & 0x7f) as u16;
-        let seg = ((dword0 >> 14) & 0x3) as u8;
         if let Some(entry) = opcodes::lookup(opcodes::TableClass::Flat, family, op) {
+            if matches!(family, EncodingFamily::Gfx11Plus) {
+                return entry.mnemonic.to_string();
+            }
+            let seg = ((dword0 >> 14) & 0x3) as u8;
             return opcodes::render_flat_mnemonic(entry.mnemonic, seg);
         }
         return format!("flat.op{op:#x}");
@@ -411,9 +422,18 @@ fn populate_operands(
             // Most SOPP forms (s_endpgm, s_nop, s_barrier) take no
             // visible operands. s_branch / s_cbranch_* take a 16-bit
             // signed SIMM16 — render as PC-relative.
-            let op = (dword0 >> 16) & 0x7f;
+            //
+            // The set of "is this a branch" OPs differs between
+            // bands (RDNA2 puts them at 0x02..=0x09; RDNA3 moved them
+            // to 0x20..=0x26), so we look the entry up in the
+            // opcode table and gate on the resulting `Operation`.
+            let op = ((dword0 >> 16) & 0x7f) as u16;
             let simm16 = (dword0 & 0xffff) as i16;
-            if matches!(op, 0x02 | 0x04..=0x09) {
+            let family = encoding_family_for(target.family);
+            let is_branch = opcodes::lookup(opcodes::TableClass::Sopp, family, op)
+                .map(|e| matches!(e.operation, Operation::Jump | Operation::ConditionalJump))
+                .unwrap_or(false);
+            if is_branch {
                 let target_addr =
                     (instr.address as i64).wrapping_add(((simm16 as i32) * 4 + 4) as i64) as u64;
                 instr
@@ -495,25 +515,26 @@ fn inline_constant_value(id: u16) -> Option<i128> {
     }
 }
 
-/// Best-effort control-flow inference from the encoding class. SOPP
-/// holds branches and `s_endpgm` (kernel exit); the rest are
-/// straight-line.
-fn derive_control_flow(class: EncodingClass, dword0: u32) -> ControlFlow {
+/// Best-effort control-flow inference from the encoding class.
+///
+/// SOPP carries branches and `s_endpgm` (kernel exit); the OP
+/// numbering shifted between bands so we read it through the
+/// family-aware opcode table rather than hard-coding the GFX10
+/// numbers.
+fn derive_control_flow(class: EncodingClass, dword0: u32, family: EncodingFamily) -> ControlFlow {
     if !matches!(class, EncodingClass::Sopp) {
         return ControlFlow::Sequential;
     }
-    // SOPP layout: bits [22:16] = OP. Several OPs are kernel
-    // terminators / branches:
-    //
-    //   0x01 s_endpgm    — kernel exit
-    //   0x02 s_branch    — unconditional 16-bit signed PC offset
-    //   0x06 s_cbranch_* — conditional branches (multiple OPs)
-    //
-    // Without a per-OP table we can at least mark `s_endpgm` as a
-    // return-equivalent.
-    let op = (dword0 >> 16) & 0x7f;
-    match op {
-        0x01 => ControlFlow::Return,
-        _ => ControlFlow::Sequential,
+    let op = ((dword0 >> 16) & 0x7f) as u16;
+    if let Some(entry) = opcodes::lookup(opcodes::TableClass::Sopp, family, op) {
+        return match entry.operation {
+            Operation::Return => ControlFlow::Return,
+            // M10.4 left branch targets unrendered on `Operation::Jump` /
+            // `Operation::ConditionalJump` — populate_operands handles
+            // the PC-relative target. Here we just tag the high-level
+            // class.
+            _ => ControlFlow::Sequential,
+        };
     }
+    ControlFlow::Sequential
 }

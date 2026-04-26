@@ -5,6 +5,97 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4] - 2026-04-26
+
+### Highlights — RDNA3 family-band split + swarm testing
+
+v1.3.4 fixes a major v1.3.3 bug surfaced by hands-on `llvm-objdump`
+diffing of the gfx1100 fixture: the AMDGPU decoder treated all
+GFX10+ targets (RDNA1, RDNA2, RDNA3, RDNA4) as a single opcode-table
+band. RDNA3 substantially renumbered the per-class OP fields, so
+v1.3.3 was decoding RDNA3 binaries with **silently wrong** mnemonics
+— `s_endpgm` rendered as `sopp.op0x30`, `v_mad_u64_u32` as `vop3`,
+`global_load_b32` as `flat`. Every instruction in the gfx1100
+kernel now resolves to a real mnemonic.
+
+The v1.3.4 work also adds proper Groce-style swarm testing
+(ISSTA 2012) for the AMDGPU decoder, mirroring the existing
+decompiler swarm tests. Random byte streams across random family
+bands hit every fallback path and never panic.
+
+What's new:
+
+- **`EncodingFamily::Gfx11Plus`** — new band for RDNA3+ (gfx11xx,
+  gfx12xx). Shares the GFX10+ encoding-class prefix layout but has
+  its own VOP2/VOP3/SOPP/SOP1/SMEM/FLAT opcode tables. RDNA1/RDNA2
+  stay in `Gfx10Plus`. The split mirrors how RDNA3's tablegen sits
+  in LLVM (`*GFX11.td` files separate from `*GFX10.td`).
+- **VOP2 GFX11 table.** `v_ashrrev_i32`: 0x18 → 0x1A.
+  `v_add_co_ci_u32`: 0x28 → 0x20. `v_add_f32` stayed at 0x03.
+- **VOP3 GFX11 table.** `v_mad_u64_u32`: 0x176 → 0x2fe.
+  `v_lshlrev_b64`: 0x2ff → 0x33c. `v_add_co_u32`: 0x30f → 0x300.
+  `v_cmpx_gt_i32_e64`: 0x094 → 0x0c4.
+- **SOPP GFX11 table.** Massive renumbering. `s_endpgm`: 0x01 →
+  0x30. `s_clause`: 0x21 → 0x05. `s_waitcnt`: 0x0c → 0x09.
+  Branches all moved to 0x20..0x26. New RDNA3-only OPs:
+  `s_delay_alu` (0x07), `s_wait_loadcnt` (0x0a), `s_wait_kmcnt`
+  (0x0c), `s_sendmsg` (0x36), `s_code_end` (0x1f).
+- **SOP1 GFX11 table.** Reverted to GFX9-style numbering
+  (`s_mov_b32` back at OP=0x00).
+- **SMEM GFX11 table.** Renamed `_dword` to `_b32`/`_b64`/`_b128`/
+  `_b256`/`_b512`. OP=0x00 stays `s_load_b32`.
+- **FLAT GFX11 table.** Renamed `_dword` to `_b32`. RDNA3 separates
+  `global_*` / `flat_*` / `scratch_*` into distinct OP slots
+  rather than using a `seg` bit, so the decoder skips the seg
+  rewrite for `Gfx11Plus`. `global_load_b32`: 0x0c → 0x14.
+  `global_store_b32`: 0x1c → 0x1a.
+- **Family-aware control-flow detection.** `derive_control_flow`
+  no longer hard-codes `OP=0x01 → Return`; it reads the entry's
+  `Operation` from the family-aware table. RDNA3's `s_endpgm` at
+  OP=0x30 is now correctly tagged.
+- **Family-aware SOPP branch operands.** `populate_operands` no
+  longer hard-codes the RDNA2 OP-0x02..=0x09 branch range; it
+  consults the per-family table to decide whether to render a
+  PC-relative target.
+
+Swarm testing (`crates/hexray-disasm/tests/swarm_amdgpu.rs`):
+
+- 5 proptest properties exercising the decoder under random
+  family-band + byte-stream combinations:
+  - **Walker invariant**: any byte stream advances exactly its
+    length under any family band; never panics.
+  - **Table omission**: random OPs (which essentially never hit
+    our hand-curated tables) all fall back to the placeholder
+    mnemonic without panicking.
+  - **Family omission**: same dword classified under Gfx10Plus
+    vs Gfx11Plus yields the same encoding class + size (only
+    OP-table mappings differ).
+  - **Operand-field omission**: spurious PC-relative operands
+    don't appear when the family-aware table says the SOPP isn't
+    a branch.
+  - **Determinism**: same `(dword, family)` always produces the
+    same `(mnemonic, size)`.
+
+Real-binary verification (`hexray -s vector_add
+tests/corpus/scale-lang/vector_add.gfx1100.co`) now matches
+`llvm-objdump --triple=amdgcn-amd-amdhsa --mcpu=gfx1100` line by
+line on the base mnemonic. New integration test
+`disasm_handles_rdna3_opcode_renumbering` locks the property.
+
+Workspace: 2364 tests pass with `--features amdgpu cuda`. Clippy
+clean.
+
+Known gaps remaining (the v1.3.5 docket):
+
+- RDNA3 SOP2/VOPC numbering still inherits `_SHARED` tables —
+  haven't confirmed whether RDNA3 renumbered those (the gfx1100
+  fixture doesn't exercise enough of those opcodes). Will validate
+  against a wider corpus.
+- Operand rendering for VOP3, SMEM, MUBUF, DS, FLAT classes
+  beyond the dispatcher (memory refs, VOP3 src modifiers, etc.).
+- HIP host-binary fatbin extraction.
+- SCALE-specific `.AMDGPU.kinfo` parsing.
+
 ## [1.3.3] - 2026-04-26
 
 ### Highlights — AMDGPU opcode tables now hit 100% on the SCALE corpus
