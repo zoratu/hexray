@@ -363,6 +363,165 @@ fn orphan_kd_surfaces_diagnostic_not_panic() {
         .any(|d| d.kind == CodeObjectDiagnosticKind::OrphanEntry));
 }
 
+/// Build a minimal `NT_AMDGPU_METADATA` note (header + name +
+/// descriptor) ready to be embedded in a SHT_NOTE section.
+fn build_amdgpu_metadata_note(msgpack_payload: &[u8]) -> Vec<u8> {
+    let name = b"AMDGPU\0";
+    let mut out = Vec::new();
+    // namesz, descsz, type
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(msgpack_payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&32u32.to_le_bytes()); // NT_AMDGPU_METADATA
+    out.extend_from_slice(name);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(msgpack_payload);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out
+}
+
+/// Build a tiny MessagePack metadata blob with one kernel.
+fn build_msgpack_for(kernel_name: &str, vgpr: u32, sgpr: u32, kernarg: u64) -> Vec<u8> {
+    let mut b = Vec::new();
+    // top-level fixmap len=2: amdhsa.version, amdhsa.kernels
+    b.push(0x82);
+    push_str(&mut b, "amdhsa.version");
+    b.extend_from_slice(&[0x92, 0x01, 0x00]); // [1, 0]
+    push_str(&mut b, "amdhsa.kernels");
+    b.push(0x91); // array len=1
+                  // kernel: fixmap len=5
+    b.push(0x85);
+    push_str(&mut b, ".name");
+    push_str(&mut b, kernel_name);
+    push_str(&mut b, ".symbol");
+    push_str(&mut b, &format!("{kernel_name}.kd"));
+    push_str(&mut b, ".kernarg_segment_size");
+    push_uint(&mut b, kernarg);
+    push_str(&mut b, ".vgpr_count");
+    push_uint(&mut b, vgpr as u64);
+    push_str(&mut b, ".sgpr_count");
+    push_uint(&mut b, sgpr as u64);
+    b
+}
+
+fn push_str(b: &mut Vec<u8>, s: &str) {
+    if s.len() <= 31 {
+        b.push(0xa0 | (s.len() as u8));
+    } else {
+        b.push(0xd9);
+        b.push(s.len() as u8);
+    }
+    b.extend_from_slice(s.as_bytes());
+}
+
+fn push_uint(b: &mut Vec<u8>, n: u64) {
+    if n < 128 {
+        b.push(n as u8);
+    } else if n <= 0xff {
+        b.push(0xcc);
+        b.push(n as u8);
+    } else {
+        b.push(0xcd);
+        b.extend_from_slice(&(n as u16).to_be_bytes());
+    }
+}
+
+#[test]
+fn metadata_note_attaches_to_matching_kernel() {
+    // Synthesise an AMDGPU ELF where the metadata blob's
+    // ".name": "vector_add" matches the kernel symbol. The view
+    // builder should attach the metadata record to the Kernel.
+    let desc = descriptor_with_vgpr_sgpr(2, 1, 24);
+    let msgpack = build_msgpack_for("vector_add", 12, 16, 24);
+    let note_bytes = build_amdgpu_metadata_note(&msgpack);
+
+    // Hand-build an ELF with a SHT_NOTE section carrying the note.
+    // Reuses the same scaffolding as AmdElfBuilder but inlines the
+    // note section since the existing builder doesn't expose it.
+    let mut elf_bytes = AmdElfBuilder::new()
+        .push_kernel("vector_add", &[0u8; 4], desc)
+        .build();
+
+    // Append a SHT_NOTE section: append note bytes to file end and
+    // add a section header pointing at it.
+    elf_bytes.extend_from_slice(&note_bytes);
+
+    // The existing ELF has 6 section headers; we need to bump
+    // e_shnum and append one more shdr. The shdr table is at
+    // e_shoff (offset 40-48 of the ehdr). Read it and rebuild.
+    let e_shoff = u64::from_le_bytes([
+        elf_bytes[40],
+        elf_bytes[41],
+        elf_bytes[42],
+        elf_bytes[43],
+        elf_bytes[44],
+        elf_bytes[45],
+        elf_bytes[46],
+        elf_bytes[47],
+    ]);
+    let e_shnum = u16::from_le_bytes([elf_bytes[60], elf_bytes[61]]);
+
+    // The shdrs start at e_shoff. We split: keep [0..e_shoff],
+    // insert the note bytes (already done above as elf_bytes
+    // append before this point — wait, the note was appended AFTER
+    // the shdrs, which is fine), then update the shdr table.
+    //
+    // Since we appended note_bytes to the end *after* the shdr
+    // table, the existing shdrs are still at e_shoff and we need to
+    // physically grow the shdr table by 64 bytes — easier: rebuild
+    // the file by truncating to e_shoff, appending shdrs +1, then
+    // appending the note bytes after.
+    //
+    // Refactor: take the existing layout apart.
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+    // The note bytes we appended live after shdrs_end.
+
+    // New layout:
+    //   [pre_shdrs]
+    //   [note_bytes]   -- needs new offset
+    //   [old shdrs] [new shdr for note]
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs);
+    let new_note_off = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&note_bytes);
+    let new_shoff = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&shdrs);
+
+    // Append a new section header for the note. SHT_NOTE = 7.
+    let mut nh = vec![0u8; 64];
+    // sh_name: re-use string offset 0 (section name table doesn't
+    // have ".note" — that's OK for our test, the section walker
+    // checks sh_type, not the name).
+    nh[4..8].copy_from_slice(&7u32.to_le_bytes()); // SHT_NOTE
+    nh[24..32].copy_from_slice(&new_note_off.to_le_bytes()); // sh_offset
+    nh[32..40].copy_from_slice(&(note_bytes.len() as u64).to_le_bytes()); // sh_size
+    nh[48..56].copy_from_slice(&4u64.to_le_bytes()); // sh_addralign
+    rebuilt.extend_from_slice(&nh);
+
+    // Update the ehdr fields: e_shoff and e_shnum.
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF with note parses");
+    let view = elf.code_object_view().expect("view builds");
+
+    assert!(view.metadata.is_some(), "metadata should be parsed");
+    assert_eq!(view.kernels.len(), 1);
+    let k = &view.kernels[0];
+    assert!(k.metadata.is_some(), "metadata should attach to kernel");
+    let m = k.metadata.as_ref().unwrap();
+    assert_eq!(m.name.as_deref(), Some("vector_add"));
+    assert_eq!(m.kernarg_segment_size, Some(24));
+    assert_eq!(m.vgpr_count, Some(12));
+    assert_eq!(m.sgpr_count, Some(16));
+}
+
 #[test]
 fn target_id_carries_through_view() {
     // Build with gfx1030 mach.
