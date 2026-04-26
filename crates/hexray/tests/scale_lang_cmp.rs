@@ -125,6 +125,63 @@ fn disasm_renders_real_operands() {
 }
 
 #[test]
+fn disasm_renders_register_pairs_and_null() {
+    if !corpus_path("vector_add.gfx1100.co").exists() {
+        eprintln!("gfx1100 fixture not present, skipping");
+        return;
+    }
+    let path = corpus_path("vector_add.gfx1100.co");
+    let output = Command::new(hexray_bin())
+        .arg("-s")
+        .arg("vector_add")
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("hexray runs");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // SMEM with SBASE register pair `s[0:1]`.
+    assert!(
+        stdout.contains("s_load_b32 s2, s[0:1], 0x38"),
+        "expected `s_load_b32 s2, s[0:1], 0x38`, got:\n{stdout}"
+    );
+    // SMEM 128-bit destination (4-dword pair).
+    assert!(
+        stdout.contains("s_load_b128 s[4:7], s[0:1], null"),
+        "expected `s_load_b128 s[4:7], s[0:1], null`, got:\n{stdout}"
+    );
+    // VOP3 v_mad_u64_u32 with VDST pair, SDST=null, SRC2 pair.
+    assert!(
+        stdout.contains("v_mad_u64_u32 v[1:2], null, s2, s3, v[0:1]"),
+        "expected v_mad_u64_u32 with v[1:2]/null/v[0:1], got:\n{stdout}"
+    );
+    // VOPC e64 — VDST is implicit EXEC, no explicit dst rendered.
+    assert!(
+        stdout.contains("v_cmpx_gt_i32_e64 s4, v1"),
+        "expected `v_cmpx_gt_i32_e64 s4, v1` (no implicit VDST), got:\n{stdout}"
+    );
+    // VOP3B — `v_add_co_u32` shows the `vcc_lo` SDST.
+    assert!(
+        stdout.contains("v_add_co_u32 v2, vcc_lo, s4, v0"),
+        "expected v_add_co_u32 with vcc_lo SDST, got:\n{stdout}"
+    );
+    // FLAT — global_load_b32 v2, v[2:3], off (saddr=null/off).
+    assert!(
+        stdout.contains("global_load_b32 v2, v[2:3], off"),
+        "expected `global_load_b32 v2, v[2:3], off`, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("global_store_b32 v[0:1], v2, off"),
+        "expected `global_store_b32 v[0:1], v2, off`, got:\n{stdout}"
+    );
+    // 2-source VOP3 (v_lshlrev_b64) does NOT render a phantom src2.
+    assert!(
+        stdout.contains("v_lshlrev_b64 v[0:1], 2, v[1:2]"),
+        "expected v_lshlrev_b64 with 2 sources only, got:\n{stdout}"
+    );
+}
+
+#[test]
 fn disasm_handles_rdna3_opcode_renumbering() {
     if !corpus_path("vector_add.gfx1100.co").exists() {
         eprintln!("gfx1100 fixture not present, skipping");

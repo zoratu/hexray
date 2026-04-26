@@ -441,12 +441,21 @@ fn populate_operands(
                     .push(Operand::pc_rel((simm16 as i64) * 4, target_addr));
             }
         }
+        EncodingClass::Vop3a | EncodingClass::Vop3b => {
+            populate_vop3_operands(instr, dword0, target);
+        }
+        EncodingClass::Smem => {
+            populate_smem_operands(instr, dword0, target);
+        }
+        EncodingClass::Flat => {
+            populate_flat_operands(instr, dword0, target);
+        }
         _ => {
-            // Other classes (VOP3, SMEM, MUBUF, DS, FLAT, MIMG, EXP)
-            // have richer operand layouts that the M10.4 + v1.3.1
-            // tables don't cover yet. Leave operands empty for now —
-            // M10.4 already renders the mnemonic, and the
-            // class-dispatcher tells callers something useful.
+            // MUBUF / MTBUF / MIMG / DS / EXP have richer operand
+            // layouts (resource descriptors + addressing modes); the
+            // mnemonic dispatcher renders the right name and the
+            // walker stays in sync. Operand-field expansion lands
+            // in a follow-up.
         }
     }
 }
@@ -513,6 +522,478 @@ fn inline_constant_value(id: u16) -> Option<i128> {
         193..=208 => Some(-((id as i128) - 192)),
         _ => None,
     }
+}
+
+// =============================================================================
+// VOP3 / SMEM / FLAT operand rendering
+// =============================================================================
+//
+// These classes have richer operand layouts than VOP1/2/C and the
+// generic `Register::name()` path can't render multi-dword register
+// pairs (`v[0:1]`, `s[2:3]`). For these classes we render the full
+// operand string ourselves and append it to `instr.mnemonic`. The
+// `instr.reads` / `writes` lists still carry per-register entries
+// for downstream IR consumers; only the *display* path is custom.
+//
+// Bit layouts (per LLVM SIInstrFormats.td):
+//
+// | Class | Layout                                                              |
+// |-------|---------------------------------------------------------------------|
+// | VOP3  | dword0: `[7:0]` VDST, `[8]` ABS_SRC0, `[9]` ABS_SRC1, `[10]` ABS_SRC2, `[14:8]` SDST (VOP3B), `[15]` CLAMP, `[25:16]` OP, `[31:26]` 0b110101. dword1: `[8:0]` SRC0, `[17:9]` SRC1, `[26:18]` SRC2, `[27]` OPSEL_HI, `[29:28]` OMOD, `[30]` NEG_SRC0, `[31]` NEG_SRC1 (RDNA layout has variations). |
+// | SMEM  | dword0: `[5:0]` SBASE>>1, `[12:6]` SDST, `[14]` DLC, `[16:15]` reserved, `[25:18]` OP, `[31:26]` 0b111101 (GFX10+). dword1: `[20:0]` OFFSET (signed). |
+// | FLAT  | dword0: `[12:0]` OFFSET (signed), `[14]` DLC, `[16:15]` SEG (0=flat, 1=scratch, 2=global), `[17]` SLC, `[24:18]` OP, `[31:26]` 0b110111. dword1: `[7:0]` ADDR, `[15:8]` DATA, `[22:16]` SADDR, `[31:24]` VDST. |
+
+fn populate_vop3_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
+    let arch = Architecture::Amdgpu(target);
+    let family = encoding_family_for(target.family);
+    let op = ((dword0 >> 16) & 0x3ff) as u16;
+
+    // VOP3 dword1 carries the SRC fields. We don't always have it
+    // (decode_instruction passes Option<u32>), but VOP3 is by spec
+    // 64-bit so dword1 should be present at this point in the call.
+    // populate_operands receives only dword0 — we encode dword1
+    // back from raw bytes if we need it. Look at the trailing 4
+    // bytes of `instr.bytes`.
+    let dword1 = if instr.bytes.len() >= 8 {
+        u32::from_le_bytes([
+            instr.bytes[4],
+            instr.bytes[5],
+            instr.bytes[6],
+            instr.bytes[7],
+        ])
+    } else {
+        0
+    };
+
+    // Sizes: hard-coded for the OPs we currently know. Default to
+    // single-dword. The mnemonic suffix (`_b32` / `_b64` / `_u64_u32`
+    // etc.) tells us widths for most ops.
+    let (dst_dwords, src_dwords) = vop3_widths(&instr.mnemonic, family, op);
+    let writes_vdst = vop3_writes_explicit_vdst(&instr.mnemonic);
+    let is_vop3b = is_vop3b_form(&instr.mnemonic);
+    let n_src = vop3_src_count(&instr.mnemonic);
+
+    let vdst = (dword0 & 0xff) as u16;
+    let sdst = ((dword0 >> 8) & 0x7f) as u16; // VOP3B SDST
+    let src0 = (dword1 & 0x1ff) as u16;
+    let src1 = ((dword1 >> 9) & 0x1ff) as u16;
+    let src2 = ((dword1 >> 18) & 0x1ff) as u16;
+
+    // Modifiers (NEG bits at [31:29] of dword1 in VOP3A).
+    let neg_src0 = (dword1 >> 29) & 1 != 0;
+    let neg_src1 = (dword1 >> 30) & 1 != 0;
+    let neg_src2 = (dword1 >> 31) & 1 != 0;
+
+    let mut parts = Vec::new();
+    if writes_vdst {
+        parts.push(render_vgpr_range(vdst, dst_dwords));
+    }
+    if is_vop3b {
+        parts.push(render_sgpr_range(sdst, 1));
+    }
+    if n_src >= 1 {
+        parts.push(render_amdgpu_operand_string(src0, src_dwords[0], neg_src0));
+    }
+    if n_src >= 2 {
+        parts.push(render_amdgpu_operand_string(src1, src_dwords[1], neg_src1));
+    }
+    if n_src >= 3 {
+        parts.push(render_amdgpu_operand_string(src2, src_dwords[2], neg_src2));
+    }
+
+    instr.mnemonic = format!("{} {}", instr.mnemonic, parts.join(", "));
+
+    // Track reads/writes for downstream consumers WITHOUT pushing
+    // to `instr.operands` — the operand string is already in the
+    // mnemonic, so a generic Display would otherwise duplicate
+    // every register it appears.
+    let _ = arch;
+    if writes_vdst {
+        track_vgpr_write(instr, target, vdst);
+    }
+    push_amdgpu_operand_no_print(instr, Architecture::Amdgpu(target), src0, false);
+    if n_src >= 2 {
+        push_amdgpu_operand_no_print(instr, Architecture::Amdgpu(target), src1, false);
+    }
+    if n_src >= 3 {
+        push_amdgpu_operand_no_print(instr, Architecture::Amdgpu(target), src2, false);
+    }
+}
+
+/// VOPC encoded as VOP3 (`v_cmp_*_e64`, `v_cmpx_*_e64`) writes the
+/// result implicitly to EXEC; the VDST field carries the EXEC
+/// reference and llvm-objdump doesn't render it. Same for any
+/// instruction where the VDST is metadata, not an output register.
+fn vop3_writes_explicit_vdst(mnemonic: &str) -> bool {
+    !mnemonic.starts_with("v_cmp_") && !mnemonic.starts_with("v_cmpx_")
+}
+
+/// VOP3B forms — the carry-add / divide-scale family that uses
+/// `[14:8]` SDST as a separate output (typically vcc / null).
+fn is_vop3b_form(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "v_add_co_u32"
+            | "v_sub_co_u32"
+            | "v_subrev_co_u32"
+            | "v_addc_u32"
+            | "v_subb_u32"
+            | "v_subbrev_u32"
+            | "v_mad_u64_u32"
+            | "v_mad_i64_i32"
+            | "v_div_scale_f32"
+            | "v_div_scale_f64"
+    )
+}
+
+/// Number of source operands the VOP3 mnemonic actually uses (so we
+/// don't print src2 for 2-source ops like `v_lshlrev_b64`).
+fn vop3_src_count(mnemonic: &str) -> u8 {
+    if mnemonic.starts_with("v_cmp_") || mnemonic.starts_with("v_cmpx_") {
+        return 2;
+    }
+    if matches!(
+        mnemonic,
+        "v_lshlrev_b64"
+            | "v_lshrrev_b64"
+            | "v_ashrrev_i64"
+            | "v_add_co_u32"
+            | "v_sub_co_u32"
+            | "v_subrev_co_u32"
+    ) {
+        return 2;
+    }
+    3
+}
+
+fn track_vgpr_write(instr: &mut Instruction, target: GfxArchitecture, id: u16) {
+    // VDST in VOP3 is an 8-bit field referencing a VGPR by absolute
+    // index 0..255. Add to writes only — no generic operand push.
+    instr.writes.push(Register::new(
+        Architecture::Amdgpu(target),
+        RegisterClass::General,
+        id + 256,
+        32,
+    ));
+}
+
+fn populate_smem_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
+    let arch = Architecture::Amdgpu(target);
+    let _ = arch;
+    let dword1 = if instr.bytes.len() >= 8 {
+        u32::from_le_bytes([
+            instr.bytes[4],
+            instr.bytes[5],
+            instr.bytes[6],
+            instr.bytes[7],
+        ])
+    } else {
+        0
+    };
+    // SBASE is in `[5:0]` shifted left by 1 (always even SGPR pair).
+    let sbase = ((dword0 & 0x3f) as u16) << 1;
+    let sdst = ((dword0 >> 6) & 0x7f) as u16;
+    let offset = dword1 & 0x1f_ffff; // 21-bit unsigned offset
+    let dst_dwords = sdst_dwords_from_smem_mnemonic(&instr.mnemonic);
+
+    let sbase_str = render_sgpr_range(sbase, 2); // SBASE is always pair (64-bit)
+    let sdst_str = render_sgpr_range(sdst, dst_dwords);
+    let offset_str = if offset == 0 {
+        // llvm-objdump renders an absent SOFFSET as `null` rather
+        // than `0` — match that for clean diff comparison.
+        "null".to_string()
+    } else {
+        format!("0x{offset:x}")
+    };
+
+    instr.mnemonic = format!(
+        "{} {}, {}, {}",
+        instr.mnemonic, sdst_str, sbase_str, offset_str
+    );
+
+    // Mark reads/writes — sdst is written; sbase is read.
+    for i in 0..dst_dwords {
+        instr.writes.push(Register::new(
+            arch,
+            RegisterClass::General,
+            sdst.wrapping_add(i as u16),
+            32,
+        ));
+    }
+    for i in 0..2 {
+        instr.reads.push(Register::new(
+            arch,
+            RegisterClass::General,
+            sbase.wrapping_add(i),
+            32,
+        ));
+    }
+}
+
+fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
+    let arch = Architecture::Amdgpu(target);
+    let dword1 = if instr.bytes.len() >= 8 {
+        u32::from_le_bytes([
+            instr.bytes[4],
+            instr.bytes[5],
+            instr.bytes[6],
+            instr.bytes[7],
+        ])
+    } else {
+        0
+    };
+    let offset = dword0 & 0x1fff; // 13-bit signed offset
+    let seg = ((dword0 >> 14) & 0x3) as u8;
+    let addr = (dword1 & 0xff) as u16;
+    let data = ((dword1 >> 8) & 0xff) as u16;
+    let saddr = ((dword1 >> 16) & 0x7f) as u16;
+    let vdst = ((dword1 >> 24) & 0xff) as u16;
+
+    let is_load = matches!(instr.operation, Operation::Load);
+    let is_store = matches!(instr.operation, Operation::Store);
+    let dst_dwords = data_dwords_from_flat_mnemonic(&instr.mnemonic);
+    let addr_dwords = if seg == 1 { 1 } else { 2 }; // scratch=1, flat/global=2
+
+    let addr_str = render_vgpr_range(addr, addr_dwords);
+    let saddr_str = if saddr == 0x7c {
+        "off".to_string()
+    } else {
+        render_sgpr_range(saddr, 2)
+    };
+
+    if is_load {
+        let dst_str = render_vgpr_range(vdst, dst_dwords);
+        instr.mnemonic = format!(
+            "{} {}, {}, {}",
+            instr.mnemonic, dst_str, addr_str, saddr_str
+        );
+        for i in 0..dst_dwords {
+            instr.writes.push(Register::new(
+                arch,
+                RegisterClass::General,
+                vdst.wrapping_add(i as u16) + 256,
+                32,
+            ));
+        }
+    } else if is_store {
+        let data_str = render_vgpr_range(data, dst_dwords);
+        instr.mnemonic = format!(
+            "{} {}, {}, {}",
+            instr.mnemonic, addr_str, data_str, saddr_str
+        );
+        for i in 0..dst_dwords {
+            instr.reads.push(Register::new(
+                arch,
+                RegisterClass::General,
+                data.wrapping_add(i as u16) + 256,
+                32,
+            ));
+        }
+    } else {
+        // Atomics, etc. — render the address only for now.
+        instr.mnemonic = format!("{} {}, {}", instr.mnemonic, addr_str, saddr_str);
+    }
+    if offset != 0 {
+        // Sign-extend the 13-bit offset.
+        let signed = ((offset << 19) as i32) >> 19;
+        if signed != 0 {
+            instr.mnemonic = format!("{} offset:{}", instr.mnemonic, signed);
+        }
+    }
+
+    for i in 0..addr_dwords {
+        instr.reads.push(Register::new(
+            arch,
+            RegisterClass::General,
+            addr.wrapping_add(i as u16) + 256,
+            32,
+        ));
+    }
+}
+
+// -- Helpers --
+
+/// Render a VGPR range as `vN` (single) or `v[N:M]` (multi-dword).
+fn render_vgpr_range(base: u16, dwords: u8) -> String {
+    if base == 0x7c && dwords == 1 {
+        // Some instructions encode `null` in the VDST slot.
+        return "null".to_string();
+    }
+    if dwords <= 1 {
+        format!("v{base}")
+    } else {
+        format!("v[{}:{}]", base, base.saturating_add(dwords as u16 - 1))
+    }
+}
+
+/// Render an SGPR range as `sN` (single) or `s[N:M]` (multi-dword).
+fn render_sgpr_range(base: u16, dwords: u8) -> String {
+    if base == 0x7c && dwords == 1 {
+        return "null".to_string();
+    }
+    // Specials.
+    match base {
+        106 if dwords == 2 => return "vcc".to_string(),
+        106 => return "vcc_lo".to_string(),
+        107 => return "vcc_hi".to_string(),
+        124 => return "m0".to_string(),
+        126 if dwords == 2 => return "exec".to_string(),
+        126 => return "exec_lo".to_string(),
+        127 => return "exec_hi".to_string(),
+        _ => {}
+    }
+    if dwords <= 1 {
+        format!("s{base}")
+    } else {
+        format!("s[{}:{}]", base, base.saturating_add(dwords as u16 - 1))
+    }
+}
+
+/// Render a 9-bit operand id with optional negation modifier and
+/// width awareness. Inline integer/float constants surface as the
+/// literal value; SGPRs/VGPRs go through the range-aware path.
+fn render_amdgpu_operand_string(id: u16, dwords: u8, negate: bool) -> String {
+    let prefix = if negate { "-" } else { "" };
+    // null sink (RDNA).
+    if id == 0x7c {
+        return format!("{prefix}null");
+    }
+    // Inline integer constants.
+    if let Some(v) = inline_constant_value(id) {
+        return format!("{prefix}{v}");
+    }
+    // Float inline constants.
+    let float = match id {
+        240 => Some("0.5"),
+        241 => Some("-0.5"),
+        242 => Some("1.0"),
+        243 => Some("-1.0"),
+        244 => Some("2.0"),
+        245 => Some("-2.0"),
+        246 => Some("4.0"),
+        247 => Some("-4.0"),
+        248 => Some("0x3e22f983"), // 1/(2*PI) — render as the LLVM-canonical hex.
+        _ => None,
+    };
+    if let Some(f) = float {
+        return format!("{prefix}{f}");
+    }
+    // VGPRs (id 256..511 — strip the offset and render as range).
+    if (256..512).contains(&id) {
+        return format!("{prefix}{}", render_vgpr_range(id - 256, dwords));
+    }
+    // SGPRs and specials.
+    format!("{prefix}{}", render_sgpr_range(id, dwords))
+}
+
+/// Like `push_amdgpu_operand` but doesn't emit the operand into the
+/// `Instruction::operands` list — used by the populator paths that
+/// render the operand string directly into the mnemonic.
+fn push_amdgpu_operand_no_print(instr: &mut Instruction, arch: Architecture, id: u16, write: bool) {
+    if inline_constant_value(id).is_some() || (240..=248).contains(&id) {
+        return; // immediate, no register to track
+    }
+    if id == 0x7c {
+        return; // null sink, no register
+    }
+    let reg = Register::new(arch, RegisterClass::General, id, 32);
+    if write {
+        instr.writes.push(reg);
+    } else {
+        instr.reads.push(reg);
+    }
+}
+
+/// Width inference for VOP3 dst / src fields based on the mnemonic
+/// suffix. Returns `(dst_dwords, [src0_dwords, src1_dwords,
+/// src2_dwords])`. Hand-encoded for the OPs in the v1.3.4 GFX10/11
+/// tables; M10.5 corpus widening will grow it.
+fn vop3_widths(mnemonic: &str, _family: EncodingFamily, _op: u16) -> (u8, [u8; 3]) {
+    // Defaults: 32-bit on both sides.
+    let mut dst = 1u8;
+    let mut src = [1u8; 3];
+
+    // Dest side: if mnemonic ends in `_b64` / `_u64_*` / `_i64_*` /
+    // `_f64`, dest is 64-bit (2 dwords).
+    if mnemonic.contains("_b64") || mnemonic.contains("_f64") {
+        dst = 2;
+    }
+    // v_mad_u64_u32: dest is 64-bit, src0/src1 are 32-bit, src2 is
+    // 64-bit (the carry-add accumulator).
+    if mnemonic == "v_mad_u64_u32" || mnemonic == "v_mad_i64_i32" {
+        dst = 2;
+        src[2] = 2;
+    }
+    // v_lshlrev_b64 / v_lshrrev_b64 / v_ashrrev_i64: dst + src1 are
+    // 64-bit, src0 (shift amount) is 32-bit.
+    if matches!(
+        mnemonic,
+        "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64"
+    ) {
+        dst = 2;
+        src[1] = 2;
+    }
+
+    (dst, src)
+}
+
+/// SMEM SDST width inference from `s_load_b{32,64,128,256,512}` etc.
+fn sdst_dwords_from_smem_mnemonic(mnemonic: &str) -> u8 {
+    let suffix = mnemonic
+        .strip_prefix("s_load_b")
+        .or_else(|| mnemonic.strip_prefix("s_buffer_load_b"))
+        .or_else(|| mnemonic.strip_prefix("s_load_dword"));
+    match suffix {
+        Some("32") | Some("") => 1,
+        Some("64") | Some("x2") => 2,
+        Some("128") | Some("x4") => 4,
+        Some("256") | Some("x8") => 8,
+        Some("512") | Some("x16") => 16,
+        Some("3") => 3, // x3
+        _ => 1,
+    }
+}
+
+/// FLAT data width inference from `flat_load_b{32,64,128}` /
+/// `global_load_b{32,64}` / `flat_load_dword*` etc.
+fn data_dwords_from_flat_mnemonic(mnemonic: &str) -> u8 {
+    // Try standard `_b<N>` suffix.
+    for prefix in [
+        "flat_load_b",
+        "flat_store_b",
+        "global_load_b",
+        "global_store_b",
+        "scratch_load_b",
+        "scratch_store_b",
+    ] {
+        if let Some(suffix) = mnemonic.strip_prefix(prefix) {
+            return match suffix {
+                "32" => 1,
+                "64" => 2,
+                "96" => 3,
+                "128" => 4,
+                _ => 1,
+            };
+        }
+    }
+    // Fallback: legacy `_dword[xN]` suffix used by RDNA2 mnemonics.
+    if let Some(suffix) = mnemonic
+        .strip_prefix("flat_load_dword")
+        .or_else(|| mnemonic.strip_prefix("flat_store_dword"))
+        .or_else(|| mnemonic.strip_prefix("global_load_dword"))
+        .or_else(|| mnemonic.strip_prefix("global_store_dword"))
+        .or_else(|| mnemonic.strip_prefix("scratch_load_dword"))
+        .or_else(|| mnemonic.strip_prefix("scratch_store_dword"))
+    {
+        return match suffix {
+            "" => 1,
+            "x2" => 2,
+            "x3" => 3,
+            "x4" => 4,
+            _ => 1,
+        };
+    }
+    1
 }
 
 /// Best-effort control-flow inference from the encoding class.
