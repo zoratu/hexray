@@ -5,6 +5,105 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-04-25
+
+### Highlights — AMDGPU operand decoding, MessagePack metadata, real scale-lang demo
+
+v1.3.2 closes the three biggest gaps the v1.3.1 AMDGPU support left
+open and ships a real end-to-end scale-lang interop demo backed by
+SCALE-built binaries committed to the repo.
+
+```bash
+# Hands-on, validated with SCALE 1.4.2 on Ubuntu 25.10:
+hexray vector_add.gfx1030.co info
+hexray -s vector_add vector_add.gfx1030.co
+hexray vector_add.gfx1030.co cmp vector_add.gfx1100.co
+```
+
+```
+<vector_add$local>:
+0x00000100:  02 00 a1 bf              sopp.op0x21
+0x00000104:  02 00 00 f4 38 00 00 fa  s_load_dword
+...
+0x00000120:  00 06 00 81              s_add_i32 s0, s0, s6
+...
+0x000001a0:  00 00 81 bf              s_endpgm
+
+hexray cmp
+==========
+a: amdgpu (gfx1030, family=Rdna2)
+b: amdgpu (gfx1100, family=Rdna3)
+
+Kernel: vector_add
+  primary regs    a=8            b=8            ✓
+  scalar regs     a=16           b=24           differ
+  kernarg/param   a=88B          b=88B          ✓
+  shared/LDS      a=0B           b=0B           ✓
+
+Matched 1 kernel(s).
+```
+
+What's new:
+
+- **AMDGPU operand decoding**: VOP1 / VOP2 / VOPC / SOP1 / SOP2 /
+  SOPP now render destination + source operands instead of just
+  the mnemonic. Bit layouts per LLVM `SIInstrFormats.td`
+  (`[8:0]` SRC0, `[16:9]` OP/VSRC1, `[24:17]` VDST/SDST, …).
+  SOPP branches render PC-relative target addresses
+  (`s_cbranch_execz 0x1a0`). Inline integer constants `0..=64`
+  and `-1..=-16` decode to `Operand::Immediate`; vgprs/sgprs/
+  vcc/exec render via the central `amdgpu_reg_name` table in
+  `hexray-core/src/register.rs`.
+- **`NT_AMDGPU_METADATA` MessagePack decode**: hand-rolled minimal
+  MessagePack reader in `hexray-formats/src/elf/amdgpu/msgpack.rs`
+  (~200 lines, no external deps). Schema-aware decoder in
+  `metadata.rs` extracts the `amdhsa.kernels[*]` records into
+  typed `AmdMetadataKernel` / `AmdMetadataArg` records. The view
+  builder walks every SHT_NOTE section, finds records with name
+  `"AMDGPU"` and type 32, and attaches the per-kernel record to
+  the matching `Kernel`.
+- **`hexray cmp` per-arg comparison**: when both binaries carry
+  argument metadata (CUDA `KPARAM_INFO` records on the cubin
+  side, `NT_AMDGPU_METADATA` on the AMDGPU side), the report now
+  prints `arg count` + `arg [i] size` rows. Argument count and
+  sizes are Structural (mismatches exit non-zero); the existing
+  vgpr/sgpr/lds rows remain Informational.
+- **Real scale-lang fixtures**: `tests/corpus/scale-lang/`
+  ships a real `vector_add.cu` plus the SCALE 1.4.2-built
+  `vector_add.gfx1030.co` and `vector_add.gfx1100.co` code
+  objects (~2KB each). Three integration tests in
+  `crates/hexray/tests/scale_lang_cmp.rs` drive `hexray info`,
+  `hexray -s vector_add`, and `hexray cmp` against them.
+- **`docs/SCALE_INTEROP.md`** walks through the demo end-to-end
+  with the real cmp output captured into the tree. README and
+  AMDGPU.md cross-link to it.
+
+Breaking changes: none. Backwards-compatible additions
+(`KernelSummary` gains a private `args` field; `Kernel` (AMDGPU
+view) gains `metadata: Option<AmdMetadataKernel>`).
+
+Workspace: 2358 tests pass with `--features amdgpu cuda`. Clippy
+clean with `-D warnings`.
+
+Known gaps remaining (the v1.3.3 docket):
+
+- VOP3 / SMEM / MUBUF / DS / FLAT / MIMG / EXP operand layouts
+  decode at the class level but don't render full operands yet
+  (placeholder `<class>.op0xNN` for opcodes outside the M10.4
+  first-pass tables — the dispatch is solid, just needs more
+  table rows).
+- HIP host-binary fatbin extraction (clang offload bundle wrapper
+  with `__CLANG_OFFLOAD_BUNDLE__` magic). Same pattern as the
+  v1.3.0 NVIDIA `FatbinWrapper`; deferred to v1.3.3.
+- CDNA MFMA / WMMA matrix opcodes, VOP3P packed math, DPP / SDWA
+  modifiers. Encoding-class dispatch covers them; opcode tables
+  stay first-pass until we have a corpus to harvest from.
+- SCALE `scale-free` emits a SCALE-specific `.AMDGPU.kinfo`
+  section *instead of* the standard `NT_AMDGPU_METADATA` note,
+  so the per-arg cmp rows render only when both binaries use the
+  standard format. The commercial SCALE build (and `hipcc` /
+  `clang amdgcn-amd-amdhsa`) emit the standard note.
+
 ## [1.3.1] - 2026-04-25
 
 ### Highlights — AMDGPU / AMD GPU support + scale-lang interop

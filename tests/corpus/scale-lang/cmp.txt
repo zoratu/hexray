@@ -1,0 +1,13 @@
+hexray cmp
+==========
+a: amdgpu (gfx1030, family=Rdna2)
+b: amdgpu (gfx1100, family=Rdna3)
+
+Kernel: vector_add
+  primary regs    a=8            b=8            ✓
+  scalar regs     a=16           b=24           differ
+  kernarg/param   a=88B          b=88B          ✓
+  shared/LDS      a=0B           b=0B           ✓
+  exit count      a=—            b=—            ✓
+
+Matched 1 kernel(s).
