@@ -125,6 +125,56 @@ fn disasm_renders_real_operands() {
 }
 
 #[test]
+fn disasm_decodes_sopp_simm16_subfields() {
+    // gfx1100 fixture exercises s_clause, s_waitcnt, s_delay_alu —
+    // each with non-trivial SIMM16 sub-fields.
+    if !corpus_path("vector_add.gfx1100.co").exists() {
+        eprintln!("gfx1100 fixture not present, skipping");
+        return;
+    }
+    let path = corpus_path("vector_add.gfx1100.co");
+    let output = Command::new(hexray_bin())
+        .arg("-s")
+        .arg("vector_add")
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("hexray runs");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // s_clause renders the count.
+    assert!(
+        stdout.contains("s_clause 0x2"),
+        "expected `s_clause 0x2`, got:\n{stdout}"
+    );
+    // s_waitcnt with GFX11 layout: lgkmcnt(0) (vmcnt + expcnt at max).
+    assert!(
+        stdout.contains("s_waitcnt lgkmcnt(0)"),
+        "expected `s_waitcnt lgkmcnt(0)`, got:\n{stdout}"
+    );
+    // s_delay_alu — RDNA3 scheduling hint with full sub-field decode.
+    assert!(
+        stdout
+            .contains("s_delay_alu instid0(SALU_CYCLE_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)"),
+        "expected s_delay_alu sub-field decode, got:\n{stdout}"
+    );
+
+    // Verify the gfx1030 (RDNA2) layout still works:
+    let path = corpus_path("vector_add.gfx1030.co");
+    let output = Command::new(hexray_bin())
+        .arg("-s")
+        .arg("vector_add")
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("hexray runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("s_waitcnt lgkmcnt(0)"),
+        "GFX10 s_waitcnt regression: {stdout}"
+    );
+}
+
+#[test]
 fn disasm_renders_register_pairs_and_null() {
     if !corpus_path("vector_add.gfx1100.co").exists() {
         eprintln!("gfx1100 fixture not present, skipping");

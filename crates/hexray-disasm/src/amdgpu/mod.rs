@@ -419,18 +419,18 @@ fn populate_operands(
             push_amdgpu_operand(instr, arch, ssrc1, false);
         }
         EncodingClass::Sopp => {
-            // Most SOPP forms (s_endpgm, s_nop, s_barrier) take no
-            // visible operands. s_branch / s_cbranch_* take a 16-bit
-            // signed SIMM16 — render as PC-relative.
-            //
-            // The set of "is this a branch" OPs differs between
-            // bands (RDNA2 puts them at 0x02..=0x09; RDNA3 moved them
-            // to 0x20..=0x26), so we look the entry up in the
-            // opcode table and gate on the resulting `Operation`.
+            // SOPP carries either branches (PC-relative SIMM16) or
+            // bare opcodes whose SIMM16 has class-specific bitfield
+            // semantics (s_waitcnt: vmcnt | lgkmcnt | expcnt;
+            // s_delay_alu: instid0 | instskip | instid1; s_clause:
+            // instruction count). Family-aware dispatch via the
+            // opcode table.
             let op = ((dword0 >> 16) & 0x7f) as u16;
-            let simm16 = (dword0 & 0xffff) as i16;
+            let simm16_u = (dword0 & 0xffff) as u16;
+            let simm16 = simm16_u as i16;
             let family = encoding_family_for(target.family);
-            let is_branch = opcodes::lookup(opcodes::TableClass::Sopp, family, op)
+            let entry = opcodes::lookup(opcodes::TableClass::Sopp, family, op);
+            let is_branch = entry
                 .map(|e| matches!(e.operation, Operation::Jump | Operation::ConditionalJump))
                 .unwrap_or(false);
             if is_branch {
@@ -439,6 +439,16 @@ fn populate_operands(
                 instr
                     .operands
                     .push(Operand::pc_rel((simm16 as i64) * 4, target_addr));
+                // PcRelative's Display renders the absolute target;
+                // we don't append the SIMM16 here so the output stays
+                // single-token (matching `llvm-objdump`'s decimal
+                // label-offset form is a future cosmetic).
+            } else if let Some(entry) = entry {
+                if let Some(rendered) = render_sopp_simm16(entry.mnemonic, simm16_u, family) {
+                    if !rendered.is_empty() {
+                        instr.mnemonic = format!("{} {}", instr.mnemonic, rendered);
+                    }
+                }
             }
         }
         EncodingClass::Vop3a | EncodingClass::Vop3b => {
@@ -999,6 +1009,157 @@ fn data_dwords_from_flat_mnemonic(mnemonic: &str) -> u8 {
 /// Best-effort control-flow inference from the encoding class.
 ///
 /// SOPP carries branches and `s_endpgm` (kernel exit); the OP
+/// Render the SOPP SIMM16 immediate as LLVM-style sub-fields for
+/// the opcodes that carry meaningful bitfields (s_waitcnt /
+/// s_delay_alu / s_clause / s_wait_*). Returns the rendered string
+/// (without leading space) or `None` if the OP doesn't have a
+/// known sub-field structure.
+///
+/// References:
+/// - **s_waitcnt** (GFX9/10/11): `[3:0]` vmcnt[3:0], `[6:4]` expcnt,
+///   `[15:8]` lgkmcnt[7:0], `[15:14] | [11:10]` vmcnt[5:4]/[5:4]
+///   pieces — RDNA1+ widened vmcnt to 6 bits.
+/// - **s_delay_alu** (GFX11+): `[3:0]` instid0, `[6:4]` instskip,
+///   `[10:7]` instid1.
+/// - **s_clause** (RDNA): SIMM16 is the count of clause-grouped
+///   instructions (low bits).
+/// - **s_wait_loadcnt / s_wait_kmcnt** (GFX11+): SIMM16 is the
+///   per-counter wait value.
+fn render_sopp_simm16(mnemonic: &str, simm16: u16, family: EncodingFamily) -> Option<String> {
+    match mnemonic {
+        "s_waitcnt" => Some(render_waitcnt(simm16, family)),
+        "s_delay_alu" => Some(render_delay_alu(simm16)),
+        "s_clause" => {
+            // SIMM16 low 6 bits = count of next-clause instructions
+            // (encoded as count - 1 on RDNA per LLVM SOPPInstructions.td).
+            let count = (simm16 & 0x3f) as u32 + 1;
+            Some(format!("{:#x}", count - 1))
+        }
+        "s_nop" => {
+            // Encoded as count - 1 (s_nop 0 → no extra cycles).
+            Some(format!("{}", simm16 & 0xf))
+        }
+        "s_wait_loadcnt" | "s_wait_kmcnt" | "s_wait_storecnt" | "s_wait_samplecnt"
+        | "s_wait_bvhcnt" | "s_wait_dscnt" | "s_wait_expcnt" => {
+            // GFX11+ separate-counter waits: SIMM16 carries the per-counter
+            // immediate value directly.
+            Some(format!("{:#x}", simm16))
+        }
+        _ => None,
+    }
+}
+
+fn render_waitcnt(simm16: u16, family: EncodingFamily) -> String {
+    // SIMM16 layout differs between bands:
+    //
+    // - GFX9: VMCNT[3:0]=[3:0], EXPCNT=[6:4], LGKMCNT[3:0]=[11:8],
+    //   no high VMCNT bits (4-bit total).
+    // - GFX10: VMCNT[3:0]=[3:0], EXPCNT=[6:4], LGKMCNT[5:0]=[13:8],
+    //   VMCNT[5:4]=[15:14] (6-bit total).
+    // - GFX11: completely reshuffled — VMCNT[5:0]=[15:10] split,
+    //   LGKMCNT[5:0]=[9:4], EXPCNT[2:0]=[3:0]. Confirmed by reverse-
+    //   engineering the SCALE gfx1100 fixture against `llvm-objdump`.
+    //
+    // For GFX11 we use the shuffled layout. For GFX9/GFX10 we use
+    // the older one.
+    let (vmcnt, expcnt, lgkmcnt, vmcnt_max, lgkmcnt_max, expcnt_max) = match family {
+        EncodingFamily::Gfx9 => {
+            let vmcnt = (simm16 & 0xf) as u32;
+            let expcnt = ((simm16 >> 4) & 0x7) as u32;
+            let lgkmcnt = ((simm16 >> 8) & 0xf) as u32;
+            (vmcnt, expcnt, lgkmcnt, 0xf, 0xf, 0x7)
+        }
+        EncodingFamily::Gfx10Plus => {
+            let vmcnt_lo = (simm16 & 0xf) as u32;
+            let expcnt = ((simm16 >> 4) & 0x7) as u32;
+            let lgkmcnt = ((simm16 >> 8) & 0x3f) as u32;
+            let vmcnt_hi = ((simm16 >> 14) & 0x3) as u32;
+            let vmcnt = (vmcnt_hi << 4) | vmcnt_lo;
+            (vmcnt, expcnt, lgkmcnt, 0x3f, 0x3f, 0x7)
+        }
+        EncodingFamily::Gfx11Plus => {
+            // GFX11 unified s_waitcnt layout (validated against
+            // `llvm-objdump --mcpu=gfx1100` on the SCALE fixture):
+            //   VMCNT  at [15:10]
+            //   LGKMCNT at [9:4]
+            //   EXPCNT  at [2:0]  (bit 3 reserved / no field)
+            let vmcnt = ((simm16 >> 10) & 0x3f) as u32;
+            let lgkmcnt = ((simm16 >> 4) & 0x3f) as u32;
+            let expcnt = (simm16 & 0x7) as u32;
+            (vmcnt, expcnt, lgkmcnt, 0x3f, 0x3f, 0x7)
+        }
+    };
+    let mut parts = Vec::new();
+    if vmcnt < vmcnt_max {
+        parts.push(format!("vmcnt({vmcnt})"));
+    }
+    if expcnt < expcnt_max {
+        parts.push(format!("expcnt({expcnt})"));
+    }
+    if lgkmcnt < lgkmcnt_max {
+        parts.push(format!("lgkmcnt({lgkmcnt})"));
+    }
+    if parts.is_empty() {
+        // All maxed out — `s_waitcnt 0xffff` "wait nothing" form.
+        format!("{simm16:#x}")
+    } else {
+        parts.join(" & ")
+    }
+}
+
+fn render_delay_alu(simm16: u16) -> String {
+    let instid0 = simm16 & 0xf;
+    let instskip = (simm16 >> 4) & 0x7;
+    let instid1 = (simm16 >> 7) & 0xf;
+    let mut parts = Vec::new();
+    if instid0 != 0 {
+        parts.push(format!("instid0({})", delay_alu_id_name(instid0)));
+    }
+    if instskip != 0 {
+        parts.push(format!("instskip({})", delay_alu_skip_name(instskip)));
+    }
+    if instid1 != 0 {
+        parts.push(format!("instid1({})", delay_alu_id_name(instid1)));
+    }
+    if parts.is_empty() {
+        format!("{:#x}", simm16)
+    } else {
+        parts.join(" | ")
+    }
+}
+
+/// `s_delay_alu` instid* field encoding.
+fn delay_alu_id_name(id: u16) -> &'static str {
+    match id {
+        0 => "NO_DEP",
+        1 => "VALU_DEP_1",
+        2 => "VALU_DEP_2",
+        3 => "VALU_DEP_3",
+        4 => "VALU_DEP_4",
+        5 => "TRANS32_DEP_1",
+        6 => "TRANS32_DEP_2",
+        7 => "TRANS32_DEP_3",
+        8 => "FMA_ACCUM_CYCLE_1",
+        9 => "SALU_CYCLE_1",
+        10 => "SALU_CYCLE_2",
+        11 => "SALU_CYCLE_3",
+        _ => "?",
+    }
+}
+
+/// `s_delay_alu` instskip field encoding.
+fn delay_alu_skip_name(skip: u16) -> &'static str {
+    match skip {
+        0 => "SAME",
+        1 => "NEXT",
+        2 => "SKIP_1",
+        3 => "SKIP_2",
+        4 => "SKIP_3",
+        5 => "SKIP_4",
+        _ => "?",
+    }
+}
+
 /// numbering shifted between bands so we read it through the
 /// family-aware opcode table rather than hard-coding the GFX10
 /// numbers.
