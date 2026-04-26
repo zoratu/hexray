@@ -1,0 +1,26 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+assertion_line: 322
+expression: normalized
+---
+Binary Information
+==================
+Format:        ELF
+Architecture:  amdgpu (gfx906:xnack+:sramecc-, family=Gcn5)
+Endianness:    Little
+Bitness:       Bits64
+Type:          Relocatable
+Machine:       Amdgpu
+
+Sections:      6
+Segments:      0
+
+AMDGPU Code Object View
+-----------------------
+Target:        gfx906:xnack+:sramecc-
+Kernels:       1
+  vector_add
+    entry=0x40  kd=0x48  wave64  vgprs=12  sgprs=16
+    kernarg=24B  lds=768B  scratch=0B  user_sgprs=0
+
+Symbols:       3

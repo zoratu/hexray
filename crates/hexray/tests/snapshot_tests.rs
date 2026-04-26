@@ -283,6 +283,229 @@ fn snapshot_info_cubin() {
     insta::assert_snapshot!("info_cubin", normalized);
 }
 
+/// Lock the AMDGPU-info output format. Generates a tiny synthetic
+/// gfx906 code object at test time — hermetic, doesn't depend on
+/// ROCm being installed.
+#[test]
+fn snapshot_info_amdgpu() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("hexray-snapshot-amdgpu");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gfx906_stub.co");
+
+    let bytes = synth_amdgpu_codeobject(
+        "vector_add",
+        // raw vgpr=2 → 12 vgprs (gfx906 wave64), raw sgpr=1 → 16
+        // sgprs, kernarg=24, granulated_lds=4 (512B dynamic).
+        DescriptorParams {
+            vgpr_raw: 2,
+            sgpr_raw: 1,
+            kernarg: 24,
+            lds_granulated: 4,
+        },
+        // gfx906 mach 0x2F, V4 ABI, xnack=on, sramecc=off.
+        0x2F | (0b11 << 8) | (0b10 << 10),
+    );
+
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+
+    let output = run_hexray(&[path.to_str().unwrap(), "info"]);
+    if !output.status.success() {
+        eprintln!("hexray info failed: {:?}", output);
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let normalized = normalize_output(&stdout);
+    insta::assert_snapshot!("info_amdgpu", normalized);
+}
+
+/// Lock the `hexray cmp` output for two identical AMDGPU code
+/// objects — every row should report `✓`. Hermetic, no ROCm
+/// required.
+#[test]
+fn snapshot_cmp_amdgpu_self() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("hexray-snapshot-cmp");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path_a = dir.join("a.co");
+    let path_b = dir.join("b.co");
+
+    let bytes = synth_amdgpu_codeobject(
+        "vector_add",
+        DescriptorParams {
+            vgpr_raw: 2,
+            sgpr_raw: 1,
+            kernarg: 24,
+            lds_granulated: 4,
+        },
+        0x2F,
+    );
+
+    std::fs::File::create(&path_a)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+    std::fs::File::create(&path_b)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+
+    let output = run_hexray(&[path_a.to_str().unwrap(), "cmp", path_b.to_str().unwrap()]);
+    if !output.status.success() {
+        eprintln!("hexray cmp failed: {:?}", output);
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let normalized = normalize_output(&stdout);
+    insta::assert_snapshot!("cmp_amdgpu_self", normalized);
+}
+
+struct DescriptorParams {
+    vgpr_raw: u32,
+    sgpr_raw: u32,
+    kernarg: u32,
+    lds_granulated: u32,
+}
+
+fn synth_amdgpu_codeobject(kernel: &str, p: DescriptorParams, e_flags: u32) -> Vec<u8> {
+    const KD: usize = 64;
+    const SYM: usize = 24;
+
+    // Build the 64-byte kernel descriptor.
+    let mut kd = [0u8; KD];
+    let rsrc1 = (p.vgpr_raw & 0x3f) | ((p.sgpr_raw & 0xf) << 6);
+    let rsrc2 = (p.lds_granulated & 0x1ff) << 15;
+    kd[0..4].copy_from_slice(&256u32.to_le_bytes()); // 256B static LDS
+    kd[8..12].copy_from_slice(&p.kernarg.to_le_bytes());
+    kd[16..24].copy_from_slice(&0x100i64.to_le_bytes()); // entry offset
+    kd[48..52].copy_from_slice(&rsrc1.to_le_bytes());
+    kd[52..56].copy_from_slice(&rsrc2.to_le_bytes());
+
+    // Section bytes.
+    let text: Vec<u8> = vec![0x01, 0x03, 0x00, 0x7e, 0x00, 0x00, 0x81, 0xbf];
+    let rodata: Vec<u8> = kd.to_vec();
+    let shstr = b"\0.text\0.rodata\0.shstrtab\0.strtab\0.symtab\0";
+    let (sh_text, sh_rodata, sh_shstrtab, sh_strtab, sh_symtab) = (1u32, 7, 15, 25, 33);
+
+    // String table for symbols.
+    let mut strtab = vec![0u8];
+    let entry_off = strtab.len() as u32;
+    strtab.extend_from_slice(kernel.as_bytes());
+    strtab.push(0);
+    let kd_off = strtab.len() as u32;
+    strtab.extend_from_slice(kernel.as_bytes());
+    strtab.extend_from_slice(b".kd\0");
+
+    // Symbol table.
+    let mut symtab = vec![0u8; SYM];
+    let mut push_sym = |name: u32, info: u8, shndx: u16, value: u64, size: u64| {
+        let mut s = [0u8; SYM];
+        s[0..4].copy_from_slice(&name.to_le_bytes());
+        s[4] = info;
+        s[6..8].copy_from_slice(&shndx.to_le_bytes());
+        s[8..16].copy_from_slice(&value.to_le_bytes());
+        s[16..24].copy_from_slice(&size.to_le_bytes());
+        symtab.extend_from_slice(&s);
+    };
+    push_sym(entry_off, 0x12, 1, 0, text.len() as u64); // STT_FUNC
+    push_sym(kd_off, 0x11, 2, 0, KD as u64); // STT_OBJECT
+
+    // Layout.
+    let ehdr = 64u64;
+    let text_off = ehdr;
+    let rodata_off = text_off + text.len() as u64;
+    let shstrtab_off = rodata_off + rodata.len() as u64;
+    let strtab_off = shstrtab_off + shstr.len() as u64;
+    let symtab_off = strtab_off + strtab.len() as u64;
+    let shdrs_off = symtab_off + symtab.len() as u64;
+
+    let mut data = Vec::new();
+    let mut h = vec![0u8; 64];
+    h[0..4].copy_from_slice(b"\x7fELF");
+    h[4] = 2;
+    h[5] = 1;
+    h[6] = 1;
+    h[7] = 64; // ELFOSABI_AMDGPU_HSA
+    h[8] = 2; // V4
+    h[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
+    h[18..20].copy_from_slice(&224u16.to_le_bytes()); // EM_AMDGPU
+    h[20..24].copy_from_slice(&1u32.to_le_bytes());
+    h[40..48].copy_from_slice(&shdrs_off.to_le_bytes());
+    h[48..52].copy_from_slice(&e_flags.to_le_bytes());
+    h[52..54].copy_from_slice(&64u16.to_le_bytes());
+    h[58..60].copy_from_slice(&64u16.to_le_bytes());
+    h[60..62].copy_from_slice(&6u16.to_le_bytes());
+    h[62..64].copy_from_slice(&3u16.to_le_bytes());
+    data.extend_from_slice(&h);
+    data.extend_from_slice(&text);
+    data.extend_from_slice(&rodata);
+    data.extend_from_slice(shstr);
+    data.extend_from_slice(&strtab);
+    data.extend_from_slice(&symtab);
+
+    let mk =
+        |name: u32, ty: u32, flags: u64, off: u64, size: u64, link: u32, info: u32, ent: u64| {
+            let mut h = vec![0u8; 64];
+            h[0..4].copy_from_slice(&name.to_le_bytes());
+            h[4..8].copy_from_slice(&ty.to_le_bytes());
+            h[8..16].copy_from_slice(&flags.to_le_bytes());
+            h[24..32].copy_from_slice(&off.to_le_bytes());
+            h[32..40].copy_from_slice(&size.to_le_bytes());
+            h[40..44].copy_from_slice(&link.to_le_bytes());
+            h[44..48].copy_from_slice(&info.to_le_bytes());
+            h[48..56].copy_from_slice(&1u64.to_le_bytes());
+            h[56..64].copy_from_slice(&ent.to_le_bytes());
+            h
+        };
+    data.extend_from_slice(&[0u8; 64]);
+    data.extend_from_slice(&mk(sh_text, 1, 0x6, text_off, text.len() as u64, 0, 0, 0));
+    data.extend_from_slice(&mk(
+        sh_rodata,
+        1,
+        0x2,
+        rodata_off,
+        rodata.len() as u64,
+        0,
+        0,
+        0,
+    ));
+    data.extend_from_slice(&mk(
+        sh_shstrtab,
+        3,
+        0,
+        shstrtab_off,
+        shstr.len() as u64,
+        0,
+        0,
+        0,
+    ));
+    data.extend_from_slice(&mk(
+        sh_strtab,
+        3,
+        0,
+        strtab_off,
+        strtab.len() as u64,
+        0,
+        0,
+        0,
+    ));
+    data.extend_from_slice(&mk(
+        sh_symtab,
+        2,
+        0,
+        symtab_off,
+        symtab.len() as u64,
+        4,
+        1,
+        SYM as u64,
+    ));
+
+    data
+}
+
 // =============================================================================
 // Sections Command Snapshots
 // =============================================================================

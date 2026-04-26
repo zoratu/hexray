@@ -17,8 +17,8 @@ pub mod register;
 pub mod symbol;
 
 pub use arch::{
-    Architecture, Bitness, CudaArchitecture, Endianness, PtxVersion, SmArchitecture, SmFamily,
-    SmVariant,
+    Architecture, Bitness, CudaArchitecture, Endianness, GfxArchitecture, GfxFamily, PtxVersion,
+    SmArchitecture, SmFamily, SmVariant, TriState,
 };
 pub use basic_block::{BasicBlock, BasicBlockId, BlockTerminator};
 pub use cfg::ControlFlowGraph;

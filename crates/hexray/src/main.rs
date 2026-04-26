@@ -79,6 +79,11 @@ enum Commands {
     },
     /// Show binary header information
     Info,
+    /// Compare two GPU binaries kernel-by-kernel (cross-vendor capable)
+    Cmp {
+        /// Path to the second binary
+        other: PathBuf,
+    },
     /// Disassemble a function and show its CFG
     Cfg {
         /// Symbol name or address
@@ -460,6 +465,9 @@ fn main() -> Result<()> {
         Some(Commands::Info) => {
             print_info(&binary);
         }
+        Some(Commands::Cmp { other }) => {
+            cmp_kernels(&binary, &other)?;
+        }
         Some(Commands::Cfg {
             target,
             dot,
@@ -622,6 +630,11 @@ fn print_info(binary: &Binary) {
             // Display CUDA CUBIN info if this is an EM_CUDA ELF.
             if let Ok(view) = elf.cubin_view() {
                 print_cubin_info(&view);
+            }
+
+            // Display AMDGPU code-object info if this is an EM_AMDGPU ELF.
+            if let Ok(view) = elf.code_object_view() {
+                print_amdgpu_info(&view);
             }
 
             // Display kernel module info if present
@@ -957,6 +970,10 @@ fn disassemble_at(fmt: &dyn BinaryFormat, address: u64, max_bytes: usize) -> Res
         }
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
             let disasm = hexray_disasm::cuda::SassDisassembler::for_sm(sm);
+            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+        }
+        Architecture::Amdgpu(target) => {
+            let disasm = hexray_disasm::amdgpu::AmdgpuDisassembler::for_target(target);
             disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
         }
         _ => {
@@ -4048,6 +4065,10 @@ fn disassemble_block_for_arch(
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
             hexray_disasm::cuda::SassDisassembler::for_sm(sm).disassemble_block(bytes, start_addr)
         }
+        Architecture::Amdgpu(target) => {
+            hexray_disasm::amdgpu::AmdgpuDisassembler::for_target(target)
+                .disassemble_block(bytes, start_addr)
+        }
         Architecture::Cuda(hexray_core::CudaArchitecture::Ptx(_))
         | Architecture::Arm
         | Architecture::Unknown(_) => Vec::new(),
@@ -4164,9 +4185,221 @@ fn print_cubin_info(view: &hexray_formats::CubinView<'_>) {
     }
 }
 
+/// A vendor-agnostic kernel summary used by the `hexray cmp`
+/// subcommand. Different vendors expose different resource axes
+/// (NVIDIA reports a single `regs`; AMDGPU splits into vgpr / sgpr),
+/// so we collapse to the union and let the comparator report the
+/// per-axis values.
+#[derive(Debug, Clone, Default)]
+struct KernelSummary {
+    name: String,
+    /// CUDA: total registers. AMDGPU: vgprs only.
+    primary_regs: Option<u32>,
+    /// AMDGPU: sgprs. CUDA: None.
+    scalar_regs: Option<u32>,
+    /// CUDA: param-cbank size. AMDGPU: kernarg_size.
+    kernarg_or_param_size: Option<u32>,
+    /// LDS / shared memory bytes (AMDGPU group_segment / CUDA shared
+    /// region size).
+    shared_lds_bytes: Option<u32>,
+    /// CUDA: exit count. AMDGPU: not modelled (yet).
+    exits: Option<usize>,
+}
+
+fn collect_summaries(binary: &Binary) -> (Vec<KernelSummary>, String) {
+    let mut summaries = Vec::new();
+    let arch_label = format_arch_for_info(binary.as_format().architecture());
+
+    if let Binary::Elf(elf) = binary {
+        if let Ok(view) = elf.cubin_view() {
+            for k in view.kernels() {
+                let resource = k.resource_usage();
+                summaries.push(KernelSummary {
+                    name: k.name.to_string(),
+                    primary_regs: resource
+                        .as_ref()
+                        .and_then(|r| r.max_reg_count.map(u32::from)),
+                    scalar_regs: None,
+                    kernarg_or_param_size: resource
+                        .as_ref()
+                        .and_then(|r| r.cbank_param_size.map(u32::from)),
+                    shared_lds_bytes: None,
+                    exits: resource.as_ref().map(|r| r.exit_offsets.len()),
+                });
+            }
+        }
+        if let Ok(view) = elf.code_object_view() {
+            for k in &view.kernels {
+                let r = &k.resource_usage;
+                summaries.push(KernelSummary {
+                    name: k.name.to_string(),
+                    primary_regs: Some(r.vgpr_count.into()),
+                    scalar_regs: Some(r.sgpr_count.into()),
+                    kernarg_or_param_size: Some(r.kernarg_size),
+                    shared_lds_bytes: Some(r.lds_bytes),
+                    exits: None,
+                });
+            }
+        }
+    }
+
+    (summaries, arch_label)
+}
+
+/// Compare two GPU binaries kernel-by-kernel.
+///
+/// Matches kernels by mangled name (the same name appears on both
+/// sides for SCALE-emitted CUDA-compiled-for-AMDGPU). Reports a
+/// per-kernel resource diff. Cross-vendor comparison is at the
+/// signature level, not instruction-by-instruction — different ISAs
+/// can't be compared word-for-word.
+///
+/// Exit code:
+/// - 0 if every matched kernel agrees on parameter / kernarg size
+///   (informational `differ` lines for register-pressure / LDS deltas
+///   don't count).
+/// - 1 if any signature-level MISMATCH was detected.
+fn cmp_kernels(a: &Binary, b_path: &Path) -> Result<()> {
+    let b_data = fs::read(b_path).with_context(|| format!("reading {}", b_path.display()))?;
+    let b = match detect_format(&b_data) {
+        BinaryType::Elf => Binary::Elf(Elf::parse(&b_data).context("Failed to parse ELF (b)")?),
+        BinaryType::MachO => {
+            Binary::MachO(MachO::parse(&b_data).context("Failed to parse Mach-O (b)")?)
+        }
+        BinaryType::Pe => Binary::Pe(Pe::parse(&b_data).context("Failed to parse PE (b)")?),
+        BinaryType::Unknown => {
+            bail!("Unknown binary format for {}", b_path.display());
+        }
+    };
+
+    let (a_kernels, a_arch) = collect_summaries(a);
+    let (b_kernels, b_arch) = collect_summaries(&b);
+
+    println!("hexray cmp");
+    println!("==========");
+    println!("a: {a_arch}");
+    println!("b: {b_arch}");
+    println!();
+
+    let mut hard_mismatch = false;
+    let mut matched = 0usize;
+    for ka in &a_kernels {
+        let Some(kb) = b_kernels.iter().find(|k| k.name == ka.name) else {
+            println!("Kernel {}: present in a only", ka.name);
+            continue;
+        };
+        matched += 1;
+        println!("Kernel: {}", ka.name);
+        cmp_field(
+            "primary regs",
+            ka.primary_regs.map(|r| r.to_string()),
+            kb.primary_regs.map(|r| r.to_string()),
+            FieldKind::Informational,
+        );
+        cmp_field(
+            "scalar regs",
+            ka.scalar_regs.map(|r| r.to_string()),
+            kb.scalar_regs.map(|r| r.to_string()),
+            FieldKind::Informational,
+        );
+        if cmp_field(
+            "kernarg/param",
+            ka.kernarg_or_param_size.map(|s| format!("{s}B")),
+            kb.kernarg_or_param_size.map(|s| format!("{s}B")),
+            FieldKind::Structural,
+        ) {
+            hard_mismatch = true;
+        }
+        cmp_field(
+            "shared/LDS",
+            ka.shared_lds_bytes.map(|s| format!("{s}B")),
+            kb.shared_lds_bytes.map(|s| format!("{s}B")),
+            FieldKind::Informational,
+        );
+        cmp_field(
+            "exit count",
+            ka.exits.map(|n| n.to_string()),
+            kb.exits.map(|n| n.to_string()),
+            FieldKind::Informational,
+        );
+        println!();
+    }
+    for kb in &b_kernels {
+        if !a_kernels.iter().any(|k| k.name == kb.name) {
+            println!("Kernel {}: present in b only", kb.name);
+        }
+    }
+    println!("Matched {matched} kernel(s).");
+
+    if hard_mismatch {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FieldKind {
+    /// Mismatch is real: parameter count, kernarg size — same source
+    /// must produce the same signature on both sides.
+    Structural,
+    /// Mismatch is expected codegen difference: vgpr vs nvidia-reg
+    /// counts, scheduling, etc.
+    Informational,
+}
+
+/// Print one comparison row. Returns `true` if a structural mismatch
+/// was detected (callers track this for the exit code).
+fn cmp_field(name: &str, a: Option<String>, b: Option<String>, kind: FieldKind) -> bool {
+    let (a_str, b_str) = (
+        a.unwrap_or_else(|| "—".to_string()),
+        b.unwrap_or_else(|| "—".to_string()),
+    );
+    let status = if a_str == b_str {
+        "✓"
+    } else if a_str == "—" || b_str == "—" {
+        "n/a"
+    } else {
+        match kind {
+            FieldKind::Structural => "MISMATCH",
+            FieldKind::Informational => "differ",
+        }
+    };
+    println!("  {name:<14}  a={a_str:<12} b={b_str:<12} {status}");
+    status == "MISMATCH"
+}
+
+/// Print the AMDGPU-specific summary block for a code object:
+/// kernels, decoded resource usage, and any soft diagnostics.
+fn print_amdgpu_info(view: &hexray_formats::CodeObjectView<'_>) {
+    println!("\nAMDGPU Code Object View");
+    println!("-----------------------");
+    println!("Target:        {}", view.target.target_id());
+    println!("Kernels:       {}", view.kernels.len());
+    for k in &view.kernels {
+        let r = &k.resource_usage;
+        let wave = if r.wave32 { "wave32" } else { "wave64" };
+        println!("  {}", k.name);
+        println!(
+            "    entry=0x{:x}  kd=0x{:x}  {}  vgprs={}  sgprs={}",
+            k.entry_addr, k.descriptor_addr, wave, r.vgpr_count, r.sgpr_count,
+        );
+        println!(
+            "    kernarg={}B  lds={}B  scratch={}B  user_sgprs={}",
+            r.kernarg_size, r.lds_bytes, r.scratch_bytes, r.user_sgpr_count,
+        );
+    }
+    if !view.diagnostics.is_empty() {
+        println!("\n  Diagnostics:");
+        for d in &view.diagnostics {
+            println!("    [{:?}] {}", d.kind, d.detail);
+        }
+    }
+}
+
 /// Pretty-print an Architecture for `hexray info`. CUDA targets expand to
-/// canonical SM names (`sm_80`, `sm_90a`); other architectures fall back to
-/// their short name plus any ABI-specific detail we'd otherwise lose.
+/// canonical SM names (`sm_80`, `sm_90a`); AMDGPU targets render as full
+/// target IDs (`gfx906`, `gfx90a:xnack+`); other architectures fall back
+/// to their short name plus any ABI-specific detail we'd otherwise lose.
 fn format_arch_for_info(arch: Architecture) -> String {
     match arch {
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
@@ -4186,6 +4419,7 @@ fn format_arch_for_info(arch: Architecture) -> String {
                 ptx.major, ptx.minor, ptx.address_size, target
             )
         }
+        Architecture::Amdgpu(g) => format!("amdgpu ({}, family={:?})", g.target_id(), g.family),
         Architecture::Unknown(m) => format!("unknown (machine={})", m),
         other => other.name().to_string(),
     }

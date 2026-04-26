@@ -1,0 +1,18 @@
+---
+source: crates/hexray/tests/snapshot_tests.rs
+assertion_line: 367
+expression: normalized
+---
+hexray cmp
+==========
+a: amdgpu (gfx906, family=Gcn5)
+b: amdgpu (gfx906, family=Gcn5)
+
+Kernel: vector_add
+  primary regs    a=12           b=12           ✓
+  scalar regs     a=16           b=16           ✓
+  kernarg/param   a=24B          b=24B          ✓
+  shared/LDS      a=768B         b=768B         ✓
+  exit count      a=—            b=—            ✓
+
+Matched 1 kernel(s).

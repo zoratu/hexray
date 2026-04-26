@@ -1,7 +1,10 @@
 //! ELF header parsing.
 
 use crate::ParseError;
-use hexray_core::{Architecture, CudaArchitecture, Endianness, SmArchitecture, SmVariant};
+use hexray_core::{
+    Architecture, CudaArchitecture, Endianness, GfxArchitecture, SmArchitecture, SmVariant,
+    TriState,
+};
 
 /// ELF magic bytes.
 pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -55,6 +58,9 @@ pub enum Machine {
     /// NVIDIA CUDA (`EM_CUDA = 190`). Encodes SASS machine code for a specific
     /// SM target; the compute-capability is carried in `e_flags`.
     Cuda,
+    /// AMD GPU (`EM_AMDGPU = 224`). Encodes GCN/CDNA/RDNA machine code; the
+    /// GFX target and `xnack` / `sramecc` features are carried in `e_flags`.
+    Amdgpu,
     Other(u16),
 }
 
@@ -69,6 +75,9 @@ impl Machine {
             // NVIDIA CUDA. Reserved as EM_CUDA in the NVIDIA toolchain and
             // recognised by binutils/LLVM. Cubins emitted by `ptxas` carry this.
             190 => Self::Cuda,
+            // AMD GPU. EM_AMDGPU in LLVM. Code objects emitted by `clang
+            // -target=amdgcn-amd-amdhsa` and `hipcc --genco` carry this.
+            224 => Self::Amdgpu,
             243 => Self::RiscV,
             other => Self::Other(other),
         }
@@ -307,6 +316,9 @@ impl ElfHeader {
                 self.abi_version,
                 self.e_flags,
             ))),
+            (Machine::Amdgpu, _) => {
+                Architecture::Amdgpu(gfx_from_amdgpu_elf(self.abi_version, self.e_flags))
+            }
             (Machine::Other(m), _) => Architecture::Unknown(m),
             (Machine::None, _) => Architecture::Unknown(0),
         }
@@ -371,6 +383,149 @@ fn sm_from_cuda_elf(abi_version: u8, e_flags: u32) -> SmArchitecture {
     };
 
     SmArchitecture::new(major, minor, variant)
+}
+
+/// Decode a GFX target from an AMDGPU ELF's `EI_ABIVERSION` and `e_flags`.
+///
+/// AMDGPU has shipped multiple `e_flags` layouts (V2 / V3 / V4); LLVM
+/// uses the `EI_ABIVERSION` byte to disambiguate. The most common
+/// encountered today is V4 (`EI_ABIVERSION = 2`), which is what
+/// every recent ROCm and `clang` build emits.
+///
+/// **V4 layout** (`EI_ABIVERSION = 2`, the modern path):
+/// - bits 0..8  — `EF_AMDGPU_MACH` (a *table-encoded* value, not the
+///   raw `(major, minor, stepping)` triple — the LLVM table maps e.g.
+///   `0x2F → gfx906`, `0x36 → gfx1030`, `0x41 → gfx1100`).
+/// - bits 8..10 — `EF_AMDGPU_FEATURE_XNACK_V4` (TriState).
+/// - bits 10..12 — `EF_AMDGPU_FEATURE_SRAMECC_V4` (TriState).
+///
+/// **V3 layout** (`EI_ABIVERSION = 1`, older ROCm):
+/// - bits 0..8  — `EF_AMDGPU_MACH` (same table).
+/// - bit 8       — `EF_AMDGPU_FEATURE_XNACK_V3` (boolean).
+/// - bit 9       — `EF_AMDGPU_FEATURE_SRAMECC_V3` (boolean).
+///
+/// Source: `llvm/include/llvm/BinaryFormat/ELF.h` `EF_AMDGPU_*`
+/// constants and the `mach`-name table in
+/// `llvm/lib/ObjectYAML/ELFYAML.cpp` (`AMDGPUElfMagicTable`).
+fn gfx_from_amdgpu_elf(abi_version: u8, e_flags: u32) -> GfxArchitecture {
+    const EF_AMDGPU_MACH: u32 = 0xff;
+    // V4 (modern) uses 2-bit TriState feature fields.
+    const EF_AMDGPU_FEATURE_XNACK_V4_SHIFT: u32 = 8;
+    const EF_AMDGPU_FEATURE_SRAMECC_V4_SHIFT: u32 = 10;
+    const FEATURE_V4_MASK: u32 = 0b11;
+    // V3 uses single-bit feature fields.
+    const EF_AMDGPU_FEATURE_XNACK_V3: u32 = 1 << 8;
+    const EF_AMDGPU_FEATURE_SRAMECC_V3: u32 = 1 << 9;
+
+    let mach = (e_flags & EF_AMDGPU_MACH) as u8;
+    let (mut major, mut minor, mut stepping) = mach_to_gfx_target(mach);
+
+    let (xnack, sramecc) = match abi_version {
+        // V4 ABI (modern). 2-bit TriState fields.
+        2 => {
+            let xnack = (e_flags >> EF_AMDGPU_FEATURE_XNACK_V4_SHIFT) & FEATURE_V4_MASK;
+            let sramecc = (e_flags >> EF_AMDGPU_FEATURE_SRAMECC_V4_SHIFT) & FEATURE_V4_MASK;
+            (tristate_v4(xnack), tristate_v4(sramecc))
+        }
+        // V3 ABI. 1-bit booleans; map false → Unspecified, true → On
+        // (V3 had no "any" state).
+        1 => {
+            let xnack = if e_flags & EF_AMDGPU_FEATURE_XNACK_V3 != 0 {
+                TriState::On
+            } else {
+                TriState::Unspecified
+            };
+            let sramecc = if e_flags & EF_AMDGPU_FEATURE_SRAMECC_V3 != 0 {
+                TriState::On
+            } else {
+                TriState::Unspecified
+            };
+            (xnack, sramecc)
+        }
+        _ => (TriState::Unspecified, TriState::Unspecified),
+    };
+
+    if major == 0 {
+        // Unknown mach — pull through the raw bits anyway so the caller
+        // can still see "this is an AMDGPU ELF, just an unrecognised
+        // target."
+        major = 0;
+        minor = 0;
+        stepping = 0;
+    }
+
+    let mut arch = GfxArchitecture::new(major, minor, stepping);
+    arch.xnack = xnack;
+    arch.sramecc = sramecc;
+    arch
+}
+
+/// Decode a 2-bit V4 feature field into `TriState`.
+///
+/// LLVM's V4 encoding:
+/// - `0b01` (1) → "any" / unspecified
+/// - `0b10` (2) → off
+/// - `0b11` (3) → on
+/// - `0b00` (0) → invalid (treat as unspecified for forward-compat)
+fn tristate_v4(bits: u32) -> TriState {
+    match bits {
+        0b10 => TriState::Off,
+        0b11 => TriState::On,
+        _ => TriState::Unspecified,
+    }
+}
+
+/// Map a raw `EF_AMDGPU_MACH` byte to a `(major, minor, stepping)`
+/// triple. Returns `(0, 0, 0)` for unrecognised values.
+///
+/// The table is harvested from
+/// `llvm/include/llvm/BinaryFormat/ELF.h` (`EF_AMDGPU_MACH_AMDGCN_*`
+/// constants). Adding a new GFX target is a one-line addition here.
+fn mach_to_gfx_target(mach: u8) -> (u8, u8, u8) {
+    match mach {
+        // GCN3 / GCN4 (Volcanic Islands / Polaris)
+        0x20 => (8, 0, 0), // gfx800 (iceland)
+        0x21 => (8, 0, 1), // gfx801
+        0x22 => (8, 0, 2), // gfx802
+        0x23 => (8, 0, 3), // gfx803
+        0x24 => (8, 1, 0), // gfx810
+        // GCN5 (Vega / Vega20)
+        0x2C => (9, 0, 0),   // gfx900
+        0x2D => (9, 0, 2),   // gfx902
+        0x2E => (9, 0, 4),   // gfx904
+        0x2F => (9, 0, 6),   // gfx906
+        0x30 => (9, 0, 8),   // gfx908 (CDNA1, MI100)
+        0x31 => (9, 0, 9),   // gfx909
+        0x32 => (9, 0, 0xC), // gfx90c
+        0x3F => (9, 0, 0xA), // gfx90a (CDNA2, MI200)
+        0x40 => (9, 4, 0),   // gfx940 (CDNA3 first ID)
+        0x4D => (9, 4, 1),   // gfx941 (CDNA3)
+        0x4E => (9, 4, 2),   // gfx942 (CDNA3)
+        // RDNA1 (Navi 10/12/14)
+        0x33 => (10, 1, 0), // gfx1010
+        0x34 => (10, 1, 1), // gfx1011
+        0x35 => (10, 1, 2), // gfx1012
+        0x42 => (10, 1, 3), // gfx1013
+        // RDNA2 (Navi 21/22/23/24)
+        0x36 => (10, 3, 0), // gfx1030
+        0x37 => (10, 3, 1), // gfx1031
+        0x38 => (10, 3, 2), // gfx1032
+        0x39 => (10, 3, 3), // gfx1033
+        0x3D => (10, 3, 5), // gfx1035
+        0x3E => (10, 3, 4), // gfx1034
+        0x45 => (10, 3, 6), // gfx1036
+        // RDNA3 (Navi 31/32/33)
+        0x41 => (11, 0, 0), // gfx1100
+        0x46 => (11, 0, 1), // gfx1101
+        0x47 => (11, 0, 2), // gfx1102
+        0x44 => (11, 0, 3), // gfx1103
+        0x43 => (11, 5, 0), // gfx1150
+        0x4C => (11, 5, 1), // gfx1151
+        // RDNA4
+        0x48 => (12, 0, 0), // gfx1200
+        0x49 => (12, 0, 1), // gfx1201
+        _ => (0, 0, 0),
+    }
 }
 
 #[cfg(test)]
@@ -531,5 +686,87 @@ mod tests {
         // cubin uses).
         let sm = sm_from_cuda_elf(99, 0x0050_0550);
         assert_eq!((sm.major, sm.minor, sm.variant), (8, 0, SmVariant::Base));
+    }
+
+    #[test]
+    fn machine_recognises_amdgpu() {
+        assert_eq!(Machine::from_u16(224), Machine::Amdgpu);
+        // 191 sits between EM_CUDA (190) and EM_AMDGPU (224); should be Other.
+        assert_eq!(Machine::from_u16(191), Machine::Other(191));
+    }
+
+    #[test]
+    fn gfx_from_amdgpu_elf_decodes_common_targets() {
+        use super::gfx_from_amdgpu_elf;
+        // gfx906, V4 ABI, no features set.
+        let g = gfx_from_amdgpu_elf(2, 0x2F);
+        assert_eq!((g.major, g.minor, g.stepping), (9, 0, 6));
+        assert_eq!(g.canonical_name(), "gfx906");
+        assert_eq!(g.xnack, TriState::Unspecified);
+        assert_eq!(g.sramecc, TriState::Unspecified);
+        // gfx1030, V4 ABI.
+        let g = gfx_from_amdgpu_elf(2, 0x36);
+        assert_eq!(g.canonical_name(), "gfx1030");
+        // gfx1100, V4 ABI.
+        let g = gfx_from_amdgpu_elf(2, 0x41);
+        assert_eq!(g.canonical_name(), "gfx1100");
+        // gfx90a, V4 ABI, with xnack=on, sramecc=off.
+        let g = gfx_from_amdgpu_elf(2, 0x3F | (0b11 << 8) | (0b10 << 10));
+        assert_eq!(g.canonical_name(), "gfx90a");
+        assert_eq!(g.xnack, TriState::On);
+        assert_eq!(g.sramecc, TriState::Off);
+        assert_eq!(g.target_id(), "gfx90a:xnack+:sramecc-");
+    }
+
+    #[test]
+    fn gfx_from_amdgpu_elf_v3_features() {
+        use super::gfx_from_amdgpu_elf;
+        // V3 ABI: bit 8 = xnack on, bit 9 = sramecc on, both enabled.
+        let g = gfx_from_amdgpu_elf(1, 0x2F | (1 << 8) | (1 << 9));
+        assert_eq!(g.canonical_name(), "gfx906");
+        assert_eq!(g.xnack, TriState::On);
+        assert_eq!(g.sramecc, TriState::On);
+        // V3 ABI with bits cleared: features unspecified.
+        let g = gfx_from_amdgpu_elf(1, 0x2F);
+        assert_eq!(g.xnack, TriState::Unspecified);
+        assert_eq!(g.sramecc, TriState::Unspecified);
+    }
+
+    #[test]
+    fn gfx_from_amdgpu_elf_handles_unknown_mach() {
+        use super::gfx_from_amdgpu_elf;
+        // 0x88 is not a known mach value; we should fall through to a
+        // best-effort UNKNOWN-shaped target rather than panicking.
+        let g = gfx_from_amdgpu_elf(2, 0x88);
+        assert_eq!(g.major, 0);
+        assert_eq!(g.canonical_name(), "gfx?");
+    }
+
+    #[test]
+    fn architecture_from_synthesized_amdgpu_elf_header() {
+        // Construct a minimal valid ELF64 little-endian header with
+        // EM_AMDGPU = 224 and gfx906 mach + V4 ABI + xnack on.
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&ELF_MAGIC);
+        data[4] = 2; // ELF64
+        data[5] = 1; // little-endian
+        data[6] = 1; // EI_VERSION
+        data[7] = 64; // ELFOSABI_AMDGPU_HSA (HSA OS)
+        data[8] = 2; // EI_ABIVERSION = 2 (V4)
+        data[16..18].copy_from_slice(&1u16.to_le_bytes()); // ET_REL
+        data[18..20].copy_from_slice(&224u16.to_le_bytes()); // EM_AMDGPU
+        data[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+                                                           // e_flags at offset 48 (ELF64): mach 0x2F | xnack on (0b11<<8).
+        let e_flags: u32 = 0x2F | (0b11 << 8);
+        data[48..52].copy_from_slice(&e_flags.to_le_bytes());
+        data[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        let header = ElfHeader::parse(&data).expect("synthetic AMDGPU ELF parses");
+        match header.architecture() {
+            Architecture::Amdgpu(g) => {
+                assert_eq!(g.canonical_name(), "gfx906");
+                assert_eq!(g.xnack, TriState::On);
+            }
+            other => panic!("expected Amdgpu, got {other:?}"),
+        }
     }
 }
