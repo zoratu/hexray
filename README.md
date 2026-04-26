@@ -276,11 +276,3 @@ See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for deterministic benchmark and
 ## License
 
 GNU GPLv3
-
-## Acknowledgments
-
-Built to deeply understand binary analysis from first principles:
-- Instruction set architectures and encoding formats
-- Binary file formats and linking
-- Control flow analysis and decompilation theory
-- Data flow analysis and type recovery
