@@ -123,3 +123,48 @@ fn disasm_renders_real_operands() {
         "expected 's_load_dword' instruction, got:\n{stdout}"
     );
 }
+
+#[test]
+fn disasm_handles_rdna3_opcode_renumbering() {
+    if !corpus_path("vector_add.gfx1100.co").exists() {
+        eprintln!("gfx1100 fixture not present, skipping");
+        return;
+    }
+    let path = corpus_path("vector_add.gfx1100.co");
+    let output = Command::new(hexray_bin())
+        .arg("-s")
+        .arg("vector_add")
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("hexray runs");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // RDNA3 SOPP: s_endpgm shifted from OP=0x01 (RDNA2) to OP=0x30
+    // (RDNA3). The v1.3.3 single-band tables would have rendered
+    // this as `sopp.op0x30`.
+    assert!(
+        stdout.contains("s_endpgm"),
+        "RDNA3 s_endpgm should resolve, got:\n{stdout}"
+    );
+    // RDNA3 SOPP scheduling hints not present in RDNA2.
+    assert!(
+        stdout.contains("s_clause") && stdout.contains("s_delay_alu"),
+        "expected RDNA3 SOPP hints (s_clause + s_delay_alu), got:\n{stdout}"
+    );
+    // RDNA3 SMEM rename: _dword → _b32.
+    assert!(
+        stdout.contains("s_load_b32"),
+        "expected RDNA3 SMEM rename s_load_b32, got:\n{stdout}"
+    );
+    // RDNA3 FLAT rename: _dword → _b32 + distinct global_/scratch_/flat_ OPs.
+    assert!(
+        stdout.contains("global_load_b32"),
+        "expected RDNA3 global_load_b32, got:\n{stdout}"
+    );
+    // RDNA3 VOP3 renumbering: v_mad_u64_u32 shifted to OP=0x2fe.
+    assert!(
+        stdout.contains("v_mad_u64_u32"),
+        "expected RDNA3 v_mad_u64_u32 to resolve, got:\n{stdout}"
+    );
+}

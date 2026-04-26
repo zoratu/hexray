@@ -19,7 +19,11 @@ use hexray_disasm::Disassembler;
 use proptest::prelude::*;
 
 fn arb_family() -> impl Strategy<Value = EncodingFamily> {
-    prop_oneof![Just(EncodingFamily::Gfx9), Just(EncodingFamily::Gfx10Plus),]
+    prop_oneof![
+        Just(EncodingFamily::Gfx9),
+        Just(EncodingFamily::Gfx10Plus),
+        Just(EncodingFamily::Gfx11Plus),
+    ]
 }
 
 proptest! {
@@ -52,6 +56,7 @@ proptest! {
         let target = match family {
             EncodingFamily::Gfx9 => hexray_core::GfxArchitecture::new(9, 0, 6),
             EncodingFamily::Gfx10Plus => hexray_core::GfxArchitecture::new(10, 3, 0),
+            EncodingFamily::Gfx11Plus => hexray_core::GfxArchitecture::new(11, 0, 0),
         };
         let d = AmdgpuDisassembler::for_target(target);
         let result = d.disassemble_block(&bytes, 0x1000);

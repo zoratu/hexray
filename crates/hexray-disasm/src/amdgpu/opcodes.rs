@@ -57,16 +57,25 @@ fn table_for(class: TableClass, family: EncodingFamily) -> &'static [OpcodeEntry
     match (class, family) {
         (TableClass::Vop1, EncodingFamily::Gfx9) => VOP1_GFX9,
         (TableClass::Vop1, EncodingFamily::Gfx10Plus) => VOP1_GFX10,
+        (TableClass::Vop1, EncodingFamily::Gfx11Plus) => VOP1_GFX10,
         (TableClass::Vop2, EncodingFamily::Gfx9) => VOP2_GFX9,
         (TableClass::Vop2, EncodingFamily::Gfx10Plus) => VOP2_GFX10,
+        (TableClass::Vop2, EncodingFamily::Gfx11Plus) => VOP2_GFX11,
+        (TableClass::Vop3, EncodingFamily::Gfx11Plus) => VOP3_GFX11,
         (TableClass::Vop3, _) => VOP3_GFX10,
         (TableClass::Vopc, _) => VOPC_SHARED,
         (TableClass::Sop1, EncodingFamily::Gfx9) => SOP1_GFX9,
         (TableClass::Sop1, EncodingFamily::Gfx10Plus) => SOP1_GFX10,
+        // RDNA3 reverted SOP1 to GFX9-style numbering
+        // (s_mov_b32 = OP=0x00 again).
+        (TableClass::Sop1, EncodingFamily::Gfx11Plus) => SOP1_GFX9,
         (TableClass::Sop2, _) => SOP2_SHARED,
         (TableClass::Sopp, EncodingFamily::Gfx9) => SOPP_GFX9,
         (TableClass::Sopp, EncodingFamily::Gfx10Plus) => SOPP_GFX10,
+        (TableClass::Sopp, EncodingFamily::Gfx11Plus) => SOPP_GFX11,
+        (TableClass::Smem, EncodingFamily::Gfx11Plus) => SMEM_GFX11,
         (TableClass::Smem, _) => SMEM_SHARED,
+        (TableClass::Flat, EncodingFamily::Gfx11Plus) => FLAT_GFX11,
         (TableClass::Flat, _) => FLAT_GFX10,
     }
 }
@@ -1020,6 +1029,341 @@ pub fn render_flat_mnemonic(base: &str, seg: u8) -> String {
         base.to_string()
     }
 }
+
+// =============================================================================
+// GFX11 (RDNA3) opcode tables
+// =============================================================================
+//
+// RDNA3 substantially renumbered the per-class OP fields. Validated
+// against `llvm-objdump --triple=amdgcn-amd-amdhsa --mcpu=gfx1100`
+// on `tests/corpus/scale-lang/vector_add.gfx1100.co`.
+
+/// VOP2 — GFX11 numbering. Diffs from GFX10:
+/// - `v_ashrrev_i32_e32`: 0x18 → 0x1A
+/// - `v_add_co_ci_u32_e32`: 0x28 → 0x20
+/// - `v_sub_co_ci_u32_e32`: 0x29 → 0x21
+///
+/// `v_add_f32` stayed at 0x03; `v_cndmask_b32` at 0x01.
+const VOP2_GFX11: &[OpcodeEntry] = &[
+    OpcodeEntry {
+        op: 0x01,
+        mnemonic: "v_cndmask_b32_e32",
+        operation: Operation::ConditionalMove,
+    },
+    OpcodeEntry {
+        op: 0x03,
+        mnemonic: "v_add_f32_e32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x04,
+        mnemonic: "v_sub_f32_e32",
+        operation: Operation::Sub,
+    },
+    OpcodeEntry {
+        op: 0x05,
+        mnemonic: "v_subrev_f32_e32",
+        operation: Operation::Sub,
+    },
+    OpcodeEntry {
+        op: 0x08,
+        mnemonic: "v_mul_f32_e32",
+        operation: Operation::Mul,
+    },
+    OpcodeEntry {
+        op: 0x16,
+        mnemonic: "v_lshlrev_b32_e32",
+        operation: Operation::Shl,
+    },
+    OpcodeEntry {
+        op: 0x17,
+        mnemonic: "v_lshrrev_b32_e32",
+        operation: Operation::Shr,
+    },
+    OpcodeEntry {
+        op: 0x1a,
+        mnemonic: "v_ashrrev_i32_e32",
+        operation: Operation::Sar,
+    },
+    OpcodeEntry {
+        op: 0x1b,
+        mnemonic: "v_and_b32_e32",
+        operation: Operation::And,
+    },
+    OpcodeEntry {
+        op: 0x1c,
+        mnemonic: "v_or_b32_e32",
+        operation: Operation::Or,
+    },
+    OpcodeEntry {
+        op: 0x1d,
+        mnemonic: "v_xor_b32_e32",
+        operation: Operation::Xor,
+    },
+    OpcodeEntry {
+        op: 0x20,
+        mnemonic: "v_add_co_ci_u32_e32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x21,
+        mnemonic: "v_sub_co_ci_u32_e32",
+        operation: Operation::Sub,
+    },
+];
+
+/// VOP3 — GFX11 numbering (10-bit OP at `[25:16]`). Renumbered
+/// substantially from RDNA2.
+const VOP3_GFX11: &[OpcodeEntry] = &[
+    OpcodeEntry {
+        op: 0x0c4,
+        mnemonic: "v_cmpx_gt_i32_e64",
+        operation: Operation::Compare,
+    },
+    OpcodeEntry {
+        op: 0x155,
+        mnemonic: "v_add3_u32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x2fe,
+        mnemonic: "v_mad_u64_u32",
+        operation: Operation::Mul,
+    },
+    OpcodeEntry {
+        op: 0x2ff,
+        mnemonic: "v_mad_i64_i32",
+        operation: Operation::Mul,
+    },
+    OpcodeEntry {
+        op: 0x300,
+        mnemonic: "v_add_co_u32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x301,
+        mnemonic: "v_sub_co_u32",
+        operation: Operation::Sub,
+    },
+    OpcodeEntry {
+        op: 0x33c,
+        mnemonic: "v_lshlrev_b64",
+        operation: Operation::Shl,
+    },
+];
+
+/// SOPP — GFX11 numbering. Major renumbering from RDNA2:
+/// - `s_endpgm`: 0x01 → 0x30
+/// - `s_clause`: 0x21 → 0x05
+/// - `s_waitcnt`: 0x0c → 0x09
+/// - branches all shifted to the 0x20 range (`s_branch` = 0x20,
+///   `s_cbranch_*` at 0x21..0x26).
+/// - `s_delay_alu` (new in RDNA3) at 0x07.
+/// - `s_sendmsg` at 0x36.
+const SOPP_GFX11: &[OpcodeEntry] = &[
+    OpcodeEntry {
+        op: 0x00,
+        mnemonic: "s_nop",
+        operation: Operation::Nop,
+    },
+    OpcodeEntry {
+        op: 0x05,
+        mnemonic: "s_clause",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x07,
+        mnemonic: "s_delay_alu",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x09,
+        mnemonic: "s_waitcnt",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x0a,
+        mnemonic: "s_wait_loadcnt",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x0c,
+        mnemonic: "s_wait_kmcnt",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x10,
+        mnemonic: "s_barrier",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x1f,
+        mnemonic: "s_code_end",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x20,
+        mnemonic: "s_branch",
+        operation: Operation::Jump,
+    },
+    OpcodeEntry {
+        op: 0x21,
+        mnemonic: "s_cbranch_scc0",
+        operation: Operation::ConditionalJump,
+    },
+    OpcodeEntry {
+        op: 0x22,
+        mnemonic: "s_cbranch_scc1",
+        operation: Operation::ConditionalJump,
+    },
+    OpcodeEntry {
+        op: 0x23,
+        mnemonic: "s_cbranch_vccz",
+        operation: Operation::ConditionalJump,
+    },
+    OpcodeEntry {
+        op: 0x24,
+        mnemonic: "s_cbranch_vccnz",
+        operation: Operation::ConditionalJump,
+    },
+    OpcodeEntry {
+        op: 0x25,
+        mnemonic: "s_cbranch_execz",
+        operation: Operation::ConditionalJump,
+    },
+    OpcodeEntry {
+        op: 0x26,
+        mnemonic: "s_cbranch_execnz",
+        operation: Operation::ConditionalJump,
+    },
+    OpcodeEntry {
+        op: 0x30,
+        mnemonic: "s_endpgm",
+        operation: Operation::Return,
+    },
+    OpcodeEntry {
+        op: 0x36,
+        mnemonic: "s_sendmsg",
+        operation: Operation::Other(0),
+    },
+];
+
+/// SMEM — GFX11 renamed `_dword` to `_b32`/`_b64`/`_b128` etc.
+/// OP numbers at `[25:18]` shifted slightly; the loads remain in
+/// the low range.
+const SMEM_GFX11: &[OpcodeEntry] = &[
+    OpcodeEntry {
+        op: 0x00,
+        mnemonic: "s_load_b32",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x01,
+        mnemonic: "s_load_b64",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x02,
+        mnemonic: "s_load_b128",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x03,
+        mnemonic: "s_load_b256",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x04,
+        mnemonic: "s_load_b512",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x08,
+        mnemonic: "s_buffer_load_b32",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x09,
+        mnemonic: "s_buffer_load_b64",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x0a,
+        mnemonic: "s_buffer_load_b128",
+        operation: Operation::Load,
+    },
+];
+
+/// FLAT — GFX11 renumbering + `_dword` → `_b32` rename. The seg
+/// field semantics on RDNA3 differ from RDNA2 — the `flat`,
+/// `global`, and `scratch` forms appear to occupy distinct OP
+/// slots in the 7-bit OP space rather than sharing OPs with a
+/// disambiguating seg bit. We list the GLOBAL forms here directly
+/// since that's what shows up in HSA-mode AMDGPU code; FLAT and
+/// SCRATCH variants land in this same table at adjacent OPs and
+/// will be filled in as we widen the corpus.
+const FLAT_GFX11: &[OpcodeEntry] = &[
+    OpcodeEntry {
+        op: 0x10,
+        mnemonic: "global_load_u8",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x11,
+        mnemonic: "global_load_i8",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x12,
+        mnemonic: "global_load_u16",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x13,
+        mnemonic: "global_load_i16",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x14,
+        mnemonic: "global_load_b32",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x15,
+        mnemonic: "global_load_b64",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x16,
+        mnemonic: "global_load_b96",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x17,
+        mnemonic: "global_load_b128",
+        operation: Operation::Load,
+    },
+    OpcodeEntry {
+        op: 0x18,
+        mnemonic: "global_store_b8",
+        operation: Operation::Store,
+    },
+    OpcodeEntry {
+        op: 0x19,
+        mnemonic: "global_store_b16",
+        operation: Operation::Store,
+    },
+    OpcodeEntry {
+        op: 0x1a,
+        mnemonic: "global_store_b32",
+        operation: Operation::Store,
+    },
+    OpcodeEntry {
+        op: 0x1b,
+        mnemonic: "global_store_b64",
+        operation: Operation::Store,
+    },
+];
 
 #[cfg(test)]
 mod tests {
