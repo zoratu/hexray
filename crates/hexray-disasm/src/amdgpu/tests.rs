@@ -157,3 +157,86 @@ fn architecture_round_trips_through_disassembler() {
         other => panic!("expected Amdgpu, got {other:?}"),
     }
 }
+
+#[test]
+fn vop1_v_mov_b32_renders_v0_v1_operands() {
+    // v_mov_b32_e32 v0, v1 ; encoding [0x01,0x03,0x00,0x7e]
+    // VDST=0 (v0, written), SRC0=257 (v1, read).
+    let d = AmdgpuDisassembler::gfx906();
+    let decoded = d.decode_instruction(&V_MOV_B32, 0x1000).unwrap();
+    let instr = &decoded.instruction;
+    assert_eq!(instr.operands.len(), 2);
+    let rendered = format!("{}", instr);
+    assert!(
+        rendered.contains("v_mov_b32_e32 v0, v1"),
+        "expected 'v_mov_b32_e32 v0, v1' in {rendered:?}"
+    );
+}
+
+#[test]
+fn sop2_s_add_u32_renders_three_sgpr_operands() {
+    // s_add_u32 s0, s1, s2 ; encoding [0x01,0x02,0x00,0x80]
+    // SDST=0 (s0, written), SSRC0=1 (s1), SSRC1=2 (s2).
+    let d = AmdgpuDisassembler::gfx906();
+    let decoded = d.decode_instruction(&S_ADD_U32, 0x1000).unwrap();
+    let instr = &decoded.instruction;
+    assert_eq!(instr.operands.len(), 3);
+    let rendered = format!("{}", instr);
+    assert!(
+        rendered.contains("s_add_u32 s0, s1, s2"),
+        "expected 's_add_u32 s0, s1, s2' in {rendered:?}"
+    );
+}
+
+#[test]
+fn vopc_renders_two_source_operands_no_destination() {
+    // v_cmp_eq_u32_e32 vcc_lo, v1, v2 ; encoding [0x01,0x05,0x94,0x7c]
+    // SRC0=0x101=v1, VSRC1=2 (v2). Implicit write to vcc_lo not
+    // pushed as a printed operand.
+    let d = AmdgpuDisassembler::gfx1030();
+    let bytes = [0x01, 0x05, 0x94, 0x7c];
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    let rendered = format!("{}", decoded.instruction);
+    assert!(
+        rendered.contains(" v1, v2"),
+        "expected ' v1, v2' in {rendered:?}"
+    );
+}
+
+#[test]
+fn sopp_s_endpgm_takes_no_operands() {
+    let d = AmdgpuDisassembler::gfx906();
+    let decoded = d.decode_instruction(&S_ENDPGM, 0x1000).unwrap();
+    assert_eq!(decoded.instruction.operands.len(), 0);
+}
+
+#[test]
+fn sopp_s_branch_renders_pc_relative_target() {
+    // s_branch +0x10 (in dwords). SOPP OP=0x02, SIMM16=0x10.
+    // Target = address + (0x10 * 4 + 4) = 0x1000 + 0x44 = 0x1044.
+    let mut bytes = [0u8; 4];
+    let dword: u32 = 0xbf820000 | 0x10; // SOPP base | SIMM16=0x10
+    bytes.copy_from_slice(&dword.to_le_bytes());
+    let d = AmdgpuDisassembler::gfx906();
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    assert_eq!(decoded.instruction.operands.len(), 1);
+    let rendered = format!("{}", decoded.instruction);
+    // PC-relative formats as "+offset" via Operand display.
+    assert!(rendered.contains("0x1044"), "got {rendered:?}");
+}
+
+#[test]
+fn vop2_inline_constant_renders_as_immediate() {
+    // v_add_f32_e32 v0, 1.0, v1 — encoded as VOP2 op=1, src0=242 (1.0),
+    // vsrc1=1 (v1), vdst=0 (v0).
+    // Build: op=1 (in [30:25]) | vdst=0 [24:17] | vsrc1=1 [16:9] | src0=242 [8:0]
+    let dword: u32 = (1u32 << 25) | (1u32 << 9) | 242;
+    let bytes = dword.to_le_bytes();
+    let d = AmdgpuDisassembler::gfx906();
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    let rendered = format!("{}", decoded.instruction);
+    // 1.0 inline constant should render via the register-name path
+    // since it's not in the integer inline-constant range.
+    assert!(rendered.contains("v0"), "got {rendered:?}");
+    assert!(rendered.contains("v1"), "got {rendered:?}");
+}
