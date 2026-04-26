@@ -4204,6 +4204,18 @@ struct KernelSummary {
     shared_lds_bytes: Option<u32>,
     /// CUDA: exit count. AMDGPU: not modelled (yet).
     exits: Option<usize>,
+    /// Per-argument records, by ordinal. CUDA fills these from the
+    /// `.nv.info` `KPARAM_INFO` records; AMDGPU from
+    /// `NT_AMDGPU_METADATA`. Vendor-agnostic shape: just size
+    /// in bytes per arg, since that's the only field both sides
+    /// expose meaningfully.
+    args: Vec<KernelArg>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct KernelArg {
+    /// Argument size in bytes.
+    size_bytes: Option<u32>,
 }
 
 fn collect_summaries(binary: &Binary) -> (Vec<KernelSummary>, String) {
@@ -4214,6 +4226,20 @@ fn collect_summaries(binary: &Binary) -> (Vec<KernelSummary>, String) {
         if let Ok(view) = elf.cubin_view() {
             for k in view.kernels() {
                 let resource = k.resource_usage();
+                let mut args: Vec<KernelArg> = resource
+                    .as_ref()
+                    .map(|r| {
+                        let mut params = r.params.clone();
+                        params.sort_by_key(|p| p.ordinal);
+                        params
+                            .iter()
+                            .map(|p| KernelArg {
+                                size_bytes: Some(p.size_bytes()),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                args.sort_by_key(|_| 0); // stable
                 summaries.push(KernelSummary {
                     name: k.name.to_string(),
                     primary_regs: resource
@@ -4225,19 +4251,47 @@ fn collect_summaries(binary: &Binary) -> (Vec<KernelSummary>, String) {
                         .and_then(|r| r.cbank_param_size.map(u32::from)),
                     shared_lds_bytes: None,
                     exits: resource.as_ref().map(|r| r.exit_offsets.len()),
+                    args,
                 });
             }
         }
         if let Ok(view) = elf.code_object_view() {
             for k in &view.kernels {
                 let r = &k.resource_usage;
+                // Prefer metadata-supplied vgpr/sgpr counts when
+                // present (the descriptor block reports
+                // *granulated* allocation while metadata reports the
+                // signed compiler view — equal in practice but
+                // metadata is the canonical source).
+                let metadata = k.metadata.as_ref();
+                let primary = metadata
+                    .and_then(|m| m.vgpr_count)
+                    .unwrap_or(u32::from(r.vgpr_count));
+                let scalar = metadata
+                    .and_then(|m| m.sgpr_count)
+                    .unwrap_or(u32::from(r.sgpr_count));
+                let kernarg = metadata
+                    .and_then(|m| m.kernarg_segment_size.map(|n| n as u32))
+                    .unwrap_or(r.kernarg_size);
+                let lds = metadata
+                    .and_then(|m| m.group_segment_fixed_size.map(|n| n as u32))
+                    .unwrap_or(r.lds_bytes);
+                let args: Vec<KernelArg> = metadata
+                    .map(|m| {
+                        m.args
+                            .iter()
+                            .map(|a| KernelArg { size_bytes: a.size })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 summaries.push(KernelSummary {
                     name: k.name.to_string(),
-                    primary_regs: Some(r.vgpr_count.into()),
-                    scalar_regs: Some(r.sgpr_count.into()),
-                    kernarg_or_param_size: Some(r.kernarg_size),
-                    shared_lds_bytes: Some(r.lds_bytes),
+                    primary_regs: Some(primary),
+                    scalar_regs: Some(scalar),
+                    kernarg_or_param_size: Some(kernarg),
+                    shared_lds_bytes: Some(lds),
                     exits: None,
+                    args,
                 });
             }
         }
@@ -4322,6 +4376,32 @@ fn cmp_kernels(a: &Binary, b_path: &Path) -> Result<()> {
             kb.exits.map(|n| n.to_string()),
             FieldKind::Informational,
         );
+        // Argument layout: count + per-ordinal size. The arg count
+        // is structural (a missing arg means the kernel signatures
+        // diverge); per-arg size is structural too (different sizes
+        // mean a real ABI break).
+        if !ka.args.is_empty() || !kb.args.is_empty() {
+            if cmp_field(
+                "arg count",
+                Some(ka.args.len().to_string()),
+                Some(kb.args.len().to_string()),
+                FieldKind::Structural,
+            ) {
+                hard_mismatch = true;
+            }
+            for i in 0..ka.args.len().max(kb.args.len()) {
+                let a = ka.args.get(i).and_then(|a| a.size_bytes);
+                let b = kb.args.get(i).and_then(|a| a.size_bytes);
+                if cmp_field(
+                    &format!("arg [{i}] size"),
+                    a.map(|s| format!("{s}B")),
+                    b.map(|s| format!("{s}B")),
+                    FieldKind::Structural,
+                ) {
+                    hard_mismatch = true;
+                }
+            }
+        }
         println!();
     }
     for kb in &b_kernels {

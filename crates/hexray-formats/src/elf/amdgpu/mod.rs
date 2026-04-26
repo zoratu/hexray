@@ -30,12 +30,15 @@
 //!   objects). M10 reads the AMDGPU object directly.
 
 mod descriptor;
+mod metadata;
+mod msgpack;
 mod schema;
 
 #[cfg(test)]
 mod tests;
 
 pub use descriptor::{KernelDescriptor, KERNEL_DESCRIPTOR_SIZE};
+pub use metadata::{AmdMetadata, AmdMetadataArg, AmdMetadataKernel};
 pub use schema::AmdKernelResourceUsage;
 
 use super::Elf;
@@ -96,6 +99,10 @@ pub struct CodeObjectView<'elf> {
     pub target: hexray_core::GfxArchitecture,
     /// One entry per detected kernel.
     pub kernels: Vec<Kernel<'elf>>,
+    /// `NT_AMDGPU_METADATA` payload, when the ELF carried one.
+    /// Provides typed kernel-arg layout, signed reg counts, and
+    /// workgroup-size limits beyond what the descriptor block has.
+    pub metadata: Option<AmdMetadata>,
     /// Soft diagnostics — orphan descriptors, malformed records.
     pub diagnostics: Vec<CodeObjectDiagnostic>,
 }
@@ -115,6 +122,10 @@ pub struct Kernel<'elf> {
     /// Vendor-specific resource summary (vgpr/sgpr, LDS, scratch,
     /// kernarg).
     pub resource_usage: AmdKernelResourceUsage,
+    /// Per-kernel metadata record from `NT_AMDGPU_METADATA`, when
+    /// present. Provides argument layout the descriptor block alone
+    /// can't surface.
+    pub metadata: Option<AmdMetadataKernel>,
 }
 
 impl<'elf> CodeObjectView<'elf> {
@@ -186,13 +197,38 @@ impl<'elf> CodeObjectView<'elf> {
                 descriptor_addr,
                 descriptor,
                 resource_usage,
+                metadata: None,
             });
+        }
+
+        // Locate the NT_AMDGPU_METADATA note. It can live in any
+        // section of type SHT_NOTE. We walk every note section,
+        // looking for a record with name "AMDGPU" and type 32.
+        let metadata = find_amdgpu_metadata(elf);
+
+        // Hook the per-kernel metadata records onto the matching
+        // Kernel by name (or symbol). Falls back to no metadata if
+        // the kernel name doesn't appear in the metadata blob.
+        if let Some(md) = &metadata {
+            for k in &mut kernels {
+                if let Some(rec) = md.kernels.iter().find(|rec| {
+                    rec.name.as_deref() == Some(k.name)
+                        || rec
+                            .symbol
+                            .as_deref()
+                            .map(|sym| sym.strip_suffix(".kd") == Some(k.name))
+                            .unwrap_or(false)
+                }) {
+                    k.metadata = Some(rec.clone());
+                }
+            }
         }
 
         Ok(Self {
             elf,
             target,
             kernels,
+            metadata,
             diagnostics,
         })
     }
@@ -201,4 +237,78 @@ impl<'elf> CodeObjectView<'elf> {
     pub fn elf(&self) -> &Elf<'elf> {
         self.elf
     }
+}
+
+/// Walk every SHT_NOTE section looking for a record with name
+/// `"AMDGPU"` and type `NT_AMDGPU_METADATA = 32`. Decode the
+/// descriptor bytes as MessagePack and return the typed
+/// [`AmdMetadata`].
+///
+/// ELF note layout (per gABI, used identically on ELF32 and ELF64):
+///
+/// ```text
+///   u32 namesz   ; length of name including NUL
+///   u32 descsz   ; length of descriptor
+///   u32 type     ; NT_AMDGPU_METADATA = 32 for AMDGPU metadata
+///   <name>       ; padded up to 4-byte alignment
+///   <desc>       ; padded up to 4-byte alignment
+/// ```
+fn find_amdgpu_metadata(elf: &Elf<'_>) -> Option<AmdMetadata> {
+    use crate::Section;
+    const SHT_NOTE: u32 = 7;
+    const NT_AMDGPU_METADATA: u32 = 32;
+
+    for section in &elf.sections {
+        if section.sh_type != SHT_NOTE {
+            continue;
+        }
+        let bytes = section.data();
+        let mut cursor = 0;
+        while cursor + 12 <= bytes.len() {
+            let namesz = u32::from_le_bytes([
+                bytes[cursor],
+                bytes[cursor + 1],
+                bytes[cursor + 2],
+                bytes[cursor + 3],
+            ]) as usize;
+            let descsz = u32::from_le_bytes([
+                bytes[cursor + 4],
+                bytes[cursor + 5],
+                bytes[cursor + 6],
+                bytes[cursor + 7],
+            ]) as usize;
+            let ntype = u32::from_le_bytes([
+                bytes[cursor + 8],
+                bytes[cursor + 9],
+                bytes[cursor + 10],
+                bytes[cursor + 11],
+            ]);
+
+            let name_off = cursor + 12;
+            let desc_off = name_off + align_up(namesz, 4);
+            let next_off = desc_off + align_up(descsz, 4);
+            if next_off > bytes.len() {
+                break;
+            }
+
+            let name = bytes[name_off..name_off + namesz]
+                .split(|&b| b == 0)
+                .next()
+                .and_then(|n| std::str::from_utf8(n).ok())
+                .unwrap_or("");
+
+            if ntype == NT_AMDGPU_METADATA && name == "AMDGPU" {
+                if let Ok(md) = AmdMetadata::parse(&bytes[desc_off..desc_off + descsz]) {
+                    return Some(md);
+                }
+            }
+
+            cursor = next_off;
+        }
+    }
+    None
+}
+
+fn align_up(n: usize, align: usize) -> usize {
+    (n + align - 1) & !(align - 1)
 }

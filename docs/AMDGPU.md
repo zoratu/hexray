@@ -90,16 +90,16 @@ sections`, `hexray <code-object> symbols`, `hexray -s <kernel>
 ## scale-lang interop
 
 [SCALE](https://scale-lang.com/) is a clean-room nvcc replacement
-that compiles unmodified CUDA source to either NVIDIA cubins
-(`-arch=sm_XX`) or AMDGPU code objects (`-arch=gfxNNN`). hexray reads
-both formats — the NVIDIA path through `Elf::cubin_view()` (v1.3.0),
-the AMD path through `Elf::code_object_view()` (this milestone).
+that compiles unmodified CUDA source to AMDGPU code objects (and,
+in the commercial build, also to NVIDIA cubins). hexray reads both
+formats — the NVIDIA path through `Elf::cubin_view()` (v1.3.0), the
+AMD path through `Elf::code_object_view()` (v1.3.1+).
 
-The point of the AMDGPU support is to make cross-vendor equivalence
-demoable: same CUDA source, two different ISAs, one tool that shows
-the kernel signatures match. The `hexray cmp` subcommand (M11) is
-the user-facing entry point; this milestone is the parser /
-disassembler infrastructure underneath it.
+`hexray cmp` (v1.3.1+) does kernel-by-kernel signature equivalence
+across the two formats so you can validate that the same CUDA source
+compiles to the same kernel signature on both targets. See
+[`SCALE_INTEROP.md`](SCALE_INTEROP.md) for the end-to-end walkthrough
+with real SCALE-built binaries.
 
 ## Known gaps
 

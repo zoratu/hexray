@@ -29,7 +29,10 @@ pub use encoding::{decode_class, EncodingClass, EncodingFamily};
 pub use opcodes::{lookup as lookup_opcode, OpcodeEntry, TableClass};
 
 use crate::{DecodeError, DecodedInstruction, Disassembler};
-use hexray_core::{Architecture, ControlFlow, GfxArchitecture, GfxFamily, Instruction, Operation};
+use hexray_core::{
+    Architecture, ControlFlow, GfxArchitecture, GfxFamily, Instruction, Operand, Operation,
+    Register, RegisterClass,
+};
 
 /// AMDGPU disassembler targeting one GFX family band (GFX9 vs GFX10+).
 ///
@@ -126,6 +129,7 @@ impl Disassembler for AmdgpuDisassembler {
         let mut instr = Instruction::new(address, size, raw, mnemonic);
         instr.operation = operation;
         instr.control_flow = control_flow;
+        populate_operands(&mut instr, class, dword0, self.target);
 
         Ok(DecodedInstruction {
             instruction: instr,
@@ -317,6 +321,153 @@ fn derive_operation(class: EncodingClass, dword0: u32, family: EncodingFamily) -
         | EncodingClass::Flat => Operation::Load,
         EncodingClass::Exp => Operation::Other(0),
         EncodingClass::Unknown => Operation::Other(0),
+    }
+}
+
+/// Populate `instr.operands` and the `reads`/`writes` register lists
+/// for the encoding class. Pure best-effort — we render the operand
+/// fields LLVM tablegen documents per class. Encodings with literal
+/// dwords or extended-form follow-on bits aren't expanded here yet.
+///
+/// Bit layouts (from LLVM `SIInstrFormats.td`):
+///
+/// | Class | SRC0 / SSRC0 | VSRC1 / SSRC1 | VDST / SDST | Notes              |
+/// |-------|--------------|----------------|--------------|--------------------|
+/// | VOP1  | `[8:0]`      | —              | `[24:17]`    | OP at `[16:9]`     |
+/// | VOP2  | `[8:0]`      | `[16:9]`       | `[24:17]`    | OP at `[30:25]`    |
+/// | VOPC  | `[8:0]`      | `[16:9]`       | (vcc/vcc_lo) | OP at `[24:17]`    |
+/// | SOP1  | `[7:0]`      | —              | `[22:16]`    | OP at `[15:8]`     |
+/// | SOP2  | `[7:0]`      | `[15:8]`       | `[22:16]`    | OP at `[29:23]`    |
+/// | SOPP  | —            | —              | —            | SIMM16 at `[15:0]` |
+fn populate_operands(
+    instr: &mut Instruction,
+    class: EncodingClass,
+    dword0: u32,
+    target: GfxArchitecture,
+) {
+    let arch = Architecture::Amdgpu(target);
+    match class {
+        EncodingClass::Vop1 => {
+            let src0 = (dword0 & 0x1ff) as u16; // 9 bits
+            let vdst = ((dword0 >> 17) & 0xff) as u16; // 8 bits, VGPR id
+            push_vgpr(instr, arch, vdst, /*write=*/ true);
+            push_amdgpu_operand(instr, arch, src0, /*write=*/ false);
+        }
+        EncodingClass::Vop2 => {
+            let src0 = (dword0 & 0x1ff) as u16;
+            let vsrc1 = ((dword0 >> 9) & 0xff) as u16;
+            let vdst = ((dword0 >> 17) & 0xff) as u16;
+            push_vgpr(instr, arch, vdst, true);
+            push_amdgpu_operand(instr, arch, src0, false);
+            push_vgpr(instr, arch, vsrc1, false);
+        }
+        EncodingClass::Vopc => {
+            // Vector compares write the result to vcc / vcc_lo —
+            // model that as an implicit write, not a printed operand.
+            let src0 = (dword0 & 0x1ff) as u16;
+            let vsrc1 = ((dword0 >> 9) & 0xff) as u16;
+            push_amdgpu_operand(instr, arch, src0, false);
+            push_vgpr(instr, arch, vsrc1, false);
+        }
+        EncodingClass::Sop1 => {
+            let ssrc0 = (dword0 & 0xff) as u16; // 8 bits
+            let sdst = ((dword0 >> 16) & 0x7f) as u16; // 7 bits, SGPR id
+            push_sgpr(instr, arch, sdst, true);
+            push_amdgpu_operand(instr, arch, ssrc0, false);
+        }
+        EncodingClass::Sop2 => {
+            let ssrc0 = (dword0 & 0xff) as u16;
+            let ssrc1 = ((dword0 >> 8) & 0xff) as u16;
+            let sdst = ((dword0 >> 16) & 0x7f) as u16;
+            push_sgpr(instr, arch, sdst, true);
+            push_amdgpu_operand(instr, arch, ssrc0, false);
+            push_amdgpu_operand(instr, arch, ssrc1, false);
+        }
+        EncodingClass::Sopp => {
+            // Most SOPP forms (s_endpgm, s_nop, s_barrier) take no
+            // visible operands. s_branch / s_cbranch_* take a 16-bit
+            // signed SIMM16 — render as PC-relative.
+            let op = (dword0 >> 16) & 0x7f;
+            let simm16 = (dword0 & 0xffff) as i16;
+            if matches!(op, 0x02 | 0x04..=0x09) {
+                let target_addr =
+                    (instr.address as i64).wrapping_add(((simm16 as i32) * 4 + 4) as i64) as u64;
+                instr
+                    .operands
+                    .push(Operand::pc_rel((simm16 as i64) * 4, target_addr));
+            }
+        }
+        _ => {
+            // Other classes (VOP3, SMEM, MUBUF, DS, FLAT, MIMG, EXP)
+            // have richer operand layouts that the M10.4 + v1.3.1
+            // tables don't cover yet. Leave operands empty for now —
+            // M10.4 already renders the mnemonic, and the
+            // class-dispatcher tells callers something useful.
+        }
+    }
+}
+
+fn push_vgpr(instr: &mut Instruction, arch: Architecture, id: u16, write: bool) {
+    // VGPR IDs are stored without the +256 offset in the VDST/VSRC1
+    // fields (which are 8-bit and reference VGPRs by absolute index
+    // 0..255). The Register `id` we store needs the +256 offset to
+    // match the operand-encoding scheme used in 9-bit SRC0 fields,
+    // so the central `amdgpu_reg_name` table can be a single
+    // dispatcher.
+    let reg = Register::new(arch, RegisterClass::General, id + 256, 32);
+    if write {
+        instr.writes.push(reg);
+    } else {
+        instr.reads.push(reg);
+    }
+    instr.operands.push(Operand::reg(reg));
+}
+
+fn push_sgpr(instr: &mut Instruction, arch: Architecture, id: u16, write: bool) {
+    let reg = Register::new(arch, RegisterClass::General, id, 32);
+    if write {
+        instr.writes.push(reg);
+    } else {
+        instr.reads.push(reg);
+    }
+    instr.operands.push(Operand::reg(reg));
+}
+
+/// Push a 9-bit operand id. Inline constants render as immediates
+/// (the Register name table also handles them, but Operand::Immediate
+/// is more semantically correct for downstream consumers — the CFG
+/// builder, signature recovery — that distinguish reg vs imm).
+fn push_amdgpu_operand(instr: &mut Instruction, arch: Architecture, id: u16, write: bool) {
+    // Inline constants 128..=208 / 240..=248 surface as immediates
+    // so downstream IR users see them as values, not registers.
+    if let Some(value) = inline_constant_value(id) {
+        instr.operands.push(Operand::imm(value, 32));
+        return;
+    }
+    // Everything else — SGPRs (0..101), VCC/EXEC/M0 specials, VGPRs
+    // (256..511) — renders as a Register through the unified
+    // amdgpu_reg_name table.
+    let reg = Register::new(arch, RegisterClass::General, id, 32);
+    if write {
+        instr.writes.push(reg);
+    } else {
+        instr.reads.push(reg);
+    }
+    instr.operands.push(Operand::reg(reg));
+}
+
+/// Return the integer value of an inline constant operand id, if
+/// the id encodes one. Hex / float constants are deliberately *not*
+/// included here — they're not integers and need to be rendered as
+/// strings; they fall through to the register-name path which
+/// handles them via `amdgpu_reg_name`.
+fn inline_constant_value(id: u16) -> Option<i128> {
+    match id {
+        // Signed 0..=64.
+        128..=192 => Some((id as i128) - 128),
+        // Signed -1..=-16.
+        193..=208 => Some(-((id as i128) - 192)),
+        _ => None,
     }
 }
 

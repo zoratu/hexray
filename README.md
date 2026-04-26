@@ -151,6 +151,7 @@ void process_input(char *input)
 | RISC-V 64 | ✅ | ✅ | M, A, C extensions |
 | RISC-V 32 | ✅ | ✅ | M, A, C extensions |
 | NVIDIA SASS (CUDA) | ✅ | — | Volta+ 16-byte; Ampere/Ada/Hopper |
+| AMD GCN / RDNA / CDNA | ✅ | — | Variable-length 32/64-bit; GFX9+ |
 
 CUDA support covers CUBIN ELF recognition (sm_70..sm_120 including
 `a` accelerator suffix), per-kernel resource metadata (`.nv.info`),
@@ -158,6 +159,16 @@ SASS disassembly with 100% base-mnemonic / 95.8% full-mnemonic match
 against `nvdisasm -json` on the handwritten corpus, fatbin
 extraction, and PTX sidecar parsing. See [docs/CUDA.md](docs/CUDA.md)
 for the full picture.
+
+AMD GPU support covers AMDGPU code objects (`EM_AMDGPU = 224`)
+emitted by `clang -target=amdgcn-amd-amdhsa`, `hipcc --genco`, and
+[SCALE](https://scale-lang.com/): kernel descriptor decode (vgpr /
+sgpr / kernarg / LDS), `NT_AMDGPU_METADATA` MessagePack note,
+variable-length disassembly across the GFX9 (Vega/CDNA) and GFX10+
+(RDNA1+) prefix bands, plus a `hexray cmp` cross-vendor comparator
+that diffs kernel signatures across cubin and AMDGPU code objects.
+See [docs/AMDGPU.md](docs/AMDGPU.md) and
+[docs/SCALE_INTEROP.md](docs/SCALE_INTEROP.md) for the walkthrough.
 
 ### Binary Formats
 
@@ -169,6 +180,7 @@ for the full picture.
 | PE/COFF | ✅ | ✅ | - |
 | NVIDIA CUBIN (EM_CUDA) | ✅ | ✅ | `.nv.info`, PTX sidecar |
 | NVIDIA fatbin | ✅ | — | wrapper extraction |
+| AMDGPU code object (EM_AMDGPU) | ✅ | ✅ | `NT_AMDGPU_METADATA`, kernel descriptor |
 
 ## Project Structure
 
@@ -276,11 +288,3 @@ See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for deterministic benchmark and
 ## License
 
 GNU GPLv3
-
-## Acknowledgments
-
-Built to deeply understand binary analysis from first principles:
-- Instruction set architectures and encoding formats
-- Binary file formats and linking
-- Control flow analysis and decompilation theory
-- Data flow analysis and type recovery
