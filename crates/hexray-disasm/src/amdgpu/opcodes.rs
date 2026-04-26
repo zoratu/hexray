@@ -1983,4 +1983,53 @@ mod tests {
         assert_eq!(entry.mnemonic, "s_load_dword");
         assert!(matches!(entry.operation, Operation::Load));
     }
+
+    #[test]
+    fn flat_mnemonic_seg_zero_returns_base_unchanged() {
+        // seg = 0 means flat addressing — the bare `flat_*` mnemonic
+        // is returned without rewriting.
+        assert_eq!(
+            render_flat_mnemonic("flat_load_dword", 0),
+            "flat_load_dword"
+        );
+    }
+
+    #[test]
+    fn flat_mnemonic_seg_one_rewrites_flat_to_scratch() {
+        // seg = 1 means scratch — the `flat_` prefix is rewritten.
+        assert_eq!(
+            render_flat_mnemonic("flat_load_dword", 1),
+            "scratch_load_dword"
+        );
+    }
+
+    #[test]
+    fn flat_mnemonic_seg_two_rewrites_flat_to_global() {
+        // seg = 2 means global — the `flat_` prefix is rewritten.
+        assert_eq!(
+            render_flat_mnemonic("flat_load_dword", 2),
+            "global_load_dword"
+        );
+    }
+
+    #[test]
+    fn flat_mnemonic_unknown_seg_falls_back_to_marker() {
+        // seg = 3 is reserved and not currently used; fall back to a
+        // visibly-broken `flat?_` form so the caller can spot it.
+        assert_eq!(
+            render_flat_mnemonic("flat_load_dword", 3),
+            "flat?_flat_load_dword"
+        );
+    }
+
+    #[test]
+    fn flat_mnemonic_without_flat_prefix_passes_through() {
+        // Some opcode-table entries already render the rewritten form
+        // (e.g. RDNA3 `global_*`); strip-prefix fails so we leave the
+        // mnemonic alone for non-zero seg.
+        assert_eq!(
+            render_flat_mnemonic("global_load_b32", 2),
+            "global_load_b32"
+        );
+    }
 }

@@ -62,8 +62,20 @@ mod tests {
     #[test]
     fn special_registers_have_expected_names() {
         assert_eq!(operand_name(106), "vcc_lo");
-        assert_eq!(operand_name(126), "exec_lo");
+        assert_eq!(operand_name(107), "vcc_hi");
         assert_eq!(operand_name(124), "m0");
+        assert_eq!(operand_name(126), "exec_lo");
+        assert_eq!(operand_name(127), "exec_hi");
+    }
+
+    #[test]
+    fn float_inline_constants_render_with_decimal() {
+        // The hex / float inline-constant slots fall outside the
+        // signed-integer range and have explicit string forms.
+        assert_eq!(operand_name(240), "0.5");
+        assert_eq!(operand_name(242), "1.0");
+        assert_eq!(operand_name(244), "2.0");
+        assert_eq!(operand_name(246), "4.0");
     }
 
     #[test]
@@ -76,5 +88,9 @@ mod tests {
     #[test]
     fn unknown_id_falls_through_to_hex() {
         assert_eq!(operand_name(220), "op:0xdc");
+        // ID 241 is in the gap between the float-constant slots and is
+        // not a recognised name, so it must fall through to the hex
+        // placeholder rather than borrowing a neighbouring arm.
+        assert_eq!(operand_name(241), "op:0xf1");
     }
 }

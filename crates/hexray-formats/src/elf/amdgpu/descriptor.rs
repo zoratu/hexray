@@ -258,4 +258,140 @@ mod tests {
         let buf = [0u8; 32];
         assert!(KernelDescriptor::parse(&buf).is_err());
     }
+
+    #[test]
+    fn entry_offset_decodes_all_eight_bytes() {
+        // The previous round-trip test used 0x100, which only hits
+        // the low byte. Use a value with non-zero bytes in every
+        // position so each `bytes[o + N]` index has to read the
+        // right slot — any off-by-one in the indices would be
+        // visible as a wrong magnitude.
+        let entry_offset: i64 = 0x1234_5678_9ABC_DEF0;
+        let buf = make_descriptor(0, 0, 0, entry_offset, 0, 0);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.kernel_code_entry_byte_offset, entry_offset);
+    }
+
+    #[test]
+    fn entry_offset_negative_round_trips_signed() {
+        // Negative i64 forces all eight bytes to be 0xFF — useful for
+        // catching mutations that swap byte order or drop a byte.
+        // (-1 still ends up all 0xff but we use a more interesting
+        // value to also catch mid-byte mutations.)
+        let entry_offset: i64 = -0x0102_0304_0506_0708;
+        let buf = make_descriptor(0, 0, 0, entry_offset, 0, 0);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.kernel_code_entry_byte_offset, entry_offset);
+    }
+
+    #[test]
+    fn vgpr_decode_at_max_raw_value() {
+        // raw = 63 (max value of bits [5:0]) on GFX9 wave64 →
+        // (63 + 1) * 4 = 256 vgprs. Catches mutations that turn
+        // `(raw + 1) * granule` into `raw * granule`.
+        let buf = make_descriptor(0, 0, 0, 0, 0x3f, 0);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.vgpr_count(9), 256);
+    }
+
+    #[test]
+    fn sgpr_decode_at_max_raw_value() {
+        // raw = 15 (max value of bits [9:6]) → (15 + 1) * 8 = 128
+        // sgprs.
+        let buf = make_descriptor(0, 0, 0, 0, 0xf << 6, 0);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.sgpr_count(), 128);
+    }
+
+    #[test]
+    fn lds_decode_zero_granulated_yields_zero_bytes() {
+        // granulated_lds_size = 0 → 0 * 128 = 0. Pins the
+        // multiplication and the 0x1ff mask.
+        let buf = make_descriptor(0, 0, 0, 0, 0, 0);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.dynamic_lds_bytes(), 0);
+    }
+
+    #[test]
+    fn lds_decode_max_granulated_yields_correct_bytes() {
+        // granulated_lds_size = 0x1ff (max in 9 bits) → 0x1ff * 128.
+        let rsrc2 = 0x1ffu32 << 15;
+        let buf = make_descriptor(0, 0, 0, 0, 0, rsrc2);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.dynamic_lds_bytes(), 0x1ff * 128);
+    }
+
+    #[test]
+    fn user_sgpr_count_extracts_max_value() {
+        // user_sgpr_count = 31 (max of bits [5:1]) → 0x1f << 1 = 0x3E.
+        let rsrc2 = 31u32 << 1;
+        let buf = make_descriptor(0, 0, 0, 0, 0, rsrc2);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.user_sgpr_count(), 31);
+    }
+
+    #[test]
+    fn is_wave32_reads_bit_ten_only() {
+        // Set every bit of `kernel_code_properties` *except* bit 10:
+        // is_wave32 must still return false. This pins the shift to
+        // `>> 10` rather than `>> 9` or `>> 11`.
+        let props: u16 = !(1u16 << 10);
+        let buf = make_descriptor_with_props(0, 0, 0, 0, 0, 0, props);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert!(
+            !d.is_wave32(),
+            "bit 10 was clear; is_wave32 should be false"
+        );
+
+        // Now flip just bit 10 — must read true.
+        let buf = make_descriptor_with_props(0, 0, 0, 0, 0, 0, 1 << 10);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert!(d.is_wave32(), "bit 10 set should yield wave32 = true");
+    }
+
+    #[test]
+    fn vgpr_count_pre_gfx10_ignores_wave32_bit() {
+        // Pre-GFX10 hardware (family_major < 10) must always use the
+        // wave64 granule (4) regardless of the wave32 property bit.
+        let buf = make_descriptor_with_props(0, 0, 0, 0, 0x02, 0, 1 << 10);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        // family_major = 9 → still wave64 → (2 + 1) * 4 = 12.
+        assert_eq!(d.vgpr_count(9), 12);
+    }
+
+    #[test]
+    fn vgpr_count_gfx10_wave64_uses_4_granule() {
+        // family_major = 10 with wave32 disabled → granule = 4.
+        // raw = 1 → (1 + 1) * 4 = 8.
+        let buf = make_descriptor(0, 0, 0, 0, 1, 0);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.vgpr_count(10), 8);
+    }
+
+    #[test]
+    fn descriptor_round_trips_all_kernarg_size_bytes() {
+        // The previous round-trip test used 24 (only the low byte).
+        // Use a 4-byte value to pin every byte of the read_u32 helper.
+        let buf = make_descriptor(0xDEAD_BEEF, 0xCAFE_F00D, 0x1234_5678, 0, 0, 0);
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.group_segment_fixed_size, 0xDEAD_BEEF);
+        assert_eq!(d.private_segment_fixed_size, 0xCAFE_F00D);
+        assert_eq!(d.kernarg_size, 0x1234_5678);
+    }
+
+    #[test]
+    fn rsrc1_rsrc2_round_trip_full_words() {
+        // The decoded sub-fields can mask away byte-order mistakes, so
+        // assert the raw words round-trip across all four bytes.
+        let mut buf = [0u8; KERNEL_DESCRIPTOR_SIZE];
+        buf[44..48].copy_from_slice(&0xAABBCCDDu32.to_le_bytes());
+        buf[48..52].copy_from_slice(&0x11223344u32.to_le_bytes());
+        buf[52..56].copy_from_slice(&0x55667788u32.to_le_bytes());
+        buf[58..60].copy_from_slice(&0x99AAu16.to_le_bytes()); // kernarg_preload
+        let d = KernelDescriptor::parse(&buf).unwrap();
+        assert_eq!(d.compute_pgm_rsrc3, 0xAABBCCDD);
+        assert_eq!(d.compute_pgm_rsrc1, 0x11223344);
+        assert_eq!(d.compute_pgm_rsrc2, 0x55667788);
+        assert_eq!(d.kernarg_preload, 0x99AA);
+    }
 }
