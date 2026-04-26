@@ -5,6 +5,91 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-04-26
+
+### Highlights — AMDGPU opcode tables now hit 100% on the SCALE corpus
+
+v1.3.3 fixes the GFX10+ opcode-table numbering and adds VOP3 + FLAT
+class support. Every instruction in the SCALE-built `vector_add`
+kernel now resolves to a real mnemonic, with ground-truth validation
+done against `llvm-objdump --triple=amdgcn-amd-amdhsa --mcpu=gfx1030`
+on the committed fixture.
+
+Before (v1.3.2):
+
+```
+0x00000100:  ... sopp.op0x21
+0x00000124:  ... vop3
+0x00000130:  ... vop3
+0x00000150:  ... vop3
+0x0000015c:  ... vop3
+0x00000164:  ... vop2.op0x28
+0x0000017c:  ... flat
+0x00000194:  ... v_subrev_f32_e32 v2, v2, v3   ← actually wrong (was v_add_f32)
+```
+
+After (v1.3.3):
+
+```
+0x00000100:  ... s_clause
+0x00000124:  ... v_mad_u64_u32
+0x00000130:  ... v_cmpx_gt_i32_e64
+0x00000150:  ... v_lshlrev_b64
+0x0000015c:  ... v_add_co_u32
+0x00000164:  ... v_add_co_ci_u32_e32 v3, s1, v1
+0x0000017c:  ... global_load_dword
+0x00000194:  ... v_add_f32_e32 v2, v2, v3
+```
+
+What's new:
+
+- **VOP2 GFX10+ table corrected.** RDNA renumbered VOP2 to a
+  compact layout. v1.3.2's table inherited GFX9 numbering for
+  several entries (`v_add_f32 = 0x01`) — wrong on GFX10+ where
+  it's `0x03`. `v_subrev_f32_e32` was *masquerading* as
+  `v_add_f32_e32` for the binary at hand. Numbering harvested from
+  LLVM `VOP2Instructions.td` GFX10 records and validated against
+  `llvm-objdump`. Adds the RDNA-specific `v_add_co_ci_u32_e32` /
+  `v_sub_co_ci_u32_e32` carry-add ops at OP=0x28/0x29.
+- **SOP1 GFX10+ table.** Split `SOP1_SHARED` into per-family tables;
+  GFX10+ moves `s_mov_b32` from OP=0x00 to 0x03, `s_mov_b64` to 0x04.
+  Added `s_cmov_b32/b64`, `s_setpc_b64`, `s_swappc_b64` at the right
+  GFX10+ slots.
+- **SOPP GFX10+ table.** Now distinct from GFX9 — adds the RDNA
+  scheduling-hint opcodes `s_clause` (0x21), `s_code_end` (0x22),
+  `s_inst_prefetch` (0x23) that show up in every RDNA kernel.
+- **VOP3 opcode table.** New `TableClass::Vop3` with 10-bit OP at
+  bits `[25:16]`. First-pass entries: `v_cmpx_gt_i32_e64` (0x094),
+  `v_add3_u32` (0x155), `v_mad_u64_u32` (0x176), `v_mad_i64_i32`
+  (0x177), `v_lshlrev_b64` (0x2ff), `v_add_co_u32` (0x30f),
+  `v_sub_co_u32` (0x310). VOP3A and VOP3B share the same OP space
+  and dispatch through one table.
+- **FLAT opcode table + seg-aware rendering.** New `TableClass::Flat`
+  with 7-bit OP at `[24:18]`. The `seg` bit field at `[16:14]`
+  (0=flat, 1=scratch, 2=global) is decoded and rewrites the
+  rendered prefix: `flat_load_dword` becomes `global_load_dword`
+  when seg=2, `scratch_load_dword` when seg=1. First-pass
+  entries cover the {`flat`,`global`,`scratch`} × {load,store} ×
+  {ubyte, sbyte, ushort, sshort, dword, dwordx2/3/4} matrix.
+
+Hands-on verification:
+- `cargo run --bin hexray -- -s vector_add tests/corpus/scale-lang/vector_add.gfx1030.co`
+  produces real mnemonics for every instruction, matching
+  `llvm-objdump`'s output 1:1 on the base mnemonic level.
+
+Workspace: 2358 tests pass with `--features amdgpu cuda`. Clippy
+clean.
+
+Known gaps remaining (the v1.3.4 docket):
+
+- VOP3 / SMEM / MUBUF / DS operand rendering. Class dispatch and
+  mnemonic resolution work; full operand strings (memory refs with
+  `v[2:3], off` notation, VOP3 src modifiers) are follow-up.
+- HIP host-binary fatbin extraction.
+- SCALE-specific `.AMDGPU.kinfo` section parsing for SCALE-free
+  binaries (so per-arg cmp rows render without standard
+  NT_AMDGPU_METADATA).
+
 ## [1.3.2] - 2026-04-25
 
 ### Highlights — AMDGPU operand decoding, MessagePack metadata, real scale-lang demo

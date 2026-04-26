@@ -208,6 +208,17 @@ fn render_mnemonic(
     _dword1: Option<u32>,
     family: EncodingFamily,
 ) -> String {
+    // FLAT is special: the `seg` bit field at [16:14] selects
+    // flat/scratch/global and rewrites the rendered prefix.
+    if matches!(class, EncodingClass::Flat) {
+        let op = ((dword0 >> 18) & 0x7f) as u16;
+        let seg = ((dword0 >> 14) & 0x3) as u8;
+        if let Some(entry) = opcodes::lookup(opcodes::TableClass::Flat, family, op) {
+            return opcodes::render_flat_mnemonic(entry.mnemonic, seg);
+        }
+        return format!("flat.op{op:#x}");
+    }
+
     let (table_class, op) = match class {
         // VOP1 layout (per LLVM SIInstrFormats.td):
         //   [8:0]   SRC0
@@ -251,6 +262,11 @@ fn render_mnemonic(
         EncodingClass::Smem => (
             Some(opcodes::TableClass::Smem),
             ((dword0 >> 18) & 0xff) as u16,
+        ),
+        // VOP3A / VOP3B: 10-bit OP at [25:16].
+        EncodingClass::Vop3a | EncodingClass::Vop3b => (
+            Some(opcodes::TableClass::Vop3),
+            ((dword0 >> 16) & 0x3ff) as u16,
         ),
         _ => (None, 0),
     };
@@ -297,6 +313,14 @@ fn derive_operation(class: EncodingClass, dword0: u32, family: EncodingFamily) -
         EncodingClass::Smem => (
             Some(opcodes::TableClass::Smem),
             ((dword0 >> 18) & 0xff) as u16,
+        ),
+        EncodingClass::Vop3a | EncodingClass::Vop3b => (
+            Some(opcodes::TableClass::Vop3),
+            ((dword0 >> 16) & 0x3ff) as u16,
+        ),
+        EncodingClass::Flat => (
+            Some(opcodes::TableClass::Flat),
+            ((dword0 >> 18) & 0x7f) as u16,
         ),
         _ => (None, 0),
     };
