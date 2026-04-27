@@ -21,7 +21,7 @@
 //! a new corpus binary doesn't fail CI before the sidecar lands).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn corpus_dir() -> PathBuf {
@@ -115,7 +115,7 @@ where
     tally
 }
 
-fn run_hexray_disasm(path: &PathBuf, kernel: &str) -> String {
+fn run_hexray_disasm(path: &Path, kernel: &str) -> String {
     let output = Command::new(hexray_bin())
         .arg("-s")
         .arg(kernel)

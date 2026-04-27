@@ -1077,3 +1077,185 @@ fn sopp_branch_offset_pinpoints_simm_quadrupling() {
         other => panic!("expected PcRelative, got {other:?}"),
     }
 }
+
+// ---- v1.3.6 — VOP3 ABS modifier, MUBUF / DS rendering, RDNA3 SOP2 ----
+
+#[test]
+fn vop3_abs_bit_wraps_src_in_pipes() {
+    // Construct a synthetic VOP3 with `v_lshlrev_b64` mnemonic and
+    // ABS[0] set on src0. v_lshlrev_b64 isn't naturally an ABS-using
+    // op (it's integer), but the renderer just trusts the ABS bit —
+    // this lets us prove the bit-extraction + `|...|` framing without
+    // needing a fixture that uses a real-FP op.
+    //
+    // VOP3 layout for gfx1030: prefix top6 = 110101.
+    //   dword0 = (0b110101 << 26) | (op << 16) | (abs[2:0] << 8) | vdst
+    //   For v_lshlrev_b64 op=0x2ff, abs[0]=1 (src0), vdst=0:
+    //   dword0 = 0xD400_0000 | 0x02FF_0000 | 0x0000_0100 = 0xD6FF_0100
+    let dword0: u32 = (0b110101u32 << 26) | (0x2ffu32 << 16) | (1u32 << 8);
+    // dword1: src0=2 (inline 2), src1=v0+1 = 257, no NEG.
+    //   src0 in [8:0] = 2, src1 in [17:9] = 257.
+    let dword1: u32 = 130 | (257u32 << 9); // src0 = inline constant 2 (id=128+2)
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&dword0.to_le_bytes());
+    bytes[4..].copy_from_slice(&dword1.to_le_bytes());
+    let d = AmdgpuDisassembler::gfx1030();
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        decoded.instruction.mnemonic.contains("|2|"),
+        "ABS[0]=1 on inline-2 should render as |2|; got {}",
+        decoded.instruction.mnemonic
+    );
+}
+
+#[test]
+fn vop3_abs_and_neg_combine_as_minus_pipes() {
+    // ABS[0]=1 + NEG[0]=1 → llvm-objdump renders `-|src|`.
+    let dword0: u32 = (0b110101u32 << 26) | (0x2ffu32 << 16) | (1u32 << 8);
+    let dword1: u32 = 130 | (257u32 << 9) | (1u32 << 29); // src0=inline-2, NEG[0]=1
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&dword0.to_le_bytes());
+    bytes[4..].copy_from_slice(&dword1.to_le_bytes());
+    let d = AmdgpuDisassembler::gfx1030();
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        decoded.instruction.mnemonic.contains("-|2|"),
+        "NEG+ABS should render as -|src|; got {}",
+        decoded.instruction.mnemonic
+    );
+}
+
+#[test]
+fn vop3b_does_not_apply_abs_to_sdst_bits() {
+    // VOP3B uses dword0[14:8] as SDST, so a stray "ABS-ish" bit in
+    // that range must NOT be interpreted as an ABS modifier on src0.
+    // v_add_co_u32 is a VOP3B form. Set bits [10:8] = 0b111 (looks
+    // like ABS for all 3 srcs in VOP3A) but in VOP3B those are SDST
+    // bits 2:0 = 7 → SDST=s7.
+    //   dword0 = (0b110101 << 26) | (0x30f << 16) | (0x07 << 8) | vdst
+    let dword0: u32 = (0b110101u32 << 26) | (0x30fu32 << 16) | (0x07u32 << 8);
+    let dword1: u32 = 130 | (257u32 << 9); // src0 = inline constant 2 (id=128+2)
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&dword0.to_le_bytes());
+    bytes[4..].copy_from_slice(&dword1.to_le_bytes());
+    let d = AmdgpuDisassembler::gfx1030();
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        !decoded.instruction.mnemonic.contains("|"),
+        "VOP3B SDST bits must not be misread as ABS modifiers; got {}",
+        decoded.instruction.mnemonic
+    );
+}
+
+#[test]
+fn sop2_gfx11_routes_to_gfx11_table() {
+    // RDNA3 placed `s_mul_i32` at SOP2 OP=0x2c (was 0x26 on GFX10
+    // and 0x24 on GFX9). Hitting OP=0x2c on a Gfx11Plus disassembler
+    // should resolve to s_mul_i32; the same OP on gfx1030 (Gfx10Plus)
+    // doesn't.
+    // SOP2 layout: top9 = bits[31:23], OP at bits[29:23]. For OP=0x2c:
+    //   top9 = 1_0_010_1100 = 0x12c.
+    let dword: u32 = 0x12cu32 << 23;
+    let bytes = dword.to_le_bytes();
+
+    let d11 = AmdgpuDisassembler::gfx1100();
+    let decoded11 = d11.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        decoded11.instruction.mnemonic.starts_with("s_mul_i32"),
+        "GFX11 SOP2 op=0x2c should resolve to s_mul_i32; got {}",
+        decoded11.instruction.mnemonic
+    );
+
+    let d10 = AmdgpuDisassembler::gfx1030();
+    let decoded10 = d10.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        !decoded10.instruction.mnemonic.starts_with("s_mul_i32"),
+        "GFX10 SOP2 op=0x2c should NOT resolve to s_mul_i32 (lives at 0x26 there); got {}",
+        decoded10.instruction.mnemonic
+    );
+}
+
+#[test]
+fn sop2_gfx11_min_i32_at_op_0x12() {
+    // RDNA3 `s_min_i32` moved from OP=0x06 to OP=0x12.
+    let dword: u32 = 0x112u32 << 23;
+    let bytes = dword.to_le_bytes();
+    let d11 = AmdgpuDisassembler::gfx1100();
+    let decoded = d11.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        decoded.instruction.mnemonic.starts_with("s_min_i32"),
+        "got {}",
+        decoded.instruction.mnemonic
+    );
+}
+
+#[test]
+fn mubuf_buffer_load_dword_renders_resource_descriptor_pair() {
+    // MUBUF prefix top6 = 111000. Pick `buffer_load_dword`:
+    //   dword0 = (0b111000 << 26) | (op << 18) | offset
+    //   We don't have an opcode-table entry yet for MUBUF mnemonics
+    //   so the rendered mnemonic falls back to `mubuf.op0xNN`. The
+    //   point of this test is that `populate_mubuf_operands` still
+    //   wires the operand fields. Use OP=0 (any), OFFSET=0x40,
+    //   GLC=1, OFFEN=1.
+    let op = 0u32;
+    let offset = 0x40u32;
+    let dword0: u32 = (0b111000u32 << 26) | (op << 18) | offset | (1 << 12) | (1 << 14);
+    // dword1: VADDR=v3 (id 3), VDATA=v5 (id 5), SRSRC quad=0 → s[0:3],
+    // SOFFSET = s2.
+    let dword1: u32 = 3 | (5u32 << 8) | (2u32 << 24); // SRSRC quad=0 stays implicit
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&dword0.to_le_bytes());
+    bytes[4..].copy_from_slice(&dword1.to_le_bytes());
+    let d = AmdgpuDisassembler::gfx1030();
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        decoded.instruction.mnemonic.contains("s[0:3]"),
+        "MUBUF SRSRC should render as `s[0:3]` (4-SGPR resource descriptor); got {}",
+        decoded.instruction.mnemonic
+    );
+    assert!(
+        decoded.instruction.mnemonic.contains("offset:64"),
+        "MUBUF should render `offset:64` for OFFSET=0x40; got {}",
+        decoded.instruction.mnemonic
+    );
+    assert!(
+        decoded.instruction.mnemonic.contains("offen"),
+        "MUBUF should render the `offen` flag; got {}",
+        decoded.instruction.mnemonic
+    );
+    assert!(
+        decoded.instruction.mnemonic.contains("glc"),
+        "MUBUF should render the `glc` flag; got {}",
+        decoded.instruction.mnemonic
+    );
+}
+
+#[test]
+fn ds_op_renders_addr_and_offset0() {
+    // DS prefix top6 = 110110. With OFFSET0=0x10, OFFSET1=0,
+    // ADDR=v7. The DS opcode table is not populated yet, so the
+    // mnemonic will be `ds.op0xNN` — the test verifies that
+    // populate_ds_operands renders the address and offset0 fields
+    // regardless of mnemonic resolution.
+    let op = 0u32;
+    let offset0 = 0x10u32;
+    let dword0: u32 = (0b110110u32 << 26) | (op << 18) | offset0;
+    // dword1: ADDR=v7 (id 7), DATA0=v0, DATA1=v0, VDST=v0.
+    let dword1: u32 = 7;
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&dword0.to_le_bytes());
+    bytes[4..].copy_from_slice(&dword1.to_le_bytes());
+    let d = AmdgpuDisassembler::gfx1030();
+    let decoded = d.decode_instruction(&bytes, 0x1000).unwrap();
+    assert!(
+        decoded.instruction.mnemonic.contains("v7"),
+        "DS should render the ADDR vgpr; got {}",
+        decoded.instruction.mnemonic
+    );
+    assert!(
+        decoded.instruction.mnemonic.contains("offset0:16"),
+        "DS should render `offset0:16` for OFFSET0=0x10; got {}",
+        decoded.instruction.mnemonic
+    );
+}

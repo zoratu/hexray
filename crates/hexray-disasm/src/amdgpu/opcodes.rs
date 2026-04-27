@@ -74,6 +74,7 @@ fn table_for(class: TableClass, family: EncodingFamily) -> &'static [OpcodeEntry
         // remains the wave32 `_b32` form, so we keep a thin overlay.
         (TableClass::Sop1, EncodingFamily::Gfx11Plus) => SOP1_GFX11,
         (TableClass::Sop2, EncodingFamily::Gfx9) => SOP2_GFX9,
+        (TableClass::Sop2, EncodingFamily::Gfx11Plus) => SOP2_GFX11,
         (TableClass::Sop2, _) => SOP2_GFX10,
         (TableClass::Sopp, EncodingFamily::Gfx9) => SOPP_GFX9,
         (TableClass::Sopp, EncodingFamily::Gfx10Plus) => SOPP_GFX10,
@@ -1037,6 +1038,161 @@ const SOP2_GFX10: &[OpcodeEntry] = &[
         op: 0x26,
         mnemonic: "s_mul_i32",
         operation: Operation::Mul,
+    },
+];
+
+/// SOP2 — GFX11 (RDNA3).
+///
+/// RDNA3 substantially renumbered SOP2. The first six opcodes
+/// (`s_add_u32`..`s_subb_u32` at 0x00..=0x05) survived from GFX10,
+/// but min/max/select/and/or/xor/shifts/multiply all moved. Numbers
+/// derived from `llvm/lib/Target/AMDGPU/SOPInstructions.td` GFX11
+/// records.
+const SOP2_GFX11: &[OpcodeEntry] = &[
+    OpcodeEntry {
+        op: 0x00,
+        mnemonic: "s_add_u32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x01,
+        mnemonic: "s_sub_u32",
+        operation: Operation::Sub,
+    },
+    OpcodeEntry {
+        op: 0x02,
+        mnemonic: "s_add_i32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x03,
+        mnemonic: "s_sub_i32",
+        operation: Operation::Sub,
+    },
+    OpcodeEntry {
+        op: 0x04,
+        mnemonic: "s_addc_u32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x05,
+        mnemonic: "s_subb_u32",
+        operation: Operation::Sub,
+    },
+    OpcodeEntry {
+        op: 0x06,
+        mnemonic: "s_absdiff_i32",
+        operation: Operation::Sub,
+    },
+    OpcodeEntry {
+        op: 0x08,
+        mnemonic: "s_lshl_b32",
+        operation: Operation::Shl,
+    },
+    OpcodeEntry {
+        op: 0x0a,
+        mnemonic: "s_lshr_b32",
+        operation: Operation::Shr,
+    },
+    OpcodeEntry {
+        op: 0x0c,
+        mnemonic: "s_ashr_i32",
+        operation: Operation::Sar,
+    },
+    OpcodeEntry {
+        op: 0x0e,
+        mnemonic: "s_lshl1_add_u32",
+        operation: Operation::Add,
+    },
+    OpcodeEntry {
+        op: 0x12,
+        mnemonic: "s_min_i32",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x13,
+        mnemonic: "s_min_u32",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x14,
+        mnemonic: "s_max_i32",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x15,
+        mnemonic: "s_max_u32",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x16,
+        mnemonic: "s_and_b32",
+        operation: Operation::And,
+    },
+    OpcodeEntry {
+        op: 0x18,
+        mnemonic: "s_or_b32",
+        operation: Operation::Or,
+    },
+    OpcodeEntry {
+        op: 0x1a,
+        mnemonic: "s_xor_b32",
+        operation: Operation::Xor,
+    },
+    OpcodeEntry {
+        op: 0x1c,
+        mnemonic: "s_nand_b32",
+        operation: Operation::And,
+    },
+    OpcodeEntry {
+        op: 0x1e,
+        mnemonic: "s_nor_b32",
+        operation: Operation::Or,
+    },
+    OpcodeEntry {
+        op: 0x20,
+        mnemonic: "s_xnor_b32",
+        operation: Operation::Xor,
+    },
+    OpcodeEntry {
+        op: 0x22,
+        mnemonic: "s_andn2_b32",
+        operation: Operation::And,
+    },
+    OpcodeEntry {
+        op: 0x24,
+        mnemonic: "s_orn2_b32",
+        operation: Operation::Or,
+    },
+    OpcodeEntry {
+        op: 0x26,
+        mnemonic: "s_bfe_u32",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x2a,
+        mnemonic: "s_bfm_b32",
+        operation: Operation::Other(0),
+    },
+    OpcodeEntry {
+        op: 0x2c,
+        mnemonic: "s_mul_i32",
+        operation: Operation::Mul,
+    },
+    OpcodeEntry {
+        op: 0x2d,
+        mnemonic: "s_mul_hi_u32",
+        operation: Operation::Mul,
+    },
+    OpcodeEntry {
+        op: 0x2e,
+        mnemonic: "s_mul_hi_i32",
+        operation: Operation::Mul,
+    },
+    OpcodeEntry {
+        op: 0x30,
+        mnemonic: "s_cselect_b32",
+        operation: Operation::ConditionalMove,
     },
 ];
 

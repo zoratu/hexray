@@ -460,12 +460,17 @@ fn populate_operands(
         EncodingClass::Flat => {
             populate_flat_operands(instr, dword0, target);
         }
+        EncodingClass::Mubuf => {
+            populate_mubuf_operands(instr, dword0, target);
+        }
+        EncodingClass::Ds => {
+            populate_ds_operands(instr, dword0, target);
+        }
         _ => {
-            // MUBUF / MTBUF / MIMG / DS / EXP have richer operand
-            // layouts (resource descriptors + addressing modes); the
-            // mnemonic dispatcher renders the right name and the
-            // walker stays in sync. Operand-field expansion lands
-            // in a follow-up.
+            // MTBUF / MIMG / EXP have richer operand layouts
+            // (resource descriptors + addressing modes); the mnemonic
+            // dispatcher renders the right name and the walker stays
+            // in sync. Operand-field expansion lands in a follow-up.
         }
     }
 }
@@ -589,10 +594,23 @@ fn populate_vop3_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
     let src1 = ((dword1 >> 9) & 0x1ff) as u16;
     let src2 = ((dword1 >> 18) & 0x1ff) as u16;
 
-    // Modifiers (NEG bits at [31:29] of dword1 in VOP3A).
+    // Modifiers. VOP3A:
+    //   - NEG bits at [31:29] of dword1 (one per source).
+    //   - ABS bits at [10:8] of dword0 (one per source).
+    // VOP3B reuses [14:8] of dword0 as SDST, so ABS is unavailable;
+    // any bits set there are SDST data, not modifiers.
     let neg_src0 = (dword1 >> 29) & 1 != 0;
     let neg_src1 = (dword1 >> 30) & 1 != 0;
     let neg_src2 = (dword1 >> 31) & 1 != 0;
+    let (abs_src0, abs_src1, abs_src2) = if is_vop3b {
+        (false, false, false)
+    } else {
+        (
+            (dword0 >> 8) & 1 != 0,
+            (dword0 >> 9) & 1 != 0,
+            (dword0 >> 10) & 1 != 0,
+        )
+    };
 
     let mut parts = Vec::new();
     if writes_vdst {
@@ -602,13 +620,28 @@ fn populate_vop3_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
         parts.push(render_sgpr_range(sdst, 1));
     }
     if n_src >= 1 {
-        parts.push(render_amdgpu_operand_string(src0, src_dwords[0], neg_src0));
+        parts.push(render_amdgpu_operand_string(
+            src0,
+            src_dwords[0],
+            neg_src0,
+            abs_src0,
+        ));
     }
     if n_src >= 2 {
-        parts.push(render_amdgpu_operand_string(src1, src_dwords[1], neg_src1));
+        parts.push(render_amdgpu_operand_string(
+            src1,
+            src_dwords[1],
+            neg_src1,
+            abs_src1,
+        ));
     }
     if n_src >= 3 {
-        parts.push(render_amdgpu_operand_string(src2, src_dwords[2], neg_src2));
+        parts.push(render_amdgpu_operand_string(
+            src2,
+            src_dwords[2],
+            neg_src2,
+            abs_src2,
+        ));
     }
 
     instr.mnemonic = format!("{} {}", instr.mnemonic, parts.join(", "));
@@ -821,6 +854,298 @@ fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
     }
 }
 
+/// MUBUF operand layout (64-bit instruction; bit indices below are
+/// across both dwords combined, low dword = `dword0`, high = `dword1`).
+///
+/// `dword0`:
+///   - `[11:0]`  OFFSET (12-bit unsigned immediate)
+///   - `[12]`    OFFEN  (use VADDR.0 as offset)
+///   - `[13]`    IDXEN  (use VADDR.0 as index)
+///   - `[14]`    GLC
+///   - `[16]`    LDS    (write straight to LDS)
+///   - `[17]`    SLC
+///
+/// `dword1`:
+///   - `[39:32]` VADDR  (in dword1 = `[7:0]`)
+///   - `[47:40]` VDATA  (in dword1 = `[15:8]`)
+///   - `[52:48]` SRSRC  (in dword1 = `[20:16]`, references s[N*4:N*4+3])
+///   - `[55]`    TFE
+///   - `[63:56]` SOFFSET (in dword1 = `[31:24]`, scalar offset)
+///
+/// llvm-objdump renders as
+///   `<vdata>, <vaddr>, <srsrc>, <soffset> [offset:N] [idxen] [offen]`
+fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
+    let arch = Architecture::Amdgpu(target);
+    let dword1 = if instr.bytes.len() >= 8 {
+        u32::from_le_bytes([
+            instr.bytes[4],
+            instr.bytes[5],
+            instr.bytes[6],
+            instr.bytes[7],
+        ])
+    } else {
+        0
+    };
+
+    let offset = dword0 & 0xfff;
+    let offen = (dword0 >> 12) & 1 != 0;
+    let idxen = (dword0 >> 13) & 1 != 0;
+    let glc = (dword0 >> 14) & 1 != 0;
+    let slc = (dword0 >> 17) & 1 != 0;
+
+    let vaddr = (dword1 & 0xff) as u16;
+    let vdata = ((dword1 >> 8) & 0xff) as u16;
+    let srsrc_quad = ((dword1 >> 16) & 0x1f) as u16; // SGPR pair-of-pairs index
+    let soffset = ((dword1 >> 24) & 0xff) as u16;
+
+    let dwords = data_dwords_from_mubuf_mnemonic(&instr.mnemonic);
+    let is_load = matches!(instr.operation, Operation::Load);
+    let is_store = matches!(instr.operation, Operation::Store);
+
+    // SRSRC is encoded as a 5-bit field that names s[N*4:N*4+3] — one
+    // resource descriptor (V#) is 4 SGPRs / 128 bits.
+    let srsrc_base = srsrc_quad * 4;
+    let srsrc_str = format!("s[{}:{}]", srsrc_base, srsrc_base + 3);
+    let vdata_str = render_vgpr_range(vdata, dwords);
+    let vaddr_str = if offen && idxen {
+        format!("v[{}:{}]", vaddr, vaddr + 1)
+    } else if offen || idxen {
+        render_vgpr_range(vaddr, 1)
+    } else {
+        // Neither offen nor idxen → no per-lane addr; render `off`.
+        "off".to_string()
+    };
+    let soffset_str = if soffset == 0x80 {
+        // Imm-zero soffset — llvm renders as literal 0.
+        "0".to_string()
+    } else {
+        render_sgpr_range(soffset, 1)
+    };
+
+    let leading_v = if is_load || is_store {
+        vdata_str.clone()
+    } else {
+        // Atomics: VDATA is both read and written; render once.
+        vdata_str.clone()
+    };
+
+    let mut s = format!(
+        "{} {}, {}, {}, {}",
+        instr.mnemonic, leading_v, vaddr_str, srsrc_str, soffset_str
+    );
+    if offset != 0 {
+        s.push_str(&format!(" offset:{offset}"));
+    }
+    if idxen {
+        s.push_str(" idxen");
+    }
+    if offen {
+        s.push_str(" offen");
+    }
+    if glc {
+        s.push_str(" glc");
+    }
+    if slc {
+        s.push_str(" slc");
+    }
+    instr.mnemonic = s;
+
+    // Track register access. SRSRC = 4 SGPRs read.
+    for i in 0..4 {
+        instr.reads.push(Register::new(
+            arch,
+            RegisterClass::General,
+            srsrc_base + i,
+            32,
+        ));
+    }
+    if soffset != 0x80 && soffset < 124 {
+        instr
+            .reads
+            .push(Register::new(arch, RegisterClass::General, soffset, 32));
+    }
+    if offen || idxen {
+        let n = if offen && idxen { 2 } else { 1 };
+        for i in 0..n {
+            instr.reads.push(Register::new(
+                arch,
+                RegisterClass::General,
+                vaddr.wrapping_add(i) + 256,
+                32,
+            ));
+        }
+    }
+    if is_load {
+        for i in 0..dwords as u16 {
+            instr.writes.push(Register::new(
+                arch,
+                RegisterClass::General,
+                vdata.wrapping_add(i) + 256,
+                32,
+            ));
+        }
+    } else if is_store {
+        for i in 0..dwords as u16 {
+            instr.reads.push(Register::new(
+                arch,
+                RegisterClass::General,
+                vdata.wrapping_add(i) + 256,
+                32,
+            ));
+        }
+    }
+}
+
+/// DS (LDS / GDS) operand layout (64-bit instruction).
+///
+/// `dword0`:
+///   - `[7:0]`   OFFSET0 (8-bit unsigned)
+///   - `[15:8]`  OFFSET1 (8-bit unsigned)
+///   - `[16]`    GDS
+///
+/// `dword1`:
+///   - `[39:32]` ADDR    (`dword1[7:0]`)
+///   - `[47:40]` DATA0   (`dword1[15:8]`)
+///   - `[55:48]` DATA1   (`dword1[23:16]`)
+///   - `[63:56]` VDST    (`dword1[31:24]`)
+///
+/// llvm-objdump renders as
+///   `<vdst>, <addr>[, <data0>[, <data1>]] [offset0:N] [offset1:N] [gds]`
+fn populate_ds_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
+    let arch = Architecture::Amdgpu(target);
+    let dword1 = if instr.bytes.len() >= 8 {
+        u32::from_le_bytes([
+            instr.bytes[4],
+            instr.bytes[5],
+            instr.bytes[6],
+            instr.bytes[7],
+        ])
+    } else {
+        0
+    };
+
+    let offset0 = dword0 & 0xff;
+    let offset1 = (dword0 >> 8) & 0xff;
+    let gds = (dword0 >> 16) & 1 != 0;
+
+    let addr = (dword1 & 0xff) as u16;
+    let data0 = ((dword1 >> 8) & 0xff) as u16;
+    let data1 = ((dword1 >> 16) & 0xff) as u16;
+    let vdst = ((dword1 >> 24) & 0xff) as u16;
+
+    let writes_vdst = ds_writes_vdst(&instr.mnemonic);
+    let n_data = ds_data_count(&instr.mnemonic);
+    let dwords = ds_data_dwords(&instr.mnemonic);
+
+    let mut parts: Vec<String> = Vec::new();
+    if writes_vdst {
+        parts.push(render_vgpr_range(vdst, dwords));
+    }
+    parts.push(render_vgpr_range(addr, 1));
+    if n_data >= 1 {
+        parts.push(render_vgpr_range(data0, dwords));
+    }
+    if n_data >= 2 {
+        parts.push(render_vgpr_range(data1, dwords));
+    }
+
+    let mut s = format!("{} {}", instr.mnemonic, parts.join(", "));
+    if offset0 != 0 {
+        s.push_str(&format!(" offset0:{offset0}"));
+    }
+    if offset1 != 0 {
+        s.push_str(&format!(" offset1:{offset1}"));
+    }
+    if gds {
+        s.push_str(" gds");
+    }
+    instr.mnemonic = s;
+
+    // Track reads/writes.
+    instr
+        .reads
+        .push(Register::new(arch, RegisterClass::General, addr + 256, 32));
+    if writes_vdst {
+        for i in 0..dwords as u16 {
+            instr.writes.push(Register::new(
+                arch,
+                RegisterClass::General,
+                vdst.wrapping_add(i) + 256,
+                32,
+            ));
+        }
+    }
+    if n_data >= 1 {
+        for i in 0..dwords as u16 {
+            instr.reads.push(Register::new(
+                arch,
+                RegisterClass::General,
+                data0.wrapping_add(i) + 256,
+                32,
+            ));
+        }
+    }
+    if n_data >= 2 {
+        for i in 0..dwords as u16 {
+            instr.reads.push(Register::new(
+                arch,
+                RegisterClass::General,
+                data1.wrapping_add(i) + 256,
+                32,
+            ));
+        }
+    }
+}
+
+/// Width in dwords of MUBUF VDATA, derived from the mnemonic suffix.
+fn data_dwords_from_mubuf_mnemonic(mnemonic: &str) -> u8 {
+    if mnemonic.ends_with("dwordx4") || mnemonic.ends_with("b128") {
+        4
+    } else if mnemonic.ends_with("dwordx3") || mnemonic.ends_with("b96") {
+        3
+    } else if mnemonic.ends_with("dwordx2") || mnemonic.ends_with("b64") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Width in dwords of DS VDATA / VDST, derived from the mnemonic
+/// suffix (mirrors the same `_b32` / `_b64` / `_b128` convention).
+fn ds_data_dwords(mnemonic: &str) -> u8 {
+    if mnemonic.contains("b128") {
+        4
+    } else if mnemonic.contains("b96") {
+        3
+    } else if mnemonic.contains("b64") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Whether a DS opcode writes the VDST field. Stores
+/// (`ds_write_*`) and barriers don't; loads / atomics-with-return do.
+fn ds_writes_vdst(mnemonic: &str) -> bool {
+    mnemonic.contains("ds_load")
+        || mnemonic.contains("ds_read")
+        || mnemonic.starts_with("ds_") && mnemonic.contains("rtn")
+}
+
+/// Number of DATA operands a DS opcode consumes (0, 1, or 2).
+fn ds_data_count(mnemonic: &str) -> usize {
+    if mnemonic.contains("ds_load") || mnemonic.contains("ds_read") {
+        0
+    } else if mnemonic.contains("ds_store2")
+        || mnemonic.contains("ds_write2")
+        || mnemonic.contains("_2addr")
+    {
+        2
+    } else {
+        1
+    }
+}
+
 // -- Helpers --
 
 /// Render a VGPR range as `vN` (single) or `v[N:M]` (multi-dword).
@@ -862,38 +1187,45 @@ fn render_sgpr_range(base: u16, dwords: u8) -> String {
 /// Render a 9-bit operand id with optional negation modifier and
 /// width awareness. Inline integer/float constants surface as the
 /// literal value; SGPRs/VGPRs go through the range-aware path.
-fn render_amdgpu_operand_string(id: u16, dwords: u8, negate: bool) -> String {
-    let prefix = if negate { "-" } else { "" };
-    // null sink (RDNA).
-    if id == 0x7c {
-        return format!("{prefix}null");
-    }
-    // Inline integer constants.
-    if let Some(v) = inline_constant_value(id) {
-        return format!("{prefix}{v}");
-    }
-    // Float inline constants.
-    let float = match id {
-        240 => Some("0.5"),
-        241 => Some("-0.5"),
-        242 => Some("1.0"),
-        243 => Some("-1.0"),
-        244 => Some("2.0"),
-        245 => Some("-2.0"),
-        246 => Some("4.0"),
-        247 => Some("-4.0"),
-        248 => Some("0x3e22f983"), // 1/(2*PI) — render as the LLVM-canonical hex.
-        _ => None,
+fn render_amdgpu_operand_string(id: u16, dwords: u8, negate: bool, abs: bool) -> String {
+    // VOP3A modifiers: ABS wraps the operand in `|...|`; NEG prefixes
+    // a `-`. When both are set the form is `-|x|` to match
+    // llvm-objdump (NEG outside ABS).
+    let neg = if negate { "-" } else { "" };
+    let (open, close) = if abs { ("|", "|") } else { ("", "") };
+    let inner: String = {
+        // null sink (RDNA).
+        if id == 0x7c {
+            "null".into()
+        } else if let Some(v) = inline_constant_value(id) {
+            // Inline integer constants.
+            format!("{v}")
+        } else {
+            // Float inline constants.
+            let float = match id {
+                240 => Some("0.5"),
+                241 => Some("-0.5"),
+                242 => Some("1.0"),
+                243 => Some("-1.0"),
+                244 => Some("2.0"),
+                245 => Some("-2.0"),
+                246 => Some("4.0"),
+                247 => Some("-4.0"),
+                248 => Some("0x3e22f983"), // 1/(2*PI)
+                _ => None,
+            };
+            if let Some(f) = float {
+                f.into()
+            } else if (256..512).contains(&id) {
+                // VGPRs (id 256..511 — strip the offset and render as range).
+                render_vgpr_range(id - 256, dwords)
+            } else {
+                // SGPRs and specials.
+                render_sgpr_range(id, dwords)
+            }
+        }
     };
-    if let Some(f) = float {
-        return format!("{prefix}{f}");
-    }
-    // VGPRs (id 256..511 — strip the offset and render as range).
-    if (256..512).contains(&id) {
-        return format!("{prefix}{}", render_vgpr_range(id - 256, dwords));
-    }
-    // SGPRs and specials.
-    format!("{prefix}{}", render_sgpr_range(id, dwords))
+    format!("{neg}{open}{inner}{close}")
 }
 
 /// Like `push_amdgpu_operand` but doesn't emit the operand into the
