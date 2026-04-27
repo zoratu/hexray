@@ -5,6 +5,138 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.5] - 2026-04-26
+
+### Highlights — full AMDGPU operand decode + differential gate
+
+v1.3.5 closes the entire v1.3.x AMDGPU docket: every byte hexray
+emits is now byte-checked against `llvm-objdump` for eight SCALE-built
+kernels spanning GFX9 (gfx900), RDNA1 (gfx1010), RDNA2 (gfx1030),
+and RDNA3 (gfx1100/1101/1102) — including a multi-kernel fixture.
+The previously committed gfx1030/gfx1100 fixtures get companion
+`expected_disasm.txt` sidecars; six more architectures land alongside
+theirs. RDNA3-specific opcode renumbering for SOP2/VOPC/VOP2/SOP1 is
+fully handled, and operand rendering is wired for VOP3 / SMEM / FLAT
+/ MUBUF / DS classes including VOP3 NEG+ABS modifiers.
+
+What's new:
+
+- **Differential gate (`amdgpu_differential_gate.rs`).** Two tests:
+  no `xxx.op0x...` placeholder mnemonics across the corpus, and
+  per-mnemonic frequency parity (±1) against the llvm-objdump sidecar
+  within each `<kernel$local>:` block. Drives every CI run.
+- **Operand rendering — VOP3, SMEM, FLAT.** Width-aware register
+  pairs (`v[0:1]`, `s[2:3]`), VOP3B SDST (`vcc_lo` for
+  `v_add_co_u32`), VOPC-as-VOP3 with implicit EXEC dst, FLAT SADDR
+  null sentinel, 2-vs-3-source VOP3 detection, GFX11 s_waitcnt
+  layout (VMCNT[15:10] / LGKMCNT[9:4] / EXPCNT[2:0]).
+- **VOP3 NEG + ABS modifier rendering.** NEG bits at `[31:29]` of
+  dword1, ABS bits at `[10:8]` of dword0. Render `|src|` for ABS,
+  `-|src|` for NEG+ABS to match llvm-objdump. Suppressed for VOP3B
+  forms (those bits are SDST data, not modifiers).
+- **MUBUF operand rendering.** Full BUF field layout: VDATA / VADDR /
+  SRSRC (4-SGPR resource descriptor at `s[N*4:N*4+3]`) / SOFFSET /
+  OFFSET / OFFEN / IDXEN / GLC / SLC / TFE flags.
+- **DS operand rendering.** LDS field layout: ADDR / DATA0 / DATA1 /
+  VDST / OFFSET0 / OFFSET1 / GDS, mnemonic-aware about which DS
+  opcodes write VDST and how many DATA inputs they take.
+- **SIMM16 sub-decoding.** `s_clause`, `s_waitcnt`, `s_delay_alu`
+  render their sub-fields:
+  `s_delay_alu instid0(SALU_CYCLE_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)`.
+- **HIP host-binary fatbin extraction.** New
+  `crates/hexray-formats/src/cuda/hip_fatbin.rs` parses the
+  `__CLANG_OFFLOAD_BUNDLE__` schema. 14 new tests on synthetic
+  bundles. LZ4-compressed bundles (CCOB magic) remain a documented
+  limitation.
+- **SCALE `.AMDGPU.kinfo` parser.** SCALE-free 1.4.x emits no
+  NT_AMDGPU_METADATA note; the private `.AMDGPU.kinfo` section
+  carries an alternate kernarg layout. The v1.3.5 parser
+  reverse-engineers the 12-byte header + N×(offset,size) format,
+  surfacing arg counts and per-arg sizes in `hexray cmp` output.
+- **GFX9 opcode tables.** `SOP2_GFX9` split out (s_mul_i32 at 0x24,
+  not 0x26). `VOPC_GFX9` split out (i32 comparators at 0xc0..=0xc7).
+  `VOP3_GFX9` split out (`v_lshlrev_b64` at 0x28f). `FLAT_GFX9` split
+  out (`flat_load_dword` at 0x14). `VOP2_GFX9` extended with the
+  carry/no-carry pairs (0x11/0x19..=0x1c/0x32..=0x36) and corrected
+  mnemonics — `0x19` is `v_add_co_u32_e32` (with carry), not
+  `v_add_u32_e32`. `SOP1_GFX9` extended with the wave64 saveexec
+  family at 0x20..=0x22.
+- **RDNA1+ opcode coverage.** `SOP1_GFX10` gained the wave32
+  `s_and_saveexec_b32` at OP=0x3c. `VOP3_GFX10` and `VOP3_GFX11`
+  gained `v_cndmask_b32_e64` at OP=0x101. `VOPC_GFX11` carved out
+  separately (RDNA3 packs i32 comparators into 0x40..=0x4e).
+- **RDNA3 SOP2 numbering.** New `SOP2_GFX11` table — RDNA3
+  substantially renumbered SOP2; only `s_add_u32` through
+  `s_subb_u32` (0x00..=0x05) survived from GFX10. `s_min_i32` moved
+  0x06→0x12, `s_and_b32` 0x0e→0x16, `s_xor_b32` 0x12→0x1a,
+  `s_lshl_b32` to 0x08, `s_mul_i32` 0x26→0x2c. Cross-checked
+  against `llvm/lib/Target/AMDGPU/SOPInstructions.td` GFX11 records.
+- **SOP1_GFX11.** RDNA3 reverted SOP1 to GFX9-style numbering for
+  the bulk of opcodes but kept `_saveexec_b32` wave32 forms.
+- **VOP2_GFX11.** Integer min/max e32 family at 0x11..=0x14.
+- **cargo-mutants gap-closing.** A full sweep across
+  `crates/hexray-disasm/src/amdgpu/**` and
+  `crates/hexray-formats/src/elf/amdgpu/**` (499 mutants total) drove
+  ~80 new unit tests covering every encoding-class dispatch arm,
+  every operand-extraction shift / mask / range, the SOPK / EXP /
+  DS / FLAT / MUBUF / MTBUF / MIMG branches, the FLAT seg-rewrite
+  variants, the kernel-descriptor parser, and the MessagePack
+  metadata walker. 162 of 170 missed mutations now caught;
+  the remaining 8 are semantically equivalent (every `Operation`
+  in the `Vopc` and `Smem` tables matches the class default, so
+  table-vs-default branches are unobservable). Walker safety:
+  two `+= → *=` mutations on the dword-stride advance loop hung
+  forever and are now caught via 120s timeout.
+
+What's deferred:
+
+- **CDNA MFMA / WMMA / VOP3P / DPP / SDWA opcodes.** SCALE-free
+  doesn't ship gfx906 / gfx908 / gfx90a / gfx940 targets, and the
+  consumer fixtures we *can* build don't exercise these classes.
+  Adding speculative tables without a byte-validating fixture would
+  be premature; tracked for the next release alongside a CDNA corpus.
+- **End-to-end fixture validation for MUBUF / DS / VOP3 ABS.**
+  `scale-free` builds don't exercise these classes on the kernels
+  it ships; the new code is byte-validated against synthetic
+  encodings only.
+- **LZ4 fatbin decompression** (CCOB magic). Documented as a
+  limitation in the HIP fatbin commit; needs a real hipcc binary.
+- **gfx1200 (RDNA4) validation.** Requires commercial SCALE.
+- **Linux-snapshot decompiler tests** for `test_decompile_callback_*`
+  — the existing snapshot tests are macOS-locked. Linux output now
+  decompiles correctly (after the validation fixes below) but
+  matches a different shape; the macOS-locked tests are gated
+  behind `#[cfg(target_os = "macos")]` until equivalent Linux
+  snapshots land.
+
+Cross-cutting decompiler fixes that surfaced during Linux release
+validation:
+
+- **PLT-stub `@plt` symbol synthesis** in the ELF parser. Calls
+  through the GOT (`call qsort@plt`) target an address inside
+  `.plt` (or `.plt.sec` on CET-aware glibc). The new
+  `synthesize_plt_symbols` walks `.rela.plt` in order, looks each
+  entry's symbol up in `.dynsym`, and adds a `Symbol { name:
+  "<dynsym>@plt", ... }` at the matching stub address. Calls now
+  decompile as `qsort(...)` instead of `sub_NNN(...)`.
+- **DWARF CFA → fp frame correction.** When `DW_AT_frame_base` is
+  `DW_OP_call_frame_cfa` (the `clang -O0 -g` default), DWARF emits
+  operand offsets relative to CFA (`fp + 16` after the standard
+  prologue). The variable-name map now rebases by +16 so DWARF
+  parameter names actually surface in decompiled output.
+- **`var_NN` → DWARF override** in signature emission. The
+  emitter post-processes signature param names: if a name is
+  `var_<hex>`, look up the stack offset in `dwarf_names` and
+  prefer the DWARF name. Signatures now render
+  `int32_t f(int64_t arr, int64_t n, int32_t (*cmp)(...))` instead
+  of `(int64_t arr, int64_t arg1, int32_t (*var_18)(...))`.
+
+Coverage on the spot (rust 1.89, `cargo llvm-cov`):
+`amdgpu/encoding.rs` 99% lines, `amdgpu/mod.rs` 88%, `amdgpu/opcodes.rs`
+100%, `amdgpu/registers.rs` 100%, `elf/amdgpu/descriptor.rs` 100%,
+`elf/amdgpu/scale_kinfo.rs` 91%. `elf/amdgpu/msgpack.rs` is the
+weakest at 61% (lots of error-path branches).
+
 ## [1.3.4] - 2026-04-26
 
 ### Highlights — RDNA3 family-band split + swarm testing
