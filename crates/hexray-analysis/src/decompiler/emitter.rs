@@ -1958,6 +1958,15 @@ impl PseudoCodeEmitter {
                 }
             }
             ExprKind::Call { target, args } => {
+                // Strip the `@plt` suffix on lookup-by-address — the
+                // synthesised PLT-stub symbol carries it as a marker
+                // (so downstream tooling can tell it's a thunk), but
+                // emitted code wants the bare symbol name. matches
+                // llvm-objdump and `c++filt` conventions.
+                fn strip_plt(name: &str) -> String {
+                    name.split_once("@plt")
+                        .map_or_else(|| name.to_string(), |(b, _)| b.to_string())
+                }
                 let target_str = match target {
                     super::expression::CallTarget::Direct {
                         target: addr,
@@ -1967,11 +1976,11 @@ impl PseudoCodeEmitter {
                         // This uses the call instruction address to find the target symbol
                         if let Some(ref reloc_table) = self.relocation_table {
                             if let Some(name) = reloc_table.get(*call_site) {
-                                name.to_string()
+                                strip_plt(name)
                             } else if let Some(ref sym_table) = self.symbol_table {
                                 // Fall back to symbol table by target address
                                 if let Some(name) = sym_table.get(*addr) {
-                                    name.to_string()
+                                    strip_plt(name)
                                 } else {
                                     format!("sub_{:x}", addr)
                                 }
@@ -1981,7 +1990,7 @@ impl PseudoCodeEmitter {
                         } else if let Some(ref sym_table) = self.symbol_table {
                             // Check symbol table by target address
                             if let Some(name) = sym_table.get(*addr) {
-                                name.to_string()
+                                strip_plt(name)
                             } else if let Some(s) = table.get(*addr) {
                                 // Check if this is a string address (for lea/adr patterns)
                                 return format!("\"{}\"", escape_string(s));
@@ -2353,7 +2362,27 @@ impl PseudoCodeEmitter {
             if sig.parameters.is_empty() {
                 func_info.parameters.clone()
             } else {
-                sig.parameters.iter().map(|p| p.name.clone()).collect()
+                sig.parameters
+                    .iter()
+                    .map(|p| {
+                        // SignatureRecovery's `var_NN` heuristic for
+                        // stack-spilled register params shadows the
+                        // DWARF parameter name when the function was
+                        // compiled with -O0 -g (the body var was lifted
+                        // from a slot at offset -NN). Override here:
+                        // if `var_NN` matches a DWARF entry, prefer
+                        // the DWARF name.
+                        if let Some(suffix) = p.name.strip_prefix("var_") {
+                            if let Ok(abs) = i128::from_str_radix(suffix, 16) {
+                                let offset = -abs;
+                                if let Some(dwarf) = self.dwarf_names.get(&offset) {
+                                    return dwarf.clone();
+                                }
+                            }
+                        }
+                        p.name.clone()
+                    })
+                    .collect()
             }
         } else {
             func_info.parameters.clone()
@@ -3455,6 +3484,7 @@ impl PseudoCodeEmitter {
     }
 
     /// Checks if the function body has any return statements with values.
+    #[allow(clippy::only_used_in_recursion)] // recurses through nested control structures
     fn has_return_value(&self, nodes: &[StructuredNode]) -> bool {
         for node in nodes {
             match node {
@@ -4125,6 +4155,7 @@ impl PseudoCodeEmitter {
     }
 
     /// Checks if a node is a control flow exit (goto, return, break, continue, noreturn call).
+    #[allow(clippy::only_used_in_recursion)] // recurses into nested If branches
     fn is_control_exit(&self, node: &StructuredNode) -> bool {
         match node {
             StructuredNode::Goto(_)
@@ -4219,6 +4250,7 @@ impl PseudoCodeEmitter {
 
     /// Try to evaluate an expression as a constant integer value.
     /// Returns Some(value) if the expression is a constant, None otherwise.
+    #[allow(clippy::only_used_in_recursion)] // recursive constant folding over Expr
     fn try_eval_constant(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),

@@ -430,6 +430,7 @@ impl ConstantPropagator {
 
     /// Folds expressions but preserves variable names (doesn't substitute constants).
     /// Used for memory addresses where we want to keep readable names.
+    #[allow(clippy::only_used_in_recursion)] // recursive structural fold over Expr
     fn fold_expr_preserve_vars(&self, expr: Expr) -> Expr {
         match expr.kind {
             // Don't substitute constants for variables - preserve the name

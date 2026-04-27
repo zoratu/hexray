@@ -62,6 +62,7 @@ fn disassemble_with<D: Disassembler>(
 }
 
 /// Find a function by name in a binary.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn find_function(binary_data: &[u8]) -> Option<(Architecture, u64, Vec<u8>, String)> {
     match detect_format(binary_data) {
         BinaryType::MachO => {
@@ -92,6 +93,7 @@ fn find_function(binary_data: &[u8]) -> Option<(Architecture, u64, Vec<u8>, Stri
 }
 
 /// Decompile a function and verify output structure.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn decompile_function(
     arch: Architecture,
     bytes: &[u8],
@@ -114,6 +116,7 @@ fn decompile_function(
 }
 
 /// Checks that decompiled output has expected structural elements.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn validate_decompiled_output(code: &str) -> DecompileValidation {
     DecompileValidation {
         has_function_header: code.contains('(') && code.contains(')'),
@@ -150,6 +153,7 @@ struct DecompileValidation {
     no_gotos: bool,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl DecompileValidation {
     fn is_valid(&self) -> bool {
         // Basic structural requirements

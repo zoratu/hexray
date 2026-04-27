@@ -71,6 +71,15 @@ fn cmp_reports_kernel_equivalence_across_amd_targets() {
     // and RDNA3 codegen).
     assert!(stdout.contains("primary regs    a=8"), "got {stdout}");
 
+    // Per-arg layout, sourced from the SCALE-private `.AMDGPU.kinfo`
+    // section (no `NT_AMDGPU_METADATA` note is present — see
+    // `crates/hexray-formats/src/elf/amdgpu/scale_kinfo.rs`).
+    // vector_add has 4 args: `(const float* a, const float* b,
+    // float* c, int n)` → sizes `[8, 8, 8, 4]`.
+    assert!(stdout.contains("arg count       a=4"), "got {stdout}");
+    assert!(stdout.contains("arg [0] size    a=8B"), "got {stdout}");
+    assert!(stdout.contains("arg [3] size    a=4B"), "got {stdout}");
+
     // Matched at least one kernel cleanly.
     assert!(stdout.contains("Matched 1 kernel(s)."), "got {stdout}");
 }
@@ -121,6 +130,113 @@ fn disasm_renders_real_operands() {
     assert!(
         stdout.contains("s_load_dword"),
         "expected 's_load_dword' instruction, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn disasm_decodes_sopp_simm16_subfields() {
+    // gfx1100 fixture exercises s_clause, s_waitcnt, s_delay_alu —
+    // each with non-trivial SIMM16 sub-fields.
+    if !corpus_path("vector_add.gfx1100.co").exists() {
+        eprintln!("gfx1100 fixture not present, skipping");
+        return;
+    }
+    let path = corpus_path("vector_add.gfx1100.co");
+    let output = Command::new(hexray_bin())
+        .arg("-s")
+        .arg("vector_add")
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("hexray runs");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // s_clause renders the count.
+    assert!(
+        stdout.contains("s_clause 0x2"),
+        "expected `s_clause 0x2`, got:\n{stdout}"
+    );
+    // s_waitcnt with GFX11 layout: lgkmcnt(0) (vmcnt + expcnt at max).
+    assert!(
+        stdout.contains("s_waitcnt lgkmcnt(0)"),
+        "expected `s_waitcnt lgkmcnt(0)`, got:\n{stdout}"
+    );
+    // s_delay_alu — RDNA3 scheduling hint with full sub-field decode.
+    assert!(
+        stdout
+            .contains("s_delay_alu instid0(SALU_CYCLE_1) | instskip(SKIP_1) | instid1(VALU_DEP_1)"),
+        "expected s_delay_alu sub-field decode, got:\n{stdout}"
+    );
+
+    // Verify the gfx1030 (RDNA2) layout still works:
+    let path = corpus_path("vector_add.gfx1030.co");
+    let output = Command::new(hexray_bin())
+        .arg("-s")
+        .arg("vector_add")
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("hexray runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("s_waitcnt lgkmcnt(0)"),
+        "GFX10 s_waitcnt regression: {stdout}"
+    );
+}
+
+#[test]
+fn disasm_renders_register_pairs_and_null() {
+    if !corpus_path("vector_add.gfx1100.co").exists() {
+        eprintln!("gfx1100 fixture not present, skipping");
+        return;
+    }
+    let path = corpus_path("vector_add.gfx1100.co");
+    let output = Command::new(hexray_bin())
+        .arg("-s")
+        .arg("vector_add")
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("hexray runs");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // SMEM with SBASE register pair `s[0:1]`.
+    assert!(
+        stdout.contains("s_load_b32 s2, s[0:1], 0x38"),
+        "expected `s_load_b32 s2, s[0:1], 0x38`, got:\n{stdout}"
+    );
+    // SMEM 128-bit destination (4-dword pair).
+    assert!(
+        stdout.contains("s_load_b128 s[4:7], s[0:1], null"),
+        "expected `s_load_b128 s[4:7], s[0:1], null`, got:\n{stdout}"
+    );
+    // VOP3 v_mad_u64_u32 with VDST pair, SDST=null, SRC2 pair.
+    assert!(
+        stdout.contains("v_mad_u64_u32 v[1:2], null, s2, s3, v[0:1]"),
+        "expected v_mad_u64_u32 with v[1:2]/null/v[0:1], got:\n{stdout}"
+    );
+    // VOPC e64 — VDST is implicit EXEC, no explicit dst rendered.
+    assert!(
+        stdout.contains("v_cmpx_gt_i32_e64 s4, v1"),
+        "expected `v_cmpx_gt_i32_e64 s4, v1` (no implicit VDST), got:\n{stdout}"
+    );
+    // VOP3B — `v_add_co_u32` shows the `vcc_lo` SDST.
+    assert!(
+        stdout.contains("v_add_co_u32 v2, vcc_lo, s4, v0"),
+        "expected v_add_co_u32 with vcc_lo SDST, got:\n{stdout}"
+    );
+    // FLAT — global_load_b32 v2, v[2:3], off (saddr=null/off).
+    assert!(
+        stdout.contains("global_load_b32 v2, v[2:3], off"),
+        "expected `global_load_b32 v2, v[2:3], off`, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("global_store_b32 v[0:1], v2, off"),
+        "expected `global_store_b32 v[0:1], v2, off`, got:\n{stdout}"
+    );
+    // 2-source VOP3 (v_lshlrev_b64) does NOT render a phantom src2.
+    assert!(
+        stdout.contains("v_lshlrev_b64 v[0:1], 2, v[1:2]"),
+        "expected v_lshlrev_b64 with 2 sources only, got:\n{stdout}"
     );
 }
 

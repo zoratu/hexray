@@ -1325,6 +1325,7 @@ impl ExpressionTypePropagation {
     }
 
     /// Extracts the variable name from an expression.
+    #[allow(clippy::only_used_in_recursion)] // recurses through Cast wrappers
     fn extract_var_name(&self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Var(var) => Some(var.name.clone()),

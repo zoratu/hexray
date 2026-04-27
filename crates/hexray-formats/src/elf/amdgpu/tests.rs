@@ -522,6 +522,191 @@ fn metadata_note_attaches_to_matching_kernel() {
     assert_eq!(m.sgpr_count, Some(16));
 }
 
+/// Encode a minimal `.AMDGPU.kinfo` record for one kernel, in the
+/// SCALE-free 1.4.x layout reverse-engineered from the corpus.
+/// `args` is `[(offset, size)]`.
+fn build_scale_kinfo(flags: u32, args: &[(u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + args.len() * 8);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(args.len() as u32).to_le_bytes());
+    for (off, size) in args {
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn scale_kinfo_section_synthesises_kernel_metadata() {
+    // Synthesise an AMDGPU ELF with NO `NT_AMDGPU_METADATA` note but
+    // WITH a `.AMDGPU.kinfo` section + a `vector_add.ki` symbol. The
+    // view should fall back to kinfo and populate kernel.metadata
+    // with the per-arg layout.
+    let desc = descriptor_with_vgpr_sgpr(2, 1, 28);
+    let elf_bytes = AmdElfBuilder::new()
+        .push_kernel("vector_add", &[0u8; 4], desc)
+        .build();
+
+    // Append a `.AMDGPU.kinfo` section + a `.ki` symbol, surgically.
+    let kinfo = build_scale_kinfo(0x400, &[(0, 8), (8, 8), (16, 8), (24, 4)]);
+    let extra_sym_name = b"vector_add.ki\0";
+
+    // Read existing offsets from the ELF header.
+    let e_shoff = u64::from_le_bytes(elf_bytes[40..48].try_into().unwrap());
+    let e_shnum = u16::from_le_bytes(elf_bytes[60..62].try_into().unwrap());
+    let e_shstrndx = u16::from_le_bytes(elf_bytes[62..64].try_into().unwrap());
+
+    // Section 3 is `.shstrtab`, section 4 is `.strtab`, section 5 is
+    // `.symtab` (see AmdElfBuilder::build). We'll grow `.shstrtab`
+    // and `.strtab` to add the new names, append a kinfo section
+    // header, and add a new symbol entry for `vector_add.ki`.
+    //
+    // To keep the surgery simple we re-lay-out the file from the
+    // ELF header forward: pre-shdr region is everything except the
+    // shdr table; we patch what we need and rebuild.
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let mut shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+
+    // Build a new shstrtab containing ".AMDGPU.kinfo".
+    let shstr_idx = e_shstrndx as usize;
+    let shstr_shdr_off = shstr_idx * 64;
+    let shstr_off = u64::from_le_bytes(
+        shdrs[shstr_shdr_off + 24..shstr_shdr_off + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let shstr_size = u64::from_le_bytes(
+        shdrs[shstr_shdr_off + 32..shstr_shdr_off + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut new_shstr = pre_shdrs[shstr_off..shstr_off + shstr_size].to_vec();
+    let kinfo_name_off = new_shstr.len() as u32;
+    new_shstr.extend_from_slice(b".AMDGPU.kinfo\0");
+
+    // Grow `.strtab` for the `.ki` symbol name.
+    let strtab_idx = 4usize;
+    let strtab_shdr_off = strtab_idx * 64;
+    let strtab_off = u64::from_le_bytes(
+        shdrs[strtab_shdr_off + 24..strtab_shdr_off + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let strtab_size = u64::from_le_bytes(
+        shdrs[strtab_shdr_off + 32..strtab_shdr_off + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut new_strtab = pre_shdrs[strtab_off..strtab_off + strtab_size].to_vec();
+    let ki_name_off = new_strtab.len() as u32;
+    new_strtab.extend_from_slice(extra_sym_name);
+
+    // Lay out the new file:
+    //   [pre-shstrtab bytes]
+    //   [new_shstr]
+    //   [new_strtab]
+    //   [old symtab bytes... + extra symbol]
+    //   [kinfo bytes]
+    //   [shdrs (patched)]
+    //
+    // Pull the existing symtab body out of `pre_shdrs`.
+    let symtab_idx = 5usize;
+    let symtab_shdr_off = symtab_idx * 64;
+    let symtab_off = u64::from_le_bytes(
+        shdrs[symtab_shdr_off + 24..symtab_shdr_off + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let symtab_size = u64::from_le_bytes(
+        shdrs[symtab_shdr_off + 32..symtab_shdr_off + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut new_symtab = pre_shdrs[symtab_off..symtab_off + symtab_size].to_vec();
+
+    // Compose the rebuilt file. We assume layout is:
+    //   [ehdr][text][rodata][shstrtab][strtab][symtab][shdrs]
+    // — exactly what AmdElfBuilder::build emits.
+    let new_shstr_off = shstr_off as u64;
+    let new_shstr_size = new_shstr.len() as u64;
+    let new_strtab_off = new_shstr_off + new_shstr_size;
+    let new_strtab_size = new_strtab.len() as u64;
+    let new_symtab_off = new_strtab_off + new_strtab_size;
+
+    // Append a new symbol entry for `vector_add.ki`. STT_OBJECT (1) +
+    // STB_GLOBAL (1) → info = 0x11. shndx = 6 (the new kinfo section).
+    let mut sym_entry = [0u8; 24];
+    sym_entry[0..4].copy_from_slice(&ki_name_off.to_le_bytes());
+    sym_entry[4] = 0x11;
+    sym_entry[6..8].copy_from_slice(&6u16.to_le_bytes()); // section index
+    sym_entry[8..16].copy_from_slice(&0u64.to_le_bytes()); // value (offset within section)
+    sym_entry[16..24].copy_from_slice(&(kinfo.len() as u64).to_le_bytes());
+    new_symtab.extend_from_slice(&sym_entry);
+    let new_symtab_size = new_symtab.len() as u64;
+
+    let kinfo_off = new_symtab_off + new_symtab_size;
+    let kinfo_size = kinfo.len() as u64;
+    let new_shoff = kinfo_off + kinfo_size;
+
+    // Patch the shdrs in place: shstrtab size, strtab size, symtab
+    // size + kinfo offsets are baked into the shdr table.
+    shdrs[shstr_shdr_off + 32..shstr_shdr_off + 40].copy_from_slice(&new_shstr_size.to_le_bytes());
+    shdrs[strtab_shdr_off + 24..strtab_shdr_off + 32]
+        .copy_from_slice(&new_strtab_off.to_le_bytes());
+    shdrs[strtab_shdr_off + 32..strtab_shdr_off + 40]
+        .copy_from_slice(&new_strtab_size.to_le_bytes());
+    shdrs[symtab_shdr_off + 24..symtab_shdr_off + 32]
+        .copy_from_slice(&new_symtab_off.to_le_bytes());
+    shdrs[symtab_shdr_off + 32..symtab_shdr_off + 40]
+        .copy_from_slice(&new_symtab_size.to_le_bytes());
+
+    // Build a new shdr for `.AMDGPU.kinfo` (SHT_PROGBITS, no flags).
+    let mut kinfo_shdr = [0u8; 64];
+    kinfo_shdr[0..4].copy_from_slice(&kinfo_name_off.to_le_bytes());
+    kinfo_shdr[4..8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+    kinfo_shdr[24..32].copy_from_slice(&kinfo_off.to_le_bytes());
+    kinfo_shdr[32..40].copy_from_slice(&kinfo_size.to_le_bytes());
+    kinfo_shdr[48..56].copy_from_slice(&4u64.to_le_bytes()); // align
+
+    // Reassemble the file.
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs[..shstr_off]);
+    rebuilt.extend_from_slice(&new_shstr);
+    rebuilt.extend_from_slice(&new_strtab);
+    rebuilt.extend_from_slice(&new_symtab);
+    rebuilt.extend_from_slice(&kinfo);
+    rebuilt.extend_from_slice(&shdrs);
+    rebuilt.extend_from_slice(&kinfo_shdr);
+
+    // Update ehdr: e_shoff and e_shnum.
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF with kinfo parses");
+    let view = elf.code_object_view().expect("view builds");
+
+    // No standard metadata note → fallback path runs.
+    assert!(view.metadata.is_none());
+    assert_eq!(view.kernels.len(), 1);
+    let k = &view.kernels[0];
+    assert!(k.metadata.is_some(), "metadata should be synthesised");
+    let m = k.metadata.as_ref().unwrap();
+    assert_eq!(m.name.as_deref(), Some("vector_add"));
+    assert_eq!(m.symbol.as_deref(), Some("vector_add.kd"));
+    assert_eq!(m.args.len(), 4);
+    assert_eq!(m.args[0].size, Some(8));
+    assert_eq!(m.args[3].size, Some(4));
+    assert_eq!(m.args[0].offset, Some(0));
+    assert_eq!(m.args[3].offset, Some(24));
+    // Synthesised metadata never reports kernarg_segment_size — see
+    // the comment on `synthesise_metadata_kernel`.
+    assert_eq!(m.kernarg_segment_size, None);
+    assert_eq!(m.vgpr_count, None);
+}
+
 #[test]
 fn target_id_carries_through_view() {
     // Build with gfx1030 mach.
@@ -533,4 +718,429 @@ fn target_id_carries_through_view() {
     let elf = Elf::parse(&bytes).expect("synthetic AMDGPU ELF parses");
     let view = elf.code_object_view().expect("code object view builds");
     assert_eq!(view.target.canonical_name(), "gfx1030");
+}
+
+#[test]
+fn code_object_error_has_distinct_display_messages() {
+    // The Display impl for CodeObjectError must not return an empty
+    // string; both variants must be distinguishable.
+    let not_amdgpu = CodeObjectError::NotAmdgpu;
+    let parse_err = CodeObjectError::DescriptorParse("fake".into());
+    let s1 = format!("{not_amdgpu}");
+    let s2 = format!("{parse_err}");
+    assert!(s1.contains("AMDGPU"), "got {s1:?}");
+    assert!(s2.contains("descriptor"), "got {s2:?}");
+    assert_ne!(s1, s2, "Display variants must be distinguishable");
+}
+
+#[test]
+fn parse_error_converts_to_descriptor_parse_error() {
+    // The From<ParseError> conversion must produce a
+    // DescriptorParse variant carrying the original error message.
+    let p = crate::ParseError::too_short(64, 32);
+    let err: CodeObjectError = p.into();
+    match err {
+        CodeObjectError::DescriptorParse(msg) => {
+            assert!(!msg.is_empty(), "converted message must be non-empty");
+        }
+        other => panic!("expected DescriptorParse, got {other:?}"),
+    }
+}
+
+#[test]
+fn metadata_attaches_via_symbol_match_not_name() {
+    // Build a kernel whose `.name` in metadata differs from the
+    // ELF entry symbol, but whose `.symbol` field carries
+    // `<entry_name>.kd`. The view-builder should still attach the
+    // metadata record by matching `symbol.strip_suffix(".kd")`.
+    let desc = descriptor_with_vgpr_sgpr(0, 0, 0);
+    let mut b = Vec::new();
+    // top-level fixmap len=2
+    b.push(0x82);
+    push_str(&mut b, "amdhsa.version");
+    b.extend_from_slice(&[0x92, 0x01, 0x00]);
+    push_str(&mut b, "amdhsa.kernels");
+    b.push(0x91); // array len=1
+    b.push(0x82); // fixmap len=2
+    push_str(&mut b, ".name");
+    push_str(&mut b, "different_name");
+    push_str(&mut b, ".symbol");
+    push_str(&mut b, "matched_kernel.kd");
+    let note_bytes = build_amdgpu_metadata_note(&b);
+
+    let mut elf_bytes = AmdElfBuilder::new()
+        .push_kernel("matched_kernel", &[0u8; 4], desc)
+        .build();
+    elf_bytes.extend_from_slice(&note_bytes);
+    let e_shoff = u64::from_le_bytes([
+        elf_bytes[40],
+        elf_bytes[41],
+        elf_bytes[42],
+        elf_bytes[43],
+        elf_bytes[44],
+        elf_bytes[45],
+        elf_bytes[46],
+        elf_bytes[47],
+    ]);
+    let e_shnum = u16::from_le_bytes([elf_bytes[60], elf_bytes[61]]);
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs);
+    let new_note_off = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&note_bytes);
+    let new_shoff = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&shdrs);
+    let mut nh = vec![0u8; 64];
+    nh[4..8].copy_from_slice(&7u32.to_le_bytes());
+    nh[24..32].copy_from_slice(&new_note_off.to_le_bytes());
+    nh[32..40].copy_from_slice(&(note_bytes.len() as u64).to_le_bytes());
+    nh[48..56].copy_from_slice(&4u64.to_le_bytes());
+    rebuilt.extend_from_slice(&nh);
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF parses");
+    let view = elf.code_object_view().expect("view builds");
+    assert_eq!(view.kernels.len(), 1);
+    let k = &view.kernels[0];
+    let m = k
+        .metadata
+        .as_ref()
+        .expect("metadata should attach via .symbol match");
+    assert_eq!(m.name.as_deref(), Some("different_name"));
+    assert_eq!(m.symbol.as_deref(), Some("matched_kernel.kd"));
+}
+
+#[test]
+fn metadata_does_not_attach_when_neither_name_nor_symbol_matches() {
+    // Build a kernel where the metadata `.name` is "ghost" and the
+    // ELF entry symbol is "real". No attachment should happen.
+    let desc = descriptor_with_vgpr_sgpr(0, 0, 0);
+    let msgpack = build_msgpack_for("ghost", 0, 0, 0);
+    let note_bytes = build_amdgpu_metadata_note(&msgpack);
+
+    let mut elf_bytes = AmdElfBuilder::new()
+        .push_kernel("real", &[0u8; 4], desc)
+        .build();
+    elf_bytes.extend_from_slice(&note_bytes);
+    let e_shoff = u64::from_le_bytes([
+        elf_bytes[40],
+        elf_bytes[41],
+        elf_bytes[42],
+        elf_bytes[43],
+        elf_bytes[44],
+        elf_bytes[45],
+        elf_bytes[46],
+        elf_bytes[47],
+    ]);
+    let e_shnum = u16::from_le_bytes([elf_bytes[60], elf_bytes[61]]);
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs);
+    let new_note_off = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&note_bytes);
+    let new_shoff = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&shdrs);
+    let mut nh = vec![0u8; 64];
+    nh[4..8].copy_from_slice(&7u32.to_le_bytes());
+    nh[24..32].copy_from_slice(&new_note_off.to_le_bytes());
+    nh[32..40].copy_from_slice(&(note_bytes.len() as u64).to_le_bytes());
+    nh[48..56].copy_from_slice(&4u64.to_le_bytes());
+    rebuilt.extend_from_slice(&nh);
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF parses");
+    let view = elf.code_object_view().expect("view builds");
+    assert_eq!(view.kernels.len(), 1);
+    assert!(
+        view.kernels[0].metadata.is_none(),
+        "metadata should not attach when both name and symbol differ"
+    );
+}
+
+#[test]
+fn metadata_note_with_wrong_name_is_ignored() {
+    // Build a SHT_NOTE record with type = NT_AMDGPU_METADATA but
+    // name = "WRONG" (instead of "AMDGPU"). The metadata-finder
+    // must ignore it; view.metadata should be None.
+    let desc = descriptor_with_vgpr_sgpr(0, 0, 0);
+    let msgpack = build_msgpack_for("k", 0, 0, 0);
+
+    // Build the note manually with name "WRONG".
+    let name = b"WRONG\0";
+    let mut note = Vec::new();
+    note.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    note.extend_from_slice(&(msgpack.len() as u32).to_le_bytes());
+    note.extend_from_slice(&32u32.to_le_bytes()); // NT_AMDGPU_METADATA
+    note.extend_from_slice(name);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+    note.extend_from_slice(&msgpack);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+
+    let mut elf_bytes = AmdElfBuilder::new()
+        .push_kernel("k", &[0u8; 4], desc)
+        .build();
+    elf_bytes.extend_from_slice(&note);
+    let e_shoff = u64::from_le_bytes([
+        elf_bytes[40],
+        elf_bytes[41],
+        elf_bytes[42],
+        elf_bytes[43],
+        elf_bytes[44],
+        elf_bytes[45],
+        elf_bytes[46],
+        elf_bytes[47],
+    ]);
+    let e_shnum = u16::from_le_bytes([elf_bytes[60], elf_bytes[61]]);
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs);
+    let new_note_off = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&note);
+    let new_shoff = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&shdrs);
+    let mut nh = vec![0u8; 64];
+    nh[4..8].copy_from_slice(&7u32.to_le_bytes());
+    nh[24..32].copy_from_slice(&new_note_off.to_le_bytes());
+    nh[32..40].copy_from_slice(&(note.len() as u64).to_le_bytes());
+    nh[48..56].copy_from_slice(&4u64.to_le_bytes());
+    rebuilt.extend_from_slice(&nh);
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF parses");
+    let view = elf.code_object_view().expect("view builds");
+    assert!(
+        view.metadata.is_none(),
+        "note with name != \"AMDGPU\" must not be picked up as metadata"
+    );
+}
+
+#[test]
+fn metadata_note_with_wrong_type_is_ignored() {
+    // Same setup as above but ntype = 1 (NT_VERSION) — the
+    // metadata-finder should skip it because it's gated on
+    // `ntype == NT_AMDGPU_METADATA && name == "AMDGPU"`. Mutating
+    // `&&` to `||` would let this through.
+    let desc = descriptor_with_vgpr_sgpr(0, 0, 0);
+    let msgpack = build_msgpack_for("k", 0, 0, 0);
+
+    let name = b"AMDGPU\0";
+    let mut note = Vec::new();
+    note.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    note.extend_from_slice(&(msgpack.len() as u32).to_le_bytes());
+    note.extend_from_slice(&1u32.to_le_bytes()); // wrong ntype
+    note.extend_from_slice(name);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+    note.extend_from_slice(&msgpack);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+
+    let mut elf_bytes = AmdElfBuilder::new()
+        .push_kernel("k", &[0u8; 4], desc)
+        .build();
+    elf_bytes.extend_from_slice(&note);
+    let e_shoff = u64::from_le_bytes([
+        elf_bytes[40],
+        elf_bytes[41],
+        elf_bytes[42],
+        elf_bytes[43],
+        elf_bytes[44],
+        elf_bytes[45],
+        elf_bytes[46],
+        elf_bytes[47],
+    ]);
+    let e_shnum = u16::from_le_bytes([elf_bytes[60], elf_bytes[61]]);
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs);
+    let new_note_off = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&note);
+    let new_shoff = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&shdrs);
+    let mut nh = vec![0u8; 64];
+    nh[4..8].copy_from_slice(&7u32.to_le_bytes());
+    nh[24..32].copy_from_slice(&new_note_off.to_le_bytes());
+    nh[32..40].copy_from_slice(&(note.len() as u64).to_le_bytes());
+    nh[48..56].copy_from_slice(&4u64.to_le_bytes());
+    rebuilt.extend_from_slice(&nh);
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF parses");
+    let view = elf.code_object_view().expect("view builds");
+    assert!(
+        view.metadata.is_none(),
+        "note with wrong ntype must not be picked up as metadata"
+    );
+}
+
+#[test]
+fn metadata_search_iterates_past_non_amdgpu_notes() {
+    // Build a SHT_NOTE section containing TWO records:
+    //   1. A junk note (name="OTHER", type=42) that should be skipped.
+    //   2. The real NT_AMDGPU_METADATA note.
+    // The loop in `find_amdgpu_metadata` must walk past the first
+    // record and find the second; mutating the bound check from
+    // `cursor + 12 <= bytes.len()` to a multiplicative form would
+    // exit the loop before reaching the second record.
+    let desc = descriptor_with_vgpr_sgpr(0, 0, 0);
+
+    // Note 1: junk record.
+    let junk_name = b"OTHER\0";
+    let junk_payload: &[u8] = &[];
+    let mut note = Vec::new();
+    note.extend_from_slice(&(junk_name.len() as u32).to_le_bytes());
+    note.extend_from_slice(&(junk_payload.len() as u32).to_le_bytes());
+    note.extend_from_slice(&42u32.to_le_bytes());
+    note.extend_from_slice(junk_name);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+    note.extend_from_slice(junk_payload);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+
+    // Note 2: real AMDGPU metadata.
+    let msgpack = build_msgpack_for("k", 4, 8, 0);
+    let amdgpu_name = b"AMDGPU\0";
+    note.extend_from_slice(&(amdgpu_name.len() as u32).to_le_bytes());
+    note.extend_from_slice(&(msgpack.len() as u32).to_le_bytes());
+    note.extend_from_slice(&32u32.to_le_bytes());
+    note.extend_from_slice(amdgpu_name);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+    note.extend_from_slice(&msgpack);
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+
+    let mut elf_bytes = AmdElfBuilder::new()
+        .push_kernel("k", &[0u8; 4], desc)
+        .build();
+    elf_bytes.extend_from_slice(&note);
+    let e_shoff = u64::from_le_bytes([
+        elf_bytes[40],
+        elf_bytes[41],
+        elf_bytes[42],
+        elf_bytes[43],
+        elf_bytes[44],
+        elf_bytes[45],
+        elf_bytes[46],
+        elf_bytes[47],
+    ]);
+    let e_shnum = u16::from_le_bytes([elf_bytes[60], elf_bytes[61]]);
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs);
+    let new_note_off = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&note);
+    let new_shoff = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&shdrs);
+    let mut nh = vec![0u8; 64];
+    nh[4..8].copy_from_slice(&7u32.to_le_bytes());
+    nh[24..32].copy_from_slice(&new_note_off.to_le_bytes());
+    nh[32..40].copy_from_slice(&(note.len() as u64).to_le_bytes());
+    nh[48..56].copy_from_slice(&4u64.to_le_bytes());
+    rebuilt.extend_from_slice(&nh);
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF parses");
+    let view = elf.code_object_view().expect("view builds");
+    let m = view
+        .metadata
+        .as_ref()
+        .expect("must skip non-AMDGPU note and find AMDGPU metadata at the second record");
+    assert_eq!(m.kernels.len(), 1);
+    assert_eq!(m.kernels[0].name.as_deref(), Some("k"));
+}
+
+#[test]
+fn truncated_note_record_breaks_loop_without_panic() {
+    // Build a SHT_NOTE section containing a header that *claims* a
+    // descsz larger than the section body. The walker's bounds
+    // check (`if next_off > bytes.len() { break; }`) must trigger
+    // — without it, we'd index out-of-bounds. Mutating the
+    // comparison to `<` would walk into invalid memory.
+    let desc = descriptor_with_vgpr_sgpr(0, 0, 0);
+
+    // Note header claims descsz = 0xFFFF but actual body is empty.
+    let mut note = Vec::new();
+    note.extend_from_slice(&7u32.to_le_bytes()); // namesz
+    note.extend_from_slice(&0xFFFFu32.to_le_bytes()); // descsz (lying)
+    note.extend_from_slice(&32u32.to_le_bytes()); // ntype
+    note.extend_from_slice(b"AMDGPU\0");
+    while note.len() % 4 != 0 {
+        note.push(0);
+    }
+    // No descriptor bytes at all.
+
+    let mut elf_bytes = AmdElfBuilder::new()
+        .push_kernel("k", &[0u8; 4], desc)
+        .build();
+    elf_bytes.extend_from_slice(&note);
+    let e_shoff = u64::from_le_bytes([
+        elf_bytes[40],
+        elf_bytes[41],
+        elf_bytes[42],
+        elf_bytes[43],
+        elf_bytes[44],
+        elf_bytes[45],
+        elf_bytes[46],
+        elf_bytes[47],
+    ]);
+    let e_shnum = u16::from_le_bytes([elf_bytes[60], elf_bytes[61]]);
+    let shdrs_size = (e_shnum as usize) * 64;
+    let shdrs_end = e_shoff as usize + shdrs_size;
+    let pre_shdrs = elf_bytes[..e_shoff as usize].to_vec();
+    let shdrs = elf_bytes[e_shoff as usize..shdrs_end].to_vec();
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&pre_shdrs);
+    let new_note_off = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&note);
+    let new_shoff = rebuilt.len() as u64;
+    rebuilt.extend_from_slice(&shdrs);
+    let mut nh = vec![0u8; 64];
+    nh[4..8].copy_from_slice(&7u32.to_le_bytes());
+    nh[24..32].copy_from_slice(&new_note_off.to_le_bytes());
+    nh[32..40].copy_from_slice(&(note.len() as u64).to_le_bytes());
+    nh[48..56].copy_from_slice(&4u64.to_le_bytes());
+    rebuilt.extend_from_slice(&nh);
+    rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+
+    let elf = Elf::parse(&rebuilt).expect("ELF parses");
+    let view = elf
+        .code_object_view()
+        .expect("view builds even with bad note");
+    assert!(
+        view.metadata.is_none(),
+        "truncated note must not produce metadata"
+    );
 }

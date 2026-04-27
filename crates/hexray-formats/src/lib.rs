@@ -18,14 +18,18 @@ pub mod macho;
 pub mod pe;
 pub mod traits;
 
-pub use cuda::{FatbinEntry, FatbinEntryKind, FatbinError, FatbinWrapper};
+pub use cuda::{
+    FatbinEntry, FatbinEntryKind, FatbinError, FatbinWrapper, HipBundleEntry, HipBundleEntryKind,
+    HipBundleError, HipBundleWrapper,
+};
 pub use elf::{
-    AmdKernel, AmdKernelResourceUsage, CodeObjectDiagnostic, CodeObjectDiagnosticKind,
-    CodeObjectError, CodeObjectView, CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView,
-    Elf, ElfType, Kernel, KernelConfidence, KernelDescriptor, KernelModuleInfo,
-    KernelResourceUsage, MemoryRegion, MemorySpace, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef,
-    NvInfoFormat, ParamCbank, ParamInfo, PtxFunction, PtxFunctionKind, PtxIndex, PtxModuleHeader,
-    Relocation, RelocationType, SchemaError, KERNEL_DESCRIPTOR_SIZE,
+    AmdKernel, AmdKernelResourceUsage, AmdMetadata, AmdMetadataArg, AmdMetadataKernel,
+    CodeObjectDiagnostic, CodeObjectDiagnosticKind, CodeObjectError, CodeObjectView,
+    CubinDiagnostic, CubinDiagnosticKind, CubinError, CubinView, Elf, ElfType, Kernel,
+    KernelConfidence, KernelDescriptor, KernelModuleInfo, KernelResourceUsage, MemoryRegion,
+    MemorySpace, NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat, ParamCbank, ParamInfo,
+    PtxFunction, PtxFunctionKind, PtxIndex, PtxModuleHeader, Relocation, RelocationType,
+    ScaleKinfo, ScaleKinfoArg, ScaleKinfoError, SchemaError, KERNEL_DESCRIPTOR_SIZE,
 };
 pub use error::ParseError;
 pub use macho::MachO;

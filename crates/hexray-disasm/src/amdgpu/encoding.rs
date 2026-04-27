@@ -345,4 +345,157 @@ mod tests {
         assert_eq!(EncodingClass::Ds.encoding_size(), 8);
         assert_eq!(EncodingClass::Unknown.encoding_size(), 4);
     }
+
+    /// Build a 32-bit dword with the given 9-bit top prefix in bits
+    /// `[31:23]`. The remaining bits are zero.
+    fn dword_with_top9(top9: u32) -> u32 {
+        (top9 & 0x1ff) << 23
+    }
+
+    /// Build a 32-bit dword with the given 6-bit top prefix in bits
+    /// `[31:26]`.
+    fn dword_with_top6(top6: u32) -> u32 {
+        (top6 & 0x3f) << 26
+    }
+
+    #[test]
+    fn sop1_top9_distinguishes_from_sop2_and_sopk() {
+        // SOP1: top9 = 1011_11101.
+        let dword = dword_with_top9(0b1_0111_1101);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Sop1
+        );
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Sop1
+        );
+    }
+
+    #[test]
+    fn sopc_top9_distinguishes_from_sop2_and_sopk() {
+        // SOPC: top9 = 1011_11110.
+        let dword = dword_with_top9(0b1_0111_1110);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Sopc
+        );
+    }
+
+    #[test]
+    fn sopp_top9_classified_before_sopk() {
+        // SOPP: top9 = 1011_11111. The literal `s_endpgm` from the
+        // end-to-end test (`0xbf810000`) has the same prefix.
+        let dword = dword_with_top9(0b1_0111_1111);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Sopp
+        );
+    }
+
+    #[test]
+    fn sopk_top4_dispatches_when_no_sop1_or_sopc_prefix() {
+        // SOPK: top4 = 1011, but with a top9 outside the SOP1/C/P
+        // patterns (1111101 / 1111110 / 1111111). Use top9 =
+        // 1011_00000 = 0x160 — top4 still 1011, top byte 0xB0.
+        let dword = dword_with_top9(0b1_0110_0000);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Sopk
+        );
+    }
+
+    #[test]
+    fn gfx9_exp_classified_at_top6_110001() {
+        // EXP on GFX9: top6 = 110001 → top byte 1100_01xx.
+        let dword = dword_with_top6(0b110001);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Exp
+        );
+        // GFX10+ moved EXP to 111110, so the GFX9 prefix shouldn't
+        // resolve to EXP there.
+        assert_ne!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Exp
+        );
+    }
+
+    #[test]
+    fn ds_classified_at_top6_110110_on_both_bands() {
+        // DS lives at the same prefix on GFX9 and GFX10+.
+        let dword = dword_with_top6(0b110110);
+        assert_eq!(decode_class(dword, EncodingFamily::Gfx9), EncodingClass::Ds);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Ds
+        );
+    }
+
+    #[test]
+    fn flat_classified_at_top6_110111_on_both_bands() {
+        let dword = dword_with_top6(0b110111);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Flat
+        );
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Flat
+        );
+    }
+
+    #[test]
+    fn mubuf_classified_at_top6_111000_on_both_bands() {
+        let dword = dword_with_top6(0b111000);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Mubuf
+        );
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Mubuf
+        );
+    }
+
+    #[test]
+    fn mtbuf_classified_at_top6_111010_on_both_bands() {
+        let dword = dword_with_top6(0b111010);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Mtbuf
+        );
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Mtbuf
+        );
+    }
+
+    #[test]
+    fn mimg_classified_at_top6_111100_on_both_bands() {
+        let dword = dword_with_top6(0b111100);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Mimg
+        );
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Mimg
+        );
+    }
+
+    #[test]
+    fn gfx10_exp_at_top6_111110_does_not_resolve_on_gfx9() {
+        // GFX10+ moved EXP to 111110.
+        let dword = dword_with_top6(0b111110);
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx10Plus),
+            EncodingClass::Exp
+        );
+        // GFX9 doesn't have EXP at this prefix.
+        assert_eq!(
+            decode_class(dword, EncodingFamily::Gfx9),
+            EncodingClass::Unknown
+        );
+    }
 }

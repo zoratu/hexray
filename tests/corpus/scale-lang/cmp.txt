@@ -9,5 +9,10 @@ Kernel: vector_add
   kernarg/param   a=88B          b=88B          ✓
   shared/LDS      a=0B           b=0B           ✓
   exit count      a=—            b=—            ✓
+  arg count       a=4            b=4            ✓
+  arg [0] size    a=8B           b=8B           ✓
+  arg [1] size    a=8B           b=8B           ✓
+  arg [2] size    a=8B           b=8B           ✓
+  arg [3] size    a=4B           b=4B           ✓
 
 Matched 1 kernel(s).

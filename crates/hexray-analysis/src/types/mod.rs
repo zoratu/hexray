@@ -1921,6 +1921,7 @@ impl TemplateParser {
     }
 
     /// Parses a primitive type name into a Type.
+    #[allow(clippy::only_used_in_recursion)] // recurses to peel pointer suffixes
     fn parse_primitive_type(&self, s: &str) -> Type {
         let s = s.trim();
 
