@@ -272,24 +272,63 @@ impl<'a> FunctionInfo<'a> {
             .filter(|d| matches!(d.tag, DwTag::Variable))
     }
 
+    /// Frame-base correction in bytes from CFA to the architecture's
+    /// frame register (rbp on x86_64, fp on ARM64).
+    ///
+    /// `DW_OP_fbreg` offsets are relative to the function's
+    /// `DW_AT_frame_base`. When the frame base is
+    /// `DW_OP_call_frame_cfa` (the default for `clang -O0 -g` on
+    /// glibc), CFA equals the caller-side stack pointer at the call
+    /// instruction. On x86_64 with the standard prologue
+    /// (`push %rbp; mov %rsp, %rbp`), that is `rbp + 16`. The
+    /// decompiler keys stack slots by offset from rbp/fp, so we
+    /// rebase the DWARF offsets by adding the CFA→rbp delta here.
+    ///
+    /// For other frame_base expressions (e.g. `DW_OP_breg6` —
+    /// rbp-relative directly), no correction is needed.
+    fn frame_base_correction(&self) -> i64 {
+        let bytes = match self.die.attr(DwAt::FrameBase) {
+            Some(AttributeValue::ExprLoc(b)) | Some(AttributeValue::Block(b)) => b,
+            _ => return 0,
+        };
+        // DW_OP_call_frame_cfa = 0x9c. The single-byte expression is
+        // emitted by clang/gcc -O0 -g on x86_64 and ARM64; on both
+        // architectures the prologue saves the previous frame
+        // pointer at the top of the new frame, so CFA = fp + 16.
+        if bytes.len() == 1 && bytes[0] == 0x9c {
+            return 16;
+        }
+        0
+    }
+
     /// Get all variable names mapped to their stack offsets.
     ///
     /// Returns a map from stack offset (as i128 to match NamingContext) to variable name.
     /// This includes both parameters and local variables.
+    ///
+    /// Offsets are normalised to be relative to the architecture's
+    /// frame-pointer register (rbp on x86_64, fp on ARM64). When the
+    /// function's `DW_AT_frame_base` is `DW_OP_call_frame_cfa` (the
+    /// `clang -O0 -g` default), DWARF emits operand offsets relative
+    /// to the CFA — which sits at `fp + 16` after the standard
+    /// prologue. We rebase those offsets here so the decompiler's
+    /// fp-relative stack-slot lookups hit. See
+    /// [`Self::frame_base_correction`].
     pub fn variable_names(&self) -> std::collections::HashMap<i128, String> {
         let mut names = std::collections::HashMap::new();
+        let cfa_correction = self.frame_base_correction() as i128;
 
         // Collect parameters
         for param in self.parameters() {
             if let (Some(name), Some(offset)) = (param.name(), param.frame_base_offset()) {
-                names.insert(offset as i128, name.to_string());
+                names.insert(offset as i128 + cfa_correction, name.to_string());
             }
         }
 
         // Collect local variables
         for var in self.local_variables() {
             if let (Some(name), Some(offset)) = (var.name(), var.frame_base_offset()) {
-                names.insert(offset as i128, name.to_string());
+                names.insert(offset as i128 + cfa_correction, name.to_string());
             }
         }
 

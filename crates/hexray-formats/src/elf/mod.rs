@@ -35,7 +35,7 @@ pub use symbol::SymbolEntry;
 // KernelModuleInfo is defined in this module and is public
 
 use crate::{BinaryFormat, ParseError, Section};
-use hexray_core::{Architecture, Bitness, Endianness, Symbol};
+use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
 
 /// A parsed ELF binary.
 #[derive(Debug)]
@@ -144,12 +144,20 @@ impl<'a> Elf<'a> {
         // We keep the raw `SymbolEntry`s alongside the simplified `Symbol`s
         // so downstream ELF-specific views (e.g. CUDA) can inspect fields
         // like `st_other` that the simplified form discards.
-        let (symbols, raw_symbols) = Self::parse_symbols(data, &sections, &header, &section_names)?;
+        let (mut symbols, raw_symbols) =
+            Self::parse_symbols(data, &sections, &header, &section_names)?;
 
         // Parse relocations for relocatable files and dynamic binaries
         // - Relocatable files: need relocations for symbol resolution in decompilation
         // - Shared objects/executables: need GOT/PLT relocations for indirect call resolution
         let relocations = Self::parse_relocations(data, &sections, &header)?;
+
+        // Synthesize `<name>@plt` symbols at each PLT stub so calls
+        // through the GOT (e.g. `qsort@plt`) decode as the libc symbol
+        // name rather than `sub_NNN`. The decompiler's
+        // `normalize_function_name` strips the `@plt` suffix, so the
+        // emitted code calls `qsort(...)`.
+        Self::synthesize_plt_symbols(data, &sections, &section_names, &header, &mut symbols)?;
 
         // Parse kernel module info if present
         let modinfo = Self::parse_modinfo(data, &sections, &section_names);
@@ -320,6 +328,174 @@ impl<'a> Elf<'a> {
         }
 
         Ok((symbols, raw_symbols))
+    }
+
+    /// Synthesize `<dynsym>@plt` symbols at each PLT stub address.
+    ///
+    /// Calls through the PLT (e.g. `call qsort@plt`) target an address
+    /// inside `.plt` (or `.plt.sec` on CET-aware glibc). Without
+    /// synthesised symbols at those addresses, the disassembler renders
+    /// the call as `sub_NNN`, and the decompiler can't normalise it
+    /// back to the libc symbol name. This routine walks `.rela.plt`
+    /// (or `.rel.plt`) in order, looks up each symbol's name in the
+    /// `.dynsym` section pointed to by the relocation section's
+    /// `sh_link`, and adds a `Symbol { name: "<dynsym>@plt", ... }`
+    /// at the matching stub address.
+    ///
+    /// Stub layout:
+    /// - **`.plt.sec`** (CET / IBT): each entry is a callable stub at
+    ///   `base + i * sh_entsize`, no resolver header.
+    /// - **`.plt`** (traditional): entry 0 is the resolver trampoline,
+    ///   real entries start at `base + (i + 1) * sh_entsize`.
+    ///
+    /// `.plt.sec` is preferred when present — it's what call sites
+    /// actually target on modern Linux. We only fall back to `.plt` if
+    /// `.plt.sec` is absent.
+    fn synthesize_plt_symbols(
+        data: &[u8],
+        sections: &[SectionHeader],
+        section_names: &StringTable,
+        header: &ElfHeader,
+        symbols: &mut Vec<Symbol>,
+    ) -> Result<(), ParseError> {
+        // Find the PLT stub-bearing section. CET-aware binaries put
+        // the callable stubs in `.plt.sec`; otherwise they live in
+        // `.plt` past the resolver header.
+        let mut plt_sec: Option<&SectionHeader> = None;
+        let mut plt: Option<&SectionHeader> = None;
+        for section in sections.iter() {
+            let name = section_names.get(section.sh_name as usize).unwrap_or("");
+            match name {
+                ".plt.sec" => plt_sec = Some(section),
+                ".plt" => plt = Some(section),
+                _ => {}
+            }
+        }
+        let (stub_base, stub_size, has_header) = match (plt_sec, plt) {
+            (Some(s), _) => (s.sh_addr, s.sh_entsize.max(16), false),
+            (None, Some(p)) => (p.sh_addr, p.sh_entsize.max(16), true),
+            _ => return Ok(()),
+        };
+
+        // Walk .rela.plt / .rel.plt sections. The `sh_link` of each
+        // points at the symbol-table section (.dynsym in dynamic
+        // binaries), and entries are emitted in the same order as
+        // the PLT stubs.
+        for rel_section in sections.iter() {
+            if rel_section.sh_type != section::SHT_RELA && rel_section.sh_type != section::SHT_REL {
+                continue;
+            }
+            let rel_name = section_names
+                .get(rel_section.sh_name as usize)
+                .unwrap_or("");
+            if rel_name != ".rela.plt" && rel_name != ".rel.plt" {
+                continue;
+            }
+
+            // Resolve the .dynsym (or .symtab) referenced by sh_link.
+            let dynsym_idx = rel_section.sh_link as usize;
+            if dynsym_idx >= sections.len() {
+                continue;
+            }
+            let dynsym = &sections[dynsym_idx];
+            let strtab_idx = dynsym.sh_link as usize;
+            if strtab_idx >= sections.len() {
+                continue;
+            }
+            let strtab_section = &sections[strtab_idx];
+            let strtab_start = strtab_section.sh_offset as usize;
+            let strtab_end = strtab_start.saturating_add(strtab_section.sh_size as usize);
+            if strtab_end > data.len() || strtab_end <= strtab_start {
+                continue;
+            }
+            let strtab = StringTable::new(&data[strtab_start..strtab_end]);
+
+            let dynsym_start = dynsym.sh_offset as usize;
+            let dynsym_end = dynsym_start.saturating_add(dynsym.sh_size as usize);
+            let dynsym_entsize = dynsym.sh_entsize as usize;
+            if dynsym_end > data.len() || dynsym_end <= dynsym_start || dynsym_entsize == 0 {
+                continue;
+            }
+
+            // Walk the relocation entries in order.
+            let rel_start = rel_section.sh_offset as usize;
+            let rel_end = rel_start.saturating_add(rel_section.sh_size as usize);
+            let rel_entsize = rel_section.sh_entsize as usize;
+            if rel_end > data.len() || rel_end <= rel_start || rel_entsize == 0 {
+                continue;
+            }
+
+            let mut rel_offset = rel_start;
+            let mut stub_index: u64 = 0;
+            while rel_offset.saturating_add(rel_entsize) <= rel_end {
+                // Symbol-index extraction: high half of r_info on
+                // ELF64, high 24 bits on ELF32. r_info layout:
+                //   ELF64: r_offset(8) r_info(8) r_addend(8)
+                //   ELF32: r_offset(4) r_info(4) r_addend(4)?
+                let entry_bytes = &data[rel_offset..rel_offset + rel_entsize];
+                let sym_index = match header.class {
+                    ElfClass::Elf64 => {
+                        if entry_bytes.len() < 16 {
+                            break;
+                        }
+                        let r_info = match header.endianness {
+                            Endianness::Little => {
+                                u64::from_le_bytes(entry_bytes[8..16].try_into().unwrap_or([0; 8]))
+                            }
+                            Endianness::Big => {
+                                u64::from_be_bytes(entry_bytes[8..16].try_into().unwrap_or([0; 8]))
+                            }
+                        };
+                        (r_info >> 32) as u32
+                    }
+                    ElfClass::Elf32 => {
+                        if entry_bytes.len() < 8 {
+                            break;
+                        }
+                        let r_info = match header.endianness {
+                            Endianness::Little => {
+                                u32::from_le_bytes(entry_bytes[4..8].try_into().unwrap_or([0; 4]))
+                            }
+                            Endianness::Big => {
+                                u32::from_be_bytes(entry_bytes[4..8].try_into().unwrap_or([0; 4]))
+                            }
+                        };
+                        r_info >> 8
+                    }
+                };
+
+                // Look up the dynsym entry by index for the name.
+                let sym_offset = dynsym_start + (sym_index as usize) * dynsym_entsize;
+                if sym_offset + dynsym_entsize <= dynsym_end {
+                    let sym_entry =
+                        SymbolEntry::parse(&data[sym_offset..], header.class, header.endianness)?;
+                    if let Some(name) = strtab.get(sym_entry.st_name as usize) {
+                        if !name.is_empty() {
+                            // Strip the GLIBC version suffix
+                            // (`qsort@GLIBC_2.2.5` → `qsort`).
+                            let bare = name.split('@').next().unwrap_or(name);
+                            let stub_addr = if has_header {
+                                stub_base + stub_size * (stub_index + 1)
+                            } else {
+                                stub_base + stub_size * stub_index
+                            };
+                            symbols.push(Symbol {
+                                name: format!("{bare}@plt"),
+                                address: stub_addr,
+                                size: stub_size,
+                                kind: SymbolKind::Function,
+                                binding: SymbolBinding::Global,
+                                section_index: None,
+                            });
+                        }
+                    }
+                }
+
+                stub_index += 1;
+                rel_offset += rel_entsize;
+            }
+        }
+        Ok(())
     }
 
     fn parse_relocations(
