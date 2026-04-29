@@ -138,3 +138,80 @@ pub fn detect_format(data: &[u8]) -> BinaryType {
 
     BinaryType::Unknown
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_from_bytes_passes_ascii_through_unchanged() {
+        assert_eq!(name_from_bytes(b"qsort"), "qsort");
+        assert_eq!(name_from_bytes(b"__TEXT"), "__TEXT");
+        assert_eq!(name_from_bytes(b".rela.plt"), ".rela.plt");
+    }
+
+    #[test]
+    fn name_from_bytes_passes_valid_multibyte_utf8_through() {
+        // `é` is two bytes in UTF-8 (0xc3 0xa9), `★` is three (0xe2 0x98
+        // 0x85). Both forms are valid; the helper must not escape them.
+        assert_eq!(name_from_bytes("héllo".as_bytes()), "héllo");
+        assert_eq!(name_from_bytes("★star".as_bytes()), "★star");
+    }
+
+    #[test]
+    fn name_from_bytes_returns_empty_string_for_empty_input() {
+        assert_eq!(name_from_bytes(b""), "");
+    }
+
+    #[test]
+    fn name_from_bytes_preserves_embedded_nulls_in_valid_utf8() {
+        // `\0` is valid UTF-8 (U+0000). It survives the to_string()
+        // path; the resulting String contains the literal NUL byte.
+        let out = name_from_bytes(b"a\0b");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.as_bytes(), b"a\0b");
+    }
+
+    #[test]
+    fn name_from_bytes_escapes_invalid_utf8_via_ascii_escape() {
+        // 0xff alone is not a valid UTF-8 byte → entire input goes
+        // through escape_default. `0xff` becomes the literal `\xff`.
+        assert_eq!(name_from_bytes(&[0xff]), r"\xff");
+        assert_eq!(name_from_bytes(&[0xff, 0xfe]), r"\xff\xfe");
+    }
+
+    #[test]
+    fn name_from_bytes_distinguishes_different_invalid_byte_sequences() {
+        // The motivating case the helper was added for. `from_utf8_lossy`
+        // collapses both inputs to `��`; we keep them distinguishable.
+        let a = name_from_bytes(&[0xff, 0xfe]);
+        let b = name_from_bytes(&[0xff, 0xfd]);
+        assert_ne!(a, b);
+        assert_eq!(a, r"\xff\xfe");
+        assert_eq!(b, r"\xff\xfd");
+    }
+
+    #[test]
+    fn name_from_bytes_escapes_mixed_valid_and_invalid_bytes() {
+        // When any byte makes the input invalid, the entire run goes
+        // through escape_default — including the printable ASCII bytes
+        // that are also in the slice. ASCII pass-through under
+        // escape_default keeps them readable; the high byte gets the
+        // `\xff` form.
+        assert_eq!(name_from_bytes(b"hi\xff"), r"hi\xff");
+    }
+
+    #[test]
+    fn name_from_bytes_escapes_low_control_bytes_only_when_input_invalid() {
+        // Mixed: control byte + invalid byte. escape_default emits
+        // the canonical `\n`, `\t`, etc. escapes for control chars
+        // even though they're valid UTF-8 — that only matters here
+        // because the trailing 0xff forces the whole input through
+        // the escape path.
+        assert_eq!(name_from_bytes(b"a\nb\xff"), r"a\nb\xff");
+        // Same control byte in valid input passes through as a real
+        // newline character (no escaping).
+        let out = name_from_bytes(b"a\nb");
+        assert_eq!(out.as_bytes(), b"a\nb");
+    }
+}
