@@ -174,7 +174,7 @@ impl LoadCommand {
                         .iter()
                         .position(|&b| b == 0)
                         .unwrap_or(name_bytes.len());
-                    String::from_utf8_lossy(&name_bytes[..end]).to_string()
+                    crate::name_from_bytes(&name_bytes[..end])
                 } else {
                     String::new()
                 };

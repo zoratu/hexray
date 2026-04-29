@@ -268,5 +268,5 @@ impl crate::Section for Section {
 /// Parse a null-terminated name from a fixed-size buffer.
 fn parse_name(data: &[u8]) -> String {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    String::from_utf8_lossy(&data[..end]).to_string()
+    crate::name_from_bytes(&data[..end])
 }

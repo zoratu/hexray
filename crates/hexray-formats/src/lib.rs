@@ -9,6 +9,28 @@
 //! These parsers are built from scratch for educational purposes.
 
 #![forbid(unsafe_code)]
+// Adversarial-input hardening — DOCUMENTED, NOT YET ENFORCED.
+//
+// Per https://corrode.dev/blog/bugs-rust-wont-catch/, panic /
+// index-out-of-bounds / overflow on attacker-controlled input is a
+// DoS surface even with Rust's memory safety. This crate parses
+// untrusted binaries, so every `.unwrap()`, `[idx]`, and `+`/`*`
+// without bounds checks is a fuzz-discoverable crash bug.
+//
+// Hundreds of pre-existing call sites violate this — flipping any
+// of the lints below to `warn` or `deny` floods the build. New
+// code on parsing paths should prefer `.get()` / `checked_*` /
+// `try_into()` / `try_from()`. PR review is the enforcement
+// mechanism until the bulk refactor lands. See
+// `scripts/run-fuzz-corpus` for the runtime check that catches
+// any regression that does slip through.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 pub mod cuda;
 pub mod dwarf;
@@ -43,6 +65,34 @@ pub enum BinaryType {
     MachO,
     Pe,
     Unknown,
+}
+
+/// Convert a name from raw binary bytes (symbol name, section name,
+/// load-command field) to a `String` suitable for display.
+///
+/// Symbol and section names in ELF, Mach-O, and PE are byte sequences
+/// — the format spec doesn't require UTF-8. The natural Rust convention
+/// `String::from_utf8_lossy` collapses every invalid byte to
+/// `\u{FFFD}`, which destroys information: an attacker-crafted symbol
+/// `\xff\xfe` and a different one `\xff\xfd` both render as the same
+/// `��` and can't be distinguished in output, logs, or comparisons.
+///
+/// This helper preserves the bytes:
+/// - Valid UTF-8 input passes through unchanged.
+/// - Invalid input is rendered with `std::ascii::escape_default`, so
+///   `\xff` shows as `\xff` and stays distinguishable / round-trippable.
+///
+/// Use this anywhere a binary-format byte buffer becomes a name
+/// surfaced to the analyzer or printed to the user.
+pub fn name_from_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes
+            .iter()
+            .flat_map(|&b| std::ascii::escape_default(b))
+            .map(char::from)
+            .collect(),
+    }
 }
 
 /// Detect the binary format from magic bytes.

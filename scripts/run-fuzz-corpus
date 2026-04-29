@@ -1,0 +1,89 @@
+#!/bin/bash
+# Run each fuzz target briefly against its committed corpus + a short
+# fresh-input campaign, fail on any crash. Catches regressions without
+# requiring a full fuzz session.
+#
+# Usage:
+#   scripts/run-fuzz-corpus              # all targets, 60s each
+#   scripts/run-fuzz-corpus elf_parser   # just one target
+#   scripts/run-fuzz-corpus --time 30    # 30s per target
+#
+# Requires nightly rustc (cargo-fuzz dependency). Skips with a clear
+# message if not available — keeps non-fuzz CI tiers passing.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+PER_TARGET_SECONDS=60
+TARGETS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --time)
+            PER_TARGET_SECONDS="$2"
+            shift 2
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--time SECONDS] [target_name ...]"
+            exit 0
+            ;;
+        *)
+            TARGETS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Some CI environments (and `tailscale ssh` non-interactive shells)
+# don't pre-source `~/.cargo/env`, so PATH may not include the cargo
+# bin dir even when rustup-managed binaries are installed. Add it
+# defensively before probing.
+if [[ -d "$HOME/.cargo/bin" ]] && [[ ":$PATH:" != *":$HOME/.cargo/bin:"* ]]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+if ! command -v cargo-fuzz >/dev/null 2>&1; then
+    if ! cargo +nightly --version >/dev/null 2>&1; then
+        echo "skipping: cargo-fuzz not installed and nightly rustc unavailable"
+        echo "install with: cargo +nightly install cargo-fuzz"
+        exit 0
+    fi
+fi
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    # Default: every target with a corresponding fuzz_targets/*.rs file.
+    while IFS= read -r f; do
+        TARGETS+=("$(basename "$f" .rs)")
+    done < <(find fuzz/fuzz_targets -maxdepth 1 -name '*.rs' | sort)
+fi
+
+echo "Running ${#TARGETS[@]} fuzz target(s) for ${PER_TARGET_SECONDS}s each"
+echo "================================================================"
+
+failed=()
+for target in "${TARGETS[@]}"; do
+    echo
+    echo ">>> $target"
+    # cargo-fuzz exits non-zero on any crash. -max_total_time bounds the
+    # campaign; -runs caps total inputs as a fallback if the timer is
+    # racy. The committed corpus under fuzz/corpus/$target seeds the
+    # campaign automatically.
+    if ! cargo +nightly fuzz run "$target" -- \
+            -max_total_time="$PER_TARGET_SECONDS" \
+            -runs=100000 \
+            -print_final_stats=1 \
+            2>&1 | tail -20; then
+        failed+=("$target")
+    fi
+done
+
+echo
+echo "================================================================"
+if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "FAILED: ${failed[*]}"
+    echo "Crash inputs saved under fuzz/artifacts/<target>/"
+    exit 1
+fi
+echo "OK: all ${#TARGETS[@]} target(s) clean"

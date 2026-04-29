@@ -291,7 +291,7 @@ impl LineNumberProgram {
                     context: "include directory",
                 });
             }
-            let dir = String::from_utf8_lossy(&data[start..*offset]).into_owned();
+            let dir = crate::name_from_bytes(&data[start..*offset]);
             *offset += 1; // Skip null terminator
 
             if dir.is_empty() {
@@ -314,7 +314,7 @@ impl LineNumberProgram {
                     context: "file name",
                 });
             }
-            let name = String::from_utf8_lossy(&data[start..*offset]).into_owned();
+            let name = crate::name_from_bytes(&data[start..*offset]);
             *offset += 1; // Skip null terminator
 
             if name.is_empty() {
@@ -367,7 +367,7 @@ impl LineNumberProgram {
             while *offset < data.len() && data[*offset] != 0 {
                 *offset += 1;
             }
-            let dir = String::from_utf8_lossy(&data[start..*offset]).into_owned();
+            let dir = crate::name_from_bytes(&data[start..*offset]);
             *offset += 1;
             include_directories.push(dir);
         }
@@ -395,7 +395,7 @@ impl LineNumberProgram {
             while *offset < data.len() && data[*offset] != 0 {
                 *offset += 1;
             }
-            let name = String::from_utf8_lossy(&data[start..*offset]).into_owned();
+            let name = crate::name_from_bytes(&data[start..*offset]);
             *offset += 1;
 
             let (directory_index, consumed) = decode_uleb128(&data[*offset..])?;

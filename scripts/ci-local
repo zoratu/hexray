@@ -176,6 +176,9 @@ run_medium() {
     fi
     if [[ "$RUN_FUZZ_TARGETS" == "yes" ]]; then
         run "Fuzz target build" "$ROOT_DIR/scripts/check-fuzz-targets"
+        # `medium` only verifies fuzz targets compile. `full` runs each
+        # target briefly against its committed corpus to catch crash
+        # regressions — see `run_full`.
     fi
     if [[ "$RUN_QUALITY_SMOKE" == "yes" ]]; then
         if [[ "$RUN_STRICT_CALLBACK" == "yes" ]]; then
@@ -191,6 +194,13 @@ run_medium() {
 
 run_full() {
     run_medium
+
+    if [[ "$RUN_FUZZ_TARGETS" == "yes" ]]; then
+        # 60s per target × ~21 targets = ~20 min. Skips with a clear
+        # message when nightly rustc / cargo-fuzz isn't available
+        # (matches the existing `check-fuzz-targets` posture).
+        run "Fuzz crash-regression gate" "$ROOT_DIR/scripts/run-fuzz-corpus" --time 60
+    fi
 
     if [[ "$RUN_SECURITY" == "yes" ]]; then
         run "Security audit" "$ROOT_DIR/scripts/check-security"

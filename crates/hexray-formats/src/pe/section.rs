@@ -47,7 +47,7 @@ impl SectionHeader {
         // Parse name (8 bytes, null-terminated)
         let name_bytes = &data[0..8];
         let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
-        let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
+        let name = crate::name_from_bytes(&name_bytes[..name_end]);
 
         Ok(Self {
             name,

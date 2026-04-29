@@ -581,7 +581,7 @@ impl<'a> DieParser<'a> {
                 context: "null-terminated string",
             });
         }
-        let s = String::from_utf8_lossy(&self.data[start..self.offset]).into_owned();
+        let s = crate::name_from_bytes(&self.data[start..self.offset]);
         self.offset += 1; // Skip null terminator
         Ok(s)
     }
