@@ -198,5 +198,5 @@ fn read_cstring(data: &[u8], offset: usize) -> String {
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(bytes.len().min(256));
-    String::from_utf8_lossy(&bytes[..end]).to_string()
+    crate::name_from_bytes(&bytes[..end])
 }

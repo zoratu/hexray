@@ -9,6 +9,18 @@
 //! - CUDA SASS (Volta+, feature-gated, in-progress)
 
 #![forbid(unsafe_code)]
+// Adversarial-input hardening — DOCUMENTED, NOT YET ENFORCED.
+// See `hexray-formats/src/lib.rs` for the full rationale. Decoders
+// walk attacker-shaped instruction streams; panics here are DoS
+// surface. The bulk-refactor migration is pending; until then PR
+// review and `scripts/run-fuzz-corpus` are the enforcement layer.
+#![allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 pub mod error;
 pub mod traits;

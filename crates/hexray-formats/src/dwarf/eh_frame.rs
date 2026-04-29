@@ -451,7 +451,7 @@ impl<'a> EhFrameParser<'a> {
                 context: "CIE augmentation",
             });
         }
-        cie.augmentation = String::from_utf8_lossy(&self.data[aug_start..offset]).to_string();
+        cie.augmentation = crate::name_from_bytes(&self.data[aug_start..offset]);
         offset += 1; // Skip null terminator
 
         // Check for signal frame ('S' augmentation)
