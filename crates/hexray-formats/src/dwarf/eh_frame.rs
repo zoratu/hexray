@@ -388,9 +388,15 @@ impl<'a> EhFrameParser<'a> {
                 eh_frame.cies.push(cie);
             } else {
                 // This is an FDE
-                // The CIE pointer is relative to the current position
+                // The CIE pointer is relative to the current position.
+                // Adversarial input can have `cie_id > offset`, which would
+                // underflow — bail out of this FDE entry and keep parsing
+                // the rest of the .eh_frame section.
                 let cie_pointer_pos = offset;
-                let cie_offset = cie_pointer_pos as u64 - cie_id;
+                let Some(cie_offset) = (cie_pointer_pos as u64).checked_sub(cie_id) else {
+                    offset = entry_end;
+                    continue;
+                };
 
                 // Find the referenced CIE
                 let cie = eh_frame.cies.iter().find(|c| c.offset == cie_offset);

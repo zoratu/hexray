@@ -2232,7 +2232,14 @@ impl PseudoCodeEmitter {
                         // RIP/EIP-relative array access - this is a global variable reference
                         // Try to resolve using the symbol table if we have a constant index
                         if let ExprKind::IntLit(idx) = &index.kind {
-                            let byte_offset = (*idx as u64) * (*element_size as u64);
+                            // saturating_mul: attacker-shaped IL can carry
+                            // an index × element_size that doesn't fit in
+                            // u64. The product is only used for symbol
+                            // lookup (no real binary places a symbol at
+                            // u64::MAX, so the lookup just misses) and
+                            // for hex rendering of the synthesised global
+                            // name below — both fine with the clamp.
+                            let byte_offset = (*idx as u64).saturating_mul(*element_size as u64);
                             // Try to find a symbol at this relative offset
                             if let Some(ref sym_table) = self.symbol_table {
                                 if let Some(name) = sym_table.get(byte_offset) {

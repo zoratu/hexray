@@ -121,14 +121,28 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     } else if next == Some('*') {
-                        // Block comment
+                        // Block comment. Walk char-by-char (not byte-by-
+                        // byte) so we don't land mid-codepoint inside a
+                        // multi-byte UTF-8 sequence — the original
+                        // `self.pos += 1` would do exactly that and then
+                        // the next `&self.input[..pos+2]` slice would
+                        // panic with a char-boundary error. The `*/`
+                        // check itself is byte-level (both bytes are
+                        // 7-bit ASCII), so it works regardless of the
+                        // surrounding UTF-8.
                         self.pos += 2;
-                        while self.pos + 1 < self.input.len() {
-                            if &self.input[self.pos..self.pos + 2] == "*/" {
+                        let bytes = self.input.as_bytes();
+                        while self.pos + 1 < bytes.len() {
+                            if bytes[self.pos] == b'*' && bytes[self.pos + 1] == b'/' {
                                 self.pos += 2;
                                 break;
                             }
-                            self.pos += 1;
+                            let step = self.input[self.pos..]
+                                .chars()
+                                .next()
+                                .map(char::len_utf8)
+                                .unwrap_or(1);
+                            self.pos += step;
                         }
                     } else {
                         break;
