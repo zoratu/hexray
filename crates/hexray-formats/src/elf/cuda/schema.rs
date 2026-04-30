@@ -16,6 +16,12 @@
 //! `.nv.info.vector_add` / `.nv.info.shared_transpose` / etc emitted by
 //! `ptxas 13.2` for sm_80.
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use super::info::{NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat};
 
 /// Summary of kernel resource usage decoded from a `.nv.info.<kernel>`

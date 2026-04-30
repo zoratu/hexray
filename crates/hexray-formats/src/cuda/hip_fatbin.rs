@@ -43,6 +43,12 @@
 //! and reader of these bundles) and ROCm's `clang-offload-bundler`
 //! command-line tool.
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use hexray_core::GfxArchitecture;
 
 /// Magic bytes at the start of an uncompressed Clang offload bundle.

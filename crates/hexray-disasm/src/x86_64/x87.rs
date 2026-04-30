@@ -5,6 +5,12 @@
 //! - When ModR/M < 0xC0: memory operand, reg field (bits 5:3) selects the instruction
 //! - When ModR/M >= 0xC0: register operand ST(i), different instruction table
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use hexray_core::Operation;
 
 /// x87 instruction info

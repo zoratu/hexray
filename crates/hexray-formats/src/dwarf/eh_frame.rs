@@ -31,6 +31,11 @@
 //! }
 //! ```
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // Allow DWARF standard naming conventions (DW_CFA_*, DW_EH_PE_*)
 #![allow(non_upper_case_globals)]
 

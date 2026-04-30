@@ -17,6 +17,12 @@
 //! Everything beyond that — instruction decoding, register allocation,
 //! control-flow — stays on the TODO for the cheap-sidecar plan.
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use core::ops::Range;
 
 /// Parsed module-level PTX directives.

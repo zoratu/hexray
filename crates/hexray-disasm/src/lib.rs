@@ -9,30 +9,33 @@
 //! - CUDA SASS (Volta+, feature-gated, in-progress)
 
 #![forbid(unsafe_code)]
-// Adversarial-input hardening — DOCUMENTED, NOT YET ENFORCED.
-// See `hexray-formats/src/lib.rs` for the full rationale. Decoders
-// walk attacker-shaped instruction streams; panics here are DoS
-// surface. The bulk-refactor migration is pending; until then PR
-// review and `scripts/run-fuzz-corpus` are the enforcement layer.
-// `unwrap_used` and `expect_used` are now ENFORCED — no remaining
-// call sites in this crate. New code must propagate errors.
+// Adversarial-input hardening — see `hexray-formats/src/lib.rs` for
+// the full rationale. Decoders walk attacker-shaped instruction
+// streams; panic / index-out-of-bounds / overflow on attacker
+// input is a DoS surface even with Rust's memory safety.
+//
+// `unwrap_used` and `expect_used` are enforced (no remaining call
+// sites). New code must propagate errors.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
-// Test code is the conventional place for `unwrap()` / `expect()` —
-// the lints would fire at every assertion-style helper otherwise.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-// `indexing_slicing`, `arithmetic_side_effects`, `panic` still
-// allowed: thousands of pre-existing call sites in instruction
-// decoders / format-header parsers do bit math and direct slice
-// indexing where bounds are checked once at the top of the parse.
-// Refactoring all of them is its own multi-day project; the
-// runtime fuzz gate (`scripts/run-fuzz-corpus`) catches regressions
-// in the interim, and reviewers should still steer new parsing
-// paths toward `.get()` / `checked_*`.
-#![allow(
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::panic
+// `indexing_slicing` and `arithmetic_side_effects` are denied at
+// the crate root. Files with bounds-checked-at-entry decoders
+// carry a file-level `#![allow]` with the `// File-level allow:`
+// audit comment. New files must either use `.get()` + `checked_*`
+// from the start, or copy that file-level allow + audit pattern.
+// `panic` stays allowed (Vec::push etc. are not adversarial vectors).
+#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+// Test code is the conventional place for `unwrap()` / `expect()`
+// and direct indexing of fixed-size buffers.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+    )
 )]
+#![allow(clippy::panic)]
 
 pub mod error;
 pub mod traits;

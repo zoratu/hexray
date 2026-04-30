@@ -9,40 +9,36 @@
 //! These parsers are built from scratch for educational purposes.
 
 #![forbid(unsafe_code)]
-// Adversarial-input hardening — DOCUMENTED, NOT YET ENFORCED.
-//
-// Per https://corrode.dev/blog/bugs-rust-wont-catch/, panic /
+// Adversarial-input hardening — per
+// https://corrode.dev/blog/bugs-rust-wont-catch/, panic /
 // index-out-of-bounds / overflow on attacker-controlled input is a
 // DoS surface even with Rust's memory safety. This crate parses
 // untrusted binaries, so every `.unwrap()`, `[idx]`, and `+`/`*`
-// without bounds checks is a fuzz-discoverable crash bug.
+// without a bounds check is a fuzz-discoverable crash bug.
 //
-// Hundreds of pre-existing call sites violate this — flipping any
-// of the lints below to `warn` or `deny` floods the build. New
-// code on parsing paths should prefer `.get()` / `checked_*` /
-// `try_into()` / `try_from()`. PR review is the enforcement
-// mechanism until the bulk refactor lands. See
-// `scripts/run-fuzz-corpus` for the runtime check that catches
-// any regression that does slip through.
-// `unwrap_used` and `expect_used` are now ENFORCED — no remaining
-// call sites in this crate. New code must propagate errors.
+// `unwrap_used` and `expect_used` are enforced (no remaining call
+// sites). New code must propagate errors.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
-// Test code is the conventional place for `unwrap()` / `expect()` —
-// the lints would fire at every assertion-style helper otherwise.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-// `indexing_slicing`, `arithmetic_side_effects`, `panic` still
-// allowed: thousands of pre-existing call sites in instruction
-// decoders / format-header parsers do bit math and direct slice
-// indexing where bounds are checked once at the top of the parse.
-// Refactoring all of them is its own multi-day project; the
-// runtime fuzz gate (`scripts/run-fuzz-corpus`) catches regressions
-// in the interim, and reviewers should still steer new parsing
-// paths toward `.get()` / `checked_*`.
-#![allow(
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::panic
+// `indexing_slicing` and `arithmetic_side_effects` are denied at
+// the crate root. Files with bounds-checked-at-entry parsing
+// patterns carry a file-level `#![allow]` with the
+// `// File-level allow:` audit comment. New files must either use
+// `.get()` + `checked_*` from the start, or copy that file-level
+// allow + audit pattern. `panic` stays allowed (Vec::push etc.
+// are not adversarial vectors here).
+#![deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+// Test code is the conventional place for `unwrap()` / `expect()`
+// and direct indexing of fixed-size buffers.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+    )
 )]
+#![allow(clippy::panic)]
 
 pub mod cuda;
 pub mod dwarf;
@@ -114,23 +110,21 @@ pub fn detect_format(data: &[u8]) -> BinaryType {
     }
 
     // Check ELF magic
-    if data[0..4] == [0x7f, b'E', b'L', b'F'] {
+    if data.get(..4) == Some(&[0x7f, b'E', b'L', b'F']) {
         return BinaryType::Elf;
     }
 
     // Check PE/DOS magic ("MZ")
-    if data[0..2] == [0x4D, 0x5A] {
-        // Verify it's actually a PE by checking for PE signature
-        if data.len() >= 64 {
-            let pe_offset = u32::from_le_bytes([data[60], data[61], data[62], data[63]]) as usize;
-            if pe_offset + 4 <= data.len() {
-                let pe_sig = u32::from_le_bytes([
-                    data[pe_offset],
-                    data[pe_offset + 1],
-                    data[pe_offset + 2],
-                    data[pe_offset + 3],
-                ]);
-                if pe_sig == 0x00004550 {
+    if data.get(..2) == Some(&[0x4D, 0x5A]) {
+        // Verify it's actually a PE by checking for PE signature.
+        // The PE-offset field lives at byte 60 of the DOS header.
+        if let Some(off_bytes) = data.get(60..64) {
+            let pe_offset = u32::from_le_bytes(off_bytes.try_into().unwrap_or_default()) as usize;
+            if let Some(sig_bytes) = pe_offset
+                .checked_add(4)
+                .and_then(|end| data.get(pe_offset..end))
+            {
+                if u32::from_le_bytes(sig_bytes.try_into().unwrap_or_default()) == 0x0000_4550 {
                     // "PE\0\0"
                     return BinaryType::Pe;
                 }
@@ -139,7 +133,10 @@ pub fn detect_format(data: &[u8]) -> BinaryType {
     }
 
     // Check Mach-O magic (both endianness)
-    let magic = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+    let Some(head) = data.get(..4) else {
+        return BinaryType::Unknown;
+    };
+    let magic = u32::from_ne_bytes(head.try_into().unwrap_or_default());
     match magic {
         0xFEEDFACE | 0xCEFAEDFE |  // 32-bit
         0xFEEDFACF | 0xCFFAEDFE |  // 64-bit

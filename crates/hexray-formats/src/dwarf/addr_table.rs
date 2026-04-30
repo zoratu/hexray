@@ -52,50 +52,80 @@ impl AddressTable {
     /// * `data` - The .debug_addr section data.
     /// * `offset` - Starting offset within the section (from DW_AT_addr_base).
     pub fn parse(data: &[u8], offset: usize) -> Result<Self, ParseError> {
-        if data.len() < offset + 4 {
-            return Err(truncated(0, 0, "address table"));
+        // Read a fixed-width little-endian integer at `pos`, advancing
+        // `pos` on success. Returns `Err(truncated)` if the slice is
+        // too short — this replaces the pattern
+        //   `if data.len() < pos+N { return Err(...) }`
+        //   `let val = u32::from_le_bytes([data[pos], data[pos+1], ...])`
+        //   `pos += N`
+        // with a single `read_le4(data, &mut pos)?` that's bounds-
+        // checked via `slice.get`. Inline so the optimizer matches the
+        // explicit version.
+        #[inline]
+        fn read_le4(data: &[u8], pos: &mut usize) -> Result<u32, ParseError> {
+            let end = pos
+                .checked_add(4)
+                .ok_or(ParseError::InvalidValue("address-table position overflow"))?;
+            let bytes = data
+                .get(*pos..end)
+                .ok_or_else(|| truncated(end, data.len(), "address table"))?;
+            let arr: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| truncated(end, data.len(), "address table"))?;
+            *pos = end;
+            Ok(u32::from_le_bytes(arr))
+        }
+        #[inline]
+        fn read_le8(data: &[u8], pos: &mut usize) -> Result<u64, ParseError> {
+            let end = pos
+                .checked_add(8)
+                .ok_or(ParseError::InvalidValue("address-table position overflow"))?;
+            let bytes = data
+                .get(*pos..end)
+                .ok_or_else(|| truncated(end, data.len(), "address table"))?;
+            let arr: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| truncated(end, data.len(), "address table"))?;
+            *pos = end;
+            Ok(u64::from_le_bytes(arr))
+        }
+        #[inline]
+        fn read_le2(data: &[u8], pos: &mut usize) -> Result<u16, ParseError> {
+            let end = pos
+                .checked_add(2)
+                .ok_or(ParseError::InvalidValue("address-table position overflow"))?;
+            let bytes = data
+                .get(*pos..end)
+                .ok_or_else(|| truncated(end, data.len(), "address table"))?;
+            let arr: [u8; 2] = bytes
+                .try_into()
+                .map_err(|_| truncated(end, data.len(), "address table"))?;
+            *pos = end;
+            Ok(u16::from_le_bytes(arr))
+        }
+        #[inline]
+        fn read_byte(data: &[u8], pos: &mut usize) -> Result<u8, ParseError> {
+            let b = data
+                .get(*pos)
+                .copied()
+                .ok_or_else(|| truncated(pos.saturating_add(1), data.len(), "address table"))?;
+            *pos = pos.saturating_add(1);
+            Ok(b)
         }
 
         let mut pos = offset;
-
-        // Parse unit length to determine 32/64-bit format
-        let initial_length =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        pos += 4;
+        let initial_length = read_le4(data, &mut pos)?;
 
         let (is_64bit, unit_length) = if initial_length == 0xffff_ffff {
-            // 64-bit DWARF
-            if data.len() < pos + 8 {
-                return Err(truncated(0, 0, "address table"));
-            }
-            let len = u64::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]);
-            pos += 8;
+            let len = read_le8(data, &mut pos)?;
             (true, len as usize)
         } else {
             (false, initial_length as usize)
         };
 
-        // Parse version (must be 5)
-        if data.len() < pos + 4 {
-            return Err(truncated(0, 0, "address table"));
-        }
-        let version = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        pos += 2;
-
-        let address_size = data[pos];
-        pos += 1;
-
-        let segment_selector_size = data[pos];
-        pos += 1;
+        let version = read_le2(data, &mut pos)?;
+        let address_size = read_byte(data, &mut pos)?;
+        let segment_selector_size = read_byte(data, &mut pos)?;
 
         if version != 5 {
             return Err(ParseError::UnsupportedVersion {
@@ -108,10 +138,11 @@ impl AddressTable {
             return Err(ParseError::InvalidValue("address size must be 4 or 8"));
         }
 
-        // Calculate how many addresses we have
-        let header_size = 4; // version (2) + address_size (1) + segment_selector_size (1)
+        // Calculate how many addresses we have. Header layout:
+        //   version(2) + address_size(1) + segment_selector_size(1) = 4 bytes
+        let header_size = 4usize;
         let body_size = unit_length.saturating_sub(header_size);
-        let entry_size = (address_size + segment_selector_size) as usize;
+        let entry_size = (address_size as usize).saturating_add(segment_selector_size as usize);
         let address_count = if entry_size > 0 {
             body_size / entry_size
         } else {
@@ -121,33 +152,19 @@ impl AddressTable {
         // Parse the addresses
         let mut addresses = Vec::with_capacity(address_count);
         for _ in 0..address_count {
-            // Skip segment selector if present
-            pos += segment_selector_size as usize;
+            // Skip segment selector if present.
+            pos = pos.saturating_add(segment_selector_size as usize);
 
             let addr = if address_size == 8 {
-                if data.len() < pos + 8 {
-                    break;
+                match read_le8(data, &mut pos) {
+                    Ok(a) => a,
+                    Err(_) => break,
                 }
-                let a = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                pos += 8;
-                a
             } else {
-                if data.len() < pos + 4 {
-                    break;
+                match read_le4(data, &mut pos) {
+                    Ok(a) => a as u64,
+                    Err(_) => break,
                 }
-                let a =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                pos += 4;
-                a as u64
             };
             addresses.push(addr);
         }

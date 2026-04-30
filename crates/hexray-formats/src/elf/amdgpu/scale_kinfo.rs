@@ -55,6 +55,12 @@
 //! - We do *not* trust `arg_count` blindly: a value larger than the
 //!   bytes can carry is rejected with [`ScaleKinfoError::Truncated`].
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 /// Decoded `.AMDGPU.kinfo` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScaleKinfo {

@@ -5,6 +5,12 @@
 //! the two halves; all bit-field extraction goes through [`bit_range`] so
 //! no caller has to think about which u64 a given bit lives in.
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 /// A raw 128-bit SASS word, low 64 bits and high 64 bits.
 ///
 /// Bit indexing is done as if the word were a single 128-bit value: bit

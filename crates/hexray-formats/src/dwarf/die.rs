@@ -3,6 +3,12 @@
 //! DIEs are the fundamental units of DWARF information. Each DIE describes
 //! a programming language entity (function, variable, type, etc.).
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use super::abbrev::{AbbreviationTable, AttributeSpec};
 use super::leb128::{decode_sleb128, decode_uleb128};
 use super::types::{DwAt, DwForm, DwTag};

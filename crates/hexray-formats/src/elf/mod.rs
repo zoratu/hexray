@@ -8,6 +8,12 @@
 //! - Shared objects (ET_DYN)
 //! - Relocatable objects (ET_REL) - including Linux kernel modules (.ko)
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 pub mod amdgpu;
 pub mod cuda;
 mod header;

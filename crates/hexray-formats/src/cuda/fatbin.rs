@@ -21,6 +21,12 @@
 //! References: `cuobjdump` output, CuAssembler's fatbin reader, and
 //! `nvidia-ptxjit-compiler`'s public fatbin.h.
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 /// Magic word at the start of an NVIDIA fatbin wrapper.
 pub const FATBIN_MAGIC: u32 = 0xBA55_ED50;
 

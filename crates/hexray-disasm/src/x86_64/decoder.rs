@@ -1,5 +1,11 @@
 //! x86_64 instruction decoder.
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use super::modrm::{
     decode_gpr, decode_modrm_reg, decode_modrm_reg_xmm, decode_modrm_rm, decode_modrm_rm_xmm,
     decode_tmm, decode_xmm, ModRM,

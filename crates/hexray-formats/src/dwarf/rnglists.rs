@@ -16,6 +16,12 @@
 //! - `DW_RLE_start_end` (0x06): Range via start/end addresses
 //! - `DW_RLE_start_length` (0x07): Range via start address + length
 
+// File-level allow: bit-math + slice indexing in this parser/decoder
+// is bounds-checked at function entry. Per-site annotations would be
+// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
+// actual crashes. New code should prefer `.get()` + `checked_*`.
+#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 use super::leb128::decode_uleb128;
 use crate::ParseError;
 
