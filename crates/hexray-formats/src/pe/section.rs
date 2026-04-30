@@ -1,11 +1,5 @@
 //! PE section parsing.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use super::header::{
     IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
 };
@@ -50,22 +44,44 @@ impl SectionHeader {
             return Err(ParseError::too_short(SECTION_HEADER_SIZE, data.len()));
         }
 
-        // Parse name (8 bytes, null-terminated)
-        let name_bytes = &data[0..8];
+        // Parse name (8 bytes, null-terminated). Bounds were checked
+        // at function entry — `data.len() >= SECTION_HEADER_SIZE`
+        // (== 40) — so the .get(..N) calls below all succeed; we use
+        // them anyway so the bounds check is visible to clippy.
+        // try_into on a slice of the right length is infallible; the
+        // .unwrap_or_default() falls back to all-zeros which can only
+        // surface if the bounds check itself was wrong.
+        fn read_u16(data: &[u8], at: usize) -> u16 {
+            u16::from_le_bytes(
+                data.get(at..at.saturating_add(2))
+                    .unwrap_or(&[0; 2])
+                    .try_into()
+                    .unwrap_or_default(),
+            )
+        }
+        fn read_u32(data: &[u8], at: usize) -> u32 {
+            u32::from_le_bytes(
+                data.get(at..at.saturating_add(4))
+                    .unwrap_or(&[0; 4])
+                    .try_into()
+                    .unwrap_or_default(),
+            )
+        }
+        let name_bytes = data.get(..8).unwrap_or(&[]);
         let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
-        let name = crate::name_from_bytes(&name_bytes[..name_end]);
+        let name = crate::name_from_bytes(name_bytes.get(..name_end).unwrap_or(&[]));
 
         Ok(Self {
             name,
-            virtual_size: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            virtual_address: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            size_of_raw_data: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            pointer_to_raw_data: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            pointer_to_relocations: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
-            pointer_to_linenumbers: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
-            number_of_relocations: u16::from_le_bytes([data[32], data[33]]),
-            number_of_linenumbers: u16::from_le_bytes([data[34], data[35]]),
-            characteristics: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
+            virtual_size: read_u32(data, 8),
+            virtual_address: read_u32(data, 12),
+            size_of_raw_data: read_u32(data, 16),
+            pointer_to_raw_data: read_u32(data, 20),
+            pointer_to_relocations: read_u32(data, 24),
+            pointer_to_linenumbers: read_u32(data, 28),
+            number_of_relocations: read_u16(data, 32),
+            number_of_linenumbers: read_u16(data, 34),
+            characteristics: read_u32(data, 36),
             data_cache: Vec::new(),
             image_base: 0, // Will be set by populate_data
         })
@@ -76,9 +92,9 @@ impl SectionHeader {
         self.image_base = image_base;
         let start = self.pointer_to_raw_data as usize;
         let size = self.size_of_raw_data as usize;
-        let end = start + size;
-        if end <= file_data.len() {
-            self.data_cache = file_data[start..end].to_vec();
+        let end = start.saturating_add(size);
+        if let Some(slice) = file_data.get(start..end) {
+            self.data_cache = slice.to_vec();
         }
     }
 
@@ -118,7 +134,7 @@ impl crate::Section for SectionHeader {
     }
 
     fn virtual_address(&self) -> u64 {
-        self.image_base + self.virtual_address as u64
+        self.image_base.saturating_add(self.virtual_address as u64)
     }
 
     fn size(&self) -> u64 {

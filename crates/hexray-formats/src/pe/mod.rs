@@ -7,12 +7,6 @@
 //! - Import and export tables
 //! - Symbol extraction from exports
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod exports;
 mod header;
 mod imports;
@@ -58,52 +52,65 @@ impl<'a> Pe<'a> {
 
         // Verify PE signature
         let pe_offset = dos_header.e_lfanew as usize;
-        if pe_offset + 4 > data.len() {
-            return Err(ParseError::too_short(pe_offset + 4, data.len()));
-        }
-
-        let pe_sig = u32::from_le_bytes([
-            data[pe_offset],
-            data[pe_offset + 1],
-            data[pe_offset + 2],
-            data[pe_offset + 3],
-        ]);
+        let pe_end = pe_offset
+            .checked_add(4)
+            .ok_or(ParseError::InvalidValue("PE offset overflow"))?;
+        let pe_sig_bytes: [u8; 4] = data
+            .get(pe_offset..pe_end)
+            .ok_or_else(|| ParseError::too_short(pe_end, data.len()))?
+            .try_into()
+            .unwrap_or_default();
+        let pe_sig = u32::from_le_bytes(pe_sig_bytes);
 
         if pe_sig != PE_SIGNATURE {
-            return Err(ParseError::invalid_magic(
-                "PE\\0\\0",
-                &data[pe_offset..pe_offset + 4],
-            ));
+            return Err(ParseError::invalid_magic("PE\\0\\0", &pe_sig_bytes));
         }
 
         // Parse COFF header
-        let coff_offset = pe_offset + 4;
-        let coff_header = CoffHeader::parse(&data[coff_offset..])?;
+        let coff_offset = pe_end;
+        let coff_chunk = data
+            .get(coff_offset..)
+            .ok_or_else(|| ParseError::too_short(coff_offset, data.len()))?;
+        let coff_header = CoffHeader::parse(coff_chunk)?;
 
-        // Parse optional header
-        let opt_offset = coff_offset + 20;
-        if opt_offset + 2 > data.len() {
-            return Err(ParseError::too_short(opt_offset + 2, data.len()));
-        }
-
-        let opt_magic = u16::from_le_bytes([data[opt_offset], data[opt_offset + 1]]);
+        // Parse optional header — COFF header is 20 bytes
+        let opt_offset = coff_offset
+            .checked_add(20)
+            .ok_or(ParseError::InvalidValue("optional header offset overflow"))?;
+        let opt_chunk = data
+            .get(opt_offset..)
+            .ok_or_else(|| ParseError::too_short(opt_offset.saturating_add(2), data.len()))?;
+        let opt_magic_bytes: [u8; 2] = opt_chunk
+            .get(..2)
+            .ok_or_else(|| ParseError::too_short(opt_offset.saturating_add(2), data.len()))?
+            .try_into()
+            .unwrap_or_default();
+        let opt_magic = u16::from_le_bytes(opt_magic_bytes);
         let optional_header = if opt_magic == PE32PLUS_MAGIC {
-            OptionalHeader::parse_pe32plus(&data[opt_offset..])?
+            OptionalHeader::parse_pe32plus(opt_chunk)?
         } else {
-            OptionalHeader::parse_pe32(&data[opt_offset..])?
+            OptionalHeader::parse_pe32(opt_chunk)?
         };
 
         // Parse section headers
-        let sections_offset = opt_offset + coff_header.size_of_optional_header as usize;
+        let sections_offset =
+            opt_offset.saturating_add(coff_header.size_of_optional_header as usize);
         let mut sections = Vec::with_capacity(coff_header.number_of_sections as usize);
         let image_base = optional_header.image_base;
 
         for i in 0..coff_header.number_of_sections as usize {
-            let sec_offset = sections_offset + i * section::SECTION_HEADER_SIZE;
-            if sec_offset + section::SECTION_HEADER_SIZE > data.len() {
+            let Some(sec_offset) =
+                sections_offset.checked_add(i.saturating_mul(section::SECTION_HEADER_SIZE))
+            else {
                 break;
-            }
-            let mut section = SectionHeader::parse(&data[sec_offset..])?;
+            };
+            let Some(sec_end) = sec_offset.checked_add(section::SECTION_HEADER_SIZE) else {
+                break;
+            };
+            let Some(sec_chunk) = data.get(sec_offset..sec_end) else {
+                break;
+            };
+            let mut section = SectionHeader::parse(sec_chunk)?;
             section.populate_data(data, image_base);
             sections.push(section);
         }
@@ -151,7 +158,7 @@ impl<'a> Pe<'a> {
                 } else {
                     e.name.clone()
                 },
-                address: image_base + e.rva as u64,
+                address: image_base.saturating_add(e.rva as u64),
                 size: 0,
                 kind: SymbolKind::Function,
                 binding: SymbolBinding::Global,
@@ -190,10 +197,15 @@ impl<'a> Pe<'a> {
     pub fn rva_to_offset(&self, rva: u32) -> Option<usize> {
         for section in &self.sections {
             let section_start = section.virtual_address;
-            let section_end = section_start + section.virtual_size.max(section.size_of_raw_data);
+            let section_end =
+                section_start.saturating_add(section.virtual_size.max(section.size_of_raw_data));
             if rva >= section_start && rva < section_end {
-                let offset_in_section = rva - section_start;
-                return Some((section.pointer_to_raw_data + offset_in_section) as usize);
+                let offset_in_section = rva.saturating_sub(section_start);
+                return Some(
+                    section
+                        .pointer_to_raw_data
+                        .saturating_add(offset_in_section) as usize,
+                );
             }
         }
         None
@@ -204,7 +216,7 @@ impl<'a> Pe<'a> {
         if va < self.optional_header.image_base {
             return None;
         }
-        let rva = (va - self.optional_header.image_base) as u32;
+        let rva = va.saturating_sub(self.optional_header.image_base) as u32;
         self.rva_to_offset(rva)
     }
 }
@@ -237,7 +249,7 @@ impl BinaryFormat for Pe<'_> {
         if rva == 0 {
             None
         } else {
-            Some(self.optional_header.image_base + rva as u64)
+            Some(self.optional_header.image_base.saturating_add(rva as u64))
         }
     }
 
@@ -264,26 +276,22 @@ impl BinaryFormat for Pe<'_> {
 
     fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
         let offset = self.va_to_offset(addr)?;
-        if offset >= self.data.len() {
-            return None;
-        }
-        // Return what's available, up to the requested length
-        let available = self.data.len() - offset;
+        let available = self.data.len().checked_sub(offset)?;
         let actual_len = len.min(available);
-        Some(&self.data[offset..offset + actual_len])
+        let end = offset.checked_add(actual_len)?;
+        self.data.get(offset..end)
     }
 
     fn section_containing(&self, addr: u64) -> Option<&dyn Section> {
         let rva = if addr >= self.optional_header.image_base {
-            (addr - self.optional_header.image_base) as u32
+            addr.saturating_sub(self.optional_header.image_base) as u32
         } else {
             return None;
         };
 
         for section in &self.sections {
-            if rva >= section.virtual_address
-                && rva < section.virtual_address + section.virtual_size
-            {
+            let section_end = section.virtual_address.saturating_add(section.virtual_size);
+            if rva >= section.virtual_address && rva < section_end {
                 return Some(section as &dyn Section);
             }
         }
