@@ -1,10 +1,5 @@
 //! x86 prefix parsing.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![allow(dead_code)]
 
 /// Legacy prefixes that can appear before an instruction.
@@ -306,9 +301,7 @@ impl Prefixes {
         let mut prefixes = Self::default();
         let mut offset = 0;
 
-        while offset < bytes.len() {
-            let byte = bytes[offset];
-
+        while let Some(&byte) = bytes.get(offset) {
             match byte {
                 // Group 1: LOCK and repeat
                 0xF0 => prefixes.lock = true,
@@ -332,62 +325,57 @@ impl Prefixes {
                 // REX prefix (0x40-0x4F in 64-bit mode)
                 0x40..=0x4F => {
                     prefixes.rex = Some(Rex::from_byte(byte));
-                    offset += 1;
+                    offset = offset.saturating_add(1);
                     // REX must be the last prefix
                     break;
                 }
 
                 // 2-byte VEX prefix (0xC5)
                 0xC5 => {
-                    if offset + 1 < bytes.len() {
-                        // In 64-bit mode, 0xC5 is always VEX
-                        // In 32-bit mode, check ModR/M (bits 7:6 != 11)
-                        prefixes.vex = Some(Vex::from_2byte(bytes[offset + 1]));
-                        offset += 2;
-                        break;
-                    } else {
-                        break; // Not enough bytes for VEX
+                    if let Some(&b1) = bytes.get(offset.saturating_add(1)) {
+                        // In 64-bit mode, 0xC5 is always VEX.
+                        prefixes.vex = Some(Vex::from_2byte(b1));
+                        offset = offset.saturating_add(2);
                     }
+                    break;
                 }
 
                 // 3-byte VEX prefix (0xC4)
                 0xC4 => {
-                    if offset + 2 < bytes.len() {
-                        // In 64-bit mode, 0xC4 is always VEX
-                        prefixes.vex = Some(Vex::from_3byte(bytes[offset + 1], bytes[offset + 2]));
-                        offset += 3;
-                        break;
-                    } else {
-                        break; // Not enough bytes for VEX
+                    if let (Some(&b1), Some(&b2)) = (
+                        bytes.get(offset.saturating_add(1)),
+                        bytes.get(offset.saturating_add(2)),
+                    ) {
+                        prefixes.vex = Some(Vex::from_3byte(b1, b2));
+                        offset = offset.saturating_add(3);
                     }
+                    break;
                 }
 
                 // 4-byte EVEX prefix (0x62)
                 0x62 => {
-                    if offset + 3 < bytes.len() {
-                        // Check if this is a valid EVEX prefix
-                        // In 64-bit mode, 0x62 is always EVEX
-                        // In 32-bit mode, EVEX.P0 bits 3-2 must be 0 (not BOUND)
-                        let p0 = bytes[offset + 1];
-                        let p1 = bytes[offset + 2];
-                        let p2 = bytes[offset + 3];
-
+                    // In 64-bit mode, 0x62 is always EVEX.
+                    // In 32-bit mode, EVEX.P0 bits 3-2 must be 0 (not BOUND).
+                    if let (Some(&p0), Some(&p1), Some(&p2)) = (
+                        bytes.get(offset.saturating_add(1)),
+                        bytes.get(offset.saturating_add(2)),
+                        bytes.get(offset.saturating_add(3)),
+                    ) {
                         // Validate EVEX format: P0 bits 3-2 must be 00
-                        // and P1 bit 2 (U) must be 1
+                        // and P1 bit 2 (U) must be 1.
                         if (p0 & 0x0C) == 0 && (p1 & 0x04) != 0 {
                             prefixes.evex = Some(Evex::from_bytes(p0, p1, p2));
-                            offset += 4;
-                            break;
+                            offset = offset.saturating_add(4);
                         }
                     }
-                    break; // Not enough bytes or invalid EVEX
+                    break;
                 }
 
                 // Not a prefix
                 _ => break,
             }
 
-            offset += 1;
+            offset = offset.saturating_add(1);
         }
 
         (prefixes, offset)

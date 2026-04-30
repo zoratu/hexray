@@ -9,12 +9,6 @@
 //! - D: Double-precision floating-point
 //! - V: Vector operations
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::{DecodeError, DecodedInstruction, Disassembler};
 use hexray_core::{
     Architecture, Condition, ControlFlow, Instruction, MemoryRef, Operand, Operation, Register,
@@ -103,9 +97,15 @@ impl RiscVDisassembler {
     /// Decode a single instruction.
     fn decode(&self, bytes: &[u8], address: u64) -> Result<DecodedInstruction, DecodeError> {
         // Check for compressed instruction (bits 1:0 != 11)
-        if bytes.len() >= 2 && bytes[0] & 0x3 != 0x3 {
+        if bytes.first().is_some_and(|b| b & 0x3 != 0x3) && bytes.len() >= 2 {
             // Compressed instruction (16-bit)
-            let insn = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let insn = u16::from_le_bytes(
+                bytes
+                    .get(..2)
+                    .unwrap_or(&[0; 2])
+                    .try_into()
+                    .unwrap_or_default(),
+            );
             return self.decode_compressed(insn, address);
         }
 
@@ -114,8 +114,14 @@ impl RiscVDisassembler {
         }
 
         // Standard 32-bit instruction
-        let insn = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let raw_bytes = bytes[0..4].to_vec();
+        let insn = u32::from_le_bytes(
+            bytes
+                .get(..4)
+                .unwrap_or(&[0; 4])
+                .try_into()
+                .unwrap_or_default(),
+        );
+        let raw_bytes = bytes.get(..4).unwrap_or(&[]).to_vec();
 
         let opcode = insn & 0x7F;
 
@@ -264,7 +270,7 @@ impl RiscVDisassembler {
     ) -> Result<DecodedInstruction, DecodeError> {
         let rd = Self::rd(insn);
         let imm = Self::imm_u(insn);
-        let target = (address as i64 + imm as i64) as u64;
+        let target = (address as i64).wrapping_add(imm as i64) as u64;
 
         let inst = Instruction::new(address, 4, bytes, "auipc")
             .with_operation(Operation::LoadEffectiveAddress)
@@ -288,7 +294,7 @@ impl RiscVDisassembler {
     ) -> Result<DecodedInstruction, DecodeError> {
         let rd = Self::rd(insn);
         let imm = Self::imm_j(insn);
-        let target = (address as i64 + imm as i64) as u64;
+        let target = (address as i64).wrapping_add(imm as i64) as u64;
 
         // JAL with rd=x0 is just a jump (J pseudo-instruction)
         // JAL with rd=x1 or other is a call
@@ -304,7 +310,7 @@ impl RiscVDisassembler {
                 Operation::Call,
                 ControlFlow::Call {
                     target,
-                    return_addr: address + 4,
+                    return_addr: address.wrapping_add(4),
                 },
             )
         };
@@ -364,7 +370,7 @@ impl RiscVDisassembler {
                 "jalr",
                 Operation::Call,
                 ControlFlow::IndirectCall {
-                    return_addr: address + 4,
+                    return_addr: address.wrapping_add(4),
                 },
                 vec![Operand::reg(self.gpr(rd)), Operand::reg(self.gpr(rs1))],
             )
@@ -382,7 +388,7 @@ impl RiscVDisassembler {
                 "jalr",
                 Operation::Call,
                 ControlFlow::IndirectCall {
-                    return_addr: address + 4,
+                    return_addr: address.wrapping_add(4),
                 },
                 ops,
             )
@@ -410,7 +416,7 @@ impl RiscVDisassembler {
         let rs2 = Self::rs2(insn);
         let imm = Self::imm_b(insn);
         let funct3 = Self::funct3(insn);
-        let target = (address as i64 + imm as i64) as u64;
+        let target = (address as i64).wrapping_add(imm as i64) as u64;
 
         let (mnemonic, condition) = match funct3 {
             0b000 => ("beq", Condition::Equal),
@@ -506,7 +512,7 @@ impl RiscVDisassembler {
             .with_control_flow(ControlFlow::ConditionalBranch {
                 target,
                 condition,
-                fallthrough: address + 4,
+                fallthrough: address.wrapping_add(4),
             });
 
         Ok(DecodedInstruction {
@@ -1162,7 +1168,7 @@ impl RiscVDisassembler {
 
     /// Get compressed register (3-bit encoding maps to x8-x15).
     fn c_reg(&self, id: u16) -> Register {
-        self.gpr(id + 8)
+        self.gpr(id.wrapping_add(8))
     }
 
     /// Decode quadrant 0 (C0) instructions.
@@ -1407,14 +1413,14 @@ impl RiscVDisassembler {
                 } else {
                     // C.JAL (RV32): jal x1, offset
                     let offset = self.decode_c_j_imm(insn);
-                    let target = (address as i64 + offset as i64) as u64;
+                    let target = (address as i64).wrapping_add(offset as i64) as u64;
 
                     let inst = Instruction::new(address, 2, bytes, "c.jal")
                         .with_operation(Operation::Call)
                         .with_operands(vec![Operand::pc_rel(offset as i64, target)])
                         .with_control_flow(ControlFlow::Call {
                             target,
-                            return_addr: address + 2,
+                            return_addr: address.wrapping_add(2),
                         });
                     Ok(DecodedInstruction {
                         instruction: inst,
@@ -1599,7 +1605,7 @@ impl RiscVDisassembler {
             0b101 => {
                 // C.J: jal x0, offset
                 let offset = self.decode_c_j_imm(insn);
-                let target = (address as i64 + offset as i64) as u64;
+                let target = (address as i64).wrapping_add(offset as i64) as u64;
 
                 let inst = Instruction::new(address, 2, bytes, "c.j")
                     .with_operation(Operation::Jump)
@@ -1614,7 +1620,7 @@ impl RiscVDisassembler {
                 // C.BEQZ: beq rs1', x0, offset
                 let rs1 = self.c_reg((insn >> 7) & 0x7);
                 let offset = self.decode_c_b_imm(insn);
-                let target = (address as i64 + offset as i64) as u64;
+                let target = (address as i64).wrapping_add(offset as i64) as u64;
 
                 let inst = Instruction::new(address, 2, bytes, "c.beqz")
                     .with_operation(Operation::ConditionalJump)
@@ -1625,7 +1631,7 @@ impl RiscVDisassembler {
                     .with_control_flow(ControlFlow::ConditionalBranch {
                         target,
                         condition: Condition::Equal,
-                        fallthrough: address + 2,
+                        fallthrough: address.wrapping_add(2),
                     });
                 Ok(DecodedInstruction {
                     instruction: inst,
@@ -1636,7 +1642,7 @@ impl RiscVDisassembler {
                 // C.BNEZ: bne rs1', x0, offset
                 let rs1 = self.c_reg((insn >> 7) & 0x7);
                 let offset = self.decode_c_b_imm(insn);
-                let target = (address as i64 + offset as i64) as u64;
+                let target = (address as i64).wrapping_add(offset as i64) as u64;
 
                 let inst = Instruction::new(address, 2, bytes, "c.bnez")
                     .with_operation(Operation::ConditionalJump)
@@ -1647,7 +1653,7 @@ impl RiscVDisassembler {
                     .with_control_flow(ControlFlow::ConditionalBranch {
                         target,
                         condition: Condition::NotEqual,
-                        fallthrough: address + 2,
+                        fallthrough: address.wrapping_add(2),
                     });
                 Ok(DecodedInstruction {
                     instruction: inst,
@@ -1818,7 +1824,7 @@ impl RiscVDisassembler {
                             .with_operation(Operation::Call)
                             .with_operands(vec![Operand::reg(self.gpr(rd))])
                             .with_control_flow(ControlFlow::IndirectCall {
-                                return_addr: address + 2,
+                                return_addr: address.wrapping_add(2),
                             });
                         Ok(DecodedInstruction {
                             instruction: inst,
@@ -1829,7 +1835,7 @@ impl RiscVDisassembler {
                             .with_operation(Operation::Call)
                             .with_operands(vec![Operand::reg(self.gpr(rd))])
                             .with_control_flow(ControlFlow::IndirectCall {
-                                return_addr: address + 2,
+                                return_addr: address.wrapping_add(2),
                             });
                         Ok(DecodedInstruction {
                             instruction: inst,

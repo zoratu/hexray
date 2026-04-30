@@ -1,11 +1,5 @@
 //! ModR/M and SIB byte decoding.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use super::prefix::{Evex, Prefixes, Rex};
 use hexray_core::{
     register::{x86, RegisterClass},
@@ -114,9 +108,9 @@ pub fn decode_gpr(reg: u8, size: u16) -> Register {
 pub fn decode_xmm(reg: u8, size: u16) -> Register {
     // For extended registers (16-31), use the XMM16 base
     let reg_id = if reg >= 16 {
-        x86::XMM16 + (reg - 16) as u16
+        x86::XMM16.wrapping_add(reg.wrapping_sub(16) as u16)
     } else {
-        x86::XMM0 + reg as u16
+        x86::XMM0.wrapping_add(reg as u16)
     };
 
     let class = match size {
@@ -133,7 +127,7 @@ pub fn decode_opmask(reg: u8) -> Register {
     Register::new(
         Architecture::X86_64,
         RegisterClass::Other,
-        x86::K0 + (reg & 0x7) as u16,
+        x86::K0.wrapping_add((reg & 0x7) as u16),
         64, // opmask registers are 64-bit
     )
 }
@@ -143,7 +137,7 @@ pub fn decode_tmm(reg: u8) -> Register {
     Register::new(
         Architecture::X86_64,
         RegisterClass::Tile,
-        x86::TMM0 + (reg & 0x7) as u16,
+        x86::TMM0.wrapping_add((reg & 0x7) as u16),
         0, // tile size is configuration-dependent
     )
 }
@@ -166,7 +160,7 @@ pub fn decode_modrm_rm(
     prefixes: &Prefixes,
     operand_size: u16,
 ) -> Option<(Operand, usize)> {
-    let mut offset = 0;
+    let mut offset: usize = 0;
 
     // Register operand
     if modrm.is_register() {
@@ -185,8 +179,8 @@ pub fn decode_modrm_rm(
         if bytes.is_empty() {
             return None;
         }
-        let sib = Sib::parse(bytes[0], prefixes.rex);
-        offset += 1;
+        let sib = Sib::parse(*bytes.first()?, prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Index register (RSP encoding means no index)
         if (sib.index & 0x7) != 0x4 {
@@ -204,16 +198,10 @@ pub fn decode_modrm_rm(
         }
     } else if (modrm.rm & 0x7) == 0x5 && modrm.mod_ == 0b00 {
         // RIP-relative addressing
-        if bytes.len() < offset + 4 {
-            return None;
-        }
-        let disp = i32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]);
-        offset += 4;
+        let end = offset.checked_add(4)?;
+        let chunk = bytes.get(offset..end)?;
+        let disp = i32::from_le_bytes(chunk.try_into().unwrap_or_default());
+        offset = end;
         // RIP-relative - we'll handle this specially
         base = Some(Register::new(
             Architecture::X86_64,
@@ -245,23 +233,15 @@ pub fn decode_modrm_rm(
     // Read displacement
     // disp32 is needed for: mod=10, or mod=00 with rm=5 (RIP-relative), or SIB with base=5 and mod=00
     if modrm.has_disp32() || sib_disp32 {
-        if bytes.len() < offset + 4 {
-            return None;
-        }
-        let disp = i32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]);
+        let end = offset.checked_add(4)?;
+        let chunk = bytes.get(offset..end)?;
+        let disp = i32::from_le_bytes(chunk.try_into().unwrap_or_default());
         displacement = disp as i64;
-        offset += 4;
+        offset = end;
     } else if modrm.has_disp8() {
-        if bytes.len() < offset + 1 {
-            return None;
-        }
-        displacement = bytes[offset] as i8 as i64;
-        offset += 1;
+        let &b = bytes.get(offset)?;
+        displacement = b as i8 as i64;
+        offset = offset.saturating_add(1);
     }
 
     Some((
