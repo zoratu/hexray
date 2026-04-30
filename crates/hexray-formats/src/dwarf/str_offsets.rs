@@ -1,4 +1,3 @@
-//! DWARF5 .debug_str_offsets section support.
 //!
 //! The .debug_str_offsets section contains a table of offsets into .debug_str,
 //! allowing indirect string references via indices. This is a DWARF5 feature
@@ -18,12 +17,6 @@
 //!   ...
 //! ```
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::ParseError;
 
 /// Helper to create a truncated data error.
@@ -33,6 +26,53 @@ fn truncated(expected: usize, actual: usize, context: &'static str) -> ParseErro
         actual,
         context,
     }
+}
+
+/// Read a fixed-width little-endian integer at `pos`, advancing `pos`
+/// on success. Mirrors the helpers used in `addr_table.rs`.
+#[inline]
+fn read_le2(data: &[u8], pos: &mut usize) -> Result<u16, ParseError> {
+    let end = pos
+        .checked_add(2)
+        .ok_or(ParseError::InvalidValue("string-offsets position overflow"))?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| truncated(end, data.len(), "string offsets header"))?;
+    let arr: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| truncated(end, data.len(), "string offsets header"))?;
+    *pos = end;
+    Ok(u16::from_le_bytes(arr))
+}
+
+#[inline]
+fn read_le4(data: &[u8], pos: &mut usize) -> Result<u32, ParseError> {
+    let end = pos
+        .checked_add(4)
+        .ok_or(ParseError::InvalidValue("string-offsets position overflow"))?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| truncated(end, data.len(), "string offsets header"))?;
+    let arr: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| truncated(end, data.len(), "string offsets header"))?;
+    *pos = end;
+    Ok(u32::from_le_bytes(arr))
+}
+
+#[inline]
+fn read_le8(data: &[u8], pos: &mut usize) -> Result<u64, ParseError> {
+    let end = pos
+        .checked_add(8)
+        .ok_or(ParseError::InvalidValue("string-offsets position overflow"))?;
+    let bytes = data
+        .get(*pos..end)
+        .ok_or_else(|| truncated(end, data.len(), "string offsets header"))?;
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| truncated(end, data.len(), "string offsets header"))?;
+    *pos = end;
+    Ok(u64::from_le_bytes(arr))
 }
 
 /// Parsed string offsets table from .debug_str_offsets section.
@@ -53,46 +93,20 @@ impl StringOffsetsTable {
     /// * `data` - The .debug_str_offsets section data.
     /// * `offset` - Starting offset within the section (from DW_AT_str_offsets_base).
     pub fn parse(data: &[u8], offset: usize) -> Result<Self, ParseError> {
-        if data.len() < offset + 4 {
-            return Err(truncated(offset + 4, data.len(), "string offsets header"));
-        }
-
         let mut pos = offset;
-
-        // Parse unit length to determine 32/64-bit format
-        let initial_length =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-        pos += 4;
+        let initial_length = read_le4(data, &mut pos)?;
 
         let (is_64bit, unit_length) = if initial_length == 0xffff_ffff {
             // 64-bit DWARF
-            if data.len() < pos + 8 {
-                return Err(truncated(offset + 4, data.len(), "string offsets header"));
-            }
-            let len = u64::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]);
-            pos += 8;
+            let len = read_le8(data, &mut pos)?;
             (true, len as usize)
         } else {
             (false, initial_length as usize)
         };
 
-        // Parse version (must be 5)
-        if data.len() < pos + 4 {
-            return Err(truncated(offset + 4, data.len(), "string offsets header"));
-        }
-        let version = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        pos += 2;
-        // Skip padding
-        pos += 2;
+        // Parse version (must be 5) and skip 2 bytes of padding
+        let version = read_le2(data, &mut pos)?;
+        let _padding = read_le2(data, &mut pos)?;
 
         if version != 5 {
             return Err(ParseError::UnsupportedVersion {
@@ -102,38 +116,25 @@ impl StringOffsetsTable {
         }
 
         // Calculate how many offsets we have
-        let offset_size = if is_64bit { 8 } else { 4 };
+        let offset_size = if is_64bit { 8usize } else { 4 };
         let body_size = unit_length.saturating_sub(4); // Subtract version + padding
-        let offset_count = body_size / offset_size;
+        let offset_count = body_size.checked_div(offset_size).unwrap_or(0);
 
         // Parse the offsets
         let mut offsets = Vec::with_capacity(offset_count);
         for _ in 0..offset_count {
-            if is_64bit {
-                if data.len() < pos + 8 {
-                    break;
+            let next = if is_64bit {
+                match read_le8(data, &mut pos) {
+                    Ok(v) => v,
+                    Err(_) => break,
                 }
-                let off = u64::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                    data[pos + 5],
-                    data[pos + 6],
-                    data[pos + 7],
-                ]);
-                offsets.push(off);
-                pos += 8;
             } else {
-                if data.len() < pos + 4 {
-                    break;
+                match read_le4(data, &mut pos) {
+                    Ok(v) => v as u64,
+                    Err(_) => break,
                 }
-                let off =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-                offsets.push(off as u64);
-                pos += 4;
-            }
+            };
+            offsets.push(next);
         }
 
         Ok(Self {
@@ -167,12 +168,9 @@ impl StringOffsetsTable {
 
 /// Read a null-terminated string from a byte slice.
 fn read_null_terminated_str(data: &[u8], offset: usize) -> Option<&str> {
-    if offset >= data.len() {
-        return None;
-    }
-    let bytes = &data[offset..];
+    let bytes = data.get(offset..)?;
     let end = bytes.iter().position(|&b| b == 0)?;
-    std::str::from_utf8(&bytes[..end]).ok()
+    std::str::from_utf8(bytes.get(..end)?).ok()
 }
 
 #[cfg(test)]
