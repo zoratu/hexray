@@ -1,15 +1,42 @@
-//! PE import table parsing.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::ParseError;
 
 /// Import directory entry size
 pub const IMPORT_DESCRIPTOR_SIZE: usize = 20;
+
+// Bounds-checked little-endian readers (caller has already verified
+// the buffer length at function entry).
+#[inline]
+fn read_u16(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
 
 /// Import directory entry
 #[derive(Debug, Clone)]
@@ -34,11 +61,11 @@ impl ImportDescriptor {
         }
 
         Ok(Self {
-            original_first_thunk: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            time_date_stamp: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            forwarder_chain: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            name_rva: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            first_thunk: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
+            original_first_thunk: read_u32(data, 0),
+            time_date_stamp: read_u32(data, 4),
+            forwarder_chain: read_u32(data, 8),
+            name_rva: read_u32(data, 12),
+            first_thunk: read_u32(data, 16),
         })
     }
 
@@ -81,11 +108,14 @@ pub fn parse_imports(
     // Parse import descriptors
     let mut desc_offset = import_offset;
     loop {
-        if desc_offset + IMPORT_DESCRIPTOR_SIZE > data.len() {
+        let Some(desc_end) = desc_offset.checked_add(IMPORT_DESCRIPTOR_SIZE) else {
             break;
-        }
+        };
+        let Some(desc_slice) = data.get(desc_offset..desc_end) else {
+            break;
+        };
 
-        let Ok(desc) = ImportDescriptor::parse(&data[desc_offset..]) else {
+        let Ok(desc) = ImportDescriptor::parse(desc_slice) else {
             break;
         };
 
@@ -108,33 +138,22 @@ pub fn parse_imports(
         };
 
         if let Some(ilt_offset) = rva_to_offset(ilt_rva, sections) {
-            let entry_size = if is_64bit { 8 } else { 4 };
+            let entry_size: usize = if is_64bit { 8 } else { 4 };
             let mut entry_offset = ilt_offset;
             let mut iat_rva = desc.first_thunk;
 
             loop {
-                if entry_offset + entry_size > data.len() {
+                let Some(entry_end) = entry_offset.checked_add(entry_size) else {
+                    break;
+                };
+                if entry_end > data.len() {
                     break;
                 }
 
                 let entry = if is_64bit {
-                    u64::from_le_bytes([
-                        data[entry_offset],
-                        data[entry_offset + 1],
-                        data[entry_offset + 2],
-                        data[entry_offset + 3],
-                        data[entry_offset + 4],
-                        data[entry_offset + 5],
-                        data[entry_offset + 6],
-                        data[entry_offset + 7],
-                    ])
+                    read_u64(data, entry_offset)
                 } else {
-                    u32::from_le_bytes([
-                        data[entry_offset],
-                        data[entry_offset + 1],
-                        data[entry_offset + 2],
-                        data[entry_offset + 3],
-                    ]) as u64
+                    read_u32(data, entry_offset) as u64
                 };
 
                 if entry == 0 {
@@ -149,17 +168,18 @@ pub fn parse_imports(
                 } else {
                     // Import by name - entry is RVA to hint/name
                     let hint_name_rva = entry as u32;
-                    if let Some(hn_offset) = rva_to_offset(hint_name_rva, sections) {
-                        if hn_offset + 2 < data.len() {
-                            let hint = u16::from_le_bytes([data[hn_offset], data[hn_offset + 1]]);
-                            let name = read_cstring(data, hn_offset + 2);
-                            (name, None, hint)
-                        } else {
-                            (String::new(), None, 0)
-                        }
-                    } else {
-                        (String::new(), None, 0)
-                    }
+                    rva_to_offset(hint_name_rva, sections)
+                        .and_then(|hn_offset| {
+                            let hn_after_hint = hn_offset.checked_add(2)?;
+                            if hn_after_hint <= data.len() {
+                                let hint = read_u16(data, hn_offset);
+                                let name = read_cstring(data, hn_after_hint);
+                                Some((name, None, hint))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or((String::new(), None, 0))
                 };
 
                 imports.push(Import {
@@ -170,12 +190,12 @@ pub fn parse_imports(
                     iat_rva,
                 });
 
-                entry_offset += entry_size;
-                iat_rva += entry_size as u32;
+                entry_offset = entry_end;
+                iat_rva = iat_rva.saturating_add(entry_size as u32);
             }
         }
 
-        desc_offset += IMPORT_DESCRIPTOR_SIZE;
+        desc_offset = desc_end;
     }
 
     imports
@@ -185,10 +205,15 @@ pub fn parse_imports(
 fn rva_to_offset(rva: u32, sections: &[super::section::SectionHeader]) -> Option<usize> {
     for section in sections {
         let section_start = section.virtual_address;
-        let section_end = section_start + section.virtual_size.max(section.size_of_raw_data);
+        let section_end =
+            section_start.saturating_add(section.virtual_size.max(section.size_of_raw_data));
         if rva >= section_start && rva < section_end {
-            let offset_in_section = rva - section_start;
-            return Some((section.pointer_to_raw_data + offset_in_section) as usize);
+            let offset_in_section = rva.saturating_sub(section_start);
+            return Some(
+                section
+                    .pointer_to_raw_data
+                    .saturating_add(offset_in_section) as usize,
+            );
         }
     }
     None
@@ -196,13 +221,12 @@ fn rva_to_offset(rva: u32, sections: &[super::section::SectionHeader]) -> Option
 
 /// Read a null-terminated C string from data.
 fn read_cstring(data: &[u8], offset: usize) -> String {
-    if offset >= data.len() {
+    let Some(bytes) = data.get(offset..) else {
         return String::new();
-    }
-    let bytes = &data[offset..];
+    };
     let end = bytes
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(bytes.len().min(256));
-    crate::name_from_bytes(&bytes[..end])
+    crate::name_from_bytes(bytes.get(..end).unwrap_or(&[]))
 }

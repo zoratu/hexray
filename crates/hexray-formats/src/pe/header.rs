@@ -1,10 +1,3 @@
-//! PE header parsing.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![allow(dead_code)]
 
 use crate::ParseError;
@@ -41,6 +34,48 @@ pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
 pub const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
 pub const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
 
+// Bounds-checked little-endian readers. Callers verify the buffer length
+// at function entry; these helpers return `0` on out-of-range access so
+// clippy's `indexing_slicing`/`arithmetic_side_effects` lints don't fire
+// at every read site without sacrificing the panic-free guarantee.
+#[inline]
+fn read_u8(data: &[u8], at: usize) -> u8 {
+    data.get(at).copied().unwrap_or(0)
+}
+
+#[inline]
+fn read_u16(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
+
 /// DOS Header (64 bytes)
 #[derive(Debug, Clone)]
 pub struct DosHeader {
@@ -57,12 +92,15 @@ impl DosHeader {
             return Err(ParseError::too_short(64, data.len()));
         }
 
-        let e_magic = u16::from_le_bytes([data[0], data[1]]);
+        let e_magic = read_u16(data, 0);
         if e_magic != DOS_MAGIC {
-            return Err(ParseError::invalid_magic("MZ", &data[0..2]));
+            return Err(ParseError::invalid_magic(
+                "MZ",
+                data.get(0..2).unwrap_or(&[]),
+            ));
         }
 
-        let e_lfanew = u32::from_le_bytes([data[60], data[61], data[62], data[63]]);
+        let e_lfanew = read_u32(data, 60);
 
         Ok(Self { e_magic, e_lfanew })
     }
@@ -95,13 +133,13 @@ impl CoffHeader {
         }
 
         Ok(Self {
-            machine: u16::from_le_bytes([data[0], data[1]]),
-            number_of_sections: u16::from_le_bytes([data[2], data[3]]),
-            time_date_stamp: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            pointer_to_symbol_table: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            number_of_symbols: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-            size_of_optional_header: u16::from_le_bytes([data[16], data[17]]),
-            characteristics: u16::from_le_bytes([data[18], data[19]]),
+            machine: read_u16(data, 0),
+            number_of_sections: read_u16(data, 2),
+            time_date_stamp: read_u32(data, 4),
+            pointer_to_symbol_table: read_u32(data, 8),
+            number_of_symbols: read_u32(data, 12),
+            size_of_optional_header: read_u16(data, 16),
+            characteristics: read_u16(data, 18),
         })
     }
 
@@ -136,8 +174,8 @@ impl DataDirectory {
             return Err(ParseError::too_short(8, data.len()));
         }
         Ok(Self {
-            virtual_address: u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            size: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+            virtual_address: read_u32(data, 0),
+            size: read_u32(data, 4),
         })
     }
 }
@@ -224,56 +262,58 @@ impl OptionalHeader {
             return Err(ParseError::too_short(96, data.len()));
         }
 
-        let magic = u16::from_le_bytes([data[0], data[1]]);
+        let magic = read_u16(data, 0);
         if magic != PE32_MAGIC {
-            return Err(ParseError::invalid_magic("PE32 (0x10b)", &data[0..2]));
+            return Err(ParseError::invalid_magic(
+                "PE32 (0x10b)",
+                data.get(0..2).unwrap_or(&[]),
+            ));
         }
 
-        let number_of_rva_and_sizes = u32::from_le_bytes([data[92], data[93], data[94], data[95]]);
+        let number_of_rva_and_sizes = read_u32(data, 92);
         let num_dirs = number_of_rva_and_sizes.min(16) as usize;
 
         let mut data_directories = Vec::with_capacity(num_dirs);
-        let dir_offset = 96;
+        let dir_offset: usize = 96;
         for i in 0..num_dirs {
-            let offset = dir_offset + i * 8;
-            if offset + 8 <= data.len() {
-                data_directories.push(DataDirectory::parse(&data[offset..])?);
+            let Some(offset) = dir_offset.checked_add(i.saturating_mul(8)) else {
+                break;
+            };
+            let Some(end) = offset.checked_add(8) else {
+                break;
+            };
+            if let Some(slice) = data.get(offset..end) {
+                data_directories.push(DataDirectory::parse(slice)?);
             }
         }
 
         Ok(Self {
             magic,
-            major_linker_version: data[2],
-            minor_linker_version: data[3],
-            size_of_code: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            size_of_initialized_data: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            size_of_uninitialized_data: u32::from_le_bytes([
-                data[12], data[13], data[14], data[15],
-            ]),
-            address_of_entry_point: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            base_of_code: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            image_base: u32::from_le_bytes([data[28], data[29], data[30], data[31]]) as u64,
-            section_alignment: u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
-            file_alignment: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
-            major_operating_system_version: u16::from_le_bytes([data[40], data[41]]),
-            minor_operating_system_version: u16::from_le_bytes([data[42], data[43]]),
-            major_image_version: u16::from_le_bytes([data[44], data[45]]),
-            minor_image_version: u16::from_le_bytes([data[46], data[47]]),
-            major_subsystem_version: u16::from_le_bytes([data[48], data[49]]),
-            minor_subsystem_version: u16::from_le_bytes([data[50], data[51]]),
-            size_of_image: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-            size_of_headers: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
-            checksum: u32::from_le_bytes([data[64], data[65], data[66], data[67]]),
-            subsystem: u16::from_le_bytes([data[68], data[69]]),
-            dll_characteristics: u16::from_le_bytes([data[70], data[71]]),
-            size_of_stack_reserve: u32::from_le_bytes([data[72], data[73], data[74], data[75]])
-                as u64,
-            size_of_stack_commit: u32::from_le_bytes([data[76], data[77], data[78], data[79]])
-                as u64,
-            size_of_heap_reserve: u32::from_le_bytes([data[80], data[81], data[82], data[83]])
-                as u64,
-            size_of_heap_commit: u32::from_le_bytes([data[84], data[85], data[86], data[87]])
-                as u64,
+            major_linker_version: read_u8(data, 2),
+            minor_linker_version: read_u8(data, 3),
+            size_of_code: read_u32(data, 4),
+            size_of_initialized_data: read_u32(data, 8),
+            size_of_uninitialized_data: read_u32(data, 12),
+            address_of_entry_point: read_u32(data, 16),
+            base_of_code: read_u32(data, 20),
+            image_base: read_u32(data, 28) as u64,
+            section_alignment: read_u32(data, 32),
+            file_alignment: read_u32(data, 36),
+            major_operating_system_version: read_u16(data, 40),
+            minor_operating_system_version: read_u16(data, 42),
+            major_image_version: read_u16(data, 44),
+            minor_image_version: read_u16(data, 46),
+            major_subsystem_version: read_u16(data, 48),
+            minor_subsystem_version: read_u16(data, 50),
+            size_of_image: read_u32(data, 56),
+            size_of_headers: read_u32(data, 60),
+            checksum: read_u32(data, 64),
+            subsystem: read_u16(data, 68),
+            dll_characteristics: read_u16(data, 70),
+            size_of_stack_reserve: read_u32(data, 72) as u64,
+            size_of_stack_commit: read_u32(data, 76) as u64,
+            size_of_heap_reserve: read_u32(data, 80) as u64,
+            size_of_heap_commit: read_u32(data, 84) as u64,
             number_of_rva_and_sizes,
             data_directories,
         })
@@ -285,63 +325,58 @@ impl OptionalHeader {
             return Err(ParseError::too_short(112, data.len()));
         }
 
-        let magic = u16::from_le_bytes([data[0], data[1]]);
+        let magic = read_u16(data, 0);
         if magic != PE32PLUS_MAGIC {
-            return Err(ParseError::invalid_magic("PE32+ (0x20b)", &data[0..2]));
+            return Err(ParseError::invalid_magic(
+                "PE32+ (0x20b)",
+                data.get(0..2).unwrap_or(&[]),
+            ));
         }
 
-        let number_of_rva_and_sizes =
-            u32::from_le_bytes([data[108], data[109], data[110], data[111]]);
+        let number_of_rva_and_sizes = read_u32(data, 108);
         let num_dirs = number_of_rva_and_sizes.min(16) as usize;
 
         let mut data_directories = Vec::with_capacity(num_dirs);
-        let dir_offset = 112;
+        let dir_offset: usize = 112;
         for i in 0..num_dirs {
-            let offset = dir_offset + i * 8;
-            if offset + 8 <= data.len() {
-                data_directories.push(DataDirectory::parse(&data[offset..])?);
+            let Some(offset) = dir_offset.checked_add(i.saturating_mul(8)) else {
+                break;
+            };
+            let Some(end) = offset.checked_add(8) else {
+                break;
+            };
+            if let Some(slice) = data.get(offset..end) {
+                data_directories.push(DataDirectory::parse(slice)?);
             }
         }
 
         Ok(Self {
             magic,
-            major_linker_version: data[2],
-            minor_linker_version: data[3],
-            size_of_code: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            size_of_initialized_data: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-            size_of_uninitialized_data: u32::from_le_bytes([
-                data[12], data[13], data[14], data[15],
-            ]),
-            address_of_entry_point: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-            base_of_code: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-            image_base: u64::from_le_bytes([
-                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
-            ]),
-            section_alignment: u32::from_le_bytes([data[32], data[33], data[34], data[35]]),
-            file_alignment: u32::from_le_bytes([data[36], data[37], data[38], data[39]]),
-            major_operating_system_version: u16::from_le_bytes([data[40], data[41]]),
-            minor_operating_system_version: u16::from_le_bytes([data[42], data[43]]),
-            major_image_version: u16::from_le_bytes([data[44], data[45]]),
-            minor_image_version: u16::from_le_bytes([data[46], data[47]]),
-            major_subsystem_version: u16::from_le_bytes([data[48], data[49]]),
-            minor_subsystem_version: u16::from_le_bytes([data[50], data[51]]),
-            size_of_image: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-            size_of_headers: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
-            checksum: u32::from_le_bytes([data[64], data[65], data[66], data[67]]),
-            subsystem: u16::from_le_bytes([data[68], data[69]]),
-            dll_characteristics: u16::from_le_bytes([data[70], data[71]]),
-            size_of_stack_reserve: u64::from_le_bytes([
-                data[72], data[73], data[74], data[75], data[76], data[77], data[78], data[79],
-            ]),
-            size_of_stack_commit: u64::from_le_bytes([
-                data[80], data[81], data[82], data[83], data[84], data[85], data[86], data[87],
-            ]),
-            size_of_heap_reserve: u64::from_le_bytes([
-                data[88], data[89], data[90], data[91], data[92], data[93], data[94], data[95],
-            ]),
-            size_of_heap_commit: u64::from_le_bytes([
-                data[96], data[97], data[98], data[99], data[100], data[101], data[102], data[103],
-            ]),
+            major_linker_version: read_u8(data, 2),
+            minor_linker_version: read_u8(data, 3),
+            size_of_code: read_u32(data, 4),
+            size_of_initialized_data: read_u32(data, 8),
+            size_of_uninitialized_data: read_u32(data, 12),
+            address_of_entry_point: read_u32(data, 16),
+            base_of_code: read_u32(data, 20),
+            image_base: read_u64(data, 24),
+            section_alignment: read_u32(data, 32),
+            file_alignment: read_u32(data, 36),
+            major_operating_system_version: read_u16(data, 40),
+            minor_operating_system_version: read_u16(data, 42),
+            major_image_version: read_u16(data, 44),
+            minor_image_version: read_u16(data, 46),
+            major_subsystem_version: read_u16(data, 48),
+            minor_subsystem_version: read_u16(data, 50),
+            size_of_image: read_u32(data, 56),
+            size_of_headers: read_u32(data, 60),
+            checksum: read_u32(data, 64),
+            subsystem: read_u16(data, 68),
+            dll_characteristics: read_u16(data, 70),
+            size_of_stack_reserve: read_u64(data, 72),
+            size_of_stack_commit: read_u64(data, 80),
+            size_of_heap_reserve: read_u64(data, 88),
+            size_of_heap_commit: read_u64(data, 96),
             number_of_rva_and_sizes,
             data_directories,
         })
