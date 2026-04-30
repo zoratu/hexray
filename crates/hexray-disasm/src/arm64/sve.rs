@@ -16,12 +16,6 @@
 //! - Match operations: MATCH, NMATCH
 //! - Histogram: HISTCNT, HISTSEG
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::DecodedInstruction;
 use hexray_core::{
     register::arm64, Architecture, Instruction, MemoryRef, Operand, Operation, Register,
@@ -539,7 +533,7 @@ impl SveDecoder {
 
         // Add multiplier if not 1 (imm4 encodes multiplier - 1)
         if imm4 > 0 {
-            operands.push(Operand::imm_unsigned((imm4 + 1) as u64, 8));
+            operands.push(Operand::imm_unsigned(imm4.wrapping_add(1) as u64, 8));
         }
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
@@ -850,7 +844,7 @@ impl SveDecoder {
         Register::new(
             Architecture::Arm64,
             RegisterClass::ScalableVector,
-            arm64::Z0 + id,
+            arm64::Z0.wrapping_add(id),
             0, // Size is scalable (VL-dependent), use 0 as placeholder
         )
     }
@@ -860,7 +854,7 @@ impl SveDecoder {
         Register::new(
             Architecture::Arm64,
             RegisterClass::Predicate,
-            arm64::P0 + id,
+            arm64::P0.wrapping_add(id),
             0, // Size is scalable
         )
     }

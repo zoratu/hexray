@@ -12,12 +12,6 @@
 //! keeps the opcode-table strategy honest — each SM generation gets its
 //! own decoder state rather than a Frankenstein table.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 pub mod bits;
 pub mod control;
 pub mod opcode_table;
@@ -236,7 +230,7 @@ impl Disassembler for SassDisassembler {
                 bytes.len(),
             ));
         }
-        let word = SassWord::from_bytes(&bytes[..SASS_INSTRUCTION_SIZE]);
+        let word = SassWord::from_bytes(bytes.get(..SASS_INSTRUCTION_SIZE).unwrap_or(bytes));
         self.decode_word(word, address)
     }
 
@@ -265,12 +259,17 @@ impl Disassembler for SassDisassembler {
         bytes: &[u8],
         start_address: u64,
     ) -> Vec<Result<Instruction, DecodeError>> {
-        let mut out =
-            Vec::with_capacity((bytes.len() + SASS_INSTRUCTION_SIZE - 1) / SASS_INSTRUCTION_SIZE);
+        let mut out = Vec::with_capacity(
+            bytes
+                .len()
+                .saturating_add(SASS_INSTRUCTION_SIZE)
+                .saturating_sub(1)
+                / SASS_INSTRUCTION_SIZE,
+        );
         let mut offset = 0usize;
         while offset < bytes.len() {
-            let address = start_address + offset as u64;
-            let remaining = &bytes[offset..];
+            let address = start_address.wrapping_add(offset as u64);
+            let remaining = bytes.get(offset..).unwrap_or(&[]);
             if remaining.len() < SASS_INSTRUCTION_SIZE {
                 out.push(Err(DecodeError::truncated(
                     address,
@@ -279,12 +278,12 @@ impl Disassembler for SassDisassembler {
                 )));
                 break;
             }
-            let slot = &remaining[..SASS_INSTRUCTION_SIZE];
+            let slot = remaining.get(..SASS_INSTRUCTION_SIZE).unwrap_or(remaining);
             out.push(
                 self.decode_instruction(slot, address)
                     .map(|d| d.instruction),
             );
-            offset += SASS_INSTRUCTION_SIZE;
+            offset = offset.saturating_add(SASS_INSTRUCTION_SIZE);
         }
         out
     }

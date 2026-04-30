@@ -18,12 +18,6 @@
 //! [`RegisterSpan`] at operand rendering time; the core [`Register`]
 //! remains a single-slot 32-bit handle.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use hexray_core::{Architecture, CudaArchitecture, Register, RegisterClass, SmArchitecture};
 
 /// Numeric IDs for each SASS register file. These become the low bits of
@@ -83,7 +77,7 @@ impl RegisterSpan {
         if self.width == 1 {
             return canonical_r(self.base);
         }
-        let end = self.base + self.width as u16 - 1;
+        let end = self.base.wrapping_add(self.width as u16).wrapping_sub(1);
         format!("R{}:R{}", self.base, end)
     }
 }

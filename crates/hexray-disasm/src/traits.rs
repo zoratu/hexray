@@ -1,11 +1,5 @@
 //! Disassembler traits.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::DecodeError;
 use hexray_core::{Architecture, Instruction};
 
@@ -56,17 +50,17 @@ pub trait Disassembler {
         let mut offset = 0;
 
         while offset < bytes.len() {
-            let remaining = &bytes[offset..];
-            let address = start_address + offset as u64;
+            let remaining = bytes.get(offset..).unwrap_or(&[]);
+            let address = start_address.wrapping_add(offset as u64);
 
             match self.decode_instruction(remaining, address) {
                 Ok(decoded) => {
-                    offset += decoded.size;
+                    offset = offset.saturating_add(decoded.size);
                     instructions.push(Ok(decoded.instruction));
                 }
                 Err(e) => {
                     // On error, skip one byte and continue
-                    offset += 1;
+                    offset = offset.saturating_add(1);
                     instructions.push(Err(e));
                 }
             }

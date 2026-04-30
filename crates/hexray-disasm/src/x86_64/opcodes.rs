@@ -1,10 +1,5 @@
 //! x86_64 opcode definitions and lookup.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 
@@ -2377,12 +2372,20 @@ pub fn lookup_sse_opcode(
 ) -> Option<&'static SseOpcodeEntry> {
     // Priority: F2 > F3 > 66 > none
     if prefix_f2 {
-        SSE_OPCODE_TABLE_F2[opcode as usize].as_ref()
+        SSE_OPCODE_TABLE_F2
+            .get(opcode as usize)
+            .and_then(Option::as_ref)
     } else if prefix_f3 {
-        SSE_OPCODE_TABLE_F3[opcode as usize].as_ref()
+        SSE_OPCODE_TABLE_F3
+            .get(opcode as usize)
+            .and_then(Option::as_ref)
     } else if prefix_66 {
-        SSE2_OPCODE_TABLE_66[opcode as usize].as_ref()
+        SSE2_OPCODE_TABLE_66
+            .get(opcode as usize)
+            .and_then(Option::as_ref)
     } else {
-        SSE_OPCODE_TABLE[opcode as usize].as_ref()
+        SSE_OPCODE_TABLE
+            .get(opcode as usize)
+            .and_then(Option::as_ref)
     }
 }

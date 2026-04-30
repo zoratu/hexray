@@ -16,12 +16,6 @@
 //! the sweep sees at least one match). Unknown classes fall through
 //! as [`DecodeError::UnknownOpcode`].
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use super::bits::SassWord;
 use hexray_core::Operation;
 
@@ -55,7 +49,7 @@ impl OpcodeEntry {
     /// variant callback if present (which returns a suffix that starts
     /// with `.`).
     pub fn render_mnemonic(&self, word: &SassWord) -> String {
-        let mut s = String::with_capacity(self.mnemonic.len() + 12);
+        let mut s = String::with_capacity(self.mnemonic.len().saturating_add(12));
         s.push_str(self.mnemonic);
         s.push_str(self.default_suffix);
         if let Some(f) = self.variant {

@@ -13,12 +13,6 @@
 //! - BFMOPA: BFloat16 outer product
 //! - SMOPA/UMOPA: Integer outer product
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::DecodedInstruction;
 use hexray_core::{
     register::arm64, Architecture, Instruction, MemoryRef, Operand, Operation, Register,
@@ -212,7 +206,7 @@ impl SmeDecoder {
             // MOVA ZA[Wv, #imm], Pg/M, Zn
             let za_reg = Self::za_tile_reg(bits_23_22, zd_or_za as u32);
             let zn_reg = Self::zreg(zn_or_za);
-            let wv = Self::wreg(12 + v); // W12-W15
+            let wv = Self::wreg(v.wrapping_add(12)); // W12-W15
             (
                 "mova",
                 vec![
@@ -226,7 +220,7 @@ impl SmeDecoder {
             // MOVA Zd, Pg/M, ZA[Wv, #imm]
             let zd_reg = Self::zreg(zd_or_za);
             let za_reg = Self::za_tile_reg(bits_23_22, zn_or_za as u32);
-            let wv = Self::wreg(12 + v);
+            let wv = Self::wreg(v.wrapping_add(12));
             (
                 "mova",
                 vec![
@@ -274,7 +268,7 @@ impl SmeDecoder {
         };
 
         let za_reg = Self::za_reg();
-        let wv = Self::wreg(12 + rv);
+        let wv = Self::wreg(rv.wrapping_add(12));
         let base = Self::xreg_sp(rn);
 
         // Memory reference with VL-scaled immediate
@@ -384,10 +378,10 @@ impl SmeDecoder {
     /// Create a ZA tile register based on size.
     fn za_tile_reg(size: u32, tile: u32) -> Register {
         let id = match size {
-            0 => arm64::ZA0_B,                       // Byte tiles (only ZA0.B)
-            1 => arm64::ZA0_H + (tile & 0x1) as u16, // Halfword tiles (ZA0.H-ZA1.H)
-            2 => arm64::ZA0_S + (tile & 0x3) as u16, // Word tiles (ZA0.S-ZA3.S)
-            3 => arm64::ZA0_D + (tile & 0x7) as u16, // Doubleword tiles (ZA0.D-ZA7.D)
+            0 => arm64::ZA0_B,                                   // Byte tiles (only ZA0.B)
+            1 => arm64::ZA0_H.wrapping_add((tile & 0x1) as u16), // Halfword tiles (ZA0.H-ZA1.H)
+            2 => arm64::ZA0_S.wrapping_add((tile & 0x3) as u16), // Word tiles (ZA0.S-ZA3.S)
+            3 => arm64::ZA0_D.wrapping_add((tile & 0x7) as u16), // Doubleword tiles (ZA0.D-ZA7.D)
             _ => arm64::ZA,
         };
         Register::new(Architecture::Arm64, RegisterClass::MatrixArray, id, 0)
@@ -398,7 +392,7 @@ impl SmeDecoder {
         Register::new(
             Architecture::Arm64,
             RegisterClass::ScalableVector,
-            arm64::Z0 + id,
+            arm64::Z0.wrapping_add(id),
             0,
         )
     }
@@ -408,7 +402,7 @@ impl SmeDecoder {
         Register::new(
             Architecture::Arm64,
             RegisterClass::Predicate,
-            arm64::P0 + id,
+            arm64::P0.wrapping_add(id),
             0,
         )
     }

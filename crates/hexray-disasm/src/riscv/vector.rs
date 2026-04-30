@@ -3,12 +3,6 @@
 //! This module handles decoding of the RISC-V Vector extension instructions,
 //! including vector configuration, loads/stores, and arithmetic operations.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::{DecodeError, DecodedInstruction};
 use hexray_core::{
     Architecture, Instruction, MemoryRef, Operand, Operation, Register, RegisterClass,
@@ -37,8 +31,8 @@ impl VectorDecoder {
                 Architecture::RiscV32
             },
             RegisterClass::Vector,
-            id + 128, // V0 starts at 128
-            0,        // Size is configurable, use 0
+            id.wrapping_add(128), // V0 starts at 128
+            0,                    // Size is configurable, use 0
         )
     }
 
@@ -70,7 +64,7 @@ impl VectorDecoder {
                 Architecture::RiscV32
             },
             RegisterClass::FloatingPoint,
-            id + 64,
+            id.wrapping_add(64),
             if self.is_64bit { 64 } else { 32 },
         )
     }
@@ -240,7 +234,10 @@ impl VectorDecoder {
                 } else {
                     // Whole register load or mask load
                     match rs2 {
-                        8 => (format!("vl{}re{}.v", nf + 1, eew), Operation::VectorLoad),
+                        8 => (
+                            format!("vl{}re{}.v", nf.wrapping_add(1), eew),
+                            Operation::VectorLoad,
+                        ),
                         11 => ("vlm.v".to_string(), Operation::VectorLoad),
                         _ => return Err(DecodeError::unknown_opcode(address, &bytes)),
                     }
@@ -324,7 +321,10 @@ impl VectorDecoder {
                 } else {
                     // Whole register store or mask store
                     match rs2 {
-                        8 => (format!("vs{}r.v", nf + 1), Operation::VectorStore),
+                        8 => (
+                            format!("vs{}r.v", nf.wrapping_add(1)),
+                            Operation::VectorStore,
+                        ),
                         11 => ("vsm.v".to_string(), Operation::VectorStore),
                         _ => return Err(DecodeError::unknown_opcode(address, &bytes)),
                     }
