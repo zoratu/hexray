@@ -5,12 +5,6 @@
 //! the two halves; all bit-field extraction goes through [`bit_range`] so
 //! no caller has to think about which u64 a given bit lives in.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 /// A raw 128-bit SASS word, low 64 bits and high 64 bits.
 ///
 /// Bit indexing is done as if the word were a single 128-bit value: bit
@@ -32,12 +26,22 @@ impl SassWord {
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         debug_assert!(bytes.len() >= 16, "SASS instructions are always 16 bytes");
-        let low = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-        let high = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
+        // Pad-then-truncate: callers guarantee bytes.len() >= 16, but
+        // doing the slice+try_into via .get() lets clippy see the
+        // bounds-check rather than relying on a debug_assert.
+        let head = bytes.get(..16).unwrap_or(&[0u8; 16][..]);
+        let low = u64::from_le_bytes(
+            head.get(..8)
+                .unwrap_or(&[0; 8])
+                .try_into()
+                .unwrap_or_default(),
+        );
+        let high = u64::from_le_bytes(
+            head.get(8..16)
+                .unwrap_or(&[0; 8])
+                .try_into()
+                .unwrap_or_default(),
+        );
         Self { low, high }
     }
 
@@ -67,7 +71,7 @@ impl SassWord {
             high_bit >= low_bit,
             "bit_range: high_bit {high_bit} < low_bit {low_bit}"
         );
-        let width = high_bit - low_bit + 1;
+        let width = high_bit.saturating_sub(low_bit).saturating_add(1);
         debug_assert!(width <= 64, "bit_range: width {width} > 64 bits");
         if width == 64 && low_bit == 0 {
             return self.low;
@@ -81,7 +85,7 @@ impl SassWord {
         let mask: u128 = if width == 64 {
             u64::MAX as u128
         } else {
-            (1u128 << width) - 1
+            (1u128 << width).wrapping_sub(1)
         };
         ((combined >> low_bit) & mask) as u64
     }

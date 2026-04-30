@@ -45,12 +45,6 @@
 //! }
 //! ```
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod abbrev;
 pub mod addr_table;
 mod die;
@@ -117,7 +111,11 @@ impl DebugInfo {
                 let low = cu.low_pc()?;
                 let high = cu.high_pc()?;
                 // High PC might be a size, not an address
-                let high_addr = if high < low { low + high } else { high };
+                let high_addr = if high < low {
+                    low.saturating_add(high)
+                } else {
+                    high
+                };
                 Some((low, high_addr, i))
             })
             .collect();
@@ -140,7 +138,9 @@ impl DebugInfo {
         if pos == 0 {
             return None;
         }
-        let (low, high, cu_idx) = self.cu_ranges[pos - 1];
+        // pos > 0 (the `if pos == 0` guard above returned). Use
+        // checked_sub + .get() to make that explicit to clippy.
+        let (low, high, cu_idx) = *self.cu_ranges.get(pos.checked_sub(1)?)?;
         if address >= low && address < high {
             Some(cu_idx)
         } else {
@@ -152,12 +152,12 @@ impl DebugInfo {
     pub fn find_location(&self, address: u64) -> Option<SourceLocation<'_>> {
         // O(log n) lookup for compilation unit
         let cu_idx = self.find_cu_index(address)?;
-        let cu = &self.compilation_units[cu_idx];
+        let cu = self.compilation_units.get(cu_idx)?;
 
         // O(1) lookup for line program
         if let Some(stmt_list) = cu.stmt_list() {
             if let Some(&prog_idx) = self.line_programs_by_offset.get(&stmt_list) {
-                let (_, prog) = &self.line_programs[prog_idx];
+                let (_, prog) = self.line_programs.get(prog_idx)?;
                 if let Some(row) = prog.find_location(address) {
                     let file_name = prog.file_name(row.file);
                     return Some(SourceLocation {
@@ -176,7 +176,7 @@ impl DebugInfo {
     pub fn find_function(&self, address: u64) -> Option<FunctionInfo<'_>> {
         // O(log n) lookup for compilation unit
         if let Some(cu_idx) = self.find_cu_index(address) {
-            let cu = &self.compilation_units[cu_idx];
+            let cu = self.compilation_units.get(cu_idx)?;
             if let Some(die) = cu.find_subprogram(address) {
                 return Some(FunctionInfo {
                     die,
@@ -301,7 +301,7 @@ impl<'a> FunctionInfo<'a> {
         // emitted by clang/gcc -O0 -g on x86_64 and ARM64; on both
         // architectures the prologue saves the previous frame
         // pointer at the top of the new frame, so CFA = fp + 16.
-        if bytes.len() == 1 && bytes[0] == 0x9c {
+        if bytes.first() == Some(&0x9c) && bytes.len() == 1 {
             return 16;
         }
         0
@@ -327,14 +327,20 @@ impl<'a> FunctionInfo<'a> {
         // Collect parameters
         for param in self.parameters() {
             if let (Some(name), Some(offset)) = (param.name(), param.frame_base_offset()) {
-                names.insert(offset as i128 + cfa_correction, name.to_string());
+                names.insert(
+                    (offset as i128).saturating_add(cfa_correction),
+                    name.to_string(),
+                );
             }
         }
 
         // Collect local variables
         for var in self.local_variables() {
             if let (Some(name), Some(offset)) = (var.name(), var.frame_base_offset()) {
-                names.insert(offset as i128 + cfa_correction, name.to_string());
+                names.insert(
+                    (offset as i128).saturating_add(cfa_correction),
+                    name.to_string(),
+                );
             }
         }
 
@@ -386,15 +392,15 @@ pub fn parse_debug_info(
     if let Some(line_data) = debug_line {
         let mut offset = 0;
         while offset < line_data.len() {
-            match LineNumberProgram::parse(&line_data[offset..], address_size) {
+            match LineNumberProgram::parse(line_data.get(offset..).unwrap_or(&[]), address_size) {
                 Ok(prog) => {
                     let prog_len = if prog.header.is_64bit {
-                        12 + prog.header.unit_length as usize
+                        (prog.header.unit_length as usize).saturating_add(12)
                     } else {
-                        4 + prog.header.unit_length as usize
+                        (prog.header.unit_length as usize).saturating_add(4)
                     };
                     line_programs.push((offset as u64, prog));
-                    offset += prog_len;
+                    offset = offset.saturating_add(prog_len);
                 }
                 Err(_) => break,
             }

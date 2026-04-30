@@ -3,12 +3,6 @@
 //! The abbreviation table defines the structure of DIEs (Debug Information Entries).
 //! Each abbreviation specifies a tag and a list of attribute specifications.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use std::collections::HashMap;
 
 use super::leb128::{decode_sleb128, decode_uleb128};
@@ -57,8 +51,8 @@ impl AbbreviationTable {
 
         loop {
             // Read abbreviation code
-            let (code, len) = decode_uleb128(&data[offset..])?;
-            offset += len;
+            let (code, len) = decode_uleb128(data.get(offset..).unwrap_or(&[]))?;
+            offset = offset.saturating_add(len);
 
             // Code 0 marks end of abbreviation table
             if code == 0 {
@@ -66,31 +60,31 @@ impl AbbreviationTable {
             }
 
             // Read tag
-            let (tag_value, len) = decode_uleb128(&data[offset..])?;
-            offset += len;
+            let (tag_value, len) = decode_uleb128(data.get(offset..).unwrap_or(&[]))?;
+            offset = offset.saturating_add(len);
             let tag = DwTag::from(tag_value as u16);
 
             // Read children flag
-            if offset >= data.len() {
+            let Some(&flag) = data.get(offset) else {
                 return Err(ParseError::TruncatedData {
-                    expected: offset + 1,
+                    expected: offset.saturating_add(1),
                     actual: data.len(),
                     context: "abbreviation children flag",
                 });
-            }
-            let has_children = data[offset] != 0;
-            offset += 1;
+            };
+            let has_children = flag != 0;
+            offset = offset.saturating_add(1);
 
             // Read attribute specifications
             let mut attributes = Vec::new();
             loop {
                 // Read attribute name
-                let (name_value, len) = decode_uleb128(&data[offset..])?;
-                offset += len;
+                let (name_value, len) = decode_uleb128(data.get(offset..).unwrap_or(&[]))?;
+                offset = offset.saturating_add(len);
 
                 // Read attribute form
-                let (form_value, len) = decode_uleb128(&data[offset..])?;
-                offset += len;
+                let (form_value, len) = decode_uleb128(data.get(offset..).unwrap_or(&[]))?;
+                offset = offset.saturating_add(len);
 
                 // (0, 0) marks end of attribute list
                 if name_value == 0 && form_value == 0 {
@@ -102,8 +96,8 @@ impl AbbreviationTable {
 
                 // Handle implicit constant (DWARF 5)
                 let implicit_const = if matches!(form, DwForm::ImplicitConst) {
-                    let (value, len) = decode_sleb128(&data[offset..])?;
-                    offset += len;
+                    let (value, len) = decode_sleb128(data.get(offset..).unwrap_or(&[]))?;
+                    offset = offset.saturating_add(len);
                     Some(value)
                 } else {
                     None
