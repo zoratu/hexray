@@ -29,12 +29,6 @@
 //! empirical verification against cubins emitted by `nvcc 13.2`
 //! (`tests/corpus/cuda/`). NVIDIA does not publish a spec for this.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 /// The four `.nv.info` framing formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvInfoFormat {

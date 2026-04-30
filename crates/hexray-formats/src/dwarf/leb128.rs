@@ -13,16 +13,14 @@ pub fn decode_uleb128(data: &[u8]) -> Result<(u64, usize), ParseError> {
     let mut index = 0;
 
     loop {
-        if index >= data.len() {
+        let Some(&byte) = data.get(index) else {
             return Err(ParseError::TruncatedData {
-                expected: index + 1,
+                expected: index.saturating_add(1),
                 actual: data.len(),
                 context: "ULEB128 value",
             });
-        }
-
-        let byte = data[index];
-        index += 1;
+        };
+        index = index.saturating_add(1);
 
         // Extract 7 bits and add to result
         let low_bits = (byte & 0x7F) as u64;
@@ -33,7 +31,7 @@ pub fn decode_uleb128(data: &[u8]) -> Result<(u64, usize), ParseError> {
         }
 
         result |= low_bits << shift;
-        shift += 7;
+        shift = shift.saturating_add(7);
 
         // High bit clear means this is the last byte
         if byte & 0x80 == 0 {
@@ -54,22 +52,20 @@ pub fn decode_sleb128(data: &[u8]) -> Result<(i64, usize), ParseError> {
     let mut last_byte = 0u8;
 
     loop {
-        if index >= data.len() {
+        let Some(&byte) = data.get(index) else {
             return Err(ParseError::TruncatedData {
-                expected: index + 1,
+                expected: index.saturating_add(1),
                 actual: data.len(),
                 context: "SLEB128 value",
             });
-        }
-
-        let byte = data[index];
+        };
         last_byte = byte;
-        index += 1;
+        index = index.saturating_add(1);
 
         // Extract 7 bits and add to result
         let low_bits = (byte & 0x7F) as i64;
         result |= low_bits << shift;
-        shift += 7;
+        shift = shift.saturating_add(7);
 
         // High bit clear means this is the last byte
         if byte & 0x80 == 0 {

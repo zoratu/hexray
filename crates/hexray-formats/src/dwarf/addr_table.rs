@@ -143,11 +143,7 @@ impl AddressTable {
         let header_size = 4usize;
         let body_size = unit_length.saturating_sub(header_size);
         let entry_size = (address_size as usize).saturating_add(segment_selector_size as usize);
-        let address_count = if entry_size > 0 {
-            body_size / entry_size
-        } else {
-            0
-        };
+        let address_count = body_size.checked_div(entry_size).unwrap_or(0);
 
         // Parse the addresses
         let mut addresses = Vec::with_capacity(address_count);
