@@ -5,6 +5,54 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.6] - 2026-04-30
+
+### Highlights — adversarial-input hardening
+
+Maintenance release acting on the lessons from
+https://corrode.dev/blog/bugs-rust-wont-catch/. Three of the eight
+bug classes the post calls out apply to a binary-analysis tool eating
+untrusted input; this release addresses all three.
+
+What's new:
+
+- **`hexray_formats::name_from_bytes`** — new helper that preserves
+  byte sequences when converting binary-format names to `String`.
+  Symbol/section/load-command names in ELF / Mach-O / PE / DWARF are
+  byte sequences (the format spec doesn't require UTF-8). The Rust
+  default `String::from_utf8_lossy` collapses every invalid byte to
+  `\u{FFFD}`, so an attacker-crafted symbol `\xff\xfe` and a different
+  one `\xff\xfd` both render as `��` and can't be distinguished. The
+  helper preserves them: valid UTF-8 passes through unchanged;
+  invalid input is rendered with `std::ascii::escape_default` so
+  `\xff` shows as the literal `\xff`. All 14 pre-existing
+  `from_utf8_lossy` call sites in PE / Mach-O / DWARF parsers
+  switched over. 8 unit tests pin the byte-preservation contract.
+- **Fuzz crash-regression CI gate** (`scripts/run-fuzz-corpus`).
+  Runs each of the 21 existing fuzz targets for a configurable
+  duration (default 60s) against its committed corpus, fails on any
+  crash. Wired into `ci-local --tier full`. Catches regressions
+  without an explicit fuzz campaign. Skips cleanly when `cargo-fuzz`
+  / nightly rustc isn't available so non-fuzz CI tiers still pass on
+  minimal toolchains.
+- **Documented adversarial-input lint posture** in
+  `hexray-formats/src/lib.rs` and `hexray-disasm/src/lib.rs`.
+  `clippy::indexing_slicing`, `arithmetic_side_effects`,
+  `unwrap_used`, `expect_used`, `panic` are documented (with the
+  corrode.dev URL and rationale) but not yet enforced — flipping
+  them on floods the build with hundreds of pre-existing call-site
+  hits. PR review and the new fuzz CI gate are the enforcement
+  layer until the bulk migration to `.get()` / `checked_*` /
+  `try_into()` lands.
+
+What's deferred:
+
+- **Bulk refactor of pre-existing parsing paths** to remove
+  `unwrap()` / direct indexing / unchecked arithmetic in favour of
+  the safer alternatives. Several hundred call sites; tracked
+  separately. The runtime fuzz gate catches regressions in the
+  interim.
+
 ## [1.3.5] - 2026-04-26
 
 ### Highlights — full AMDGPU operand decode + differential gate
