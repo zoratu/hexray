@@ -1169,7 +1169,10 @@ impl Arm64Disassembler {
             }
         } else {
             // SIMD/FP register
-            (Self::simd_reg(rt, simd_size.unwrap()), Self::xreg_sp(rn))
+            (
+                Self::simd_reg(rt, simd_size.unwrap_or_default()),
+                Self::xreg_sp(rn),
+            )
         };
 
         let mem = MemoryRef::base_disp(reg_base, imm9, data_size as u8);

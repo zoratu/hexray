@@ -24,11 +24,23 @@
 // mechanism until the bulk refactor lands. See
 // `scripts/run-fuzz-corpus` for the runtime check that catches
 // any regression that does slip through.
+// `unwrap_used` and `expect_used` are now ENFORCED — no remaining
+// call sites in this crate. New code must propagate errors.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
+// Test code is the conventional place for `unwrap()` / `expect()` —
+// the lints would fire at every assertion-style helper otherwise.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+// `indexing_slicing`, `arithmetic_side_effects`, `panic` still
+// allowed: thousands of pre-existing call sites in instruction
+// decoders / format-header parsers do bit math and direct slice
+// indexing where bounds are checked once at the top of the parse.
+// Refactoring all of them is its own multi-day project; the
+// runtime fuzz gate (`scripts/run-fuzz-corpus`) catches regressions
+// in the interim, and reviewers should still steer new parsing
+// paths toward `.get()` / `checked_*`.
 #![allow(
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects,
-    clippy::unwrap_used,
-    clippy::expect_used,
     clippy::panic
 )]
 

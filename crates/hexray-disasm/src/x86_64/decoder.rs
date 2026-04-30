@@ -77,10 +77,7 @@ impl Disassembler for X86_64Disassembler {
         }
 
         // Check if this is a VEX-encoded instruction
-        if prefixes.is_vex() {
-            // VEX-encoded: the opcode follows immediately after the VEX prefix
-            // The escape bytes are encoded in VEX.mmmmm
-            let vex = prefixes.vex.unwrap();
+        if let Some(vex) = prefixes.vex {
             let opcode = bytes[offset];
             offset += 1;
 
@@ -1384,8 +1381,7 @@ impl X86_64Disassembler {
                 offset += rm_consumed;
 
                 // For VEX 3-operand form, add vvvv register
-                if prefixes.is_vex() {
-                    let vex = prefixes.vex.unwrap();
+                if let Some(vex) = prefixes.vex {
                     // VEX dest is reg, src1 is vvvv, src2 is rm
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
                     operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
@@ -1418,8 +1414,7 @@ impl X86_64Disassembler {
                 offset += rm_consumed;
 
                 // For VEX 4-operand form
-                if prefixes.is_vex() {
-                    let vex = prefixes.vex.unwrap();
+                if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
                     operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
                     operands.push(rm_operand);
@@ -1445,8 +1440,7 @@ impl X86_64Disassembler {
                         .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
-                if prefixes.is_vex() {
-                    let vex = prefixes.vex.unwrap();
+                if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
                     operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
                     operands.push(rm_operand);
@@ -1468,8 +1462,7 @@ impl X86_64Disassembler {
                 .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
-                if prefixes.is_vex() {
-                    let vex = prefixes.vex.unwrap();
+                if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
                     operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
                     operands.push(rm_operand);
@@ -1490,8 +1483,7 @@ impl X86_64Disassembler {
                 .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
-                if prefixes.is_vex() {
-                    let vex = prefixes.vex.unwrap();
+                if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
                     operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
                     operands.push(rm_operand);
@@ -1514,8 +1506,7 @@ impl X86_64Disassembler {
                         .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
                 offset += rm_consumed;
 
-                if prefixes.is_vex() {
-                    let vex = prefixes.vex.unwrap();
+                if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
                     operands.push(Operand::Register(decode_xmm(vex.vvvv, vector_size)));
                     operands.push(rm_operand);

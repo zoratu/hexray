@@ -55,8 +55,6 @@
 //! - We do *not* trust `arg_count` blindly: a value larger than the
 //!   bytes can carry is rejected with [`ScaleKinfoError::Truncated`].
 
-use std::convert::TryInto;
-
 /// Decoded `.AMDGPU.kinfo` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScaleKinfo {
@@ -180,8 +178,11 @@ pub fn parse(bytes: &[u8]) -> Result<ScaleKinfo, ScaleKinfoError> {
 /// Helper: read a little-endian u32 from a 4-byte slice. The caller
 /// guarantees `bytes.len() == 4`.
 fn read_u32(bytes: &[u8]) -> u32 {
-    let arr: [u8; 4] = bytes.try_into().expect("caller provides 4 bytes");
-    u32::from_le_bytes(arr)
+    // Caller guarantees bytes.len() == 4. Inline byte construction
+    // rather than going through try_into().expect() — same
+    // generated code but without the panic surface clippy
+    // expect_used complains about.
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 #[cfg(test)]
