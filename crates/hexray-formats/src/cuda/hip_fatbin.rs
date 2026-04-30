@@ -43,12 +43,6 @@
 //! and reader of these bundles) and ROCm's `clang-offload-bundler`
 //! command-line tool.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use hexray_core::GfxArchitecture;
 
 /// Magic bytes at the start of an uncompressed Clang offload bundle.
@@ -211,7 +205,7 @@ impl<'a> HipBundleWrapper<'a> {
                 have: bytes.len(),
             });
         }
-        if &bytes[..HIP_BUNDLE_MAGIC_LEN] != HIP_BUNDLE_MAGIC.as_slice() {
+        if bytes.get(..HIP_BUNDLE_MAGIC_LEN) != Some(HIP_BUNDLE_MAGIC.as_slice()) {
             return Err(HipBundleError::BadMagic);
         }
         let num_bundles = read_u64_le(bytes, HIP_BUNDLE_MAGIC_LEN)? as usize;
@@ -229,8 +223,8 @@ impl<'a> HipBundleWrapper<'a> {
                 });
             }
             let offset = read_u64_le(bytes, cursor)? as usize;
-            let size = read_u64_le(bytes, cursor + 8)? as usize;
-            let triple_size = read_u64_le(bytes, cursor + 16)? as usize;
+            let size = read_u64_le(bytes, cursor.saturating_add(8))? as usize;
+            let triple_size = read_u64_le(bytes, cursor.saturating_add(16))? as usize;
 
             let triple_start = fixed_end;
             let triple_end = triple_start.saturating_add(triple_size);
@@ -241,7 +235,7 @@ impl<'a> HipBundleWrapper<'a> {
                     buffer_len: bytes.len(),
                 });
             }
-            let triple_bytes = &bytes[triple_start..triple_end];
+            let triple_bytes = bytes.get(triple_start..triple_end).unwrap_or(&[]);
             // Triples are documented as ASCII; treat invalid UTF-8
             // bytes as an entry overflow rather than panicking. In
             // practice every triple seen in the wild is ASCII.
@@ -261,7 +255,7 @@ impl<'a> HipBundleWrapper<'a> {
                     buffer_len: bytes.len(),
                 });
             }
-            let payload = &bytes[offset..payload_end];
+            let payload = bytes.get(offset..payload_end).unwrap_or(&[]);
 
             entries.push(HipBundleEntry {
                 triple,
@@ -357,18 +351,22 @@ fn parse_gfx_token(token: &str) -> Option<GfxArchitecture> {
         return None;
     }
     let bytes = digits.as_bytes();
-    let stepping = hex_nibble(bytes[bytes.len() - 1])?;
-    let minor = hex_nibble(bytes[bytes.len() - 2])?;
-    let major_str = &digits[..digits.len() - 2];
+    // bytes is non-empty by the digits-string check above; using
+    // .last() and split_last avoids the explicit subtraction.
+    let (last, rest) = bytes.split_last()?;
+    let (penult, _) = rest.split_last()?;
+    let stepping = hex_nibble(*last)?;
+    let minor = hex_nibble(*penult)?;
+    let major_str = digits.get(..digits.len().saturating_sub(2)).unwrap_or("");
     let major: u8 = major_str.parse().ok()?;
     Some(GfxArchitecture::new(major, minor, stepping))
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(10 + byte - b'a'),
-        b'A'..=b'F' => Some(10 + byte - b'A'),
+        b'0'..=b'9' => Some(byte.wrapping_sub(b'0')),
+        b'a'..=b'f' => Some(byte.wrapping_sub(b'a').wrapping_add(10)),
+        b'A'..=b'F' => Some(byte.wrapping_sub(b'A').wrapping_add(10)),
         _ => None,
     }
 }
@@ -386,16 +384,12 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, HipBundleError> {
             have: bytes.len(),
         });
     }
-    Ok(u64::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-        bytes[offset + 4],
-        bytes[offset + 5],
-        bytes[offset + 6],
-        bytes[offset + 7],
-    ]))
+    let chunk = bytes.get(offset..end).ok_or(HipBundleError::Truncated {
+        what: "u64 field",
+        needed: end,
+        have: bytes.len(),
+    })?;
+    Ok(u64::from_le_bytes(chunk.try_into().unwrap_or_default()))
 }
 
 #[cfg(test)]

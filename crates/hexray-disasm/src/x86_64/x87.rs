@@ -5,12 +5,6 @@
 //! - When ModR/M < 0xC0: memory operand, reg field (bits 5:3) selects the instruction
 //! - When ModR/M >= 0xC0: register operand ST(i), different instruction table
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use hexray_core::Operation;
 
 /// x87 instruction info
@@ -98,6 +92,7 @@ pub static X87_D8_MEM: [X87Entry; 8] = [
 
 /// D8 with register operand (ModR/M >= 0xC0): FADD/FMUL/etc ST(0), ST(i)
 /// Range: D8 C0 - D8 FF (64 entries for 8 instructions × 8 registers)
+#[allow(clippy::indexing_slicing)]
 pub static X87_D8_REG: [X87Entry; 64] = {
     let mut table = [X87Entry::new("", Operation::Other(0)); 64];
     let mut i = 0;
@@ -105,19 +100,19 @@ pub static X87_D8_REG: [X87Entry; 64] = {
         // C0-C7: FADD ST(0), ST(i)
         table[i] = X87Entry::reg2("fadd", Operation::X87Add);
         // C8-CF: FMUL ST(0), ST(i)
-        table[0x08 + i] = X87Entry::reg2("fmul", Operation::X87Mul);
+        table[i.wrapping_add(0x08)] = X87Entry::reg2("fmul", Operation::X87Mul);
         // D0-D7: FCOM ST(i)
-        table[0x10 + i] = X87Entry::reg("fcom", Operation::X87Compare);
+        table[i.wrapping_add(0x10)] = X87Entry::reg("fcom", Operation::X87Compare);
         // D8-DF: FCOMP ST(i)
-        table[0x18 + i] = X87Entry::reg("fcomp", Operation::X87Compare);
+        table[i.wrapping_add(0x18)] = X87Entry::reg("fcomp", Operation::X87Compare);
         // E0-E7: FSUB ST(0), ST(i)
-        table[0x20 + i] = X87Entry::reg2("fsub", Operation::X87Sub);
+        table[i.wrapping_add(0x20)] = X87Entry::reg2("fsub", Operation::X87Sub);
         // E8-EF: FSUBR ST(0), ST(i)
-        table[0x28 + i] = X87Entry::reg2("fsubr", Operation::X87Sub);
+        table[i.wrapping_add(0x28)] = X87Entry::reg2("fsubr", Operation::X87Sub);
         // F0-F7: FDIV ST(0), ST(i)
-        table[0x30 + i] = X87Entry::reg2("fdiv", Operation::X87Div);
+        table[i.wrapping_add(0x30)] = X87Entry::reg2("fdiv", Operation::X87Div);
         // F8-FF: FDIVR ST(0), ST(i)
-        table[0x38 + i] = X87Entry::reg2("fdivr", Operation::X87Div);
+        table[i.wrapping_add(0x38)] = X87Entry::reg2("fdivr", Operation::X87Div);
         i += 1;
     }
     table
@@ -298,6 +293,7 @@ pub static X87_DC_MEM: [X87Entry; 8] = [
 ];
 
 /// DC with register operand (ModR/M >= 0xC0): ST(i), ST(0) arithmetic
+#[allow(clippy::indexing_slicing)]
 pub static X87_DC_REG: [X87Entry; 64] = {
     let mut table = [X87Entry::new("", Operation::Other(0)); 64];
     let mut i = 0;
@@ -305,19 +301,19 @@ pub static X87_DC_REG: [X87Entry; 64] = {
         // C0-C7: FADD ST(i), ST(0)
         table[i] = X87Entry::reg2("fadd", Operation::X87Add);
         // C8-CF: FMUL ST(i), ST(0)
-        table[0x08 + i] = X87Entry::reg2("fmul", Operation::X87Mul);
+        table[i.wrapping_add(0x08)] = X87Entry::reg2("fmul", Operation::X87Mul);
         // D0-D7: FCOM ST(i) (same as D8)
-        table[0x10 + i] = X87Entry::reg("fcom", Operation::X87Compare);
+        table[i.wrapping_add(0x10)] = X87Entry::reg("fcom", Operation::X87Compare);
         // D8-DF: FCOMP ST(i)
-        table[0x18 + i] = X87Entry::reg("fcomp", Operation::X87Compare);
+        table[i.wrapping_add(0x18)] = X87Entry::reg("fcomp", Operation::X87Compare);
         // E0-E7: FSUBR ST(i), ST(0) (note: reversed from D8)
-        table[0x20 + i] = X87Entry::reg2("fsubr", Operation::X87Sub);
+        table[i.wrapping_add(0x20)] = X87Entry::reg2("fsubr", Operation::X87Sub);
         // E8-EF: FSUB ST(i), ST(0)
-        table[0x28 + i] = X87Entry::reg2("fsub", Operation::X87Sub);
+        table[i.wrapping_add(0x28)] = X87Entry::reg2("fsub", Operation::X87Sub);
         // F0-F7: FDIVR ST(i), ST(0) (note: reversed from D8)
-        table[0x30 + i] = X87Entry::reg2("fdivr", Operation::X87Div);
+        table[i.wrapping_add(0x30)] = X87Entry::reg2("fdivr", Operation::X87Div);
         // F8-FF: FDIV ST(i), ST(0)
-        table[0x38 + i] = X87Entry::reg2("fdiv", Operation::X87Div);
+        table[i.wrapping_add(0x38)] = X87Entry::reg2("fdiv", Operation::X87Div);
         i += 1;
     }
     table
@@ -436,15 +432,18 @@ pub fn decode_x87(escape: u8, modrm: u8) -> Option<X87Entry> {
     match escape {
         0xD8 => {
             if is_memory {
-                Some(X87_D8_MEM[reg])
+                X87_D8_MEM.get(reg).copied()
             } else {
-                let idx = (modrm - 0xC0) as usize;
-                Some(X87_D8_REG[idx])
+                let idx = modrm.wrapping_sub(0xC0) as usize;
+                X87_D8_REG.get(idx).copied()
             }
         }
         0xD9 => {
             if is_memory {
-                let entry = X87_D9_MEM[reg];
+                let entry = X87_D9_MEM
+                    .get(reg)
+                    .copied()
+                    .unwrap_or(X87Entry::new("", Operation::Other(0)));
                 if entry.mnemonic.is_empty() {
                     None
                 } else {
@@ -456,14 +455,17 @@ pub fn decode_x87(escape: u8, modrm: u8) -> Option<X87Entry> {
         }
         0xDA => {
             if is_memory {
-                Some(X87_DA_MEM[reg])
+                X87_DA_MEM.get(reg).copied()
             } else {
                 lookup_da_reg(modrm)
             }
         }
         0xDB => {
             if is_memory {
-                let entry = X87_DB_MEM[reg];
+                let entry = X87_DB_MEM
+                    .get(reg)
+                    .copied()
+                    .unwrap_or(X87Entry::new("", Operation::Other(0)));
                 if entry.mnemonic.is_empty() {
                     None
                 } else {
@@ -475,15 +477,18 @@ pub fn decode_x87(escape: u8, modrm: u8) -> Option<X87Entry> {
         }
         0xDC => {
             if is_memory {
-                Some(X87_DC_MEM[reg])
+                X87_DC_MEM.get(reg).copied()
             } else {
-                let idx = (modrm - 0xC0) as usize;
-                Some(X87_DC_REG[idx])
+                let idx = modrm.wrapping_sub(0xC0) as usize;
+                X87_DC_REG.get(idx).copied()
             }
         }
         0xDD => {
             if is_memory {
-                let entry = X87_DD_MEM[reg];
+                let entry = X87_DD_MEM
+                    .get(reg)
+                    .copied()
+                    .unwrap_or(X87Entry::new("", Operation::Other(0)));
                 if entry.mnemonic.is_empty() {
                     None
                 } else {
@@ -495,14 +500,14 @@ pub fn decode_x87(escape: u8, modrm: u8) -> Option<X87Entry> {
         }
         0xDE => {
             if is_memory {
-                Some(X87_DE_MEM[reg])
+                X87_DE_MEM.get(reg).copied()
             } else {
                 lookup_de_reg(modrm)
             }
         }
         0xDF => {
             if is_memory {
-                Some(X87_DF_MEM[reg])
+                X87_DF_MEM.get(reg).copied()
             } else {
                 lookup_df_reg(modrm)
             }
