@@ -1,4 +1,3 @@
-//! Mach-O (macOS/iOS) binary format parser.
 //!
 //! This module provides a complete Mach-O parser built from scratch,
 //! supporting:
@@ -7,11 +6,6 @@
 //! - Common load commands
 //! - Symbol tables
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![allow(dead_code)]
 
 mod header;
@@ -26,6 +20,37 @@ pub use symbol::Nlist;
 
 use crate::{BinaryFormat, ParseError, Section};
 use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolKind};
+
+// Bounds-checked little-endian readers (caller has already verified
+// the buffer length at function entry).
+#[inline]
+fn read_u32_le(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u32_ne(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_ne_bytes(arr)
+}
+
+/// Read a NUL-terminated name from a string-table slice.
+fn read_strtab_name(strtab: &[u8], offset: usize) -> Option<String> {
+    let bytes = strtab.get(offset..)?;
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Some(crate::name_from_bytes(bytes.get(..end).unwrap_or(&[])))
+}
 
 /// A parsed Mach-O binary.
 #[derive(Debug)]
@@ -66,16 +91,14 @@ impl<'a> MachO<'a> {
         offset: usize,
         allow_fat: bool,
     ) -> Result<Self, ParseError> {
-        if data.len() < offset.saturating_add(4) {
+        let magic_end = offset.checked_add(4).ok_or(ParseError::Overflow {
+            context: "Mach-O magic",
+        })?;
+        if magic_end > data.len() {
             return Err(ParseError::too_short(4, data.len().saturating_sub(offset)));
         }
 
-        let magic = u32::from_ne_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
+        let magic = read_u32_ne(data, offset);
 
         // Check for fat binary (only at top level)
         if allow_fat && (magic == header::FAT_MAGIC || magic == header::FAT_CIGAM) {
@@ -83,7 +106,10 @@ impl<'a> MachO<'a> {
         }
 
         // Parse regular Mach-O
-        let header = MachHeader::parse(&data[offset..])?;
+        let header_slice = data
+            .get(offset..)
+            .ok_or_else(|| ParseError::too_short(offset.saturating_add(1), data.len()))?;
+        let header = MachHeader::parse(header_slice)?;
         let is_64 = header.is_64bit();
 
         // Parse load commands
@@ -98,15 +124,14 @@ impl<'a> MachO<'a> {
                 .ok_or(ParseError::Overflow {
                     context: "Mach-O load commands",
                 })?;
-        if lc_end > data.len() {
-            return Err(ParseError::TruncatedData {
+        let lc_slice = data
+            .get(lc_offset..lc_end)
+            .ok_or(ParseError::TruncatedData {
                 expected: lc_end,
                 actual: data.len(),
                 context: "Mach-O load commands",
-            });
-        }
-        let load_commands =
-            Self::parse_load_commands(&data[lc_offset..lc_end], header.ncmds as usize, is_64)?;
+            })?;
+        let load_commands = Self::parse_load_commands(lc_slice, header.ncmds as usize, is_64)?;
 
         // Extract segments and populate section data
         let mut segments: Vec<Segment> = load_commands
@@ -122,10 +147,10 @@ impl<'a> MachO<'a> {
             })
             .collect();
 
-        // Populate section data caches
-        // For fat binaries, section offsets are relative to the slice, not the whole file
-        // So we need to pass the slice starting at 'offset'
-        let slice_data = &data[offset..];
+        // Populate section data caches.
+        // For fat binaries, section offsets are relative to the slice, not the
+        // whole file, so we pass the slice starting at `offset`.
+        let slice_data = data.get(offset..).unwrap_or(&[]);
         for segment in &mut segments {
             for section in &mut segment.sections {
                 section.populate_data(slice_data);
@@ -147,8 +172,10 @@ impl<'a> MachO<'a> {
             {
                 let str_start = offset.saturating_add(*stroff as usize);
                 let str_end = str_start.saturating_add(*strsize as usize);
-                if str_end <= data.len() && str_end > str_start {
-                    strtab = &data[str_start..str_end];
+                if str_end > str_start {
+                    if let Some(slice) = data.get(str_start..str_end) {
+                        strtab = slice;
+                    }
                 }
                 symtab_offset = offset.saturating_add(*symoff as usize);
                 symtab_count = *nsyms as usize;
@@ -259,26 +286,17 @@ impl<'a> MachO<'a> {
                 ));
             }
 
-            if offset.saturating_add(8) > data.len() {
+            let header_end = offset.saturating_add(8);
+            if header_end > data.len() {
                 return Err(ParseError::TruncatedData {
-                    expected: offset.saturating_add(8),
+                    expected: header_end,
                     actual: data.len(),
                     context: "Mach-O load command header",
                 });
             }
 
-            let cmd = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
-            let cmdsize = u32::from_le_bytes([
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ]) as usize;
+            let cmd = read_u32_le(data, offset);
+            let cmdsize = read_u32_le(data, offset.saturating_add(4)) as usize;
 
             if cmdsize < 8 {
                 return Err(ParseError::invalid_structure(
@@ -291,18 +309,16 @@ impl<'a> MachO<'a> {
             let command_end = offset.checked_add(cmdsize).ok_or(ParseError::Overflow {
                 context: "Mach-O load command size",
             })?;
-            if command_end > data.len() {
-                return Err(ParseError::invalid_structure(
+            let cmd_data = data.get(offset..command_end).ok_or_else(|| {
+                ParseError::invalid_structure(
                     "load command",
                     offset as u64,
                     format!(
                         "cmdsize {cmdsize} extends beyond declared sizeofcmds region (remaining bytes: {})",
                         data.len().saturating_sub(offset)
                     ),
-                ));
-            }
-
-            let cmd_data = &data[offset..command_end];
+                )
+            })?;
             if let Some(lc) = LoadCommand::parse(cmd, cmd_data, is_64)? {
                 commands.push(lc);
             }
@@ -377,24 +393,19 @@ impl<'a> MachO<'a> {
             return stub_symbols;
         }
 
-        let num_stubs = stubs.size as usize / stub_size;
+        let num_stubs = (stubs.size as usize).checked_div(stub_size).unwrap_or(0);
         let entry_size = if is_64 { 16 } else { 12 };
 
         for i in 0..num_stubs {
             // Read the indirect symbol table entry (4 bytes each)
             let indirect_offset = file_offset
                 .saturating_add(indirect_symoff as usize)
-                .saturating_add((indirect_start_index + i).saturating_mul(4));
+                .saturating_add(indirect_start_index.saturating_add(i).saturating_mul(4));
             if indirect_offset.saturating_add(4) > data.len() {
                 break;
             }
 
-            let sym_index = u32::from_le_bytes([
-                data[indirect_offset],
-                data[indirect_offset + 1],
-                data[indirect_offset + 2],
-                data[indirect_offset + 3],
-            ]) as usize;
+            let sym_index = read_u32_le(data, indirect_offset) as usize;
 
             // Skip special indirect symbol values
             const INDIRECT_SYMBOL_LOCAL: u32 = 0x80000000;
@@ -410,20 +421,14 @@ impl<'a> MachO<'a> {
             }
 
             let sym_offset = symtab_offset.saturating_add(sym_index.saturating_mul(entry_size));
-            if sym_offset.saturating_add(entry_size) > data.len() {
+            let sym_end = sym_offset.saturating_add(entry_size);
+            let Some(sym_slice) = data.get(sym_offset..sym_end) else {
                 continue;
-            }
+            };
 
             // Parse the nlist to get the name
-            if let Ok(nlist) = Nlist::parse(&data[sym_offset..], is_64) {
-                let name = if (nlist.n_strx as usize) < strtab.len() {
-                    let name_bytes = &strtab[nlist.n_strx as usize..];
-                    let end = name_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(name_bytes.len());
-                    crate::name_from_bytes(&name_bytes[..end])
-                } else {
+            if let Ok(nlist) = Nlist::parse(sym_slice, is_64) {
+                let Some(name) = read_strtab_name(strtab, nlist.n_strx as usize) else {
                     continue;
                 };
 
@@ -432,7 +437,9 @@ impl<'a> MachO<'a> {
                 }
 
                 // Create a symbol at the stub address
-                let stub_addr = stubs.addr + (i * stub_size) as u64;
+                let stub_addr = stubs
+                    .addr
+                    .saturating_add(i.saturating_mul(stub_size) as u64);
                 stub_symbols.push(Symbol {
                     name,
                     address: stub_addr,
@@ -495,8 +502,8 @@ impl<'a> MachO<'a> {
         };
 
         // Each GOT entry is a pointer (8 bytes on 64-bit, 4 bytes on 32-bit)
-        let entry_size = if is_64 { 8 } else { 4 };
-        let num_entries = got.size as usize / entry_size;
+        let entry_size: usize = if is_64 { 8 } else { 4 };
+        let num_entries = (got.size as usize).checked_div(entry_size).unwrap_or(0);
         let nlist_entry_size = if is_64 { 16 } else { 12 };
 
         // reserved1 contains the index into the indirect symbol table
@@ -506,17 +513,12 @@ impl<'a> MachO<'a> {
             // Read the indirect symbol table entry (4 bytes each)
             let indirect_offset = file_offset
                 .saturating_add(indirect_symoff as usize)
-                .saturating_add((indirect_start_index + i).saturating_mul(4));
+                .saturating_add(indirect_start_index.saturating_add(i).saturating_mul(4));
             if indirect_offset.saturating_add(4) > data.len() {
                 break;
             }
 
-            let sym_index = u32::from_le_bytes([
-                data[indirect_offset],
-                data[indirect_offset + 1],
-                data[indirect_offset + 2],
-                data[indirect_offset + 3],
-            ]) as usize;
+            let sym_index = read_u32_le(data, indirect_offset) as usize;
 
             // Skip special indirect symbol values
             const INDIRECT_SYMBOL_LOCAL: u32 = 0x80000000;
@@ -533,20 +535,14 @@ impl<'a> MachO<'a> {
 
             let sym_offset =
                 symtab_offset.saturating_add(sym_index.saturating_mul(nlist_entry_size));
-            if sym_offset.saturating_add(nlist_entry_size) > data.len() {
+            let sym_end = sym_offset.saturating_add(nlist_entry_size);
+            let Some(sym_slice) = data.get(sym_offset..sym_end) else {
                 continue;
-            }
+            };
 
             // Parse the nlist to get the name
-            if let Ok(nlist) = Nlist::parse(&data[sym_offset..], is_64) {
-                let name = if (nlist.n_strx as usize) < strtab.len() {
-                    let name_bytes = &strtab[nlist.n_strx as usize..];
-                    let end = name_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(name_bytes.len());
-                    crate::name_from_bytes(&name_bytes[..end])
-                } else {
+            if let Ok(nlist) = Nlist::parse(sym_slice, is_64) {
+                let Some(name) = read_strtab_name(strtab, nlist.n_strx as usize) else {
                     continue;
                 };
 
@@ -555,7 +551,7 @@ impl<'a> MachO<'a> {
                 }
 
                 // Create a symbol at the GOT entry address
-                let got_addr = got.addr + (i * entry_size) as u64;
+                let got_addr = got.addr.saturating_add(i.saturating_mul(entry_size) as u64);
                 got_symbols.push(Symbol {
                     name,
                     address: got_addr,
@@ -583,23 +579,15 @@ impl<'a> MachO<'a> {
 
         for i in 0..count {
             let entry_offset = offset.saturating_add(i.saturating_mul(entry_size));
-            if entry_offset.saturating_add(entry_size) > data.len() {
+            let entry_end = entry_offset.saturating_add(entry_size);
+            let Some(entry_slice) = data.get(entry_offset..entry_end) else {
                 break;
-            }
+            };
 
-            let nlist = Nlist::parse(&data[entry_offset..], is_64)?;
+            let nlist = Nlist::parse(entry_slice, is_64)?;
 
             // Get symbol name from string table
-            let name = if (nlist.n_strx as usize) < strtab.len() {
-                let name_bytes = &strtab[nlist.n_strx as usize..];
-                let end = name_bytes
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(name_bytes.len());
-                crate::name_from_bytes(&name_bytes[..end])
-            } else {
-                String::new()
-            };
+            let name = read_strtab_name(strtab, nlist.n_strx as usize).unwrap_or_default();
 
             // Determine symbol kind based on section properties
             let kind = if nlist.is_stab() {
@@ -608,10 +596,10 @@ impl<'a> MachO<'a> {
                 SymbolKind::None
             } else if nlist.n_sect > 0 {
                 // n_sect is 1-based, convert to 0-based index
-                let sect_idx = (nlist.n_sect - 1) as usize;
-                if sect_idx < sections.len() {
+                let sect_idx = nlist.n_sect.saturating_sub(1) as usize;
+                if let Some(sect) = sections.get(sect_idx) {
                     use crate::Section as SectionTrait;
-                    if sections[sect_idx].is_executable() {
+                    if sect.is_executable() {
                         SymbolKind::Function
                     } else {
                         SymbolKind::Object
@@ -651,38 +639,49 @@ impl<'a> MachO<'a> {
         // Sort symbols by address for efficient neighbor lookup
         // We work on indices to avoid ownership issues
         let mut sorted_indices: Vec<usize> = (0..symbols.len()).collect();
-        sorted_indices.sort_by_key(|&i| symbols[i].address);
+        sorted_indices.sort_by_key(|&i| symbols.get(i).map(|s| s.address).unwrap_or(0));
 
         // For each symbol, find the next symbol in the same section
         for i in 0..sorted_indices.len() {
-            let idx = sorted_indices[i];
-            let sym = &symbols[idx];
+            let Some(&idx) = sorted_indices.get(i) else {
+                continue;
+            };
+            let Some(sym) = symbols.get(idx) else {
+                continue;
+            };
 
             // Skip symbols that already have a size or are undefined
             if sym.size > 0 || sym.address == 0 {
                 continue;
             }
+            let sym_address = sym.address;
 
             // Find which section this symbol belongs to
             let sym_section = section_bounds
                 .iter()
-                .position(|(start, end)| sym.address >= *start && sym.address < *end);
+                .position(|(start, end)| sym_address >= *start && sym_address < *end);
 
             let Some(sect_idx) = sym_section else {
                 continue;
             };
 
-            let (sect_start, sect_end) = section_bounds[sect_idx];
+            let Some(&(sect_start, sect_end)) = section_bounds.get(sect_idx) else {
+                continue;
+            };
 
             // Look for the next symbol in the same section
             let mut estimated_size = None;
-            for &next_idx in &sorted_indices[(i + 1)..] {
-                let next_sym = &symbols[next_idx];
+            let next_start = i.saturating_add(1);
+            let tail = sorted_indices.get(next_start..).unwrap_or(&[]);
+            for &next_idx in tail {
+                let Some(next_sym) = symbols.get(next_idx) else {
+                    continue;
+                };
 
                 // Check if next symbol is in the same section
                 if next_sym.address >= sect_start && next_sym.address < sect_end {
                     // Found the next symbol in the same section
-                    estimated_size = Some(next_sym.address - sym.address);
+                    estimated_size = Some(next_sym.address.saturating_sub(sym_address));
                     break;
                 }
 
@@ -694,18 +693,20 @@ impl<'a> MachO<'a> {
 
             // If no next symbol found, use distance to section end (with reasonable cap)
             let size = estimated_size.unwrap_or_else(|| {
-                let to_end = sect_end.saturating_sub(sym.address);
+                let to_end = sect_end.saturating_sub(sym_address);
                 to_end.min(4096) // Cap at 4KB for safety
             });
 
             // Apply the estimated size (cap at reasonable maximum)
-            symbols[idx].size = size.min(65536); // Cap at 64KB
+            if let Some(s) = symbols.get_mut(idx) {
+                s.size = size.min(65536); // Cap at 64KB
+            }
         }
     }
 
     /// Returns the data for this Mach-O (accounting for fat binary offset).
     fn macho_data(&self) -> &[u8] {
-        &self.data[self.offset..]
+        self.data.get(self.offset..).unwrap_or(&[])
     }
 
     /// Get a segment by name.
@@ -787,7 +788,7 @@ impl BinaryFormat for MachO<'_> {
         // Find the segment containing this address
         for segment in &self.segments {
             if addr >= segment.vmaddr && addr < segment.vmaddr.saturating_add(segment.vmsize) {
-                let offset_in_seg = (addr - segment.vmaddr) as usize;
+                let offset_in_seg = addr.saturating_sub(segment.vmaddr) as usize;
                 if offset_in_seg < segment.filesize as usize {
                     let file_offset = self
                         .offset
@@ -796,8 +797,10 @@ impl BinaryFormat for MachO<'_> {
                     let available = (segment.filesize as usize).saturating_sub(offset_in_seg);
                     let to_read = len.min(available);
                     let end = file_offset.saturating_add(to_read);
-                    if end <= self.data.len() && end > file_offset {
-                        return Some(&self.data[file_offset..end]);
+                    if end > file_offset {
+                        if let Some(slice) = self.data.get(file_offset..end) {
+                            return Some(slice);
+                        }
                     }
                 }
             }
@@ -808,7 +811,7 @@ impl BinaryFormat for MachO<'_> {
     fn section_containing(&self, addr: u64) -> Option<&dyn Section> {
         for segment in &self.segments {
             for section in &segment.sections {
-                if addr >= section.addr && addr < section.addr + section.size {
+                if addr >= section.addr && addr < section.addr.saturating_add(section.size) {
                     return Some(section as &dyn Section);
                 }
             }

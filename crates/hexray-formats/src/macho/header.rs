@@ -32,6 +32,17 @@ pub const MH_BUNDLE: u32 = 0x8;
 pub const MH_DSYM: u32 = 0xA;
 pub const MH_KEXT_BUNDLE: u32 = 0xB;
 
+// Bounds-checked little-endian reader (caller has already verified the
+// buffer length at function entry).
+#[inline]
+fn read_u32_at(data: &[u8], at: usize) -> [u8; 4] {
+    let end = at.saturating_add(4);
+    data.get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default()
+}
+
 /// CPU type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuType {
@@ -112,7 +123,7 @@ impl MachHeader {
             return Err(ParseError::too_short(28, data.len()));
         }
 
-        let magic = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+        let magic = u32::from_ne_bytes(read_u32_at(data, 0));
 
         let (is_64, needs_swap) = match magic {
             MH_MAGIC => (false, false),
@@ -120,7 +131,10 @@ impl MachHeader {
             MH_MAGIC_64 => (true, false),
             MH_CIGAM_64 => (true, true),
             _ => {
-                return Err(ParseError::invalid_magic("Mach-O", &data[0..4]));
+                return Err(ParseError::invalid_magic(
+                    "Mach-O",
+                    data.get(0..4).unwrap_or(&[]),
+                ));
             }
         };
 
@@ -130,12 +144,7 @@ impl MachHeader {
         }
 
         let read_u32 = |offset: usize| -> u32 {
-            let val = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
+            let val = u32::from_le_bytes(read_u32_at(data, offset));
             if needs_swap {
                 val.swap_bytes()
             } else {
@@ -218,29 +227,34 @@ impl FatHeader {
             return Err(ParseError::too_short(8, data.len()));
         }
 
-        let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let magic = u32::from_be_bytes(read_u32_at(data, 0));
         let needs_swap = magic == FAT_CIGAM;
 
         if magic != FAT_MAGIC && magic != FAT_CIGAM {
-            return Err(ParseError::invalid_magic("fat Mach-O", &data[0..4]));
+            return Err(ParseError::invalid_magic(
+                "fat Mach-O",
+                data.get(0..4).unwrap_or(&[]),
+            ));
         }
 
+        let raw_count = u32::from_be_bytes(read_u32_at(data, 4));
         let nfat_arch = if needs_swap {
-            u32::from_be_bytes([data[4], data[5], data[6], data[7]]).swap_bytes()
+            raw_count.swap_bytes()
         } else {
-            u32::from_be_bytes([data[4], data[5], data[6], data[7]])
+            raw_count
         };
 
         let mut architectures = Vec::with_capacity(nfat_arch.min(100) as usize);
         let mut offset: usize = 8;
 
         for _ in 0..nfat_arch {
-            if offset.saturating_add(20) > data.len() {
+            let next = offset.saturating_add(20);
+            if next > data.len() {
                 break;
             }
 
             let read_u32 = |o: usize| -> u32 {
-                let val = u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                let val = u32::from_be_bytes(read_u32_at(data, o));
                 if needs_swap {
                     val.swap_bytes()
                 } else {
@@ -250,13 +264,13 @@ impl FatHeader {
 
             architectures.push(FatArch {
                 cputype: read_u32(offset),
-                cpusubtype: read_u32(offset + 4),
-                offset: read_u32(offset + 8),
-                size: read_u32(offset + 12),
-                align: read_u32(offset + 16),
+                cpusubtype: read_u32(offset.saturating_add(4)),
+                offset: read_u32(offset.saturating_add(8)),
+                size: read_u32(offset.saturating_add(12)),
+                align: read_u32(offset.saturating_add(16)),
             });
 
-            offset = offset.saturating_add(20);
+            offset = next;
         }
 
         Ok(Self { architectures })

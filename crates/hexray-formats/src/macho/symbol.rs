@@ -1,5 +1,3 @@
-//! Mach-O symbol table parsing.
-
 #![allow(dead_code)]
 
 use crate::ParseError;
@@ -17,6 +15,41 @@ const N_ABS: u8 = 0x2; // Absolute
 const N_SECT: u8 = 0xE; // Defined in section
 const N_PBUD: u8 = 0xC; // Prebound undefined
 const N_INDR: u8 = 0xA; // Indirect
+
+// Bounds-checked little-endian readers (caller has already verified the
+// buffer length at function entry).
+#[inline]
+fn read_u16(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
 
 /// A Mach-O symbol table entry (nlist).
 #[derive(Debug, Clone)]
@@ -41,17 +74,15 @@ impl Nlist {
             return Err(ParseError::too_short(entry_size, data.len()));
         }
 
-        let n_strx = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let n_type = data[4];
-        let n_sect = data[5];
-        let n_desc = u16::from_le_bytes([data[6], data[7]]);
+        let n_strx = read_u32(data, 0);
+        let n_type = data.get(4).copied().unwrap_or(0);
+        let n_sect = data.get(5).copied().unwrap_or(0);
+        let n_desc = read_u16(data, 6);
 
         let n_value = if is_64 {
-            u64::from_le_bytes([
-                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
-            ])
+            read_u64(data, 8)
         } else {
-            u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as u64
+            read_u32(data, 8) as u64
         };
 
         Ok(Self {
@@ -126,7 +157,7 @@ impl Nlist {
             kind: self.kind(),
             binding: self.binding(),
             section_index: if self.n_sect > 0 {
-                Some(self.n_sect as u32 - 1) // n_sect is 1-based
+                Some((self.n_sect as u32).saturating_sub(1)) // n_sect is 1-based
             } else {
                 None
             },

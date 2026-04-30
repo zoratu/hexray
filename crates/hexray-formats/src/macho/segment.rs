@@ -1,11 +1,3 @@
-//! Mach-O segment and section parsing.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::ParseError;
 
 // Section flags
@@ -16,6 +8,30 @@ pub const S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00000400;
 pub const VM_PROT_READ: u32 = 0x01;
 pub const VM_PROT_WRITE: u32 = 0x02;
 pub const VM_PROT_EXECUTE: u32 = 0x04;
+
+// Bounds-checked little-endian readers (caller has already verified
+// the buffer length at function entry).
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
 
 /// A Mach-O segment.
 #[derive(Debug, Clone)]
@@ -47,25 +63,26 @@ impl Segment {
             return Err(ParseError::too_short(56, data.len()));
         }
 
-        let segname = parse_name(&data[8..24]);
-        let vmaddr = u32::from_le_bytes([data[24], data[25], data[26], data[27]]) as u64;
-        let vmsize = u32::from_le_bytes([data[28], data[29], data[30], data[31]]) as u64;
-        let fileoff = u32::from_le_bytes([data[32], data[33], data[34], data[35]]) as u64;
-        let filesize = u32::from_le_bytes([data[36], data[37], data[38], data[39]]) as u64;
-        let maxprot = u32::from_le_bytes([data[40], data[41], data[42], data[43]]);
-        let initprot = u32::from_le_bytes([data[44], data[45], data[46], data[47]]);
-        let nsects = u32::from_le_bytes([data[48], data[49], data[50], data[51]]);
-        let flags = u32::from_le_bytes([data[52], data[53], data[54], data[55]]);
+        let segname = parse_name(data.get(8..24).unwrap_or(&[]));
+        let vmaddr = read_u32(data, 24) as u64;
+        let vmsize = read_u32(data, 28) as u64;
+        let fileoff = read_u32(data, 32) as u64;
+        let filesize = read_u32(data, 36) as u64;
+        let maxprot = read_u32(data, 40);
+        let initprot = read_u32(data, 44);
+        let nsects = read_u32(data, 48);
+        let flags = read_u32(data, 52);
 
         // Parse sections
         let mut sections = Vec::with_capacity(nsects.min(1000) as usize);
         let mut offset: usize = 56;
         for _ in 0..nsects {
-            if offset.saturating_add(68) > data.len() {
+            let next = offset.saturating_add(68);
+            let Some(slice) = data.get(offset..next) else {
                 break;
-            }
-            sections.push(Section::parse_32(&data[offset..])?);
-            offset = offset.saturating_add(68);
+            };
+            sections.push(Section::parse_32(slice)?);
+            offset = next;
         }
 
         Ok(Self {
@@ -87,33 +104,26 @@ impl Segment {
             return Err(ParseError::too_short(72, data.len()));
         }
 
-        let segname = parse_name(&data[8..24]);
-        let vmaddr = u64::from_le_bytes([
-            data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
-        ]);
-        let vmsize = u64::from_le_bytes([
-            data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
-        ]);
-        let fileoff = u64::from_le_bytes([
-            data[40], data[41], data[42], data[43], data[44], data[45], data[46], data[47],
-        ]);
-        let filesize = u64::from_le_bytes([
-            data[48], data[49], data[50], data[51], data[52], data[53], data[54], data[55],
-        ]);
-        let maxprot = u32::from_le_bytes([data[56], data[57], data[58], data[59]]);
-        let initprot = u32::from_le_bytes([data[60], data[61], data[62], data[63]]);
-        let nsects = u32::from_le_bytes([data[64], data[65], data[66], data[67]]);
-        let flags = u32::from_le_bytes([data[68], data[69], data[70], data[71]]);
+        let segname = parse_name(data.get(8..24).unwrap_or(&[]));
+        let vmaddr = read_u64(data, 24);
+        let vmsize = read_u64(data, 32);
+        let fileoff = read_u64(data, 40);
+        let filesize = read_u64(data, 48);
+        let maxprot = read_u32(data, 56);
+        let initprot = read_u32(data, 60);
+        let nsects = read_u32(data, 64);
+        let flags = read_u32(data, 68);
 
         // Parse sections
         let mut sections = Vec::with_capacity(nsects.min(1000) as usize);
         let mut offset: usize = 72;
         for _ in 0..nsects {
-            if offset.saturating_add(80) > data.len() {
+            let next = offset.saturating_add(80);
+            let Some(slice) = data.get(offset..next) else {
                 break;
-            }
-            sections.push(Section::parse_64(&data[offset..])?);
-            offset = offset.saturating_add(80);
+            };
+            sections.push(Section::parse_64(slice)?);
+            offset = next;
         }
 
         Ok(Self {
@@ -182,17 +192,17 @@ impl Section {
         }
 
         Ok(Self {
-            sectname: parse_name(&data[0..16]),
-            segname: parse_name(&data[16..32]),
-            addr: u32::from_le_bytes([data[32], data[33], data[34], data[35]]) as u64,
-            size: u32::from_le_bytes([data[36], data[37], data[38], data[39]]) as u64,
-            offset: u32::from_le_bytes([data[40], data[41], data[42], data[43]]),
-            align: u32::from_le_bytes([data[44], data[45], data[46], data[47]]),
-            reloff: u32::from_le_bytes([data[48], data[49], data[50], data[51]]),
-            nreloc: u32::from_le_bytes([data[52], data[53], data[54], data[55]]),
-            flags: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-            reserved1: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
-            reserved2: u32::from_le_bytes([data[64], data[65], data[66], data[67]]),
+            sectname: parse_name(data.get(0..16).unwrap_or(&[])),
+            segname: parse_name(data.get(16..32).unwrap_or(&[])),
+            addr: read_u32(data, 32) as u64,
+            size: read_u32(data, 36) as u64,
+            offset: read_u32(data, 40),
+            align: read_u32(data, 44),
+            reloff: read_u32(data, 48),
+            nreloc: read_u32(data, 52),
+            flags: read_u32(data, 56),
+            reserved1: read_u32(data, 60),
+            reserved2: read_u32(data, 64),
             reserved3: 0,
             data_cache: Vec::new(),
         })
@@ -205,22 +215,18 @@ impl Section {
         }
 
         Ok(Self {
-            sectname: parse_name(&data[0..16]),
-            segname: parse_name(&data[16..32]),
-            addr: u64::from_le_bytes([
-                data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
-            ]),
-            size: u64::from_le_bytes([
-                data[40], data[41], data[42], data[43], data[44], data[45], data[46], data[47],
-            ]),
-            offset: u32::from_le_bytes([data[48], data[49], data[50], data[51]]),
-            align: u32::from_le_bytes([data[52], data[53], data[54], data[55]]),
-            reloff: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-            nreloc: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
-            flags: u32::from_le_bytes([data[64], data[65], data[66], data[67]]),
-            reserved1: u32::from_le_bytes([data[68], data[69], data[70], data[71]]),
-            reserved2: u32::from_le_bytes([data[72], data[73], data[74], data[75]]),
-            reserved3: u32::from_le_bytes([data[76], data[77], data[78], data[79]]),
+            sectname: parse_name(data.get(0..16).unwrap_or(&[])),
+            segname: parse_name(data.get(16..32).unwrap_or(&[])),
+            addr: read_u64(data, 32),
+            size: read_u64(data, 40),
+            offset: read_u32(data, 48),
+            align: read_u32(data, 52),
+            reloff: read_u32(data, 56),
+            nreloc: read_u32(data, 60),
+            flags: read_u32(data, 64),
+            reserved1: read_u32(data, 68),
+            reserved2: read_u32(data, 72),
+            reserved3: read_u32(data, 76),
             data_cache: Vec::new(),
         })
     }
@@ -234,8 +240,10 @@ impl Section {
     pub fn populate_data(&mut self, file_data: &[u8]) {
         let start = self.offset as usize;
         let end = start.saturating_add(self.size as usize);
-        if end <= file_data.len() && end > start {
-            self.data_cache = file_data[start..end].to_vec();
+        if end > start {
+            if let Some(slice) = file_data.get(start..end) {
+                self.data_cache = slice.to_vec();
+            }
         }
     }
 }
@@ -274,5 +282,5 @@ impl crate::Section for Section {
 /// Parse a null-terminated name from a fixed-size buffer.
 fn parse_name(data: &[u8]) -> String {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    crate::name_from_bytes(&data[..end])
+    crate::name_from_bytes(data.get(..end).unwrap_or(&[]))
 }

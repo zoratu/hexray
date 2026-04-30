@@ -1,10 +1,3 @@
-//! Mach-O load command parsing.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![allow(dead_code)]
 
 use super::segment::Segment;
@@ -31,6 +24,30 @@ pub const LC_MAIN: u32 = 0x80000028;
 pub const LC_DATA_IN_CODE: u32 = 0x29;
 pub const LC_SOURCE_VERSION: u32 = 0x2A;
 pub const LC_BUILD_VERSION: u32 = 0x32;
+
+// Bounds-checked little-endian readers (caller has already verified
+// the buffer length at function entry).
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
 
 /// A parsed load command.
 #[derive(Debug, Clone)]
@@ -82,7 +99,7 @@ impl LoadCommand {
             return Err(ParseError::too_short(8, data.len()));
         }
 
-        let cmdsize = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let cmdsize = read_u32(data, 4);
 
         let result = match cmd {
             LC_SEGMENT => {
@@ -98,10 +115,10 @@ impl LoadCommand {
                     return Err(ParseError::too_short(24, data.len()));
                 }
                 Some(Self::Symtab {
-                    symoff: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-                    nsyms: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-                    stroff: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-                    strsize: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
+                    symoff: read_u32(data, 8),
+                    nsyms: read_u32(data, 12),
+                    stroff: read_u32(data, 16),
+                    strsize: read_u32(data, 20),
                 })
             }
             LC_DYSYMTAB => {
@@ -109,15 +126,15 @@ impl LoadCommand {
                     return Ok(Some(Self::Other { cmd, cmdsize }));
                 }
                 Some(Self::Dysymtab {
-                    ilocalsym: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-                    nlocalsym: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-                    iextdefsym: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
-                    nextdefsym: u32::from_le_bytes([data[20], data[21], data[22], data[23]]),
-                    iundefsym: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
-                    nundefsym: u32::from_le_bytes([data[28], data[29], data[30], data[31]]),
+                    ilocalsym: read_u32(data, 8),
+                    nlocalsym: read_u32(data, 12),
+                    iextdefsym: read_u32(data, 16),
+                    nextdefsym: read_u32(data, 20),
+                    iundefsym: read_u32(data, 24),
+                    nundefsym: read_u32(data, 28),
                     // Indirect symbol table info is at offsets 56 and 60
-                    indirectsymoff: u32::from_le_bytes([data[56], data[57], data[58], data[59]]),
-                    nindirectsyms: u32::from_le_bytes([data[60], data[61], data[62], data[63]]),
+                    indirectsymoff: read_u32(data, 56),
+                    nindirectsyms: read_u32(data, 60),
                 })
             }
             LC_MAIN => {
@@ -125,35 +142,19 @@ impl LoadCommand {
                     return Err(ParseError::too_short(24, data.len()));
                 }
                 Some(Self::Main {
-                    entryoff: u64::from_le_bytes([
-                        data[8], data[9], data[10], data[11], data[12], data[13], data[14],
-                        data[15],
-                    ]),
-                    stacksize: u64::from_le_bytes([
-                        data[16], data[17], data[18], data[19], data[20], data[21], data[22],
-                        data[23],
-                    ]),
+                    entryoff: read_u64(data, 8),
+                    stacksize: read_u64(data, 16),
                 })
             }
             LC_UNIXTHREAD => {
-                // Thread state is architecture-specific
-                // For x86_64, RIP is at offset 16*8 + 8 = 136 from thread state start
-                // Thread state starts at offset 16 (after cmd, cmdsize, flavor, count)
+                // Thread state is architecture-specific.
+                // For x86_64, RIP is at offset 16*8 + 8 = 136 from thread state start.
+                // Thread state starts at offset 16 (after cmd, cmdsize, flavor, count).
+                // For i386, EIP is at offset 10*4 = 40.
                 let entry_point = if is_64 && data.len() >= 16 + 136 + 8 {
-                    u64::from_le_bytes([
-                        data[16 + 136],
-                        data[16 + 137],
-                        data[16 + 138],
-                        data[16 + 139],
-                        data[16 + 140],
-                        data[16 + 141],
-                        data[16 + 142],
-                        data[16 + 143],
-                    ])
+                    read_u64(data, 16 + 136)
                 } else if !is_64 && data.len() >= 16 + 40 + 4 {
-                    // For i386, EIP is at offset 10*4 = 40
-                    u32::from_le_bytes([data[16 + 40], data[16 + 41], data[16 + 42], data[16 + 43]])
-                        as u64
+                    read_u32(data, 16 + 40) as u64
                 } else {
                     0
                 };
@@ -164,24 +165,25 @@ impl LoadCommand {
                     return Err(ParseError::too_short(24, data.len()));
                 }
                 let mut uuid = [0u8; 16];
-                uuid.copy_from_slice(&data[8..24]);
+                if let Some(slice) = data.get(8..24) {
+                    uuid.copy_from_slice(slice);
+                }
                 Some(Self::Uuid { uuid })
             }
             LC_LOAD_DYLIB | LC_ID_DYLIB => {
                 if data.len() < 24 {
                     return Ok(Some(Self::Other { cmd, cmdsize }));
                 }
-                let name_offset =
-                    u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-                let name = if name_offset < data.len() {
-                    let name_bytes = &data[name_offset..];
-                    let end = name_bytes
-                        .iter()
-                        .position(|&b| b == 0)
-                        .unwrap_or(name_bytes.len());
-                    crate::name_from_bytes(&name_bytes[..end])
-                } else {
-                    String::new()
+                let name_offset = read_u32(data, 8) as usize;
+                let name = match data.get(name_offset..) {
+                    Some(name_bytes) => {
+                        let end = name_bytes
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(name_bytes.len());
+                        crate::name_from_bytes(name_bytes.get(..end).unwrap_or(&[]))
+                    }
+                    None => String::new(),
                 };
                 Some(Self::LoadDylib { name })
             }
@@ -190,9 +192,9 @@ impl LoadCommand {
                     return Ok(Some(Self::Other { cmd, cmdsize }));
                 }
                 Some(Self::BuildVersion {
-                    platform: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-                    minos: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
-                    sdk: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
+                    platform: read_u32(data, 8),
+                    minos: read_u32(data, 12),
+                    sdk: read_u32(data, 16),
                 })
             }
             LC_FUNCTION_STARTS => {
@@ -200,8 +202,8 @@ impl LoadCommand {
                     return Ok(Some(Self::Other { cmd, cmdsize }));
                 }
                 Some(Self::FunctionStarts {
-                    dataoff: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
-                    datasize: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+                    dataoff: read_u32(data, 8),
+                    datasize: read_u32(data, 12),
                 })
             }
             _ => Some(Self::Other { cmd, cmdsize }),
