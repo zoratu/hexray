@@ -77,7 +77,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             RegisterClass::FloatingPoint,
-            hexray_core::register::arm64::V0 + id,
+            hexray_core::register::arm64::V0.saturating_add(id),
             8,
         )
     }
@@ -88,7 +88,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             RegisterClass::FloatingPoint,
-            hexray_core::register::arm64::V0 + id,
+            hexray_core::register::arm64::V0.saturating_add(id),
             16,
         )
     }
@@ -98,7 +98,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             RegisterClass::FloatingPoint,
-            hexray_core::register::arm64::V0 + id,
+            hexray_core::register::arm64::V0.saturating_add(id),
             32,
         )
     }
@@ -108,7 +108,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             RegisterClass::FloatingPoint,
-            hexray_core::register::arm64::V0 + id,
+            hexray_core::register::arm64::V0.saturating_add(id),
             64,
         )
     }
@@ -118,7 +118,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             RegisterClass::Vector,
-            hexray_core::register::arm64::V0 + id,
+            hexray_core::register::arm64::V0.saturating_add(id),
             128,
         )
     }
@@ -136,7 +136,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             class,
-            hexray_core::register::arm64::V0 + id,
+            hexray_core::register::arm64::V0.saturating_add(id),
             bits,
         )
     }
@@ -446,7 +446,7 @@ impl Arm64Disassembler {
                 let imm16 = ((insn >> 5) & 0xFFFF) as u64;
                 let hw = ((insn >> 21) & 0x3) as u8;
                 let opc = (insn >> 29) & 0x3;
-                let shift = hw * 16;
+                let shift = (hw as u32).wrapping_mul(16);
 
                 let (mnemonic, operation) = match opc {
                     0b00 => ("movn", Operation::Move),
@@ -697,7 +697,7 @@ impl Arm64Disassembler {
                 let is_bl = (insn >> 31) & 1 == 1;
                 let imm26 = (insn & 0x3FFFFFF) as i64;
                 let offset = sign_extend((imm26 << 2) as u64, 28);
-                let target = (address as i64 + offset) as u64;
+                let target = (address as i64).wrapping_add(offset) as u64;
 
                 let mnemonic = if is_bl { "bl" } else { "b" };
                 let cf = if is_bl {
@@ -736,7 +736,7 @@ impl Arm64Disassembler {
                     let rt = (insn & 0x1F) as u16;
                     let imm19 = ((insn >> 5) & 0x7FFFF) as i64;
                     let offset = sign_extend((imm19 << 2) as u64, 21);
-                    let target = (address as i64 + offset) as u64;
+                    let target = (address as i64).wrapping_add(offset) as u64;
 
                     let mnemonic = if is_cbnz { "cbnz" } else { "cbz" };
                     let reg = if sf { Self::xreg(rt) } else { Self::wreg(rt) };
@@ -767,7 +767,7 @@ impl Arm64Disassembler {
                     let rt = (insn & 0x1F) as u16;
                     let imm14 = ((insn >> 5) & 0x3FFF) as i64;
                     let offset = sign_extend((imm14 << 2) as u64, 16);
-                    let target = (address as i64 + offset) as u64;
+                    let target = (address as i64).wrapping_add(offset) as u64;
 
                     let mnemonic = if is_tbnz { "tbnz" } else { "tbz" };
                     let is_64bit = b5 == 1;
@@ -807,7 +807,7 @@ impl Arm64Disassembler {
                 let cond = (insn & 0xF) as u8;
                 let imm19 = ((insn >> 5) & 0x7FFFF) as i64;
                 let offset = sign_extend((imm19 << 2) as u64, 21);
-                let target = (address as i64 + offset) as u64;
+                let target = (address as i64).wrapping_add(offset) as u64;
 
                 let (cond_suffix, condition) = decode_condition(cond);
                 let mnemonic = format!("b.{}", cond_suffix);
@@ -1334,8 +1334,8 @@ impl Arm64Disassembler {
                 _ => return self.decode_unknown(insn, address, bytes),
             };
 
-            let offset = sign_extend((imm7 << scale) as u64, 7 + scale as u8);
-            let access_size = (1u8 << scale) * 2; // Pair access
+            let offset = sign_extend((imm7 << scale) as u64, 7u8.saturating_add(scale as u8));
+            let access_size = (1u8 << scale).saturating_mul(2); // Pair access
 
             let mnemonic = if is_load { "ldp" } else { "stp" };
             let reg1 = Self::simd_reg(rt, simd_size);
@@ -1370,7 +1370,7 @@ impl Arm64Disassembler {
         let is_load = l == 1;
         let is_64bit = opc & 0b10 != 0;
         let scale = if is_64bit { 3 } else { 2 };
-        let offset = sign_extend((imm7 << scale) as u64, 7 + scale);
+        let offset = sign_extend((imm7 << scale) as u64, 7u8.saturating_add(scale));
 
         let mnemonic = if is_load { "ldp" } else { "stp" };
         let reg1 = if is_64bit {
@@ -1648,7 +1648,7 @@ impl Arm64Disassembler {
         let rt = (insn & 0x1F) as u16;
 
         let offset = sign_extend((imm19 << 2) as u64, 21);
-        let target = (address as i64 + offset) as u64;
+        let target = (address as i64).wrapping_add(offset) as u64;
 
         if v == 1 {
             // SIMD/FP literal load
@@ -3263,7 +3263,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             RegisterClass::Vector,
-            arm64::V0 + id,
+            arm64::V0.saturating_add(id),
             bits,
         )
     }
@@ -3273,7 +3273,7 @@ impl Arm64Disassembler {
         Register::new(
             Architecture::Arm64,
             RegisterClass::FloatingPoint,
-            arm64::V0 + id,
+            arm64::V0.saturating_add(id),
             bits,
         )
     }
@@ -3350,7 +3350,7 @@ impl Disassembler for Arm64Disassembler {
 
 /// Sign-extend a value from a given bit width.
 fn sign_extend(value: u64, bits: u8) -> i64 {
-    let shift = 64 - bits;
+    let shift = 64u8.saturating_sub(bits);
     ((value as i64) << shift) >> shift
 }
 
@@ -3386,7 +3386,7 @@ fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
         // Find highest set bit in ~imms
         let mut len = 5u8;
         while len > 0 && (imms & (1 << len)) != 0 {
-            len -= 1;
+            len = len.saturating_sub(1);
         }
         len
     };
