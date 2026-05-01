@@ -159,16 +159,12 @@ impl Emulator {
 
         // Handle control flow
         match inst.operation {
-            hexray_core::Operation::Call => {
-                if self.config.stop_at_calls {
-                    let target = self.get_call_target(inst);
-                    return Ok(StopReason::Call(target.as_concrete().unwrap_or(0)));
-                }
+            hexray_core::Operation::Call if self.config.stop_at_calls => {
+                let target = self.get_call_target(inst);
+                return Ok(StopReason::Call(target.as_concrete().unwrap_or(0)));
             }
-            hexray_core::Operation::Return => {
-                if self.config.stop_at_returns {
-                    return Ok(StopReason::Return);
-                }
+            hexray_core::Operation::Return if self.config.stop_at_returns => {
+                return Ok(StopReason::Return);
             }
             hexray_core::Operation::Jump => {
                 let target = self.get_jump_target(inst);
