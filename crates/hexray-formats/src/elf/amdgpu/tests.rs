@@ -506,7 +506,7 @@ fn metadata_note_attaches_to_matching_kernel() {
 
     // Update the ehdr fields: e_shoff and e_shnum.
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF with note parses");
     let view = elf.code_object_view().expect("view builds");
@@ -683,7 +683,7 @@ fn scale_kinfo_section_synthesises_kernel_metadata() {
 
     // Update ehdr: e_shoff and e_shnum.
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF with kinfo parses");
     let view = elf.code_object_view().expect("view builds");
@@ -800,7 +800,7 @@ fn metadata_attaches_via_symbol_match_not_name() {
     nh[48..56].copy_from_slice(&4u64.to_le_bytes());
     rebuilt.extend_from_slice(&nh);
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF parses");
     let view = elf.code_object_view().expect("view builds");
@@ -854,7 +854,7 @@ fn metadata_does_not_attach_when_neither_name_nor_symbol_matches() {
     nh[48..56].copy_from_slice(&4u64.to_le_bytes());
     rebuilt.extend_from_slice(&nh);
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF parses");
     let view = elf.code_object_view().expect("view builds");
@@ -920,7 +920,7 @@ fn metadata_note_with_wrong_name_is_ignored() {
     nh[48..56].copy_from_slice(&4u64.to_le_bytes());
     rebuilt.extend_from_slice(&nh);
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF parses");
     let view = elf.code_object_view().expect("view builds");
@@ -985,7 +985,7 @@ fn metadata_note_with_wrong_type_is_ignored() {
     nh[48..56].copy_from_slice(&4u64.to_le_bytes());
     rebuilt.extend_from_slice(&nh);
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF parses");
     let view = elf.code_object_view().expect("view builds");
@@ -1069,7 +1069,7 @@ fn metadata_search_iterates_past_non_amdgpu_notes() {
     nh[48..56].copy_from_slice(&4u64.to_le_bytes());
     rebuilt.extend_from_slice(&nh);
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF parses");
     let view = elf.code_object_view().expect("view builds");
@@ -1133,7 +1133,7 @@ fn truncated_note_record_breaks_loop_without_panic() {
     nh[48..56].copy_from_slice(&4u64.to_le_bytes());
     rebuilt.extend_from_slice(&nh);
     rebuilt[40..48].copy_from_slice(&new_shoff.to_le_bytes());
-    rebuilt[60..62].copy_from_slice(&((e_shnum + 1) as u16).to_le_bytes());
+    rebuilt[60..62].copy_from_slice(&(e_shnum + 1).to_le_bytes());
 
     let elf = Elf::parse(&rebuilt).expect("ELF parses");
     let view = elf
