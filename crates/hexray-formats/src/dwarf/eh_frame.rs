@@ -1,4 +1,3 @@
-//! DWARF .eh_frame exception handling frame parsing.
 //!
 //! The `.eh_frame` section contains exception handling information used for:
 //! - C++ exception unwinding
@@ -31,16 +30,37 @@
 //! }
 //! ```
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // Allow DWARF standard naming conventions (DW_CFA_*, DW_EH_PE_*)
 #![allow(non_upper_case_globals)]
 
 use super::leb128::{decode_sleb128, decode_uleb128};
 use crate::ParseError;
+
+/// Decode a ULEB128 starting at `*pos` of `data`, advancing `*pos`.
+#[inline]
+fn read_uleb_at(data: &[u8], pos: &mut usize) -> Result<u64, ParseError> {
+    let tail = data.get(*pos..).ok_or(ParseError::TruncatedData {
+        expected: *pos,
+        actual: data.len(),
+        context: "ULEB128",
+    })?;
+    let (val, len) = decode_uleb128(tail)?;
+    *pos = pos.saturating_add(len);
+    Ok(val)
+}
+
+/// Decode an SLEB128 starting at `*pos` of `data`, advancing `*pos`.
+#[inline]
+fn read_sleb_at(data: &[u8], pos: &mut usize) -> Result<i64, ParseError> {
+    let tail = data.get(*pos..).ok_or(ParseError::TruncatedData {
+        expected: *pos,
+        actual: data.len(),
+        context: "SLEB128",
+    })?;
+    let (val, len) = decode_sleb128(tail)?;
+    *pos = pos.saturating_add(len);
+    Ok(val)
+}
 
 /// Parsed .eh_frame section data.
 #[derive(Debug, Clone)]
@@ -66,14 +86,14 @@ impl EhFrame {
     pub fn function_boundaries(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.fdes
             .iter()
-            .map(|fde| (fde.pc_begin, fde.pc_begin + fde.pc_range))
+            .map(|fde| (fde.pc_begin, fde.pc_begin.saturating_add(fde.pc_range)))
     }
 
     /// Find the FDE containing the given address.
     pub fn find_fde(&self, address: u64) -> Option<&Fde> {
-        self.fdes
-            .iter()
-            .find(|fde| address >= fde.pc_begin && address < fde.pc_begin + fde.pc_range)
+        self.fdes.iter().find(|fde| {
+            address >= fde.pc_begin && address < fde.pc_begin.saturating_add(fde.pc_range)
+        })
     }
 
     /// Get the CIE for an FDE by its CIE offset.
@@ -193,7 +213,7 @@ impl Fde {
 
     /// Get the end address of the code range.
     pub fn pc_end(&self) -> u64 {
-        self.pc_begin + self.pc_range
+        self.pc_begin.saturating_add(self.pc_range)
     }
 }
 
@@ -332,11 +352,14 @@ impl<'a> EhFrameParser<'a> {
     /// Parse the .eh_frame section.
     pub fn parse(&self) -> Result<EhFrame, ParseError> {
         let mut eh_frame = EhFrame::new();
-        let mut offset = 0;
+        let mut offset = 0usize;
 
         while offset < self.data.len() {
             // Check if we have enough data for the length field
-            if offset + 4 > self.data.len() {
+            let Some(after_initial) = offset.checked_add(4) else {
+                break;
+            };
+            if after_initial > self.data.len() {
                 break;
             }
 
@@ -344,7 +367,7 @@ impl<'a> EhFrameParser<'a> {
 
             // Parse length (4 bytes, or 12 bytes for 64-bit DWARF)
             let initial_length = self.read_u32(offset)?;
-            offset += 4;
+            offset = after_initial;
 
             // Handle terminator (zero length)
             if initial_length == 0 {
@@ -353,22 +376,25 @@ impl<'a> EhFrameParser<'a> {
 
             let (length, is_64bit) = if initial_length == 0xFFFFFFFF {
                 // 64-bit DWARF
-                if offset + 8 > self.data.len() {
+                let after_64bit = offset.saturating_add(8);
+                if after_64bit > self.data.len() {
                     return Err(ParseError::TruncatedData {
-                        expected: offset + 8,
+                        expected: after_64bit,
                         actual: self.data.len(),
                         context: "eh_frame 64-bit length",
                     });
                 }
                 let len = self.read_u64(offset)?;
-                offset += 8;
+                offset = after_64bit;
                 (len, true)
             } else {
                 (initial_length as u64, false)
             };
 
             // Calculate end of this entry
-            let entry_end = offset + length as usize;
+            let Some(entry_end) = offset.checked_add(length as usize) else {
+                break;
+            };
             if entry_end > self.data.len() {
                 // Truncated entry, try to continue with what we have
                 break;
@@ -376,7 +402,10 @@ impl<'a> EhFrameParser<'a> {
 
             // Read CIE ID / CIE pointer
             let id_size = if is_64bit { 8 } else { 4 };
-            if offset + id_size > self.data.len() {
+            let Some(after_id) = offset.checked_add(id_size) else {
+                break;
+            };
+            if after_id > self.data.len() {
                 break;
             }
 
@@ -437,33 +466,36 @@ impl<'a> EhFrameParser<'a> {
         cie.is_64bit = is_64bit;
 
         // Skip the CIE ID (already read)
-        offset += if is_64bit { 8 } else { 4 };
+        offset = offset.saturating_add(if is_64bit { 8 } else { 4 });
 
         // Version
-        if offset >= self.data.len() {
+        let Some(version_byte) = self.data.get(offset).copied() else {
             return Err(ParseError::TruncatedData {
-                expected: offset + 1,
+                expected: offset.saturating_add(1),
                 actual: self.data.len(),
                 context: "CIE version",
             });
-        }
-        cie.version = self.data[offset];
-        offset += 1;
+        };
+        cie.version = version_byte;
+        offset = offset.saturating_add(1);
 
         // Augmentation string (null-terminated)
         let aug_start = offset;
-        while offset < self.data.len() && self.data[offset] != 0 {
-            offset += 1;
+        while let Some(b) = self.data.get(offset).copied() {
+            if b == 0 {
+                break;
+            }
+            offset = offset.saturating_add(1);
         }
         if offset >= self.data.len() {
             return Err(ParseError::TruncatedData {
-                expected: offset + 1,
+                expected: offset.saturating_add(1),
                 actual: self.data.len(),
                 context: "CIE augmentation",
             });
         }
-        cie.augmentation = crate::name_from_bytes(&self.data[aug_start..offset]);
-        offset += 1; // Skip null terminator
+        cie.augmentation = crate::name_from_bytes(self.data.get(aug_start..offset).unwrap_or(&[]));
+        offset = offset.saturating_add(1); // Skip null terminator
 
         // Check for signal frame ('S' augmentation)
         if cie.augmentation.contains('S') {
@@ -473,50 +505,41 @@ impl<'a> EhFrameParser<'a> {
         // For DWARF version 4+, there are address_size and segment_size fields
         if cie.version >= 4 {
             // address_size
-            if offset >= self.data.len() {
+            if self.data.get(offset).is_none() {
                 return Ok(cie);
             }
-            let _address_size = self.data[offset];
-            offset += 1;
+            offset = offset.saturating_add(1);
 
             // segment_size
-            if offset >= self.data.len() {
+            if self.data.get(offset).is_none() {
                 return Ok(cie);
             }
-            let _segment_size = self.data[offset];
-            offset += 1;
+            offset = offset.saturating_add(1);
         }
 
         // Code alignment factor (ULEB128)
-        let (code_align, bytes) = decode_uleb128(&self.data[offset..])?;
-        cie.code_alignment = code_align;
-        offset += bytes;
+        cie.code_alignment = read_uleb_at(self.data, &mut offset)?;
 
         // Data alignment factor (SLEB128)
-        let (data_align, bytes) = decode_sleb128(&self.data[offset..])?;
-        cie.data_alignment = data_align;
-        offset += bytes;
+        cie.data_alignment = read_sleb_at(self.data, &mut offset)?;
 
         // Return address register
         if cie.version == 1 {
-            if offset >= self.data.len() {
+            let Some(reg_byte) = self.data.get(offset).copied() else {
                 return Ok(cie);
-            }
-            cie.return_register = self.data[offset] as u64;
-            offset += 1;
+            };
+            cie.return_register = reg_byte as u64;
+            offset = offset.saturating_add(1);
         } else {
-            let (return_reg, bytes) = decode_uleb128(&self.data[offset..])?;
-            cie.return_register = return_reg;
-            offset += bytes;
+            cie.return_register = read_uleb_at(self.data, &mut offset)?;
         }
 
         // Parse augmentation data if augmentation string starts with 'z'
         if cie.augmentation.starts_with('z') {
-            let (aug_len, bytes) = decode_uleb128(&self.data[offset..])?;
+            let aug_len = read_uleb_at(self.data, &mut offset)?;
             cie.augmentation_length = Some(aug_len);
-            offset += bytes;
 
-            let aug_end = offset + aug_len as usize;
+            let aug_end = offset.saturating_add(aug_len as usize);
 
             // Parse augmentation data based on the augmentation string
             for ch in cie.augmentation.chars().skip(1) {
@@ -526,29 +549,28 @@ impl<'a> EhFrameParser<'a> {
                 match ch {
                     'L' => {
                         // LSDA encoding
-                        if offset < self.data.len() {
-                            cie.lsda_encoding = Some(self.data[offset]);
-                            offset += 1;
+                        if let Some(b) = self.data.get(offset).copied() {
+                            cie.lsda_encoding = Some(b);
+                            offset = offset.saturating_add(1);
                         }
                     }
                     'P' => {
                         // Personality encoding and pointer
-                        if offset < self.data.len() {
-                            let encoding = self.data[offset];
+                        if let Some(encoding) = self.data.get(offset).copied() {
                             cie.personality_encoding = Some(encoding);
-                            offset += 1;
+                            offset = offset.saturating_add(1);
 
                             // Read the personality pointer
                             let (ptr, bytes) = self.read_encoded_pointer(offset, encoding)?;
                             cie.personality = Some(ptr);
-                            offset += bytes;
+                            offset = offset.saturating_add(bytes);
                         }
                     }
                     'R' => {
                         // FDE pointer encoding
-                        if offset < self.data.len() {
-                            cie.fde_pointer_encoding = Some(self.data[offset]);
-                            offset += 1;
+                        if let Some(b) = self.data.get(offset).copied() {
+                            cie.fde_pointer_encoding = Some(b);
+                            offset = offset.saturating_add(1);
                         }
                     }
                     'S' => {
@@ -566,8 +588,8 @@ impl<'a> EhFrameParser<'a> {
 
         // Parse initial instructions
         if offset < entry_end {
-            cie.initial_instructions =
-                self.parse_cfi_instructions(&self.data[offset..entry_end], &cie)?;
+            let initial = self.data.get(offset..entry_end).unwrap_or(&[]);
+            cie.initial_instructions = self.parse_cfi_instructions(initial, &cie)?;
         }
 
         Ok(cie)
@@ -591,7 +613,7 @@ impl<'a> EhFrameParser<'a> {
         fde.cie_offset = cie_offset;
 
         // Skip the CIE pointer (already read)
-        offset += if is_64bit { 8 } else { 4 };
+        offset = offset.saturating_add(if is_64bit { 8 } else { 4 });
 
         // Get pointer encoding from CIE
         let ptr_encoding = cie
@@ -603,10 +625,10 @@ impl<'a> EhFrameParser<'a> {
         let (pc_begin, bytes) = self.read_encoded_pointer_with_base(
             offset,
             ptr_encoding,
-            self.section_base + pc_begin_offset as u64,
+            self.section_base.wrapping_add(pc_begin_offset as u64),
         )?;
         fde.pc_begin = pc_begin;
-        offset += bytes;
+        offset = offset.saturating_add(bytes);
 
         // PC range (address range)
         // Note: The range is encoded the same way as pc_begin, but it's always
@@ -614,18 +636,17 @@ impl<'a> EhFrameParser<'a> {
         let range_encoding = ptr_encoding & 0x0F; // Just the format, not the application
         let (pc_range, bytes) = self.read_encoded_value(offset, range_encoding)?;
         fde.pc_range = pc_range;
-        offset += bytes;
+        offset = offset.saturating_add(bytes);
 
         // Parse augmentation data if CIE has 'z' augmentation
         if cie
             .map(|c| c.augmentation.starts_with('z'))
             .unwrap_or(false)
         {
-            let (aug_len, bytes) = decode_uleb128(&self.data[offset..])?;
+            let aug_len = read_uleb_at(self.data, &mut offset)?;
             fde.augmentation_length = Some(aug_len);
-            offset += bytes;
 
-            let aug_end = offset + aug_len as usize;
+            let aug_end = offset.saturating_add(aug_len as usize);
 
             // Parse LSDA pointer if CIE has 'L' augmentation
             if let Some(c) = cie {
@@ -635,7 +656,7 @@ impl<'a> EhFrameParser<'a> {
                             let (lsda, _bytes) = self.read_encoded_pointer_with_base(
                                 offset,
                                 lsda_encoding,
-                                self.section_base + offset as u64,
+                                self.section_base.wrapping_add(offset as u64),
                             )?;
                             if lsda != 0 {
                                 fde.lsda = Some(lsda);
@@ -651,7 +672,8 @@ impl<'a> EhFrameParser<'a> {
         // Parse CFI instructions
         if offset < entry_end {
             if let Some(c) = cie {
-                fde.instructions = self.parse_cfi_instructions(&self.data[offset..entry_end], c)?;
+                let body = self.data.get(offset..entry_end).unwrap_or(&[]);
+                fde.instructions = self.parse_cfi_instructions(body, c)?;
             }
         }
 
@@ -665,11 +687,10 @@ impl<'a> EhFrameParser<'a> {
         cie: &Cie,
     ) -> Result<Vec<CfiInstruction>, ParseError> {
         let mut instructions = Vec::new();
-        let mut offset = 0;
+        let mut offset = 0usize;
 
-        while offset < data.len() {
-            let opcode = data[offset];
-            offset += 1;
+        while let Some(opcode) = data.get(offset).copied() {
+            offset = offset.saturating_add(1);
 
             // Check high 2 bits for short-form instructions
             let high2 = opcode >> 6;
@@ -682,8 +703,7 @@ impl<'a> EhFrameParser<'a> {
                 }
                 0x2 => {
                     // DW_CFA_offset
-                    let (factored_offset, bytes) = decode_uleb128(&data[offset..])?;
-                    offset += bytes;
+                    let factored_offset = read_uleb_at(data, &mut offset)?;
                     CfiInstruction::Offset {
                         register: low6 as u64,
                         offset: factored_offset,
@@ -701,43 +721,43 @@ impl<'a> EhFrameParser<'a> {
                         DW_CFA_nop => CfiInstruction::Nop,
 
                         DW_CFA_set_loc => {
-                            let (addr, bytes) = self.read_address(&data[offset..], cie.is_64bit)?;
-                            offset += bytes;
+                            let tail = data.get(offset..).unwrap_or(&[]);
+                            let (addr, bytes) = self.read_address(tail, cie.is_64bit)?;
+                            offset = offset.saturating_add(bytes);
                             CfiInstruction::SetLoc { address: addr }
                         }
 
                         DW_CFA_advance_loc1 => {
-                            if offset >= data.len() {
+                            let Some(delta) = data.get(offset).copied() else {
                                 break;
-                            }
-                            let delta = data[offset];
-                            offset += 1;
+                            };
+                            offset = offset.saturating_add(1);
                             CfiInstruction::AdvanceLoc1 { delta }
                         }
 
                         DW_CFA_advance_loc2 => {
-                            if offset + 2 > data.len() {
+                            let tail = data.get(offset..).unwrap_or(&[]);
+                            if tail.len() < 2 {
                                 break;
                             }
-                            let delta = self.read_u16_from_slice(&data[offset..])?;
-                            offset += 2;
+                            let delta = self.read_u16_from_slice(tail)?;
+                            offset = offset.saturating_add(2);
                             CfiInstruction::AdvanceLoc2 { delta }
                         }
 
                         DW_CFA_advance_loc4 => {
-                            if offset + 4 > data.len() {
+                            let tail = data.get(offset..).unwrap_or(&[]);
+                            if tail.len() < 4 {
                                 break;
                             }
-                            let delta = self.read_u32_from_slice(&data[offset..])?;
-                            offset += 4;
+                            let delta = self.read_u32_from_slice(tail)?;
+                            offset = offset.saturating_add(4);
                             CfiInstruction::AdvanceLoc4 { delta }
                         }
 
                         DW_CFA_offset_extended => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (factored_offset, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let factored_offset = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::OffsetExtended {
                                 register,
                                 factored_offset,
@@ -745,28 +765,23 @@ impl<'a> EhFrameParser<'a> {
                         }
 
                         DW_CFA_restore_extended => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::RestoreExtended { register }
                         }
 
                         DW_CFA_undefined => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::Undefined { register }
                         }
 
                         DW_CFA_same_value => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::SameValue { register }
                         }
 
                         DW_CFA_register => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (target_register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let target_register = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::Register {
                                 register,
                                 target_register,
@@ -778,10 +793,8 @@ impl<'a> EhFrameParser<'a> {
                         DW_CFA_restore_state => CfiInstruction::RestoreState,
 
                         DW_CFA_def_cfa => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (cfa_offset, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let cfa_offset = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::DefCfa {
                                 register,
                                 offset: cfa_offset,
@@ -789,39 +802,38 @@ impl<'a> EhFrameParser<'a> {
                         }
 
                         DW_CFA_def_cfa_register => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::DefCfaRegister { register }
                         }
 
                         DW_CFA_def_cfa_offset => {
-                            let (cfa_offset, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let cfa_offset = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::DefCfaOffset { offset: cfa_offset }
                         }
 
                         DW_CFA_def_cfa_expression => {
-                            let (len, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let expr_end = offset + len as usize;
-                            if expr_end > data.len() {
+                            let len = read_uleb_at(data, &mut offset)?;
+                            let Some(expr_end) = offset.checked_add(len as usize) else {
                                 break;
-                            }
-                            let expression = data[offset..expr_end].to_vec();
+                            };
+                            let Some(slice) = data.get(offset..expr_end) else {
+                                break;
+                            };
+                            let expression = slice.to_vec();
                             offset = expr_end;
                             CfiInstruction::DefCfaExpression { expression }
                         }
 
                         DW_CFA_expression => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (len, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let expr_end = offset + len as usize;
-                            if expr_end > data.len() {
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let len = read_uleb_at(data, &mut offset)?;
+                            let Some(expr_end) = offset.checked_add(len as usize) else {
                                 break;
-                            }
-                            let expression = data[offset..expr_end].to_vec();
+                            };
+                            let Some(slice) = data.get(offset..expr_end) else {
+                                break;
+                            };
+                            let expression = slice.to_vec();
                             offset = expr_end;
                             CfiInstruction::Expression {
                                 register,
@@ -830,10 +842,8 @@ impl<'a> EhFrameParser<'a> {
                         }
 
                         DW_CFA_offset_extended_sf => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (factored_offset, bytes) = decode_sleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let factored_offset = read_sleb_at(data, &mut offset)?;
                             CfiInstruction::OffsetExtendedSf {
                                 register,
                                 factored_offset,
@@ -841,10 +851,8 @@ impl<'a> EhFrameParser<'a> {
                         }
 
                         DW_CFA_def_cfa_sf => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (factored_offset, bytes) = decode_sleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let factored_offset = read_sleb_at(data, &mut offset)?;
                             CfiInstruction::DefCfaSf {
                                 register,
                                 factored_offset,
@@ -852,16 +860,13 @@ impl<'a> EhFrameParser<'a> {
                         }
 
                         DW_CFA_def_cfa_offset_sf => {
-                            let (factored_offset, bytes) = decode_sleb128(&data[offset..])?;
-                            offset += bytes;
+                            let factored_offset = read_sleb_at(data, &mut offset)?;
                             CfiInstruction::DefCfaOffsetSf { factored_offset }
                         }
 
                         DW_CFA_val_offset => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (factored_offset, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let factored_offset = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::ValOffset {
                                 register,
                                 factored_offset,
@@ -869,10 +874,8 @@ impl<'a> EhFrameParser<'a> {
                         }
 
                         DW_CFA_val_offset_sf => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (factored_offset, bytes) = decode_sleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let factored_offset = read_sleb_at(data, &mut offset)?;
                             CfiInstruction::ValOffsetSf {
                                 register,
                                 factored_offset,
@@ -880,15 +883,15 @@ impl<'a> EhFrameParser<'a> {
                         }
 
                         DW_CFA_val_expression => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (len, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let expr_end = offset + len as usize;
-                            if expr_end > data.len() {
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let len = read_uleb_at(data, &mut offset)?;
+                            let Some(expr_end) = offset.checked_add(len as usize) else {
                                 break;
-                            }
-                            let expression = data[offset..expr_end].to_vec();
+                            };
+                            let Some(slice) = data.get(offset..expr_end) else {
+                                break;
+                            };
+                            let expression = slice.to_vec();
                             offset = expr_end;
                             CfiInstruction::ValExpression {
                                 register,
@@ -898,16 +901,13 @@ impl<'a> EhFrameParser<'a> {
 
                         // GNU extensions
                         DW_CFA_GNU_args_size => {
-                            let (size, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let size = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::GnuArgsSize { size }
                         }
 
                         DW_CFA_GNU_negative_offset_extended => {
-                            let (register, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
-                            let (factored_offset, bytes) = decode_uleb128(&data[offset..])?;
-                            offset += bytes;
+                            let register = read_uleb_at(data, &mut offset)?;
+                            let factored_offset = read_uleb_at(data, &mut offset)?;
                             CfiInstruction::GnuNegOffsetExtended {
                                 register,
                                 factored_offset,
@@ -933,119 +933,127 @@ impl<'a> EhFrameParser<'a> {
 
     /// Read a u16 from the data.
     fn read_u16(&self, offset: usize) -> Result<u16, ParseError> {
-        if offset + 2 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: offset + 2,
+        let end = offset.checked_add(2).ok_or(ParseError::TruncatedData {
+            expected: offset,
+            actual: self.data.len(),
+            context: "u16",
+        })?;
+        let bytes = self
+            .data
+            .get(offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
                 actual: self.data.len(),
                 context: "u16",
-            });
-        }
-        let bytes = [self.data[offset], self.data[offset + 1]];
+            })?;
+        let arr: [u8; 2] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u16 conversion"))?;
         Ok(if self.big_endian {
-            u16::from_be_bytes(bytes)
+            u16::from_be_bytes(arr)
         } else {
-            u16::from_le_bytes(bytes)
+            u16::from_le_bytes(arr)
         })
     }
 
     /// Read a u32 from the data.
     fn read_u32(&self, offset: usize) -> Result<u32, ParseError> {
-        if offset + 4 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: offset + 4,
+        let end = offset.checked_add(4).ok_or(ParseError::TruncatedData {
+            expected: offset,
+            actual: self.data.len(),
+            context: "u32",
+        })?;
+        let bytes = self
+            .data
+            .get(offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
                 actual: self.data.len(),
                 context: "u32",
-            });
-        }
-        let bytes = [
-            self.data[offset],
-            self.data[offset + 1],
-            self.data[offset + 2],
-            self.data[offset + 3],
-        ];
+            })?;
+        let arr: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u32 conversion"))?;
         Ok(if self.big_endian {
-            u32::from_be_bytes(bytes)
+            u32::from_be_bytes(arr)
         } else {
-            u32::from_le_bytes(bytes)
+            u32::from_le_bytes(arr)
         })
     }
 
     /// Read a u64 from the data.
     fn read_u64(&self, offset: usize) -> Result<u64, ParseError> {
-        if offset + 8 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: offset + 8,
+        let end = offset.checked_add(8).ok_or(ParseError::TruncatedData {
+            expected: offset,
+            actual: self.data.len(),
+            context: "u64",
+        })?;
+        let bytes = self
+            .data
+            .get(offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
                 actual: self.data.len(),
                 context: "u64",
-            });
-        }
-        let bytes = [
-            self.data[offset],
-            self.data[offset + 1],
-            self.data[offset + 2],
-            self.data[offset + 3],
-            self.data[offset + 4],
-            self.data[offset + 5],
-            self.data[offset + 6],
-            self.data[offset + 7],
-        ];
+            })?;
+        let arr: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u64 conversion"))?;
         Ok(if self.big_endian {
-            u64::from_be_bytes(bytes)
+            u64::from_be_bytes(arr)
         } else {
-            u64::from_le_bytes(bytes)
+            u64::from_le_bytes(arr)
         })
     }
 
     /// Read a u16 from a slice.
     fn read_u16_from_slice(&self, data: &[u8]) -> Result<u16, ParseError> {
-        if data.len() < 2 {
-            return Err(ParseError::TruncatedData {
-                expected: 2,
-                actual: data.len(),
-                context: "u16",
-            });
-        }
-        let bytes = [data[0], data[1]];
+        let bytes = data.get(0..2).ok_or(ParseError::TruncatedData {
+            expected: 2,
+            actual: data.len(),
+            context: "u16",
+        })?;
+        let arr: [u8; 2] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u16 conversion"))?;
         Ok(if self.big_endian {
-            u16::from_be_bytes(bytes)
+            u16::from_be_bytes(arr)
         } else {
-            u16::from_le_bytes(bytes)
+            u16::from_le_bytes(arr)
         })
     }
 
     /// Read a u32 from a slice.
     fn read_u32_from_slice(&self, data: &[u8]) -> Result<u32, ParseError> {
-        if data.len() < 4 {
-            return Err(ParseError::TruncatedData {
-                expected: 4,
-                actual: data.len(),
-                context: "u32",
-            });
-        }
-        let bytes = [data[0], data[1], data[2], data[3]];
+        let bytes = data.get(0..4).ok_or(ParseError::TruncatedData {
+            expected: 4,
+            actual: data.len(),
+            context: "u32",
+        })?;
+        let arr: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u32 conversion"))?;
         Ok(if self.big_endian {
-            u32::from_be_bytes(bytes)
+            u32::from_be_bytes(arr)
         } else {
-            u32::from_le_bytes(bytes)
+            u32::from_le_bytes(arr)
         })
     }
 
     /// Read a u64 from a slice.
     fn read_u64_from_slice(&self, data: &[u8]) -> Result<u64, ParseError> {
-        if data.len() < 8 {
-            return Err(ParseError::TruncatedData {
-                expected: 8,
-                actual: data.len(),
-                context: "u64",
-            });
-        }
-        let bytes = [
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-        ];
+        let bytes = data.get(0..8).ok_or(ParseError::TruncatedData {
+            expected: 8,
+            actual: data.len(),
+            context: "u64",
+        })?;
+        let arr: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u64 conversion"))?;
         Ok(if self.big_endian {
-            u64::from_be_bytes(bytes)
+            u64::from_be_bytes(arr)
         } else {
-            u64::from_le_bytes(bytes)
+            u64::from_le_bytes(arr)
         })
     }
 
@@ -1064,7 +1072,8 @@ impl<'a> EhFrameParser<'a> {
         offset: usize,
         encoding: u8,
     ) -> Result<(u64, usize), ParseError> {
-        self.read_encoded_pointer_with_base(offset, encoding, self.section_base + offset as u64)
+        let pc = self.section_base.wrapping_add(offset as u64);
+        self.read_encoded_pointer_with_base(offset, encoding, pc)
     }
 
     /// Read an encoded pointer value with explicit base.
@@ -1111,14 +1120,24 @@ impl<'a> EhFrameParser<'a> {
                 }
             }
             DW_EH_PE_uleb128 => {
-                let (val, bytes) = decode_uleb128(&self.data[offset..])?;
+                let tail = self.data.get(offset..).ok_or(ParseError::TruncatedData {
+                    expected: offset,
+                    actual: self.data.len(),
+                    context: "ULEB128",
+                })?;
+                let (val, bytes) = decode_uleb128(tail)?;
                 Ok((val, bytes))
             }
             DW_EH_PE_udata2 => Ok((self.read_u16(offset)? as u64, 2)),
             DW_EH_PE_udata4 => Ok((self.read_u32(offset)? as u64, 4)),
             DW_EH_PE_udata8 => Ok((self.read_u64(offset)?, 8)),
             DW_EH_PE_sleb128 => {
-                let (val, bytes) = decode_sleb128(&self.data[offset..])?;
+                let tail = self.data.get(offset..).ok_or(ParseError::TruncatedData {
+                    expected: offset,
+                    actual: self.data.len(),
+                    context: "SLEB128",
+                })?;
+                let (val, bytes) = decode_sleb128(tail)?;
                 Ok((val as u64, bytes))
             }
             DW_EH_PE_sdata2 => Ok((self.read_u16(offset)? as i16 as i64 as u64, 2)),
