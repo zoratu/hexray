@@ -107,10 +107,7 @@ pub fn parse_imports(
 
     // Parse import descriptors
     let mut desc_offset = import_offset;
-    loop {
-        let Some(desc_end) = desc_offset.checked_add(IMPORT_DESCRIPTOR_SIZE) else {
-            break;
-        };
+    while let Some(desc_end) = desc_offset.checked_add(IMPORT_DESCRIPTOR_SIZE) {
         let Some(desc_slice) = data.get(desc_offset..desc_end) else {
             break;
         };
@@ -142,10 +139,7 @@ pub fn parse_imports(
             let mut entry_offset = ilt_offset;
             let mut iat_rva = desc.first_thunk;
 
-            loop {
-                let Some(entry_end) = entry_offset.checked_add(entry_size) else {
-                    break;
-                };
+            while let Some(entry_end) = entry_offset.checked_add(entry_size) {
                 if entry_end > data.len() {
                     break;
                 }

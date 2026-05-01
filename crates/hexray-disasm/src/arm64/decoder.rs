@@ -2596,16 +2596,11 @@ impl Arm64Disassembler {
                     Operand::reg(addend),
                 ],
             ),
-            (0b00, 0b010, 0) if sf => {
-                if ra == 31 {
-                    (
-                        "smulh",
-                        vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
-                    )
-                } else {
-                    return self.decode_unknown(insn, address, bytes);
-                }
-            }
+            (0b00, 0b010, 0) if sf && ra == 31 => (
+                "smulh",
+                vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+            ),
+            (0b00, 0b010, 0) if sf => return self.decode_unknown(insn, address, bytes),
             (0b00, 0b101, 0) if sf => (
                 "umaddl",
                 vec![
@@ -2615,16 +2610,11 @@ impl Arm64Disassembler {
                     Operand::reg(addend),
                 ],
             ),
-            (0b00, 0b110, 0) if sf => {
-                if ra == 31 {
-                    (
-                        "umulh",
-                        vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
-                    )
-                } else {
-                    return self.decode_unknown(insn, address, bytes);
-                }
-            }
+            (0b00, 0b110, 0) if sf && ra == 31 => (
+                "umulh",
+                vec![Operand::reg(dst), Operand::reg(src1), Operand::reg(src2)],
+            ),
+            (0b00, 0b110, 0) if sf => return self.decode_unknown(insn, address, bytes),
             _ => return self.decode_unknown(insn, address, bytes),
         };
 
