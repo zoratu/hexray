@@ -2072,10 +2072,8 @@ fn parse_condition_from_mnemonic(mnemonic: &str) -> Option<Condition> {
     // Handle x86 style: sete, cmovne, etc.
     let suffix = if let Some(s) = mnemonic.strip_prefix("set") {
         s
-    } else if let Some(s) = mnemonic.strip_prefix("cmov") {
-        s
     } else {
-        return None;
+        mnemonic.strip_prefix("cmov")?
     };
 
     // Map x86 suffix to Condition

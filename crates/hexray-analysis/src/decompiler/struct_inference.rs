@@ -686,7 +686,7 @@ impl StructInference {
             for (offset, size, access_list) in field_data {
                 // Skip if this is part of a detected array (and not the start)
                 if array_fields.iter().any(|(start, elem_size, count)| {
-                    offset != *start && offset >= *start && offset < start + elem_size * count
+                    offset > *start && offset < start + elem_size * count
                 }) {
                     continue;
                 }

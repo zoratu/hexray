@@ -261,7 +261,7 @@ impl GlobalAccessTracker {
     /// Returns addresses sorted by access frequency (most accessed first).
     pub fn addresses_by_frequency(&self) -> Vec<(u64, usize)> {
         let mut addrs: Vec<_> = self.access_counts.iter().map(|(&a, &c)| (a, c)).collect();
-        addrs.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by count
+        addrs.sort_by_key(|b| std::cmp::Reverse(b.1)); // Sort descending by count
         addrs
     }
 
