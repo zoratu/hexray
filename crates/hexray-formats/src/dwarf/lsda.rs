@@ -1,8 +1,3 @@
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // Allow DWARF standard naming conventions (DW_EH_PE_*)
 #![allow(non_upper_case_globals)]
 
@@ -66,7 +61,7 @@ impl Lsda {
     pub fn find_landing_pad(&self, pc: u64) -> Option<&CallSite> {
         self.call_sites
             .iter()
-            .find(|site| pc >= site.start && pc < site.start + site.length)
+            .find(|site| pc >= site.start && pc < site.start.saturating_add(site.length))
     }
 
     /// Gets exception types caught at a landing pad.
@@ -75,13 +70,18 @@ impl Lsda {
         let mut current = action_index;
 
         while current > 0 && current <= self.actions.len() {
-            let action = &self.actions[current - 1];
+            let Some(action) = self.actions.get(current.saturating_sub(1)) else {
+                break;
+            };
 
             if action.type_filter > 0 {
                 // Positive filter: catch specific type
                 let type_idx = action.type_filter as usize;
                 let type_info = if type_idx <= self.type_table.len() {
-                    self.type_table.get(type_idx - 1).copied().flatten()
+                    self.type_table
+                        .get(type_idx.saturating_sub(1))
+                        .copied()
+                        .flatten()
                 } else {
                     None
                 };
@@ -102,7 +102,7 @@ impl Lsda {
             }
             // next_action is a byte offset, but we indexed actions sequentially
             // This is a simplification - proper handling needs byte offset tracking
-            current = (current as i64 + action.next_action) as usize;
+            current = (current as i64).wrapping_add(action.next_action) as usize;
             if current == 0 || current > self.actions.len() {
                 break;
             }
@@ -128,7 +128,7 @@ pub struct CallSite {
 impl CallSite {
     /// Returns the end address of the protected region.
     pub fn end(&self) -> u64 {
-        self.start + self.length
+        self.start.saturating_add(self.length)
     }
 
     /// Returns true if this site has a landing pad (catch/cleanup handler).
@@ -218,9 +218,35 @@ impl<'a> LsdaParser<'a> {
         }
     }
 
+    /// Decode a ULEB128 starting at `*offset`, advancing past it.
+    #[inline]
+    fn read_uleb(&self, offset: &mut usize) -> Result<u64, ParseError> {
+        let tail = self.data.get(*offset..).ok_or(ParseError::TruncatedData {
+            expected: *offset,
+            actual: self.data.len(),
+            context: "LSDA ULEB128",
+        })?;
+        let (val, len) = decode_uleb128(tail)?;
+        *offset = offset.saturating_add(len);
+        Ok(val)
+    }
+
+    /// Decode an SLEB128 starting at `*offset`, advancing past it.
+    #[inline]
+    fn read_sleb(&self, offset: &mut usize) -> Result<i64, ParseError> {
+        let tail = self.data.get(*offset..).ok_or(ParseError::TruncatedData {
+            expected: *offset,
+            actual: self.data.len(),
+            context: "LSDA SLEB128",
+        })?;
+        let (val, len) = decode_sleb128(tail)?;
+        *offset = offset.saturating_add(len);
+        Ok(val)
+    }
+
     /// Parses the LSDA.
     pub fn parse(&self) -> Result<Lsda, ParseError> {
-        let mut offset = 0;
+        let mut offset = 0usize;
 
         // Parse header
         // Landing pad base encoding
@@ -234,19 +260,24 @@ impl<'a> LsdaParser<'a> {
         // Type table encoding
         let type_table_encoding = self.read_u8(&mut offset)?;
         let type_table_offset = if type_table_encoding != DW_EH_PE_omit {
-            let (val, _) = decode_uleb128(&self.data[offset..])?;
-            offset += self.uleb128_size(val);
-            Some(offset + val as usize)
+            // Decode the offset directly via the parser helper, which
+            // both yields the value and advances the cursor past it.
+            let pre = offset;
+            let val = self.read_uleb(&mut offset)?;
+            // The type-table absolute offset is the post-ULEB cursor
+            // plus the decoded value. Use checked_add so a malformed
+            // gigantic ULEB128 can't wrap us into a smaller offset.
+            let _ = pre;
+            offset.checked_add(val as usize)
         } else {
             None
         };
 
         // Call site table encoding
         let call_site_encoding = self.read_u8(&mut offset)?;
-        let (call_site_table_length, _) = decode_uleb128(&self.data[offset..])?;
-        offset += self.uleb128_size(call_site_table_length);
+        let call_site_table_length = self.read_uleb(&mut offset)?;
 
-        let call_site_table_end = offset + call_site_table_length as usize;
+        let call_site_table_end = offset.saturating_add(call_site_table_length as usize);
 
         // Parse call sites
         let mut call_sites = Vec::new();
@@ -254,17 +285,16 @@ impl<'a> LsdaParser<'a> {
             let start = self.read_encoded(&mut offset, call_site_encoding)?;
             let length = self.read_encoded(&mut offset, call_site_encoding)?;
             let landing_pad_offset = self.read_encoded(&mut offset, call_site_encoding)?;
-            let (action_raw, _) = decode_uleb128(&self.data[offset..])?;
-            offset += self.uleb128_size(action_raw);
+            let action_raw = self.read_uleb(&mut offset)?;
 
             let landing_pad = if landing_pad_offset != 0 {
-                Some(landing_pad_base + landing_pad_offset)
+                Some(landing_pad_base.wrapping_add(landing_pad_offset))
             } else {
                 None
             };
 
             call_sites.push(CallSite {
-                start: landing_pad_base + start,
+                start: landing_pad_base.wrapping_add(start),
                 length,
                 landing_pad,
                 action_index: action_raw as usize,
@@ -282,15 +312,13 @@ impl<'a> LsdaParser<'a> {
         let action_table_end = type_table_offset.unwrap_or(self.data.len());
 
         while offset < action_table_end && offset < self.data.len() {
-            let (type_filter, bytes1) = decode_sleb128(&self.data[offset..])?;
-            offset += bytes1;
+            let type_filter = self.read_sleb(&mut offset)?;
 
             if offset >= action_table_end || offset >= self.data.len() {
                 break;
             }
 
-            let (next_action, bytes2) = decode_sleb128(&self.data[offset..])?;
-            offset += bytes2;
+            let next_action = self.read_sleb(&mut offset)?;
 
             actions.push(ActionRecord {
                 type_filter,
@@ -306,8 +334,8 @@ impl<'a> LsdaParser<'a> {
                 let mut tt_pos = tt_offset;
 
                 // Read entries backward
-                while tt_pos >= entry_size && tt_pos > action_table_start {
-                    tt_pos -= entry_size;
+                while entry_size > 0 && tt_pos >= entry_size && tt_pos > action_table_start {
+                    tt_pos = tt_pos.saturating_sub(entry_size);
                     let mut read_pos = tt_pos;
                     let value = self.read_encoded(&mut read_pos, type_table_encoding)?;
 
@@ -336,70 +364,91 @@ impl<'a> LsdaParser<'a> {
     }
 
     fn read_u8(&self, offset: &mut usize) -> Result<u8, ParseError> {
-        if *offset >= self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: *offset + 1,
+        let val = self
+            .data
+            .get(*offset)
+            .copied()
+            .ok_or(ParseError::TruncatedData {
+                expected: offset.saturating_add(1),
                 actual: self.data.len(),
                 context: "LSDA read_u8",
-            });
-        }
-        let val = self.data[*offset];
-        *offset += 1;
+            })?;
+        *offset = offset.saturating_add(1);
         Ok(val)
     }
 
     fn read_u16(&self, offset: &mut usize) -> Result<u16, ParseError> {
-        if *offset + 2 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: *offset + 2,
+        let end = offset.checked_add(2).ok_or(ParseError::TruncatedData {
+            expected: *offset,
+            actual: self.data.len(),
+            context: "LSDA read_u16",
+        })?;
+        let bytes = self
+            .data
+            .get(*offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
                 actual: self.data.len(),
                 context: "LSDA read_u16",
-            });
-        }
-        let bytes = &self.data[*offset..*offset + 2];
-        *offset += 2;
+            })?;
+        let arr: [u8; 2] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("LSDA u16"))?;
+        *offset = end;
         Ok(if self.big_endian {
-            u16::from_be_bytes([bytes[0], bytes[1]])
+            u16::from_be_bytes(arr)
         } else {
-            u16::from_le_bytes([bytes[0], bytes[1]])
+            u16::from_le_bytes(arr)
         })
     }
 
     fn read_u32(&self, offset: &mut usize) -> Result<u32, ParseError> {
-        if *offset + 4 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: *offset + 4,
+        let end = offset.checked_add(4).ok_or(ParseError::TruncatedData {
+            expected: *offset,
+            actual: self.data.len(),
+            context: "LSDA read_u32",
+        })?;
+        let bytes = self
+            .data
+            .get(*offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
                 actual: self.data.len(),
                 context: "LSDA read_u32",
-            });
-        }
-        let bytes = &self.data[*offset..*offset + 4];
-        *offset += 4;
+            })?;
+        let arr: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("LSDA u32"))?;
+        *offset = end;
         Ok(if self.big_endian {
-            u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            u32::from_be_bytes(arr)
         } else {
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            u32::from_le_bytes(arr)
         })
     }
 
     fn read_u64(&self, offset: &mut usize) -> Result<u64, ParseError> {
-        if *offset + 8 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: *offset + 8,
+        let end = offset.checked_add(8).ok_or(ParseError::TruncatedData {
+            expected: *offset,
+            actual: self.data.len(),
+            context: "LSDA read_u64",
+        })?;
+        let bytes = self
+            .data
+            .get(*offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
                 actual: self.data.len(),
                 context: "LSDA read_u64",
-            });
-        }
-        let bytes = &self.data[*offset..*offset + 8];
-        *offset += 8;
+            })?;
+        let arr: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("LSDA u64"))?;
+        *offset = end;
         Ok(if self.big_endian {
-            u64::from_be_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ])
+            u64::from_be_bytes(arr)
         } else {
-            u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ])
+            u64::from_le_bytes(arr)
         })
     }
 
@@ -431,16 +480,8 @@ impl<'a> LsdaParser<'a> {
                     self.read_u32(offset)? as i64
                 }
             }
-            DW_EH_PE_uleb128 => {
-                let (val, bytes) = decode_uleb128(&self.data[*offset..])?;
-                *offset += bytes;
-                val as i64
-            }
-            DW_EH_PE_sleb128 => {
-                let (val, bytes) = decode_sleb128(&self.data[*offset..])?;
-                *offset += bytes;
-                val
-            }
+            DW_EH_PE_uleb128 => self.read_uleb(offset)? as i64,
+            DW_EH_PE_sleb128 => self.read_sleb(offset)?,
             DW_EH_PE_udata2 => self.read_u16(offset)? as i64,
             DW_EH_PE_sdata2 => self.read_i16(offset)? as i64,
             DW_EH_PE_udata4 => self.read_u32(offset)? as i64,
@@ -461,9 +502,9 @@ impl<'a> LsdaParser<'a> {
             0 => 0i64, // Absolute
             DW_EH_PE_pcrel => {
                 // PC-relative: relative to current position in LSDA
-                (self.lsda_addr
-                    + (*offset as u64).saturating_sub(self.encoded_size(encoding) as u64))
-                    as i64
+                self.lsda_addr.saturating_add(
+                    (*offset as u64).saturating_sub(self.encoded_size(encoding) as u64),
+                ) as i64
             }
             DW_EH_PE_funcrel => self.func_start as i64,
             DW_EH_PE_datarel | DW_EH_PE_textrel => {
@@ -476,7 +517,7 @@ impl<'a> LsdaParser<'a> {
         let result = if raw_value == 0 {
             0
         } else {
-            (base_addr + raw_value) as u64
+            base_addr.wrapping_add(raw_value) as u64
         };
 
         // Handle indirect
@@ -495,16 +536,6 @@ impl<'a> LsdaParser<'a> {
             DW_EH_PE_udata8 | DW_EH_PE_sdata8 => 8,
             _ => self.pointer_size as usize, // Default
         }
-    }
-
-    fn uleb128_size(&self, value: u64) -> usize {
-        let mut v = value;
-        let mut size = 1;
-        while v >= 0x80 {
-            v >>= 7;
-            size += 1;
-        }
-        size
     }
 }
 
