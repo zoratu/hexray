@@ -1,4 +1,3 @@
-//! Typed decoding of `.nv.info` record payloads.
 //!
 //! M2 framed each record as `(format, attribute, payload)`. M5 gives the
 //! payloads semantic shape: parameter layout, register counts, launch
@@ -16,13 +15,31 @@
 //! `.nv.info.vector_add` / `.nv.info.shared_transpose` / etc emitted by
 //! `ptxas 13.2` for sm_80.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use super::info::{NvInfoAttribute, NvInfoBlob, NvInfoEntryRef, NvInfoFormat};
+
+// Bounds-checked little-endian readers. Caller has already verified the
+// payload length at the entry of each `decode_*` helper.
+#[inline]
+fn read_u16(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
 
 /// Summary of kernel resource usage decoded from a `.nv.info.<kernel>`
 /// blob. Every field is optional — a malformed or missing attribute
@@ -121,7 +138,7 @@ pub struct ParamInfo {
 impl ParamInfo {
     /// Size in bytes (from [`Self::size_dwords`]).
     pub fn size_bytes(&self) -> u32 {
-        (self.size_dwords as u32) * 4
+        (self.size_dwords as u32).saturating_mul(4)
     }
 }
 
@@ -219,7 +236,7 @@ fn decode_hval_u16(entry: &NvInfoEntryRef, payload: &[u8]) -> Option<u16> {
     if payload.len() < 2 {
         return None;
     }
-    Some(u16::from_le_bytes([payload[0], payload[1]]))
+    Some(read_u16(payload, 0))
 }
 
 /// Decode a pair of `(index_or_kind, value)` u32 words. Used by
@@ -229,9 +246,7 @@ fn decode_sval_u32_pair(payload: &[u8]) -> Option<(u32, u32)> {
     if payload.len() < 8 {
         return None;
     }
-    let a = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let b = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    Some((a, b))
+    Some((read_u32(payload, 0), read_u32(payload, 4)))
 }
 
 /// `EIATTR_PARAM_CBANK` payload:
@@ -252,9 +267,9 @@ fn decode_param_cbank(payload: &[u8]) -> Option<ParamCbank> {
     // param cbank is always bank 0 for non-`__constant__` data. We
     // record bank=0 here and revisit in M7 when we wire in symbol-to-
     // section mapping.
-    let _sym_index = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let offset = u16::from_le_bytes([payload[4], payload[5]]) as u32;
-    let size = u16::from_le_bytes([payload[6], payload[7]]) as u32;
+    let _sym_index = read_u32(payload, 0);
+    let offset = read_u16(payload, 4) as u32;
+    let size = read_u16(payload, 6) as u32;
     Some(ParamCbank {
         bank: 0,
         offset,
@@ -268,9 +283,9 @@ fn decode_kparam_info(payload: &[u8]) -> Option<ParamInfo> {
     if payload.len() < 12 {
         return None;
     }
-    let ordinal = u16::from_le_bytes([payload[4], payload[5]]);
-    let offset = u16::from_le_bytes([payload[6], payload[7]]);
-    let trailing = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let ordinal = read_u16(payload, 4);
+    let offset = read_u16(payload, 6);
+    let trailing = read_u32(payload, 8);
     let size_dwords = ((trailing >> 20) & 0xF) as u8;
     Some(ParamInfo {
         ordinal,
@@ -285,7 +300,10 @@ fn decode_kparam_info(payload: &[u8]) -> Option<ParamInfo> {
 fn decode_u32_list(payload: &[u8]) -> Vec<u32> {
     payload
         .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .map(|c| {
+            let arr: [u8; 4] = c.try_into().unwrap_or_default();
+            u32::from_le_bytes(arr)
+        })
         .collect()
 }
 
@@ -295,9 +313,9 @@ fn decode_triple_u32(payload: &[u8]) -> Option<(u32, u32, u32)> {
     if payload.len() < 12 {
         return None;
     }
-    let x = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let y = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    let z = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let x = read_u32(payload, 0);
+    let y = read_u32(payload, 4);
+    let z = read_u32(payload, 8);
     Some((x, y, z))
 }
 
