@@ -1,4 +1,3 @@
-//! AMDGPU code-object view over a parsed ELF.
 //!
 //! An AMDGPU code object is an ELF file with `e_machine =
 //! EM_AMDGPU = 224`, a `.text` section holding GCN/CDNA/RDNA
@@ -28,12 +27,6 @@
 //!   follow-up commit.
 //! - HIP fatbin extraction (host-side ELF wrapping AMDGPU code
 //!   objects). M10 reads the AMDGPU object directly.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 mod descriptor;
 mod metadata;
@@ -261,6 +254,18 @@ impl<'elf> CodeObjectView<'elf> {
     }
 }
 
+// Bounds-checked little-endian u32 reader for ELF note headers.
+#[inline]
+fn read_u32_le(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
 /// Walk every SHT_NOTE section looking for a record with name
 /// `"AMDGPU"` and type `NT_AMDGPU_METADATA = 32`. Decode the
 /// descriptor bytes as MessagePack and return the typed
@@ -285,43 +290,44 @@ fn find_amdgpu_metadata(elf: &Elf<'_>) -> Option<AmdMetadata> {
             continue;
         }
         let bytes = section.data();
-        let mut cursor = 0;
-        while cursor + 12 <= bytes.len() {
-            let namesz = u32::from_le_bytes([
-                bytes[cursor],
-                bytes[cursor + 1],
-                bytes[cursor + 2],
-                bytes[cursor + 3],
-            ]) as usize;
-            let descsz = u32::from_le_bytes([
-                bytes[cursor + 4],
-                bytes[cursor + 5],
-                bytes[cursor + 6],
-                bytes[cursor + 7],
-            ]) as usize;
-            let ntype = u32::from_le_bytes([
-                bytes[cursor + 8],
-                bytes[cursor + 9],
-                bytes[cursor + 10],
-                bytes[cursor + 11],
-            ]);
+        let mut cursor = 0usize;
+        while let Some(header_end) = cursor.checked_add(12) {
+            if header_end > bytes.len() {
+                break;
+            }
 
-            let name_off = cursor + 12;
-            let desc_off = name_off + align_up(namesz, 4);
-            let next_off = desc_off + align_up(descsz, 4);
+            let namesz = read_u32_le(bytes, cursor) as usize;
+            let descsz = read_u32_le(bytes, cursor.saturating_add(4)) as usize;
+            let ntype = read_u32_le(bytes, cursor.saturating_add(8));
+
+            let name_off = header_end;
+            let Some(desc_off) = name_off.checked_add(align_up(namesz, 4)) else {
+                break;
+            };
+            let Some(next_off) = desc_off.checked_add(align_up(descsz, 4)) else {
+                break;
+            };
             if next_off > bytes.len() {
                 break;
             }
 
-            let name = bytes[name_off..name_off + namesz]
+            let Some(name_end) = name_off.checked_add(namesz) else {
+                break;
+            };
+            let name_bytes = bytes.get(name_off..name_end).unwrap_or(&[]);
+            let name = name_bytes
                 .split(|&b| b == 0)
                 .next()
                 .and_then(|n| std::str::from_utf8(n).ok())
                 .unwrap_or("");
 
             if ntype == NT_AMDGPU_METADATA && name == "AMDGPU" {
-                if let Ok(md) = AmdMetadata::parse(&bytes[desc_off..desc_off + descsz]) {
-                    return Some(md);
+                if let Some(desc_end) = desc_off.checked_add(descsz) {
+                    if let Some(desc_bytes) = bytes.get(desc_off..desc_end) {
+                        if let Ok(md) = AmdMetadata::parse(desc_bytes) {
+                            return Some(md);
+                        }
+                    }
                 }
             }
 
@@ -332,7 +338,11 @@ fn find_amdgpu_metadata(elf: &Elf<'_>) -> Option<AmdMetadata> {
 }
 
 fn align_up(n: usize, align: usize) -> usize {
-    (n + align - 1) & !(align - 1)
+    if align == 0 {
+        return n;
+    }
+    let mask = align.saturating_sub(1);
+    n.saturating_add(mask) & !mask
 }
 
 /// Walk the symbol table for `<kernel>.ki` records pointing into the
@@ -361,7 +371,7 @@ fn attach_scale_kinfo(
         return;
     };
     let section_base = kinfo_section.sh_offset;
-    let section_end = section_base + kinfo_section.sh_size;
+    let section_end = section_base.saturating_add(kinfo_section.sh_size);
     let section_bytes = kinfo_section.data();
     if section_bytes.is_empty() {
         return;
@@ -378,19 +388,23 @@ fn attach_scale_kinfo(
         if addr < section_base || addr >= section_end {
             continue;
         }
-        let rec_off = (addr - section_base) as usize;
+        let rec_off = addr.saturating_sub(section_base) as usize;
         let rec_len = sym.size as usize;
-        if rec_len == 0 || rec_off + rec_len > section_bytes.len() {
+        let Some(rec_end) = rec_off.checked_add(rec_len) else {
+            continue;
+        };
+        if rec_len == 0 || rec_end > section_bytes.len() {
             diagnostics.push(CodeObjectDiagnostic {
                 kind: CodeObjectDiagnosticKind::MalformedScaleKinfo,
                 detail: format!(
-                    "{stripped}.ki at 0x{addr:x}: range {rec_off}..{} exceeds .AMDGPU.kinfo",
-                    rec_off + rec_len
+                    "{stripped}.ki at 0x{addr:x}: range {rec_off}..{rec_end} exceeds .AMDGPU.kinfo"
                 ),
             });
             continue;
         }
-        let bytes = &section_bytes[rec_off..rec_off + rec_len];
+        let Some(bytes) = section_bytes.get(rec_off..rec_end) else {
+            continue;
+        };
         let info = match scale_kinfo::parse(bytes) {
             Ok(info) => info,
             Err(e) => {
