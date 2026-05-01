@@ -10,6 +10,9 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// rust 1.95 collapsible-match style lint; matches the policy in
+// hexray-analysis (see its `lib.rs`).
+#![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -913,7 +916,7 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
         })
         .cloned()
         .collect();
-    contains_matches.sort_by(|a, b| a.name.len().cmp(&b.name.len()));
+    contains_matches.sort_by_key(|a| a.name.len());
     if !contains_matches.is_empty() {
         return Some(contains_matches.remove(0));
     }

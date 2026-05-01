@@ -1243,7 +1243,7 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<(PathBuf, SessionMeta)>> {
     }
 
     // Sort by last accessed (most recent first)
-    sessions.sort_by(|a, b| b.1.last_accessed.cmp(&a.1.last_accessed));
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.1.last_accessed));
 
     Ok(sessions)
 }
