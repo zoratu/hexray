@@ -196,11 +196,7 @@ impl<'a> NvInfoBlob<'a> {
     pub fn payload(&self, entry: &NvInfoEntryRef) -> &'a [u8] {
         let start = entry.payload_offset as usize;
         let end = start.saturating_add(entry.payload_size as usize);
-        if end > self.raw.len() {
-            &[]
-        } else {
-            &self.raw[start..end]
-        }
+        self.raw.get(start..end).unwrap_or(&[])
     }
 
     /// Iterate over all entries whose attribute matches `attr`.
@@ -219,29 +215,38 @@ pub fn parse_nv_info(raw: &[u8]) -> NvInfoBlob<'_> {
     let mut offset = 0usize;
     let mut truncated = false;
 
-    while offset + 2 <= raw.len() {
+    while let Some(header_end) = offset.checked_add(2) {
+        if header_end > raw.len() {
+            break;
+        }
         let entry_offset = offset as u32;
-        let format_byte = raw[offset];
-        let attr_byte = raw[offset + 1];
+        let format_byte = raw.get(offset).copied().unwrap_or(0);
+        let attr_byte = raw.get(offset.saturating_add(1)).copied().unwrap_or(0);
         let Some(format) = NvInfoFormat::from_byte(format_byte) else {
             // Unknown framing; we can't safely step past this entry. Bail.
             truncated = true;
             break;
         };
         let attribute = NvInfoAttribute::from_byte(attr_byte);
-        offset += 2;
+        offset = offset.saturating_add(2);
 
         let (payload_offset, payload_size) = match format {
             NvInfoFormat::NVal => (offset as u32, 0u16),
             NvInfoFormat::BVal => (offset as u32, 1),
             NvInfoFormat::HVal => (offset as u32, 2),
             NvInfoFormat::SVal => {
-                if offset + 2 > raw.len() {
+                let after_len = offset.saturating_add(2);
+                if after_len > raw.len() {
                     truncated = true;
                     break;
                 }
-                let len = u16::from_le_bytes([raw[offset], raw[offset + 1]]);
-                offset += 2;
+                let len_arr: [u8; 2] = raw
+                    .get(offset..after_len)
+                    .unwrap_or(&[0; 2])
+                    .try_into()
+                    .unwrap_or_default();
+                let len = u16::from_le_bytes(len_arr);
+                offset = after_len;
                 (offset as u32, len)
             }
         };
@@ -251,7 +256,7 @@ pub fn parse_nv_info(raw: &[u8]) -> NvInfoBlob<'_> {
             truncated = true;
             break;
         }
-        offset += advance;
+        offset = offset.saturating_add(advance);
 
         entries.push(NvInfoEntryRef {
             entry_offset,
@@ -265,9 +270,9 @@ pub fn parse_nv_info(raw: &[u8]) -> NvInfoBlob<'_> {
         // 2 bytes of padding, BVAL 1 byte, HVAL 0, SVAL varies with its
         // `length` field. Running past the end is fine — the outer
         // while-loop will exit on the next iteration's header check.
-        let rem = offset % 4;
+        let rem = offset.checked_rem(4).unwrap_or(0);
         if rem != 0 {
-            let pad = 4 - rem;
+            let pad = 4usize.saturating_sub(rem);
             offset = offset.saturating_add(pad).min(raw.len());
         }
     }

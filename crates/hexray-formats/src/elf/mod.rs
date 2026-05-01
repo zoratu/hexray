@@ -1,4 +1,3 @@
-//! ELF (Executable and Linkable Format) parser.
 //!
 //! This module provides a complete ELF parser built from scratch,
 //! supporting both 32-bit and 64-bit formats.
@@ -7,12 +6,6 @@
 //! - Executables (ET_EXEC)
 //! - Shared objects (ET_DYN)
 //! - Relocatable objects (ET_REL) - including Linux kernel modules (.ko)
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 pub mod amdgpu;
 pub mod cuda;
@@ -108,13 +101,20 @@ impl<'a> Elf<'a> {
         // Get section name string table
         let section_names =
             if header.e_shstrndx > 0 && (header.e_shstrndx as usize) < sections.len() {
-                let shstrtab = &sections[header.e_shstrndx as usize];
-                let start = shstrtab.sh_offset as usize;
-                let end = start.saturating_add(shstrtab.sh_size as usize);
-                if end <= data.len() && end > start {
-                    StringTable::new(&data[start..end])
-                } else {
-                    StringTable::empty()
+                match sections.get(header.e_shstrndx as usize) {
+                    Some(shstrtab) => {
+                        let start = shstrtab.sh_offset as usize;
+                        let end = start.saturating_add(shstrtab.sh_size as usize);
+                        if end > start {
+                            match data.get(start..end) {
+                                Some(slice) => StringTable::new(slice),
+                                None => StringTable::empty(),
+                            }
+                        } else {
+                            StringTable::empty()
+                        }
+                    }
+                    None => StringTable::empty(),
                 }
             } else {
                 StringTable::empty()
@@ -140,8 +140,10 @@ impl<'a> Elf<'a> {
             if section.sh_type != section::SHT_NOBITS && section.sh_size > 0 {
                 let start = section.sh_offset as usize;
                 let end = start.saturating_add(section.sh_size as usize);
-                if end <= data.len() && end > start {
-                    section.set_data(data[start..end].to_vec());
+                if end > start {
+                    if let Some(slice) = data.get(start..end) {
+                        section.set_data(slice.to_vec());
+                    }
                 }
             }
         }
@@ -222,7 +224,8 @@ impl<'a> Elf<'a> {
                 return Err(ParseError::too_short(end, data.len()));
             }
 
-            let section = SectionHeader::parse(&data[offset..], header.class, header.endianness)?;
+            let chunk = data.get(offset..).unwrap_or(&[]);
+            let section = SectionHeader::parse(chunk, header.class, header.endianness)?;
             sections.push(section);
             offset = end;
         }
@@ -244,7 +247,8 @@ impl<'a> Elf<'a> {
                 return Err(ParseError::too_short(end, data.len()));
             }
 
-            let segment = ProgramHeader::parse(&data[offset..], header.class, header.endianness)?;
+            let chunk = data.get(offset..).unwrap_or(&[]);
+            let segment = ProgramHeader::parse(chunk, header.class, header.endianness)?;
             segments.push(segment);
             offset = end;
         }
@@ -273,16 +277,18 @@ impl<'a> Elf<'a> {
 
             // Get the associated string table
             let strtab_idx = section.sh_link as usize;
-            if strtab_idx >= sections.len() {
+            let Some(strtab_section) = sections.get(strtab_idx) else {
                 continue;
-            }
-            let strtab_section = &sections[strtab_idx];
+            };
             let strtab_start = strtab_section.sh_offset as usize;
             let strtab_end = strtab_start.saturating_add(strtab_section.sh_size as usize);
-            if strtab_end > data.len() || strtab_end <= strtab_start {
+            let Some(strtab_slice) = data.get(strtab_start..strtab_end) else {
+                continue;
+            };
+            if strtab_slice.is_empty() {
                 continue;
             }
-            let strtab = StringTable::new(&data[strtab_start..strtab_end]);
+            let strtab = StringTable::new(strtab_slice);
 
             // Parse symbol entries
             let sym_start = section.sh_offset as usize;
@@ -297,8 +303,12 @@ impl<'a> Elf<'a> {
             }
 
             let mut offset = sym_start;
-            while offset.saturating_add(entry_size) <= sym_end && offset < sym_end {
-                let entry = SymbolEntry::parse(&data[offset..], header.class, header.endianness)?;
+            while let Some(next) = offset.checked_add(entry_size) {
+                if next > sym_end {
+                    break;
+                }
+                let chunk = data.get(offset..).unwrap_or(&[]);
+                let entry = SymbolEntry::parse(chunk, header.class, header.endianness)?;
 
                 let mut name = strtab.get(entry.st_name as usize).unwrap_or("").to_string();
 
@@ -307,9 +317,10 @@ impl<'a> Elf<'a> {
                     && entry.st_shndx > 0
                     && (entry.st_shndx as usize) < sections.len()
                 {
-                    let sym_section = &sections[entry.st_shndx as usize];
-                    if let Some(sec_name) = section_names.get(sym_section.sh_name as usize) {
-                        name = sec_name.to_string();
+                    if let Some(sym_section) = sections.get(entry.st_shndx as usize) {
+                        if let Some(sec_name) = section_names.get(sym_section.sh_name as usize) {
+                            name = sec_name.to_string();
+                        }
                     }
                 }
 
@@ -321,15 +332,16 @@ impl<'a> Elf<'a> {
                     && entry.st_shndx > 0
                     && (entry.st_shndx as usize) < sections.len()
                 {
-                    let sym_section = &sections[entry.st_shndx as usize];
-                    // Use section file offset + symbol value as the address
-                    sym.address = sym_section.sh_offset + entry.st_value;
+                    if let Some(sym_section) = sections.get(entry.st_shndx as usize) {
+                        // Use section file offset + symbol value as the address
+                        sym.address = sym_section.sh_offset.saturating_add(entry.st_value);
+                    }
                 }
 
                 symbols.push(sym);
                 raw_symbols.push(entry);
 
-                offset += entry_size;
+                offset = next;
             }
         }
 
@@ -400,21 +412,22 @@ impl<'a> Elf<'a> {
 
             // Resolve the .dynsym (or .symtab) referenced by sh_link.
             let dynsym_idx = rel_section.sh_link as usize;
-            if dynsym_idx >= sections.len() {
+            let Some(dynsym) = sections.get(dynsym_idx) else {
                 continue;
-            }
-            let dynsym = &sections[dynsym_idx];
+            };
             let strtab_idx = dynsym.sh_link as usize;
-            if strtab_idx >= sections.len() {
+            let Some(strtab_section) = sections.get(strtab_idx) else {
                 continue;
-            }
-            let strtab_section = &sections[strtab_idx];
+            };
             let strtab_start = strtab_section.sh_offset as usize;
             let strtab_end = strtab_start.saturating_add(strtab_section.sh_size as usize);
-            if strtab_end > data.len() || strtab_end <= strtab_start {
+            let Some(strtab_slice) = data.get(strtab_start..strtab_end) else {
+                continue;
+            };
+            if strtab_slice.is_empty() {
                 continue;
             }
-            let strtab = StringTable::new(&data[strtab_start..strtab_end]);
+            let strtab = StringTable::new(strtab_slice);
 
             let dynsym_start = dynsym.sh_offset as usize;
             let dynsym_end = dynsym_start.saturating_add(dynsym.sh_size as usize);
@@ -433,24 +446,28 @@ impl<'a> Elf<'a> {
 
             let mut rel_offset = rel_start;
             let mut stub_index: u64 = 0;
-            while rel_offset.saturating_add(rel_entsize) <= rel_end {
+            while let Some(rel_next) = rel_offset.checked_add(rel_entsize) {
+                if rel_next > rel_end {
+                    break;
+                }
                 // Symbol-index extraction: high half of r_info on
                 // ELF64, high 24 bits on ELF32. r_info layout:
                 //   ELF64: r_offset(8) r_info(8) r_addend(8)
                 //   ELF32: r_offset(4) r_info(4) r_addend(4)?
-                let entry_bytes = &data[rel_offset..rel_offset + rel_entsize];
+                let entry_bytes = data.get(rel_offset..rel_next).unwrap_or(&[]);
                 let sym_index = match header.class {
                     ElfClass::Elf64 => {
                         if entry_bytes.len() < 16 {
                             break;
                         }
+                        let info_bytes: [u8; 8] = entry_bytes
+                            .get(8..16)
+                            .unwrap_or(&[0; 8])
+                            .try_into()
+                            .unwrap_or([0; 8]);
                         let r_info = match header.endianness {
-                            Endianness::Little => {
-                                u64::from_le_bytes(entry_bytes[8..16].try_into().unwrap_or([0; 8]))
-                            }
-                            Endianness::Big => {
-                                u64::from_be_bytes(entry_bytes[8..16].try_into().unwrap_or([0; 8]))
-                            }
+                            Endianness::Little => u64::from_le_bytes(info_bytes),
+                            Endianness::Big => u64::from_be_bytes(info_bytes),
                         };
                         (r_info >> 32) as u32
                     }
@@ -458,33 +475,40 @@ impl<'a> Elf<'a> {
                         if entry_bytes.len() < 8 {
                             break;
                         }
+                        let info_bytes: [u8; 4] = entry_bytes
+                            .get(4..8)
+                            .unwrap_or(&[0; 4])
+                            .try_into()
+                            .unwrap_or([0; 4]);
                         let r_info = match header.endianness {
-                            Endianness::Little => {
-                                u32::from_le_bytes(entry_bytes[4..8].try_into().unwrap_or([0; 4]))
-                            }
-                            Endianness::Big => {
-                                u32::from_be_bytes(entry_bytes[4..8].try_into().unwrap_or([0; 4]))
-                            }
+                            Endianness::Little => u32::from_le_bytes(info_bytes),
+                            Endianness::Big => u32::from_be_bytes(info_bytes),
                         };
                         r_info >> 8
                     }
                 };
 
                 // Look up the dynsym entry by index for the name.
-                let sym_offset = dynsym_start + (sym_index as usize) * dynsym_entsize;
-                if sym_offset + dynsym_entsize <= dynsym_end {
-                    let sym_entry =
-                        SymbolEntry::parse(&data[sym_offset..], header.class, header.endianness)?;
+                let sym_offset = dynsym_start
+                    .saturating_add((sym_index as usize).saturating_mul(dynsym_entsize));
+                let Some(sym_off_end) = sym_offset.checked_add(dynsym_entsize) else {
+                    break;
+                };
+                if sym_off_end <= dynsym_end {
+                    let sym_chunk = data.get(sym_offset..).unwrap_or(&[]);
+                    let sym_entry = SymbolEntry::parse(sym_chunk, header.class, header.endianness)?;
                     if let Some(name) = strtab.get(sym_entry.st_name as usize) {
                         if !name.is_empty() {
                             // Strip the GLIBC version suffix
                             // (`qsort@GLIBC_2.2.5` → `qsort`).
                             let bare = name.split('@').next().unwrap_or(name);
-                            let stub_addr = if has_header {
-                                stub_base + stub_size * (stub_index + 1)
+                            let stub_idx = if has_header {
+                                stub_index.saturating_add(1)
                             } else {
-                                stub_base + stub_size * stub_index
+                                stub_index
                             };
+                            let stub_addr =
+                                stub_base.saturating_add(stub_size.saturating_mul(stub_idx));
                             symbols.push(Symbol {
                                 name: format!("{bare}@plt"),
                                 address: stub_addr,
@@ -497,8 +521,8 @@ impl<'a> Elf<'a> {
                     }
                 }
 
-                stub_index += 1;
-                rel_offset += rel_entsize;
+                stub_index = stub_index.saturating_add(1);
+                rel_offset = rel_next;
             }
         }
         Ok(())
@@ -517,35 +541,39 @@ impl<'a> Elf<'a> {
             if section.sh_type == section::SHT_RELA {
                 let start = section.sh_offset as usize;
                 let end = start.saturating_add(section.sh_size as usize);
-                if end <= data.len() && end > start {
-                    // sh_info tells us which section these relocations apply to
-                    let target_section = section.sh_info as usize;
-                    let relocs = Relocation::parse_rela(
-                        &data[start..end],
-                        section,
-                        target_section,
-                        header.class,
-                        header.endianness,
-                        is_x86_64,
-                    )?;
-                    relocations.extend(relocs);
+                if let Some(slice) = data.get(start..end) {
+                    if !slice.is_empty() {
+                        // sh_info tells us which section these relocations apply to
+                        let target_section = section.sh_info as usize;
+                        let relocs = Relocation::parse_rela(
+                            slice,
+                            section,
+                            target_section,
+                            header.class,
+                            header.endianness,
+                            is_x86_64,
+                        )?;
+                        relocations.extend(relocs);
+                    }
                 }
             }
             // REL sections have implicit addend (stored in the target location)
             else if section.sh_type == section::SHT_REL {
                 let start = section.sh_offset as usize;
                 let end = start.saturating_add(section.sh_size as usize);
-                if end <= data.len() && end > start {
-                    let target_section = section.sh_info as usize;
-                    let relocs = Relocation::parse_rel(
-                        &data[start..end],
-                        section,
-                        target_section,
-                        header.class,
-                        header.endianness,
-                        is_x86_64,
-                    )?;
-                    relocations.extend(relocs);
+                if let Some(slice) = data.get(start..end) {
+                    if !slice.is_empty() {
+                        let target_section = section.sh_info as usize;
+                        let relocs = Relocation::parse_rel(
+                            slice,
+                            section,
+                            target_section,
+                            header.class,
+                            header.endianness,
+                            is_x86_64,
+                        )?;
+                        relocations.extend(relocs);
+                    }
                 }
             }
         }
@@ -568,54 +596,57 @@ impl<'a> Elf<'a> {
 
         let start = modinfo_section.sh_offset as usize;
         let end = start.saturating_add(modinfo_section.sh_size as usize);
-        if end > data.len() || end <= start {
+        let modinfo_data = data.get(start..end)?;
+        if modinfo_data.is_empty() {
             return None;
         }
 
-        let modinfo_data = &data[start..end];
         let mut info = KernelModuleInfo::default();
 
         // Parse null-terminated key=value pairs
-        let mut offset = 0;
+        let mut offset = 0usize;
         while offset < modinfo_data.len() {
             // Find the end of this entry
-            let entry_end = modinfo_data[offset..]
+            let tail = modinfo_data.get(offset..).unwrap_or(&[]);
+            let entry_end = tail
                 .iter()
                 .position(|&b| b == 0)
-                .map(|p| offset + p)
+                .and_then(|p| offset.checked_add(p))
                 .unwrap_or(modinfo_data.len());
 
             if entry_end > offset {
-                if let Ok(entry_str) = std::str::from_utf8(&modinfo_data[offset..entry_end]) {
-                    if let Some((key, value)) = entry_str.split_once('=') {
-                        let key = key.trim();
-                        let value = value.trim();
+                if let Some(slice) = modinfo_data.get(offset..entry_end) {
+                    if let Ok(entry_str) = std::str::from_utf8(slice) {
+                        if let Some((key, value)) = entry_str.split_once('=') {
+                            let key = key.trim();
+                            let value = value.trim();
 
-                        info.all_info.push((key.to_string(), value.to_string()));
+                            info.all_info.push((key.to_string(), value.to_string()));
 
-                        match key {
-                            "name" => info.name = Some(value.to_string()),
-                            "version" => info.version = Some(value.to_string()),
-                            "author" => info.author = Some(value.to_string()),
-                            "description" => info.description = Some(value.to_string()),
-                            "license" => info.license = Some(value.to_string()),
-                            "srcversion" => info.srcversion = Some(value.to_string()),
-                            "vermagic" => info.vermagic = Some(value.to_string()),
-                            "depends" => {
-                                info.depends = value
-                                    .split(',')
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| s.trim().to_string())
-                                    .collect();
+                            match key {
+                                "name" => info.name = Some(value.to_string()),
+                                "version" => info.version = Some(value.to_string()),
+                                "author" => info.author = Some(value.to_string()),
+                                "description" => info.description = Some(value.to_string()),
+                                "license" => info.license = Some(value.to_string()),
+                                "srcversion" => info.srcversion = Some(value.to_string()),
+                                "vermagic" => info.vermagic = Some(value.to_string()),
+                                "depends" => {
+                                    info.depends = value
+                                        .split(',')
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.trim().to_string())
+                                        .collect();
+                                }
+                                "retpoline" => info.retpoline = value == "Y",
+                                _ => {}
                             }
-                            "retpoline" => info.retpoline = value == "Y",
-                            _ => {}
                         }
                     }
                 }
             }
 
-            offset = entry_end + 1;
+            offset = entry_end.saturating_add(1);
         }
 
         // Only return if we found at least some module info
@@ -657,17 +688,15 @@ impl<'a> Elf<'a> {
 
             // Use section's file offset as its base address for relocatable files
             let section_base = section.sh_offset;
-            let section_end = section_base + section.sh_size;
+            let section_end = section_base.saturating_add(section.sh_size);
 
             if addr >= section_base && addr < section_end {
-                let offset_in_section = (addr - section_base) as usize;
-                let file_offset = section.sh_offset as usize + offset_in_section;
+                let offset_in_section = addr.saturating_sub(section_base) as usize;
+                let file_offset = (section.sh_offset as usize).saturating_add(offset_in_section);
                 let available = (section.sh_size as usize).saturating_sub(offset_in_section);
                 let to_read = len.min(available);
-
-                if file_offset + to_read <= self.data.len() {
-                    return Some(&self.data[file_offset..file_offset + to_read]);
-                }
+                let end = file_offset.saturating_add(to_read);
+                return self.data.get(file_offset..end);
             }
         }
         None
@@ -698,10 +727,11 @@ impl<'a> Elf<'a> {
     pub fn section_data(&self, section: &SectionHeader) -> Option<&[u8]> {
         let start = section.sh_offset as usize;
         let end = start.saturating_add(section.sh_size as usize);
-        if end <= self.data.len() && end > start {
-            Some(&self.data[start..end])
-        } else {
+        let slice = self.data.get(start..end)?;
+        if slice.is_empty() {
             None
+        } else {
+            Some(slice)
         }
     }
 }
@@ -765,21 +795,19 @@ impl BinaryFormat for Elf<'_> {
                 continue;
             }
             let seg_start = segment.p_vaddr;
-            let seg_end = seg_start + segment.p_memsz;
+            let seg_end = seg_start.saturating_add(segment.p_memsz);
 
             if addr >= seg_start && addr < seg_end {
-                let offset_in_seg = (addr - seg_start) as usize;
-                let file_offset = segment.p_offset as usize + offset_in_seg;
+                let offset_in_seg = addr.saturating_sub(seg_start) as usize;
+                let file_offset = (segment.p_offset as usize).saturating_add(offset_in_seg);
                 let file_size = segment.p_filesz as usize;
 
                 // Check if we're within the file-backed portion
                 if offset_in_seg < file_size {
-                    let available = file_size - offset_in_seg;
+                    let available = file_size.saturating_sub(offset_in_seg);
                     let to_read = len.min(available);
-                    let end = file_offset + to_read;
-                    if end <= self.data.len() {
-                        return Some(&self.data[file_offset..end]);
-                    }
+                    let end = file_offset.saturating_add(to_read);
+                    return self.data.get(file_offset..end);
                 }
             }
         }
@@ -792,7 +820,7 @@ impl BinaryFormat for Elf<'_> {
             .find(|s| {
                 // Use virtual_address() which handles relocatable files correctly
                 let start = s.virtual_address();
-                let end = start + s.sh_size;
+                let end = start.saturating_add(s.sh_size);
                 addr >= start && addr < end
             })
             .map(|s| s as &dyn Section)
@@ -815,11 +843,8 @@ impl<'a> StringTable<'a> {
     }
 
     fn get(&self, offset: usize) -> Option<&'a str> {
-        if offset >= self.data.len() {
-            return None;
-        }
-        let remaining = &self.data[offset..];
+        let remaining = self.data.get(offset..)?;
         let end = remaining.iter().position(|&b| b == 0)?;
-        std::str::from_utf8(&remaining[..end]).ok()
+        std::str::from_utf8(remaining.get(..end)?).ok()
     }
 }

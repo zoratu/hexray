@@ -70,15 +70,15 @@ impl SectionHeader {
         }
 
         let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
+            let end = offset.saturating_add(4);
+            let arr: [u8; 4] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 4])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
+                Endianness::Little => u32::from_le_bytes(arr),
+                Endianness::Big => u32::from_be_bytes(arr),
             }
         };
 
@@ -106,32 +106,28 @@ impl SectionHeader {
         }
 
         let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
+            let end = offset.saturating_add(4);
+            let arr: [u8; 4] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 4])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
+                Endianness::Little => u32::from_le_bytes(arr),
+                Endianness::Big => u32::from_be_bytes(arr),
             }
         };
 
         let read_u64 = |offset: usize| -> u64 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ];
+            let end = offset.saturating_add(8);
+            let arr: [u8; 8] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 8])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u64::from_le_bytes(bytes),
-                Endianness::Big => u64::from_be_bytes(bytes),
+                Endianness::Little => u64::from_le_bytes(arr),
+                Endianness::Big => u64::from_be_bytes(arr),
             }
         };
 

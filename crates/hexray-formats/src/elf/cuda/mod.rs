@@ -159,7 +159,9 @@ impl<'elf> CubinView<'elf> {
         for (sec_idx, kernel_name) in &text_candidates {
             let sec_idx = *sec_idx;
             let kernel_name = *kernel_name;
-            let section = &elf.sections[sec_idx];
+            let Some(section) = elf.sections.get(sec_idx) else {
+                continue;
+            };
 
             // Find the defining symbol for this section that matches the
             // kernel name. We accept: matching name, or matching section
@@ -203,8 +205,8 @@ impl<'elf> CubinView<'elf> {
             }
             seen_names.push(kernel_name);
 
-            let nv_info = sibling_info.map(|info_idx| {
-                let data = elf.sections[info_idx].data();
+            let nv_info = sibling_info.and_then(|info_idx| {
+                let data = elf.sections.get(info_idx)?.data();
                 let blob = parse_nv_info(data);
                 if blob.truncated {
                     diagnostics.push(CubinDiagnostic {
@@ -212,7 +214,7 @@ impl<'elf> CubinView<'elf> {
                         section_index: Some(info_idx),
                     });
                 }
-                blob
+                Some(blob)
             });
 
             let size = sym
@@ -234,8 +236,8 @@ impl<'elf> CubinView<'elf> {
         }
 
         // Module-wide `.nv.info` (if any).
-        let module_info = nv_info_module.map(|(idx, _)| {
-            let data = elf.sections[idx].data();
+        let module_info = nv_info_module.and_then(|(idx, _)| {
+            let data = elf.sections.get(idx)?.data();
             let blob = parse_nv_info(data);
             if blob.truncated {
                 diagnostics.push(CubinDiagnostic {
@@ -243,7 +245,7 @@ impl<'elf> CubinView<'elf> {
                     section_index: Some(idx),
                 });
             }
-            blob
+            Some(blob)
         });
 
         Ok(Self {
@@ -493,7 +495,7 @@ fn find_defining_symbol<'a>(
 
     let idx = name_match.or(index_match);
     match idx {
-        Some(i) => (Some(&symbols[i]), Some(&raw_symbols[i])),
+        Some(i) => (symbols.get(i), raw_symbols.get(i)),
         None => (None, None),
     }
 }

@@ -139,9 +139,9 @@ pub fn parse(bytes: &[u8]) -> Result<ScaleKinfo, ScaleKinfoError> {
     if bytes.len() < 12 {
         return Err(ScaleKinfoError::HeaderTruncated { len: bytes.len() });
     }
-    let flags = read_u32(&bytes[0..4]);
-    let reserved = read_u32(&bytes[4..8]);
-    let arg_count = read_u32(&bytes[8..12]);
+    let flags = read_u32(bytes.get(0..4).unwrap_or(&[0; 4]));
+    let reserved = read_u32(bytes.get(4..8).unwrap_or(&[0; 4]));
+    let arg_count = read_u32(bytes.get(8..12).unwrap_or(&[0; 4]));
 
     if arg_count > MAX_ARG_COUNT {
         return Err(ScaleKinfoError::ArgCountOutOfRange { count: arg_count });
@@ -150,7 +150,7 @@ pub fn parse(bytes: &[u8]) -> Result<ScaleKinfo, ScaleKinfoError> {
     let needed = (arg_count as usize)
         .checked_mul(8)
         .ok_or(ScaleKinfoError::ArgCountOutOfRange { count: arg_count })?;
-    let body = &bytes[12..];
+    let body = bytes.get(12..).unwrap_or(&[]);
     if body.len() < needed {
         return Err(ScaleKinfoError::Truncated {
             declared_args: arg_count,
@@ -160,13 +160,15 @@ pub fn parse(bytes: &[u8]) -> Result<ScaleKinfo, ScaleKinfoError> {
 
     let mut args = Vec::with_capacity(arg_count as usize);
     for i in 0..arg_count as usize {
-        let off = i * 8;
-        let offset = read_u32(&body[off..off + 4]);
-        let size = read_u32(&body[off + 4..off + 8]);
+        let off = i.saturating_mul(8);
+        let off_end = off.saturating_add(4);
+        let size_end = off.saturating_add(8);
+        let offset = read_u32(body.get(off..off_end).unwrap_or(&[0; 4]));
+        let size = read_u32(body.get(off_end..size_end).unwrap_or(&[0; 4]));
         args.push(ScaleKinfoArg { offset, size });
     }
 
-    let trailing = body[needed..].to_vec();
+    let trailing = body.get(needed..).unwrap_or(&[]).to_vec();
     Ok(ScaleKinfo {
         flags,
         reserved,
@@ -176,13 +178,14 @@ pub fn parse(bytes: &[u8]) -> Result<ScaleKinfo, ScaleKinfoError> {
 }
 
 /// Helper: read a little-endian u32 from a 4-byte slice. The caller
-/// guarantees `bytes.len() == 4`.
+/// guarantees `bytes.len() == 4` (or it falls back to zero).
 fn read_u32(bytes: &[u8]) -> u32 {
-    // Caller guarantees bytes.len() == 4. Inline byte construction
-    // rather than going through try_into().expect() — same
-    // generated code but without the panic surface clippy
-    // expect_used complains about.
-    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    let arr: [u8; 4] = bytes
+        .get(0..4)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
 }
 
 #[cfg(test)]

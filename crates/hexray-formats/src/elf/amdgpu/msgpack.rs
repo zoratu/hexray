@@ -103,10 +103,11 @@ impl<'a> Cursor<'a> {
     }
 
     fn need(&self, n: usize) -> Result<(), DecodeError> {
-        if self.pos + n > self.data.len() {
+        let end = self.pos.saturating_add(n);
+        if end > self.data.len() {
             Err(self.err(format!(
                 "need {n} bytes, only {} remain",
-                self.data.len() - self.pos
+                self.data.len().saturating_sub(self.pos)
             )))
         } else {
             Ok(())
@@ -115,42 +116,55 @@ impl<'a> Cursor<'a> {
 
     fn read_byte(&mut self) -> Result<u8, DecodeError> {
         self.need(1)?;
-        let b = self.data[self.pos];
-        self.pos += 1;
+        let b = self.data.get(self.pos).copied().unwrap_or(0);
+        self.pos = self.pos.saturating_add(1);
         Ok(b)
     }
 
     fn read_u16(&mut self) -> Result<u16, DecodeError> {
         self.need(2)?;
-        let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-        self.pos += 2;
-        Ok(v)
+        let end = self.pos.saturating_add(2);
+        let arr: [u8; 2] = self
+            .data
+            .get(self.pos..end)
+            .unwrap_or(&[0; 2])
+            .try_into()
+            .unwrap_or_default();
+        self.pos = end;
+        Ok(u16::from_be_bytes(arr))
     }
 
     fn read_u32(&mut self) -> Result<u32, DecodeError> {
         self.need(4)?;
-        let v = u32::from_be_bytes([
-            self.data[self.pos],
-            self.data[self.pos + 1],
-            self.data[self.pos + 2],
-            self.data[self.pos + 3],
-        ]);
-        self.pos += 4;
-        Ok(v)
+        let end = self.pos.saturating_add(4);
+        let arr: [u8; 4] = self
+            .data
+            .get(self.pos..end)
+            .unwrap_or(&[0; 4])
+            .try_into()
+            .unwrap_or_default();
+        self.pos = end;
+        Ok(u32::from_be_bytes(arr))
     }
 
     fn read_u64(&mut self) -> Result<u64, DecodeError> {
         self.need(8)?;
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&self.data[self.pos..self.pos + 8]);
-        self.pos += 8;
-        Ok(u64::from_be_bytes(buf))
+        let end = self.pos.saturating_add(8);
+        let arr: [u8; 8] = self
+            .data
+            .get(self.pos..end)
+            .unwrap_or(&[0; 8])
+            .try_into()
+            .unwrap_or_default();
+        self.pos = end;
+        Ok(u64::from_be_bytes(arr))
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         self.need(n)?;
-        let s = &self.data[self.pos..self.pos + n];
-        self.pos += n;
+        let end = self.pos.saturating_add(n);
+        let s = self.data.get(self.pos..end).unwrap_or(&[]);
+        self.pos = end;
         Ok(s)
     }
 

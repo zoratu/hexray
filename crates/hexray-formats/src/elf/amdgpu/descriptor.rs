@@ -70,20 +70,32 @@ impl KernelDescriptor {
         if bytes.len() < KERNEL_DESCRIPTOR_SIZE {
             return Err(ParseError::too_short(KERNEL_DESCRIPTOR_SIZE, bytes.len()));
         }
-        let read_u32 =
-            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-        let read_u16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
-        let read_i64 = |o: usize| {
-            i64::from_le_bytes([
-                bytes[o],
-                bytes[o + 1],
-                bytes[o + 2],
-                bytes[o + 3],
-                bytes[o + 4],
-                bytes[o + 5],
-                bytes[o + 6],
-                bytes[o + 7],
-            ])
+        let read_u32 = |o: usize| -> u32 {
+            let end = o.saturating_add(4);
+            let arr: [u8; 4] = bytes
+                .get(o..end)
+                .unwrap_or(&[0; 4])
+                .try_into()
+                .unwrap_or_default();
+            u32::from_le_bytes(arr)
+        };
+        let read_u16 = |o: usize| -> u16 {
+            let end = o.saturating_add(2);
+            let arr: [u8; 2] = bytes
+                .get(o..end)
+                .unwrap_or(&[0; 2])
+                .try_into()
+                .unwrap_or_default();
+            u16::from_le_bytes(arr)
+        };
+        let read_i64 = |o: usize| -> i64 {
+            let end = o.saturating_add(8);
+            let arr: [u8; 8] = bytes
+                .get(o..end)
+                .unwrap_or(&[0; 8])
+                .try_into()
+                .unwrap_or_default();
+            i64::from_le_bytes(arr)
         };
 
         Ok(Self {
@@ -119,7 +131,7 @@ impl KernelDescriptor {
         } else {
             4
         };
-        (raw + 1) * granule
+        raw.saturating_add(1).saturating_mul(granule)
     }
 
     /// Decoded SGPR count.
@@ -128,7 +140,7 @@ impl KernelDescriptor {
     /// COMPUTE_PGM_RSRC1[9:6]; granule is 8 across all families.
     pub fn sgpr_count(&self) -> u16 {
         let raw = ((self.compute_pgm_rsrc1 >> 6) & 0xf) as u16;
-        (raw + 1) * 8
+        raw.saturating_add(1).saturating_mul(8)
     }
 
     /// True when this kernel runs in wave32 mode (GFX10+ only).
@@ -148,7 +160,7 @@ impl KernelDescriptor {
     /// "4 dwords."
     pub fn dynamic_lds_bytes(&self) -> u32 {
         let granulated = (self.compute_pgm_rsrc2 >> 15) & 0x1ff;
-        granulated * 128
+        granulated.saturating_mul(128)
     }
 
     /// `user_sgpr_count` from COMPUTE_PGM_RSRC2[5:1].

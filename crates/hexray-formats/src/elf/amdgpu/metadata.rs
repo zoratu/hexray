@@ -92,8 +92,8 @@ impl AmdMetadata {
 
         if let Some(arr) = map.get("amdhsa.version").and_then(Value::as_array) {
             if arr.len() >= 2 {
-                let major = arr[0].as_uint().unwrap_or(0) as u32;
-                let minor = arr[1].as_uint().unwrap_or(0) as u32;
+                let major = arr.first().and_then(|v| v.as_uint()).unwrap_or(0) as u32;
+                let minor = arr.get(1).and_then(|v| v.as_uint()).unwrap_or(0) as u32;
                 out.version = Some((major, minor));
             }
         }

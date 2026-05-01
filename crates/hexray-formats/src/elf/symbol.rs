@@ -58,23 +58,28 @@ impl SymbolEntry {
         }
 
         let read_u16 = |offset: usize| -> u16 {
-            let bytes = [data[offset], data[offset + 1]];
+            let end = offset.saturating_add(2);
+            let arr: [u8; 2] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 2])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u16::from_le_bytes(bytes),
-                Endianness::Big => u16::from_be_bytes(bytes),
+                Endianness::Little => u16::from_le_bytes(arr),
+                Endianness::Big => u16::from_be_bytes(arr),
             }
         };
 
         let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
+            let end = offset.saturating_add(4);
+            let arr: [u8; 4] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 4])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
+                Endianness::Little => u32::from_le_bytes(arr),
+                Endianness::Big => u32::from_be_bytes(arr),
             }
         };
 
@@ -82,8 +87,8 @@ impl SymbolEntry {
             st_name: read_u32(0),
             st_value: read_u32(4) as u64,
             st_size: read_u32(8) as u64,
-            st_info: data[12],
-            st_other: data[13],
+            st_info: data.get(12).copied().unwrap_or(0),
+            st_other: data.get(13).copied().unwrap_or(0),
             st_shndx: read_u16(14),
         })
     }
@@ -95,47 +100,48 @@ impl SymbolEntry {
         }
 
         let read_u16 = |offset: usize| -> u16 {
-            let bytes = [data[offset], data[offset + 1]];
+            let end = offset.saturating_add(2);
+            let arr: [u8; 2] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 2])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u16::from_le_bytes(bytes),
-                Endianness::Big => u16::from_be_bytes(bytes),
+                Endianness::Little => u16::from_le_bytes(arr),
+                Endianness::Big => u16::from_be_bytes(arr),
             }
         };
 
         let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
+            let end = offset.saturating_add(4);
+            let arr: [u8; 4] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 4])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
+                Endianness::Little => u32::from_le_bytes(arr),
+                Endianness::Big => u32::from_be_bytes(arr),
             }
         };
 
         let read_u64 = |offset: usize| -> u64 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ];
+            let end = offset.saturating_add(8);
+            let arr: [u8; 8] = data
+                .get(offset..end)
+                .unwrap_or(&[0; 8])
+                .try_into()
+                .unwrap_or_default();
             match endianness {
-                Endianness::Little => u64::from_le_bytes(bytes),
-                Endianness::Big => u64::from_be_bytes(bytes),
+                Endianness::Little => u64::from_le_bytes(arr),
+                Endianness::Big => u64::from_be_bytes(arr),
             }
         };
 
         Ok(Self {
             st_name: read_u32(0),
-            st_info: data[4],
-            st_other: data[5],
+            st_info: data.get(4).copied().unwrap_or(0),
+            st_other: data.get(5).copied().unwrap_or(0),
             st_shndx: read_u16(6),
             st_value: read_u64(8),
             st_size: read_u64(16),
