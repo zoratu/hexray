@@ -216,7 +216,16 @@ impl<'a> FatbinWrapper<'a> {
                 payload: payload_slice,
                 compressed: (flags & 0x1) != 0,
             });
-            cursor = payload_cap;
+            // Guarantee strict forward progress. A malformed entry with
+            // `header_len < ENTRY_HEADER_SIZE` and `payload_size == 0`
+            // can otherwise leave `payload_cap == cursor` and loop
+            // forever, allocating entries until OOM. Step at least
+            // past this entry's header.
+            let next_cursor = payload_cap.max(cursor_end);
+            if next_cursor <= cursor {
+                break;
+            }
+            cursor = next_cursor;
             entry_index = entry_index.saturating_add(1);
         }
 

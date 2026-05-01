@@ -1644,7 +1644,7 @@ impl PseudoCodeEmitter {
                         && matches!(index.kind, ExprKind::IntLit(_))
                     {
                         if let ExprKind::IntLit(idx) = &index.kind {
-                            let byte_offset = (*idx as u64) * (*element_size as u64);
+                            let byte_offset = (*idx as u64).wrapping_mul(*element_size as u64);
                             // Try to find a symbol at this relative offset
                             if let Some(ref sym_table) = self.symbol_table {
                                 if let Some(name) = sym_table.get(byte_offset) {
