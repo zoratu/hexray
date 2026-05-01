@@ -1,18 +1,45 @@
-//! DWARF compilation unit parsing (.debug_info).
 //!
 //! This module parses the .debug_info section which contains the main debugging
 //! information organized into compilation units.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use super::abbrev::AbbreviationTable;
 use super::die::{Die, DieParser};
 use super::types::DwLang;
 use crate::ParseError;
+
+// Bounds-checked little-endian readers used by the CU header parser.
+#[inline]
+fn read_le2(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_le4(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_le8(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
 
 /// A DWARF compilation unit header.
 #[derive(Debug, Clone)]
@@ -115,7 +142,7 @@ impl CompilationUnit {
                 let high_pc = match high_pc_val {
                     // High PC can be an address or a size offset
                     AttributeValue::Address(addr) => *addr,
-                    AttributeValue::Unsigned(size) => low_pc + size,
+                    AttributeValue::Unsigned(size) => low_pc.saturating_add(*size),
                     _ => return None,
                 };
                 if address >= low_pc && address < high_pc {
@@ -269,7 +296,14 @@ impl<'a> DebugInfoParser<'a> {
         &self,
         offset: usize,
     ) -> Result<(CompilationUnit, usize), ParseError> {
-        let data = &self.debug_info[offset..];
+        let data = self
+            .debug_info
+            .get(offset..)
+            .ok_or(ParseError::TruncatedData {
+                expected: offset,
+                actual: self.debug_info.len(),
+                context: "compilation unit header",
+            })?;
 
         // Parse unit length
         let (unit_length, is_64bit) = if data.len() < 4 {
@@ -279,7 +313,7 @@ impl<'a> DebugInfoParser<'a> {
                 context: "compilation unit header",
             });
         } else {
-            let first_word = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            let first_word = read_le4(data, 0);
             if first_word == 0xFFFFFFFF {
                 // 64-bit DWARF
                 if data.len() < 12 {
@@ -289,79 +323,48 @@ impl<'a> DebugInfoParser<'a> {
                         context: "64-bit compilation unit header",
                     });
                 }
-                let len = u64::from_le_bytes([
-                    data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
-                ]);
-                (len, true)
+                (read_le8(data, 4), true)
             } else {
                 (first_word as u64, false)
             }
         };
 
-        let header_offset = if is_64bit { 12 } else { 4 };
+        let header_offset: usize = if is_64bit { 12 } else { 4 };
         let mut local_offset = header_offset;
 
         // Parse version
-        let version = u16::from_le_bytes([data[local_offset], data[local_offset + 1]]);
-        local_offset += 2;
+        let version = read_le2(data, local_offset);
+        local_offset = local_offset.saturating_add(2);
 
         // DWARF 5 has unit_type before address_size
         let (unit_type, address_size, debug_abbrev_offset) = if version >= 5 {
-            let unit_type = data[local_offset];
-            local_offset += 1;
-            let address_size = data[local_offset];
-            local_offset += 1;
+            let unit_type = data.get(local_offset).copied().unwrap_or(0);
+            local_offset = local_offset.saturating_add(1);
+            let address_size = data.get(local_offset).copied().unwrap_or(0);
+            local_offset = local_offset.saturating_add(1);
             let abbrev_offset = if is_64bit {
-                let off = u64::from_le_bytes([
-                    data[local_offset],
-                    data[local_offset + 1],
-                    data[local_offset + 2],
-                    data[local_offset + 3],
-                    data[local_offset + 4],
-                    data[local_offset + 5],
-                    data[local_offset + 6],
-                    data[local_offset + 7],
-                ]);
-                local_offset += 8;
+                let off = read_le8(data, local_offset);
+                local_offset = local_offset.saturating_add(8);
                 off
             } else {
-                let off = u32::from_le_bytes([
-                    data[local_offset],
-                    data[local_offset + 1],
-                    data[local_offset + 2],
-                    data[local_offset + 3],
-                ]) as u64;
-                local_offset += 4;
+                let off = read_le4(data, local_offset) as u64;
+                local_offset = local_offset.saturating_add(4);
                 off
             };
             (unit_type, address_size, abbrev_offset)
         } else {
             // DWARF 2/3/4
             let abbrev_offset = if is_64bit {
-                let off = u64::from_le_bytes([
-                    data[local_offset],
-                    data[local_offset + 1],
-                    data[local_offset + 2],
-                    data[local_offset + 3],
-                    data[local_offset + 4],
-                    data[local_offset + 5],
-                    data[local_offset + 6],
-                    data[local_offset + 7],
-                ]);
-                local_offset += 8;
+                let off = read_le8(data, local_offset);
+                local_offset = local_offset.saturating_add(8);
                 off
             } else {
-                let off = u32::from_le_bytes([
-                    data[local_offset],
-                    data[local_offset + 1],
-                    data[local_offset + 2],
-                    data[local_offset + 3],
-                ]) as u64;
-                local_offset += 4;
+                let off = read_le4(data, local_offset) as u64;
+                local_offset = local_offset.saturating_add(4);
                 off
             };
-            let address_size = data[local_offset];
-            local_offset += 1;
+            let address_size = data.get(local_offset).copied().unwrap_or(0);
+            local_offset = local_offset.saturating_add(1);
             (0x01, address_size, abbrev_offset) // 0x01 = DW_UT_compile
         };
 
@@ -376,14 +379,23 @@ impl<'a> DebugInfoParser<'a> {
         };
 
         // Parse abbreviation table
-        let abbrev_data = &self.debug_abbrev[debug_abbrev_offset as usize..];
+        let abbrev_data = self
+            .debug_abbrev
+            .get(debug_abbrev_offset as usize..)
+            .ok_or(ParseError::TruncatedData {
+                expected: debug_abbrev_offset as usize,
+                actual: self.debug_abbrev.len(),
+                context: "abbrev offset",
+            })?;
         let (abbrev_table, _) = AbbreviationTable::parse(abbrev_data)?;
 
         // Calculate the end of this compilation unit
-        let cu_end = offset + header_offset + unit_length as usize;
+        let cu_end = offset
+            .saturating_add(header_offset)
+            .saturating_add(unit_length as usize);
 
         // Parse the root DIE
-        let die_start = offset + local_offset;
+        let die_start = offset.saturating_add(local_offset);
         let mut parser = DieParser::new(
             self.debug_info,
             &abbrev_table,
@@ -405,15 +417,9 @@ impl<'a> DebugInfoParser<'a> {
     pub fn get_string(&self, offset: u64) -> Option<&str> {
         let debug_str = self.debug_str?;
         let start = offset as usize;
-        if start >= debug_str.len() {
-            return None;
-        }
-
-        let end = debug_str[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|pos| start + pos)?;
-
-        std::str::from_utf8(&debug_str[start..end]).ok()
+        let tail = debug_str.get(start..)?;
+        let pos = tail.iter().position(|&b| b == 0)?;
+        let end = start.checked_add(pos)?;
+        std::str::from_utf8(debug_str.get(start..end)?).ok()
     }
 }

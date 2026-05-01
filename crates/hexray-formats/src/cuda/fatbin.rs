@@ -1,4 +1,3 @@
-//! NVIDIA fatbin container parser.
 //!
 //! A "fatbin" is a thin wrapper `nvcc` uses to collect per-SM cubins
 //! (and sometimes PTX blobs) into a single payload that a host binary
@@ -21,12 +20,6 @@
 //! References: `cuobjdump` output, CuAssembler's fatbin reader, and
 //! `nvidia-ptxjit-compiler`'s public fatbin.h.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 /// Magic word at the start of an NVIDIA fatbin wrapper.
 pub const FATBIN_MAGIC: u32 = 0xBA55_ED50;
 
@@ -36,6 +29,41 @@ pub const WRAPPER_HEADER_SIZE: usize = 16;
 
 /// Byte length of each entry header in the payload table.
 pub const ENTRY_HEADER_SIZE: usize = 64;
+
+// Bounds-checked little-endian readers (caller has already verified the
+// buffer length at the parser entry point).
+#[inline]
+fn read_u16(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
 
 /// Errors from parsing a fatbin wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,14 +169,14 @@ impl<'a> FatbinWrapper<'a> {
                 have: bytes.len(),
             });
         }
-        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let magic = read_u32(bytes, 0);
         if magic != FATBIN_MAGIC {
             return Err(FatbinError::BadMagic(magic));
         }
-        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let version = read_u32(bytes, 4);
         // Offset to first entry header, from the start of the wrapper.
-        let header_offset = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
-        let header_size = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+        let header_offset = read_u32(bytes, 8) as usize;
+        let header_size = read_u32(bytes, 12) as usize;
         let payload_end = header_offset.saturating_add(header_size);
         if payload_end > bytes.len() {
             return Err(FatbinError::PayloadOverflow {
@@ -160,26 +188,16 @@ impl<'a> FatbinWrapper<'a> {
         let mut entries = Vec::new();
         let mut cursor = header_offset;
         let mut entry_index = 0usize;
-        while cursor + ENTRY_HEADER_SIZE <= payload_end {
-            let kind_raw = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
-            let flags = u16::from_le_bytes([bytes[cursor + 2], bytes[cursor + 3]]);
-            let header_len = u32::from_le_bytes([
-                bytes[cursor + 4],
-                bytes[cursor + 5],
-                bytes[cursor + 6],
-                bytes[cursor + 7],
-            ]) as usize;
-            let payload_size = u64::from_le_bytes([
-                bytes[cursor + 8],
-                bytes[cursor + 9],
-                bytes[cursor + 10],
-                bytes[cursor + 11],
-                bytes[cursor + 12],
-                bytes[cursor + 13],
-                bytes[cursor + 14],
-                bytes[cursor + 15],
-            ]) as usize;
-            let sm = u16::from_le_bytes([bytes[cursor + 28], bytes[cursor + 29]]);
+        while let Some(cursor_end) = cursor.checked_add(ENTRY_HEADER_SIZE) {
+            if cursor_end > payload_end {
+                break;
+            }
+
+            let kind_raw = read_u16(bytes, cursor);
+            let flags = read_u16(bytes, cursor.saturating_add(2));
+            let header_len = read_u32(bytes, cursor.saturating_add(4)) as usize;
+            let payload_size = read_u64(bytes, cursor.saturating_add(8)) as usize;
+            let sm = read_u16(bytes, cursor.saturating_add(28));
 
             let payload_start = cursor.saturating_add(header_len);
             let payload_cap = payload_start.saturating_add(payload_size);
@@ -191,14 +209,15 @@ impl<'a> FatbinWrapper<'a> {
                     wrapper_end: payload_end,
                 });
             }
+            let payload_slice = bytes.get(payload_start..payload_cap).unwrap_or(&[]);
             entries.push(FatbinEntry {
                 kind: FatbinEntryKind::from_raw(kind_raw),
                 sm,
-                payload: &bytes[payload_start..payload_cap],
+                payload: payload_slice,
                 compressed: (flags & 0x1) != 0,
             });
             cursor = payload_cap;
-            entry_index += 1;
+            entry_index = entry_index.saturating_add(1);
         }
 
         Ok(Self {

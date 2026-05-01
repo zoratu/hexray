@@ -1,4 +1,3 @@
-//! DWARF5 .debug_loclists section support.
 //!
 //! The .debug_loclists section contains location lists that describe where
 //! a variable is stored at different points in the program. This replaces
@@ -16,12 +15,6 @@
 //! - `DW_LLE_base_address` (0x06): Set base address directly
 //! - `DW_LLE_start_end` (0x07): Range via start/end addresses
 //! - `DW_LLE_start_length` (0x08): Range via start address + length
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use super::leb128::decode_uleb128;
 use crate::ParseError;
@@ -124,6 +117,29 @@ impl<'a> LocationListsParser<'a> {
         Self { data, address_size }
     }
 
+    /// Read a single byte at `pos`, advancing on success.
+    #[inline]
+    fn read_byte(&self, pos: &mut usize) -> Result<u8, ParseError> {
+        let b =
+            self.data.get(*pos).copied().ok_or_else(|| {
+                truncated(pos.saturating_add(1), self.data.len(), "location list")
+            })?;
+        *pos = pos.saturating_add(1);
+        Ok(b)
+    }
+
+    /// Decode a ULEB128 starting at `pos`, advancing `pos` past it.
+    #[inline]
+    fn read_uleb(&self, pos: &mut usize) -> Result<u64, ParseError> {
+        let tail = self
+            .data
+            .get(*pos..)
+            .ok_or_else(|| truncated(*pos, self.data.len(), "location list"))?;
+        let (val, len) = decode_uleb128(tail)?;
+        *pos = pos.saturating_add(len);
+        Ok(val)
+    }
+
     /// Parse a location list at the given offset.
     ///
     /// # Arguments
@@ -141,19 +157,13 @@ impl<'a> LocationListsParser<'a> {
         let mut current_base = base_address;
 
         loop {
-            if pos >= self.data.len() {
-                return Err(truncated(0, 0, "location list"));
-            }
-
-            let op = DwLle::from(self.data[pos]);
-            pos += 1;
+            let op = DwLle::from(self.read_byte(&mut pos)?);
 
             match op {
                 DwLle::EndOfList => break,
 
                 DwLle::BaseAddressx => {
-                    let (index, len) = decode_uleb128(&self.data[pos..])?;
-                    pos += len;
+                    let index = self.read_uleb(&mut pos)?;
                     if let Some(table) = addr_table {
                         if let Some(addr) = table.get_address(index as usize) {
                             current_base = addr;
@@ -162,10 +172,8 @@ impl<'a> LocationListsParser<'a> {
                 }
 
                 DwLle::StartxEndx => {
-                    let (start_idx, len1) = decode_uleb128(&self.data[pos..])?;
-                    pos += len1;
-                    let (end_idx, len2) = decode_uleb128(&self.data[pos..])?;
-                    pos += len2;
+                    let start_idx = self.read_uleb(&mut pos)?;
+                    let end_idx = self.read_uleb(&mut pos)?;
                     let expr = self.read_expression(&mut pos)?;
 
                     if let Some(table) = addr_table {
@@ -179,24 +187,24 @@ impl<'a> LocationListsParser<'a> {
                 }
 
                 DwLle::StartxLength => {
-                    let (start_idx, len1) = decode_uleb128(&self.data[pos..])?;
-                    pos += len1;
-                    let (length, len2) = decode_uleb128(&self.data[pos..])?;
-                    pos += len2;
+                    let start_idx = self.read_uleb(&mut pos)?;
+                    let length = self.read_uleb(&mut pos)?;
                     let expr = self.read_expression(&mut pos)?;
 
                     if let Some(table) = addr_table {
                         if let Some(start) = table.get_address(start_idx as usize) {
-                            locations.push(LocationEntry::new(start, start + length, expr));
+                            locations.push(LocationEntry::new(
+                                start,
+                                start.wrapping_add(length),
+                                expr,
+                            ));
                         }
                     }
                 }
 
                 DwLle::OffsetPair => {
-                    let (start_off, len1) = decode_uleb128(&self.data[pos..])?;
-                    pos += len1;
-                    let (end_off, len2) = decode_uleb128(&self.data[pos..])?;
-                    pos += len2;
+                    let start_off = self.read_uleb(&mut pos)?;
+                    let end_off = self.read_uleb(&mut pos)?;
                     let expr = self.read_expression(&mut pos)?;
 
                     let start = current_base.wrapping_add(start_off);
@@ -222,10 +230,9 @@ impl<'a> LocationListsParser<'a> {
 
                 DwLle::StartLength => {
                     let start = self.read_address(&mut pos)?;
-                    let (length, len) = decode_uleb128(&self.data[pos..])?;
-                    pos += len;
+                    let length = self.read_uleb(&mut pos)?;
                     let expr = self.read_expression(&mut pos)?;
-                    locations.push(LocationEntry::new(start, start + length, expr));
+                    locations.push(LocationEntry::new(start, start.wrapping_add(length), expr));
                 }
             }
         }
@@ -236,48 +243,46 @@ impl<'a> LocationListsParser<'a> {
     /// Read an address at the current position.
     fn read_address(&self, pos: &mut usize) -> Result<u64, ParseError> {
         if self.address_size == 8 {
-            if self.data.len() < *pos + 8 {
-                return Err(truncated(0, 0, "location list"));
-            }
-            let addr = u64::from_le_bytes([
-                self.data[*pos],
-                self.data[*pos + 1],
-                self.data[*pos + 2],
-                self.data[*pos + 3],
-                self.data[*pos + 4],
-                self.data[*pos + 5],
-                self.data[*pos + 6],
-                self.data[*pos + 7],
-            ]);
-            *pos += 8;
-            Ok(addr)
+            let end = pos
+                .checked_add(8)
+                .ok_or_else(|| truncated(*pos, self.data.len(), "location list"))?;
+            let bytes = self
+                .data
+                .get(*pos..end)
+                .ok_or_else(|| truncated(end, self.data.len(), "location list"))?;
+            let arr: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| truncated(end, self.data.len(), "location list"))?;
+            *pos = end;
+            Ok(u64::from_le_bytes(arr))
         } else {
-            if self.data.len() < *pos + 4 {
-                return Err(truncated(0, 0, "location list"));
-            }
-            let addr = u32::from_le_bytes([
-                self.data[*pos],
-                self.data[*pos + 1],
-                self.data[*pos + 2],
-                self.data[*pos + 3],
-            ]);
-            *pos += 4;
-            Ok(addr as u64)
+            let end = pos
+                .checked_add(4)
+                .ok_or_else(|| truncated(*pos, self.data.len(), "location list"))?;
+            let bytes = self
+                .data
+                .get(*pos..end)
+                .ok_or_else(|| truncated(end, self.data.len(), "location list"))?;
+            let arr: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| truncated(end, self.data.len(), "location list"))?;
+            *pos = end;
+            Ok(u32::from_le_bytes(arr) as u64)
         }
     }
 
     /// Read a location expression (ULEB128 length followed by bytes).
     fn read_expression(&self, pos: &mut usize) -> Result<Vec<u8>, ParseError> {
-        let (length, len) = decode_uleb128(&self.data[*pos..])?;
-        *pos += len;
-
-        let length = length as usize;
-        if self.data.len() < *pos + length {
-            return Err(truncated(0, 0, "location list"));
-        }
-
-        let expr = self.data[*pos..*pos + length].to_vec();
-        *pos += length;
+        let length = self.read_uleb(pos)? as usize;
+        let end = pos
+            .checked_add(length)
+            .ok_or_else(|| truncated(*pos, self.data.len(), "location list"))?;
+        let expr = self
+            .data
+            .get(*pos..end)
+            .ok_or_else(|| truncated(end, self.data.len(), "location list"))?
+            .to_vec();
+        *pos = end;
         Ok(expr)
     }
 }
