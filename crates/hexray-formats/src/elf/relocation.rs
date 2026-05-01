@@ -1,19 +1,72 @@
-//! ELF relocation parsing.
 //!
 //! Relocations are used in relocatable objects (.o files, kernel modules)
 //! to specify how addresses should be patched when linking.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use super::header::ElfClass;
 use super::section::{SHT_REL, SHT_RELA};
 use super::SectionHeader;
 use crate::ParseError;
 use hexray_core::Endianness;
+
+// Bounds-checked endian-aware fixed-width readers. Callers verify the
+// buffer length at function entry; these helpers return `0` on
+// out-of-range access so clippy's `indexing_slicing` /
+// `arithmetic_side_effects` lints don't fire at every read site.
+#[inline]
+fn read_u32(data: &[u8], at: usize, endianness: Endianness) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    match endianness {
+        Endianness::Little => u32::from_le_bytes(arr),
+        Endianness::Big => u32::from_be_bytes(arr),
+    }
+}
+
+#[inline]
+fn read_i32(data: &[u8], at: usize, endianness: Endianness) -> i32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    match endianness {
+        Endianness::Little => i32::from_le_bytes(arr),
+        Endianness::Big => i32::from_be_bytes(arr),
+    }
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize, endianness: Endianness) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    match endianness {
+        Endianness::Little => u64::from_le_bytes(arr),
+        Endianness::Big => u64::from_be_bytes(arr),
+    }
+}
+
+#[inline]
+fn read_i64(data: &[u8], at: usize, endianness: Endianness) -> i64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    match endianness {
+        Endianness::Little => i64::from_le_bytes(arr),
+        Endianness::Big => i64::from_be_bytes(arr),
+    }
+}
 
 /// x86_64 relocation types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,19 +197,21 @@ impl Relocation {
         }
 
         let mut relocations = Vec::new();
-        let mut offset = 0;
+        let mut offset = 0usize;
 
-        while offset + entry_size <= data.len() {
+        while let Some(end) = offset.checked_add(entry_size) {
+            if end > data.len() {
+                break;
+            }
+            let Some(slice) = data.get(offset..end) else {
+                break;
+            };
             let reloc = match class {
-                ElfClass::Elf32 => {
-                    Self::parse_rel32(&data[offset..], endianness, section_index, is_x86_64)?
-                }
-                ElfClass::Elf64 => {
-                    Self::parse_rel64(&data[offset..], endianness, section_index, is_x86_64)?
-                }
+                ElfClass::Elf32 => Self::parse_rel32(slice, endianness, section_index, is_x86_64)?,
+                ElfClass::Elf64 => Self::parse_rel64(slice, endianness, section_index, is_x86_64)?,
             };
             relocations.push(reloc);
-            offset += entry_size;
+            offset = end;
         }
 
         Ok(relocations)
@@ -181,19 +236,21 @@ impl Relocation {
         }
 
         let mut relocations = Vec::new();
-        let mut offset = 0;
+        let mut offset = 0usize;
 
-        while offset + entry_size <= data.len() {
+        while let Some(end) = offset.checked_add(entry_size) {
+            if end > data.len() {
+                break;
+            }
+            let Some(slice) = data.get(offset..end) else {
+                break;
+            };
             let reloc = match class {
-                ElfClass::Elf32 => {
-                    Self::parse_rela32(&data[offset..], endianness, section_index, is_x86_64)?
-                }
-                ElfClass::Elf64 => {
-                    Self::parse_rela64(&data[offset..], endianness, section_index, is_x86_64)?
-                }
+                ElfClass::Elf32 => Self::parse_rela32(slice, endianness, section_index, is_x86_64)?,
+                ElfClass::Elf64 => Self::parse_rela64(slice, endianness, section_index, is_x86_64)?,
             };
             relocations.push(reloc);
-            offset += entry_size;
+            offset = end;
         }
 
         Ok(relocations)
@@ -209,21 +266,8 @@ impl Relocation {
             return Err(ParseError::too_short(8, data.len()));
         }
 
-        let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
-            match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
-            }
-        };
-
-        let r_offset = read_u32(0);
-        let r_info = read_u32(4);
+        let r_offset = read_u32(data, 0, endianness);
+        let r_info = read_u32(data, 4, endianness);
 
         let symbol_index = r_info >> 8;
         let r_type_raw = r_info & 0xff;
@@ -252,38 +296,8 @@ impl Relocation {
             return Err(ParseError::too_short(16, data.len()));
         }
 
-        let _read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
-            match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
-            }
-        };
-
-        let read_u64 = |offset: usize| -> u64 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ];
-            match endianness {
-                Endianness::Little => u64::from_le_bytes(bytes),
-                Endianness::Big => u64::from_be_bytes(bytes),
-            }
-        };
-
-        let r_offset = read_u64(0);
-        let r_info = read_u64(8);
+        let r_offset = read_u64(data, 0, endianness);
+        let r_info = read_u64(data, 8, endianness);
 
         let symbol_index = (r_info >> 32) as u32;
         let r_type_raw = (r_info & 0xffffffff) as u32;
@@ -312,35 +326,9 @@ impl Relocation {
             return Err(ParseError::too_short(12, data.len()));
         }
 
-        let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
-            match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
-            }
-        };
-
-        let read_i32 = |offset: usize| -> i32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
-            match endianness {
-                Endianness::Little => i32::from_le_bytes(bytes),
-                Endianness::Big => i32::from_be_bytes(bytes),
-            }
-        };
-
-        let r_offset = read_u32(0);
-        let r_info = read_u32(4);
-        let r_addend = read_i32(8);
+        let r_offset = read_u32(data, 0, endianness);
+        let r_info = read_u32(data, 4, endianness);
+        let r_addend = read_i32(data, 8, endianness);
 
         let symbol_index = r_info >> 8;
         let r_type_raw = r_info & 0xff;
@@ -369,43 +357,9 @@ impl Relocation {
             return Err(ParseError::too_short(24, data.len()));
         }
 
-        let read_u64 = |offset: usize| -> u64 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ];
-            match endianness {
-                Endianness::Little => u64::from_le_bytes(bytes),
-                Endianness::Big => u64::from_be_bytes(bytes),
-            }
-        };
-
-        let read_i64 = |offset: usize| -> i64 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ];
-            match endianness {
-                Endianness::Little => i64::from_le_bytes(bytes),
-                Endianness::Big => i64::from_be_bytes(bytes),
-            }
-        };
-
-        let r_offset = read_u64(0);
-        let r_info = read_u64(8);
-        let r_addend = read_i64(16);
+        let r_offset = read_u64(data, 0, endianness);
+        let r_info = read_u64(data, 8, endianness);
+        let r_addend = read_i64(data, 16, endianness);
 
         let symbol_index = (r_info >> 32) as u32;
         let r_type_raw = (r_info & 0xffffffff) as u32;

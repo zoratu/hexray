@@ -1,13 +1,6 @@
-//! DWARF Debug Information Entry (DIE) parsing.
 //!
 //! DIEs are the fundamental units of DWARF information. Each DIE describes
 //! a programming language entity (function, variable, type, etc.).
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use super::abbrev::{AbbreviationTable, AttributeSpec};
 use super::leb128::{decode_sleb128, decode_uleb128};
@@ -145,36 +138,16 @@ impl Die {
             _ => return None,
         };
 
-        // Parse simple DW_OP_fbreg expressions
-        // DW_OP_fbreg (0x91) followed by a SLEB128 offset
-        if loc_data.is_empty() {
-            return None;
-        }
-
-        if loc_data[0] == 0x91 {
-            // DW_OP_fbreg
-            let (offset, _) = decode_sleb128(&loc_data[1..]).ok()?;
-            return Some(offset);
-        }
-
-        // Also handle DW_OP_breg6 (rbp-relative on x86_64)
-        // DW_OP_breg6 = 0x76 (base register 6 = rbp on x86_64)
-        if loc_data[0] == 0x76 {
-            let (offset, _) = decode_sleb128(&loc_data[1..]).ok()?;
-            return Some(offset);
-        }
-
-        // DW_OP_breg29 (x29/fp-relative on ARM64)
-        // DW_OP_breg<n> = 0x70 + n, so breg29 = 0x70 + 29 = 0x8d
-        if loc_data[0] == 0x8d {
-            let (offset, _) = decode_sleb128(&loc_data[1..]).ok()?;
-            return Some(offset);
-        }
-
-        // DW_OP_breg31 (sp-relative on ARM64)
-        // breg31 = 0x70 + 31 = 0x8f
-        if loc_data[0] == 0x8f {
-            let (offset, _) = decode_sleb128(&loc_data[1..]).ok()?;
+        // Recognised location-expression opcodes whose payload is a single
+        // SLEB128 frame/base-register offset:
+        //   DW_OP_fbreg  (0x91) — frame-base relative
+        //   DW_OP_breg6  (0x76) — rbp-relative on x86_64
+        //   DW_OP_breg29 (0x8d) — fp/x29-relative on ARM64
+        //   DW_OP_breg31 (0x8f) — sp-relative on ARM64
+        let op = *loc_data.first()?;
+        if matches!(op, 0x91 | 0x76 | 0x8d | 0x8f) {
+            let tail = loc_data.get(1..)?;
+            let (offset, _) = decode_sleb128(tail).ok()?;
             return Some(offset);
         }
 
@@ -228,13 +201,44 @@ impl<'a> DieParser<'a> {
         }
     }
 
+    /// Decode a ULEB128 starting at `self.offset`, advancing past it.
+    #[inline]
+    fn read_uleb(&mut self) -> Result<u64, ParseError> {
+        let tail = self
+            .data
+            .get(self.offset..)
+            .ok_or(ParseError::TruncatedData {
+                expected: self.offset,
+                actual: self.data.len(),
+                context: "ULEB128",
+            })?;
+        let (val, len) = decode_uleb128(tail)?;
+        self.offset = self.offset.saturating_add(len);
+        Ok(val)
+    }
+
+    /// Decode a SLEB128 starting at `self.offset`, advancing past it.
+    #[inline]
+    fn read_sleb(&mut self) -> Result<i64, ParseError> {
+        let tail = self
+            .data
+            .get(self.offset..)
+            .ok_or(ParseError::TruncatedData {
+                expected: self.offset,
+                actual: self.data.len(),
+                context: "SLEB128",
+            })?;
+        let (val, len) = decode_sleb128(tail)?;
+        self.offset = self.offset.saturating_add(len);
+        Ok(val)
+    }
+
     /// Parse a single DIE and its children.
     pub fn parse_die(&mut self) -> Result<Option<Die>, ParseError> {
-        let die_offset = self.offset - self.cu_offset;
+        let die_offset = self.offset.saturating_sub(self.cu_offset);
 
         // Read abbreviation code
-        let (abbrev_code, len) = decode_uleb128(&self.data[self.offset..])?;
-        self.offset += len;
+        let abbrev_code = self.read_uleb()?;
 
         // Code 0 means null entry (end of siblings)
         if abbrev_code == 0 {
@@ -308,9 +312,8 @@ impl<'a> DieParser<'a> {
                 Ok(AttributeValue::Block(block))
             }
             DwForm::Block => {
-                let (len, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                self.offset += consumed;
-                let block = self.read_bytes(len as usize)?;
+                let len = self.read_uleb()? as usize;
+                let block = self.read_bytes(len)?;
                 Ok(AttributeValue::Block(block))
             }
             DwForm::Data1 => {
@@ -331,15 +334,24 @@ impl<'a> DieParser<'a> {
             }
             DwForm::Data16 => {
                 let mut data = [0u8; 16];
-                if self.offset + 16 > self.data.len() {
-                    return Err(ParseError::TruncatedData {
-                        expected: self.offset + 16,
+                let end = self
+                    .offset
+                    .checked_add(16)
+                    .ok_or(ParseError::TruncatedData {
+                        expected: self.offset,
                         actual: self.data.len(),
                         context: "DW_FORM_data16",
-                    });
-                }
-                data.copy_from_slice(&self.data[self.offset..self.offset + 16]);
-                self.offset += 16;
+                    })?;
+                let slice = self
+                    .data
+                    .get(self.offset..end)
+                    .ok_or(ParseError::TruncatedData {
+                        expected: end,
+                        actual: self.data.len(),
+                        context: "DW_FORM_data16",
+                    })?;
+                data.copy_from_slice(slice);
+                self.offset = end;
                 Ok(AttributeValue::Data16(data))
             }
             DwForm::String => {
@@ -351,13 +363,11 @@ impl<'a> DieParser<'a> {
                 Ok(AttributeValue::StringOffset(offset))
             }
             DwForm::Udata => {
-                let (value, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                self.offset += consumed;
+                let value = self.read_uleb()?;
                 Ok(AttributeValue::Unsigned(value))
             }
             DwForm::Sdata => {
-                let (value, consumed) = decode_sleb128(&self.data[self.offset..])?;
-                self.offset += consumed;
+                let value = self.read_sleb()?;
                 Ok(AttributeValue::Signed(value))
             }
             DwForm::Flag => {
@@ -382,8 +392,7 @@ impl<'a> DieParser<'a> {
                 Ok(AttributeValue::Reference(offset))
             }
             DwForm::RefUdata => {
-                let (offset, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                self.offset += consumed;
+                let offset = self.read_uleb()?;
                 Ok(AttributeValue::Reference(offset))
             }
             DwForm::RefAddr => {
@@ -399,9 +408,8 @@ impl<'a> DieParser<'a> {
                 Ok(AttributeValue::SecOffset(offset))
             }
             DwForm::Exprloc => {
-                let (len, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                self.offset += consumed;
-                let block = self.read_bytes(len as usize)?;
+                let len = self.read_uleb()? as usize;
+                let block = self.read_bytes(len)?;
                 Ok(AttributeValue::ExprLoc(block))
             }
             DwForm::Strx | DwForm::Strx1 | DwForm::Strx2 | DwForm::Strx3 | DwForm::Strx4 => {
@@ -415,11 +423,7 @@ impl<'a> DieParser<'a> {
                         b0 | (b1 << 8) | (b2 << 16)
                     }
                     DwForm::Strx4 => self.read_u32()? as u64,
-                    _ => {
-                        let (val, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                        self.offset += consumed;
-                        val
-                    }
+                    _ => self.read_uleb()?,
                 };
                 Ok(AttributeValue::StringIndex(index))
             }
@@ -434,11 +438,7 @@ impl<'a> DieParser<'a> {
                         b0 | (b1 << 8) | (b2 << 16)
                     }
                     DwForm::Addrx4 => self.read_u32()? as u64,
-                    _ => {
-                        let (val, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                        self.offset += consumed;
-                        val
-                    }
+                    _ => self.read_uleb()?,
                 };
                 Ok(AttributeValue::AddressIndex(index))
             }
@@ -450,8 +450,7 @@ impl<'a> DieParser<'a> {
             }
             DwForm::Indirect => {
                 // Read the actual form
-                let (form_value, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                self.offset += consumed;
+                let form_value = self.read_uleb()?;
                 let actual_spec = AttributeSpec {
                     name: spec.name,
                     form: DwForm::from(form_value as u8),
@@ -460,8 +459,7 @@ impl<'a> DieParser<'a> {
                 self.parse_attribute_value(&actual_spec)
             }
             DwForm::Loclistx | DwForm::Rnglistx => {
-                let (index, consumed) = decode_uleb128(&self.data[self.offset..])?;
-                self.offset += consumed;
+                let index = self.read_uleb()?;
                 Ok(AttributeValue::SecOffset(index))
             }
             DwForm::RefSup4 => {
@@ -481,69 +479,89 @@ impl<'a> DieParser<'a> {
     }
 
     fn read_u8(&mut self) -> Result<u8, ParseError> {
-        if self.offset >= self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: self.offset + 1,
+        let value = self
+            .data
+            .get(self.offset)
+            .copied()
+            .ok_or(ParseError::TruncatedData {
+                expected: self.offset.saturating_add(1),
                 actual: self.data.len(),
                 context: "u8",
-            });
-        }
-        let value = self.data[self.offset];
-        self.offset += 1;
+            })?;
+        self.offset = self.offset.saturating_add(1);
         Ok(value)
     }
 
     fn read_u16(&mut self) -> Result<u16, ParseError> {
-        if self.offset + 2 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: self.offset + 2,
+        let end = self
+            .offset
+            .checked_add(2)
+            .ok_or(ParseError::TruncatedData {
+                expected: self.offset,
                 actual: self.data.len(),
                 context: "u16",
-            });
-        }
-        let value = u16::from_le_bytes([self.data[self.offset], self.data[self.offset + 1]]);
-        self.offset += 2;
-        Ok(value)
+            })?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
+                actual: self.data.len(),
+                context: "u16",
+            })?;
+        let arr: [u8; 2] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u16 conversion"))?;
+        self.offset = end;
+        Ok(u16::from_le_bytes(arr))
     }
 
     fn read_u32(&mut self) -> Result<u32, ParseError> {
-        if self.offset + 4 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: self.offset + 4,
+        let end = self
+            .offset
+            .checked_add(4)
+            .ok_or(ParseError::TruncatedData {
+                expected: self.offset,
                 actual: self.data.len(),
                 context: "u32",
-            });
-        }
-        let value = u32::from_le_bytes([
-            self.data[self.offset],
-            self.data[self.offset + 1],
-            self.data[self.offset + 2],
-            self.data[self.offset + 3],
-        ]);
-        self.offset += 4;
-        Ok(value)
+            })?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
+                actual: self.data.len(),
+                context: "u32",
+            })?;
+        let arr: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u32 conversion"))?;
+        self.offset = end;
+        Ok(u32::from_le_bytes(arr))
     }
 
     fn read_u64(&mut self) -> Result<u64, ParseError> {
-        if self.offset + 8 > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: self.offset + 8,
+        let end = self
+            .offset
+            .checked_add(8)
+            .ok_or(ParseError::TruncatedData {
+                expected: self.offset,
                 actual: self.data.len(),
                 context: "u64",
-            });
-        }
-        let value = u64::from_le_bytes([
-            self.data[self.offset],
-            self.data[self.offset + 1],
-            self.data[self.offset + 2],
-            self.data[self.offset + 3],
-            self.data[self.offset + 4],
-            self.data[self.offset + 5],
-            self.data[self.offset + 6],
-            self.data[self.offset + 7],
-        ]);
-        self.offset += 8;
-        Ok(value)
+            })?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
+                actual: self.data.len(),
+                context: "u64",
+            })?;
+        let arr: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| ParseError::InvalidValue("u64 conversion"))?;
+        self.offset = end;
+        Ok(u64::from_le_bytes(arr))
     }
 
     fn read_address(&mut self) -> Result<u64, ParseError> {
@@ -563,32 +581,44 @@ impl<'a> DieParser<'a> {
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>, ParseError> {
-        if self.offset + len > self.data.len() {
-            return Err(ParseError::TruncatedData {
-                expected: self.offset + len,
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(ParseError::TruncatedData {
+                expected: self.offset,
                 actual: self.data.len(),
                 context: "byte block",
-            });
-        }
-        let bytes = self.data[self.offset..self.offset + len].to_vec();
-        self.offset += len;
+            })?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .ok_or(ParseError::TruncatedData {
+                expected: end,
+                actual: self.data.len(),
+                context: "byte block",
+            })?
+            .to_vec();
+        self.offset = end;
         Ok(bytes)
     }
 
     fn read_string(&mut self) -> Result<String, ParseError> {
         let start = self.offset;
-        while self.offset < self.data.len() && self.data[self.offset] != 0 {
-            self.offset += 1;
+        while let Some(&b) = self.data.get(self.offset) {
+            if b == 0 {
+                break;
+            }
+            self.offset = self.offset.saturating_add(1);
         }
         if self.offset >= self.data.len() {
             return Err(ParseError::TruncatedData {
-                expected: self.offset + 1,
+                expected: self.offset.saturating_add(1),
                 actual: self.data.len(),
                 context: "null-terminated string",
             });
         }
-        let s = crate::name_from_bytes(&self.data[start..self.offset]);
-        self.offset += 1; // Skip null terminator
+        let s = crate::name_from_bytes(self.data.get(start..self.offset).unwrap_or(&[]));
+        self.offset = self.offset.saturating_add(1); // Skip null terminator
         Ok(s)
     }
 }
