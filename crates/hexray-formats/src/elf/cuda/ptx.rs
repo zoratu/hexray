@@ -1,4 +1,3 @@
-//! PTX sidecar parser.
 //!
 //! PTX is NVIDIA's virtual ISA — human-readable text stored alongside
 //! SASS in a CUBIN (`.nv_debug_ptx_txt`) or as a standalone blob inside
@@ -17,13 +16,13 @@
 //! Everything beyond that — instruction decoding, register allocation,
 //! control-flow — stays on the TODO for the cheap-sidecar plan.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use core::ops::Range;
+
+/// Read a byte at `i`, returning `None` if out of range.
+#[inline]
+fn at(bytes: &[u8], i: usize) -> Option<u8> {
+    bytes.get(i).copied()
+}
 
 /// Parsed module-level PTX directives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -107,13 +106,14 @@ impl<'a> PtxIndex<'a> {
         let trailing = bytes
             .iter()
             .rposition(|b| *b != 0)
-            .map(|x| x + 1)
+            .map(|x| x.saturating_add(1))
             .unwrap_or(bytes.len());
         if start >= trailing {
             return None;
         }
-        let mut owned = String::with_capacity(trailing - start);
-        for &b in &bytes[start..trailing] {
+        let span = bytes.get(start..trailing)?;
+        let mut owned = String::with_capacity(trailing.saturating_sub(start));
+        for &b in span {
             owned.push(if b == 0 { '\n' } else { b as char });
         }
         let header = parse_header(&owned);
@@ -132,12 +132,13 @@ impl<'a> PtxIndex<'a> {
 
     /// Byte slice of one function's body (between `{` and `}`).
     pub fn function_body(&self, f: &PtxFunction) -> &str {
-        &self.raw[f.body_start..f.body_end.min(self.raw.len())]
+        let end = f.body_end.min(self.raw.len());
+        self.raw.get(f.body_start..end).unwrap_or("")
     }
 
     /// Byte slice of the directive header (signature).
     pub fn function_header(&self, f: &PtxFunction) -> &str {
-        &self.raw[f.header.clone()]
+        self.raw.get(f.header.clone()).unwrap_or("")
     }
 }
 
@@ -221,7 +222,7 @@ fn parse_functions(raw: &str) -> Vec<PtxFunction> {
                     // any `(...)` return-type group on `.func`.
                     let mut cursor = next;
                     cursor = skip_ws(bytes, cursor);
-                    if bytes.get(cursor).copied() == Some(b'(') {
+                    if at(bytes, cursor) == Some(b'(') {
                         cursor = match_paren(bytes, cursor).unwrap_or(bytes.len());
                         cursor = skip_ws(bytes, cursor);
                     }
@@ -234,12 +235,15 @@ fn parse_functions(raw: &str) -> Vec<PtxFunction> {
 
                     // Find the opening brace.
                     let mut k = after_name;
-                    while k < bytes.len() && bytes[k] != b'{' && bytes[k] != b';' {
-                        k += 1;
+                    while let Some(b) = at(bytes, k) {
+                        if b == b'{' || b == b';' {
+                            break;
+                        }
+                        k = k.saturating_add(1);
                     }
                     let header_end = k;
-                    let (body_start, body_end) = if bytes.get(k).copied() == Some(b'{') {
-                        let start = k + 1;
+                    let (body_start, body_end) = if at(bytes, k) == Some(b'{') {
+                        let start = k.saturating_add(1);
                         let end = match_brace(bytes, k).unwrap_or(start);
                         (start, end)
                     } else {
@@ -265,10 +269,11 @@ fn parse_functions(raw: &str) -> Vec<PtxFunction> {
                 _ => {
                     // Non-function directive (e.g. `.reg`, `.global`).
                     // Skip to the end of its statement (next `;`).
-                    i = bytes[i..]
+                    let tail = bytes.get(i..).unwrap_or(&[]);
+                    i = tail
                         .iter()
                         .position(|b| *b == b';' || *b == b'\n')
-                        .map(|p| i + p + 1)
+                        .and_then(|p| i.checked_add(p)?.checked_add(1))
                         .unwrap_or(bytes.len());
                     visible = false;
                     continue;
@@ -276,7 +281,7 @@ fn parse_functions(raw: &str) -> Vec<PtxFunction> {
             }
         }
         // Step past any byte we couldn't recognise.
-        i += 1;
+        i = i.saturating_add(1);
     }
 
     out
@@ -284,20 +289,29 @@ fn parse_functions(raw: &str) -> Vec<PtxFunction> {
 
 fn skip_trivia(bytes: &[u8], mut i: usize) -> Option<usize> {
     let start = i;
-    while i < bytes.len() {
-        let b = bytes[i];
+    while let Some(b) = at(bytes, i) {
         if b.is_ascii_whitespace() {
-            i += 1;
-        } else if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
+            i = i.saturating_add(1);
+        } else if b == b'/' && at(bytes, i.saturating_add(1)) == Some(b'/') {
+            while let Some(b2) = at(bytes, i) {
+                if b2 == b'\n' {
+                    break;
+                }
+                i = i.saturating_add(1);
             }
-        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
+        } else if b == b'/' && at(bytes, i.saturating_add(1)) == Some(b'*') {
+            i = i.saturating_add(2);
+            loop {
+                let next = i.saturating_add(1);
+                if next >= bytes.len() {
+                    break;
+                }
+                if at(bytes, i) == Some(b'*') && at(bytes, next) == Some(b'/') {
+                    break;
+                }
+                i = i.saturating_add(1);
             }
-            i = (i + 2).min(bytes.len());
+            i = i.saturating_add(2).min(bytes.len());
         } else {
             break;
         }
@@ -310,8 +324,11 @@ fn skip_trivia(bytes: &[u8], mut i: usize) -> Option<usize> {
 }
 
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
+    while let Some(b) = at(bytes, i) {
+        if !b.is_ascii_whitespace() {
+            break;
+        }
+        i = i.saturating_add(1);
     }
     i
 }
@@ -320,18 +337,14 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 /// Returns the word and the byte offset just past it.
 fn word_at(bytes: &[u8], i: usize) -> Option<(&str, usize)> {
     let start = i;
-    if start >= bytes.len() {
-        return None;
-    }
-    let b0 = bytes[start];
+    let b0 = at(bytes, start)?;
     if !(b0 == b'.' || b0 == b'_' || b0 == b'%' || b0.is_ascii_alphanumeric()) {
         return None;
     }
     let mut j = start;
-    while j < bytes.len() {
-        let b = bytes[j];
+    while let Some(b) = at(bytes, j) {
         if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'%' {
-            j += 1;
+            j = j.saturating_add(1);
         } else {
             break;
         }
@@ -339,7 +352,9 @@ fn word_at(bytes: &[u8], i: usize) -> Option<(&str, usize)> {
     if j == start {
         return None;
     }
-    std::str::from_utf8(&bytes[start..j]).ok().map(|s| (s, j))
+    std::str::from_utf8(bytes.get(start..j)?)
+        .ok()
+        .map(|s| (s, j))
 }
 
 /// Parse a plain C-like identifier (no leading `.` or `%`).
@@ -352,41 +367,41 @@ fn identifier_at(bytes: &[u8], i: usize) -> Option<(&str, usize)> {
 }
 
 fn match_brace(bytes: &[u8], open: usize) -> Option<usize> {
-    debug_assert_eq!(bytes.get(open).copied(), Some(b'{'));
+    debug_assert_eq!(at(bytes, open), Some(b'{'));
     let mut depth = 0usize;
     let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => depth += 1,
+    while let Some(b) = at(bytes, i) {
+        match b {
+            b'{' => depth = depth.saturating_add(1),
             b'}' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return Some(i);
                 }
             }
             _ => {}
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
     None
 }
 
 fn match_paren(bytes: &[u8], open: usize) -> Option<usize> {
-    debug_assert_eq!(bytes.get(open).copied(), Some(b'('));
+    debug_assert_eq!(at(bytes, open), Some(b'('));
     let mut depth = 0usize;
     let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
+    while let Some(b) = at(bytes, i) {
+        match b {
+            b'(' => depth = depth.saturating_add(1),
             b')' => {
-                depth -= 1;
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(i + 1);
+                    return i.checked_add(1);
                 }
             }
             _ => {}
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
     None
 }
@@ -424,10 +439,9 @@ impl<'a> Iterator for TokenIter<'a> {
                 self.pos = adv;
                 continue;
             }
-            let b = self.raw[self.pos];
+            let b = at(self.raw, self.pos)?;
             if b == b'{' || b == b'}' {
-                self.pos += 1;
-                let _ = b;
+                self.pos = self.pos.saturating_add(1);
                 return Some(Token::Brace);
             }
             if let Some((w, next)) = word_at(self.raw, self.pos) {
@@ -438,7 +452,7 @@ impl<'a> Iterator for TokenIter<'a> {
                     Token::Word(w)
                 });
             }
-            self.pos += 1;
+            self.pos = self.pos.saturating_add(1);
         }
         None
     }
