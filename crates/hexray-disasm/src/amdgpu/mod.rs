@@ -1,4 +1,3 @@
-//! AMDGPU disassembler (GCN, CDNA, RDNA — variable-length encoding).
 //!
 //! Unlike SASS's fixed 16-byte word, AMDGPU instructions are 32 bits
 //! or 64 bits, distinguished by a few high bits of the first dword.
@@ -18,12 +17,6 @@
 //! VOP3A/B (`110100` → `110101`), SMEM (`110000` → `111101`), and EXP
 //! (`110001` → `111110`).
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 pub mod encoding;
 pub mod opcodes;
 pub mod registers;
@@ -39,6 +32,20 @@ use hexray_core::{
     Architecture, ControlFlow, GfxArchitecture, GfxFamily, Instruction, Operand, Operation,
     Register, RegisterClass,
 };
+
+/// Read a little-endian u32 from a byte slice. Returns 0 if the
+/// slice has fewer than 4 bytes — caller is expected to gate this
+/// behind a length check.
+#[inline]
+fn read_u32_le(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
 
 /// AMDGPU disassembler targeting one GFX family band (GFX9 vs GFX10+).
 ///
@@ -119,7 +126,7 @@ impl Disassembler for AmdgpuDisassembler {
         if bytes.len() < 4 {
             return Err(DecodeError::truncated(address, 4, bytes.len()));
         }
-        let dword0 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let dword0 = read_u32_le(bytes, 0);
         let class = decode_class(dword0, self.family_band);
 
         let size = class.encoding_size();
@@ -127,7 +134,7 @@ impl Disassembler for AmdgpuDisassembler {
             return Err(DecodeError::truncated(address, size, bytes.len()));
         }
         let dword1 = if size == 8 {
-            Some(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+            Some(read_u32_le(bytes, 4))
         } else {
             None
         };
@@ -135,7 +142,7 @@ impl Disassembler for AmdgpuDisassembler {
         let mnemonic = render_mnemonic(class, dword0, dword1, self.family_band);
         let operation = derive_operation(class, dword0, self.family_band);
         let control_flow = derive_control_flow(class, dword0, self.family_band);
-        let raw = bytes[..size].to_vec();
+        let raw = bytes.get(..size).unwrap_or(&[]).to_vec();
         let mut instr = Instruction::new(address, size, raw, mnemonic);
         instr.operation = operation;
         instr.control_flow = control_flow;
@@ -177,20 +184,23 @@ impl Disassembler for AmdgpuDisassembler {
         bytes: &[u8],
         start_address: u64,
     ) -> Vec<Result<Instruction, DecodeError>> {
-        let mut out = Vec::with_capacity(bytes.len() / 4);
+        let mut out = Vec::with_capacity(bytes.len().checked_div(4).unwrap_or(0));
         let mut offset = 0usize;
-        while offset + 4 <= bytes.len() {
-            let address = start_address + offset as u64;
-            let remaining = &bytes[offset..];
+        while let Some(end) = offset.checked_add(4) {
+            if end > bytes.len() {
+                break;
+            }
+            let address = start_address.saturating_add(offset as u64);
+            let remaining = bytes.get(offset..).unwrap_or(&[]);
             match self.decode_instruction(remaining, address) {
                 Ok(d) => {
                     let size = d.size;
                     out.push(Ok(d.instruction));
-                    offset += size;
+                    offset = offset.saturating_add(size);
                 }
                 Err(e) => {
                     out.push(Err(e));
-                    offset += 4;
+                    offset = offset.saturating_add(4);
                 }
             }
         }
@@ -199,9 +209,9 @@ impl Disassembler for AmdgpuDisassembler {
             // truncation error so the caller knows the stream
             // didn't end on a dword boundary.
             out.push(Err(DecodeError::truncated(
-                start_address + offset as u64,
+                start_address.saturating_add(offset as u64),
                 4,
-                bytes.len() - offset,
+                bytes.len().saturating_sub(offset),
             )));
         }
         out
@@ -365,6 +375,18 @@ fn derive_operation(class: EncodingClass, dword0: u32, family: EncodingFamily) -
     }
 }
 
+/// Read dword1 (bytes 4..8) from `instr.bytes`; returns 0 if the
+/// instruction is shorter than 8 bytes (caller has already classified
+/// it as a 64-bit form so this is a defensive fallback).
+#[inline]
+fn dword1_from(instr: &Instruction) -> u32 {
+    if instr.bytes.len() >= 8 {
+        read_u32_le(&instr.bytes, 4)
+    } else {
+        0
+    }
+}
+
 /// Populate `instr.operands` and the `reads`/`writes` register lists
 /// for the encoding class. Pure best-effort — we render the operand
 /// fields LLVM tablegen documents per class. Encodings with literal
@@ -440,11 +462,16 @@ fn populate_operands(
                 .map(|e| matches!(e.operation, Operation::Jump | Operation::ConditionalJump))
                 .unwrap_or(false);
             if is_branch {
-                let target_addr =
-                    (instr.address as i64).wrapping_add(((simm16 as i32) * 4 + 4) as i64) as u64;
-                instr
-                    .operands
-                    .push(Operand::pc_rel((simm16 as i64) * 4, target_addr));
+                // PC-relative branches: target = PC + simm16 * 4 + 4.
+                // simm16 is signed 16-bit; the branch range is well
+                // within u64, so wrapping arithmetic is the conventional
+                // operation here and matches what hardware does.
+                let delta = (simm16 as i32).wrapping_mul(4).wrapping_add(4) as i64;
+                let target_addr = (instr.address as i64).wrapping_add(delta) as u64;
+                instr.operands.push(Operand::pc_rel(
+                    (simm16 as i64).wrapping_mul(4),
+                    target_addr,
+                ));
                 // PcRelative's Display renders the absolute target;
                 // we don't append the SIMM16 here so the output stays
                 // single-token (matching `llvm-objdump`'s decimal
@@ -488,7 +515,7 @@ fn push_vgpr(instr: &mut Instruction, arch: Architecture, id: u16, write: bool) 
     // match the operand-encoding scheme used in 9-bit SRC0 fields,
     // so the central `amdgpu_reg_name` table can be a single
     // dispatcher.
-    let reg = Register::new(arch, RegisterClass::General, id + 256, 32);
+    let reg = Register::new(arch, RegisterClass::General, id.saturating_add(256), 32);
     if write {
         instr.writes.push(reg);
     } else {
@@ -538,9 +565,9 @@ fn push_amdgpu_operand(instr: &mut Instruction, arch: Architecture, id: u16, wri
 fn inline_constant_value(id: u16) -> Option<i128> {
     match id {
         // Signed 0..=64.
-        128..=192 => Some((id as i128) - 128),
+        128..=192 => Some((id as i128).wrapping_sub(128)),
         // Signed -1..=-16.
-        193..=208 => Some(-((id as i128) - 192)),
+        193..=208 => Some((192i128).wrapping_sub(id as i128)),
         _ => None,
     }
 }
@@ -573,18 +600,8 @@ fn populate_vop3_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
     // (decode_instruction passes Option<u32>), but VOP3 is by spec
     // 64-bit so dword1 should be present at this point in the call.
     // populate_operands receives only dword0 — we encode dword1
-    // back from raw bytes if we need it. Look at the trailing 4
-    // bytes of `instr.bytes`.
-    let dword1 = if instr.bytes.len() >= 8 {
-        u32::from_le_bytes([
-            instr.bytes[4],
-            instr.bytes[5],
-            instr.bytes[6],
-            instr.bytes[7],
-        ])
-    } else {
-        0
-    };
+    // back from raw bytes if we need it.
+    let dword1 = dword1_from(instr);
 
     // Sizes: hard-coded for the OPs we currently know. Default to
     // single-dword. The mnemonic suffix (`_b32` / `_b64` / `_u64_u32`
@@ -626,27 +643,21 @@ fn populate_vop3_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
         parts.push(render_sgpr_range(sdst, 1));
     }
     if n_src >= 1 {
+        let src0_dw = src_dwords.first().copied().unwrap_or(1);
         parts.push(render_amdgpu_operand_string(
-            src0,
-            src_dwords[0],
-            neg_src0,
-            abs_src0,
+            src0, src0_dw, neg_src0, abs_src0,
         ));
     }
     if n_src >= 2 {
+        let src1_dw = src_dwords.get(1).copied().unwrap_or(1);
         parts.push(render_amdgpu_operand_string(
-            src1,
-            src_dwords[1],
-            neg_src1,
-            abs_src1,
+            src1, src1_dw, neg_src1, abs_src1,
         ));
     }
     if n_src >= 3 {
+        let src2_dw = src_dwords.get(2).copied().unwrap_or(1);
         parts.push(render_amdgpu_operand_string(
-            src2,
-            src_dwords[2],
-            neg_src2,
-            abs_src2,
+            src2, src2_dw, neg_src2, abs_src2,
         ));
     }
 
@@ -721,7 +732,7 @@ fn track_vgpr_write(instr: &mut Instruction, target: GfxArchitecture, id: u16) {
     instr.writes.push(Register::new(
         Architecture::Amdgpu(target),
         RegisterClass::General,
-        id + 256,
+        id.saturating_add(256),
         32,
     ));
 }
@@ -729,16 +740,7 @@ fn track_vgpr_write(instr: &mut Instruction, target: GfxArchitecture, id: u16) {
 fn populate_smem_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
     let arch = Architecture::Amdgpu(target);
     let _ = arch;
-    let dword1 = if instr.bytes.len() >= 8 {
-        u32::from_le_bytes([
-            instr.bytes[4],
-            instr.bytes[5],
-            instr.bytes[6],
-            instr.bytes[7],
-        ])
-    } else {
-        0
-    };
+    let dword1 = dword1_from(instr);
     // SBASE is in `[5:0]` shifted left by 1 (always even SGPR pair).
     let sbase = ((dword0 & 0x3f) as u16) << 1;
     let sdst = ((dword0 >> 6) & 0x7f) as u16;
@@ -781,16 +783,7 @@ fn populate_smem_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
 
 fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
     let arch = Architecture::Amdgpu(target);
-    let dword1 = if instr.bytes.len() >= 8 {
-        u32::from_le_bytes([
-            instr.bytes[4],
-            instr.bytes[5],
-            instr.bytes[6],
-            instr.bytes[7],
-        ])
-    } else {
-        0
-    };
+    let dword1 = dword1_from(instr);
     let offset = dword0 & 0x1fff; // 13-bit signed offset
     let seg = ((dword0 >> 14) & 0x3) as u8;
     let addr = (dword1 & 0xff) as u16;
@@ -820,7 +813,7 @@ fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
             instr.writes.push(Register::new(
                 arch,
                 RegisterClass::General,
-                vdst.wrapping_add(i as u16) + 256,
+                vdst.wrapping_add(i as u16).saturating_add(256),
                 32,
             ));
         }
@@ -834,7 +827,7 @@ fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
             instr.reads.push(Register::new(
                 arch,
                 RegisterClass::General,
-                data.wrapping_add(i as u16) + 256,
+                data.wrapping_add(i as u16).saturating_add(256),
                 32,
             ));
         }
@@ -844,7 +837,7 @@ fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
     }
     if offset != 0 {
         // Sign-extend the 13-bit offset.
-        let signed = ((offset << 19) as i32) >> 19;
+        let signed = ((offset.wrapping_shl(19)) as i32).wrapping_shr(19);
         if signed != 0 {
             instr.mnemonic = format!("{} offset:{}", instr.mnemonic, signed);
         }
@@ -854,7 +847,7 @@ fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
         instr.reads.push(Register::new(
             arch,
             RegisterClass::General,
-            addr.wrapping_add(i as u16) + 256,
+            addr.wrapping_add(i as u16).saturating_add(256),
             32,
         ));
     }
@@ -882,16 +875,7 @@ fn populate_flat_operands(instr: &mut Instruction, dword0: u32, target: GfxArchi
 ///   `<vdata>, <vaddr>, <srsrc>, <soffset> [offset:N] [idxen] [offen]`
 fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
     let arch = Architecture::Amdgpu(target);
-    let dword1 = if instr.bytes.len() >= 8 {
-        u32::from_le_bytes([
-            instr.bytes[4],
-            instr.bytes[5],
-            instr.bytes[6],
-            instr.bytes[7],
-        ])
-    } else {
-        0
-    };
+    let dword1 = dword1_from(instr);
 
     let offset = dword0 & 0xfff;
     let offen = (dword0 >> 12) & 1 != 0;
@@ -910,11 +894,11 @@ fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArch
 
     // SRSRC is encoded as a 5-bit field that names s[N*4:N*4+3] — one
     // resource descriptor (V#) is 4 SGPRs / 128 bits.
-    let srsrc_base = srsrc_quad * 4;
-    let srsrc_str = format!("s[{}:{}]", srsrc_base, srsrc_base + 3);
+    let srsrc_base = srsrc_quad.wrapping_mul(4);
+    let srsrc_str = format!("s[{}:{}]", srsrc_base, srsrc_base.saturating_add(3));
     let vdata_str = render_vgpr_range(vdata, dwords);
     let vaddr_str = if offen && idxen {
-        format!("v[{}:{}]", vaddr, vaddr + 1)
+        format!("v[{}:{}]", vaddr, vaddr.saturating_add(1))
     } else if offen || idxen {
         render_vgpr_range(vaddr, 1)
     } else {
@@ -957,11 +941,11 @@ fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArch
     instr.mnemonic = s;
 
     // Track register access. SRSRC = 4 SGPRs read.
-    for i in 0..4 {
+    for i in 0..4u16 {
         instr.reads.push(Register::new(
             arch,
             RegisterClass::General,
-            srsrc_base + i,
+            srsrc_base.wrapping_add(i),
             32,
         ));
     }
@@ -971,12 +955,12 @@ fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArch
             .push(Register::new(arch, RegisterClass::General, soffset, 32));
     }
     if offen || idxen {
-        let n = if offen && idxen { 2 } else { 1 };
+        let n: u16 = if offen && idxen { 2 } else { 1 };
         for i in 0..n {
             instr.reads.push(Register::new(
                 arch,
                 RegisterClass::General,
-                vaddr.wrapping_add(i) + 256,
+                vaddr.wrapping_add(i).saturating_add(256),
                 32,
             ));
         }
@@ -986,7 +970,7 @@ fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArch
             instr.writes.push(Register::new(
                 arch,
                 RegisterClass::General,
-                vdata.wrapping_add(i) + 256,
+                vdata.wrapping_add(i).saturating_add(256),
                 32,
             ));
         }
@@ -995,7 +979,7 @@ fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArch
             instr.reads.push(Register::new(
                 arch,
                 RegisterClass::General,
-                vdata.wrapping_add(i) + 256,
+                vdata.wrapping_add(i).saturating_add(256),
                 32,
             ));
         }
@@ -1019,16 +1003,7 @@ fn populate_mubuf_operands(instr: &mut Instruction, dword0: u32, target: GfxArch
 ///   `<vdst>, <addr>[, <data0>[, <data1>]] [offset0:N] [offset1:N] [gds]`
 fn populate_ds_operands(instr: &mut Instruction, dword0: u32, target: GfxArchitecture) {
     let arch = Architecture::Amdgpu(target);
-    let dword1 = if instr.bytes.len() >= 8 {
-        u32::from_le_bytes([
-            instr.bytes[4],
-            instr.bytes[5],
-            instr.bytes[6],
-            instr.bytes[7],
-        ])
-    } else {
-        0
-    };
+    let dword1 = dword1_from(instr);
 
     let offset0 = dword0 & 0xff;
     let offset1 = (dword0 >> 8) & 0xff;
@@ -1068,15 +1043,18 @@ fn populate_ds_operands(instr: &mut Instruction, dword0: u32, target: GfxArchite
     instr.mnemonic = s;
 
     // Track reads/writes.
-    instr
-        .reads
-        .push(Register::new(arch, RegisterClass::General, addr + 256, 32));
+    instr.reads.push(Register::new(
+        arch,
+        RegisterClass::General,
+        addr.saturating_add(256),
+        32,
+    ));
     if writes_vdst {
         for i in 0..dwords as u16 {
             instr.writes.push(Register::new(
                 arch,
                 RegisterClass::General,
-                vdst.wrapping_add(i) + 256,
+                vdst.wrapping_add(i).saturating_add(256),
                 32,
             ));
         }
@@ -1086,7 +1064,7 @@ fn populate_ds_operands(instr: &mut Instruction, dword0: u32, target: GfxArchite
             instr.reads.push(Register::new(
                 arch,
                 RegisterClass::General,
-                data0.wrapping_add(i) + 256,
+                data0.wrapping_add(i).saturating_add(256),
                 32,
             ));
         }
@@ -1096,7 +1074,7 @@ fn populate_ds_operands(instr: &mut Instruction, dword0: u32, target: GfxArchite
             instr.reads.push(Register::new(
                 arch,
                 RegisterClass::General,
-                data1.wrapping_add(i) + 256,
+                data1.wrapping_add(i).saturating_add(256),
                 32,
             ));
         }
@@ -1163,7 +1141,11 @@ fn render_vgpr_range(base: u16, dwords: u8) -> String {
     if dwords <= 1 {
         format!("v{base}")
     } else {
-        format!("v[{}:{}]", base, base.saturating_add(dwords as u16 - 1))
+        format!(
+            "v[{}:{}]",
+            base,
+            base.saturating_add((dwords as u16).saturating_sub(1))
+        )
     }
 }
 
@@ -1186,7 +1168,11 @@ fn render_sgpr_range(base: u16, dwords: u8) -> String {
     if dwords <= 1 {
         format!("s{base}")
     } else {
-        format!("s[{}:{}]", base, base.saturating_add(dwords as u16 - 1))
+        format!(
+            "s[{}:{}]",
+            base,
+            base.saturating_add((dwords as u16).saturating_sub(1))
+        )
     }
 }
 
@@ -1224,7 +1210,7 @@ fn render_amdgpu_operand_string(id: u16, dwords: u8, negate: bool, abs: bool) ->
                 f.into()
             } else if (256..512).contains(&id) {
                 // VGPRs (id 256..511 — strip the offset and render as range).
-                render_vgpr_range(id - 256, dwords)
+                render_vgpr_range(id.saturating_sub(256), dwords)
             } else {
                 // SGPRs and specials.
                 render_sgpr_range(id, dwords)
@@ -1270,7 +1256,9 @@ fn vop3_widths(mnemonic: &str, _family: EncodingFamily, _op: u16) -> (u8, [u8; 3
     // 64-bit (the carry-add accumulator).
     if mnemonic == "v_mad_u64_u32" || mnemonic == "v_mad_i64_i32" {
         dst = 2;
-        src[2] = 2;
+        if let Some(s) = src.get_mut(2) {
+            *s = 2;
+        }
     }
     // v_lshlrev_b64 / v_lshrrev_b64 / v_ashrrev_i64: dst + src1 are
     // 64-bit, src0 (shift amount) is 32-bit.
@@ -1279,7 +1267,9 @@ fn vop3_widths(mnemonic: &str, _family: EncodingFamily, _op: u16) -> (u8, [u8; 3
         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64"
     ) {
         dst = 2;
-        src[1] = 2;
+        if let Some(s) = src.get_mut(1) {
+            *s = 2;
+        }
     }
 
     (dst, src)
@@ -1370,8 +1360,11 @@ fn render_sopp_simm16(mnemonic: &str, simm16: u16, family: EncodingFamily) -> Op
         "s_clause" => {
             // SIMM16 low 6 bits = count of next-clause instructions
             // (encoded as count - 1 on RDNA per LLVM SOPPInstructions.td).
-            let count = (simm16 & 0x3f) as u32 + 1;
-            Some(format!("{:#x}", count - 1))
+            let count = (simm16 & 0x3f) as u32;
+            // The "rendered count" is the raw field value (the
+            // `+1`/`-1` round-trip in the original was a no-op — we
+            // print the encoded count directly).
+            Some(format!("{count:#x}"))
         }
         "s_nop" => {
             // Encoded as count - 1 (s_nop 0 → no extra cycles).

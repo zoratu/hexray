@@ -30,14 +30,14 @@ pub fn operand_name(id: u16) -> String {
         128..=192 => {
             // Signed inline constants: 128 → 0, 129 → 1, ..., 192 → 64,
             // and 193..=208 are negative half then small floats.
-            let signed = (id as i16) - 128;
+            let signed = (id as i16).wrapping_sub(128);
             format!("{signed}")
         }
         240 => "0.5".to_string(),
         242 => "1.0".to_string(),
         244 => "2.0".to_string(),
         246 => "4.0".to_string(),
-        256..=511 => format!("v{}", id - 256),
+        256..=511 => format!("v{}", id.wrapping_sub(256)),
         _ => format!("op:0x{id:x}"),
     }
 }
