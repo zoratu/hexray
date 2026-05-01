@@ -18,6 +18,14 @@
 //! - Analysis result caching
 
 #![forbid(unsafe_code)]
+// Style lints introduced in rust 1.95 that we don't want to gate the
+// build on. These don't change semantics — `collapsible_match` and
+// `collapsible_if` ask us to fold an inner `if cond { … }` into the
+// match-arm guard, and `if let_else` style. The result is sometimes
+// less readable, especially when the inner block has comments or
+// multiple statements. Keep both off; we'll revisit if a stronger
+// case for either appears.
+#![allow(clippy::collapsible_match, clippy::collapsible_if)]
 
 pub mod analysis_cache;
 pub mod callgraph;
