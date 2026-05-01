@@ -1,16 +1,76 @@
-//! DWARF line number program parsing (.debug_line).
 //!
 //! The line number program maps machine code addresses to source file locations.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 use super::leb128::{decode_sleb128, decode_uleb128};
 use super::types::{DwLne, DwLns};
 use crate::ParseError;
+
+// ---- bounds-checked little-endian readers ----------------------------------
+
+#[inline]
+fn read_u16(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u32(data: &[u8], at: usize) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    u32::from_le_bytes(arr)
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
+}
+
+/// Read a single byte at `pos`, returning `None` if out of range.
+#[inline]
+fn read_u8(data: &[u8], pos: usize) -> Option<u8> {
+    data.get(pos).copied()
+}
+
+/// Decode a ULEB128 starting at `*pos`, advancing `*pos` past it.
+#[inline]
+fn read_uleb_at(data: &[u8], pos: &mut usize) -> Result<u64, ParseError> {
+    let tail = data.get(*pos..).ok_or(ParseError::TruncatedData {
+        expected: *pos,
+        actual: data.len(),
+        context: "ULEB128",
+    })?;
+    let (val, len) = decode_uleb128(tail)?;
+    *pos = pos.saturating_add(len);
+    Ok(val)
+}
+
+/// Decode an SLEB128 starting at `*pos`, advancing `*pos` past it.
+#[inline]
+fn read_sleb_at(data: &[u8], pos: &mut usize) -> Result<i64, ParseError> {
+    let tail = data.get(*pos..).ok_or(ParseError::TruncatedData {
+        expected: *pos,
+        actual: data.len(),
+        context: "SLEB128",
+    })?;
+    let (val, len) = decode_sleb128(tail)?;
+    *pos = pos.saturating_add(len);
+    Ok(val)
+}
 
 /// A file entry in the line number program.
 #[derive(Debug, Clone)]
@@ -135,48 +195,45 @@ impl LineNumberProgram {
     /// * `data` - The raw section data starting at the program offset.
     /// * `address_size` - The address size (4 or 8 bytes).
     pub fn parse(data: &[u8], address_size: u8) -> Result<Self, ParseError> {
-        let mut offset = 0;
+        let mut offset = 0usize;
 
         // Parse unit length (determines 32-bit vs 64-bit DWARF)
-        let (unit_length, is_64bit) = if data.len() < 4 {
+        if data.len() < 4 {
             return Err(ParseError::TruncatedData {
                 expected: 4,
                 actual: data.len(),
                 context: "line number program header",
             });
-        } else {
-            let first_word = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            offset += 4;
+        }
+        let first_word = read_u32(data, offset);
+        offset = offset.saturating_add(4);
 
-            if first_word == 0xFFFFFFFF {
-                // 64-bit DWARF
-                if data.len() < 12 {
-                    return Err(ParseError::TruncatedData {
-                        expected: 12,
-                        actual: data.len(),
-                        context: "64-bit line number program header",
-                    });
-                }
-                let len = u64::from_le_bytes([
-                    data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
-                ]);
-                offset += 8;
-                (len, true)
-            } else {
-                (first_word as u64, false)
+        let (unit_length, is_64bit) = if first_word == 0xFFFFFFFF {
+            // 64-bit DWARF
+            if data.len() < 12 {
+                return Err(ParseError::TruncatedData {
+                    expected: 12,
+                    actual: data.len(),
+                    context: "64-bit line number program header",
+                });
             }
+            let len = read_u64(data, offset);
+            offset = offset.saturating_add(8);
+            (len, true)
+        } else {
+            (first_word as u64, false)
         };
 
         // Version
-        let version = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        offset += 2;
+        let version = read_u16(data, offset);
+        offset = offset.saturating_add(2);
 
         // Address size and segment selector size (DWARF 5)
         let actual_address_size = if version >= 5 {
-            let addr_size = data[offset];
-            offset += 1;
-            let _segment_selector_size = data[offset];
-            offset += 1;
+            let addr_size = read_u8(data, offset).unwrap_or(0);
+            offset = offset.saturating_add(1);
+            let _segment_selector_size = read_u8(data, offset).unwrap_or(0);
+            offset = offset.saturating_add(1);
             addr_size
         } else {
             address_size
@@ -184,65 +241,52 @@ impl LineNumberProgram {
 
         // Header length
         let header_length = if is_64bit {
-            let len = u64::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ]);
-            offset += 8;
+            let len = read_u64(data, offset);
+            offset = offset.saturating_add(8);
             len
         } else {
-            let len = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]) as u64;
-            offset += 4;
+            let len = read_u32(data, offset) as u64;
+            offset = offset.saturating_add(4);
             len
         };
 
-        let header_end = offset + header_length as usize;
+        let header_end = offset.saturating_add(header_length as usize);
 
         // Minimum instruction length
-        let min_instruction_length = data[offset];
-        offset += 1;
+        let min_instruction_length = read_u8(data, offset).unwrap_or(1);
+        offset = offset.saturating_add(1);
 
         // Maximum operations per instruction (DWARF 4+)
         let max_ops_per_instruction = if version >= 4 {
-            let val = data[offset];
-            offset += 1;
+            let val = read_u8(data, offset).unwrap_or(1);
+            offset = offset.saturating_add(1);
             val
         } else {
             1
         };
 
         // Default is_stmt
-        let default_is_stmt = data[offset] != 0;
-        offset += 1;
+        let default_is_stmt = read_u8(data, offset).unwrap_or(0) != 0;
+        offset = offset.saturating_add(1);
 
         // Line base
-        let line_base = data[offset] as i8;
-        offset += 1;
+        let line_base = read_u8(data, offset).unwrap_or(0) as i8;
+        offset = offset.saturating_add(1);
 
         // Line range
-        let line_range = data[offset];
-        offset += 1;
+        let line_range = read_u8(data, offset).unwrap_or(1);
+        offset = offset.saturating_add(1);
 
         // Opcode base
-        let opcode_base = data[offset];
-        offset += 1;
+        let opcode_base = read_u8(data, offset).unwrap_or(1);
+        offset = offset.saturating_add(1);
 
         // Standard opcode lengths
-        let mut standard_opcode_lengths = Vec::with_capacity((opcode_base - 1) as usize);
-        for _ in 0..(opcode_base - 1) {
-            standard_opcode_lengths.push(data[offset]);
-            offset += 1;
+        let opcode_count = (opcode_base as usize).saturating_sub(1);
+        let mut standard_opcode_lengths = Vec::with_capacity(opcode_count);
+        for _ in 0..opcode_count {
+            standard_opcode_lengths.push(read_u8(data, offset).unwrap_or(0));
+            offset = offset.saturating_add(1);
         }
 
         // Parse directory and file entries differently for DWARF 5
@@ -287,18 +331,21 @@ impl LineNumberProgram {
         let mut include_directories = Vec::new();
         loop {
             let start = *offset;
-            while *offset < data.len() && data[*offset] != 0 {
-                *offset += 1;
+            while let Some(b) = read_u8(data, *offset) {
+                if b == 0 {
+                    break;
+                }
+                *offset = offset.saturating_add(1);
             }
             if *offset >= data.len() {
                 return Err(ParseError::TruncatedData {
-                    expected: *offset + 1,
+                    expected: offset.saturating_add(1),
                     actual: data.len(),
                     context: "include directory",
                 });
             }
-            let dir = crate::name_from_bytes(&data[start..*offset]);
-            *offset += 1; // Skip null terminator
+            let dir = crate::name_from_bytes(data.get(start..*offset).unwrap_or(&[]));
+            *offset = offset.saturating_add(1); // Skip null terminator
 
             if dir.is_empty() {
                 break;
@@ -310,29 +357,29 @@ impl LineNumberProgram {
         let mut file_names = Vec::new();
         loop {
             let start = *offset;
-            while *offset < data.len() && data[*offset] != 0 {
-                *offset += 1;
+            while let Some(b) = read_u8(data, *offset) {
+                if b == 0 {
+                    break;
+                }
+                *offset = offset.saturating_add(1);
             }
             if *offset >= data.len() {
                 return Err(ParseError::TruncatedData {
-                    expected: *offset + 1,
+                    expected: offset.saturating_add(1),
                     actual: data.len(),
                     context: "file name",
                 });
             }
-            let name = crate::name_from_bytes(&data[start..*offset]);
-            *offset += 1; // Skip null terminator
+            let name = crate::name_from_bytes(data.get(start..*offset).unwrap_or(&[]));
+            *offset = offset.saturating_add(1); // Skip null terminator
 
             if name.is_empty() {
                 break;
             }
 
-            let (directory_index, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
-            let (mod_time, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
-            let (size, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
+            let directory_index = read_uleb_at(data, offset)?;
+            let mod_time = read_uleb_at(data, offset)?;
+            let size = read_uleb_at(data, offset)?;
 
             file_names.push(FileEntry {
                 name,
@@ -351,61 +398,60 @@ impl LineNumberProgram {
         offset: &mut usize,
     ) -> Result<(Vec<String>, Vec<FileEntry>), ParseError> {
         // Directory entry format count
-        let dir_entry_format_count = data[*offset];
-        *offset += 1;
+        let dir_entry_format_count = read_u8(data, *offset).unwrap_or(0);
+        *offset = offset.saturating_add(1);
 
         // Skip directory entry formats for now (we only handle DW_LNCT_path)
         for _ in 0..dir_entry_format_count {
-            let (_content_type, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
-            let (_form, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
+            let _content_type = read_uleb_at(data, offset)?;
+            let _form = read_uleb_at(data, offset)?;
         }
 
         // Directory count
-        let (dir_count, consumed) = decode_uleb128(&data[*offset..])?;
-        *offset += consumed;
+        let dir_count = read_uleb_at(data, offset)?;
 
         // Parse directories (simplified - assumes string form)
         let mut include_directories = Vec::new();
         for _ in 0..dir_count {
             let start = *offset;
-            while *offset < data.len() && data[*offset] != 0 {
-                *offset += 1;
+            while let Some(b) = read_u8(data, *offset) {
+                if b == 0 {
+                    break;
+                }
+                *offset = offset.saturating_add(1);
             }
-            let dir = crate::name_from_bytes(&data[start..*offset]);
-            *offset += 1;
+            let dir = crate::name_from_bytes(data.get(start..*offset).unwrap_or(&[]));
+            *offset = offset.saturating_add(1);
             include_directories.push(dir);
         }
 
         // File entry format count
-        let file_entry_format_count = data[*offset];
-        *offset += 1;
+        let file_entry_format_count = read_u8(data, *offset).unwrap_or(0);
+        *offset = offset.saturating_add(1);
 
         // Skip file entry formats
         for _ in 0..file_entry_format_count {
-            let (_content_type, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
-            let (_form, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
+            let _content_type = read_uleb_at(data, offset)?;
+            let _form = read_uleb_at(data, offset)?;
         }
 
         // File count
-        let (file_count, consumed) = decode_uleb128(&data[*offset..])?;
-        *offset += consumed;
+        let file_count = read_uleb_at(data, offset)?;
 
         // Parse files (simplified)
         let mut file_names = Vec::new();
         for _ in 0..file_count {
             let start = *offset;
-            while *offset < data.len() && data[*offset] != 0 {
-                *offset += 1;
+            while let Some(b) = read_u8(data, *offset) {
+                if b == 0 {
+                    break;
+                }
+                *offset = offset.saturating_add(1);
             }
-            let name = crate::name_from_bytes(&data[start..*offset]);
-            *offset += 1;
+            let name = crate::name_from_bytes(data.get(start..*offset).unwrap_or(&[]));
+            *offset = offset.saturating_add(1);
 
-            let (directory_index, consumed) = decode_uleb128(&data[*offset..])?;
-            *offset += consumed;
+            let directory_index = read_uleb_at(data, offset)?;
 
             file_names.push(FileEntry {
                 name,
@@ -427,27 +473,29 @@ impl LineNumberProgram {
         let mut rows = Vec::new();
         let mut state = LineRow::new(header.default_is_stmt);
 
-        let program_end = if header.is_64bit {
-            12 + header.unit_length as usize
-        } else {
-            4 + header.unit_length as usize
-        };
+        let header_prefix: usize = if header.is_64bit { 12 } else { 4 };
+        let program_end = header_prefix.saturating_add(header.unit_length as usize);
 
         while offset < program_end && offset < data.len() {
-            let opcode = data[offset];
-            offset += 1;
+            let opcode = match read_u8(data, offset) {
+                Some(b) => b,
+                None => break,
+            };
+            offset = offset.saturating_add(1);
 
             if opcode == 0 {
                 // Extended opcode
-                let (len, consumed) = decode_uleb128(&data[offset..])?;
-                offset += consumed;
+                let len = read_uleb_at(data, &mut offset)?;
 
                 if len == 0 {
                     continue;
                 }
 
-                let ext_opcode = data[offset];
-                offset += 1;
+                let ext_opcode = match read_u8(data, offset) {
+                    Some(b) => b,
+                    None => break,
+                };
+                offset = offset.saturating_add(1);
 
                 match ext_opcode {
                     op if op == DwLne::EndSequence as u8 => {
@@ -458,53 +506,40 @@ impl LineNumberProgram {
                     op if op == DwLne::SetAddress as u8 => {
                         state.address = match header.address_size {
                             4 => {
-                                let addr = u32::from_le_bytes([
-                                    data[offset],
-                                    data[offset + 1],
-                                    data[offset + 2],
-                                    data[offset + 3],
-                                ]) as u64;
-                                offset += 4;
+                                let addr = read_u32(data, offset) as u64;
+                                offset = offset.saturating_add(4);
                                 addr
                             }
                             8 => {
-                                let addr = u64::from_le_bytes([
-                                    data[offset],
-                                    data[offset + 1],
-                                    data[offset + 2],
-                                    data[offset + 3],
-                                    data[offset + 4],
-                                    data[offset + 5],
-                                    data[offset + 6],
-                                    data[offset + 7],
-                                ]);
-                                offset += 8;
+                                let addr = read_u64(data, offset);
+                                offset = offset.saturating_add(8);
                                 addr
                             }
                             _ => return Err(ParseError::InvalidValue("unsupported address size")),
                         };
                     }
                     op if op == DwLne::DefineFile as u8 => {
-                        // Skip the file definition
-                        while offset < data.len() && data[offset] != 0 {
-                            offset += 1;
+                        // Skip the file definition name
+                        while let Some(b) = read_u8(data, offset) {
+                            if b == 0 {
+                                break;
+                            }
+                            offset = offset.saturating_add(1);
                         }
-                        offset += 1;
-                        let (_, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
-                        let (_, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
-                        let (_, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
+                        offset = offset.saturating_add(1);
+                        let _ = read_uleb_at(data, &mut offset)?;
+                        let _ = read_uleb_at(data, &mut offset)?;
+                        let _ = read_uleb_at(data, &mut offset)?;
                     }
                     op if op == DwLne::SetDiscriminator as u8 => {
-                        let (discriminator, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
+                        let discriminator = read_uleb_at(data, &mut offset)?;
                         state.discriminator = discriminator;
                     }
                     _ => {
-                        // Skip unknown extended opcode
-                        offset += (len as usize) - 1;
+                        // Skip unknown extended opcode (len includes the
+                        // opcode byte we already consumed).
+                        let skip = (len as usize).saturating_sub(1);
+                        offset = offset.saturating_add(skip);
                     }
                 }
             } else if opcode < header.opcode_base {
@@ -518,24 +553,19 @@ impl LineNumberProgram {
                         state.discriminator = 0;
                     }
                     op if op == DwLns::AdvancePc as u8 => {
-                        let (advance, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
-                        state.address += advance * header.min_instruction_length as u64;
+                        let advance = read_uleb_at(data, &mut offset)?;
+                        let delta = advance.wrapping_mul(header.min_instruction_length as u64);
+                        state.address = state.address.wrapping_add(delta);
                     }
                     op if op == DwLns::AdvanceLine as u8 => {
-                        let (advance, consumed) = decode_sleb128(&data[offset..])?;
-                        offset += consumed;
-                        state.line = (state.line as i64 + advance) as u64;
+                        let advance = read_sleb_at(data, &mut offset)?;
+                        state.line = (state.line as i64).wrapping_add(advance) as u64;
                     }
                     op if op == DwLns::SetFile as u8 => {
-                        let (file, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
-                        state.file = file;
+                        state.file = read_uleb_at(data, &mut offset)?;
                     }
                     op if op == DwLns::SetColumn as u8 => {
-                        let (column, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
-                        state.column = column;
+                        state.column = read_uleb_at(data, &mut offset)?;
                     }
                     op if op == DwLns::NegateStmt as u8 => {
                         state.is_stmt = !state.is_stmt;
@@ -544,15 +574,20 @@ impl LineNumberProgram {
                         state.basic_block = true;
                     }
                     op if op == DwLns::ConstAddPc as u8 => {
-                        let adjusted_opcode = 255 - header.opcode_base;
-                        let address_advance = adjusted_opcode / header.line_range;
-                        state.address +=
-                            address_advance as u64 * header.min_instruction_length as u64;
+                        let adjusted_opcode = 255u8.saturating_sub(header.opcode_base);
+                        let address_advance = if header.line_range == 0 {
+                            0
+                        } else {
+                            adjusted_opcode.checked_div(header.line_range).unwrap_or(0)
+                        };
+                        let delta = (address_advance as u64)
+                            .wrapping_mul(header.min_instruction_length as u64);
+                        state.address = state.address.wrapping_add(delta);
                     }
                     op if op == DwLns::FixedAdvancePc as u8 => {
-                        let advance = u16::from_le_bytes([data[offset], data[offset + 1]]) as u64;
-                        offset += 2;
-                        state.address += advance;
+                        let advance = read_u16(data, offset) as u64;
+                        offset = offset.saturating_add(2);
+                        state.address = state.address.wrapping_add(advance);
                     }
                     op if op == DwLns::SetPrologueEnd as u8 => {
                         state.prologue_end = true;
@@ -561,31 +596,34 @@ impl LineNumberProgram {
                         state.epilogue_begin = true;
                     }
                     op if op == DwLns::SetIsa as u8 => {
-                        let (isa, consumed) = decode_uleb128(&data[offset..])?;
-                        offset += consumed;
-                        state.isa = isa;
+                        state.isa = read_uleb_at(data, &mut offset)?;
                     }
                     _ => {
                         // Skip unknown standard opcode
-                        let idx = (opcode - 1) as usize;
-                        if idx < header.standard_opcode_lengths.len() {
-                            let arg_count = header.standard_opcode_lengths[idx];
+                        let idx = (opcode as usize).saturating_sub(1);
+                        if let Some(&arg_count) = header.standard_opcode_lengths.get(idx) {
                             for _ in 0..arg_count {
-                                let (_, consumed) = decode_uleb128(&data[offset..])?;
-                                offset += consumed;
+                                let _ = read_uleb_at(data, &mut offset)?;
                             }
                         }
                     }
                 }
             } else {
                 // Special opcode
-                let adjusted_opcode = opcode - header.opcode_base;
-                let address_advance = adjusted_opcode / header.line_range;
-                let line_advance =
-                    header.line_base as i64 + (adjusted_opcode % header.line_range) as i64;
+                let adjusted_opcode = opcode.saturating_sub(header.opcode_base);
+                if header.line_range == 0 {
+                    rows.push(state.clone());
+                    continue;
+                }
+                let address_advance = adjusted_opcode.checked_div(header.line_range).unwrap_or(0);
+                let line_advance = (header.line_base as i64).wrapping_add(
+                    (adjusted_opcode.checked_rem(header.line_range).unwrap_or(0)) as i64,
+                );
 
-                state.address += address_advance as u64 * header.min_instruction_length as u64;
-                state.line = (state.line as i64 + line_advance) as u64;
+                let addr_delta =
+                    (address_advance as u64).wrapping_mul(header.min_instruction_length as u64);
+                state.address = state.address.wrapping_add(addr_delta);
+                state.line = (state.line as i64).wrapping_add(line_advance) as u64;
 
                 rows.push(state.clone());
                 state.basic_block = false;
@@ -602,13 +640,13 @@ impl LineNumberProgram {
     pub fn find_location(&self, address: u64) -> Option<&LineRow> {
         // Binary search for the row with the highest address <= target
         let idx = self.rows.partition_point(|r| r.address <= address);
-        if idx > 0 {
-            let row = &self.rows[idx - 1];
-            if !row.end_sequence {
-                return Some(row);
-            }
+        let prev = idx.checked_sub(1)?;
+        let row = self.rows.get(prev)?;
+        if row.end_sequence {
+            None
+        } else {
+            Some(row)
         }
-        None
     }
 
     /// Get the file name for a file index.
@@ -616,6 +654,7 @@ impl LineNumberProgram {
         if file_index == 0 || file_index > self.header.file_names.len() as u64 {
             return None;
         }
-        Some(&self.header.file_names[(file_index - 1) as usize].name)
+        let idx = (file_index as usize).checked_sub(1)?;
+        self.header.file_names.get(idx).map(|f| f.name.as_str())
     }
 }
