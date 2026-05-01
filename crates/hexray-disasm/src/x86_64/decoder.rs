@@ -1,11 +1,5 @@
 //! x86_64 instruction decoder.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use super::modrm::{
     decode_gpr, decode_modrm_reg, decode_modrm_reg_xmm, decode_modrm_rm, decode_modrm_rm_xmm,
     decode_tmm, decode_xmm, ModRM,
@@ -79,13 +73,17 @@ impl Disassembler for X86_64Disassembler {
         let mut offset = prefix_len;
 
         if offset >= bytes.len() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
         // Check if this is a VEX-encoded instruction
         if let Some(vex) = prefixes.vex {
-            let opcode = bytes[offset];
-            offset += 1;
+            let opcode = bytes.get(offset).copied().unwrap_or(0);
+            offset = offset.saturating_add(1);
 
             // Look up in SSE tables based on VEX.pp (implied prefix)
             let prefix_66 = vex.pp == 1;
@@ -109,8 +107,9 @@ impl Disassembler for X86_64Disassembler {
                 if (0xF2..=0xF7).contains(&opcode) {
                     return self.decode_bmi_instruction(bytes, address, &prefixes, offset, opcode);
                 }
-                if let Some(entry) =
-                    super::opcodes_0f38::OPCODE_TABLE_0F38[opcode as usize].as_ref()
+                if let Some(entry) = super::opcodes_0f38::OPCODE_TABLE_0F38
+                    .get(opcode as usize)
+                    .and_then(|e| e.as_ref())
                 {
                     return self
                         .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
@@ -118,8 +117,9 @@ impl Disassembler for X86_64Disassembler {
             }
             // For VEX.mmmmm == 3 (0x0F 0x3A escape) - instructions with immediate
             if vex.mmmmm == 3 {
-                if let Some(entry) =
-                    super::opcodes_0f3a::OPCODE_TABLE_0F3A[opcode as usize].as_ref()
+                if let Some(entry) = super::opcodes_0f3a::OPCODE_TABLE_0F3A
+                    .get(opcode as usize)
+                    .and_then(|e| e.as_ref())
                 {
                     return self
                         .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
@@ -127,7 +127,10 @@ impl Disassembler for X86_64Disassembler {
             }
             // Unknown VEX opcode
             let end = offset.min(bytes.len());
-            return Err(DecodeError::unknown_opcode(address, &bytes[..end]));
+            return Err(DecodeError::unknown_opcode(
+                address,
+                bytes.get(..end).unwrap_or(&[]),
+            ));
         }
 
         // Check if this is an EVEX-encoded instruction (AVX-512)
@@ -136,16 +139,20 @@ impl Disassembler for X86_64Disassembler {
         }
 
         // Check for two-byte opcode escape
-        let (opcode, is_two_byte) = if bytes[offset] == 0x0F {
-            offset += 1;
+        let (opcode, is_two_byte) = if bytes.get(offset).copied().unwrap_or(0) == 0x0F {
+            offset = offset.saturating_add(1);
             if offset >= bytes.len() {
-                return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                return Err(DecodeError::truncated(
+                    address,
+                    offset.saturating_add(1),
+                    bytes.len(),
+                ));
             }
-            (bytes[offset], true)
+            (bytes.get(offset).copied().unwrap_or(0), true)
         } else {
-            (bytes[offset], false)
+            (bytes.get(offset).copied().unwrap_or(0), false)
         };
-        offset += 1;
+        offset = offset.saturating_add(1);
 
         // Look up opcode in table
         let entry = if is_two_byte {
@@ -153,10 +160,10 @@ impl Disassembler for X86_64Disassembler {
             if prefixes.rep {
                 // F3 0F 1E: ENDBR64/ENDBR32/RDSSPD/RDSSPQ
                 if opcode == 0x1E {
-                    let remaining = &bytes[offset..];
+                    let remaining = bytes.get(offset..).unwrap_or(&[]);
                     if !remaining.is_empty() {
-                        let modrm_byte = remaining[0];
-                        offset += 1;
+                        let modrm_byte = remaining.first().copied().unwrap_or(0);
+                        offset = offset.saturating_add(1);
                         return self.decode_cet_instruction(
                             bytes, address, &prefixes, offset, opcode, modrm_byte,
                         );
@@ -164,12 +171,12 @@ impl Disassembler for X86_64Disassembler {
                 }
                 // F3 0F AE /5: INCSSPD/INCSSPQ
                 if opcode == 0xAE {
-                    let remaining = &bytes[offset..];
+                    let remaining = bytes.get(offset..).unwrap_or(&[]);
                     if !remaining.is_empty() {
-                        let modrm_byte = remaining[0];
+                        let modrm_byte = remaining.first().copied().unwrap_or(0);
                         let modrm = ModRM::parse(modrm_byte, prefixes.rex);
                         if modrm.is_register() && (modrm.reg & 0x7) == 5 {
-                            offset += 1;
+                            offset = offset.saturating_add(1);
                             return self.decode_cet_instruction(
                                 bytes, address, &prefixes, offset, opcode, modrm_byte,
                             );
@@ -178,12 +185,12 @@ impl Disassembler for X86_64Disassembler {
                 }
                 // F3 0F 01 EA: SAVEPREVSSP, F3 0F 01 /5: RSTORSSP
                 if opcode == 0x01 {
-                    let remaining = &bytes[offset..];
+                    let remaining = bytes.get(offset..).unwrap_or(&[]);
                     if !remaining.is_empty() {
-                        let modrm_byte = remaining[0];
+                        let modrm_byte = remaining.first().copied().unwrap_or(0);
                         // Check for SAVEPREVSSP or RSTORSSP
                         if modrm_byte == 0xEA || ((modrm_byte >> 3) & 0x7) == 5 {
-                            offset += 1;
+                            offset = offset.saturating_add(1);
                             return self
                                 .decode_cet_0f01(bytes, address, &prefixes, offset, modrm_byte);
                         }
@@ -194,20 +201,28 @@ impl Disassembler for X86_64Disassembler {
             // Handle 0F 38 three-byte escape (SSSE3, SSE4.1, SSE4.2)
             if opcode == 0x38 {
                 if offset >= bytes.len() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let opcode3 = bytes[offset];
-                offset += 1;
+                let opcode3 = bytes.get(offset).copied().unwrap_or(0);
+                offset = offset.saturating_add(1);
                 return self.decode_0f38_instruction(bytes, address, &prefixes, offset, opcode3);
             }
 
             // Handle 0F 3A three-byte escape (SSE4.1, SSE4.2 with immediate)
             if opcode == 0x3A {
                 if offset >= bytes.len() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let opcode3 = bytes[offset];
-                offset += 1;
+                let opcode3 = bytes.get(offset).copied().unwrap_or(0);
+                offset = offset.saturating_add(1);
                 return self.decode_0f3a_instruction(bytes, address, &prefixes, offset, opcode3);
             }
 
@@ -239,7 +254,9 @@ impl Disassembler for X86_64Disassembler {
                 return self.decode_group8(bytes, address, &prefixes, offset);
             }
 
-            OPCODE_TABLE_0F[opcode as usize].as_ref()
+            OPCODE_TABLE_0F
+                .get(opcode as usize)
+                .and_then(|e| e.as_ref())
         } else {
             // Handle group 1 (0x80-0x83) specially
             if (0x80..=0x83).contains(&opcode) {
@@ -268,12 +285,12 @@ impl Disassembler for X86_64Disassembler {
                 return self.decode_invalid_64bit(bytes, address, offset, opcode);
             }
 
-            OPCODE_TABLE[opcode as usize].as_ref()
+            OPCODE_TABLE.get(opcode as usize).and_then(|e| e.as_ref())
         };
 
         let entry = entry.ok_or_else(|| {
             let end = (offset).min(bytes.len());
-            DecodeError::unknown_opcode(address, &bytes[..end])
+            DecodeError::unknown_opcode(address, bytes.get(..end).unwrap_or(&[]))
         })?;
 
         // Determine operand size
@@ -285,7 +302,7 @@ impl Disassembler for X86_64Disassembler {
 
         // Decode operands based on encoding
         let mut operands = Vec::new();
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
 
         match entry.encoding {
             OperandEncoding::None => {}
@@ -314,34 +331,37 @@ impl Disassembler for X86_64Disassembler {
                     if remaining.len() < imm_size {
                         return Err(DecodeError::truncated(
                             address,
-                            offset + imm_size,
+                            offset.saturating_add(imm_size),
                             bytes.len(),
                         ));
                     }
 
                     let imm = match imm_size {
-                        1 => remaining[0] as i128,
-                        2 => i16::from_le_bytes([remaining[0], remaining[1]]) as i128,
+                        1 => remaining.first().copied().unwrap_or(0) as i128,
+                        2 => i16::from_le_bytes([
+                            remaining.first().copied().unwrap_or(0),
+                            remaining.get(1).copied().unwrap_or(0),
+                        ]) as i128,
                         4 => i32::from_le_bytes([
-                            remaining[0],
-                            remaining[1],
-                            remaining[2],
-                            remaining[3],
+                            remaining.first().copied().unwrap_or(0),
+                            remaining.get(1).copied().unwrap_or(0),
+                            remaining.get(2).copied().unwrap_or(0),
+                            remaining.get(3).copied().unwrap_or(0),
                         ]) as i128,
                         8 => i64::from_le_bytes([
-                            remaining[0],
-                            remaining[1],
-                            remaining[2],
-                            remaining[3],
-                            remaining[4],
-                            remaining[5],
-                            remaining[6],
-                            remaining[7],
+                            remaining.first().copied().unwrap_or(0),
+                            remaining.get(1).copied().unwrap_or(0),
+                            remaining.get(2).copied().unwrap_or(0),
+                            remaining.get(3).copied().unwrap_or(0),
+                            remaining.get(4).copied().unwrap_or(0),
+                            remaining.get(5).copied().unwrap_or(0),
+                            remaining.get(6).copied().unwrap_or(0),
+                            remaining.get(7).copied().unwrap_or(0),
                         ]) as i128,
                         _ => unreachable!(),
                     };
-                    operands.push(Operand::imm(imm, (imm_size * 8) as u8));
-                    offset += imm_size;
+                    operands.push(Operand::imm(imm, imm_size.saturating_mul(8) as u8));
+                    offset = offset.saturating_add(imm_size);
                 }
             }
 
@@ -349,16 +369,21 @@ impl Disassembler for X86_64Disassembler {
             | OperandEncoding::ModRmReg_Rm
             | OperandEncoding::ModRmRmOnly => {
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let modrm = ModRM::parse(remaining[0], prefixes.rex);
-                offset += 1;
+                let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+                offset = offset.saturating_add(1);
 
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 match entry.encoding {
                     OperandEncoding::ModRmRm_Reg => {
@@ -395,157 +420,233 @@ impl Disassembler for X86_64Disassembler {
                 if remaining.len() < imm_size {
                     return Err(DecodeError::truncated(
                         address,
-                        offset + imm_size,
+                        offset.saturating_add(imm_size),
                         bytes.len(),
                     ));
                 }
 
                 let imm = match imm_size {
-                    1 => remaining[0] as i8 as i128,
-                    2 => i16::from_le_bytes([remaining[0], remaining[1]]) as i128,
-                    4 => {
-                        i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
-                            as i128
-                    }
+                    1 => remaining.first().copied().unwrap_or(0) as i8 as i128,
+                    2 => i16::from_le_bytes([
+                        remaining.first().copied().unwrap_or(0),
+                        remaining.get(1).copied().unwrap_or(0),
+                    ]) as i128,
+                    4 => i32::from_le_bytes([
+                        remaining.first().copied().unwrap_or(0),
+                        remaining.get(1).copied().unwrap_or(0),
+                        remaining.get(2).copied().unwrap_or(0),
+                        remaining.get(3).copied().unwrap_or(0),
+                    ]) as i128,
                     _ => unreachable!(),
                 };
-                operands.push(Operand::imm(imm, (imm_size * 8) as u8));
-                offset += imm_size;
+                operands.push(Operand::imm(imm, imm_size.saturating_mul(8) as u8));
+                offset = offset.saturating_add(imm_size);
             }
 
             OperandEncoding::Rel8 => {
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let rel = remaining[0] as i8 as i64;
-                let target = (address as i64 + offset as i64 + 1 + rel) as u64;
+                let rel = remaining.first().copied().unwrap_or(0) as i8 as i64;
+                let target = ((address as i64)
+                    .wrapping_add(offset as i64)
+                    .wrapping_add(1)
+                    .wrapping_add(rel)) as u64;
                 operands.push(Operand::pc_rel(rel, target));
-                offset += 1;
+                offset = offset.saturating_add(1);
             }
 
             OperandEncoding::Rel32 => {
                 if remaining.len() < 4 {
-                    return Err(DecodeError::truncated(address, offset + 4, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(4),
+                        bytes.len(),
+                    ));
                 }
-                let rel =
-                    i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
-                        as i64;
-                let target = (address as i64 + offset as i64 + 4 + rel) as u64;
+                let rel = i32::from_le_bytes([
+                    remaining.first().copied().unwrap_or(0),
+                    remaining.get(1).copied().unwrap_or(0),
+                    remaining.get(2).copied().unwrap_or(0),
+                    remaining.get(3).copied().unwrap_or(0),
+                ]) as i64;
+                let target = ((address as i64)
+                    .wrapping_add(offset as i64)
+                    .wrapping_add(4)
+                    .wrapping_add(rel)) as u64;
                 operands.push(Operand::pc_rel(rel, target));
-                offset += 4;
+                offset = offset.saturating_add(4);
             }
 
             OperandEncoding::Imm8 => {
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                operands.push(Operand::imm(remaining[0] as i128, 8));
-                offset += 1;
+                operands.push(Operand::imm(
+                    remaining.first().copied().unwrap_or(0) as i128,
+                    8,
+                ));
+                offset = offset.saturating_add(1);
             }
 
             OperandEncoding::Imm16 => {
                 if remaining.len() < 2 {
-                    return Err(DecodeError::truncated(address, offset + 2, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(2),
+                        bytes.len(),
+                    ));
                 }
-                let imm = i16::from_le_bytes([remaining[0], remaining[1]]) as i128;
+                let imm = i16::from_le_bytes([
+                    remaining.first().copied().unwrap_or(0),
+                    remaining.get(1).copied().unwrap_or(0),
+                ]) as i128;
                 operands.push(Operand::imm(imm, 16));
-                offset += 2;
+                offset = offset.saturating_add(2);
             }
 
             OperandEncoding::Imm32 => {
                 if remaining.len() < 4 {
-                    return Err(DecodeError::truncated(address, offset + 4, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(4),
+                        bytes.len(),
+                    ));
                 }
-                let imm =
-                    i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
-                        as i128;
+                let imm = i32::from_le_bytes([
+                    remaining.first().copied().unwrap_or(0),
+                    remaining.get(1).copied().unwrap_or(0),
+                    remaining.get(2).copied().unwrap_or(0),
+                    remaining.get(3).copied().unwrap_or(0),
+                ]) as i128;
                 operands.push(Operand::imm(imm, 32));
-                offset += 4;
+                offset = offset.saturating_add(4);
             }
 
             OperandEncoding::Imm64 => {
                 if remaining.len() < 8 {
-                    return Err(DecodeError::truncated(address, offset + 8, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(8),
+                        bytes.len(),
+                    ));
                 }
                 let imm = i64::from_le_bytes([
-                    remaining[0],
-                    remaining[1],
-                    remaining[2],
-                    remaining[3],
-                    remaining[4],
-                    remaining[5],
-                    remaining[6],
-                    remaining[7],
+                    remaining.first().copied().unwrap_or(0),
+                    remaining.get(1).copied().unwrap_or(0),
+                    remaining.get(2).copied().unwrap_or(0),
+                    remaining.get(3).copied().unwrap_or(0),
+                    remaining.get(4).copied().unwrap_or(0),
+                    remaining.get(5).copied().unwrap_or(0),
+                    remaining.get(6).copied().unwrap_or(0),
+                    remaining.get(7).copied().unwrap_or(0),
                 ]) as i128;
                 operands.push(Operand::imm(imm, 64));
-                offset += 8;
+                offset = offset.saturating_add(8);
             }
 
             OperandEncoding::Rm_Imm | OperandEncoding::Rm_Imm8 => {
                 // r/m operand with immediate
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let modrm = ModRM::parse(remaining[0], prefixes.rex);
-                offset += 1;
+                let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+                offset = offset.saturating_add(1);
 
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // Decode immediate
                 // For Rm_Imm8 or when entry.default_size is 8, use 8-bit immediate
-                let remaining = &bytes[offset..];
+                let remaining = bytes.get(offset..).unwrap_or(&[]);
                 let (imm, imm_size) = if matches!(entry.encoding, OperandEncoding::Rm_Imm8)
                     || entry.default_size == 8
                 {
                     if remaining.is_empty() {
-                        return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                        return Err(DecodeError::truncated(
+                            address,
+                            offset.saturating_add(1),
+                            bytes.len(),
+                        ));
                     }
-                    (remaining[0] as i8 as i128, 1)
+                    (remaining.first().copied().unwrap_or(0) as i8 as i128, 1)
                 } else {
                     // Full-size immediate (32-bit even in 64-bit mode)
                     let size = if prefixes.operand_size { 2 } else { 4 };
                     if remaining.len() < size {
-                        return Err(DecodeError::truncated(address, offset + size, bytes.len()));
+                        return Err(DecodeError::truncated(
+                            address,
+                            offset.saturating_add(size),
+                            bytes.len(),
+                        ));
                     }
                     let imm = if size == 2 {
-                        i16::from_le_bytes([remaining[0], remaining[1]]) as i128
+                        i16::from_le_bytes([
+                            remaining.first().copied().unwrap_or(0),
+                            remaining.get(1).copied().unwrap_or(0),
+                        ]) as i128
                     } else {
-                        i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]])
-                            as i128
+                        i32::from_le_bytes([
+                            remaining.first().copied().unwrap_or(0),
+                            remaining.get(1).copied().unwrap_or(0),
+                            remaining.get(2).copied().unwrap_or(0),
+                            remaining.get(3).copied().unwrap_or(0),
+                        ]) as i128
                     };
                     (imm, size)
                 };
-                offset += imm_size;
+                offset = offset.saturating_add(imm_size);
 
                 operands.push(rm_operand);
-                operands.push(Operand::imm(imm, (imm_size * 8) as u8));
+                operands.push(Operand::imm(imm, imm_size.saturating_mul(8) as u8));
             }
 
             OperandEncoding::ModRmRm_Reg_Imm8 => {
                 // SHLD/SHRD r/m, reg, imm8
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let modrm = ModRM::parse(remaining[0], prefixes.rex);
-                offset += 1;
+                let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+                offset = offset.saturating_add(1);
 
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // Get immediate
-                let remaining = &bytes[offset..];
+                let remaining = bytes.get(offset..).unwrap_or(&[]);
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let imm = remaining[0];
-                offset += 1;
+                let imm = remaining.first().copied().unwrap_or(0);
+                offset = offset.saturating_add(1);
 
                 operands.push(rm_operand);
                 operands.push(decode_modrm_reg(modrm, operand_size));
@@ -555,16 +656,21 @@ impl Disassembler for X86_64Disassembler {
             OperandEncoding::ModRmRm_Reg_Cl => {
                 // SHLD/SHRD r/m, reg, CL
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let modrm = ModRM::parse(remaining[0], prefixes.rex);
-                offset += 1;
+                let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+                offset = offset.saturating_add(1);
 
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 operands.push(rm_operand);
                 operands.push(decode_modrm_reg(modrm, operand_size));
@@ -593,52 +699,75 @@ impl Disassembler for X86_64Disassembler {
 
             OperandEncoding::Imm16_Imm8 => {
                 // ENTER imm16, imm8
-                let remaining = &bytes[offset..];
+                let remaining = bytes.get(offset..).unwrap_or(&[]);
                 if remaining.len() < 3 {
-                    return Err(DecodeError::truncated(address, offset + 3, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(3),
+                        bytes.len(),
+                    ));
                 }
-                let imm16 = u16::from_le_bytes([remaining[0], remaining[1]]);
-                let imm8 = remaining[2];
-                offset += 3;
+                let imm16 = u16::from_le_bytes([
+                    remaining.first().copied().unwrap_or(0),
+                    remaining.get(1).copied().unwrap_or(0),
+                ]);
+                let imm8 = remaining.get(2).copied().unwrap_or(0);
+                offset = offset.saturating_add(3);
                 operands.push(Operand::imm(imm16 as i128, 16));
                 operands.push(Operand::imm(imm8 as i128, 8));
             }
 
             OperandEncoding::ModRmReg_Rm_Imm => {
                 // IMUL r, r/m, imm16/32
-                let remaining = &bytes[offset..];
+                let remaining = bytes.get(offset..).unwrap_or(&[]);
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let modrm = ModRM::parse(remaining[0], prefixes.rex);
-                offset += 1;
+                let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+                offset = offset.saturating_add(1);
 
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // Read immediate (16 or 32 bits depending on operand size)
-                let imm_remaining = &bytes[offset..];
+                let imm_remaining = bytes.get(offset..).unwrap_or(&[]);
                 let (imm_val, imm_size) = if operand_size == 16 {
                     if imm_remaining.len() < 2 {
-                        return Err(DecodeError::truncated(address, offset + 2, bytes.len()));
+                        return Err(DecodeError::truncated(
+                            address,
+                            offset.saturating_add(2),
+                            bytes.len(),
+                        ));
                     }
-                    let imm = i16::from_le_bytes([imm_remaining[0], imm_remaining[1]]) as i128;
-                    offset += 2;
+                    let imm = i16::from_le_bytes([
+                        imm_remaining.first().copied().unwrap_or(0),
+                        imm_remaining.get(1).copied().unwrap_or(0),
+                    ]) as i128;
+                    offset = offset.saturating_add(2);
                     (imm, 16)
                 } else {
                     if imm_remaining.len() < 4 {
-                        return Err(DecodeError::truncated(address, offset + 4, bytes.len()));
+                        return Err(DecodeError::truncated(
+                            address,
+                            offset.saturating_add(4),
+                            bytes.len(),
+                        ));
                     }
                     let imm = i32::from_le_bytes([
-                        imm_remaining[0],
-                        imm_remaining[1],
-                        imm_remaining[2],
-                        imm_remaining[3],
+                        imm_remaining.first().copied().unwrap_or(0),
+                        imm_remaining.get(1).copied().unwrap_or(0),
+                        imm_remaining.get(2).copied().unwrap_or(0),
+                        imm_remaining.get(3).copied().unwrap_or(0),
                     ]) as i128;
-                    offset += 4;
+                    offset = offset.saturating_add(4);
                     (imm, 32)
                 };
 
@@ -649,26 +778,35 @@ impl Disassembler for X86_64Disassembler {
 
             OperandEncoding::ModRmReg_Rm_Imm8 => {
                 // IMUL r, r/m, imm8 (sign-extended)
-                let remaining = &bytes[offset..];
+                let remaining = bytes.get(offset..).unwrap_or(&[]);
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let modrm = ModRM::parse(remaining[0], prefixes.rex);
-                offset += 1;
+                let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+                offset = offset.saturating_add(1);
 
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // Read 8-bit immediate (sign-extended)
-                let imm_remaining = &bytes[offset..];
+                let imm_remaining = bytes.get(offset..).unwrap_or(&[]);
                 if imm_remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                let imm = imm_remaining[0] as i8 as i128;
-                offset += 1;
+                let imm = imm_remaining.first().copied().unwrap_or(0) as i8 as i128;
+                offset = offset.saturating_add(1);
 
                 operands.push(decode_modrm_reg(modrm, operand_size));
                 operands.push(rm_operand);
@@ -693,7 +831,7 @@ impl Disassembler for X86_64Disassembler {
                     ControlFlow::ConditionalBranch {
                         target: *target,
                         condition,
-                        fallthrough: address + offset as u64,
+                        fallthrough: address.saturating_add(offset as u64),
                     }
                 } else {
                     ControlFlow::Sequential
@@ -703,11 +841,11 @@ impl Disassembler for X86_64Disassembler {
                 if let Some(Operand::PcRelative { target, .. }) = operands.first() {
                     ControlFlow::Call {
                         target: *target,
-                        return_addr: address + offset as u64,
+                        return_addr: address.saturating_add(offset as u64),
                     }
                 } else {
                     ControlFlow::IndirectCall {
-                        return_addr: address + offset as u64,
+                        return_addr: address.saturating_add(offset as u64),
                     }
                 }
             }
@@ -739,7 +877,7 @@ impl Disassembler for X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation: entry.operation,
             mnemonic: mnemonic.to_string(),
             operands,
@@ -834,7 +972,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation: Operation::Invalid,
             mnemonic,
             operands: vec![],
@@ -860,16 +998,23 @@ impl X86_64Disassembler {
         mut offset: usize,
         opcode: u8,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm = ModRM::parse(remaining[0], prefixes.rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Determine operation from ModR/M reg field
-        let (mnemonic, operation) = GROUP1_OPS[(modrm.reg & 0x7) as usize];
+        let (mnemonic, operation) = GROUP1_OPS
+            .get((modrm.reg & 0x7) as usize)
+            .copied()
+            .unwrap_or(("?", Operation::Other(0)));
 
         // Determine operand size
         let operand_size = if opcode == 0x80 {
@@ -879,29 +1024,47 @@ impl X86_64Disassembler {
         };
 
         // Decode r/m operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // Decode immediate
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         let (imm, imm_size) = if opcode == 0x80 || opcode == 0x83 {
             // 8-bit immediate (sign-extended for 0x83)
             if remaining.is_empty() {
-                return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                return Err(DecodeError::truncated(
+                    address,
+                    offset.saturating_add(1),
+                    bytes.len(),
+                ));
             }
-            (remaining[0] as i8 as i128, 1)
+            (remaining.first().copied().unwrap_or(0) as i8 as i128, 1)
         } else if opcode == 0x81 {
             // 32-bit immediate (or 16-bit with 0x66 prefix)
             let size = if prefixes.operand_size { 2 } else { 4 };
             if remaining.len() < size {
-                return Err(DecodeError::truncated(address, offset + size, bytes.len()));
+                return Err(DecodeError::truncated(
+                    address,
+                    offset.saturating_add(size),
+                    bytes.len(),
+                ));
             }
             let imm = if size == 2 {
-                i16::from_le_bytes([remaining[0], remaining[1]]) as i128
+                i16::from_le_bytes([
+                    remaining.first().copied().unwrap_or(0),
+                    remaining.get(1).copied().unwrap_or(0),
+                ]) as i128
             } else {
-                i32::from_le_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as i128
+                i32::from_le_bytes([
+                    remaining.first().copied().unwrap_or(0),
+                    remaining.get(1).copied().unwrap_or(0),
+                    remaining.get(2).copied().unwrap_or(0),
+                    remaining.get(3).copied().unwrap_or(0),
+                ]) as i128
             };
             (imm, size)
         } else {
@@ -911,15 +1074,18 @@ impl X86_64Disassembler {
                 "opcode 0x82 invalid in 64-bit mode",
             ));
         };
-        offset += imm_size;
+        offset = offset.saturating_add(imm_size);
 
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
-            operands: vec![rm_operand, Operand::imm(imm, (imm_size * 8) as u8)],
+            operands: vec![
+                rm_operand,
+                Operand::imm(imm, imm_size.saturating_mul(8) as u8),
+            ],
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
@@ -944,16 +1110,23 @@ impl X86_64Disassembler {
     ) -> Result<DecodedInstruction, DecodeError> {
         use super::opcodes::GROUP2_OPS;
 
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm = ModRM::parse(remaining[0], prefixes.rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Determine operation from ModR/M reg field
-        let (mnemonic, operation) = GROUP2_OPS[(modrm.reg & 0x7) as usize];
+        let (mnemonic, operation) = GROUP2_OPS
+            .get((modrm.reg & 0x7) as usize)
+            .copied()
+            .unwrap_or(("?", Operation::Other(0)));
 
         // Determine operand size
         let operand_size = if opcode == 0xC0 || opcode == 0xD0 || opcode == 0xD2 {
@@ -963,10 +1136,12 @@ impl X86_64Disassembler {
         };
 
         // Decode r/m operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // Decode shift amount based on opcode
         let mut operands = vec![rm_operand];
@@ -986,12 +1161,19 @@ impl X86_64Disassembler {
             }
             0xC0 | 0xC1 => {
                 // Shift by immediate
-                let remaining = &bytes[offset..];
+                let remaining = bytes.get(offset..).unwrap_or(&[]);
                 if remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                operands.push(Operand::imm(remaining[0] as i128, 8));
-                offset += 1;
+                operands.push(Operand::imm(
+                    remaining.first().copied().unwrap_or(0) as i128,
+                    8,
+                ));
+                offset = offset.saturating_add(1);
             }
             _ => {}
         }
@@ -999,7 +1181,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
             operands,
@@ -1025,16 +1207,23 @@ impl X86_64Disassembler {
         mut offset: usize,
         opcode: u8,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm = ModRM::parse(remaining[0], prefixes.rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Determine operation from ModR/M reg field
-        let (mnemonic, operation) = GROUP3_OPS[(modrm.reg & 0x7) as usize];
+        let (mnemonic, operation) = GROUP3_OPS
+            .get((modrm.reg & 0x7) as usize)
+            .copied()
+            .unwrap_or(("?", Operation::Other(0)));
 
         // Operand size: F6 = 8-bit, F7 = 16/32/64-bit
         let operand_size = if opcode == 0xF6 {
@@ -1044,14 +1233,16 @@ impl X86_64Disassembler {
         };
 
         // Decode r/m operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // For TEST (reg field 0 or 1), we need an immediate operand
         let operands = if (modrm.reg & 0x7) <= 1 {
-            let imm_remaining = &bytes[offset..];
+            let imm_remaining = bytes.get(offset..).unwrap_or(&[]);
             let imm_size = if opcode == 0xF6 {
                 1
             } else {
@@ -1060,23 +1251,29 @@ impl X86_64Disassembler {
             if imm_remaining.len() < imm_size {
                 return Err(DecodeError::truncated(
                     address,
-                    offset + imm_size,
+                    offset.saturating_add(imm_size),
                     bytes.len(),
                 ));
             }
             let imm = match imm_size {
-                1 => imm_remaining[0] as i8 as i128,
-                2 => i16::from_le_bytes([imm_remaining[0], imm_remaining[1]]) as i128,
+                1 => imm_remaining.first().copied().unwrap_or(0) as i8 as i128,
+                2 => i16::from_le_bytes([
+                    imm_remaining.first().copied().unwrap_or(0),
+                    imm_remaining.get(1).copied().unwrap_or(0),
+                ]) as i128,
                 4 => i32::from_le_bytes([
-                    imm_remaining[0],
-                    imm_remaining[1],
-                    imm_remaining[2],
-                    imm_remaining[3],
+                    imm_remaining.first().copied().unwrap_or(0),
+                    imm_remaining.get(1).copied().unwrap_or(0),
+                    imm_remaining.get(2).copied().unwrap_or(0),
+                    imm_remaining.get(3).copied().unwrap_or(0),
                 ]) as i128,
                 _ => unreachable!(),
             };
-            offset += imm_size;
-            vec![rm_operand, Operand::imm(imm, (imm_size * 8) as u8)]
+            offset = offset.saturating_add(imm_size);
+            vec![
+                rm_operand,
+                Operand::imm(imm, imm_size.saturating_mul(8) as u8),
+            ]
         } else {
             // NOT/NEG/MUL/IMUL/DIV/IDIV - just r/m operand
             vec![rm_operand]
@@ -1085,7 +1282,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
             operands,
@@ -1110,16 +1307,23 @@ impl X86_64Disassembler {
         prefixes: &Prefixes,
         mut offset: usize,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm = ModRM::parse(remaining[0], prefixes.rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Determine operation from ModR/M reg field
-        let (mnemonic, operation) = GROUP5_OPS[(modrm.reg & 0x7) as usize];
+        let (mnemonic, operation) = GROUP5_OPS
+            .get((modrm.reg & 0x7) as usize)
+            .copied()
+            .unwrap_or(("?", Operation::Other(0)));
 
         // Reserved opcode extension
         if mnemonic.is_empty() {
@@ -1137,17 +1341,19 @@ impl X86_64Disassembler {
         };
 
         // Decode r/m operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // Determine control flow
         let control_flow = match modrm.reg & 0x7 {
             2 | 3 => {
                 // CALL r/m64 (indirect call)
                 ControlFlow::IndirectCall {
-                    return_addr: address + offset as u64,
+                    return_addr: address.saturating_add(offset as u64),
                 }
             }
             4 | 5 => {
@@ -1162,7 +1368,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
             operands: vec![rm_operand],
@@ -1187,16 +1393,23 @@ impl X86_64Disassembler {
         prefixes: &Prefixes,
         mut offset: usize,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm = ModRM::parse(remaining[0], prefixes.rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Determine operation from ModR/M reg field
-        let (mnemonic, operation) = GROUP8_OPS[(modrm.reg & 0x7) as usize];
+        let (mnemonic, operation) = GROUP8_OPS
+            .get((modrm.reg & 0x7) as usize)
+            .copied()
+            .unwrap_or(("?", Operation::Other(0)));
 
         // Reserved opcode extension (reg = 0-3 are reserved)
         if mnemonic.is_empty() {
@@ -1210,22 +1423,28 @@ impl X86_64Disassembler {
         let operand_size = prefixes.operand_size(false);
 
         // Decode r/m operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // Read immediate byte (bit position)
         if offset >= bytes.len() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
-        let imm = bytes[offset];
-        offset += 1;
+        let imm = bytes.get(offset).copied().unwrap_or(0);
+        offset = offset.saturating_add(1);
 
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
             operands: vec![rm_operand, Operand::imm_unsigned(imm as u64, 8)],
@@ -1251,17 +1470,22 @@ impl X86_64Disassembler {
         mut offset: usize,
         escape: u8,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm_byte = remaining[0];
-        offset += 1;
+        let modrm_byte = remaining.first().copied().unwrap_or(0);
+        offset = offset.saturating_add(1);
 
         // Look up the x87 instruction
-        let entry = super::x87::decode_x87(escape, modrm_byte)
-            .ok_or_else(|| DecodeError::unknown_opcode(address, &bytes[..offset]))?;
+        let entry = super::x87::decode_x87(escape, modrm_byte).ok_or_else(|| {
+            DecodeError::unknown_opcode(address, bytes.get(..offset).unwrap_or(&[]))
+        })?;
 
         let modrm = ModRM::parse(modrm_byte, prefixes.rex);
         let is_memory = modrm_byte < 0xC0;
@@ -1271,12 +1495,14 @@ impl X86_64Disassembler {
 
         if is_memory {
             // Memory operand
-            let rm_bytes = &bytes[offset..];
+            let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
             // Use the mem_size from entry to determine effective size, but decode_modrm_rm
             // just needs a size for register addressing (not used for memory)
             let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, 64)
-                .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-            offset += rm_consumed;
+                .ok_or_else(|| {
+                    DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                })?;
+            offset = offset.saturating_add(rm_consumed);
             operands.push(rm_operand);
         } else {
             // Register operand - ST(i)
@@ -1325,7 +1551,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation: entry.operation,
             mnemonic: entry.mnemonic.to_string(),
             operands,
@@ -1352,17 +1578,21 @@ impl X86_64Disassembler {
         _opcode: u8,
         sse: &super::opcodes::SseOpcodeEntry,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
         // Get effective REX prefix (from REX or VEX)
         let effective_rex = prefixes.effective_rex();
 
         // Parse ModR/M
-        let modrm = ModRM::parse(remaining[0], effective_rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), effective_rex);
+        offset = offset.saturating_add(1);
 
         // Determine vector size (XMM=128 or YMM=256 for VEX)
         let vector_size = prefixes.vector_size();
@@ -1380,11 +1610,12 @@ impl X86_64Disassembler {
         match sse.encoding {
             SseEncoding::XmmRm => {
                 // xmm, xmm/m128
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size).ok_or_else(
+                        || DecodeError::truncated(address, offset.saturating_add(1), bytes.len()),
+                    )?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // For VEX 3-operand form, add vvvv register
                 if let Some(vex) = prefixes.vex {
@@ -1401,11 +1632,12 @@ impl X86_64Disassembler {
 
             SseEncoding::RmXmm => {
                 // xmm/m128, xmm
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size).ok_or_else(
+                        || DecodeError::truncated(address, offset.saturating_add(1), bytes.len()),
+                    )?;
+                offset = offset.saturating_add(rm_consumed);
 
                 operands.push(rm_operand);
                 operands.push(decode_modrm_reg_xmm(modrm, vector_size));
@@ -1413,11 +1645,12 @@ impl X86_64Disassembler {
 
             SseEncoding::XmmRmImm8 => {
                 // xmm, xmm/m128, imm8
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size).ok_or_else(
+                        || DecodeError::truncated(address, offset.saturating_add(1), bytes.len()),
+                    )?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // For VEX 4-operand form
                 if let Some(vex) = prefixes.vex {
@@ -1430,21 +1663,29 @@ impl X86_64Disassembler {
                 }
 
                 // Read immediate
-                let imm_remaining = &bytes[offset..];
+                let imm_remaining = bytes.get(offset..).unwrap_or(&[]);
                 if imm_remaining.is_empty() {
-                    return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
                 }
-                operands.push(Operand::imm(imm_remaining[0] as i128, 8));
-                offset += 1;
+                operands.push(Operand::imm(
+                    imm_remaining.first().copied().unwrap_or(0) as i128,
+                    8,
+                ));
+                offset = offset.saturating_add(1);
             }
 
             SseEncoding::XmmXmmRm => {
                 // xmm, xmm, xmm/m128 (VEX 3-operand)
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size).ok_or_else(
+                        || DecodeError::truncated(address, offset.saturating_add(1), bytes.len()),
+                    )?;
+                offset = offset.saturating_add(rm_consumed);
 
                 if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
@@ -1458,15 +1699,17 @@ impl X86_64Disassembler {
 
             SseEncoding::XmmRmScalar64 => {
                 // xmm, xmm/m64
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 // For scalar, memory is 64-bit but registers are full vector size
                 let (rm_operand, rm_consumed) = if modrm.is_register() {
                     decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
                 } else {
                     decode_modrm_rm(rm_bytes, modrm, prefixes, 64)
                 }
-                .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                .ok_or_else(|| {
+                    DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
@@ -1480,14 +1723,16 @@ impl X86_64Disassembler {
 
             SseEncoding::XmmRmScalar32 => {
                 // xmm, xmm/m32
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) = if modrm.is_register() {
                     decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
                 } else {
                     decode_modrm_rm(rm_bytes, modrm, prefixes, 32)
                 }
-                .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                .ok_or_else(|| {
+                    DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
@@ -1501,16 +1746,17 @@ impl X86_64Disassembler {
 
             SseEncoding::XmmGpr => {
                 // xmm, r/m32/64
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) {
                     64
                 } else {
                     32
                 };
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 if let Some(vex) = prefixes.vex {
                     operands.push(decode_modrm_reg_xmm(modrm, vector_size));
@@ -1524,11 +1770,12 @@ impl X86_64Disassembler {
 
             SseEncoding::GprXmm => {
                 // r32/64, xmm/m
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size).ok_or_else(
+                        || DecodeError::truncated(address, offset.saturating_add(1), bytes.len()),
+                    )?;
+                offset = offset.saturating_add(rm_consumed);
 
                 let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) {
                     64
@@ -1546,16 +1793,17 @@ impl X86_64Disassembler {
 
             SseEncoding::GprGprRm => {
                 // r, r/m (GPR to GPR, for POPCNT/LZCNT/TZCNT)
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let gpr_size = if prefixes.rex.map(|r| r.w).unwrap_or(false) {
                     64
                 } else {
                     32
                 };
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, gpr_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 operands.push(Operand::Register(decode_gpr(modrm.reg, gpr_size)));
                 operands.push(rm_operand);
@@ -1565,7 +1813,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation: sse.operation,
             mnemonic: mnemonic.to_string(),
             operands,
@@ -1592,27 +1840,36 @@ impl X86_64Disassembler {
         opcode: u8,
     ) -> Result<DecodedInstruction, DecodeError> {
         // Look up the opcode in the 0F38 table
-        let entry = super::opcodes_0f38::OPCODE_TABLE_0F38[opcode as usize]
-            .as_ref()
-            .ok_or_else(|| DecodeError::unknown_opcode(address, &bytes[..offset]))?;
+        let entry = super::opcodes_0f38::OPCODE_TABLE_0F38
+            .get(opcode as usize)
+            .and_then(|e| e.as_ref())
+            .ok_or_else(|| {
+                DecodeError::unknown_opcode(address, bytes.get(..offset).unwrap_or(&[]))
+            })?;
 
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
         // Parse ModR/M
-        let modrm = ModRM::parse(remaining[0], prefixes.rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Decode operands
         let mut operands = Vec::new();
 
         // Get the rm operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, 128)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // For SSE4.1 PBLENDVB and similar, the implicit xmm0 operand is used
         // Order: dest, src, [implicit xmm0]
@@ -1627,7 +1884,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation: entry.operation,
             mnemonic: entry.mnemonic.to_string(),
             operands,
@@ -1654,44 +1911,60 @@ impl X86_64Disassembler {
         opcode: u8,
     ) -> Result<DecodedInstruction, DecodeError> {
         // Look up the opcode in the 0F3A table
-        let entry = super::opcodes_0f3a::OPCODE_TABLE_0F3A[opcode as usize]
-            .as_ref()
-            .ok_or_else(|| DecodeError::unknown_opcode(address, &bytes[..offset]))?;
+        let entry = super::opcodes_0f3a::OPCODE_TABLE_0F3A
+            .get(opcode as usize)
+            .and_then(|e| e.as_ref())
+            .ok_or_else(|| {
+                DecodeError::unknown_opcode(address, bytes.get(..offset).unwrap_or(&[]))
+            })?;
 
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
         // Parse ModR/M
-        let modrm = ModRM::parse(remaining[0], prefixes.rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
 
         // Decode operands
         let mut operands = Vec::new();
 
         // Get the rm operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, 128)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // Order: dest (reg), src (rm), imm8
         operands.push(decode_modrm_reg_xmm(modrm, 128));
         operands.push(rm_operand);
 
         // Read immediate byte
-        let imm_remaining = &bytes[offset..];
+        let imm_remaining = bytes.get(offset..).unwrap_or(&[]);
         if imm_remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
-        operands.push(Operand::imm(imm_remaining[0] as i128, 8));
-        offset += 1;
+        operands.push(Operand::imm(
+            imm_remaining.first().copied().unwrap_or(0) as i128,
+            8,
+        ));
+        offset = offset.saturating_add(1);
 
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation: entry.operation,
             mnemonic: entry.mnemonic.to_string(),
             operands,
@@ -1718,17 +1991,21 @@ impl X86_64Disassembler {
         _opcode: u8,
         entry: &super::opcodes::OpcodeEntry,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
         // Get effective REX prefix from VEX
         let effective_rex = prefixes.effective_rex();
 
         // Parse ModR/M
-        let modrm = ModRM::parse(remaining[0], effective_rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), effective_rex);
+        offset = offset.saturating_add(1);
 
         // Determine vector size (XMM=128, YMM=256, ZMM=512 for EVEX)
         let vector_size = prefixes.vector_size();
@@ -1745,10 +2022,12 @@ impl X86_64Disassembler {
         let mut operands = Vec::new();
 
         // Get the rm operand first
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = decode_modrm_rm_xmm(rm_bytes, modrm, prefixes, vector_size)
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // Build operands based on encoding
         // For 3-operand VEX: dest=reg, src1=vvvv, src2=rm
@@ -1767,18 +2046,25 @@ impl X86_64Disassembler {
 
         // For 0F3A instructions, read immediate byte
         if prefixes.opcode_map() == 3 {
-            let imm_remaining = &bytes[offset..];
+            let imm_remaining = bytes.get(offset..).unwrap_or(&[]);
             if imm_remaining.is_empty() {
-                return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                return Err(DecodeError::truncated(
+                    address,
+                    offset.saturating_add(1),
+                    bytes.len(),
+                ));
             }
-            operands.push(Operand::imm(imm_remaining[0] as i128, 8));
-            offset += 1;
+            operands.push(Operand::imm(
+                imm_remaining.first().copied().unwrap_or(0) as i128,
+                8,
+            ));
+            offset = offset.saturating_add(1);
         }
 
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation: entry.operation,
             mnemonic,
             operands,
@@ -1815,17 +2101,25 @@ impl X86_64Disassembler {
 
         // Read the opcode byte
         if offset >= bytes.len() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
-        let opcode = bytes[offset];
-        offset += 1;
+        let opcode = bytes.get(offset).copied().unwrap_or(0);
+        offset = offset.saturating_add(1);
 
         // Read ModR/M byte
         if offset >= bytes.len() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
-        let modrm = ModRM::parse_evex(bytes[offset], &evex);
-        offset += 1;
+        let modrm = ModRM::parse_evex(bytes.get(offset).copied().unwrap_or(0), &evex);
+        offset = offset.saturating_add(1);
         let rm_is_register = modrm.is_register();
 
         // Determine vector size from EVEX.L'L
@@ -1841,7 +2135,7 @@ impl X86_64Disassembler {
         }
         .ok_or_else(|| {
             let end = offset.min(bytes.len());
-            DecodeError::unknown_opcode(address, &bytes[..end])
+            DecodeError::unknown_opcode(address, bytes.get(..end).unwrap_or(&[]))
         })?;
         let allow_mem_broadcast =
             self.evex_memory_broadcast_allowed(evex.mm, opcode, evex.pp, operation);
@@ -1850,7 +2144,7 @@ impl X86_64Disassembler {
         let mut operands = Vec::new();
 
         // Decode r/m operand
-        let rm_bytes = &bytes[offset..];
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
         let (rm_operand, rm_consumed) = self
             .decode_evex_modrm_rm(
                 rm_bytes,
@@ -1860,8 +2154,10 @@ impl X86_64Disassembler {
                 vector_size,
                 allow_mem_broadcast,
             )
-            .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-        offset += rm_consumed;
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
 
         // Build operand list: dest=reg, src1=vvvv, src2=rm
         // For EVEX, dest uses extended reg (R, R')
@@ -1873,10 +2169,17 @@ impl X86_64Disassembler {
         // For 0F3A map, read immediate byte
         if evex.mm == 3 {
             if offset >= bytes.len() {
-                return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+                return Err(DecodeError::truncated(
+                    address,
+                    offset.saturating_add(1),
+                    bytes.len(),
+                ));
             }
-            operands.push(Operand::imm(bytes[offset] as i128, 8));
-            offset += 1;
+            operands.push(Operand::imm(
+                bytes.get(offset).copied().unwrap_or(0) as i128,
+                8,
+            ));
+            offset = offset.saturating_add(1);
         }
 
         // Build the mnemonic with EVEX decorators when applicable.
@@ -1886,7 +2189,7 @@ impl X86_64Disassembler {
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: full_mnemonic,
             operands,
@@ -2201,17 +2504,21 @@ impl X86_64Disassembler {
             DecodeError::invalid_encoding(address, "BMI instruction requires VEX prefix")
         })?;
 
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
         // Get effective REX from VEX
         let effective_rex = Some(vex.to_rex());
 
         // Parse ModR/M
-        let modrm = ModRM::parse(remaining[0], effective_rex);
-        offset += 1;
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), effective_rex);
+        offset = offset.saturating_add(1);
 
         // Determine operand size from VEX.W (32 or 64-bit)
         let operand_size: u16 = if vex.w { 64 } else { 32 };
@@ -2220,11 +2527,12 @@ impl X86_64Disassembler {
         let (mnemonic, operation, operands) = match opcode {
             // 0xF2: ANDN r, vvvv, r/m
             0xF2 => {
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // ANDN: dest=reg, src1=vvvv (to be inverted), src2=r/m
                 let operands = vec![
@@ -2237,11 +2545,12 @@ impl X86_64Disassembler {
 
             // 0xF3: Group 17 - BLSR/BLSMSK/BLSI vvvv, r/m
             0xF3 => {
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // Instruction is determined by ModR/M.reg field
                 let (mnemonic, operation) = super::opcodes_0f38::bmi1_group_info(modrm.reg & 0x7);
@@ -2256,11 +2565,12 @@ impl X86_64Disassembler {
 
             // 0xF5: BZHI/PDEP/PEXT (prefix-dependent)
             0xF5 => {
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 let (mnemonic, operation) = super::opcodes_0f38::f5_info(vex.pp);
 
@@ -2294,11 +2604,12 @@ impl X86_64Disassembler {
                     ));
                 }
 
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 // MULX: dest1=reg, dest2=vvvv, src=r/m
                 // Note: This is a 3-operand form where reg and vvvv are both destinations
@@ -2313,11 +2624,12 @@ impl X86_64Disassembler {
 
             // 0xF7: BEXTR/SHLX/SARX/SHRX (prefix-dependent)
             0xF7 => {
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                        .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 let (mnemonic, operation) = super::opcodes_0f38::f7_info(vex.pp);
 
@@ -2331,14 +2643,17 @@ impl X86_64Disassembler {
             }
 
             _ => {
-                return Err(DecodeError::unknown_opcode(address, &bytes[..offset]));
+                return Err(DecodeError::unknown_opcode(
+                    address,
+                    bytes.get(..offset).unwrap_or(&[]),
+                ));
             }
         };
 
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
             operands,
@@ -2376,14 +2691,18 @@ impl X86_64Disassembler {
         prefixes: &Prefixes,
         mut offset: usize,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm_byte = remaining[0];
+        let modrm_byte = remaining.first().copied().unwrap_or(0);
         let modrm = ModRM::parse(modrm_byte, prefixes.rex);
-        offset += 1;
+        offset = offset.saturating_add(1);
 
         // Check for special register-form encodings first
         // RDTSCP: 0F 01 F9 (mod=11, reg=7, rm=1 => modrm_byte = 0xF9)
@@ -2391,7 +2710,7 @@ impl X86_64Disassembler {
             let instruction = Instruction {
                 address,
                 size: offset,
-                bytes: bytes[..offset].to_vec(),
+                bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                 operation: Operation::ReadTscP,
                 mnemonic: "rdtscp".to_string(),
                 operands: vec![],
@@ -2444,7 +2763,7 @@ impl X86_64Disassembler {
             vec![Operand::Register(decode_gpr(modrm.rm, operand_size))]
         } else {
             // Memory operand
-            let rm_bytes = &bytes[offset..];
+            let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
             // SGDT/SIDT/LGDT/LIDT use 10-byte memory (48-bit limit + 64-bit base in 64-bit mode)
             // SMSW/LMSW use 16-bit memory
             // INVLPG uses byte granularity
@@ -2455,16 +2774,17 @@ impl X86_64Disassembler {
                 _ => 16,
             };
             let (rm_operand, rm_consumed) =
-                decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-            offset += rm_consumed;
+                decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size).ok_or_else(|| {
+                    DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                })?;
+            offset = offset.saturating_add(rm_consumed);
             vec![rm_operand]
         };
 
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
             operands,
@@ -2497,14 +2817,18 @@ impl X86_64Disassembler {
         prefixes: &Prefixes,
         mut offset: usize,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm_byte = remaining[0];
+        let modrm_byte = remaining.first().copied().unwrap_or(0);
         let modrm = ModRM::parse(modrm_byte, prefixes.rex);
-        offset += 1;
+        offset = offset.saturating_add(1);
 
         // Determine instruction from reg field
         let reg = modrm.reg & 0x7;
@@ -2530,18 +2854,19 @@ impl X86_64Disassembler {
         let operands = if modrm.is_register() {
             vec![Operand::Register(decode_gpr(modrm.rm, operand_size))]
         } else {
-            let rm_bytes = &bytes[offset..];
+            let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
             let (rm_operand, rm_consumed) =
-                decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 4, bytes.len()))?;
-            offset += rm_consumed;
+                decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size).ok_or_else(|| {
+                    DecodeError::truncated(address, offset.saturating_add(4), bytes.len())
+                })?;
+            offset = offset.saturating_add(rm_consumed);
             vec![rm_operand]
         };
 
         let instruction = Instruction {
             address,
             size: offset,
-            bytes: bytes[..offset].to_vec(),
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
             operation,
             mnemonic: mnemonic.to_string(),
             operands,
@@ -2591,15 +2916,19 @@ impl X86_64Disassembler {
             DecodeError::invalid_encoding(address, "AMX instruction requires VEX prefix")
         })?;
 
-        let remaining = &bytes[offset..];
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
         if remaining.is_empty() {
-            return Err(DecodeError::truncated(address, offset + 1, bytes.len()));
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
         }
 
-        let modrm_byte = remaining[0];
+        let modrm_byte = remaining.first().copied().unwrap_or(0);
         let effective_rex = Some(vex.to_rex());
         let modrm = ModRM::parse(modrm_byte, effective_rex);
-        offset += 1;
+        offset = offset.saturating_add(1);
 
         match opcode {
             // 0x49: LDTILECFG / STTILECFG / TILERELEASE / TILEZERO
@@ -2618,12 +2947,16 @@ impl X86_64Disassembler {
                     }
                     // LDTILECFG/STTILECFG have one memory operand
                     _ => {
-                        let rm_bytes = &bytes[offset..];
+                        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                         let (rm_operand, rm_consumed) =
                             decode_modrm_rm(rm_bytes, modrm, prefixes, 512).ok_or_else(|| {
-                                DecodeError::truncated(address, offset + 1, bytes.len())
+                                DecodeError::truncated(
+                                    address,
+                                    offset.saturating_add(1),
+                                    bytes.len(),
+                                )
                             })?;
-                        offset += rm_consumed;
+                        offset = offset.saturating_add(rm_consumed);
                         vec![rm_operand]
                     }
                 };
@@ -2631,7 +2964,7 @@ impl X86_64Disassembler {
                 let instruction = Instruction {
                     address,
                     size: offset,
-                    bytes: bytes[..offset].to_vec(),
+                    bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation,
                     mnemonic: mnemonic.to_string(),
                     operands,
@@ -2656,10 +2989,12 @@ impl X86_64Disassembler {
                     })?;
 
                 // These instructions use SIB addressing for the memory operand
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, 0)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    .ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 let operands = if operation == Operation::AmxTileStore {
                     // TILESTORED: sibmem, tmm
@@ -2672,7 +3007,7 @@ impl X86_64Disassembler {
                 let instruction = Instruction {
                     address,
                     size: offset,
-                    bytes: bytes[..offset].to_vec(),
+                    bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation,
                     mnemonic: mnemonic.to_string(),
                     operands,
@@ -2707,7 +3042,7 @@ impl X86_64Disassembler {
                 let instruction = Instruction {
                     address,
                     size: offset,
-                    bytes: bytes[..offset].to_vec(),
+                    bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation,
                     mnemonic: mnemonic.to_string(),
                     operands,
@@ -2742,7 +3077,7 @@ impl X86_64Disassembler {
                 let instruction = Instruction {
                     address,
                     size: offset,
-                    bytes: bytes[..offset].to_vec(),
+                    bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation,
                     mnemonic: mnemonic.to_string(),
                     operands,
@@ -2759,7 +3094,10 @@ impl X86_64Disassembler {
                 })
             }
 
-            _ => Err(DecodeError::unknown_opcode(address, &bytes[..offset])),
+            _ => Err(DecodeError::unknown_opcode(
+                address,
+                bytes.get(..offset).unwrap_or(&[]),
+            )),
         }
     }
 
@@ -2798,7 +3136,7 @@ impl X86_64Disassembler {
                         let instruction = Instruction {
                             address,
                             size: offset,
-                            bytes: bytes[..offset].to_vec(),
+                            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                             operation: Operation::CetEndBranch64,
                             mnemonic: "endbr64".to_string(),
                             operands: vec![],
@@ -2818,7 +3156,7 @@ impl X86_64Disassembler {
                         let instruction = Instruction {
                             address,
                             size: offset,
-                            bytes: bytes[..offset].to_vec(),
+                            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                             operation: Operation::CetEndBranch32,
                             mnemonic: "endbr32".to_string(),
                             operands: vec![],
@@ -2840,7 +3178,7 @@ impl X86_64Disassembler {
                         let instruction = Instruction {
                             address,
                             size: offset,
-                            bytes: bytes[..offset].to_vec(),
+                            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                             operation: Operation::CetReadSsp,
                             mnemonic: mnemonic.to_string(),
                             operands: vec![Operand::Register(decode_gpr(modrm.rm, operand_size))],
@@ -2860,7 +3198,7 @@ impl X86_64Disassembler {
                         let instruction = Instruction {
                             address,
                             size: offset,
-                            bytes: bytes[..offset].to_vec(),
+                            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                             operation: Operation::Nop,
                             mnemonic: "nop".to_string(),
                             operands: vec![],
@@ -2885,7 +3223,7 @@ impl X86_64Disassembler {
                 let instruction = Instruction {
                     address,
                     size: offset,
-                    bytes: bytes[..offset].to_vec(),
+                    bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation: Operation::CetIncSsp,
                     mnemonic: mnemonic.to_string(),
                     operands: vec![Operand::Register(decode_gpr(modrm.rm, operand_size))],
@@ -2925,7 +3263,7 @@ impl X86_64Disassembler {
                 let instruction = Instruction {
                     address,
                     size: offset,
-                    bytes: bytes[..offset].to_vec(),
+                    bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation: Operation::CetSavePrevSsp,
                     mnemonic: "saveprevssp".to_string(),
                     operands: vec![],
@@ -2942,15 +3280,17 @@ impl X86_64Disassembler {
             }
             // RSTORSSP: F3 0F 01 /5 (memory operand)
             _ if prefixes.rep && (modrm.reg & 0x7) == 5 && !modrm.is_register() => {
-                let rm_bytes = &bytes[offset..];
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, 64)
-                    .ok_or_else(|| DecodeError::truncated(address, offset + 1, bytes.len()))?;
-                offset += rm_consumed;
+                    .ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(rm_consumed);
 
                 let instruction = Instruction {
                     address,
                     size: offset,
-                    bytes: bytes[..offset].to_vec(),
+                    bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation: Operation::CetRestoreSsp,
                     mnemonic: "rstorssp".to_string(),
                     operands: vec![rm_operand],
