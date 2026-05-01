@@ -1,10 +1,5 @@
 //! ARM64 instruction decoder implementation.
 
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![allow(unused_variables)]
 
 use super::sme::SmeDecoder;
@@ -153,8 +148,13 @@ impl Arm64Disassembler {
         }
 
         // ARM64 instructions are little-endian 32-bit
-        let insn = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let raw_bytes = bytes[0..4].to_vec();
+        let insn_bytes: [u8; 4] = bytes
+            .get(0..4)
+            .unwrap_or(&[0; 4])
+            .try_into()
+            .unwrap_or_default();
+        let insn = u32::from_le_bytes(insn_bytes);
+        let raw_bytes = bytes.get(0..4).unwrap_or(&[]).to_vec();
 
         // Check for SME instructions first (they have distinctive bit patterns)
         if SmeDecoder::is_sme_instruction(insn) {
@@ -217,13 +217,13 @@ impl Arm64Disassembler {
                 let imm = if is_adrp {
                     // ADRP: page address (4KB aligned)
                     let imm21 = ((immhi << 2) | immlo) as i64;
-                    let imm = sign_extend(imm21 as u64, 21) << 12;
-                    (address & !0xFFF) as i64 + imm
+                    let imm = sign_extend(imm21 as u64, 21).wrapping_shl(12);
+                    ((address & !0xFFF) as i64).wrapping_add(imm)
                 } else {
                     // ADR: byte address
                     let imm21 = ((immhi << 2) | immlo) as i64;
                     let imm = sign_extend(imm21 as u64, 21);
-                    address as i64 + imm
+                    (address as i64).wrapping_add(imm)
                 };
 
                 let mnemonic = if is_adrp { "adrp" } else { "adr" };
@@ -231,7 +231,7 @@ impl Arm64Disassembler {
                     .with_operation(Operation::LoadEffectiveAddress)
                     .with_operands(vec![
                         Operand::reg(Self::xreg(rd)),
-                        Operand::pc_rel(imm - address as i64, imm as u64),
+                        Operand::pc_rel(imm.wrapping_sub(address as i64), imm as u64),
                     ]);
 
                 Ok(DecodedInstruction {
@@ -504,7 +504,7 @@ impl Arm64Disassembler {
                 let immr = ((insn >> 16) & 0x3F) as u8;
                 let opc = (insn >> 29) & 0x3;
 
-                let reg_size = if is_64bit { 64 } else { 32 };
+                let reg_size: u8 = if is_64bit { 64 } else { 32 };
                 let dst = if is_64bit {
                     Self::xreg(rd)
                 } else {
@@ -520,7 +520,7 @@ impl Arm64Disassembler {
                 let (mnemonic, operands) = match opc {
                     0b00 => {
                         // SBFM aliases
-                        if imms == reg_size - 1 {
+                        if imms == reg_size.saturating_sub(1) {
                             // ASR
                             (
                                 "asr",
@@ -562,9 +562,9 @@ impl Arm64Disassembler {
                     }
                     0b10 => {
                         // UBFM aliases
-                        if imms + 1 == immr {
+                        if imms.wrapping_add(1) == immr {
                             // LSL
-                            let shift = reg_size.wrapping_sub(immr) & (reg_size - 1);
+                            let shift = reg_size.wrapping_sub(immr) & reg_size.saturating_sub(1);
                             (
                                 "lsl",
                                 vec![
@@ -573,7 +573,7 @@ impl Arm64Disassembler {
                                     Operand::imm_unsigned(shift as u64, 8),
                                 ],
                             )
-                        } else if imms == reg_size - 1 {
+                        } else if imms == reg_size.saturating_sub(1) {
                             // LSR
                             (
                                 "lsr",
@@ -703,7 +703,7 @@ impl Arm64Disassembler {
                 let cf = if is_bl {
                     ControlFlow::Call {
                         target,
-                        return_addr: address + 4,
+                        return_addr: address.saturating_add(4),
                     }
                 } else {
                     ControlFlow::UnconditionalBranch { target }
@@ -752,7 +752,7 @@ impl Arm64Disassembler {
                         .with_control_flow(ControlFlow::ConditionalBranch {
                             target,
                             condition,
-                            fallthrough: address + 4,
+                            fallthrough: address.saturating_add(4),
                         });
 
                     Ok(DecodedInstruction {
@@ -792,7 +792,7 @@ impl Arm64Disassembler {
                         .with_control_flow(ControlFlow::ConditionalBranch {
                             target,
                             condition,
-                            fallthrough: address + 4,
+                            fallthrough: address.saturating_add(4),
                         });
 
                     Ok(DecodedInstruction {
@@ -818,7 +818,7 @@ impl Arm64Disassembler {
                     .with_control_flow(ControlFlow::ConditionalBranch {
                         target,
                         condition,
-                        fallthrough: address + 4,
+                        fallthrough: address.saturating_add(4),
                     });
 
                 Ok(DecodedInstruction {
@@ -857,7 +857,7 @@ impl Arm64Disassembler {
                             "blr",
                             Operation::Call,
                             ControlFlow::IndirectCall {
-                                return_addr: address + 4,
+                                return_addr: address.saturating_add(4),
                             },
                         ),
                         0b010 => ("ret", Operation::Return, ControlFlow::Return),
@@ -3396,20 +3396,25 @@ fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
     }
 
     // Element size: when len=6, size=64 (not 128); element size is capped at 64
-    let size = if len >= 6 { 64u64 } else { 1u64 << (len + 1) };
+    let size = if len >= 6 {
+        64u64
+    } else {
+        1u64.wrapping_shl(len.wrapping_add(1) as u32)
+    };
     let mask = if len >= 6 {
         0x3Fu64
     } else {
-        (1u64 << (len + 1)) - 1
+        1u64.wrapping_shl(len.wrapping_add(1) as u32)
+            .wrapping_sub(1)
     };
     let s = (imms as u64) & mask;
     let r = (immr as u64) & mask;
 
     // Create base pattern: s+1 ones
-    let ones = if s + 1 >= 64 {
+    let ones = if s.saturating_add(1) >= 64 {
         !0u64
     } else {
-        (1u64 << (s + 1)) - 1
+        1u64.wrapping_shl(s.wrapping_add(1) as u32).wrapping_sub(1)
     };
 
     // Rotate right by r within element size
@@ -3418,17 +3423,21 @@ fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
     } else if size == 64 {
         // Use built-in rotate for 64-bit elements to avoid overflow
         ones.rotate_right(r as u32)
+    } else if size == 0 {
+        ones
     } else {
         // For smaller elements, rotate within element size
-        let r = r % size;
-        ((ones >> r) | (ones << (size - r))) & ((1u64 << size) - 1)
+        let r = r.checked_rem(size).unwrap_or(0);
+        let size_mask = 1u64.wrapping_shl(size as u32).wrapping_sub(1);
+        ((ones.wrapping_shr(r as u32)) | (ones.wrapping_shl(size.wrapping_sub(r) as u32)))
+            & size_mask
     };
 
     // Mask to element size
     let pattern = if size >= 64 {
         rotated
     } else {
-        rotated & ((1u64 << size) - 1)
+        rotated & 1u64.wrapping_shl(size as u32).wrapping_sub(1)
     };
 
     // Replicate pattern across register
@@ -3436,8 +3445,11 @@ fn decode_bitmask_imm(n: u8, imms: u8, immr: u8, is_64bit: bool) -> u64 {
     let mut pos = 0u64;
     let reg_size = if is_64bit { 64u64 } else { 32u64 };
     while pos < reg_size {
-        result |= pattern << pos;
-        pos += size;
+        result |= pattern.wrapping_shl(pos as u32);
+        pos = pos.saturating_add(size);
+        if size == 0 {
+            break;
+        }
     }
 
     if !is_64bit {
