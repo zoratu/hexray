@@ -1,11 +1,3 @@
-//! ELF header parsing.
-
-// File-level allow: bit-math + slice indexing in this parser/decoder
-// is bounds-checked at function entry. Per-site annotations would be
-// noise; the runtime fuzz gate (`scripts/run-fuzz-corpus`) catches
-// actual crashes. New code should prefer `.get()` + `checked_*`.
-#![allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use crate::ParseError;
 use hexray_core::{
     Architecture, CudaArchitecture, Endianness, GfxArchitecture, SmArchitecture, SmVariant,
@@ -14,6 +6,52 @@ use hexray_core::{
 
 /// ELF magic bytes.
 pub const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+// Bounds-checked endian-aware fixed-width readers. Callers verify
+// the buffer length at function entry; these helpers fall back to 0
+// rather than panic so clippy's adversarial-input lints don't fire
+// at every read site.
+#[inline]
+fn read_u16(data: &[u8], at: usize, endianness: Endianness) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    match endianness {
+        Endianness::Little => u16::from_le_bytes(arr),
+        Endianness::Big => u16::from_be_bytes(arr),
+    }
+}
+
+#[inline]
+fn read_u32(data: &[u8], at: usize, endianness: Endianness) -> u32 {
+    let end = at.saturating_add(4);
+    let arr: [u8; 4] = data
+        .get(at..end)
+        .unwrap_or(&[0; 4])
+        .try_into()
+        .unwrap_or_default();
+    match endianness {
+        Endianness::Little => u32::from_le_bytes(arr),
+        Endianness::Big => u32::from_be_bytes(arr),
+    }
+}
+
+#[inline]
+fn read_u64(data: &[u8], at: usize, endianness: Endianness) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    match endianness {
+        Endianness::Little => u64::from_le_bytes(arr),
+        Endianness::Big => u64::from_be_bytes(arr),
+    }
+}
 
 /// ELF class (32-bit or 64-bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,39 +179,42 @@ impl ElfHeader {
         }
 
         // Check magic
-        if data[0..4] != ELF_MAGIC {
-            return Err(ParseError::invalid_magic("ELF", &data[0..4]));
+        let magic = data.get(0..4).unwrap_or(&[]);
+        if magic != ELF_MAGIC {
+            return Err(ParseError::invalid_magic("ELF", magic));
         }
 
         // Parse ELF class
-        let class = match data[4] {
+        let class_byte = data.get(4).copied().unwrap_or(0);
+        let class = match class_byte {
             1 => ElfClass::Elf32,
             2 => ElfClass::Elf64,
             _ => {
                 return Err(ParseError::invalid_structure(
                     "ELF header",
                     4,
-                    format!("invalid ELF class: {}", data[4]),
+                    format!("invalid ELF class: {class_byte}"),
                 ))
             }
         };
 
         // Parse endianness
-        let endianness = match data[5] {
+        let endianness_byte = data.get(5).copied().unwrap_or(0);
+        let endianness = match endianness_byte {
             1 => Endianness::Little,
             2 => Endianness::Big,
             _ => {
                 return Err(ParseError::invalid_structure(
                     "ELF header",
                     5,
-                    format!("invalid endianness: {}", data[5]),
+                    format!("invalid endianness: {endianness_byte}"),
                 ))
             }
         };
 
-        let version = data[6];
-        let osabi = data[7];
-        let abi_version = data[8];
+        let version = data.get(6).copied().unwrap_or(0);
+        let osabi = data.get(7).copied().unwrap_or(0);
+        let abi_version = data.get(8).copied().unwrap_or(0);
 
         // Parse the rest based on class
         match class {
@@ -195,45 +236,24 @@ impl ElfHeader {
             return Err(ParseError::too_short(ELF32_HEADER_SIZE, data.len()));
         }
 
-        let read_u16 = |offset: usize| -> u16 {
-            let bytes = [data[offset], data[offset + 1]];
-            match endianness {
-                Endianness::Little => u16::from_le_bytes(bytes),
-                Endianness::Big => u16::from_be_bytes(bytes),
-            }
-        };
-
-        let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
-            match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
-            }
-        };
-
         Ok(Self {
             class: ElfClass::Elf32,
             endianness,
             version,
             osabi,
             abi_version,
-            file_type: ElfType::from(read_u16(16)),
-            machine: Machine::from_u16(read_u16(18)),
-            e_entry: read_u32(24) as u64,
-            e_phoff: read_u32(28) as u64,
-            e_shoff: read_u32(32) as u64,
-            e_flags: read_u32(36),
-            e_ehsize: read_u16(40),
-            e_phentsize: read_u16(42),
-            e_phnum: read_u16(44),
-            e_shentsize: read_u16(46),
-            e_shnum: read_u16(48),
-            e_shstrndx: read_u16(50),
+            file_type: ElfType::from(read_u16(data, 16, endianness)),
+            machine: Machine::from_u16(read_u16(data, 18, endianness)),
+            e_entry: read_u32(data, 24, endianness) as u64,
+            e_phoff: read_u32(data, 28, endianness) as u64,
+            e_shoff: read_u32(data, 32, endianness) as u64,
+            e_flags: read_u32(data, 36, endianness),
+            e_ehsize: read_u16(data, 40, endianness),
+            e_phentsize: read_u16(data, 42, endianness),
+            e_phnum: read_u16(data, 44, endianness),
+            e_shentsize: read_u16(data, 46, endianness),
+            e_shnum: read_u16(data, 48, endianness),
+            e_shstrndx: read_u16(data, 50, endianness),
         })
     }
 
@@ -250,62 +270,24 @@ impl ElfHeader {
             return Err(ParseError::too_short(ELF64_HEADER_SIZE, data.len()));
         }
 
-        let read_u16 = |offset: usize| -> u16 {
-            let bytes = [data[offset], data[offset + 1]];
-            match endianness {
-                Endianness::Little => u16::from_le_bytes(bytes),
-                Endianness::Big => u16::from_be_bytes(bytes),
-            }
-        };
-
-        let read_u32 = |offset: usize| -> u32 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ];
-            match endianness {
-                Endianness::Little => u32::from_le_bytes(bytes),
-                Endianness::Big => u32::from_be_bytes(bytes),
-            }
-        };
-
-        let read_u64 = |offset: usize| -> u64 {
-            let bytes = [
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ];
-            match endianness {
-                Endianness::Little => u64::from_le_bytes(bytes),
-                Endianness::Big => u64::from_be_bytes(bytes),
-            }
-        };
-
         Ok(Self {
             class: ElfClass::Elf64,
             endianness,
             version,
             osabi,
             abi_version,
-            file_type: ElfType::from(read_u16(16)),
-            machine: Machine::from_u16(read_u16(18)),
-            e_entry: read_u64(24),
-            e_phoff: read_u64(32),
-            e_shoff: read_u64(40),
-            e_flags: read_u32(48),
-            e_ehsize: read_u16(52),
-            e_phentsize: read_u16(54),
-            e_phnum: read_u16(56),
-            e_shentsize: read_u16(58),
-            e_shnum: read_u16(60),
-            e_shstrndx: read_u16(62),
+            file_type: ElfType::from(read_u16(data, 16, endianness)),
+            machine: Machine::from_u16(read_u16(data, 18, endianness)),
+            e_entry: read_u64(data, 24, endianness),
+            e_phoff: read_u64(data, 32, endianness),
+            e_shoff: read_u64(data, 40, endianness),
+            e_flags: read_u32(data, 48, endianness),
+            e_ehsize: read_u16(data, 52, endianness),
+            e_phentsize: read_u16(data, 54, endianness),
+            e_phnum: read_u16(data, 56, endianness),
+            e_shentsize: read_u16(data, 58, endianness),
+            e_shnum: read_u16(data, 60, endianness),
+            e_shstrndx: read_u16(data, 62, endianness),
         })
     }
 
@@ -372,8 +354,8 @@ fn sm_from_cuda_elf(abi_version: u8, e_flags: u32) -> SmArchitecture {
         ),
     };
 
-    let major = sm_code / 10;
-    let minor = sm_code % 10;
+    let major = sm_code.checked_div(10).unwrap_or(0);
+    let minor = sm_code.checked_rem(10).unwrap_or(0);
 
     // Conservative sanity check: known SM majors are 1..=10 today. Anything
     // beyond sm_XX with major > 20 is more likely a different flag layout
