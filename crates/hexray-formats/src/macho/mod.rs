@@ -80,11 +80,138 @@ impl<'a> MachO<'a> {
         Self::parse_at(data, 0)
     }
 
+    /// Parse a Mach-O file, preferring `arch` (e.g. "x86_64", "arm64",
+    /// "arm64e") when the input is a universal binary. Returns
+    /// [`ParseError::InvalidStructure`] if the requested arch is not in the
+    /// fat header. For non-fat input the `arch` argument is ignored.
+    pub fn parse_with_arch(data: &'a [u8], arch: Option<&str>) -> Result<Self, ParseError> {
+        if data.len() < 4 {
+            return Err(ParseError::too_short(4, data.len()));
+        }
+        let magic = read_u32_ne(data, 0);
+        if magic != header::FAT_MAGIC && magic != header::FAT_CIGAM {
+            return Self::parse_at_internal(data, 0, true);
+        }
+
+        let fat_header = header::FatHeader::parse(data)?;
+        let chosen = if let Some(name) = arch {
+            fat_header
+                .architectures
+                .iter()
+                .find(|a| arch_name_matches(a.cputype, a.cpusubtype, name))
+                .ok_or_else(|| {
+                    let available: Vec<String> = fat_header
+                        .architectures
+                        .iter()
+                        .map(|a| arch_label(a.cputype, a.cpusubtype).to_string())
+                        .collect();
+                    ParseError::invalid_structure(
+                        "fat header",
+                        0,
+                        format!(
+                            "requested arch '{}' not present (available: {})",
+                            name,
+                            available.join(", ")
+                        ),
+                    )
+                })?
+        } else {
+            fat_header
+                .architectures
+                .iter()
+                .find(|a| a.cputype == header::CPU_TYPE_X86_64)
+                .or_else(|| {
+                    fat_header
+                        .architectures
+                        .iter()
+                        .find(|a| a.cputype == header::CPU_TYPE_ARM64)
+                })
+                .or_else(|| fat_header.architectures.first())
+                .ok_or_else(|| {
+                    ParseError::invalid_structure("fat header", 0, "no architectures in fat binary")
+                })?
+        };
+
+        Self::parse_at_internal(data, chosen.offset as usize, false)
+    }
+
+    /// List the architecture slices in a universal Mach-O input. Returns an
+    /// empty vector for non-fat input.
+    pub fn list_slices(data: &[u8]) -> Vec<String> {
+        if data.len() < 4 {
+            return Vec::new();
+        }
+        let magic = read_u32_ne(data, 0);
+        if magic != header::FAT_MAGIC && magic != header::FAT_CIGAM {
+            return Vec::new();
+        }
+        match header::FatHeader::parse(data) {
+            Ok(h) => h
+                .architectures
+                .iter()
+                .map(|a| arch_label(a.cputype, a.cpusubtype).to_string())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Parse a Mach-O file at a specific offset.
     pub fn parse_at(data: &'a [u8], offset: usize) -> Result<Self, ParseError> {
         Self::parse_at_internal(data, offset, true)
     }
 
+    /// Returns true if this MachO instance was loaded from a universal
+    /// (fat) container, i.e. one slice was selected from several.
+    pub fn is_fat_slice(&self) -> bool {
+        self.offset != 0
+    }
+
+    /// Human-readable label for the slice this MachO instance was loaded
+    /// from (e.g. "x86_64", "arm64e"). Always returns something, even for
+    /// non-fat input.
+    pub fn slice_label(&self) -> String {
+        let cputype = match self.header.cputype {
+            CpuType::X86 => header::CPU_TYPE_X86,
+            CpuType::X86_64 => header::CPU_TYPE_X86_64,
+            CpuType::Arm => header::CPU_TYPE_ARM,
+            CpuType::Arm64 => header::CPU_TYPE_ARM64,
+            CpuType::Arm64_32 => header::CPU_TYPE_ARM64_32,
+            CpuType::Other(x) => x,
+        };
+        arch_label(cputype, self.header.cpusubtype).to_string()
+    }
+}
+
+fn arch_label(cputype: u32, cpusubtype: u32) -> &'static str {
+    const CPU_SUBTYPE_MASK: u32 = 0x00ffffff;
+    let subtype = cpusubtype & CPU_SUBTYPE_MASK;
+    match cputype {
+        header::CPU_TYPE_X86_64 => "x86_64",
+        header::CPU_TYPE_X86 => "x86",
+        header::CPU_TYPE_ARM64 => match subtype {
+            2 => "arm64e",
+            _ => "arm64",
+        },
+        header::CPU_TYPE_ARM64_32 => "arm64_32",
+        header::CPU_TYPE_ARM => "arm",
+        _ => "unknown",
+    }
+}
+
+fn arch_name_matches(cputype: u32, cpusubtype: u32, name: &str) -> bool {
+    let label = arch_label(cputype, cpusubtype);
+    if label.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    // Allow "arm64" to match "arm64e" only as a relaxed fallback. Users
+    // who specifically want arm64e must spell it out.
+    matches!(
+        (label, name.to_ascii_lowercase().as_str()),
+        ("x86_64", "x64" | "amd64") | ("x86", "i386" | "i686")
+    )
+}
+
+impl<'a> MachO<'a> {
     /// Internal parse function with recursion control.
     fn parse_at_internal(
         data: &'a [u8],

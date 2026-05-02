@@ -68,6 +68,11 @@ struct Cli {
     /// Project file for annotations
     #[arg(short, long)]
     project: Option<PathBuf>,
+
+    /// For universal (fat) Mach-O input, select an architecture slice
+    /// (e.g. x86_64, arm64, arm64e). Defaults to x86_64 then arm64.
+    #[arg(long)]
+    arch: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -444,7 +449,8 @@ fn main() -> Result<()> {
             Binary::Elf(elf)
         }
         BinaryType::MachO => {
-            let macho = MachO::parse(&data).context("Failed to parse Mach-O file")?;
+            let macho = MachO::parse_with_arch(&data, cli.arch.as_deref())
+                .context("Failed to parse Mach-O file")?;
             Binary::MachO(macho)
         }
         BinaryType::Pe => {
@@ -679,6 +685,12 @@ fn print_info(binary: &Binary) {
         Binary::MachO(macho) => {
             println!("Type:          {:?}", macho.header.filetype);
             println!("CPU Type:      {:?}", macho.header.cputype);
+            if macho.is_fat_slice() {
+                println!(
+                    "Slice:         {} (selected from universal binary)",
+                    macho.slice_label()
+                );
+            }
             if let Some(entry) = fmt.entry_point() {
                 println!("Entry Point:   {:#x}", entry);
             }
