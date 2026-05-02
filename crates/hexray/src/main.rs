@@ -1672,6 +1672,8 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
     disasm: &D,
     bytes: &[u8],
     start_addr: u64,
+    heuristic_bounds: bool,
+    noreturn_targets: &std::collections::HashSet<u64>,
 ) -> Vec<hexray_core::Instruction> {
     let mut instructions = Vec::new();
     let mut offset = 0;
@@ -1684,9 +1686,18 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_noreturn_call = heuristic_bounds
+                    && matches!(
+                        decoded.instruction.control_flow,
+                        hexray_core::ControlFlow::Call { target, .. }
+                            if noreturn_targets.contains(&target)
+                    );
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
+                if is_noreturn_call {
+                    break;
+                }
                 // Don't stop at return - we want to find all calls in the function
                 // including those after conditional returns
                 if is_ret && offset >= bytes.len() / 2 {
@@ -1712,11 +1723,16 @@ fn build_callgraph(
 ) -> Result<()> {
     let symbols: Vec<_> = fmt.symbols().cloned().collect();
     let arch = fmt.architecture();
+    let noreturn_targets: std::collections::HashSet<u64> = symbols
+        .iter()
+        .filter(|symbol| is_noreturn_function_name(&symbol.name))
+        .map(|symbol| symbol.address)
+        .collect();
 
-    // Determine which functions to analyze (address, name, size)
+    // Determine which functions to analyze (address, name, size, heuristic_bounds)
     // Note: Mach-O symbols don't have size info (nlist doesn't store it),
     // so we use a default size for symbols with size == 0
-    let functions_to_analyze: Vec<(u64, String, u64)> = if target == "all" {
+    let functions_to_analyze: Vec<(u64, String, u64, bool)> = if target == "all" {
         // Start with defined internal function symbols
         let mut funcs: Vec<_> = symbols
             .iter()
@@ -1725,7 +1741,7 @@ fn build_callgraph(
             })
             .map(|s| {
                 let size = if s.size > 0 { s.size } else { 4096 }; // Larger default for actual code
-                (s.address, demangle_or_original(&s.name), size)
+                (s.address, demangle_or_original(&s.name), size, s.size == 0)
             })
             .collect();
 
@@ -1736,8 +1752,8 @@ fn build_callgraph(
                 .find(|s| s.address == entry)
                 .map(|s| demangle_or_original(&s.name))
                 .unwrap_or_else(|| format!("_start_{:x}", entry));
-            if !funcs.iter().any(|(addr, _, _)| *addr == entry) {
-                funcs.push((entry, entry_name, 8192)); // Entry functions are often large
+            if !funcs.iter().any(|(addr, _, _, _)| *addr == entry) {
+                funcs.push((entry, entry_name, 8192, true)); // Entry functions are often large
             }
         }
 
@@ -1750,17 +1766,22 @@ fn build_callgraph(
             u64::from_str_radix(target, 16).ok()
         };
 
-        let (addr, name, size) = if let Some(a) = address {
+        let (addr, name, size, heuristic_bounds) = if let Some(a) = address {
             // For raw addresses, use a default size
-            (a, format!("sub_{:x}", a), 4096u64)
+            (a, format!("sub_{:x}", a), 4096u64, true)
         } else {
             let symbol = find_symbol(fmt, target)
                 .with_context(|| format!("Symbol '{}' not found", target))?;
             let size = if symbol.size > 0 { symbol.size } else { 4096 };
-            (symbol.address, demangle_or_original(&symbol.name), size)
+            (
+                symbol.address,
+                demangle_or_original(&symbol.name),
+                size,
+                symbol.size == 0,
+            )
         };
 
-        vec![(addr, name, size)]
+        vec![(addr, name, size, heuristic_bounds)]
     };
 
     // Helper to check if an address is in executable code (not a stub/import)
@@ -1776,8 +1797,8 @@ fn build_callgraph(
 
     // Iteratively discover functions by following calls
     let mut known_functions: std::collections::HashSet<u64> =
-        functions_to_analyze.iter().map(|(a, _, _)| *a).collect();
-    let mut pending_functions: Vec<(u64, String, u64)> = functions_to_analyze.clone();
+        functions_to_analyze.iter().map(|(a, _, _, _)| *a).collect();
+    let mut pending_functions: Vec<(u64, String, u64, bool)> = functions_to_analyze.clone();
     let mut all_function_infos: Vec<FunctionInfo> = Vec::new();
 
     // Create disassembler once based on architecture
@@ -1795,32 +1816,49 @@ fn build_callgraph(
         // Collect function info for current batch
         let function_infos: Vec<FunctionInfo> = pending_functions
             .iter()
-            .filter_map(|(func_addr, _, func_size)| {
+            .filter_map(|(func_addr, _, func_size, heuristic_bounds)| {
                 let size = (*func_size).max(64) as usize;
                 fmt.bytes_at(*func_addr, size).map(|bytes| FunctionInfo {
                     address: *func_addr,
                     size,
                     bytes: bytes.to_vec(),
+                    heuristic_bounds: *heuristic_bounds,
                 })
             })
             .collect();
 
         // Disassemble and find call targets
-        let mut new_call_targets: Vec<(u64, String, u64)> = Vec::new();
+        let mut new_call_targets: Vec<(u64, String, u64, bool)> = Vec::new();
         for func_info in &function_infos {
             let instructions: Vec<hexray_core::Instruction> = match arch {
-                Architecture::X86_64 | Architecture::X86 => {
-                    disassemble_for_calls(&disasm_x86, &func_info.bytes, func_info.address)
-                }
-                Architecture::Arm64 => {
-                    disassemble_for_calls(&disasm_arm64, &func_info.bytes, func_info.address)
-                }
-                Architecture::RiscV64 => {
-                    disassemble_for_calls(&disasm_riscv, &func_info.bytes, func_info.address)
-                }
-                Architecture::RiscV32 => {
-                    disassemble_for_calls(&disasm_riscv32, &func_info.bytes, func_info.address)
-                }
+                Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
+                    &disasm_x86,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::Arm64 => disassemble_for_calls(
+                    &disasm_arm64,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::RiscV64 => disassemble_for_calls(
+                    &disasm_riscv,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::RiscV32 => disassemble_for_calls(
+                    &disasm_riscv32,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
                 _ => Vec::new(),
             };
 
@@ -1829,12 +1867,15 @@ fn build_callgraph(
                 if let hexray_core::ControlFlow::Call { target, .. } = instr.control_flow {
                     if !known_functions.contains(&target) && is_internal_code(target) {
                         known_functions.insert(target);
-                        let name = symbols
+                        let (name, size, heuristic_bounds) = symbols
                             .iter()
                             .find(|s| s.address == target)
-                            .map(|s| demangle_or_original(&s.name))
-                            .unwrap_or_else(|| format!("sub_{:x}", target));
-                        new_call_targets.push((target, name, 4096));
+                            .map(|s| {
+                                let size = if s.size > 0 { s.size } else { 4096 };
+                                (demangle_or_original(&s.name), size, s.size == 0)
+                            })
+                            .unwrap_or_else(|| (format!("sub_{:x}", target), 4096, true));
+                        new_call_targets.push((target, name, size, heuristic_bounds));
                     }
                 }
             }

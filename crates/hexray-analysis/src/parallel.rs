@@ -3,6 +3,8 @@
 //! This module provides utilities for parallel disassembly and analysis
 //! of multiple functions using rayon.
 
+use std::collections::HashSet;
+
 use rayon::prelude::*;
 
 use hexray_core::Instruction;
@@ -26,6 +28,8 @@ pub struct FunctionInfo {
     pub size: usize,
     /// Raw bytes to disassemble.
     pub bytes: Vec<u8>,
+    /// Whether the byte range is a heuristic fallback rather than known bounds.
+    pub heuristic_bounds: bool,
 }
 
 /// Disassemble multiple functions in parallel.
@@ -39,16 +43,17 @@ pub struct FunctionInfo {
 /// use hexray_disasm::X86_64Disassembler;
 ///
 /// let functions = vec![
-///     FunctionInfo { address: 0x1000, size: 100, bytes: vec![...] },
-///     FunctionInfo { address: 0x2000, size: 200, bytes: vec![...] },
+///     FunctionInfo { address: 0x1000, size: 100, bytes: vec![...], heuristic_bounds: false },
+///     FunctionInfo { address: 0x2000, size: 200, bytes: vec![...], heuristic_bounds: false },
 /// ];
 ///
 /// let disasm = X86_64Disassembler::new();
-/// let results = disassemble_functions_parallel(&functions, &disasm);
+/// let results = disassemble_functions_parallel(&functions, &disasm, &HashSet::new());
 /// ```
 pub fn disassemble_functions_parallel<D>(
     functions: &[FunctionInfo],
     disasm: &D,
+    noreturn_targets: &HashSet<u64>,
 ) -> Vec<DisassembledFunction>
 where
     D: Disassembler + Sync,
@@ -56,7 +61,13 @@ where
     functions
         .par_iter()
         .map(|func| {
-            let instructions = disassemble_function(disasm, &func.bytes, func.address);
+            let instructions = disassemble_function(
+                disasm,
+                &func.bytes,
+                func.address,
+                func.heuristic_bounds,
+                noreturn_targets,
+            );
             DisassembledFunction {
                 entry: func.address,
                 instructions,
@@ -70,6 +81,8 @@ fn disassemble_function<D: Disassembler>(
     disasm: &D,
     bytes: &[u8],
     start_addr: u64,
+    heuristic_bounds: bool,
+    noreturn_targets: &HashSet<u64>,
 ) -> Vec<Instruction> {
     let mut instructions = Vec::new();
     let mut offset = 0;
@@ -82,11 +95,17 @@ fn disassemble_function<D: Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_noreturn_call = heuristic_bounds
+                    && matches!(
+                        decoded.instruction.control_flow,
+                        hexray_core::ControlFlow::Call { target, .. }
+                            if noreturn_targets.contains(&target)
+                    );
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
-                // Stop at return
-                if is_ret {
+                // Heuristic fallback windows should also stop at terminating calls.
+                if is_ret || is_noreturn_call {
                     break;
                 }
             }
@@ -112,8 +131,14 @@ impl ParallelCallGraphBuilder {
     where
         D: Disassembler + Sync,
     {
+        let noreturn_targets: HashSet<u64> = symbols
+            .iter()
+            .filter(|symbol| crate::is_noreturn_function_name(&symbol.name))
+            .map(|symbol| symbol.address)
+            .collect();
+
         // Disassemble all functions in parallel
-        let disassembled = disassemble_functions_parallel(functions, disasm);
+        let disassembled = disassemble_functions_parallel(functions, disasm, &noreturn_targets);
 
         // Build the call graph sequentially (shared state)
         let mut builder = crate::CallGraphBuilder::new();
@@ -137,9 +162,11 @@ mod tests {
             address: 0x1000,
             size: 100,
             bytes: vec![0x90; 100], // NOP sled
+            heuristic_bounds: false,
         };
         assert_eq!(info.address, 0x1000);
         assert_eq!(info.size, 100);
+        assert!(!info.heuristic_bounds);
     }
 
     #[test]
