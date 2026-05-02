@@ -1939,12 +1939,29 @@ fn build_callgraph(
 
             if !callees.is_empty() {
                 println!("{} ({:#x}):", node_name, node.address);
+                let mut seen: std::collections::HashMap<u64, (String, usize)> =
+                    std::collections::HashMap::new();
+                let mut order: Vec<u64> = Vec::new();
                 for callee in callees {
                     let callee_name = callee
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("sub_{:x}", callee.address));
-                    println!("  -> {} ({:#x})", callee_name, callee.address);
+                    let entry = seen
+                        .entry(callee.address)
+                        .or_insert_with(|| (callee_name.clone(), 0));
+                    if entry.1 == 0 {
+                        order.push(callee.address);
+                    }
+                    entry.1 += 1;
+                }
+                for addr in order {
+                    let (name, count) = &seen[&addr];
+                    if *count > 1 {
+                        println!("  -> {} ({:#x}) [{}x]", name, addr, count);
+                    } else {
+                        println!("  -> {} ({:#x})", name, addr);
+                    }
                 }
                 println!();
             }
@@ -2646,20 +2663,81 @@ fn build_xrefs(
             .map(|s| demangle_or_original(&s.name))
             .unwrap_or_else(|| format!("sub_{:x}", target_addr));
 
+        // Function-start lookup table: sorted by address. For any call-site
+        // address we use partition_point to find the nearest preceding
+        // function start so xrefs report "<caller> + 0xN" instead of
+        // sub_<call-site-addr>. We seed it with three sources:
+        //   1. Symbol-table function entries (typical ELF case).
+        //   2. Call targets discovered while building the xref database.
+        //      On Mach-O, where most callers lack a name, this is what
+        //      lets us recognise sub_<addr> as a function start.
+        //   3. The binary's entry point, since stripped Mach-O binaries
+        //      otherwise have no symbol covering main.
+        // Mach-O image-anchor symbols (__mh_execute_header etc.) are not
+        // real functions and would otherwise dominate the lookup, so we
+        // exclude anything starting with __mh_.
+        let mut function_starts: Vec<(u64, Option<String>, u64)> = symbols
+            .iter()
+            .filter(|s| s.is_function() && s.address != 0 && !s.name.starts_with("__mh_"))
+            .map(|s| (s.address, Some(demangle_or_original(&s.name)), s.size))
+            .collect();
+        let mut seen: std::collections::HashSet<u64> =
+            function_starts.iter().map(|(a, _, _)| *a).collect();
+        for target in db.all_referenced() {
+            // Only call targets are function starts. Jump and data refs
+            // would otherwise pollute the lookup table with basic-block
+            // heads and global symbols.
+            if db.call_refs_to(target).is_empty() {
+                continue;
+            }
+            if seen.insert(target) {
+                let name = fmt
+                    .symbol_at(target)
+                    .filter(|s| !s.name.starts_with("__mh_"))
+                    .map(|s| demangle_or_original(&s.name));
+                function_starts.push((target, name, 0));
+            }
+        }
+        if let Some(entry) = fmt.entry_point() {
+            if seen.insert(entry) {
+                function_starts.push((entry, None, 0));
+            }
+        }
+        function_starts.sort_by_key(|(addr, _, _)| *addr);
+
+        let resolve_caller = |from: u64| -> (String, Option<u64>) {
+            if let Some(s) = fmt.symbol_at(from).filter(|s| !s.name.starts_with("__mh_")) {
+                return (demangle_or_original(&s.name), Some(0));
+            }
+            let idx = function_starts.partition_point(|(addr, _, _)| *addr <= from);
+            if idx == 0 {
+                return (format!("sub_{:x}", from), None);
+            }
+            let (start, name, size) = &function_starts[idx - 1];
+            let offset = from - start;
+            let limit = if *size > 0 { *size } else { 0x2000 };
+            if offset < limit {
+                let display = name.clone().unwrap_or_else(|| format!("sub_{:x}", start));
+                (display, Some(offset))
+            } else {
+                (format!("sub_{:x}", from), None)
+            }
+        };
+
         if json {
             println!("{{");
             println!("  \"target\": \"{:#x}\",", target_addr);
             println!("  \"target_name\": \"{}\",", target_name);
             println!("  \"references\": [");
             for (i, xref) in refs.iter().enumerate() {
-                let from_name = fmt
-                    .symbol_at(xref.from)
-                    .map(|s| demangle_or_original(&s.name))
-                    .unwrap_or_else(|| format!("sub_{:x}", xref.from));
+                let (from_name, from_offset) = resolve_caller(xref.from);
                 let comma = if i < refs.len() - 1 { "," } else { "" };
                 println!("    {{");
                 println!("      \"from\": \"{:#x}\",", xref.from);
                 println!("      \"from_name\": \"{}\",", from_name);
+                if let Some(off) = from_offset {
+                    println!("      \"from_offset\": \"{:#x}\",", off);
+                }
                 println!("      \"type\": \"{:?}\"", xref.xref_type);
                 println!("    }}{}", comma);
             }
@@ -2675,10 +2753,7 @@ fn build_xrefs(
                 println!("No references found.");
             } else {
                 for xref in &refs {
-                    let from_name = fmt
-                        .symbol_at(xref.from)
-                        .map(|s| demangle_or_original(&s.name))
-                        .unwrap_or_else(|| format!("sub_{:x}", xref.from));
+                    let (from_name, from_offset) = resolve_caller(xref.from);
                     let type_str = match xref.xref_type {
                         XrefType::Call => "CALL",
                         XrefType::Jump => "JUMP",
@@ -2686,7 +2761,12 @@ fn build_xrefs(
                         XrefType::DataWrite => "WRITE",
                         XrefType::Unknown => "???",
                     };
-                    println!("{:#016x} {} from {}", xref.from, type_str, from_name);
+                    let caller_label = match from_offset {
+                        Some(0) => from_name,
+                        Some(off) => format!("{} + {:#x}", from_name, off),
+                        None => from_name,
+                    };
+                    println!("{:#016x} {} from {}", xref.from, type_str, caller_label);
                 }
                 println!();
                 println!("Total: {} references", refs.len());
