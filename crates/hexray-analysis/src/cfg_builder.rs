@@ -47,10 +47,18 @@ impl CfgBuilder {
                     leaders.insert(*fallthrough);
                 }
                 ControlFlow::Call { return_addr, .. } => {
-                    leaders.insert(*return_addr);
+                    if let Some(&next_idx) = sorted_indices.get(pos + 1) {
+                        if instructions[next_idx].address == *return_addr {
+                            leaders.insert(*return_addr);
+                        }
+                    }
                 }
                 ControlFlow::IndirectCall { return_addr } => {
-                    leaders.insert(*return_addr);
+                    if let Some(&next_idx) = sorted_indices.get(pos + 1) {
+                        if instructions[next_idx].address == *return_addr {
+                            leaders.insert(*return_addr);
+                        }
+                    }
                 }
                 ControlFlow::Return
                 | ControlFlow::Halt
@@ -214,5 +222,31 @@ impl CfgBuilder {
         }
 
         cfg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CfgBuilder;
+    use hexray_core::{BlockTerminator, ControlFlow, Instruction, Operation};
+
+    #[test]
+    fn terminal_call_without_fallthrough_does_not_create_empty_block() {
+        let instructions = vec![
+            Instruction::new(0x1000, 1, vec![0x90], "nop"),
+            Instruction::new(0x1001, 5, vec![0xe8, 0, 0, 0, 0], "call")
+                .with_operation(Operation::Call)
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1006,
+                }),
+        ];
+
+        let cfg = CfgBuilder::build(&instructions, 0x1000);
+
+        assert_eq!(cfg.num_blocks(), 1);
+        let block = cfg.entry_block().unwrap();
+        assert!(cfg.successors(block.id).is_empty());
+        assert!(matches!(block.terminator, BlockTerminator::Unknown));
     }
 }

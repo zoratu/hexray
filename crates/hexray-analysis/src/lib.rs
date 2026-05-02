@@ -39,6 +39,7 @@ pub mod exception_handling;
 pub mod function_finder;
 pub mod incremental;
 pub mod indirect_calls;
+pub mod noreturn;
 pub mod output;
 pub mod parallel;
 pub mod project;
@@ -96,6 +97,7 @@ pub use incremental::{
     IncrementalError, IncrementalResult, IncrementalStats, InvalidationLevel, Patch, PatchSet,
     PatchType,
 };
+pub use noreturn::is_noreturn_function_name;
 pub use output::{
     CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CfgDotExporter,
     CfgHtmlExporter, CfgJsonExporter,

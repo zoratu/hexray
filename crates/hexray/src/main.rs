@@ -17,11 +17,11 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
-    AnalysisProject, BinaryDataContext, BinaryDiff, CallGraphBuilder, CallGraphDotExporter,
-    CallGraphHtmlExporter, CallGraphJsonExporter, CfgBuilder, CfgDotExporter, CfgHtmlExporter,
-    CfgJsonExporter, Decompiler, DecompilerConfig, FunctionInfo, OptimizationLevel,
-    OptimizationPass, ParallelCallGraphBuilder, PatchType, RelocationTable, StringConfig,
-    StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
+    is_noreturn_function_name, AnalysisProject, BinaryDataContext, BinaryDiff, CallGraphBuilder,
+    CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CfgBuilder, CfgDotExporter,
+    CfgHtmlExporter, CfgJsonExporter, Decompiler, DecompilerConfig, FunctionInfo,
+    OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder, PatchType, RelocationTable,
+    StringConfig, StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -1072,19 +1072,19 @@ fn disassemble_cfg(
     let instructions = match arch {
         Architecture::X86_64 | Architecture::X86 => {
             let disasm = X86_64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         Architecture::Arm64 => {
             let disasm = Arm64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV64 => {
             let disasm = RiscVDisassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV32 => {
             let disasm = RiscVDisassembler::new_rv32();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         _ => {
             bail!("Unsupported architecture: {:?}", arch);
@@ -1135,6 +1135,7 @@ fn disassemble_cfg(
 
 fn disassemble_for_cfg<D: Disassembler>(
     disasm: &D,
+    fmt: &dyn BinaryFormat,
     bytes: &[u8],
     start_addr: u64,
     stop_after_first_return: bool,
@@ -1149,12 +1150,19 @@ fn disassemble_for_cfg<D: Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_noreturn_call = matches!(
+                    decoded.instruction.control_flow,
+                    hexray_core::ControlFlow::Call { target, .. }
+                        if fmt
+                            .symbol_at(target)
+                            .is_some_and(|symbol| is_noreturn_function_name(&symbol.name))
+                );
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
                 // If we only have a fallback byte window (unknown function size),
-                // stop at the first return to avoid spilling into neighboring functions.
-                if stop_after_first_return && is_ret {
+                // stop at the first return/noreturn call to avoid spilling into neighbors.
+                if stop_after_first_return && (is_ret || is_noreturn_call) {
                     break;
                 }
                 // With known function bounds, allow early returns and continue.
@@ -1243,19 +1251,19 @@ fn decompile_function(
     let instructions = match arch {
         Architecture::X86_64 | Architecture::X86 => {
             let disasm = X86_64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         Architecture::Arm64 => {
             let disasm = Arm64Disassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV64 => {
             let disasm = RiscVDisassembler::new();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         Architecture::RiscV32 => {
             let disasm = RiscVDisassembler::new_rv32();
-            disassemble_for_cfg(&disasm, bytes, start_addr, stop_after_first_return)
+            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
         }
         _ => {
             bail!("Unsupported architecture: {:?}", arch);
@@ -2120,19 +2128,19 @@ fn decompile_with_follow(
         let instructions = match arch {
             Architecture::X86_64 | Architecture::X86 => {
                 let disasm = X86_64Disassembler::new();
-                disassemble_for_cfg(&disasm, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
             }
             Architecture::Arm64 => {
                 let disasm = Arm64Disassembler::new();
-                disassemble_for_cfg(&disasm, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
             }
             Architecture::RiscV64 => {
                 let disasm = RiscVDisassembler::new();
-                disassemble_for_cfg(&disasm, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
             }
             Architecture::RiscV32 => {
                 let disasm = RiscVDisassembler::new_rv32();
-                disassemble_for_cfg(&disasm, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
             }
             _ => continue,
         };
@@ -2529,19 +2537,19 @@ fn build_xrefs(
             let instructions = match arch {
                 Architecture::X86_64 | Architecture::X86 => {
                     let disasm = X86_64Disassembler::new();
-                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
+                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
                 }
                 Architecture::Arm64 => {
                     let disasm = Arm64Disassembler::new();
-                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
+                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
                 }
                 Architecture::RiscV64 => {
                     let disasm = RiscVDisassembler::new();
-                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
+                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
                 }
                 Architecture::RiscV32 => {
                     let disasm = RiscVDisassembler::new_rv32();
-                    disassemble_for_cfg(&disasm, bytes, func.address, stop_after_first_return)
+                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
                 }
                 _ => Vec::new(),
             };
