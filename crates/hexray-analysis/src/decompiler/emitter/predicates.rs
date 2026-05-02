@@ -657,6 +657,17 @@ pub(super) fn is_declarable_variable(name: &str) -> bool {
         return false;
     }
 
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return false;
+    }
+
     // Default: if not a register and not a literal, likely a local variable
     // This catches any other semantic names we might have missed
     true

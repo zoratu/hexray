@@ -457,6 +457,48 @@ impl PseudoCodeEmitter {
         Self::format_signature_param(p, rendered_name)
     }
 
+    fn format_function_header(
+        return_type: &super::signature::ParamType,
+        func_name: &str,
+        params: &[String],
+    ) -> String {
+        let params_str = if params.is_empty() {
+            "void".to_string()
+        } else {
+            params.join(", ")
+        };
+
+        match return_type {
+            super::signature::ParamType::FunctionPointer {
+                return_type,
+                params,
+            } => {
+                let callback_params = if params.is_empty() {
+                    "void".to_string()
+                } else {
+                    params
+                        .iter()
+                        .map(super::signature::ParamType::to_c_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!(
+                    "{} (*{}({}))({})",
+                    return_type.to_c_string(),
+                    func_name,
+                    params_str,
+                    callback_params
+                )
+            }
+            _ => format!(
+                "{} {}({})",
+                return_type.to_c_string(),
+                func_name,
+                params_str
+            ),
+        }
+    }
+
     /// Creates a new emitter.
     pub fn new(indent: &str, emit_addresses: bool) -> Self {
         Self {
@@ -2181,6 +2223,11 @@ impl PseudoCodeEmitter {
                 index,
                 element_size,
             } => {
+                if let Some(stack_array) =
+                    self.try_format_stack_slot_array_access(base, index, *element_size)
+                {
+                    return stack_array;
+                }
                 if let ExprKind::IntLit(idx) = &index.kind {
                     if *idx >= 0 {
                         if let ExprKind::Var(base_var) = &base.kind {
@@ -2241,7 +2288,7 @@ impl PseudoCodeEmitter {
                                 .naming_ctx
                                 .borrow_mut()
                                 .get_name(actual_offset, is_param);
-                            return name;
+                            return normalize_variable_name(&name);
                         }
                     } else if is_pc_relative {
                         // RIP/EIP-relative array access - this is a global variable reference
@@ -2455,10 +2502,8 @@ impl PseudoCodeEmitter {
                     .collect();
                 writeln!(
                     output,
-                    "{} {}({})",
-                    return_type,
-                    func_name,
-                    params.join(", ")
+                    "{}",
+                    Self::format_function_header(&sig.return_type, func_name, &params)
                 )
                 .unwrap();
             } else {
@@ -2514,8 +2559,7 @@ impl PseudoCodeEmitter {
         writeln!(output, "{{").unwrap();
 
         let mut param_exclusion_names = HashSet::new();
-        for (idx, name) in param_override_sources.iter().enumerate() {
-            param_exclusion_names.insert(name.clone());
+        for (idx, _) in param_override_sources.iter().enumerate() {
             param_exclusion_names.insert(rendered_param_names[idx].clone());
             param_exclusion_names.insert(format!("arg{}", idx));
         }
@@ -2554,6 +2598,14 @@ impl PseudoCodeEmitter {
                 all_vars_set.insert(inferred);
             }
         }
+        for arg_index in 0..8 {
+            let leaked_arg = format!("arg{}", arg_index);
+            if !param_exclusion_list.contains(&leaked_arg)
+                && contains_identifier_token(&body_output, &leaked_arg)
+            {
+                all_vars_set.insert(leaked_arg);
+            }
+        }
         let mut all_vars: Vec<String> = all_vars_set.into_iter().collect();
         all_vars.sort();
 
@@ -2561,7 +2613,12 @@ impl PseudoCodeEmitter {
         if !all_vars.is_empty() {
             let indent = &self.indent;
             for var in &all_vars {
-                let var_type = self.get_type(var);
+                let var_type =
+                    if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var)) {
+                        "char*"
+                    } else {
+                        self.get_type(var)
+                    };
                 if loop_zero_init_vars.contains(var) {
                     writeln!(output, "{}{} {} = 0;", indent, var_type, var).unwrap();
                 } else {
@@ -2630,41 +2687,30 @@ impl PseudoCodeEmitter {
         };
         self.set_return_fallback_expr_for_type(&return_type);
 
-        if signature.parameters.is_empty() {
-            writeln!(output, "{} {}(void)", return_type, func_name).unwrap();
-        } else {
-            let params: Vec<_> = signature
-                .parameters
-                .iter()
-                .enumerate()
-                .map(|(idx, p)| {
-                    let source_name = &signature_param_names[idx];
-                    let rendered_name = rendered_param_names[idx].clone();
-                    let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
-                    self.format_signature_param_with_type_hint(
-                        p,
-                        &rendered_name,
-                        type_hint.as_deref(),
-                    )
-                })
-                .collect();
-            writeln!(
-                output,
-                "{} {}({})",
-                return_type,
-                func_name,
-                params.join(", ")
-            )
-            .unwrap();
-        }
+        let params: Vec<_> = signature
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| {
+                let source_name = &signature_param_names[idx];
+                let rendered_name = rendered_param_names[idx].clone();
+                let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
+                self.format_signature_param_with_type_hint(p, &rendered_name, type_hint.as_deref())
+            })
+            .collect();
+        writeln!(
+            output,
+            "{}",
+            Self::format_function_header(&signature.return_type, func_name, &params)
+        )
+        .unwrap();
         writeln!(output, "{{").unwrap();
 
         // Legacy analysis for skipping parameter statements
         let func_info = self.analyze_function(&cfg.body);
 
         let mut param_exclusion_names = HashSet::new();
-        for (idx, name) in signature_param_names.iter().enumerate() {
-            param_exclusion_names.insert(name.clone());
+        for (idx, _) in signature_param_names.iter().enumerate() {
             param_exclusion_names.insert(rendered_param_names[idx].clone());
             param_exclusion_names.insert(format!("arg{}", idx));
         }
@@ -2703,6 +2749,14 @@ impl PseudoCodeEmitter {
                 all_vars_set.insert(inferred);
             }
         }
+        for arg_index in 0..8 {
+            let leaked_arg = format!("arg{}", arg_index);
+            if !param_exclusion_list.contains(&leaked_arg)
+                && contains_identifier_token(&body_output, &leaked_arg)
+            {
+                all_vars_set.insert(leaked_arg);
+            }
+        }
         let mut all_vars: Vec<String> = all_vars_set.into_iter().collect();
         all_vars.sort();
 
@@ -2710,7 +2764,12 @@ impl PseudoCodeEmitter {
         if !all_vars.is_empty() {
             let indent = &self.indent;
             for var in &all_vars {
-                let var_type = self.get_type(var);
+                let var_type =
+                    if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var)) {
+                        "char*"
+                    } else {
+                        self.get_type(var)
+                    };
                 if loop_zero_init_vars.contains(var) {
                     writeln!(output, "{}{} {} = 0;", indent, var_type, var).unwrap();
                 } else {
@@ -3364,6 +3423,9 @@ impl PseudoCodeEmitter {
                 self.collect_vars_from_expr(expr, vars);
             }
             ExprKind::ArrayAccess { base, index, .. } => {
+                if let Some(var_name) = self.try_get_var_name(expr) {
+                    vars.insert(var_name);
+                }
                 self.collect_vars_from_expr(base, vars);
                 self.collect_vars_from_expr(index, vars);
             }
@@ -4983,6 +5045,11 @@ impl PseudoCodeEmitter {
                 }
             }
             ExprKind::Deref { addr, size } => self.try_format_stack_slot(addr, *size),
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => self.try_get_array_base_name(base, index, *element_size),
             _ => None,
         }
     }
@@ -5046,7 +5113,7 @@ impl PseudoCodeEmitter {
             if base.name == "sp" {
                 // Check for DWARF name at offset 0
                 if let Some(name) = self.get_dwarf_name(0) {
-                    return Some(name.to_string());
+                    return Some(normalize_variable_name(name));
                 }
                 return Some("var_0".to_string());
             }
@@ -5070,7 +5137,7 @@ impl PseudoCodeEmitter {
 
                         // First, check for DWARF name at this offset
                         if let Some(name) = self.get_dwarf_name(actual_offset) {
-                            return Some(name.to_string());
+                            return Some(normalize_variable_name(name));
                         }
 
                         // Use NamingContext for pattern-based naming (loop indices, type hints, etc.)
@@ -5080,12 +5147,94 @@ impl PseudoCodeEmitter {
                             .naming_ctx
                             .borrow_mut()
                             .get_name(actual_offset, is_param);
-                        return Some(name);
+                        return Some(normalize_variable_name(&name));
                     }
                 }
             }
         }
         None
+    }
+
+    fn try_format_stack_slot_array_access(
+        &self,
+        base: &Expr,
+        index: &Expr,
+        element_size: usize,
+    ) -> Option<String> {
+        use super::expression::BinOpKind;
+
+        let ExprKind::IntLit(slot_index) = &index.kind else {
+            return None;
+        };
+
+        let (stack_base, dynamic_index) = match &base.kind {
+            ExprKind::BinOp {
+                op: BinOpKind::Add,
+                left,
+                right,
+            } => match (&left.kind, &right.kind) {
+                (ExprKind::Var(_base_var), ExprKind::IntLit(_)) => return None,
+                (ExprKind::Var(base_var), _) => (base_var, &**right),
+                (_, ExprKind::Var(base_var)) => (base_var, &**left),
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        let is_frame_ptr = stack_base.name == "rbp" || stack_base.name == "x29";
+        let is_stack_ptr = stack_base.name == "rsp" || stack_base.name == "sp";
+        if !(is_frame_ptr || is_stack_ptr) {
+            return None;
+        }
+
+        let actual_offset = *slot_index * element_size as i128;
+        let stack_name = if let Some(name) = self.get_dwarf_name(actual_offset) {
+            name.to_string()
+        } else {
+            let is_param = is_frame_ptr && actual_offset > 0;
+            self.naming_ctx
+                .borrow_mut()
+                .get_name(actual_offset, is_param)
+        };
+
+        let base_name = normalize_variable_name(&stack_name);
+        let index_str = self.format_expr_no_string_resolve(dynamic_index);
+        Some(format!("{}[{}]", base_name, index_str))
+    }
+
+    fn try_get_array_base_name(
+        &self,
+        base: &Expr,
+        index: &Expr,
+        element_size: usize,
+    ) -> Option<String> {
+        if let ExprKind::Var(v) = &base.kind {
+            let is_stack_ptr = v.name == "sp" || v.name == "rsp";
+            let is_frame_ptr = v.name == "rbp" || v.name == "x29";
+            if is_stack_ptr || is_frame_ptr {
+                if let ExprKind::IntLit(idx) = &index.kind {
+                    let byte_offset = *idx * element_size as i128;
+                    let actual_offset = if is_frame_ptr {
+                        -byte_offset
+                    } else {
+                        byte_offset
+                    };
+
+                    let name = if let Some(name) = self.get_dwarf_name(actual_offset) {
+                        name.to_string()
+                    } else {
+                        let is_param = is_frame_ptr && actual_offset > 0;
+                        self.naming_ctx
+                            .borrow_mut()
+                            .get_name(actual_offset, is_param)
+                    };
+                    return Some(normalize_variable_name(&name));
+                }
+            }
+        }
+
+        self.try_format_stack_slot_array_access(base, index, element_size)
+            .and_then(|formatted| formatted.split('[').next().map(str::to_string))
     }
 
     /// Emits a statement where the RHS 0 should be replaced with a symbol.
@@ -5792,6 +5941,28 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_with_signature_formats_function_pointer_return_header() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::FunctionPointer {
+            return_type: Box::new(super::super::signature::ParamType::Void),
+            params: vec![super::super::signature::ParamType::SignedInt(32)],
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "fp_ret", &sig);
+        let header = output.lines().next().unwrap_or_default();
+        assert_eq!(header, "void (*fp_ret(void))(int32_t)");
+    }
+
+    #[test]
     fn test_emit_does_not_force_callback_type_for_static_callback_symbol() {
         use super::super::expression::Variable;
 
@@ -5882,6 +6053,48 @@ mod tests {
         let addr_sp = Expr::binop(BinOpKind::Add, sp, Expr::int(16));
         let result_sp = emitter.try_format_stack_slot(&addr_sp, 4);
         assert!(result_sp.is_some(), "Expected Some for sp + 16, got None");
+    }
+
+    #[test]
+    fn test_emit_formats_stack_slot_array_access_with_dynamic_index() {
+        use super::super::expression::Variable;
+
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let dynamic_index = Expr::unknown("ret");
+        let base = Expr::binop(BinOpKind::Add, rbp, dynamic_index.clone());
+        let access = Expr::array_access(base, Expr::int(-1088), 1);
+        let assign = Expr::assign(access, Expr::int(0));
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![assign],
+                address_range: (0x1000, 0x1004),
+            }],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut type_info = HashMap::new();
+        type_info.insert("local_440".to_string(), "char*".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+        let output = emitter.emit(&cfg, "stack_array");
+
+        assert!(
+            output.contains("char* local_440;"),
+            "expected a typed stack slot declaration, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("local_440[ret] = 0;"),
+            "expected stack-slot array formatting, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("(rbp + ret)"),
+            "did not expect raw frame-pointer arithmetic, got:\n{}",
+            output
+        );
     }
 
     #[test]
