@@ -2557,6 +2557,11 @@ fn build_xrefs(
 ) -> Result<()> {
     let arch = fmt.architecture();
     let symbols: Vec<_> = fmt.symbols().cloned().collect();
+    let noreturn_targets: std::collections::HashSet<u64> = symbols
+        .iter()
+        .filter(|s| is_noreturn_function_name(&s.name))
+        .map(|s| s.address)
+        .collect();
 
     // Build xref database by disassembling all functions
     let mut xref_builder = XrefBuilder::new();
@@ -2567,31 +2572,47 @@ fn build_xrefs(
         .filter(|s| s.is_function() && s.address != 0)
         .collect();
 
+    let disasm_x86 = X86_64Disassembler::new();
+    let disasm_arm64 = Arm64Disassembler::new();
+    let disasm_riscv = RiscVDisassembler::new();
+    let disasm_riscv32 = RiscVDisassembler::new_rv32();
+
     for func in &functions {
-        let size = if func.size > 0 {
-            func.size as usize
+        let (size, heuristic_bounds) = if func.size > 0 {
+            (func.size as usize, false)
         } else {
-            256
+            (4096, true)
         };
         if let Some(bytes) = fmt.bytes_at(func.address, size) {
-            let stop_after_first_return = func.size == 0;
             let instructions = match arch {
-                Architecture::X86_64 | Architecture::X86 => {
-                    let disasm = X86_64Disassembler::new();
-                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
-                }
-                Architecture::Arm64 => {
-                    let disasm = Arm64Disassembler::new();
-                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
-                }
-                Architecture::RiscV64 => {
-                    let disasm = RiscVDisassembler::new();
-                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
-                }
-                Architecture::RiscV32 => {
-                    let disasm = RiscVDisassembler::new_rv32();
-                    disassemble_for_cfg(&disasm, fmt, bytes, func.address, stop_after_first_return)
-                }
+                Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
+                    &disasm_x86,
+                    bytes,
+                    func.address,
+                    heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::Arm64 => disassemble_for_calls(
+                    &disasm_arm64,
+                    bytes,
+                    func.address,
+                    heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::RiscV64 => disassemble_for_calls(
+                    &disasm_riscv,
+                    bytes,
+                    func.address,
+                    heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::RiscV32 => disassemble_for_calls(
+                    &disasm_riscv32,
+                    bytes,
+                    func.address,
+                    heuristic_bounds,
+                    &noreturn_targets,
+                ),
                 _ => Vec::new(),
             };
             xref_builder.analyze_instructions(&instructions);
