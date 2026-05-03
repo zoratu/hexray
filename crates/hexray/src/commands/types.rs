@@ -42,6 +42,21 @@ pub enum TypesAction {
     All,
 }
 
+fn listed_type_names(db: &TypeDatabase, structs_only: bool) -> Vec<String> {
+    let mut names: Vec<String> = db
+        .type_names()
+        .filter(|name| !structs_only || name.starts_with("struct "))
+        .map(str::to_string)
+        .collect();
+
+    if !structs_only {
+        names.extend(db.typedef_names().map(str::to_string));
+    }
+
+    names.sort();
+    names
+}
+
 /// Handle types management commands.
 pub fn handle_types_command(action: TypesAction) -> Result<()> {
     use hexray_types::builtin::{libc, linux, macos, posix};
@@ -88,10 +103,7 @@ pub fn handle_types_command(action: TypesAction) -> Result<()> {
 
             if !functions {
                 println!("\nTypes/Typedefs:");
-                for name in db.type_names() {
-                    if structs && !name.starts_with("struct ") {
-                        continue;
-                    }
+                for name in listed_type_names(&db, structs) {
                     println!("  {}", name);
                 }
             }
@@ -196,4 +208,36 @@ pub fn handle_types_command(action: TypesAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hexray_types::{CType, StructType};
+
+    #[test]
+    fn listed_type_names_include_typedefs_when_not_struct_only() {
+        let mut db = TypeDatabase::new();
+        let mut st = StructType::new(Some("point".to_string()));
+        st.finalize();
+        db.add_type("struct point", CType::Struct(st));
+        db.add_typedef("size_t", CType::ulong());
+
+        let names = listed_type_names(&db, false);
+
+        assert_eq!(names, vec!["size_t", "struct point"]);
+    }
+
+    #[test]
+    fn listed_type_names_exclude_typedefs_for_struct_only_filter() {
+        let mut db = TypeDatabase::new();
+        let mut st = StructType::new(Some("point".to_string()));
+        st.finalize();
+        db.add_type("struct point", CType::Struct(st));
+        db.add_typedef("size_t", CType::ulong());
+
+        let names = listed_type_names(&db, true);
+
+        assert_eq!(names, vec!["struct point"]);
+    }
 }
