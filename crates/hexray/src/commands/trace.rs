@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
-use hexray_analysis::{CfgBuilder, DataFlowQuery, DataFlowQueryEngine};
+use hexray_analysis::{collect_noreturn_targets, CfgBuilder, DataFlowQuery, DataFlowQueryEngine};
 use hexray_core::Architecture;
 use hexray_disasm::{Arm64Disassembler, Disassembler, RiscVDisassembler, X86_64Disassembler};
 use hexray_formats::BinaryFormat;
@@ -78,7 +78,7 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
     };
 
     // Helper to resolve function target
-    let resolve_function = |target: &str| -> Result<(u64, usize)> {
+    let resolve_function = |target: &str| -> Result<(u64, usize, bool)> {
         // Try parsing as hex address
         if let Ok(addr) = u64::from_str_radix(target.strip_prefix("0x").unwrap_or(target), 16) {
             // Find section containing this address
@@ -87,7 +87,7 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
                 let end = start + section.data().len() as u64;
                 if addr >= start && addr < end {
                     // Estimate function size (simple heuristic: until next symbol or 4KB)
-                    return Ok((addr, 4096));
+                    return Ok((addr, 4096, true));
                 }
             }
             bail!("Address {:#x} not found in any section", addr);
@@ -101,7 +101,7 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
                 } else {
                     4096
                 };
-                return Ok((sym.address, size));
+                return Ok((sym.address, size, sym.size == 0));
             }
         }
 
@@ -109,8 +109,13 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
     };
 
     // Helper to build CFG for a function
-    let build_cfg = |start_addr: u64, size: usize| -> Result<hexray_core::ControlFlowGraph> {
+    let build_cfg = |start_addr: u64,
+                     size: usize,
+                     heuristic_bounds: bool|
+     -> Result<hexray_core::ControlFlowGraph> {
         // Find section containing the function
+        let noreturn_targets = collect_noreturn_targets(fmt.symbols());
+
         for section in fmt.sections() {
             let section_start = section.virtual_address();
             let section_data = section.data();
@@ -122,9 +127,38 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
                 let func_size = size.min(available);
                 let func_data = &section_data[offset..offset + func_size];
 
-                // Disassemble the function bytes
-                let results = disassembler.disassemble_block(func_data, start_addr);
-                let instructions: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+                // Heuristic windows must stop at a return or known noreturn call
+                // to avoid decoding into the next function.
+                let mut instructions = Vec::new();
+                let mut inst_offset = 0usize;
+                while inst_offset < func_data.len() && instructions.len() < 2000 {
+                    let remaining = &func_data[inst_offset..];
+                    let addr = start_addr + inst_offset as u64;
+
+                    match disassembler.decode_instruction(remaining, addr) {
+                        Ok(decoded) => {
+                            let is_ret = decoded.instruction.is_return();
+                            let is_noreturn_call = matches!(
+                                decoded.instruction.control_flow,
+                                hexray_core::ControlFlow::Call { target, .. }
+                                    if noreturn_targets.contains(&target)
+                            );
+
+                            instructions.push(decoded.instruction);
+                            inst_offset += decoded.size;
+
+                            if heuristic_bounds && (is_ret || is_noreturn_call) {
+                                break;
+                            }
+                            if !heuristic_bounds && is_ret && inst_offset >= func_data.len() / 2 {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            inst_offset += disassembler.min_instruction_size().max(1);
+                        }
+                    }
+                }
 
                 if instructions.is_empty() {
                     bail!("Failed to disassemble function at {:#x}", start_addr);
@@ -149,8 +183,8 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             register,
             json,
         } => {
-            let (func_addr, func_size) = resolve_function(&function)?;
-            let cfg = build_cfg(func_addr, func_size)?;
+            let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
+            let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
             let engine = DataFlowQueryEngine::new(&cfg);
             let query = DataFlowQuery::TraceBackward {
@@ -172,8 +206,8 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             register,
             json,
         } => {
-            let (func_addr, func_size) = resolve_function(&function)?;
-            let cfg = build_cfg(func_addr, func_size)?;
+            let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
+            let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
             let engine = DataFlowQueryEngine::new(&cfg);
             let query = DataFlowQuery::TraceForward {
@@ -194,8 +228,8 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             address,
             register,
         } => {
-            let (func_addr, func_size) = resolve_function(&function)?;
-            let cfg = build_cfg(func_addr, func_size)?;
+            let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
+            let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
             let engine = DataFlowQueryEngine::new(&cfg);
             let query = DataFlowQuery::FindUses {
@@ -212,8 +246,8 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             address,
             register,
         } => {
-            let (func_addr, func_size) = resolve_function(&function)?;
-            let cfg = build_cfg(func_addr, func_size)?;
+            let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
+            let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
             let engine = DataFlowQueryEngine::new(&cfg);
             let query = DataFlowQuery::FindDefs {

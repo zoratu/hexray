@@ -1,5 +1,8 @@
 //! Shared helpers for recognizing known noreturn functions.
 
+use hexray_core::Symbol;
+use std::collections::HashSet;
+
 /// Returns true when `name` is a known noreturn function.
 pub fn is_noreturn_function_name(name: &str) -> bool {
     // Mach-O, PLT, and thunk symbols often grow one or more leading underscores.
@@ -33,9 +36,20 @@ pub fn is_noreturn_function_name(name: &str) -> bool {
     )
 }
 
+/// Collect the addresses of known noreturn symbols.
+pub fn collect_noreturn_targets<'a>(symbols: impl IntoIterator<Item = &'a Symbol>) -> HashSet<u64> {
+    symbols
+        .into_iter()
+        .filter(|symbol| is_noreturn_function_name(&symbol.name))
+        .map(|symbol| symbol.address)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_noreturn_function_name;
+    use super::{collect_noreturn_targets, is_noreturn_function_name};
+    use hexray_core::{Symbol, SymbolBinding, SymbolKind};
+    use std::collections::HashSet;
 
     #[test]
     fn matches_macho_prefixed_names() {
@@ -52,5 +66,30 @@ mod tests {
                 "{name} should not be noreturn"
             );
         }
+    }
+
+    #[test]
+    fn collects_noreturn_symbol_addresses() {
+        let symbols = vec![
+            Symbol {
+                name: "_exit".to_string(),
+                address: 0x1000,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            },
+            Symbol {
+                name: "printf".to_string(),
+                address: 0x2000,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            },
+        ];
+
+        let targets = collect_noreturn_targets(symbols.iter());
+        assert_eq!(targets, HashSet::from([0x1000]));
     }
 }
