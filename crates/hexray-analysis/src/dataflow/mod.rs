@@ -69,6 +69,15 @@ pub struct InstructionEffects {
 impl InstructionEffects {
     /// Analyzes an instruction to determine its effects.
     pub fn from_instruction(inst: &Instruction) -> Self {
+        Self::from_instruction_with_arch(inst, None)
+    }
+
+    /// Analyzes an instruction using a fallback architecture when the
+    /// instruction itself does not expose one in its operands.
+    pub fn from_instruction_with_arch(
+        inst: &Instruction,
+        default_arch: Option<Architecture>,
+    ) -> Self {
         let mut effects = Self::default();
 
         // Analyze operands based on instruction operation
@@ -150,7 +159,7 @@ impl InstructionEffects {
                 for op in &inst.operands {
                     effects.add_use(op);
                 }
-                effects.add_call_abi_effects(inst);
+                effects.add_call_abi_effects(inst, default_arch);
             }
 
             // Return: uses return value register
@@ -214,8 +223,8 @@ impl InstructionEffects {
         }
     }
 
-    fn add_call_abi_effects(&mut self, inst: &Instruction) {
-        let Some(arch) = infer_arch_from_operands(inst) else {
+    fn add_call_abi_effects(&mut self, inst: &Instruction, default_arch: Option<Architecture>) {
+        let Some(arch) = infer_arch_from_instruction(inst).or(default_arch) else {
             return;
         };
 
@@ -329,7 +338,7 @@ fn is_frame_pointer(reg_id: u16) -> bool {
     reg_id == 5 || reg_id == 29
 }
 
-fn infer_arch_from_operands(inst: &Instruction) -> Option<Architecture> {
+fn infer_arch_from_instruction(inst: &Instruction) -> Option<Architecture> {
     fn arch_from_operand(op: &Operand) -> Option<Architecture> {
         match op {
             Operand::Register(r) => Some(r.arch),
@@ -342,7 +351,20 @@ fn infer_arch_from_operands(inst: &Instruction) -> Option<Architecture> {
         }
     }
 
-    inst.operands.iter().find_map(arch_from_operand)
+    inst.operands
+        .iter()
+        .find_map(arch_from_operand)
+        .or_else(|| inst.reads.first().map(|reg| reg.arch))
+        .or_else(|| inst.writes.first().map(|reg| reg.arch))
+}
+
+pub(crate) fn infer_cfg_arch(cfg: &ControlFlowGraph) -> Option<Architecture> {
+    cfg.blocks().find_map(|block| {
+        block
+            .instructions
+            .iter()
+            .find_map(infer_arch_from_instruction)
+    })
 }
 
 /// Trait for dataflow analyses that compute per-block information.

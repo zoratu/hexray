@@ -715,8 +715,9 @@ impl std::fmt::Display for DataFlowResult {
 mod tests {
     use super::*;
     use hexray_core::{
-        Architecture, BasicBlock, BasicBlockId, Immediate, Instruction, Operand, Operation,
-        Register, RegisterClass,
+        register::{arm64, x86},
+        Architecture, BasicBlock, BasicBlockId, ControlFlow, Immediate, Instruction, Operand,
+        Operation, Register, RegisterClass,
     };
 
     fn make_register(id: u16, _name: &str) -> Register {
@@ -819,6 +820,96 @@ mod tests {
 
         // Should find the use at 0x1003
         assert!(result.has_results());
+    }
+
+    #[test]
+    fn test_trace_backward_direct_call_uses_sysv_arg_registers() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, x86::RDI, 64);
+
+        let mut inst1 = Instruction::new(0x1000, 5, vec![0; 5], "mov rdi, 1");
+        inst1.operation = Operation::Move;
+        inst1.operands = vec![
+            Operand::Register(rdi),
+            Operand::Immediate(Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
+        ];
+        bb.push_instruction(inst1);
+
+        let mut inst2 = Instruction::new(0x1005, 5, vec![0; 5], "call 0x2000");
+        inst2.operation = Operation::Call;
+        inst2.operands = vec![Operand::Immediate(Immediate {
+            value: 0x2000,
+            size: 8,
+            signed: false,
+        })];
+        inst2.control_flow = ControlFlow::Call {
+            target: 0x2000,
+            return_addr: 0x100a,
+        };
+        bb.push_instruction(inst2);
+
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg);
+        let result = engine.query(&DataFlowQuery::TraceBackward {
+            address: 0x1005,
+            register_id: x86::RDI,
+        });
+
+        assert!(result.complete);
+        assert_eq!(result.steps[0].address, 0x1005);
+        assert!(result.steps.iter().any(|step| step.address == 0x1000));
+    }
+
+    #[test]
+    fn test_trace_backward_direct_call_uses_aapcs_arg_registers() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x2000);
+
+        let x0 = Register::new(Architecture::Arm64, RegisterClass::General, arm64::X0, 64);
+
+        let mut inst1 = Instruction::new(0x2000, 4, vec![0; 4], "mov x0, #1");
+        inst1.operation = Operation::Move;
+        inst1.operands = vec![
+            Operand::Register(x0),
+            Operand::Immediate(Immediate {
+                value: 1,
+                size: 8,
+                signed: false,
+            }),
+        ];
+        bb.push_instruction(inst1);
+
+        let mut inst2 = Instruction::new(0x2004, 4, vec![0; 4], "bl 0x3000");
+        inst2.operation = Operation::Call;
+        inst2.operands = vec![Operand::Immediate(Immediate {
+            value: 0x3000,
+            size: 8,
+            signed: false,
+        })];
+        inst2.control_flow = ControlFlow::Call {
+            target: 0x3000,
+            return_addr: 0x2008,
+        };
+        bb.push_instruction(inst2);
+
+        cfg.add_block(bb);
+
+        let engine = DataFlowQueryEngine::new(&cfg);
+        let result = engine.query(&DataFlowQuery::TraceBackward {
+            address: 0x2004,
+            register_id: arm64::X0,
+        });
+
+        assert!(result.complete);
+        assert_eq!(result.steps[0].address, 0x2004);
+        assert!(result.steps.iter().any(|step| step.address == 0x2000));
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! Def-use chains connect each definition of a variable to all its uses,
 //! enabling optimizations like dead code elimination and constant propagation.
 
-use super::{InstructionEffects, Location};
+use super::{infer_cfg_arch, InstructionEffects, Location};
+use hexray_core::Architecture;
 use hexray_core::{BasicBlockId, ControlFlowGraph};
 use std::collections::{HashMap, HashSet};
 
@@ -132,6 +133,7 @@ struct DefUseChainBuilder {
     defs_by_location: HashMap<Location, Vec<DefId>>,
     /// Current reaching definitions at each block entry.
     reaching_at_entry: HashMap<BasicBlockId, HashMap<Location, HashSet<DefId>>>,
+    default_arch: Option<Architecture>,
 }
 
 impl DefUseChainBuilder {
@@ -143,6 +145,7 @@ impl DefUseChainBuilder {
             def_to_uses: HashMap::new(),
             defs_by_location: HashMap::new(),
             reaching_at_entry: HashMap::new(),
+            default_arch: None,
         }
     }
 
@@ -153,6 +156,8 @@ impl DefUseChainBuilder {
     }
 
     fn build(&mut self, cfg: &ControlFlowGraph) {
+        self.default_arch = infer_cfg_arch(cfg);
+
         // First pass: collect all definitions
         self.collect_definitions(cfg);
 
@@ -166,7 +171,8 @@ impl DefUseChainBuilder {
     fn collect_definitions(&mut self, cfg: &ControlFlowGraph) {
         for block in cfg.blocks() {
             for (inst_index, inst) in block.instructions.iter().enumerate() {
-                let effects = InstructionEffects::from_instruction(inst);
+                let effects =
+                    InstructionEffects::from_instruction_with_arch(inst, self.default_arch);
 
                 for location in effects.defs {
                     let def_id = self.new_def_id();
@@ -239,7 +245,7 @@ impl DefUseChainBuilder {
 
         // Transfer: for each instruction, kill old defs and add new ones
         for (inst_index, inst) in block.instructions.iter().enumerate() {
-            let effects = InstructionEffects::from_instruction(inst);
+            let effects = InstructionEffects::from_instruction_with_arch(inst, self.default_arch);
 
             for def_loc in effects.defs {
                 // Find the definition ID for this instruction/location
@@ -271,7 +277,8 @@ impl DefUseChainBuilder {
                 .unwrap_or_default();
 
             for (inst_index, inst) in block.instructions.iter().enumerate() {
-                let effects = InstructionEffects::from_instruction(inst);
+                let effects =
+                    InstructionEffects::from_instruction_with_arch(inst, self.default_arch);
 
                 // Record uses with their reaching definitions
                 for use_loc in effects.uses {
