@@ -15,7 +15,7 @@ pub enum SignaturesAction {
     /// Scan binary for known library functions
     Scan {
         /// Minimum confidence threshold (0.0-1.0)
-        #[arg(short, long, default_value = "0.5")]
+        #[arg(short, long, default_value = "0.5", value_parser = parse_confidence)]
         confidence: f32,
         /// Output in JSON format
         #[arg(long)]
@@ -219,6 +219,20 @@ fn scan_function_symbols<'a>(
     }
 
     matches
+}
+
+fn parse_confidence(input: &str) -> std::result::Result<f32, String> {
+    let confidence: f32 = input.parse().map_err(|_| {
+        format!("invalid confidence '{input}': expected a number between 0.0 and 1.0")
+    })?;
+
+    if !(0.0..=1.0).contains(&confidence) {
+        return Err(format!(
+            "confidence must be between 0.0 and 1.0, got {confidence}"
+        ));
+    }
+
+    Ok(confidence)
 }
 
 fn function_symbol_bytes<'a>(fmt: &'a dyn BinaryFormat, symbol: &Symbol) -> Option<&'a [u8]> {
@@ -454,5 +468,18 @@ mod tests {
         assert!(matches
             .iter()
             .any(|m| m.offset == 0x2000 && m.signature.name == "free"));
+    }
+
+    #[test]
+    fn parse_confidence_accepts_bounds() {
+        assert_eq!(parse_confidence("0.0").unwrap(), 0.0);
+        assert_eq!(parse_confidence("0.5").unwrap(), 0.5);
+        assert_eq!(parse_confidence("1.0").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn parse_confidence_rejects_out_of_range_values() {
+        assert!(parse_confidence("-0.1").is_err());
+        assert!(parse_confidence("1.5").is_err());
     }
 }
