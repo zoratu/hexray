@@ -840,7 +840,7 @@ fn resolve_decompile_target(binary: &Binary, target: Option<String>) -> Result<S
     let fmt = binary.as_format();
 
     // Try to find "main" symbol first
-    if let Some(sym) = find_symbol(fmt, "main") {
+    if let Some(sym) = find_exact_symbol(fmt, "main") {
         println!("(auto-selected 'main' at {:#x})\n", sym.address);
         return Ok("main".to_string());
     }
@@ -859,6 +859,42 @@ fn resolve_decompile_target(binary: &Binary, target: Option<String>) -> Result<S
 /// Find a symbol by name, preferring exact matches over partial matches.
 /// For function decompilation, we want the most specific match.
 fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
+    find_symbol_with_mode(fmt, name, SymbolLookupMode::Fuzzy)
+}
+
+fn find_exact_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
+    find_symbol_with_mode(fmt, name, SymbolLookupMode::ExactOnly)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SymbolLookupMode {
+    ExactOnly,
+    Fuzzy,
+}
+
+fn find_symbol_with_mode(
+    fmt: &dyn BinaryFormat,
+    name: &str,
+    mode: SymbolLookupMode,
+) -> Option<hexray_core::Symbol> {
+    // CUDA CUBIN kernels have section-relative addresses (the driver
+    // relocates them at module-load time), so address==0 is normal —
+    // filter only on `is_defined()`.
+    let symbols: Vec<hexray_core::Symbol> =
+        fmt.symbols().filter(|s| s.is_defined()).cloned().collect();
+    find_symbol_in_candidates(&symbols, name, mode)
+}
+
+fn find_symbol_in_candidates(
+    symbols: &[hexray_core::Symbol],
+    name: &str,
+    mode: SymbolLookupMode,
+) -> Option<hexray_core::Symbol> {
+    let is_exact_alias_match = |candidate: &str| {
+        candidate
+            .strip_prefix('_')
+            .is_some_and(|stripped| stripped == name)
+    };
     let symbol_priority = |s: &hexray_core::Symbol| {
         let is_func = if s.is_function() { 1u8 } else { 0u8 };
         let binding_rank = match s.binding {
@@ -877,12 +913,6 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
         candidates.into_iter().next()
     };
 
-    // CUDA CUBIN kernels have section-relative addresses (the driver
-    // relocates them at module-load time), so address==0 is normal —
-    // filter only on `is_defined()`.
-    let symbols: Vec<hexray_core::Symbol> =
-        fmt.symbols().filter(|s| s.is_defined()).cloned().collect();
-
     // 1. Try exact match first (highest priority)
     let exact_matches: Vec<_> = symbols.iter().filter(|s| s.name == name).cloned().collect();
     if !exact_matches.is_empty() {
@@ -897,6 +927,21 @@ fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol
         .collect();
     if !demangled_exact_matches.is_empty() {
         return pick_best(demangled_exact_matches);
+    }
+
+    let exact_alias_matches: Vec<_> = symbols
+        .iter()
+        .filter(|s| {
+            is_exact_alias_match(&s.name) || is_exact_alias_match(&demangle_or_original(&s.name))
+        })
+        .cloned()
+        .collect();
+    if !exact_alias_matches.is_empty() {
+        return pick_best(exact_alias_matches);
+    }
+
+    if mode == SymbolLookupMode::ExactOnly {
+        return None;
     }
 
     // 3. Try prefix match (e.g., "nfsd_open" matches "nfsd_open.cold")
@@ -4667,5 +4712,75 @@ fn format_arch_for_info(arch: Architecture) -> String {
         Architecture::Amdgpu(g) => format!("amdgpu ({}, family={:?})", g.target_id(), g.family),
         Architecture::Unknown(m) => format!("unknown (machine={})", m),
         other => other.name().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_symbol_in_candidates, SymbolLookupMode};
+    use hexray_core::{Symbol, SymbolBinding, SymbolKind};
+
+    fn test_symbol(name: &str, address: u64) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            address,
+            size: 16,
+            kind: SymbolKind::Function,
+            binding: SymbolBinding::Global,
+            section_index: Some(1),
+        }
+    }
+
+    #[test]
+    fn exact_match_beats_contains_match() {
+        let symbols = vec![
+            test_symbol("textdomain@plt", 0x4860),
+            test_symbol("main", 0x6000),
+        ];
+
+        let resolved =
+            find_symbol_in_candidates(&symbols, "main", SymbolLookupMode::Fuzzy).unwrap();
+
+        assert_eq!(resolved.name, "main");
+        assert_eq!(resolved.address, 0x6000);
+    }
+
+    #[test]
+    fn exact_only_lookup_rejects_substring_matches() {
+        let symbols = vec![test_symbol("textdomain@plt", 0x4860)];
+
+        let resolved = find_symbol_in_candidates(&symbols, "main", SymbolLookupMode::ExactOnly);
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn demangled_exact_match_is_preserved() {
+        let symbols = vec![test_symbol("_ZN3foo4mainEv", 0x7000)];
+
+        let resolved =
+            find_symbol_in_candidates(&symbols, "foo::main()", SymbolLookupMode::Fuzzy).unwrap();
+
+        assert_eq!(resolved.name, "_ZN3foo4mainEv");
+    }
+
+    #[test]
+    fn exact_only_lookup_accepts_leading_underscore_alias() {
+        let symbols = vec![test_symbol("_main", 0x7080)];
+
+        let resolved =
+            find_symbol_in_candidates(&symbols, "main", SymbolLookupMode::ExactOnly).unwrap();
+
+        assert_eq!(resolved.name, "_main");
+    }
+
+    #[test]
+    fn prefix_fallback_still_works() {
+        let symbols = vec![test_symbol("nfsd_open.cold", 0x7100)];
+
+        let resolved =
+            find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
+
+        assert_eq!(resolved.name, "nfsd_open.cold");
     }
 }
