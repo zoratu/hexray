@@ -5,7 +5,7 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
-use hexray_core::Architecture;
+use hexray_core::{Architecture, Symbol};
 use hexray_formats::BinaryFormat;
 use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
 
@@ -164,29 +164,7 @@ pub fn handle_signatures_command(fmt: &dyn BinaryFormat, action: SignaturesActio
 
             let db = sig_builtin::load_for_architecture(arch_str);
             let matcher = SignatureMatcher::new(&db).with_min_confidence(confidence);
-
-            // Scan all executable sections for function signatures
-            let mut matches = Vec::new();
-
-            for section in fmt.sections() {
-                if !section.is_executable() {
-                    continue;
-                }
-
-                let section_data = section.data();
-                let section_addr = section.virtual_address();
-
-                if section_data.is_empty() {
-                    continue;
-                }
-
-                // Scan the section for all matching signatures
-                // scan() returns byte offsets, convert to virtual addresses
-                for mut m in matcher.scan(section_data) {
-                    m.offset += section_addr as usize;
-                    matches.push(m);
-                }
-            }
+            let mut matches = scan_function_symbols(fmt, &matcher);
 
             // Sort by address
             matches.sort_by_key(|m| m.offset);
@@ -218,6 +196,47 @@ pub fn handle_signatures_command(fmt: &dyn BinaryFormat, action: SignaturesActio
     }
 
     Ok(())
+}
+
+fn scan_function_symbols<'a>(
+    fmt: &dyn BinaryFormat,
+    matcher: &SignatureMatcher<'a>,
+) -> Vec<hexray_signatures::MatchResult<'a>> {
+    let mut matches = Vec::new();
+
+    for symbol in fmt
+        .symbols()
+        .filter(|symbol| symbol.is_function() && symbol.is_defined() && symbol.address != 0)
+    {
+        let Some(bytes) = function_symbol_bytes(fmt, symbol) else {
+            continue;
+        };
+
+        for mut m in matcher.match_bytes_all(bytes) {
+            m.offset += symbol.address as usize;
+            matches.push(m);
+        }
+    }
+
+    matches
+}
+
+fn function_symbol_bytes<'a>(fmt: &'a dyn BinaryFormat, symbol: &Symbol) -> Option<&'a [u8]> {
+    let section = fmt.section_containing(symbol.address)?;
+    if !section.is_executable() {
+        return None;
+    }
+
+    let section_start = section.virtual_address();
+    let start = usize::try_from(symbol.address.checked_sub(section_start)?).ok()?;
+    let available = section.data().get(start..)?;
+
+    if symbol.size == 0 {
+        return Some(available);
+    }
+
+    let len = usize::try_from(symbol.size).ok().unwrap_or(available.len());
+    Some(&available[..available.len().min(len)])
 }
 
 fn print_scan_result_json(
@@ -275,5 +294,165 @@ fn print_scan_result(arch_str: &str, confidence: f32, matches: &[hexray_signatur
 
         println!();
         println!("Found {} potential library function(s)", matches.len());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hexray_core::{Bitness, Endianness, SymbolBinding, SymbolKind};
+    use hexray_formats::Section;
+
+    struct TestBinary {
+        sections: Vec<TestSection>,
+        symbols: Vec<Symbol>,
+    }
+
+    struct TestSection {
+        name: &'static str,
+        address: u64,
+        data: Vec<u8>,
+        executable: bool,
+    }
+
+    impl BinaryFormat for TestBinary {
+        fn architecture(&self) -> Architecture {
+            Architecture::X86_64
+        }
+
+        fn endianness(&self) -> Endianness {
+            Endianness::Little
+        }
+
+        fn bitness(&self) -> Bitness {
+            Bitness::Bits64
+        }
+
+        fn entry_point(&self) -> Option<u64> {
+            None
+        }
+
+        fn executable_sections(&self) -> Box<dyn Iterator<Item = &dyn Section> + '_> {
+            Box::new(
+                self.sections
+                    .iter()
+                    .filter(|section| section.executable)
+                    .map(|section| section as &dyn Section),
+            )
+        }
+
+        fn sections(&self) -> Box<dyn Iterator<Item = &dyn Section> + '_> {
+            Box::new(self.sections.iter().map(|section| section as &dyn Section))
+        }
+
+        fn symbols(&self) -> Box<dyn Iterator<Item = &Symbol> + '_> {
+            Box::new(self.symbols.iter())
+        }
+
+        fn symbol_at(&self, addr: u64) -> Option<&Symbol> {
+            self.symbols.iter().find(|symbol| symbol.address == addr)
+        }
+
+        fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
+            let section = self.section_containing(addr)?;
+            let start = usize::try_from(addr.checked_sub(section.virtual_address())?).ok()?;
+            section.data().get(start..start.checked_add(len)?)
+        }
+
+        fn section_containing(&self, addr: u64) -> Option<&dyn Section> {
+            self.sections
+                .iter()
+                .find(|section| {
+                    let start = section.address;
+                    let end = start.saturating_add(section.data.len() as u64);
+                    addr >= start && addr < end
+                })
+                .map(|section| section as &dyn Section)
+        }
+    }
+
+    impl Section for TestSection {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn virtual_address(&self) -> u64 {
+            self.address
+        }
+
+        fn size(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+
+        fn is_executable(&self) -> bool {
+            self.executable
+        }
+
+        fn is_writable(&self) -> bool {
+            false
+        }
+
+        fn is_allocated(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn scan_is_anchored_to_function_symbol_starts() {
+        let mut false_positive = vec![0x90; 4];
+        false_positive.extend_from_slice(&[
+            0x55, 0x48, 0x89, 0xE5, 0x53, 0x48, 0x83, 0xEC, 0x08, 0x48, 0x85, 0xFF, 0x74,
+        ]);
+
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text.false_positive",
+                    address: 0x1000,
+                    data: false_positive,
+                    executable: true,
+                },
+                TestSection {
+                    name: ".text.real_match",
+                    address: 0x2000,
+                    data: vec![
+                        0x55, 0x48, 0x89, 0xE5, 0x53, 0x48, 0x83, 0xEC, 0x08, 0x48, 0x85, 0xFF,
+                        0x74,
+                    ],
+                    executable: true,
+                },
+            ],
+            symbols: vec![
+                Symbol {
+                    name: "not_free".to_string(),
+                    address: 0x1000,
+                    size: 17,
+                    kind: SymbolKind::Function,
+                    binding: SymbolBinding::Global,
+                    section_index: Some(1),
+                },
+                Symbol {
+                    name: "real_free".to_string(),
+                    address: 0x2000,
+                    size: 13,
+                    kind: SymbolKind::Function,
+                    binding: SymbolBinding::Global,
+                    section_index: Some(2),
+                },
+            ],
+        };
+
+        let db = sig_builtin::load_x86_64();
+        let matcher = SignatureMatcher::new(&db).with_min_confidence(0.5);
+        let matches = scan_function_symbols(&binary, &matcher);
+
+        assert!(!matches.iter().any(|m| m.offset == 0x1004));
+        assert!(matches
+            .iter()
+            .any(|m| m.offset == 0x2000 && m.signature.name == "free"));
     }
 }
