@@ -375,6 +375,9 @@ impl<'a> Binary<'a> {
 }
 
 fn main() -> Result<()> {
+    // Restore the Unix default so piped output exits quietly on EPIPE.
+    sigpipe::reset();
+
     let cli = Cli::parse();
 
     // Handle commands that don't require a binary file
