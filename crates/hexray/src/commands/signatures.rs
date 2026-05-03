@@ -25,14 +25,14 @@ pub enum SignaturesAction {
     Builtin,
     /// Show signature database statistics
     Stats {
-        /// Architecture: x86_64 or aarch64
-        #[arg(short, long, default_value = "x86_64")]
+        /// Architecture: x86_64 or aarch64 (arm64/arm64e aliases accepted)
+        #[arg(short, long, default_value = "x86_64", value_parser = parse_signature_arch)]
         arch: String,
     },
     /// List all signatures in a database
     List {
-        /// Architecture: x86_64 or aarch64
-        #[arg(short, long, default_value = "x86_64")]
+        /// Architecture: x86_64 or aarch64 (arm64/arm64e aliases accepted)
+        #[arg(short, long, default_value = "x86_64", value_parser = parse_signature_arch)]
         arch: String,
         /// Filter by library name
         #[arg(short, long)]
@@ -42,8 +42,8 @@ pub enum SignaturesAction {
     Show {
         /// Signature name (e.g., "strlen", "malloc")
         name: String,
-        /// Architecture: x86_64 or aarch64
-        #[arg(short, long, default_value = "x86_64")]
+        /// Architecture: x86_64 or aarch64 (arm64/arm64e aliases accepted)
+        #[arg(short, long, default_value = "x86_64", value_parser = parse_signature_arch)]
         arch: String,
     },
 }
@@ -219,6 +219,16 @@ fn scan_function_symbols<'a>(
     }
 
     matches
+}
+
+fn parse_signature_arch(input: &str) -> std::result::Result<String, String> {
+    match input.to_ascii_lowercase().as_str() {
+        "x86_64" | "x64" | "amd64" => Ok("x86_64".to_string()),
+        "aarch64" | "arm64" | "arm64e" => Ok("aarch64".to_string()),
+        _ => Err(format!(
+            "unsupported architecture '{input}'; supported values: x86_64, aarch64 (aliases: x64, amd64, arm64, arm64e)"
+        )),
+    }
 }
 
 fn parse_confidence(input: &str) -> std::result::Result<f32, String> {
@@ -481,5 +491,19 @@ mod tests {
     fn parse_confidence_rejects_out_of_range_values() {
         assert!(parse_confidence("-0.1").is_err());
         assert!(parse_confidence("1.5").is_err());
+    }
+
+    #[test]
+    fn parse_signature_arch_accepts_aliases() {
+        assert_eq!(parse_signature_arch("x86_64").unwrap(), "x86_64");
+        assert_eq!(parse_signature_arch("amd64").unwrap(), "x86_64");
+        assert_eq!(parse_signature_arch("arm64").unwrap(), "aarch64");
+        assert_eq!(parse_signature_arch("arm64e").unwrap(), "aarch64");
+    }
+
+    #[test]
+    fn parse_signature_arch_rejects_unknown_values() {
+        assert!(parse_signature_arch("riscv64").is_err());
+        assert!(parse_signature_arch("not-a-real-arch").is_err());
     }
 }
