@@ -8,7 +8,7 @@
 //! - Pointers and arrays
 //!
 //! It does NOT handle:
-//! - Preprocessor directives (#include, #define, etc.)
+//! - Expanding preprocessor directives (#include, #define, etc.)
 //! - Complex expressions
 //! - Function bodies
 //! - Attributes
@@ -108,6 +108,8 @@ impl<'a> Lexer<'a> {
         while let Some(ch) = self.peek_char() {
             if ch.is_whitespace() {
                 self.next_char();
+            } else if ch == '#' {
+                self.skip_preprocessor_directive();
             } else if ch == '/' {
                 // Skip comments
                 let next_pos = self.pos + 1;
@@ -153,6 +155,17 @@ impl<'a> Lexer<'a> {
             } else {
                 break;
             }
+        }
+    }
+
+    fn skip_preprocessor_directive(&mut self) {
+        let mut saw_line_continuation = false;
+
+        while let Some(ch) = self.next_char() {
+            if ch == '\n' && !saw_line_continuation {
+                break;
+            }
+            saw_line_continuation = ch == '\\';
         }
     }
 
@@ -1338,6 +1351,32 @@ mod tests {
         } else {
             panic!("Expected struct type");
         }
+    }
+
+    #[test]
+    fn test_parse_include_guarded_header() {
+        let input = r#"
+            #ifndef TEST_HEADER_H
+            #define TEST_HEADER_H
+            struct guarded {
+                int a;
+            };
+            #endif
+        "#;
+        let db = parse_header(input).unwrap();
+
+        assert!(db.has_type("struct guarded"));
+    }
+
+    #[test]
+    fn test_parse_pragma_once_header() {
+        let input = r#"
+            #pragma once
+            typedef int myint;
+        "#;
+        let db = parse_header(input).unwrap();
+
+        assert!(db.has_type("myint"));
     }
 
     // --- Multiple Declarations Tests ---
