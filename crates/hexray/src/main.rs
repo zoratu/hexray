@@ -225,7 +225,7 @@ enum Commands {
 }
 
 /// Project management actions
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum ProjectAction {
     /// Create a new project for a binary
     Create {
@@ -425,6 +425,18 @@ fn main() -> Result<()> {
         }
     }
 
+    // Handle project subcommands that don't require a binary on the command line
+    if let Some(Commands::Project { ref action }) = cli.command {
+        match action {
+            ProjectAction::Create { .. } => {
+                // Create requires a binary, handled below
+            }
+            _ => {
+                return handle_project_command(None, action.clone());
+            }
+        }
+    }
+
     // Handle diff command (doesn't use the main binary argument)
     if let Some(Commands::Diff {
         original,
@@ -566,7 +578,7 @@ fn main() -> Result<()> {
             build_xrefs(fmt, target.as_deref(), calls_only, json)?;
         }
         Some(Commands::Project { action }) => {
-            handle_project_command(binary_path, action)?;
+            handle_project_command(Some(binary_path.as_path()), action)?;
         }
         Some(Commands::Types { .. }) => {
             // Already handled before binary loading
@@ -2859,9 +2871,15 @@ fn build_xrefs(
 }
 
 /// Handle project management commands
-fn handle_project_command(binary_path: &PathBuf, action: ProjectAction) -> Result<()> {
+fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> Result<()> {
     match action {
         ProjectAction::Create { output } => {
+            let binary_path = binary_path.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Binary file path is required for project create. Usage: hexray <BINARY> project create --output <PROJECT>"
+                )
+            })?;
+
             let project = AnalysisProject::new(binary_path).with_context(|| {
                 format!("Failed to create project for {}", binary_path.display())
             })?;
