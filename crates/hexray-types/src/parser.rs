@@ -999,6 +999,40 @@ mod tests {
         assert!(ty.is_pointer());
     }
 
+    #[test]
+    fn test_parse_typedef_only_header() {
+        let input = r#"
+            typedef int myint;
+            typedef unsigned long my_size_t;
+        "#;
+        let db = parse_header(input).unwrap();
+
+        assert!(db.has_type("myint"));
+        assert!(db.has_type("my_size_t"));
+        assert_eq!(db.stats().typedef_count, 2);
+    }
+
+    #[test]
+    fn test_parse_typedef_anonymous_struct() {
+        let input = r#"
+            typedef struct {
+                int a;
+                long b;
+            } pair_t;
+        "#;
+        let db = parse_header(input).unwrap();
+
+        assert!(db.has_type("pair_t"));
+        let ty = db.get_type("pair_t").unwrap();
+        if let CType::Struct(s) = ty {
+            assert_eq!(s.fields.len(), 2);
+            assert_eq!(s.fields[0].name, "a");
+            assert_eq!(s.fields[1].name, "b");
+        } else {
+            panic!("Expected struct type");
+        }
+    }
+
     // --- Extended Struct Tests ---
 
     #[test]

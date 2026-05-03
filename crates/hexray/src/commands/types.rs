@@ -171,7 +171,7 @@ pub fn handle_types_command(action: TypesAction) -> Result<()> {
             println!("{}", "=".repeat(50));
 
             println!("\nTypes:");
-            for name in db.type_names() {
+            for name in listed_type_names(&db, false) {
                 println!("  {}", name);
             }
 
