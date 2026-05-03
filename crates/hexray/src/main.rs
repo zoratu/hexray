@@ -4531,6 +4531,10 @@ fn collect_summaries(binary: &Binary) -> (Vec<KernelSummary>, String) {
     (summaries, arch_label)
 }
 
+fn cmp_input_kind(binary: &Binary, arch_label: &str) -> String {
+    format!("{}/{}", binary.format_name(), arch_label)
+}
+
 /// Compare two GPU binaries kernel-by-kernel.
 ///
 /// Matches kernels by mangled name (the same name appears on both
@@ -4559,6 +4563,22 @@ fn cmp_kernels(a: &Binary, b_path: &Path) -> Result<()> {
 
     let (a_kernels, a_arch) = collect_summaries(a);
     let (b_kernels, b_arch) = collect_summaries(&b);
+
+    let a_kind = cmp_input_kind(a, &a_arch);
+    let b_kind = cmp_input_kind(&b, &b_arch);
+
+    match (a_kernels.is_empty(), b_kernels.is_empty()) {
+        (false, false) => {}
+        (true, true) => {
+            bail!("cmp expects GPU binaries; got {a_kind} for 'a' and {b_kind} for 'b'");
+        }
+        (true, false) => {
+            bail!("cmp expects a GPU binary for 'a'; got {a_kind}");
+        }
+        (false, true) => {
+            bail!("cmp expects a GPU binary for 'b'; got {b_kind}");
+        }
+    }
 
     println!("hexray cmp");
     println!("==========");
