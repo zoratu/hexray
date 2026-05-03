@@ -34,6 +34,9 @@ pub enum ParseError {
 
     #[error("Syntax error at position {pos}: {message}")]
     SyntaxError { pos: usize, message: String },
+
+    #[error("Duplicate definition of {kind} {name}")]
+    DuplicateDefinition { kind: &'static str, name: String },
 }
 
 /// Result type for parsing operations.
@@ -416,8 +419,7 @@ impl<'a> Parser<'a> {
         let st = self.parse_struct()?;
         if let CType::Struct(ref s) = st {
             if let Some(name) = &s.name {
-                self.database
-                    .add_type(format!("struct {}", name), st.clone());
+                self.register_named_type("struct", name, st.clone())?;
             }
         }
 
@@ -434,8 +436,7 @@ impl<'a> Parser<'a> {
         let un = self.parse_union()?;
         if let CType::Union(ref u) = un {
             if let Some(name) = &u.name {
-                self.database
-                    .add_type(format!("union {}", name), un.clone());
+                self.register_named_type("union", name, un.clone())?;
             }
         }
 
@@ -452,7 +453,7 @@ impl<'a> Parser<'a> {
         let en = self.parse_enum()?;
         if let CType::Enum(ref e) = en {
             if let Some(name) = &e.name {
-                self.database.add_type(format!("enum {}", name), en.clone());
+                self.register_named_type("enum", name, en.clone())?;
             }
         }
 
@@ -797,6 +798,24 @@ impl<'a> Parser<'a> {
         self.expect(Token::CloseParen)?;
 
         Ok((params, variadic))
+    }
+
+    fn register_named_type(
+        &mut self,
+        kind: &'static str,
+        name: &str,
+        ty: CType,
+    ) -> ParseResult<()> {
+        let full_name = format!("{kind} {name}");
+        if self.database.get_type(&full_name).is_some() {
+            return Err(ParseError::DuplicateDefinition {
+                kind,
+                name: name.to_string(),
+            });
+        }
+
+        self.database.add_type(full_name, ty);
+        Ok(())
     }
 }
 
@@ -1483,6 +1502,27 @@ mod tests {
         let input = "struct test { int x;";
         let result = parse_header(input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duplicate_struct_definition() {
+        let input = r#"
+            struct dupe {
+                int a;
+            };
+
+            struct dupe {
+                long b;
+            };
+        "#;
+        let result = parse_header(input);
+        match result {
+            Err(ParseError::DuplicateDefinition { kind, name }) => {
+                assert_eq!(kind, "struct");
+                assert_eq!(name, "dupe");
+            }
+            other => panic!("Expected duplicate definition error, got {other:?}"),
+        }
     }
 
     #[test]
