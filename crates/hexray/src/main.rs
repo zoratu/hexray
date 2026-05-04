@@ -2112,10 +2112,48 @@ fn has_internal_function_symbols(symbols: &[hexray_core::Symbol]) -> bool {
         .any(|s| s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some())
 }
 
+// Shared function-start recovery for analyses that need whole-function
+// coverage on stripped binaries. When symbols are absent, reuse the
+// round-21 x86 ENDBR seeding; callers can still layer additional
+// discoveries on top (for example round-6.5's xref call-target seeding).
+fn discover_function_starts(
+    fmt: &dyn BinaryFormat,
+    arch: Architecture,
+    symbols: &[hexray_core::Symbol],
+) -> Vec<(u64, u64, bool)> {
+    let mut starts: Vec<_> = symbols
+        .iter()
+        .filter(|s| {
+            s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some()
+        })
+        .map(|s| {
+            (
+                s.address,
+                if s.size > 0 { s.size } else { 4096 },
+                s.size == 0,
+            )
+        })
+        .collect();
+
+    if !has_internal_function_symbols(symbols) {
+        starts.extend(discover_stripped_x86_function_seeds(fmt, arch));
+    }
+
+    if let Some(entry) = fmt.entry_point() {
+        if !starts.iter().any(|(addr, _, _)| *addr == entry) {
+            starts.push((entry, 8192, true));
+        }
+    }
+
+    starts.sort_by_key(|(addr, _, _)| *addr);
+    starts.dedup_by_key(|(addr, _, _)| *addr);
+    starts
+}
+
 fn discover_stripped_x86_function_seeds(
     fmt: &dyn BinaryFormat,
     arch: Architecture,
-) -> Vec<(u64, String, u64, bool)> {
+) -> Vec<(u64, u64, bool)> {
     let pattern: &[u8] = match arch {
         Architecture::X86_64 => &[0xf3, 0x0f, 0x1e, 0xfa],
         Architecture::X86 => &[0xf3, 0x0f, 0x1e, 0xfb],
@@ -2132,12 +2170,12 @@ fn discover_stripped_x86_function_seeds(
                 .copied()
                 .unwrap_or_else(|| section.virtual_address().saturating_add(section.size()));
             let size = end.saturating_sub(*start).max(pattern.len() as u64);
-            seeds.push((*start, format!("sub_{start:x}"), size, false));
+            seeds.push((*start, size, false));
         }
     }
 
-    seeds.sort_by_key(|(addr, _, _, _)| *addr);
-    seeds.dedup_by_key(|(addr, _, _, _)| *addr);
+    seeds.sort_by_key(|(addr, _, _)| *addr);
+    seeds.dedup_by_key(|(addr, _, _)| *addr);
     seeds
 }
 
@@ -2233,39 +2271,23 @@ fn build_callgraph(
     // Note: Mach-O symbols don't have size info (nlist doesn't store it),
     // so we use a default size for symbols with size == 0
     let functions_to_analyze: Vec<(u64, String, u64, bool)> = if target == "all" {
-        // Start with defined internal function symbols
-        let mut funcs: Vec<_> = symbols
-            .iter()
-            .filter(|s| {
-                s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some()
+        discover_function_starts(fmt, arch, &symbols)
+            .into_iter()
+            .map(|(addr, size, heuristic_bounds)| {
+                let name = symbols
+                    .iter()
+                    .find(|s| s.address == addr)
+                    .map(|s| demangle_or_original(&s.name))
+                    .unwrap_or_else(|| {
+                        if Some(addr) == fmt.entry_point() {
+                            format!("_start_{addr:x}")
+                        } else {
+                            format!("sub_{addr:x}")
+                        }
+                    });
+                (addr, name, size, heuristic_bounds)
             })
-            .map(|s| {
-                let size = if s.size > 0 { s.size } else { 4096 }; // Larger default for actual code
-                (s.address, demangle_or_original(&s.name), size, s.size == 0)
-            })
-            .collect();
-
-        // CET-enabled stripped x86 binaries often retain ENDBR anchors at
-        // each real function start even when .symtab is gone. Seed those
-        // starts so `callgraph all` does not collapse to just the entry-point
-        // routine and a handful of direct-call targets.
-        if !has_internal_function_symbols(&symbols) {
-            funcs.extend(discover_stripped_x86_function_seeds(fmt, arch));
-        }
-
-        // Also add the entry point if present (important for stripped binaries)
-        if let Some(entry) = fmt.entry_point() {
-            let entry_name = symbols
-                .iter()
-                .find(|s| s.address == entry)
-                .map(|s| demangle_or_original(&s.name))
-                .unwrap_or_else(|| format!("_start_{:x}", entry));
-            if !funcs.iter().any(|(addr, _, _, _)| *addr == entry) {
-                funcs.push((entry, entry_name, 8192, true)); // Entry functions are often large
-            }
-        }
-
-        funcs
+            .collect()
     } else {
         let (addr, name, size, heuristic_bounds) =
             match resolve_analysis_target(fmt, project, target)? {
@@ -3174,30 +3196,10 @@ fn build_xrefs(
     // Build xref database by disassembling all functions
     let mut xref_builder = XrefBuilder::new();
 
-    // Start from known function symbols, but also walk discovered internal
-    // callees so stripped callers still contribute xrefs.
-    let mut functions_to_analyze: Vec<(u64, u64, bool)> = symbols
-        .iter()
-        .filter(|s| {
-            s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some()
-        })
-        .map(|s| {
-            (
-                s.address,
-                if s.size > 0 { s.size } else { 4096 },
-                s.size == 0,
-            )
-        })
-        .collect();
-
-    if let Some(entry) = fmt.entry_point() {
-        if !functions_to_analyze
-            .iter()
-            .any(|(addr, _, _)| *addr == entry)
-        {
-            functions_to_analyze.push((entry, 8192, true));
-        }
-    }
+    // Start from the same function-start seeds used by `callgraph all`, then
+    // also walk discovered internal callees so stripped callers still
+    // contribute xrefs.
+    let functions_to_analyze = discover_function_starts(fmt, arch, &symbols);
 
     let is_internal_code = |addr: u64| -> bool {
         fmt.executable_sections().any(|sec| {
@@ -3299,27 +3301,29 @@ fn build_xrefs(
         // Function-start lookup table: sorted by address. For any call-site
         // address we use partition_point to find the nearest preceding
         // function start so xrefs report "<caller> + 0xN" instead of
-        // sub_<call-site-addr>. We seed it with three sources:
-        //   1. Symbol-table function entries (typical ELF case).
-        //   2. Call targets discovered while building the xref database.
-        //      On Mach-O, where most callers lack a name, this is what
-        //      lets us recognise sub_<addr> as a function start.
-        //   3. The binary's entry point, since stripped Mach-O binaries
-        //      otherwise have no symbol covering main.
+        // sub_<call-site-addr>. Start with the same recovered seeds as
+        // `callgraph all`, then add xref-discovered call targets so Mach-O
+        // callers without symbols still get a stable function label.
         // Mach-O image-anchor symbols (__mh_execute_header etc.) are not
         // real functions and would otherwise dominate the lookup, so we
         // exclude anything starting with __mh_.
-        let mut function_starts: Vec<(u64, Option<String>, u64)> = symbols
-            .iter()
-            .filter(|s| s.is_function() && s.address != 0 && !s.name.starts_with("__mh_"))
-            .map(|s| {
-                (
-                    s.address,
-                    Some(display_function_name(fmt, project, s.address)),
-                    s.size,
-                )
-            })
-            .collect();
+        let mut function_starts: Vec<(u64, Option<String>, u64)> =
+            discover_function_starts(fmt, arch, &symbols)
+                .into_iter()
+                .filter_map(|(addr, size, _)| {
+                    let symbol = fmt.symbol_at(addr);
+                    if symbol.is_some_and(|s| s.name.starts_with("__mh_")) {
+                        None
+                    } else {
+                        let lookup_size = symbol.map(|s| s.size).unwrap_or(size);
+                        Some((
+                            addr,
+                            Some(display_function_name(fmt, project, addr)),
+                            lookup_size,
+                        ))
+                    }
+                })
+                .collect();
         let mut seen: std::collections::HashSet<u64> =
             function_starts.iter().map(|(a, _, _)| *a).collect();
         for target in db.all_referenced() {
@@ -5565,12 +5569,12 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_calling_convention, discover_materialized_internal_targets,
-        discover_stripped_x86_function_seeds, ensure_distinct_export_paths,
-        find_symbol_in_candidates, format_callgraph_text, parse_address_str,
-        patch_affects_function, resolve_analysis_target, string_tags, truncate_for_display,
-        DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat,
-        SymbolLookupMode,
+        default_calling_convention, discover_function_starts,
+        discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
+        ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
+        parse_address_str, patch_affects_function, resolve_analysis_target, string_tags,
+        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
+        SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding};
     use hexray_core::{
@@ -5583,6 +5587,7 @@ mod tests {
     struct TestBinary {
         sections: Vec<TestSection>,
         symbols: Vec<Symbol>,
+        entry_point: Option<u64>,
     }
 
     struct TestSection {
@@ -5607,7 +5612,7 @@ mod tests {
         }
 
         fn entry_point(&self) -> Option<u64> {
-            None
+            self.entry_point
         }
 
         fn executable_sections(&self) -> Box<dyn Iterator<Item = &dyn Section> + '_> {
@@ -5772,6 +5777,7 @@ mod tests {
                 allocated: true,
             }],
             symbols: vec![test_symbol("add", 0x401106)],
+            entry_point: None,
         };
 
         let resolved = resolve_analysis_target(&binary, None, "add").unwrap();
@@ -5795,6 +5801,7 @@ mod tests {
                 allocated: true,
             }],
             symbols: vec![test_symbol("adder", 0x401106)],
+            entry_point: None,
         };
 
         let resolved = resolve_analysis_target(&binary, None, "add").unwrap();
@@ -5821,15 +5828,39 @@ mod tests {
                 allocated: true,
             }],
             symbols: vec![],
+            entry_point: None,
         };
 
         let seeds = discover_stripped_x86_function_seeds(&binary, Architecture::X86_64);
 
+        assert_eq!(seeds, vec![(0x401020, 8, false), (0x401028, 6, false)]);
+    }
+
+    #[test]
+    fn shared_function_starts_add_entry_and_stripped_seeds() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401020,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0xc3, 0x90, 0x90, 0xf3, 0x0f, 0x1e, 0xfa, 0x55,
+                    0xc3,
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: Some(0x401000),
+        };
+
+        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols);
+
         assert_eq!(
-            seeds,
+            starts,
             vec![
-                (0x401020, "sub_401020".to_string(), 8, false),
-                (0x401028, "sub_401028".to_string(), 6, false),
+                (0x401000, 8192, true),
+                (0x401020, 8, false),
+                (0x401028, 6, false),
             ]
         );
     }
@@ -5854,6 +5885,7 @@ mod tests {
                 },
             ],
             symbols: vec![],
+            entry_point: None,
         };
         let instructions = vec![
             Instruction {
