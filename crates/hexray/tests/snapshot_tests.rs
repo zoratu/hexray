@@ -363,6 +363,67 @@ fn snapshot_cmp_amdgpu_self() {
     insta::assert_snapshot!("cmp_amdgpu_self", normalized);
 }
 
+#[test]
+fn cmp_accepts_zero_kernel_amdgpu_as_gpu() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("hexray-cmp-zero-kernel-amdgpu");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path_a = dir.join("zero_kernel.co");
+    let path_b = dir.join("vector_add.co");
+
+    let flags = 0x2F | (0b11 << 8) | (0b10 << 10);
+    let zero_kernel = synth_empty_amdgpu_codeobject(flags);
+    let one_kernel = synth_amdgpu_codeobject(
+        "vector_add",
+        DescriptorParams {
+            vgpr_raw: 2,
+            sgpr_raw: 1,
+            kernarg: 24,
+            lds_granulated: 4,
+        },
+        flags,
+    );
+
+    std::fs::File::create(&path_a)
+        .unwrap()
+        .write_all(&zero_kernel)
+        .unwrap();
+    std::fs::File::create(&path_b)
+        .unwrap()
+        .write_all(&one_kernel)
+        .unwrap();
+
+    let output = run_hexray(&[path_a.to_str().unwrap(), "cmp", path_b.to_str().unwrap()]);
+    assert!(output.status.success(), "hexray cmp failed: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("amdgpu (gfx906"), "got {stdout}");
+    assert!(
+        stdout.contains("Kernel vector_add: present in b only"),
+        "got {stdout}"
+    );
+    assert!(stdout.contains("Matched 0 kernel(s)."), "got {stdout}");
+}
+
+#[test]
+fn cmp_rejects_plain_elfs_without_gpu_markers() {
+    skip_if_missing!("elf/simple_x86_64");
+    skip_if_missing!("elf/test_with_symbols");
+
+    let output = run_hexray(&[
+        &fixture_path("elf/simple_x86_64"),
+        "cmp",
+        &fixture_path("elf/test_with_symbols"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "plain ELF cmp unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cmp expects GPU binaries"), "got {stderr}");
+    assert!(stderr.contains("ELF/x86_64"), "got {stderr}");
+}
+
+#[derive(Clone, Copy)]
 struct DescriptorParams {
     vgpr_raw: u32,
     sgpr_raw: u32,
@@ -370,34 +431,55 @@ struct DescriptorParams {
     lds_granulated: u32,
 }
 
+fn synth_empty_amdgpu_codeobject(e_flags: u32) -> Vec<u8> {
+    synth_amdgpu_codeobject_inner(None, e_flags)
+}
+
 fn synth_amdgpu_codeobject(kernel: &str, p: DescriptorParams, e_flags: u32) -> Vec<u8> {
+    synth_amdgpu_codeobject_inner(Some((kernel, p)), e_flags)
+}
+
+fn synth_amdgpu_codeobject_inner(
+    kernel: Option<(&str, DescriptorParams)>,
+    e_flags: u32,
+) -> Vec<u8> {
     const KD: usize = 64;
     const SYM: usize = 24;
 
-    // Build the 64-byte kernel descriptor.
-    let mut kd = [0u8; KD];
-    let rsrc1 = (p.vgpr_raw & 0x3f) | ((p.sgpr_raw & 0xf) << 6);
-    let rsrc2 = (p.lds_granulated & 0x1ff) << 15;
-    kd[0..4].copy_from_slice(&256u32.to_le_bytes()); // 256B static LDS
-    kd[8..12].copy_from_slice(&p.kernarg.to_le_bytes());
-    kd[16..24].copy_from_slice(&0x100i64.to_le_bytes()); // entry offset
-    kd[48..52].copy_from_slice(&rsrc1.to_le_bytes());
-    kd[52..56].copy_from_slice(&rsrc2.to_le_bytes());
+    // Zero-kernel objects are still valid AMDGPU code objects; they
+    // simply omit the entry/descriptor symbols entirely.
+    let (text, rodata) = if let Some((_, p)) = kernel {
+        let mut kd = [0u8; KD];
+        let rsrc1 = (p.vgpr_raw & 0x3f) | ((p.sgpr_raw & 0xf) << 6);
+        let rsrc2 = (p.lds_granulated & 0x1ff) << 15;
+        kd[0..4].copy_from_slice(&256u32.to_le_bytes()); // 256B static LDS
+        kd[8..12].copy_from_slice(&p.kernarg.to_le_bytes());
+        kd[16..24].copy_from_slice(&0x100i64.to_le_bytes()); // entry offset
+        kd[48..52].copy_from_slice(&rsrc1.to_le_bytes());
+        kd[52..56].copy_from_slice(&rsrc2.to_le_bytes());
 
-    // Section bytes.
-    let text: Vec<u8> = vec![0x01, 0x03, 0x00, 0x7e, 0x00, 0x00, 0x81, 0xbf];
-    let rodata: Vec<u8> = kd.to_vec();
+        let text = vec![0x01, 0x03, 0x00, 0x7e, 0x00, 0x00, 0x81, 0xbf];
+        let rodata = kd.to_vec();
+        (text, rodata)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let shstr = b"\0.text\0.rodata\0.shstrtab\0.strtab\0.symtab\0";
     let (sh_text, sh_rodata, sh_shstrtab, sh_strtab, sh_symtab) = (1u32, 7, 15, 25, 33);
 
     // String table for symbols.
     let mut strtab = vec![0u8];
-    let entry_off = strtab.len() as u32;
-    strtab.extend_from_slice(kernel.as_bytes());
-    strtab.push(0);
-    let kd_off = strtab.len() as u32;
-    strtab.extend_from_slice(kernel.as_bytes());
-    strtab.extend_from_slice(b".kd\0");
+    let (entry_off, kd_off) = if let Some((kernel_name, _)) = kernel {
+        let entry_off = strtab.len() as u32;
+        strtab.extend_from_slice(kernel_name.as_bytes());
+        strtab.push(0);
+        let kd_off = strtab.len() as u32;
+        strtab.extend_from_slice(kernel_name.as_bytes());
+        strtab.extend_from_slice(b".kd\0");
+        (Some(entry_off), Some(kd_off))
+    } else {
+        (None, None)
+    };
 
     // Symbol table.
     let mut symtab = vec![0u8; SYM];
@@ -410,8 +492,10 @@ fn synth_amdgpu_codeobject(kernel: &str, p: DescriptorParams, e_flags: u32) -> V
         s[16..24].copy_from_slice(&size.to_le_bytes());
         symtab.extend_from_slice(&s);
     };
-    push_sym(entry_off, 0x12, 1, 0, text.len() as u64); // STT_FUNC
-    push_sym(kd_off, 0x11, 2, 0, KD as u64); // STT_OBJECT
+    if let (Some(entry_off), Some(kd_off)) = (entry_off, kd_off) {
+        push_sym(entry_off, 0x12, 1, 0, text.len() as u64); // STT_FUNC
+        push_sym(kd_off, 0x11, 2, 0, KD as u64); // STT_OBJECT
+    }
 
     // Layout.
     let ehdr = 64u64;

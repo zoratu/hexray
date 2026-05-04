@@ -4822,6 +4822,17 @@ fn cmp_input_kind(binary: &Binary, arch_label: &str) -> String {
     format!("{}/{}", binary.format_name(), arch_label)
 }
 
+/// `cmp` accepts recognized GPU binary formats even when they contain
+/// zero kernels (for example, metadata-only AMDGPU code objects or
+/// CUDA stubs). Kernel presence only affects the comparison output,
+/// not whether the binary is GPU-shaped in the first place.
+fn cmp_recognizes_gpu_binary(binary: &Binary) -> bool {
+    match binary {
+        Binary::Elf(elf) => elf.cubin_view().is_ok() || elf.code_object_view().is_ok(),
+        Binary::MachO(_) | Binary::Pe(_) => false,
+    }
+}
+
 /// Compare two GPU binaries kernel-by-kernel.
 ///
 /// Matches kernels by mangled name (the same name appears on both
@@ -4854,15 +4865,15 @@ fn cmp_kernels(a: &Binary, b_path: &Path) -> Result<()> {
     let a_kind = cmp_input_kind(a, &a_arch);
     let b_kind = cmp_input_kind(&b, &b_arch);
 
-    match (a_kernels.is_empty(), b_kernels.is_empty()) {
-        (false, false) => {}
-        (true, true) => {
+    match (cmp_recognizes_gpu_binary(a), cmp_recognizes_gpu_binary(&b)) {
+        (true, true) => {}
+        (false, false) => {
             bail!("cmp expects GPU binaries; got {a_kind} for 'a' and {b_kind} for 'b'");
         }
-        (true, false) => {
+        (false, true) => {
             bail!("cmp expects a GPU binary for 'a'; got {a_kind}");
         }
-        (false, true) => {
+        (true, false) => {
             bail!("cmp expects a GPU binary for 'b'; got {b_kind}");
         }
     }
