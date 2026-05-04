@@ -1547,27 +1547,30 @@ pub(super) fn merge_return_value_captures_with_counter(
         // First, recursively process nested structures
         let node = merge_return_value_captures_node(node, capture_counter);
 
-        // Check if we should merge with the previous block
-        if let StructuredNode::Block {
-            id,
-            mut statements,
-            address_range,
-        } = node
-        {
-            // Check if first statement is `var = eax` (return value capture)
-            if !statements.is_empty() {
-                let should_merge = if let ExprKind::Assign { lhs: _, rhs } = &statements[0].kind {
-                    if let ExprKind::Var(v) = &rhs.kind {
-                        if is_return_register(&v.name) {
-                            // Check if previous node is a block ending with a call
-                            if let Some(StructuredNode::Block {
-                                statements: prev_stmts,
-                                ..
-                            }) = result.last()
-                            {
-                                if let Some(last_stmt) = prev_stmts.last() {
-                                    if let ExprKind::Call { target, .. } = &last_stmt.kind {
-                                        is_real_function_call(target)
+        match node {
+            StructuredNode::Block {
+                id,
+                mut statements,
+                address_range,
+            } => {
+                // Check if first statement is `var = eax` (return value capture)
+                if !statements.is_empty() {
+                    let should_merge = if let ExprKind::Assign { lhs: _, rhs } = &statements[0].kind
+                    {
+                        if let ExprKind::Var(v) = &rhs.kind {
+                            if is_return_register(&v.name) {
+                                // Check if previous node is a block ending with a call
+                                if let Some(StructuredNode::Block {
+                                    statements: prev_stmts,
+                                    ..
+                                }) = result.last()
+                                {
+                                    if let Some(last_stmt) = prev_stmts.last() {
+                                        if let ExprKind::Call { target, .. } = &last_stmt.kind {
+                                            is_real_function_call(target)
+                                        } else {
+                                            false
+                                        }
                                     } else {
                                         false
                                     }
@@ -1582,59 +1585,60 @@ pub(super) fn merge_return_value_captures_with_counter(
                         }
                     } else {
                         false
-                    }
-                } else {
-                    false
-                };
+                    };
 
-                if should_merge {
-                    // Pop the previous block
-                    if let Some(StructuredNode::Block {
-                        id: prev_id,
-                        statements: mut prev_stmts,
-                        address_range: prev_range,
-                    }) = result.pop()
-                    {
-                        // Extract the call from the previous block
-                        if let Some(last_stmt) = prev_stmts.pop() {
-                            if let ExprKind::Call { target, args } = &last_stmt.kind {
-                                // Get the LHS from current block's first statement
-                                if let ExprKind::Assign { lhs, .. } = &statements[0].kind {
-                                    // Create the merged assignment
-                                    let call_expr = Expr::call(target.clone(), args.clone());
-                                    let assign = Expr::assign((**lhs).clone(), call_expr);
+                    if should_merge {
+                        // Pop the previous block
+                        if let Some(StructuredNode::Block {
+                            id: prev_id,
+                            statements: mut prev_stmts,
+                            address_range: prev_range,
+                        }) = result.pop()
+                        {
+                            // Extract the call from the previous block
+                            if let Some(last_stmt) = prev_stmts.pop() {
+                                if let ExprKind::Call { target, args } = &last_stmt.kind {
+                                    // Get the LHS from current block's first statement
+                                    if let ExprKind::Assign { lhs, .. } = &statements[0].kind {
+                                        // Create the merged assignment
+                                        let call_expr = Expr::call(target.clone(), args.clone());
+                                        let assign = Expr::assign((**lhs).clone(), call_expr);
 
-                                    // Put the modified previous block back (if not empty)
-                                    if !prev_stmts.is_empty() {
-                                        result.push(StructuredNode::Block {
-                                            id: prev_id,
-                                            statements: prev_stmts,
-                                            address_range: prev_range,
-                                        });
+                                        // Put the modified previous block back (if not empty)
+                                        if !prev_stmts.is_empty() {
+                                            result.push(StructuredNode::Block {
+                                                id: prev_id,
+                                                statements: prev_stmts,
+                                                address_range: prev_range,
+                                            });
+                                        }
+
+                                        // Replace first statement with the merged assignment
+                                        statements[0] = assign;
                                     }
-
-                                    // Replace first statement with the merged assignment
-                                    statements[0] = assign;
                                 }
                             }
                         }
                     }
-                }
 
-                capture_return_register_uses_from_previous_block(
-                    &mut result,
-                    &mut statements,
-                    capture_counter,
-                );
+                    capture_return_register_uses_from_previous_block(
+                        &mut result,
+                        &mut statements,
+                        capture_counter,
+                    );
+                }
+                let statements = capture_return_register_uses_in_block(statements, capture_counter);
+                result.push(StructuredNode::Block {
+                    id,
+                    statements,
+                    address_range,
+                });
             }
-            let statements = capture_return_register_uses_in_block(statements, capture_counter);
-            result.push(StructuredNode::Block {
-                id,
-                statements,
-                address_range,
-            });
-        } else {
-            result.push(node);
+            StructuredNode::Return(Some(mut expr)) => {
+                capture_return_register_uses_in_return(&mut result, &mut expr, capture_counter);
+                result.push(StructuredNode::Return(Some(expr)));
+            }
+            other => result.push(other),
         }
     }
 
@@ -1733,50 +1737,44 @@ fn capture_return_register_uses_from_previous_block(
     statements: &mut [Expr],
     capture_counter: &mut u32,
 ) {
-    use super::super::expression::{ExprKind, VarKind, Variable};
-
-    let Some(StructuredNode::Block {
-        statements: prev_stmts,
-        ..
-    }) = result.last_mut()
-    else {
-        return;
-    };
-
-    let Some(Expr {
-        kind: ExprKind::Call { target, args },
-    }) = prev_stmts.last().cloned()
-    else {
-        return;
-    };
-
-    if !is_real_function_call(&target) {
-        return;
-    }
-
     let Some(primary_reg) = first_return_register_use_before_clobber(statements) else {
         return;
     };
 
     let aliases = return_register_aliases(&primary_reg);
-    let reg_size = if matches!(primary_reg.as_str(), "eax" | "w0") {
-        4
-    } else {
-        8
+    let Some(block_index) = find_previous_call_capture_block(result, &aliases) else {
+        return;
     };
-    let temp_name = format!("ret_{}", *capture_counter);
-    *capture_counter += 1;
-    let temp_expr = Expr::var(Variable {
-        kind: VarKind::Temp(*capture_counter),
-        name: temp_name,
-        size: reg_size,
-    });
-
-    if let Some(last_stmt) = prev_stmts.last_mut() {
-        *last_stmt = Expr::assign(temp_expr.clone(), Expr::call(target, args));
-    }
+    let Some(temp_expr) =
+        capture_previous_call_result(result, block_index, capture_counter, &primary_reg)
+    else {
+        return;
+    };
 
     substitute_return_register_uses_until_clobber(statements, &aliases, &temp_expr);
+}
+
+fn capture_return_register_uses_in_return(
+    result: &mut [StructuredNode],
+    expr: &mut Expr,
+    capture_counter: &mut u32,
+) {
+    let uses = collect_return_register_uses(expr);
+    let Some(primary_reg) = uses.into_iter().next() else {
+        return;
+    };
+
+    let aliases = return_register_aliases(&primary_reg);
+    let Some(block_index) = find_previous_call_capture_block(result, &aliases) else {
+        return;
+    };
+    let Some(temp_expr) =
+        capture_previous_call_result(result, block_index, capture_counter, &primary_reg)
+    else {
+        return;
+    };
+
+    *expr = substitute_return_register_uses(expr.clone(), &aliases, &temp_expr);
 }
 
 pub(super) fn capture_return_register_uses_in_block(
@@ -1888,6 +1886,85 @@ fn first_return_register_use_before_clobber(statements: &[Expr]) -> Option<Strin
     }
 
     None
+}
+
+fn find_previous_call_capture_block(nodes: &[StructuredNode], aliases: &[String]) -> Option<usize> {
+    use super::super::expression::ExprKind;
+
+    for idx in (0..nodes.len()).rev() {
+        let StructuredNode::Block { statements, .. } = &nodes[idx] else {
+            return None;
+        };
+
+        if statements.is_empty() {
+            continue;
+        }
+
+        if let Some(Expr {
+            kind: ExprKind::Call { target, .. },
+        }) = statements.last()
+        {
+            if is_real_function_call(target) {
+                return Some(idx);
+            }
+        }
+
+        if statements.iter().any(|stmt| {
+            matches!(&stmt.kind, ExprKind::Call { target, .. } if is_real_function_call(target))
+                || statement_clobbers_return_register(stmt, aliases)
+        }) {
+            return None;
+        }
+    }
+
+    None
+}
+
+fn capture_previous_call_result(
+    nodes: &mut [StructuredNode],
+    block_index: usize,
+    capture_counter: &mut u32,
+    primary_reg: &str,
+) -> Option<Expr> {
+    use super::super::expression::{ExprKind, VarKind, Variable};
+
+    let reg_size = if matches!(primary_reg, "eax" | "w0") {
+        4
+    } else {
+        8
+    };
+    let temp_name = format!("ret_{}", *capture_counter);
+    *capture_counter += 1;
+    let temp_expr = Expr::var(Variable {
+        kind: VarKind::Temp(*capture_counter),
+        name: temp_name,
+        size: reg_size,
+    });
+
+    let StructuredNode::Block {
+        statements: prev_stmts,
+        ..
+    } = &mut nodes[block_index]
+    else {
+        return None;
+    };
+
+    let Some(Expr {
+        kind: ExprKind::Call { target, args },
+    }) = prev_stmts.last().cloned()
+    else {
+        return None;
+    };
+
+    if !is_real_function_call(&target) {
+        return None;
+    }
+
+    if let Some(last_stmt) = prev_stmts.last_mut() {
+        *last_stmt = Expr::assign(temp_expr.clone(), Expr::call(target, args));
+    }
+
+    Some(temp_expr)
 }
 
 fn substitute_return_register_uses_until_clobber(
@@ -2230,5 +2307,46 @@ mod tests {
 
         assert_eq!(format!("{}", first_block[0]), "ret_0 = foo(1)");
         assert_eq!(format!("{}", second_block[0]), "sum += ret_0");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_into_return_across_intervening_block() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(
+                    CallTarget::Named("recursive_sum".to_string()),
+                    vec![Expr::binop(
+                        BinOpKind::Sub,
+                        Expr::unknown("n"),
+                        Expr::int(1),
+                    )],
+                )],
+            ),
+            block(1, vec![Expr::assign(reg("edx", 4), Expr::unknown("n"))]),
+            StructuredNode::Return(Some(Expr::binop(
+                BinOpKind::Add,
+                reg("eax", 4),
+                Expr::unknown("n"),
+            ))),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        let StructuredNode::Return(Some(ret_expr)) = &merged[2] else {
+            panic!("expected trailing return node");
+        };
+
+        assert_eq!(
+            format!("{}", first_block[0]),
+            "ret_0 = recursive_sum(n - 1)"
+        );
+        assert_eq!(format!("{}", ret_expr), "ret_0 + n");
     }
 }
