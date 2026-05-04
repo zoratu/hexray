@@ -3619,6 +3619,28 @@ fn handle_session_new(binary_path: &Path, output: Option<&PathBuf>) -> Result<()
     Ok(())
 }
 
+const SESSION_EXPORT_FORMATS: &[&str] = &["text", "json"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionExportFormat {
+    Text,
+    Json,
+}
+
+impl SessionExportFormat {
+    fn parse(format: &str) -> Result<Self> {
+        match format {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            _ => bail!(
+                "format '{}' not supported; valid: {}",
+                format,
+                SESSION_EXPORT_FORMATS.join(", ")
+            ),
+        }
+    }
+}
+
 fn canonicalize_output_path(path: &Path) -> Result<PathBuf> {
     match path.canonicalize() {
         Ok(path) => Ok(path),
@@ -3656,6 +3678,8 @@ fn handle_session_export(
     output: Option<&PathBuf>,
     format: &str,
 ) -> Result<()> {
+    let format = SessionExportFormat::parse(format)?;
+
     if let Some(path) = output {
         ensure_distinct_export_paths(session_path, path)?;
     }
@@ -3664,8 +3688,8 @@ fn handle_session_export(
     let history = session.get_history(None)?;
 
     let content = match format {
-        "json" => serde_json::to_string_pretty(&history)?,
-        _ => {
+        SessionExportFormat::Json => serde_json::to_string_pretty(&history)?,
+        SessionExportFormat::Text => {
             let mut s = String::new();
             s.push_str(&format!("# Session: {}\n", session.meta.name));
             s.push_str(&format!("# Binary: {}\n", session.meta.binary_path));
@@ -5028,7 +5052,10 @@ fn format_arch_for_info(arch: Architecture) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_distinct_export_paths, find_symbol_in_candidates, SymbolLookupMode};
+    use super::{
+        ensure_distinct_export_paths, find_symbol_in_candidates, SessionExportFormat,
+        SymbolLookupMode,
+    };
     use hexray_core::{Symbol, SymbolBinding, SymbolKind};
     use std::fs;
 
@@ -5111,5 +5138,14 @@ mod tests {
             .contains("input and output paths are the same"));
 
         fs::remove_file(&session_path).unwrap();
+    }
+
+    #[test]
+    fn export_rejects_unknown_format() {
+        let err = SessionExportFormat::parse("asciinema").unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("format 'asciinema' not supported; valid: text, json"));
     }
 }
