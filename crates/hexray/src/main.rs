@@ -2106,6 +2106,113 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
     instructions
 }
 
+fn has_internal_function_symbols(symbols: &[hexray_core::Symbol]) -> bool {
+    symbols
+        .iter()
+        .any(|s| s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some())
+}
+
+fn discover_stripped_x86_function_seeds(
+    fmt: &dyn BinaryFormat,
+    arch: Architecture,
+) -> Vec<(u64, String, u64, bool)> {
+    let pattern: &[u8] = match arch {
+        Architecture::X86_64 => &[0xf3, 0x0f, 0x1e, 0xfa],
+        Architecture::X86 => &[0xf3, 0x0f, 0x1e, 0xfb],
+        _ => return Vec::new(),
+    };
+
+    let mut seeds = Vec::new();
+    for section in fmt.executable_sections() {
+        let starts =
+            discover_endbr_function_starts(section.virtual_address(), section.data(), pattern);
+        for (idx, start) in starts.iter().enumerate() {
+            let end = starts
+                .get(idx + 1)
+                .copied()
+                .unwrap_or_else(|| section.virtual_address().saturating_add(section.size()));
+            let size = end.saturating_sub(*start).max(pattern.len() as u64);
+            seeds.push((*start, format!("sub_{start:x}"), size, false));
+        }
+    }
+
+    seeds.sort_by_key(|(addr, _, _, _)| *addr);
+    seeds.dedup_by_key(|(addr, _, _, _)| *addr);
+    seeds
+}
+
+fn discover_endbr_function_starts(section_addr: u64, bytes: &[u8], pattern: &[u8]) -> Vec<u64> {
+    if bytes.len() < pattern.len() {
+        return Vec::new();
+    }
+
+    bytes
+        .windows(pattern.len())
+        .enumerate()
+        .filter_map(|(offset, window)| {
+            if window == pattern {
+                Some(section_addr.saturating_add(offset as u64))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn discover_materialized_internal_targets(
+    instructions: &[hexray_core::Instruction],
+    fmt: &dyn BinaryFormat,
+) -> Vec<u64> {
+    use hexray_core::{register::x86, Operand, Operation};
+
+    let is_internal_addr = |addr: u64| -> bool {
+        if addr == 0 {
+            return false;
+        }
+        fmt.sections().any(|s| {
+            let section_start = s.virtual_address();
+            let section_end = section_start.saturating_add(s.size());
+            let section_name = s.name().to_ascii_lowercase();
+            if section_name.contains("plt") || section_name.contains("stub") {
+                return false;
+            }
+            addr >= section_start && addr < section_end && s.is_executable()
+        })
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    for instr in instructions {
+        let Some(source) = (match instr.operation {
+            Operation::Move | Operation::LoadEffectiveAddress => instr.operands.get(1),
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        let target = match source {
+            Operand::Immediate(imm) => Some(imm.value as u64),
+            Operand::PcRelative { target, .. } => Some(*target),
+            Operand::Memory(mem)
+                if matches!(instr.operation, Operation::LoadEffectiveAddress)
+                    && mem.base.as_ref().map(|reg| reg.id) == Some(x86::RIP)
+                    && mem.index.is_none() =>
+            {
+                Some((instr.address + instr.size as u64).wrapping_add(mem.displacement as u64))
+            }
+            _ => None,
+        };
+
+        if let Some(addr) = target.filter(|addr| is_internal_addr(*addr)) {
+            if seen.insert(addr) {
+                targets.push(addr);
+            }
+        }
+    }
+
+    targets
+}
+
 fn build_callgraph(
     fmt: &dyn BinaryFormat,
     target: &str,
@@ -2137,6 +2244,14 @@ fn build_callgraph(
                 (s.address, demangle_or_original(&s.name), size, s.size == 0)
             })
             .collect();
+
+        // CET-enabled stripped x86 binaries often retain ENDBR anchors at
+        // each real function start even when .symtab is gone. Seed those
+        // starts so `callgraph all` does not collapse to just the entry-point
+        // routine and a handful of direct-call targets.
+        if !has_internal_function_symbols(&symbols) {
+            funcs.extend(discover_stripped_x86_function_seeds(fmt, arch));
+        }
 
         // Also add the entry point if present (important for stripped binaries)
         if let Some(entry) = fmt.entry_point() {
@@ -2261,20 +2376,35 @@ fn build_callgraph(
             };
 
             // Extract call targets
-            for instr in instructions {
-                if let hexray_core::ControlFlow::Call { target, .. } = instr.control_flow {
-                    if !known_functions.contains(&target) && is_internal_code(target) {
-                        known_functions.insert(target);
+            for instr in &instructions {
+                if let hexray_core::ControlFlow::Call { target, .. } = &instr.control_flow {
+                    if !known_functions.contains(target) && is_internal_code(*target) {
+                        known_functions.insert(*target);
                         let (name, size, heuristic_bounds) = symbols
                             .iter()
-                            .find(|s| s.address == target)
+                            .find(|s| s.address == *target)
                             .map(|s| {
                                 let size = if s.size > 0 { s.size } else { 4096 };
                                 (demangle_or_original(&s.name), size, s.size == 0)
                             })
                             .unwrap_or_else(|| (format!("sub_{:x}", target), 4096, true));
-                        new_call_targets.push((target, name, size, heuristic_bounds));
+                        new_call_targets.push((*target, name, size, heuristic_bounds));
                     }
+                }
+            }
+
+            for target in discover_materialized_internal_targets(&instructions, fmt) {
+                if !known_functions.contains(&target) && is_internal_code(target) {
+                    known_functions.insert(target);
+                    let (name, size, heuristic_bounds) = symbols
+                        .iter()
+                        .find(|s| s.address == target)
+                        .map(|s| {
+                            let size = if s.size > 0 { s.size } else { 4096 };
+                            (demangle_or_original(&s.name), size, s.size == 0)
+                        })
+                        .unwrap_or_else(|| (format!("sub_{:x}", target), 4096, true));
+                    new_call_targets.push((target, name, size, heuristic_bounds));
                 }
             }
         }
@@ -5435,13 +5565,18 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_calling_convention, ensure_distinct_export_paths, find_symbol_in_candidates,
-        format_callgraph_text, parse_address_str, patch_affects_function, resolve_analysis_target,
-        string_tags, truncate_for_display, DiffPatchAddressSpace, FileAddressRange,
-        ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
+        default_calling_convention, discover_materialized_internal_targets,
+        discover_stripped_x86_function_seeds, ensure_distinct_export_paths,
+        find_symbol_in_candidates, format_callgraph_text, parse_address_str,
+        patch_affects_function, resolve_analysis_target, string_tags, truncate_for_display,
+        DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat,
+        SymbolLookupMode,
     };
     use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding};
-    use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
+    use hexray_core::{
+        register::x86, Architecture, Bitness, ControlFlow, Endianness, Immediate, Instruction,
+        Operand, Operation, Register, RegisterClass, Symbol, SymbolBinding, SymbolKind,
+    };
     use hexray_formats::{BinaryFormat, BinaryType, Section};
     use std::fs;
 
@@ -5670,6 +5805,110 @@ mod tests {
                 panic!("resolved {} instead of the hex address", symbol.name)
             }
         }
+    }
+
+    #[test]
+    fn stripped_x86_function_seeds_use_endbr_boundaries() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401020,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0xc3, 0x90, 0x90, 0xf3, 0x0f, 0x1e, 0xfa, 0x55,
+                    0xc3,
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+        };
+
+        let seeds = discover_stripped_x86_function_seeds(&binary, Architecture::X86_64);
+
+        assert_eq!(
+            seeds,
+            vec![
+                (0x401020, "sub_401020".to_string(), 8, false),
+                (0x401028, "sub_401028".to_string(), 6, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn materialized_internal_targets_include_mov_immediates_in_text() {
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x401000,
+                    data: vec![0x90; 0x200],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".plt",
+                    address: 0x402000,
+                    data: vec![0x90; 0x40],
+                    executable: true,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+        };
+        let instructions = vec![
+            Instruction {
+                address: 0x401020,
+                size: 7,
+                operation: Operation::Move,
+                mnemonic: "mov".to_string(),
+                operands: vec![
+                    Operand::Register(Register::new(
+                        Architecture::X86_64,
+                        RegisterClass::General,
+                        x86::RDI,
+                        64,
+                    )),
+                    Operand::Immediate(Immediate {
+                        value: 0x401080,
+                        size: 64,
+                        signed: false,
+                    }),
+                ],
+                control_flow: ControlFlow::Sequential,
+                bytes: vec![0x48, 0xc7, 0xc7, 0x80, 0x10, 0x40, 0x00],
+                reads: vec![],
+                writes: vec![],
+                guard: None,
+            },
+            Instruction {
+                address: 0x401027,
+                size: 7,
+                operation: Operation::Move,
+                mnemonic: "mov".to_string(),
+                operands: vec![
+                    Operand::Register(Register::new(
+                        Architecture::X86_64,
+                        RegisterClass::General,
+                        x86::RAX,
+                        64,
+                    )),
+                    Operand::Immediate(Immediate {
+                        value: 0x402010,
+                        size: 64,
+                        signed: false,
+                    }),
+                ],
+                control_flow: ControlFlow::Sequential,
+                bytes: vec![0x48, 0xc7, 0xc0, 0x10, 0x20, 0x40, 0x00],
+                reads: vec![],
+                writes: vec![],
+                guard: None,
+            },
+        ];
+
+        let targets = discover_materialized_internal_targets(&instructions, &binary);
+
+        assert_eq!(targets, vec![0x401080]);
     }
 
     #[test]
