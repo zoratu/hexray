@@ -466,8 +466,37 @@ fn load_analysis_project(path: &Path) -> Result<AnalysisProject> {
 fn load_requested_project(
     explicit: Option<&Path>,
     global: Option<&Path>,
+    binary_path: &Path,
 ) -> Result<Option<AnalysisProject>> {
-    explicit.or(global).map(load_analysis_project).transpose()
+    let Some(project_path) = explicit.or(global) else {
+        return Ok(None);
+    };
+
+    let project = load_analysis_project(project_path)?;
+    ensure_project_matches_binary(project_path, &project, binary_path)?;
+    Ok(Some(project))
+}
+
+fn ensure_project_matches_binary(
+    project_path: &Path,
+    project: &AnalysisProject,
+    binary_path: &Path,
+) -> Result<()> {
+    let project_binary =
+        fs::canonicalize(&project.binary_path).unwrap_or_else(|_| project.binary_path.clone());
+    let requested_binary =
+        fs::canonicalize(binary_path).unwrap_or_else(|_| binary_path.to_path_buf());
+
+    if project_binary != requested_binary {
+        bail!(
+            "project {} was created for binary {}, but you specified {}",
+            project_path.display(),
+            project.binary_path.display(),
+            binary_path.display()
+        );
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -595,7 +624,8 @@ fn main() -> Result<()> {
             json,
             html,
         }) => {
-            let project = load_requested_project(None, global_project_path.as_deref())?;
+            let project =
+                load_requested_project(None, global_project_path.as_deref(), binary_path)?;
             disassemble_cfg(fmt, &target, dot, json, html, project.as_ref())?;
         }
         Some(Commands::Decompile {
@@ -617,9 +647,12 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let project = load_requested_project(
+                project.as_deref(),
+                global_project_path.as_deref(),
+                binary_path,
+            )?;
             let target = resolve_decompile_target(&binary, target)?;
-            let project =
-                load_requested_project(project.as_deref(), global_project_path.as_deref())?;
             let type_db = load_type_database(&binary, types.as_deref())?;
 
             // Build decompiler config
