@@ -370,6 +370,30 @@ fn test_strings_json() {
 }
 
 #[test]
+fn test_strings_json_includes_tags_field() {
+    let binary = workspace_fixture_path("test_strings");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture test_strings not found");
+        return;
+    }
+
+    let output = run_hexray(&[&binary, "strings", "--json"]);
+    assert!(output.status.success(), "strings --json should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("strings --json should emit valid JSON");
+    let strings = json["strings"]
+        .as_array()
+        .expect("strings JSON should include a strings array");
+    assert!(
+        strings.iter().all(|entry| entry["tags"].is_array()),
+        "every JSON string object should include a tags array: {}",
+        stdout
+    );
+}
+
+#[test]
 fn test_emulate_run_json_success_includes_ok() {
     let binary = workspace_fixture_path("pe/simple_x64.exe");
     if !Path::new(&binary).exists() {

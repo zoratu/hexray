@@ -2252,6 +2252,20 @@ fn truncate_for_display(content: &str, max_chars: usize) -> String {
     format!("{prefix}...")
 }
 
+fn string_tags(s: &hexray_analysis::DetectedString) -> Vec<&'static str> {
+    let mut tags = Vec::new();
+    if s.is_path() {
+        tags.push("PATH");
+    }
+    if s.is_url() {
+        tags.push("URL");
+    }
+    if s.is_error_message() {
+        tags.push("ERROR");
+    }
+    tags
+}
+
 fn extract_strings(
     fmt: &dyn BinaryFormat,
     min_length: usize,
@@ -2296,13 +2310,20 @@ fn extract_strings(
                 .replace('\n', "\\n")
                 .replace('\r', "\\r")
                 .replace('\t', "\\t");
+            let tags = string_tags(s);
+            let tags_json = tags
+                .iter()
+                .map(|tag| format!("\"{tag}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
 
             let comma = if i < all_strings.len() - 1 { "," } else { "" };
             println!("    {{");
             println!("      \"address\": \"{:#x}\",", s.address);
             println!("      \"length\": {},", s.length);
             println!("      \"encoding\": \"{:?}\",", s.encoding);
-            println!("      \"content\": \"{}\"", escaped_content);
+            println!("      \"content\": \"{}\",", escaped_content);
+            println!("      \"tags\": [{}]", tags_json);
             println!("    }}{}", comma);
         }
         println!("  ],");
@@ -2324,18 +2345,7 @@ fn extract_strings(
 
             // Truncate very long strings without slicing through a UTF-8 codepoint.
             let display_content = truncate_for_display(&s.content, 80);
-
-            // Add indicators for special string types
-            let mut indicators = Vec::new();
-            if s.is_path() {
-                indicators.push("PATH");
-            }
-            if s.is_url() {
-                indicators.push("URL");
-            }
-            if s.is_error_message() {
-                indicators.push("ERROR");
-            }
+            let indicators = string_tags(s);
 
             let indicator_str = if indicators.is_empty() {
                 String::new()
@@ -5077,10 +5087,10 @@ fn format_arch_for_info(arch: Architecture) -> String {
 mod tests {
     use super::{
         default_calling_convention, ensure_distinct_export_paths, find_symbol_in_candidates,
-        format_callgraph_text, parse_address_str, truncate_for_display, SessionExportFormat,
-        SymbolLookupMode,
+        format_callgraph_text, parse_address_str, string_tags, truncate_for_display,
+        SessionExportFormat, SymbolLookupMode,
     };
-    use hexray_analysis::{CallGraph, CallSite, CallType};
+    use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, StringEncoding};
     use hexray_core::{Architecture, Symbol, SymbolBinding, SymbolKind};
     use hexray_formats::BinaryType;
     use std::fs;
@@ -5165,6 +5175,35 @@ mod tests {
             find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
 
         assert_eq!(resolved.name, "nfsd_open.cold");
+    }
+
+    #[test]
+    fn string_tags_match_text_classifier() {
+        let path = DetectedString {
+            address: 0,
+            length: 9,
+            content: "/tmp/file".to_string(),
+            encoding: StringEncoding::Ascii,
+            null_terminated: true,
+        };
+        let url = DetectedString {
+            address: 0,
+            length: 19,
+            content: "https://hexray.dev".to_string(),
+            encoding: StringEncoding::Ascii,
+            null_terminated: true,
+        };
+        let error = DetectedString {
+            address: 0,
+            length: 18,
+            content: "operation failed".to_string(),
+            encoding: StringEncoding::Ascii,
+            null_terminated: true,
+        };
+
+        assert_eq!(string_tags(&path), vec!["PATH"]);
+        assert_eq!(string_tags(&url), vec!["URL"]);
+        assert_eq!(string_tags(&error), vec!["ERROR"]);
     }
 
     #[test]
