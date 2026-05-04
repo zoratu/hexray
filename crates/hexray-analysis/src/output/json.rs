@@ -198,20 +198,43 @@ impl CallGraphJsonExporter {
             .unwrap_or_else(|| format!("sub_{:x}", node.address))
     }
 
+    fn call_type_sort_key(call_type: crate::CallType) -> u8 {
+        match call_type {
+            crate::CallType::Direct => 0,
+            crate::CallType::Indirect => 1,
+            crate::CallType::TailCall => 2,
+        }
+    }
+
     /// Export the call graph to JSON format, writing to the provided writer.
     pub fn export<W: Write>(&self, callgraph: &CallGraph, mut writer: W) -> io::Result<()> {
         let mut nodes = Vec::new();
 
-        for node in callgraph.nodes() {
-            let callees: Vec<JsonCallEdge> = callgraph
+        let mut callgraph_nodes: Vec<_> = callgraph.nodes().collect();
+        callgraph_nodes.sort_by_key(|node| node.address);
+
+        for node in callgraph_nodes {
+            let mut callees: Vec<_> = callgraph
                 .callees(node.address)
-                .filter_map(|(addr, site)| {
-                    callgraph.get_node(addr).map(|callee| JsonCallEdge {
-                        address: callee.address,
-                        name: Self::node_display_name(callee),
-                        call_address: site.call_address,
-                        call_type: format!("{:?}", site.call_type),
+                .filter_map(|(addr, site)| callgraph.get_node(addr).map(|callee| (callee, site)))
+                .collect();
+            callees.sort_by(|(callee_a, site_a), (callee_b, site_b)| {
+                callee_a
+                    .address
+                    .cmp(&callee_b.address)
+                    .then_with(|| site_a.call_address.cmp(&site_b.call_address))
+                    .then_with(|| {
+                        Self::call_type_sort_key(site_a.call_type)
+                            .cmp(&Self::call_type_sort_key(site_b.call_type))
                     })
+            });
+            let callees = callees
+                .into_iter()
+                .map(|(callee, site)| JsonCallEdge {
+                    address: callee.address,
+                    name: Self::node_display_name(callee),
+                    call_address: site.call_address,
+                    call_type: format!("{:?}", site.call_type),
                 })
                 .collect();
 
@@ -620,5 +643,66 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value.get("node_count").unwrap().as_u64().unwrap(), 3);
         assert_eq!(value.get("edge_count").unwrap().as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_callgraph_json_exporter_sorts_nodes_and_callees_by_address() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x3000, Some("callee_b".to_string()), false);
+        callgraph.add_node(0x1000, Some("caller".to_string()), false);
+        callgraph.add_node(0x2000, Some("callee_a".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x3000,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1008,
+                call_type: crate::CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x1000,
+            0x3000,
+            crate::CallSite {
+                call_address: 0x1004,
+                call_type: crate::CallType::Indirect,
+            },
+        );
+
+        let exporter = CallGraphJsonExporter::new();
+        let json = exporter.export_to_string(&callgraph);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let nodes = value.get("nodes").unwrap().as_array().unwrap();
+
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.get("address").unwrap().as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0x1000, 0x2000, 0x3000]
+        );
+
+        let callees = nodes[0].get("callees").unwrap().as_array().unwrap();
+        assert_eq!(
+            callees
+                .iter()
+                .map(|callee| callee.get("address").unwrap().as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0x2000, 0x3000, 0x3000]
+        );
+        assert_eq!(
+            callees
+                .iter()
+                .map(|callee| callee.get("call_address").unwrap().as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0x1008, 0x1004, 0x1010]
+        );
     }
 }

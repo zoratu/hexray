@@ -135,8 +135,11 @@ impl CallGraphDotExporter {
         write!(writer, "{}", self.config.header("callgraph"))?;
         writeln!(writer)?;
 
+        let mut nodes: Vec<_> = callgraph.nodes().collect();
+        nodes.sort_by_key(|node| node.address);
+
         // Add nodes
-        for node in callgraph.nodes() {
+        for node in &nodes {
             let name = Self::node_display_name(node);
             let escaped_name = escape_dot_string(&name);
             writeln!(
@@ -149,11 +152,14 @@ impl CallGraphDotExporter {
         writeln!(writer)?;
 
         // Add edges
-        for node in callgraph.nodes() {
+        for node in nodes {
             let caller_name = Self::node_display_name(node);
             let caller_escaped = escape_dot_string(&caller_name);
 
-            for (callee_addr, _call_site) in callgraph.callees(node.address) {
+            let mut callees: Vec<_> = callgraph.callees(node.address).collect();
+            callees.sort_by_key(|(callee_addr, _)| *callee_addr);
+
+            for (callee_addr, _call_site) in callees {
                 if let Some(callee) = callgraph.get_node(callee_addr) {
                     let callee_name = Self::node_display_name(callee);
                     let callee_escaped = escape_dot_string(&callee_name);
@@ -480,6 +486,43 @@ mod tests {
 
         // Name should be escaped
         assert!(dot.contains("operator\\<"));
+    }
+
+    #[test]
+    fn test_callgraph_dot_exporter_sorts_nodes_and_callees_by_address() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x3000, Some("callee_b".to_string()), false);
+        callgraph.add_node(0x1000, Some("caller".to_string()), false);
+        callgraph.add_node(0x2000, Some("callee_a".to_string()), false);
+        callgraph.add_call(
+            0x1000,
+            0x3000,
+            crate::CallSite {
+                call_address: 0x1010,
+                call_type: crate::CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            crate::CallSite {
+                call_address: 0x1008,
+                call_type: crate::CallType::Direct,
+            },
+        );
+
+        let exporter = CallGraphDotExporter::new();
+        let dot = exporter.export_to_string(&callgraph);
+
+        let caller_pos = dot.find("\"caller\" [label=\"caller\"]").unwrap();
+        let callee_a_pos = dot.find("\"callee_a\" [label=\"callee_a\"]").unwrap();
+        let callee_b_pos = dot.find("\"callee_b\" [label=\"callee_b\"]").unwrap();
+        assert!(caller_pos < callee_a_pos);
+        assert!(callee_a_pos < callee_b_pos);
+
+        let edge_a_pos = dot.find("\"caller\" -> \"callee_a\"").unwrap();
+        let edge_b_pos = dot.find("\"caller\" -> \"callee_b\"").unwrap();
+        assert!(edge_a_pos < edge_b_pos);
     }
 
     // --- CFG with Multiple Blocks and Branches ---
