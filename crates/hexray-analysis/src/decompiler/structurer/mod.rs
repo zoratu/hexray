@@ -644,12 +644,26 @@ impl<'a> Structurer<'a> {
                 }
             }
             BlockTerminator::Jump { target } => {
-                // Follow the jump
-                self.get_return_expr_following_chain(*target, visited)
+                let target_return = self.get_return_expr_following_chain(*target, visited);
+                if target_return.is_some() {
+                    let (_, block_return) =
+                        extract_return_value(self.block_to_statements(block_id));
+                    if block_return.is_some() {
+                        return Some(block_return);
+                    }
+                }
+                target_return
             }
             BlockTerminator::Fallthrough { target } => {
-                // Follow fallthrough
-                self.get_return_expr_following_chain(*target, visited)
+                let target_return = self.get_return_expr_following_chain(*target, visited);
+                if target_return.is_some() {
+                    let (_, block_return) =
+                        extract_return_value(self.block_to_statements(block_id));
+                    if block_return.is_some() {
+                        return Some(block_return);
+                    }
+                }
+                target_return
             }
             _ => None,
         }
@@ -2228,6 +2242,62 @@ mod tests {
         cfg
     }
 
+    fn make_shared_return_arithmetic_cfg() -> ControlFlowGraph {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x2000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x2010);
+        bb1.instructions.push(
+            Instruction::new(0x2010, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(5, 32)]),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x2015, 3, vec![], "add")
+                .with_operation(Operation::Add)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(20, 32)]),
+        );
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x2020);
+        bb2.instructions.push(
+            Instruction::new(0x2020, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(7, 32)]),
+        );
+        bb2.instructions.push(
+            Instruction::new(0x2025, 2, vec![], "neg")
+                .with_operation(Operation::Neg)
+                .with_operands(vec![Operand::Register(eax)]),
+        );
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x2030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        cfg
+    }
+
     fn make_while_loop_cfg() -> ControlFlowGraph {
         // bb0 -> bb1 (loop header with condition)
         //        bb1 -> bb2 (loop body) -> bb1 (back edge)
@@ -3316,6 +3386,28 @@ mod tests {
         assert!(
             !contains_void_return(structured.body()),
             "Shared return join should not leave behind a void return: {:?}",
+            structured.body()
+        );
+    }
+
+    #[test]
+    fn test_structurer_preserves_arithmetic_shared_return_branch_values() {
+        let cfg = make_shared_return_arithmetic_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        assert!(
+            contains_return_literal(structured.body(), 25),
+            "Expected arithmetic branch to preserve the computed return value: {:?}",
+            structured.body()
+        );
+        assert!(
+            contains_return_literal(structured.body(), -7),
+            "Expected negated branch to preserve its computed return value: {:?}",
+            structured.body()
+        );
+        assert!(
+            !contains_void_return(structured.body()),
+            "Arithmetic shared return join should not degrade to bare returns: {:?}",
             structured.body()
         );
     }
