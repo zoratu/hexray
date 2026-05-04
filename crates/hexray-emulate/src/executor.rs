@@ -7,6 +7,10 @@ use crate::{EmulationResult, IndirectTarget, ResolutionMethod};
 use hexray_core::Instruction;
 use std::collections::{HashMap, HashSet};
 
+const DEFAULT_STACK_BASE: u64 = 0x7FFF_FFFF_0000;
+const DEFAULT_STACK_SIZE: u64 = 0x100000;
+const ENTRY_RETURN_SENTINEL: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+
 /// Configuration for the emulator.
 #[derive(Debug, Clone)]
 pub struct EmulatorConfig {
@@ -93,13 +97,15 @@ pub struct Emulator {
 impl Emulator {
     /// Create a new emulator with default configuration.
     pub fn new(config: EmulatorConfig) -> Self {
-        Self {
-            state: MachineState::with_stack(0x7FFF_FFFF_0000, 0x100000),
+        let mut emu = Self {
+            state: MachineState::with_stack(DEFAULT_STACK_BASE, DEFAULT_STACK_SIZE),
             config,
             path: Vec::new(),
             visit_counts: HashMap::new(),
             indirect_targets: Vec::new(),
-        }
+        };
+        emu.seed_entry_return();
+        emu
     }
 
     /// Get the current machine state.
@@ -129,10 +135,17 @@ impl Emulator {
 
     /// Reset the emulator state.
     pub fn reset(&mut self) {
-        self.state = MachineState::with_stack(0x7FFF_FFFF_0000, 0x100000);
+        self.state = MachineState::with_stack(DEFAULT_STACK_BASE, DEFAULT_STACK_SIZE);
+        self.seed_entry_return();
         self.path.clear();
         self.visit_counts.clear();
         self.indirect_targets.clear();
+    }
+
+    fn seed_entry_return(&mut self) {
+        self.state
+            .push(Value::Concrete(ENTRY_RETURN_SENTINEL))
+            .expect("entry return sentinel should fit in the default stack");
     }
 
     /// Execute a single instruction.
@@ -163,7 +176,9 @@ impl Emulator {
                 let target = self.get_call_target(inst);
                 return Ok(StopReason::Call(target.as_concrete().unwrap_or(0)));
             }
-            hexray_core::Operation::Return if self.config.stop_at_returns => {
+            hexray_core::Operation::Return
+                if self.config.stop_at_returns && self.state.pc() == ENTRY_RETURN_SENTINEL =>
+            {
                 return Ok(StopReason::Return);
             }
             hexray_core::Operation::Jump => {
@@ -494,6 +509,50 @@ mod tests {
         let result = emu.execute(&instructions).unwrap();
 
         assert!(matches!(result.stop_reason, StopReason::Call(0x2000)));
+    }
+
+    #[test]
+    fn test_top_level_ret_stops_without_stack_underflow() {
+        let mut emu = Emulator::new(EmulatorConfig {
+            stop_at_calls: false,
+            stop_at_returns: true,
+            ..Default::default()
+        });
+
+        let instructions = vec![
+            make_inst(0x1000, Operation::Move, vec![reg(x86_regs::RAX), imm(9)]),
+            make_inst(0x1004, Operation::Return, vec![]),
+        ];
+
+        emu.state_mut().set_pc(0x1000);
+        let result = emu.execute(&instructions).unwrap();
+
+        assert_eq!(emu.get_register(x86_regs::RAX), Value::Concrete(9));
+        assert!(matches!(result.stop_reason, StopReason::Return));
+    }
+
+    #[test]
+    fn test_inner_ret_unwinds_to_caller_before_stopping() {
+        let mut emu = Emulator::new(EmulatorConfig {
+            stop_at_calls: false,
+            stop_at_returns: true,
+            ..Default::default()
+        });
+
+        let instructions = vec![
+            make_inst(0x1000, Operation::Call, vec![imm(0x2000)]),
+            make_inst(0x1004, Operation::Move, vec![reg(x86_regs::RAX), imm(42)]),
+            make_inst(0x1008, Operation::Return, vec![]),
+            make_inst(0x2000, Operation::Move, vec![reg(x86_regs::RAX), imm(7)]),
+            make_inst(0x2004, Operation::Return, vec![]),
+        ];
+
+        emu.state_mut().set_pc(0x1000);
+        let result = emu.execute(&instructions).unwrap();
+
+        assert_eq!(emu.get_register(x86_regs::RAX), Value::Concrete(42));
+        assert!(matches!(result.stop_reason, StopReason::Return));
+        assert_eq!(result.path, vec![0x1000, 0x2000, 0x2004, 0x1004, 0x1008]);
     }
 
     #[test]

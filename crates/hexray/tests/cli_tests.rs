@@ -430,10 +430,10 @@ fn test_emulate_run_json_errors_stay_json() {
         return;
     }
 
-    let output = run_hexray(&[&binary, "emulate", "run", "--json", "0x140001000"]);
+    let output = run_hexray(&[&binary, "emulate", "run", "--json", "0x1"]);
     assert!(
         !output.status.success(),
-        "unbounded emulate run should fail to exercise JSON error path"
+        "invalid emulate run target should fail to exercise JSON error path"
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -443,7 +443,7 @@ fn test_emulate_run_json_errors_stay_json() {
     assert!(
         json["error"]
             .as_str()
-            .is_some_and(|msg| msg.contains("Stack underflow")),
+            .is_some_and(|msg| msg.contains("not found")),
         "error JSON should preserve the runtime error: {}",
         stdout
     );

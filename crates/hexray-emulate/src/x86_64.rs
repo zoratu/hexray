@@ -38,7 +38,9 @@ pub fn execute(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
         _ => {
             // Handle setcc and cmov by checking the mnemonic
             let mnemonic = inst.mnemonic.to_lowercase();
-            if mnemonic.starts_with("set") {
+            if mnemonic == "leave" {
+                execute_leave(state)
+            } else if mnemonic.starts_with("set") {
                 execute_setcc(state, inst)
             } else if mnemonic.starts_with("cmov") {
                 execute_cmov(state, inst)
@@ -499,6 +501,15 @@ fn execute_ret(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
         }
     }
 
+    Ok(())
+}
+
+fn execute_leave(state: &mut MachineState) -> EmulationResult<()> {
+    let frame_pointer = state.get_register(x86_regs::RBP);
+    state.set_register(x86_regs::RSP, frame_pointer.clone());
+
+    let saved_rbp = state.pop().map_err(|_| EmulationError::StackUnderflow)?;
+    state.set_register(x86_regs::RBP, saved_rbp);
     Ok(())
 }
 
