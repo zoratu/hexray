@@ -333,9 +333,14 @@ enum SessionAction {
     },
 }
 
-/// Parse a hex string (with optional 0x prefix) into u64.
+fn normalize_hex_address_target(s: &str) -> &str {
+    let s = s.strip_prefix("sub_").unwrap_or(s);
+    s.strip_prefix("0x").unwrap_or(s)
+}
+
+/// Parse a hex string (with optional `sub_`/`0x` prefix) into u64.
 pub fn parse_hex(s: &str) -> Result<u64, String> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
+    let s = normalize_hex_address_target(s);
     u64::from_str_radix(s, 16).map_err(|e| e.to_string())
 }
 
@@ -1086,26 +1091,11 @@ fn find_symbol_in_candidates(
         return Some(prefix_matches.remove(0));
     }
 
-    // 4. Try contains match as last resort (lowest priority)
-    //    Only match function symbols, and prefer shorter names
-    let mut contains_matches: Vec<hexray_core::Symbol> = symbols
-        .iter()
-        .filter(|s| {
-            s.is_function()
-                && (s.name.contains(name) || demangle_or_original(&s.name).contains(name))
-        })
-        .cloned()
-        .collect();
-    contains_matches.sort_by_key(|a| a.name.len());
-    if !contains_matches.is_empty() {
-        return Some(contains_matches.remove(0));
-    }
-
     None
 }
 
 fn disassemble_symbol(fmt: &dyn BinaryFormat, name: &str, max_count: usize) -> Result<()> {
-    // Find the symbol - prefer exact matches, then prefix matches, then contains
+    // Find the symbol - prefer exact or alias matches, then prefix matches.
     let symbol = find_symbol(fmt, name).with_context(|| format!("Symbol '{}' not found", name))?;
 
     println!(
@@ -1219,11 +1209,7 @@ fn disassemble_cfg(
     project: Option<&AnalysisProject>,
 ) -> Result<()> {
     // Try to parse as address first
-    let address = if let Some(stripped) = target.strip_prefix("0x") {
-        u64::from_str_radix(stripped, 16).ok()
-    } else {
-        u64::from_str_radix(target, 16).ok()
-    };
+    let address = parse_address_str(target).ok();
 
     let (start_addr, name, max_bytes, stop_after_first_return) = if let Some(addr) = address {
         let name = project
@@ -1377,11 +1363,7 @@ fn decompile_function(
     let fmt = binary.as_format();
 
     // Try to parse as address first
-    let address = if let Some(stripped) = target.strip_prefix("0x") {
-        u64::from_str_radix(stripped, 16).ok()
-    } else {
-        u64::from_str_radix(target, 16).ok()
-    };
+    let address = parse_address_str(target).ok();
 
     let (start_addr, name, max_bytes, stop_after_first_return) = if let Some(addr) = address {
         // Check if project has a custom name for this address
@@ -2023,11 +2005,7 @@ fn build_callgraph(
         funcs
     } else {
         // Parse as address or find symbol by name
-        let address = if let Some(stripped) = target.strip_prefix("0x") {
-            u64::from_str_radix(stripped, 16).ok()
-        } else {
-            u64::from_str_radix(target, 16).ok()
-        };
+        let address = parse_address_str(target).ok();
 
         let (addr, name, size, heuristic_bounds) = if let Some(a) = address {
             // For raw addresses, use a default size
@@ -2373,11 +2351,7 @@ fn decompile_with_follow(
     let mut queue: Vec<(u64, String, usize)> = Vec::new();
 
     // Resolve the initial target
-    let address = if let Some(stripped) = target.strip_prefix("0x") {
-        u64::from_str_radix(stripped, 16).ok()
-    } else {
-        u64::from_str_radix(target, 16).ok()
-    };
+    let address = parse_address_str(target).ok();
 
     let (start_addr, name) = if let Some(addr) = address {
         // Check if project has a custom name for this address
@@ -4575,7 +4549,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
 }
 
 fn parse_address_str(s: &str) -> Result<u64> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
+    let s = normalize_hex_address_target(s);
     u64::from_str_radix(s, 16).context("Invalid address")
 }
 
@@ -5063,8 +5037,8 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_distinct_export_paths, find_symbol_in_candidates, truncate_for_display,
-        SessionExportFormat, SymbolLookupMode,
+        ensure_distinct_export_paths, find_symbol_in_candidates, parse_address_str,
+        truncate_for_display, SessionExportFormat, SymbolLookupMode,
     };
     use hexray_core::{Symbol, SymbolBinding, SymbolKind};
     use std::fs;
@@ -5105,6 +5079,20 @@ mod tests {
         let resolved = find_symbol_in_candidates(&symbols, "main", SymbolLookupMode::ExactOnly);
 
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn fuzzy_lookup_rejects_substring_matches() {
+        let symbols = vec![test_symbol("textdomain@plt", 0x4860)];
+
+        let resolved = find_symbol_in_candidates(&symbols, "main", SymbolLookupMode::Fuzzy);
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn parse_address_str_accepts_sub_prefix() {
+        assert_eq!(parse_address_str("sub_4860").unwrap(), 0x4860);
     }
 
     #[test]
