@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 use cpp_demangle::{DemangleOptions as CppDemangleOptions, Symbol as CppSymbol};
+use rustc_demangle::try_demangle as try_demangle_rust;
 use std::fmt::Write;
 
 /// Attempt to demangle a symbol name.
@@ -25,6 +26,12 @@ use std::fmt::Write;
 /// Returns the demangled name if successful, or None if the symbol
 /// is not mangled or uses an unsupported scheme.
 pub fn demangle(name: &str) -> Option<String> {
+    // Try the canonical Rust demangler first so legacy _ZN... symbols do not
+    // get misclassified as C++.
+    if let Some(demangled) = demangle_rust(name) {
+        return Some(demangled);
+    }
+
     // Try the canonical C++ Itanium demangler first.
     if let Some(demangled) = demangle_cpp(name) {
         return Some(demangled);
@@ -46,6 +53,16 @@ pub fn demangle(name: &str) -> Option<String> {
 /// Returns the demangled name or the original if demangling fails.
 pub fn demangle_or_original(name: &str) -> String {
     demangle(name).unwrap_or_else(|| name.to_string())
+}
+
+fn demangle_rust(name: &str) -> Option<String> {
+    try_demangle_rust(name)
+        .ok()
+        .or_else(|| {
+            name.strip_prefix('_')
+                .and_then(|stripped| try_demangle_rust(stripped).ok())
+        })
+        .map(|demangled| format!("{:#}", demangled))
 }
 
 fn demangle_cpp(name: &str) -> Option<String> {
@@ -1165,5 +1182,25 @@ mod tests {
     #[test]
     fn test_cpp_demangle_handles_macho_leading_underscore() {
         assert_eq!(demangle("__ZN3foo3barEv"), Some("foo::bar()".to_string()));
+    }
+
+    #[test]
+    fn test_rust_demangle_v0_symbol() {
+        assert_eq!(
+            demangle("_RNvCskwGfYPst2Cb_3foo16example_function"),
+            Some("foo::example_function".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rust_demangle_legacy_symbol() {
+        assert_eq!(
+            demangle("_ZN3foo17h05af221e174051e9E"),
+            Some("foo".to_string())
+        );
+        assert_eq!(
+            demangle("__ZN3foo17h05af221e174051e9E"),
+            Some("foo".to_string())
+        );
     }
 }

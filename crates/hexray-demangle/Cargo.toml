@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 cpp_demangle = "0.5.1"
+rustc-demangle = "0.1.27"
 thiserror.workspace = true
 
 [dev-dependencies]
