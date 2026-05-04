@@ -27,7 +27,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -317,8 +317,26 @@ impl AnalysisProject {
 
     /// Save the project to a file.
     pub fn save<P: AsRef<Path>>(&mut self, path: P) -> ProjectResult<()> {
+        let path = path.as_ref();
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(path, content)?;
+        let tmp_name = format!(
+            "{}.tmp.{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project.hxp"),
+            std::process::id()
+        );
+        let tmp_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(tmp_name);
+
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&tmp_path, path)?;
         self.dirty = false;
         Ok(())
     }
