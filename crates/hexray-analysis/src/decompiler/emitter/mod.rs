@@ -599,6 +599,28 @@ impl PseudoCodeEmitter {
             .unwrap_or_else(|| name.to_string())
     }
 
+    fn resolve_display_identifier_name(&self, name: &str) -> String {
+        if let Some(semantic_name) = self.try_get_semantic_var_name(name) {
+            let overridden = self.apply_param_name_override(&semantic_name);
+            return normalize_variable_name(&overridden);
+        }
+
+        let renamed = rename_register(name);
+        let overridden = self.apply_param_name_override(&renamed);
+        normalize_variable_name(&overridden)
+    }
+
+    fn should_prefer_specific_param_name(candidate: &str) -> bool {
+        !looks_like_parameter_name(candidate)
+            && !candidate.starts_with("var_")
+            && !candidate.starts_with("local_")
+            && !candidate.starts_with("arg_")
+    }
+
+    fn is_lifted_stack_identifier(name: &str) -> bool {
+        name.starts_with("var_") || name.starts_with("local_") || name.starts_with("arg_")
+    }
+
     /// Sets the calling convention for signature recovery.
     pub fn with_calling_convention(mut self, convention: CallingConvention) -> Self {
         self.calling_convention = convention;
@@ -2139,8 +2161,7 @@ impl PseudoCodeEmitter {
                     // but at least preserves the semantic information
                     name.clone()
                 } else {
-                    let overridden = self.apply_param_name_override(name);
-                    normalize_variable_name(&overridden)
+                    self.resolve_display_identifier_name(name)
                 }
             }
             // Handle casts with potential elimination based on known types
@@ -2412,11 +2433,20 @@ impl PseudoCodeEmitter {
             let params: Vec<String> = sig.parameters.iter().map(|p| p.name.clone()).collect();
 
             let info = self.analyze_function(&cfg.body);
+            let mut merged_param_names = params.clone();
+            if merged_param_names.len() < info.parameters.len() {
+                merged_param_names.resize(info.parameters.len(), String::new());
+            }
+            for (idx, name) in info.parameters.iter().enumerate() {
+                if !name.is_empty() {
+                    merged_param_names[idx] = name.clone();
+                }
+            }
             let merged_info = FunctionInfo {
-                parameters: if params.is_empty() {
+                parameters: if merged_param_names.is_empty() {
                     info.parameters
                 } else {
-                    params
+                    merged_param_names
                 },
                 has_return_value: sig.has_return || info.has_return_value,
                 skip_statements: info.skip_statements,
@@ -2433,7 +2463,16 @@ impl PseudoCodeEmitter {
             } else {
                 sig.parameters
                     .iter()
-                    .map(|p| {
+                    .enumerate()
+                    .map(|(idx, p)| {
+                        if let Some(recovered_name) = func_info.parameters.get(idx) {
+                            if Self::should_prefer_specific_param_name(recovered_name)
+                                && !Self::should_prefer_specific_param_name(&p.name)
+                            {
+                                return recovered_name.clone();
+                            }
+                        }
+
                         // SignatureRecovery's `var_NN` heuristic for
                         // stack-spilled register params shadows the
                         // DWARF parameter name when the function was
@@ -3375,7 +3414,7 @@ impl PseudoCodeEmitter {
 
     fn extract_display_assigned_identifier(&self, lhs: &Expr) -> Option<String> {
         let raw = match &lhs.kind {
-            ExprKind::Unknown(name) => self.apply_param_name_override(name),
+            ExprKind::Unknown(name) => self.resolve_display_identifier_name(name),
             ExprKind::Var(var) => {
                 let renamed = rename_register(&var.name);
                 self.apply_param_name_override(&renamed)
@@ -3484,7 +3523,7 @@ impl PseudoCodeEmitter {
             ExprKind::IntLit(_) => {}
             ExprKind::Unknown(name) => {
                 if is_assignable_unknown_name(name) {
-                    vars.insert(name.clone());
+                    vars.insert(self.resolve_display_identifier_name(name));
                 }
             }
         }
@@ -5053,6 +5092,9 @@ impl PseudoCodeEmitter {
                 index,
                 element_size,
             } => self.try_get_array_base_name(base, index, *element_size),
+            ExprKind::Unknown(name) if Self::is_lifted_stack_identifier(name) => {
+                Some(self.resolve_display_identifier_name(name))
+            }
             _ => None,
         }
     }
@@ -5061,7 +5103,7 @@ impl PseudoCodeEmitter {
         self.try_get_var_name(expr).or_else(|| {
             if let ExprKind::Unknown(name) = &expr.kind {
                 if is_assignable_unknown_name(name) {
-                    return Some(name.clone());
+                    return Some(self.resolve_display_identifier_name(name));
                 }
             }
             None
@@ -5617,6 +5659,91 @@ mod tests {
         assert!(
             output.contains("atoi(ret);"),
             "Expected renamed return register use in body, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_applies_dwarf_names_to_unknown_stack_slots_and_params() {
+        use super::super::expression::Variable;
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(
+                    Expr::unknown("local_18"),
+                    Expr::var(Variable::reg("rdi", 8)),
+                ),
+                Expr::assign(
+                    Expr::unknown("local_1c"),
+                    Expr::var(Variable::reg("rsi", 8)),
+                ),
+                Expr::assign(
+                    Expr::unknown("local_28"),
+                    Expr::var(Variable::reg("rdx", 8)),
+                ),
+                Expr::assign(
+                    Expr::unknown("local_20"),
+                    Expr::var(Variable::reg("rcx", 8)),
+                ),
+                Expr::assign(Expr::unknown("local_8"), Expr::int(0)),
+                Expr::assign(Expr::unknown("local_4"), Expr::int(0)),
+                Expr::assign(
+                    Expr::unknown("local_8"),
+                    Expr::binop(
+                        BinOpKind::Add,
+                        Expr::unknown("local_8"),
+                        Expr::unknown("local_4"),
+                    ),
+                ),
+                Expr::assign(
+                    Expr::unknown("local_4"),
+                    Expr::binop(BinOpKind::Add, Expr::unknown("local_4"), Expr::int(1)),
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::unknown("local_8"))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let dwarf_names = HashMap::from([
+            (-24, "arr".to_string()),
+            (-28, "n".to_string()),
+            (-40, "fn".to_string()),
+            (-32, "factor".to_string()),
+            (-8, "total".to_string()),
+            (-4, "i".to_string()),
+        ]);
+        let emitter = PseudoCodeEmitter::new("    ", false).with_dwarf_names(dwarf_names);
+        let output = emitter.emit(&cfg, "accumulate_named");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(
+            header.contains("arr")
+                && header.contains("n")
+                && header.contains("fn")
+                && header.contains("factor"),
+            "Expected DWARF parameter names in header, got:\n{}",
+            output
+        );
+        assert!(
+            !header.contains("arg1") && !header.contains("arg2") && !header.contains("arg3"),
+            "Did not expect generic parameter names in header, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("int i;") && output.contains("int total;"),
+            "Expected DWARF local names in declarations, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("total = 0;") && output.contains("i = 0;"),
+            "Expected DWARF local names in body, got:\n{}",
             output
         );
     }

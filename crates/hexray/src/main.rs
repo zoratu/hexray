@@ -1479,11 +1479,11 @@ fn decompile_function(
 
     // Try to load DWARF debug info for variable names
     let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary) {
-        let names = get_dwarf_variable_names(&debug_info, start_addr);
-        if !names.is_empty() {
-            println!("(using DWARF debug info for variable names)\n");
-        }
-        names
+        // TODO(round-9): only restore a DWARF banner once lifted
+        // local_/arg_ identifiers and signature recovery consume these
+        // names consistently enough that the user can actually see them
+        // in the emitted pseudo-C.
+        get_dwarf_variable_names(&debug_info, start_addr)
     } else {
         std::collections::HashMap::new()
     };
