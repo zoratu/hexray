@@ -11,6 +11,22 @@ use hexray_emulate::{state::x86_regs, Emulator, EmulatorConfig, Value};
 use hexray_formats::BinaryFormat;
 use serde::Serialize;
 
+fn find_exact_symbol_target(
+    mut symbols: impl Iterator<Item = hexray_core::Symbol>,
+    target: &str,
+) -> Option<(u64, usize)> {
+    symbols.find(|sym| sym.name == target).map(|sym| {
+        (
+            sym.address,
+            if sym.size > 0 {
+                sym.size as usize
+            } else {
+                4096
+            },
+        )
+    })
+}
+
 fn parse_register_id(arch: Architecture, value: &str) -> Result<u16> {
     if let Ok(register_id) = value.parse::<u16>() {
         return Ok(register_id);
@@ -135,7 +151,10 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
 
     // Helper to resolve function target
     let resolve_function = |target: &str| -> Result<(u64, usize)> {
-        // Try parsing as hex address
+        if let Some((address, size)) = find_exact_symbol_target(fmt.symbols().cloned(), target) {
+            return Ok((address, size));
+        }
+
         if let Ok(addr) = u64::from_str_radix(target.strip_prefix("0x").unwrap_or(target), 16) {
             for section in fmt.sections() {
                 let start = section.virtual_address();
@@ -145,18 +164,6 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
                 }
             }
             bail!("Address {:#x} not found in any section", addr);
-        }
-
-        // Try as symbol name
-        for sym in fmt.symbols() {
-            if sym.name == target {
-                let size = if sym.size > 0 {
-                    sym.size as usize
-                } else {
-                    4096
-                };
-                return Ok((sym.address, size));
-            }
         }
 
         bail!("Symbol '{}' not found", target);
@@ -549,8 +556,8 @@ fn print_state_result(result: &hexray_emulate::ExecutionResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_register_id;
-    use hexray_core::Architecture;
+    use super::{find_exact_symbol_target, parse_register_id};
+    use hexray_core::{Architecture, Symbol, SymbolBinding, SymbolKind};
     use hexray_emulate::state::x86_regs;
 
     #[test]
@@ -571,6 +578,23 @@ mod tests {
         assert_eq!(
             parse_register_id(Architecture::X86_64, "edi").unwrap(),
             x86_regs::RDI
+        );
+    }
+
+    #[test]
+    fn test_find_exact_symbol_target_matches_hex_looking_names() {
+        let symbols = vec![Symbol {
+            name: "add".to_string(),
+            address: 0x401106,
+            size: 32,
+            kind: SymbolKind::Function,
+            binding: SymbolBinding::Global,
+            section_index: Some(1),
+        }];
+
+        assert_eq!(
+            find_exact_symbol_target(symbols.into_iter(), "add"),
+            Some((0x401106, 32))
         );
     }
 }
