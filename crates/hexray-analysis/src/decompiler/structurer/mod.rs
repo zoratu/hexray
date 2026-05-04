@@ -610,6 +610,10 @@ impl<'a> Structurer<'a> {
         self.get_return_expr_following_chain(block_id, &mut HashSet::new())
     }
 
+    fn mark_pure_return_chain_processed(&mut self, block_id: BasicBlockId) {
+        self.mark_pure_return_chain_processed_inner(block_id, &mut HashSet::new());
+    }
+
     /// Helper that follows the chain of blocks to find the return expression.
     fn get_return_expr_following_chain(
         &self,
@@ -648,6 +652,35 @@ impl<'a> Structurer<'a> {
                 self.get_return_expr_following_chain(*target, visited)
             }
             _ => None,
+        }
+    }
+
+    fn mark_pure_return_chain_processed_inner(
+        &mut self,
+        block_id: BasicBlockId,
+        visited: &mut HashSet<BasicBlockId>,
+    ) {
+        if !visited.insert(block_id) {
+            return;
+        }
+
+        let Some(block) = self.cfg.block(block_id) else {
+            return;
+        };
+
+        self.processed.insert(block_id);
+
+        match &block.terminator {
+            BlockTerminator::Return => {}
+            BlockTerminator::Call { return_block, .. } => {
+                if self.is_cleanup_block(block) {
+                    self.mark_pure_return_chain_processed_inner(*return_block, visited);
+                }
+            }
+            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target } => {
+                self.mark_pure_return_chain_processed_inner(*target, visited);
+            }
+            _ => {}
         }
     }
 
@@ -832,6 +865,7 @@ impl<'a> Structurer<'a> {
             {
                 // Check if target is a pure return block - if so, emit return instead of goto
                 if let Some(ret_expr) = self.get_return_expr_if_pure_return(block_id) {
+                    self.mark_pure_return_chain_processed(block_id);
                     result.push(StructuredNode::Return(ret_expr));
                 } else {
                     result.push(StructuredNode::Goto(block_id));
@@ -843,6 +877,7 @@ impl<'a> Structurer<'a> {
             if self.processed.contains(&block_id) {
                 // Check if target is a pure return block - if so, emit return instead of goto
                 if let Some(ret_expr) = self.get_return_expr_if_pure_return(block_id) {
+                    self.mark_pure_return_chain_processed(block_id);
                     result.push(StructuredNode::Return(ret_expr));
                 } else {
                     result.push(StructuredNode::Goto(block_id));
@@ -934,20 +969,24 @@ impl<'a> Structurer<'a> {
                         });
                     }
 
+                    let join = self.find_join_point(*true_target, *false_target, end);
+
                     // Structure the if/else
-                    let if_node = self.structure_if_else(
+                    let (if_node, consumes_join) = self.structure_if_else(
                         *condition,
                         *true_target,
                         *false_target,
-                        end,
+                        join,
                         block_id,
                         block,
                     );
                     result.push(if_node);
 
-                    // Find join point and continue
-                    let join = self.find_join_point(*true_target, *false_target, end);
+                    if consumes_join {
+                        break;
+                    }
 
+                    // Find join point and continue
                     // Mark the join point as inline-allowed so we don't emit a goto to it.
                     // This is the natural continuation after the if-else structure.
                     // HOWEVER, don't mark irreducible entry points as inline-allowed, since
@@ -1244,38 +1283,63 @@ impl<'a> Structurer<'a> {
         condition: Condition,
         true_target: BasicBlockId,
         false_target: BasicBlockId,
-        region_end: Option<BasicBlockId>,
+        join: Option<BasicBlockId>,
         block_id: BasicBlockId,
         block: &BasicBlock,
-    ) -> StructuredNode {
+    ) -> (StructuredNode, bool) {
         let cond_expr = self.rewrite_condition_call_return_alias(
             block_id,
             condition_to_expr_with_block(condition, block),
         );
 
-        // Find join point
-        let join = self.find_join_point(true_target, false_target, region_end);
+        let shared_return = join.and_then(|join_id| self.get_return_expr_if_pure_return(join_id));
 
-        // Structure then branch
-        let then_body = self.structure_region(true_target, join);
+        let mut then_body = if join == Some(true_target) {
+            shared_return
+                .clone()
+                .map(|ret_expr| vec![StructuredNode::Return(ret_expr)])
+                .unwrap_or_default()
+        } else {
+            self.structure_region(true_target, join)
+        };
 
-        // Structure else branch (if it's not the join point)
-        let else_body = if join != Some(false_target) {
+        let mut else_body = if join == Some(false_target) {
+            shared_return
+                .clone()
+                .map(|ret_expr| vec![StructuredNode::Return(ret_expr)])
+        } else {
             let body = self.structure_region(false_target, join);
             if body.is_empty() {
                 None
             } else {
                 Some(body)
             }
-        } else {
-            None
         };
 
-        StructuredNode::If {
-            condition: cond_expr,
-            then_body,
-            else_body,
+        if let Some(ret_expr) = shared_return.clone() {
+            then_body = attach_shared_return_to_branch(then_body, ret_expr.clone());
+            else_body =
+                else_body.map(|body| attach_shared_return_to_branch(body, ret_expr.clone()));
         }
+
+        let consumes_join = shared_return.is_some()
+            && body_terminates(&then_body)
+            && else_body.as_ref().is_some_and(|body| body_terminates(body));
+
+        if consumes_join {
+            if let Some(join_id) = join {
+                self.mark_pure_return_chain_processed(join_id);
+            }
+        }
+
+        (
+            StructuredNode::If {
+                condition: cond_expr,
+                then_body,
+                else_body,
+            },
+            consumes_join,
+        )
     }
 
     /// In blocks entered from a call-terminated predecessor, treat arg0/x0/w0
@@ -1957,6 +2021,35 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
     }
 }
 
+fn attach_shared_return_to_branch(
+    mut body: Vec<StructuredNode>,
+    shared_return: Option<Expr>,
+) -> Vec<StructuredNode> {
+    if body_terminates(&body) {
+        return body;
+    }
+
+    let mut return_value = shared_return;
+
+    if let Some(StructuredNode::Block { statements, .. }) = body.last_mut() {
+        let (filtered_statements, branch_return) = extract_return_value(std::mem::take(statements));
+        *statements = filtered_statements;
+        if branch_return.is_some() {
+            return_value = branch_return;
+        }
+    }
+
+    if matches!(
+        body.last(),
+        Some(StructuredNode::Block { statements, .. }) if statements.is_empty()
+    ) {
+        body.pop();
+    }
+
+    body.push(StructuredNode::Return(return_value));
+    body
+}
+
 /// Checks if a body of statements terminates (ends with return/break/continue/goto/noreturn call).
 pub(super) fn body_terminates(body: &[StructuredNode]) -> bool {
     if body.is_empty() {
@@ -2067,6 +2160,57 @@ mod tests {
         cfg.add_block(bb1);
 
         let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        cfg
+    }
+
+    fn make_shared_return_diamond_cfg() -> ControlFlowGraph {
+        //     bb0
+        //    /   \
+        //  bb1   bb2
+        //    \   /
+        //     bb3 (ret)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.instructions.push(
+            Instruction::new(0x1010, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(1, 32)]),
+        );
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.instructions.push(
+            Instruction::new(0x1020, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(0, 32)]),
+        );
         bb2.terminator = BlockTerminator::Jump {
             target: BasicBlockId::new(3),
         };
@@ -2644,6 +2788,154 @@ mod tests {
         })
     }
 
+    fn expr_contains_int_lit(expr: &Expr, target: i128) -> bool {
+        use crate::decompiler::expression::ExprKind;
+
+        match &expr.kind {
+            ExprKind::IntLit(value) => *value == target,
+            ExprKind::Var(_) | ExprKind::GotRef { .. } | ExprKind::Unknown(_) => false,
+            ExprKind::BinOp { left, right, .. } => {
+                expr_contains_int_lit(left, target) || expr_contains_int_lit(right, target)
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => expr_contains_int_lit(operand, target),
+            ExprKind::Deref { addr, .. } => expr_contains_int_lit(addr, target),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                expr_contains_int_lit(base, target) || expr_contains_int_lit(index, target)
+            }
+            ExprKind::FieldAccess { base, .. } => expr_contains_int_lit(base, target),
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+                args.iter().any(|arg| expr_contains_int_lit(arg, target))
+            }
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                expr_contains_int_lit(lhs, target) || expr_contains_int_lit(rhs, target)
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                expr_contains_int_lit(cond, target)
+                    || expr_contains_int_lit(then_expr, target)
+                    || expr_contains_int_lit(else_expr, target)
+            }
+        }
+    }
+
+    fn contains_return_literal(nodes: &[StructuredNode], target: i128) -> bool {
+        for node in nodes {
+            match node {
+                StructuredNode::Return(Some(expr)) if expr_contains_int_lit(expr, target) => {
+                    return true;
+                }
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    if contains_return_literal(then_body, target)
+                        || else_body
+                            .as_ref()
+                            .is_some_and(|body| contains_return_literal(body, target))
+                    {
+                        return true;
+                    }
+                }
+                StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::For { body, .. }
+                | StructuredNode::Loop { body, .. }
+                | StructuredNode::Sequence(body) => {
+                    if contains_return_literal(body, target) {
+                        return true;
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    if cases
+                        .iter()
+                        .any(|(_, body)| contains_return_literal(body, target))
+                        || default
+                            .as_ref()
+                            .is_some_and(|body| contains_return_literal(body, target))
+                    {
+                        return true;
+                    }
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    if contains_return_literal(try_body, target)
+                        || catch_handlers
+                            .iter()
+                            .any(|handler| contains_return_literal(&handler.body, target))
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    fn contains_void_return(nodes: &[StructuredNode]) -> bool {
+        for node in nodes {
+            match node {
+                StructuredNode::Return(None) => return true,
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    if contains_void_return(then_body)
+                        || else_body
+                            .as_ref()
+                            .is_some_and(|body| contains_void_return(body))
+                    {
+                        return true;
+                    }
+                }
+                StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::For { body, .. }
+                | StructuredNode::Loop { body, .. }
+                | StructuredNode::Sequence(body) => {
+                    if contains_void_return(body) {
+                        return true;
+                    }
+                }
+                StructuredNode::Switch { cases, default, .. } => {
+                    if cases.iter().any(|(_, body)| contains_void_return(body))
+                        || default
+                            .as_ref()
+                            .is_some_and(|body| contains_void_return(body))
+                    {
+                        return true;
+                    }
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    if contains_void_return(try_body)
+                        || catch_handlers
+                            .iter()
+                            .any(|handler| contains_void_return(&handler.body))
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
     #[test]
     fn test_extract_switch_range_info() {
         use super::super::expression::BinOpKind;
@@ -3004,6 +3296,28 @@ mod tests {
             .iter()
             .any(|n| matches!(n, StructuredNode::If { .. }));
         assert!(has_if, "Diamond CFG should produce if-else structure");
+    }
+
+    #[test]
+    fn test_structurer_preserves_shared_return_branch_values() {
+        let cfg = make_shared_return_diamond_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        assert!(
+            contains_return_literal(structured.body(), 1),
+            "Expected a branch-specific return value of 1 in {:?}",
+            structured.body()
+        );
+        assert!(
+            contains_return_literal(structured.body(), 0),
+            "Expected a branch-specific return value of 0 in {:?}",
+            structured.body()
+        );
+        assert!(
+            !contains_void_return(structured.body()),
+            "Shared return join should not leave behind a void return: {:?}",
+            structured.body()
+        );
     }
 
     #[test]
