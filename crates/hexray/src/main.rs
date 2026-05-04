@@ -3619,11 +3619,47 @@ fn handle_session_new(binary_path: &Path, output: Option<&PathBuf>) -> Result<()
     Ok(())
 }
 
+fn canonicalize_output_path(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(_) if !path.exists() => {
+            let parent = path.parent().unwrap_or(Path::new("."));
+            let parent = parent.canonicalize().with_context(|| {
+                format!("Failed to resolve output directory: {}", parent.display())
+            })?;
+            let Some(file_name) = path.file_name() else {
+                bail!("Output path must include a filename: {}", path.display());
+            };
+            Ok(parent.join(file_name))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to resolve output path: {}", path.display()))
+        }
+    }
+}
+
+fn ensure_distinct_export_paths(session_path: &Path, output_path: &Path) -> Result<()> {
+    let session_path = session_path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve session path: {}", session_path.display()))?;
+    let output_path = canonicalize_output_path(output_path)?;
+
+    if session_path == output_path {
+        bail!("input and output paths are the same");
+    }
+
+    Ok(())
+}
+
 fn handle_session_export(
     session_path: &Path,
     output: Option<&PathBuf>,
     format: &str,
 ) -> Result<()> {
+    if let Some(path) = output {
+        ensure_distinct_export_paths(session_path, path)?;
+    }
+
     let session = Session::resume(session_path)?;
     let history = session.get_history(None)?;
 
@@ -4992,8 +5028,13 @@ fn format_arch_for_info(arch: Architecture) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_symbol_in_candidates, SymbolLookupMode};
+    use super::{ensure_distinct_export_paths, find_symbol_in_candidates, SymbolLookupMode};
     use hexray_core::{Symbol, SymbolBinding, SymbolKind};
+    use std::fs;
+
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hexray-{}-{}", std::process::id(), name))
+    }
 
     fn test_symbol(name: &str, address: u64) -> Symbol {
         Symbol {
@@ -5057,5 +5098,18 @@ mod tests {
             find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
 
         assert_eq!(resolved.name, "nfsd_open.cold");
+    }
+
+    #[test]
+    fn export_rejects_same_input_and_output_path() {
+        let session_path = unique_temp_path("session-export-same-path.hrp");
+        fs::write(&session_path, b"session").unwrap();
+
+        let err = ensure_distinct_export_paths(&session_path, &session_path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("input and output paths are the same"));
+
+        fs::remove_file(&session_path).unwrap();
     }
 }
