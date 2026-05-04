@@ -445,11 +445,28 @@ fn validate_project_function_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn load_analysis_project(path: &Path) -> Result<AnalysisProject> {
+    if !path.exists() {
+        bail!("Project file not found: {}", path.display());
+    }
+
+    AnalysisProject::load(path)
+        .with_context(|| format!("Failed to load project: {}", path.display()))
+}
+
+fn load_requested_project(
+    explicit: Option<&Path>,
+    global: Option<&Path>,
+) -> Result<Option<AnalysisProject>> {
+    explicit.or(global).map(load_analysis_project).transpose()
+}
+
 fn main() -> Result<()> {
     // Restore the Unix default so piped output exits quietly on EPIPE.
     sigpipe::reset();
 
     let cli = Cli::parse();
+    let global_project_path = cli.project.clone();
 
     // Handle commands that don't require a binary file
     if let Some(Commands::Types { action }) = cli.command {
@@ -569,7 +586,8 @@ fn main() -> Result<()> {
             json,
             html,
         }) => {
-            disassemble_cfg(fmt, &target, dot, json, html)?;
+            let project = load_requested_project(None, global_project_path.as_deref())?;
+            disassemble_cfg(fmt, &target, dot, json, html, project.as_ref())?;
         }
         Some(Commands::Decompile {
             target,
@@ -591,13 +609,8 @@ fn main() -> Result<()> {
             }
 
             let target = resolve_decompile_target(&binary, target)?;
-            let project = match project {
-                Some(path) => Some(
-                    AnalysisProject::load(&path)
-                        .with_context(|| format!("Failed to load project: {}", path.display()))?,
-                ),
-                None => None,
-            };
+            let project =
+                load_requested_project(project.as_deref(), global_project_path.as_deref())?;
             let type_db = load_type_database(&binary, types.as_deref())?;
 
             // Build decompiler config
@@ -971,6 +984,40 @@ fn find_symbol_with_mode(
     find_symbol_in_candidates(&symbols, name, mode)
 }
 
+fn find_symbol_for_project(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    name: &str,
+) -> Option<hexray_core::Symbol> {
+    let mut symbols: Vec<hexray_core::Symbol> =
+        fmt.symbols().filter(|s| s.is_defined()).cloned().collect();
+
+    if let Some(project) = project {
+        for addr in project.overridden_functions() {
+            let Some(project_name) = project.get_function_name(addr) else {
+                continue;
+            };
+
+            let mut symbol = fmt.symbol_at(addr).cloned().unwrap_or(hexray_core::Symbol {
+                name: project_name.to_string(),
+                address: addr,
+                size: 0,
+                kind: hexray_core::SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Local,
+                section_index: fmt.section_containing(addr).map(|_| 0),
+            });
+            symbol.name = project_name.to_string();
+            symbol.kind = hexray_core::SymbolKind::Function;
+            if symbol.section_index.is_none() && fmt.section_containing(addr).is_some() {
+                symbol.section_index = Some(0);
+            }
+            symbols.push(symbol);
+        }
+    }
+
+    find_symbol_in_candidates(&symbols, name, SymbolLookupMode::Fuzzy)
+}
+
 fn find_symbol_in_candidates(
     symbols: &[hexray_core::Symbol],
     name: &str,
@@ -1179,6 +1226,7 @@ fn disassemble_cfg(
     dot: bool,
     json: bool,
     html: bool,
+    project: Option<&AnalysisProject>,
 ) -> Result<()> {
     // Try to parse as address first
     let address = if let Some(stripped) = target.strip_prefix("0x") {
@@ -1188,22 +1236,26 @@ fn disassemble_cfg(
     };
 
     let (start_addr, name, max_bytes, stop_after_first_return) = if let Some(addr) = address {
-        (addr, format!("sub_{:x}", addr), 4096usize, true)
+        let name = project
+            .and_then(|p| p.get_function_name(addr))
+            .map(|n| n.to_string())
+            .or_else(|| fmt.symbol_at(addr).map(|s| demangle_or_original(&s.name)))
+            .unwrap_or_else(|| format!("sub_{:x}", addr));
+        (addr, name, 4096usize, true)
     } else {
         // Find symbol using improved search
-        let symbol =
-            find_symbol(fmt, target).with_context(|| format!("Symbol '{}' not found", target))?;
+        let symbol = find_symbol_for_project(fmt, project, target)
+            .with_context(|| format!("Symbol '{}' not found", target))?;
         let max_bytes = if symbol.size > 0 {
             symbol.size as usize
         } else {
             4096usize
         };
-        (
-            symbol.address,
-            demangle_or_original(&symbol.name),
-            max_bytes,
-            symbol.size == 0,
-        )
+        let name = project
+            .and_then(|p| p.get_function_name(symbol.address))
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| demangle_or_original(&symbol.name));
+        (symbol.address, name, max_bytes, symbol.size == 0)
     };
 
     // Disassemble instructions
@@ -1350,7 +1402,7 @@ fn decompile_function(
         (addr, name, 4096usize, true)
     } else {
         // Find symbol using improved search
-        let symbol = find_symbol(fmt, target)
+        let symbol = find_symbol_for_project(fmt, project, target)
             .with_context(|| format!("Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).", target))?;
         let max_bytes = if symbol.size > 0 {
             symbol.size as usize
@@ -2257,8 +2309,8 @@ fn decompile_with_follow(
             .unwrap_or_else(|| format!("sub_{:x}", addr));
         (addr, name)
     } else {
-        let symbol =
-            find_symbol(fmt, target).with_context(|| format!("Symbol '{}' not found", target))?;
+        let symbol = find_symbol_for_project(fmt, project, target)
+            .with_context(|| format!("Symbol '{}' not found", target))?;
         // Check if project has a custom name for this address
         let name = project
             .and_then(|p| p.get_function_name(symbol.address))

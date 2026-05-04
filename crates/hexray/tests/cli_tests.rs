@@ -1310,6 +1310,81 @@ fn test_project_name_rejects_invalid_identifiers() {
     );
 }
 
+#[test]
+fn test_project_names_propagate_through_cfg_and_lookup() {
+    skip_if_missing!("elf/test_with_symbols");
+
+    let project_path = temp_path("project-name-propagation", "hxp");
+    let project_str = project_path.to_string_lossy().to_string();
+    let binary = fixture_path("elf/test_with_symbols");
+
+    let create = run_hexray(&[&binary, "project", "create", "-o", &project_str]);
+    assert!(
+        create.status.success(),
+        "project create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let rename = run_hexray(&["project", "name", &project_str, "0x40100f", "rp_name"]);
+    assert!(
+        rename.status.success(),
+        "project rename should succeed: {}",
+        String::from_utf8_lossy(&rename.stderr)
+    );
+
+    let cfg = run_hexray(&["-p", &project_str, &binary, "cfg", "0x40100f"]);
+    assert!(
+        cfg.status.success(),
+        "cfg with project should succeed: {}",
+        String::from_utf8_lossy(&cfg.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&cfg.stdout).contains("Building CFG for rp_name at 0x40100f"),
+        "cfg output should use the project name: {}",
+        String::from_utf8_lossy(&cfg.stdout)
+    );
+
+    let cfg_by_name = run_hexray(&["-p", &project_str, &binary, "cfg", "rp_name"]);
+    assert!(
+        cfg_by_name.status.success(),
+        "cfg should resolve project names as targets: {}",
+        String::from_utf8_lossy(&cfg_by_name.stderr)
+    );
+
+    let decompile = run_hexray(&[&binary, "decompile", "--project", &project_str, "rp_name"]);
+    assert!(
+        decompile.status.success(),
+        "decompile should resolve project names as targets: {}",
+        String::from_utf8_lossy(&decompile.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&decompile.stdout).contains("Decompiling rp_name at 0x40100f"),
+        "decompile output should use the project name: {}",
+        String::from_utf8_lossy(&decompile.stdout)
+    );
+}
+
+#[test]
+fn test_global_project_flag_rejects_missing_file() {
+    skip_if_missing!("elf/test_with_symbols");
+
+    let missing_path = temp_path("missing-project", "hxp");
+    let _ = fs::remove_file(&missing_path);
+    let missing_str = missing_path.to_string_lossy().to_string();
+    let binary = fixture_path("elf/test_with_symbols");
+
+    let output = run_hexray(&["-p", &missing_str, &binary, "cfg", "0x40100f"]);
+    assert!(
+        !output.status.success(),
+        "cfg should fail when the requested project file is missing"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Project file not found"),
+        "missing-project failure should be explicit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // =============================================================================
 // Format Detection Tests
 // =============================================================================
