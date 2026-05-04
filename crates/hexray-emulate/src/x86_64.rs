@@ -16,6 +16,7 @@ pub fn execute(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
         Operation::Add => execute_add(state, inst),
         Operation::Sub => execute_sub(state, inst),
         Operation::Mul => execute_mul(state, inst),
+        Operation::Div => execute_div(state, inst),
         Operation::And => execute_and(state, inst),
         Operation::Or => execute_or(state, inst),
         Operation::Xor => execute_xor(state, inst),
@@ -36,6 +37,7 @@ pub fn execute(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
         Operation::ConditionalJump => execute_jcc(state, inst),
         Operation::Call => execute_call(state, inst),
         Operation::Return => execute_ret(state, inst),
+        Operation::SignExtend => execute_sign_extend(state, inst),
         Operation::Nop => Ok(()), // No operation
         _ => {
             // Handle setcc and cmov by checking the mnemonic
@@ -240,6 +242,60 @@ fn execute_mul(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
     let b = read_operand(state, &inst.operands[1], inst);
     let result = a.mul(&b);
     write_operand(state, &inst.operands[0], result, inst);
+    Ok(())
+}
+
+fn execute_div(state: &mut MachineState, inst: &Instruction) -> EmulationResult<()> {
+    if inst.operands.is_empty() {
+        return Ok(());
+    }
+
+    let width = operand_size(&inst.operands[0]);
+    let signed = inst.mnemonic.eq_ignore_ascii_case("idiv");
+    let divisor = read_operand(state, &inst.operands[0], inst);
+
+    let Some(divisor_bits) = divisor.as_concrete() else {
+        write_division_unknown(state, width);
+        return Ok(());
+    };
+
+    if divisor_bits == 0 {
+        return Err(EmulationError::DivisionByZero);
+    }
+
+    if signed {
+        let dividend = signed_dividend(state, width);
+        let divisor = sign_extend(divisor_bits as u128, width);
+        let quotient = dividend / divisor;
+        let remainder = dividend % divisor;
+        let min = -(1i128 << (width - 1));
+        let max = (1i128 << (width - 1)) - 1;
+        if quotient < min || quotient > max {
+            return Err(EmulationError::InvalidOperand(format!(
+                "Division overflow for {}-bit idiv",
+                width
+            )));
+        }
+        write_division_result(
+            state,
+            width,
+            (quotient as u128 & mask_for_bits_u128(width)) as u64,
+            (remainder as u128 & mask_for_bits_u128(width)) as u64,
+        );
+    } else {
+        let dividend = unsigned_dividend(state, width);
+        let divisor = divisor_bits as u128 & mask_for_bits_u128(width);
+        let quotient = dividend / divisor;
+        let remainder = dividend % divisor;
+        if quotient > mask_for_bits_u128(width) {
+            return Err(EmulationError::InvalidOperand(format!(
+                "Division overflow for {}-bit div",
+                width
+            )));
+        }
+        write_division_result(state, width, quotient as u64, remainder as u64);
+    }
+
     Ok(())
 }
 
@@ -565,6 +621,173 @@ fn execute_leave(state: &mut MachineState) -> EmulationResult<()> {
     Ok(())
 }
 
+fn execute_sign_extend(state: &mut MachineState, inst: &Instruction) -> EmulationResult<()> {
+    match inst.mnemonic.as_str() {
+        "cbw" => {
+            let value = state.get_register_8l(x86_regs::RAX).sext(8);
+            state.set_register_16(x86_regs::RAX, value);
+        }
+        "cwde" => {
+            let value = state.get_register_16(x86_regs::RAX).sext(16);
+            state.set_register_32(x86_regs::RAX, value);
+        }
+        "cdqe" => {
+            let value = state.get_register_32(x86_regs::RAX).sext(32);
+            state.set_register(x86_regs::RAX, value);
+        }
+        "cwd" => {
+            let value = state.get_register_16(x86_regs::RAX);
+            state.set_register_16(
+                x86_regs::RDX,
+                sign_fill(value.as_concrete(), 16).map_or(Value::Unknown, Value::Concrete),
+            );
+        }
+        "cdq" => {
+            let value = state.get_register_32(x86_regs::RAX);
+            state.set_register_32(
+                x86_regs::RDX,
+                sign_fill(value.as_concrete(), 32).map_or(Value::Unknown, Value::Concrete),
+            );
+        }
+        "cqo" => {
+            let value = state.get_register(x86_regs::RAX);
+            state.set_register(
+                x86_regs::RDX,
+                sign_fill(value.as_concrete(), 64).map_or(Value::Unknown, Value::Concrete),
+            );
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn sign_fill(value: Option<u64>, bits: u32) -> Option<u64> {
+    value.map(|value| {
+        if bits == 64 {
+            if value >> 63 != 0 {
+                u64::MAX
+            } else {
+                0
+            }
+        } else if (value >> (bits - 1)) & 1 != 0 {
+            mask_for_bits(bits)
+        } else {
+            0
+        }
+    })
+}
+
+fn unsigned_dividend(state: &MachineState, width: u32) -> u128 {
+    match width {
+        8 => state.get_register_16(x86_regs::RAX).unwrap_concrete() as u128,
+        16 => {
+            let high = state.get_register_16(x86_regs::RDX).unwrap_concrete() as u128;
+            let low = state.get_register_16(x86_regs::RAX).unwrap_concrete() as u128;
+            (high << 16) | low
+        }
+        32 => {
+            let high = state.get_register_32(x86_regs::RDX).unwrap_concrete() as u128;
+            let low = state.get_register_32(x86_regs::RAX).unwrap_concrete() as u128;
+            (high << 32) | low
+        }
+        64 => {
+            let high = state.get_register(x86_regs::RDX).unwrap_concrete() as u128;
+            let low = state.get_register(x86_regs::RAX).unwrap_concrete() as u128;
+            (high << 64) | low
+        }
+        _ => 0,
+    }
+}
+
+fn signed_dividend(state: &MachineState, width: u32) -> i128 {
+    match width {
+        8 => sign_extend(
+            state.get_register_16(x86_regs::RAX).unwrap_concrete() as u128,
+            16,
+        ),
+        16 => {
+            let high = state.get_register_16(x86_regs::RDX).unwrap_concrete() as u128;
+            let low = state.get_register_16(x86_regs::RAX).unwrap_concrete() as u128;
+            sign_extend((high << 16) | low, 32)
+        }
+        32 => {
+            let high = state.get_register_32(x86_regs::RDX).unwrap_concrete() as u128;
+            let low = state.get_register_32(x86_regs::RAX).unwrap_concrete() as u128;
+            sign_extend((high << 32) | low, 64)
+        }
+        64 => {
+            let high = state.get_register(x86_regs::RDX).unwrap_concrete() as u128;
+            let low = state.get_register(x86_regs::RAX).unwrap_concrete() as u128;
+            sign_extend((high << 64) | low, 128)
+        }
+        _ => 0,
+    }
+}
+
+fn sign_extend(value: u128, bits: u32) -> i128 {
+    let mask = mask_for_bits_u128(bits);
+    let value = value & mask;
+    let sign_bit = 1u128 << (bits - 1);
+    if value & sign_bit != 0 {
+        (value | !mask) as i128
+    } else {
+        value as i128
+    }
+}
+
+fn mask_for_bits_u128(bits: u32) -> u128 {
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
+fn write_division_result(state: &mut MachineState, width: u32, quotient: u64, remainder: u64) {
+    match width {
+        8 => {
+            state.set_register_8l(x86_regs::RAX, Value::Concrete(quotient));
+            state.set_register_8h(x86_regs::RAX, Value::Concrete(remainder));
+        }
+        16 => {
+            state.set_register_16(x86_regs::RAX, Value::Concrete(quotient));
+            state.set_register_16(x86_regs::RDX, Value::Concrete(remainder));
+        }
+        32 => {
+            state.set_register_32(x86_regs::RAX, Value::Concrete(quotient));
+            state.set_register_32(x86_regs::RDX, Value::Concrete(remainder));
+        }
+        64 => {
+            state.set_register(x86_regs::RAX, Value::Concrete(quotient));
+            state.set_register(x86_regs::RDX, Value::Concrete(remainder));
+        }
+        _ => {}
+    }
+}
+
+fn write_division_unknown(state: &mut MachineState, width: u32) {
+    match width {
+        8 => {
+            state.set_register_8l(x86_regs::RAX, Value::Unknown);
+            state.set_register_8h(x86_regs::RAX, Value::Unknown);
+        }
+        16 => {
+            state.set_register_16(x86_regs::RAX, Value::Unknown);
+            state.set_register_16(x86_regs::RDX, Value::Unknown);
+        }
+        32 => {
+            state.set_register_32(x86_regs::RAX, Value::Unknown);
+            state.set_register_32(x86_regs::RDX, Value::Unknown);
+        }
+        64 => {
+            state.set_register(x86_regs::RAX, Value::Unknown);
+            state.set_register(x86_regs::RDX, Value::Unknown);
+        }
+        _ => {}
+    }
+}
+
 fn execute_setcc(state: &mut MachineState, inst: &Instruction) -> EmulationResult<()> {
     if inst.operands.is_empty() {
         return Ok(());
@@ -610,7 +833,7 @@ fn execute_cmov(state: &mut MachineState, inst: &Instruction) -> EmulationResult
 mod tests {
     use super::execute;
     use crate::state::{x86_regs, MachineState};
-    use crate::Value;
+    use crate::{EmulationError, Value};
     use hexray_core::{
         Architecture, ControlFlow, Instruction, Operand, Operation, Register, RegisterClass,
     };
@@ -657,5 +880,38 @@ mod tests {
             state.get_register(x86_regs::RDX),
             Value::Concrete(0x3456_7812)
         );
+    }
+
+    #[test]
+    fn test_cdq_idiv_updates_quotient_and_remainder() {
+        let mut state = MachineState::new();
+        state.set_register(x86_regs::RAX, Value::Concrete(10));
+        state.set_register(x86_regs::RCX, Value::Concrete(2));
+
+        execute(&mut state, &make_inst(Operation::SignExtend, "cdq", vec![])).unwrap();
+        execute(
+            &mut state,
+            &make_inst(Operation::Div, "idiv", vec![reg(x86_regs::RCX, 32)]),
+        )
+        .unwrap();
+
+        assert_eq!(state.get_register(x86_regs::RAX), Value::Concrete(5));
+        assert_eq!(state.get_register(x86_regs::RDX), Value::Concrete(0));
+    }
+
+    #[test]
+    fn test_idiv_by_zero_errors() {
+        let mut state = MachineState::new();
+        state.set_register(x86_regs::RAX, Value::Concrete(10));
+        state.set_register(x86_regs::RCX, Value::Concrete(0));
+
+        execute(&mut state, &make_inst(Operation::SignExtend, "cdq", vec![])).unwrap();
+        let error = execute(
+            &mut state,
+            &make_inst(Operation::Div, "idiv", vec![reg(x86_regs::RCX, 32)]),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, EmulationError::DivisionByZero));
     }
 }
