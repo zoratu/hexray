@@ -193,6 +193,12 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             );
         };
 
+    let load_sections = |emu: &mut Emulator| {
+        for section in fmt.sections() {
+            emu.load_memory(section.virtual_address(), section.data());
+        }
+    };
+
     // Helper to parse register assignment (e.g., "rax=0x1234")
     let parse_reg_assignment = |s: &str| -> Result<(u16, u64)> {
         let parts: Vec<&str> = s.split('=').collect();
@@ -247,12 +253,7 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             };
             let mut emu = Emulator::new(config);
 
-            // Load code section into emulator memory
-            for section in fmt.sections() {
-                if section.is_executable() {
-                    emu.load_memory(section.virtual_address(), section.data());
-                }
-            }
+            load_sections(&mut emu);
 
             // Set initial register values
             for reg_str in &reg {
@@ -295,12 +296,7 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             };
             let mut emu = Emulator::new(config);
 
-            // Load code section
-            for section in fmt.sections() {
-                if section.is_executable() {
-                    emu.load_memory(section.virtual_address(), section.data());
-                }
-            }
+            load_sections(&mut emu);
 
             // Resolve the indirect branch
             let targets =
@@ -335,12 +331,7 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             };
             let mut emu = Emulator::new(config);
 
-            // Load code section
-            for section in fmt.sections() {
-                if section.is_executable() {
-                    emu.load_memory(section.virtual_address(), section.data());
-                }
-            }
+            load_sections(&mut emu);
 
             // Set initial register values
             for reg_str in &reg {

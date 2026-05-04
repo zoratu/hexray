@@ -355,19 +355,26 @@ impl Emulator {
             self.visit_counts.clear();
 
             if let Ok(result) = self.execute(instructions) {
-                if let StopReason::IndirectBranch(addr) = result.stop_reason {
-                    if addr == indirect_addr {
-                        // Get the computed target
-                        let inst_map: HashMap<u64, &Instruction> = instructions
-                            .iter()
-                            .map(|inst| (inst.address, inst))
-                            .collect();
-                        if let Some(inst) = inst_map.get(&addr) {
-                            let target = self.get_jump_target(inst);
-                            if let Value::Concrete(t) = target {
-                                if !targets.contains(&t) {
-                                    targets.push(t);
-                                }
+                let stopped_at_indirect = matches!(
+                    result.stop_reason,
+                    StopReason::IndirectBranch(addr) if addr == indirect_addr
+                );
+                let stopped_at_indirect_call = matches!(
+                    result.stop_reason,
+                    StopReason::Call(target)
+                        if target != 0 && result.path.last().copied() == Some(indirect_addr)
+                );
+
+                if stopped_at_indirect || stopped_at_indirect_call {
+                    let inst_map: HashMap<u64, &Instruction> = instructions
+                        .iter()
+                        .map(|inst| (inst.address, inst))
+                        .collect();
+                    if let Some(inst) = inst_map.get(&indirect_addr) {
+                        let target = self.get_jump_target(inst);
+                        if let Value::Concrete(t) = target {
+                            if !targets.contains(&t) {
+                                targets.push(t);
                             }
                         }
                     }
@@ -384,7 +391,10 @@ impl Emulator {
 mod tests {
     use super::*;
     use crate::state::x86_regs;
-    use hexray_core::{Architecture, Operand, Operation, Register, RegisterClass};
+    use hexray_core::{
+        Architecture, ControlFlow, IndexMode, MemoryRef, Operand, Operation, Register,
+        RegisterClass,
+    };
 
     fn make_inst(addr: u64, op: Operation, operands: Vec<Operand>) -> Instruction {
         Instruction {
@@ -413,6 +423,25 @@ mod tests {
 
     fn imm(val: i64) -> Operand {
         Operand::imm(val as i128, 8)
+    }
+
+    fn mem(index_id: u16, scale: u8, displacement: i64) -> Operand {
+        Operand::Memory(MemoryRef {
+            base: None,
+            index: Some(Register::new(
+                Architecture::X86_64,
+                RegisterClass::General,
+                index_id,
+                64,
+            )),
+            scale,
+            displacement,
+            size: 8,
+            segment: None,
+            broadcast: false,
+            index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
+        })
     }
 
     #[test]
@@ -465,5 +494,48 @@ mod tests {
         let result = emu.execute(&instructions).unwrap();
 
         assert!(matches!(result.stop_reason, StopReason::Call(0x2000)));
+    }
+
+    #[test]
+    fn test_resolve_indirect_collects_concrete_indirect_call_targets() {
+        let mut emu = Emulator::new(EmulatorConfig {
+            stop_at_calls: true,
+            ..Default::default()
+        });
+
+        let mut mov_inst = make_inst(
+            0x1000,
+            Operation::Move,
+            vec![reg(x86_regs::RCX), mem(x86_regs::RAX, 8, 0x2000)],
+        );
+        mov_inst.reads = vec![Register::new(
+            Architecture::X86_64,
+            RegisterClass::General,
+            x86_regs::RAX,
+            64,
+        )];
+
+        let mut call_inst = make_inst(0x1004, Operation::Call, vec![reg(x86_regs::RCX)]);
+        call_inst.control_flow = ControlFlow::IndirectCall {
+            return_addr: 0x1008,
+        };
+        call_inst.reads = vec![Register::new(
+            Architecture::X86_64,
+            RegisterClass::General,
+            x86_regs::RCX,
+            64,
+        )];
+
+        let instructions = vec![mov_inst, call_inst];
+
+        let mut table_bytes = Vec::new();
+        for entry in [0x3000_u64, 0x4000_u64, 0x5000_u64] {
+            table_bytes.extend_from_slice(&entry.to_le_bytes());
+        }
+        emu.load_memory(0x2000, &table_bytes);
+
+        let targets = emu.resolve_indirect(&instructions, 0x1004, x86_regs::RAX, 0, 2);
+
+        assert_eq!(targets, vec![0x3000, 0x4000, 0x5000]);
     }
 }
