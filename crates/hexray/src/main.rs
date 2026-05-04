@@ -3444,6 +3444,22 @@ fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> 
                 println!();
             }
 
+            if show_all {
+                println!("Labels");
+                println!("{}", "-".repeat(40));
+                let mut count = 0;
+                for addr in project.annotated_addresses() {
+                    if let Some(label) = project.get_label(addr) {
+                        println!("{:#016x}: {}", addr, label);
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    println!("(none)");
+                }
+                println!();
+            }
+
             if show_all || bookmarks {
                 println!("Bookmarks");
                 println!("{}", "-".repeat(40));
