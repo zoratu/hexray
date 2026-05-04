@@ -2234,6 +2234,20 @@ fn build_callgraph(
     Ok(())
 }
 
+fn truncate_for_display(content: &str, max_chars: usize) -> String {
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
+        return content.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let prefix: String = content.chars().take(max_chars - 3).collect();
+    format!("{prefix}...")
+}
+
 fn extract_strings(
     fmt: &dyn BinaryFormat,
     min_length: usize,
@@ -2304,12 +2318,8 @@ fn extract_strings(
                 hexray_analysis::StringEncoding::Utf16Be => " (UTF-16 BE)",
             };
 
-            // Truncate very long strings
-            let display_content = if s.content.len() > 80 {
-                format!("{}...", &s.content[..77])
-            } else {
-                s.content.clone()
-            };
+            // Truncate very long strings without slicing through a UTF-8 codepoint.
+            let display_content = truncate_for_display(&s.content, 80);
 
             // Add indicators for special string types
             let mut indicators = Vec::new();
@@ -5053,8 +5063,8 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_distinct_export_paths, find_symbol_in_candidates, SessionExportFormat,
-        SymbolLookupMode,
+        ensure_distinct_export_paths, find_symbol_in_candidates, truncate_for_display,
+        SessionExportFormat, SymbolLookupMode,
     };
     use hexray_core::{Symbol, SymbolBinding, SymbolKind};
     use std::fs;
@@ -5125,6 +5135,15 @@ mod tests {
             find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
 
         assert_eq!(resolved.name, "nfsd_open.cold");
+    }
+
+    #[test]
+    fn truncate_for_display_preserves_utf8_boundaries() {
+        let content = format!("{}Æ{}", "A".repeat(76), "B".repeat(10));
+
+        let truncated = truncate_for_display(&content, 80);
+
+        assert_eq!(truncated, format!("{}Æ...", "A".repeat(76)));
     }
 
     #[test]
