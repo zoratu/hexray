@@ -28,8 +28,8 @@ use predicates::{
     exprs_equal, is_arm64_temp_register, is_arm64_temp_register_expr, is_assignable_unknown_name,
     is_declarable_variable, is_epilogue_statement, is_likely_global_identifier,
     is_loop_counter_like_name, is_prologue_statement, is_stack_canary_check_body,
-    is_stack_canary_load, normalize_variable_name, rename_register, try_extract_array_access,
-    try_extract_rip_relative_offset,
+    is_stack_canary_load, looks_like_parameter_name, normalize_variable_name, rename_register,
+    try_extract_array_access, try_extract_rip_relative_offset,
 };
 
 /// Represents a case value or range for switch statement output.
@@ -3398,9 +3398,12 @@ impl PseudoCodeEmitter {
                 // Collect simple variable references that need declaration
                 // This includes both original names (var_N, local_N, arg_N) and
                 // semantically renamed variables (iter, idx, tmp0, saved1, etc.)
-                if is_declarable_variable(&v.name) {
-                    // Use the renamed name for declaration (e.g., x8 → tmp0)
-                    let display_name = rename_register(&v.name);
+                let display_name = rename_register(&v.name);
+                if is_declarable_variable(&v.name)
+                    || (display_name != v.name
+                        && is_declarable_variable(&display_name)
+                        && !looks_like_parameter_name(&display_name))
+                {
                     vars.insert(display_name);
                 }
             }
@@ -5583,6 +5586,37 @@ mod tests {
         assert!(
             output.contains("int sum;"),
             "Expected declaration for inferred local 'sum', got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_declares_renamed_return_register_aliases() {
+        use super::super::expression::Variable;
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::call(
+                CallTarget::Named("atoi".to_string()),
+                vec![Expr::var(Variable::reg("rax", 8))],
+            )],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(Some(Expr::int(0)))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "declare_ret_alias");
+        assert!(
+            output.contains("int ret;"),
+            "Expected declaration for renamed return alias, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("atoi(ret);"),
+            "Expected renamed return register use in body, got:\n{}",
             output
         );
     }
