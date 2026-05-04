@@ -167,6 +167,34 @@ impl CallGraph {
         reachable
     }
 
+    /// Build a call graph containing only the nodes reachable from the entry.
+    pub fn subgraph_from(&self, entry: u64) -> Self {
+        let reachable = self.reachable_from(entry);
+        let mut subgraph = Self::new();
+
+        for address in &reachable {
+            if let Some(node) = self.get_node(*address) {
+                subgraph.add_node(node.address, node.name.clone(), node.is_external);
+            }
+        }
+
+        for &caller in &reachable {
+            for (callee, call_site) in self.callees(caller) {
+                if reachable.contains(&callee) {
+                    subgraph.add_call(caller, callee, call_site.clone());
+                }
+            }
+        }
+
+        for &(caller, call_address) in &self.unresolved_calls {
+            if reachable.contains(&caller) {
+                subgraph.add_unresolved_call(caller, call_address);
+            }
+        }
+
+        subgraph
+    }
+
     /// Find leaf functions (functions that don't call any other functions).
     pub fn leaf_functions(&self) -> Vec<u64> {
         self.nodes
@@ -625,6 +653,52 @@ mod tests {
         assert!(reachable.contains(&0x2000));
         assert!(reachable.contains(&0x3000));
         assert!(!reachable.contains(&0x4000));
+    }
+
+    #[test]
+    fn test_subgraph_from_filters_unreachable_nodes() {
+        let mut cg = CallGraph::new();
+        cg.add_node(0x1000, Some("main".to_string()), false);
+        cg.add_node(0x2000, Some("foo".to_string()), false);
+        cg.add_node(0x3000, Some("bar".to_string()), false);
+        cg.add_node(0x4000, Some("dead".to_string()), false);
+
+        cg.add_call(
+            0x1000,
+            0x2000,
+            CallSite {
+                call_address: 0x1010,
+                call_type: CallType::Direct,
+            },
+        );
+        cg.add_call(
+            0x2000,
+            0x3000,
+            CallSite {
+                call_address: 0x2010,
+                call_type: CallType::Direct,
+            },
+        );
+        cg.add_call(
+            0x4000,
+            0x3000,
+            CallSite {
+                call_address: 0x4010,
+                call_type: CallType::Direct,
+            },
+        );
+        cg.add_unresolved_call(0x1000, 0x1020);
+        cg.add_unresolved_call(0x4000, 0x4020);
+
+        let subgraph = cg.subgraph_from(0x1000);
+
+        assert_eq!(subgraph.node_count(), 3);
+        assert_eq!(subgraph.edge_count(), 2);
+        assert!(subgraph.get_node(0x1000).is_some());
+        assert!(subgraph.get_node(0x2000).is_some());
+        assert!(subgraph.get_node(0x3000).is_some());
+        assert!(subgraph.get_node(0x4000).is_none());
+        assert_eq!(subgraph.unresolved_calls(), &[(0x1000, 0x1020)]);
     }
 
     #[test]

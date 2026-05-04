@@ -2041,6 +2041,11 @@ fn build_callgraph(
 
         vec![(addr, name, size, heuristic_bounds)]
     };
+    let target_root = if target == "all" {
+        None
+    } else {
+        functions_to_analyze.first().map(|(addr, _, _, _)| *addr)
+    };
 
     // Helper to check if an address is in executable code (not a stub/import)
     let is_internal_code = |addr: u64| -> bool {
@@ -2065,11 +2070,14 @@ fn build_callgraph(
     let disasm_riscv = RiscVDisassembler::new();
     let disasm_riscv32 = RiscVDisassembler::new_rv32();
 
-    // Iteratively discover functions (up to 3 iterations to avoid infinite loops)
-    for _iteration in 0..3 {
-        if pending_functions.is_empty() {
+    // Discover all reachable callees for targeted graphs; keep the bounded
+    // best-effort discovery behavior for `all`.
+    let mut iteration = 0usize;
+    while !pending_functions.is_empty() {
+        if target == "all" && iteration >= 3 {
             break;
         }
+        iteration += 1;
 
         // Collect function info for current batch
         let function_infos: Vec<FunctionInfo> = pending_functions
@@ -2163,6 +2171,11 @@ fn build_callgraph(
             builder.add_symbols(&symbols);
             builder.build()
         }
+    };
+    let callgraph = if let Some(root) = target_root {
+        callgraph.subgraph_from(root)
+    } else {
+        callgraph
     };
 
     if html {
