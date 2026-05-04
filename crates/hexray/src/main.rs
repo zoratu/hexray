@@ -1223,10 +1223,10 @@ fn display_symbol_name(
         .unwrap_or_else(|| demangle_or_original(&symbol.name))
 }
 
-fn find_preferred_symbol_at<'a>(
-    symbols: &'a [hexray_core::Symbol],
+fn find_preferred_symbol_at(
+    symbols: &[hexray_core::Symbol],
     address: u64,
-) -> Option<&'a hexray_core::Symbol> {
+) -> Option<&hexray_core::Symbol> {
     symbols
         .iter()
         .filter(|symbol| symbol.address == address)

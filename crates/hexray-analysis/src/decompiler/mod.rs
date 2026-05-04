@@ -337,9 +337,7 @@ impl RelocationTable {
     }
 
     /// Returns all resolved call relocations.
-    pub fn call_relocations(
-        &self,
-    ) -> impl Iterator<Item = (u64, &CallRelocation)> + ExactSizeIterator + '_ {
+    pub fn call_relocations(&self) -> impl ExactSizeIterator<Item = (u64, &CallRelocation)> + '_ {
         self.call_relocations
             .iter()
             .map(|(addr, reloc)| (*addr, reloc))
