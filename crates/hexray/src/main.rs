@@ -369,6 +369,20 @@ impl<'a> Binary<'a> {
     }
 }
 
+fn default_calling_convention(
+    binary_type: BinaryType,
+    arch: Architecture,
+) -> hexray_analysis::CallingConvention {
+    match arch {
+        Architecture::Arm64 => hexray_analysis::CallingConvention::Aarch64,
+        Architecture::RiscV64 | Architecture::RiscV32 => hexray_analysis::CallingConvention::RiscV,
+        Architecture::X86_64 if matches!(binary_type, BinaryType::Pe) => {
+            hexray_analysis::CallingConvention::Win64
+        }
+        _ => hexray_analysis::CallingConvention::SystemV,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ProjectAddressRule {
     AnySection,
@@ -1475,11 +1489,14 @@ fn decompile_function(
     let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
 
     // Determine calling convention from architecture
-    let calling_convention = match arch {
-        Architecture::Arm64 => hexray_analysis::CallingConvention::Aarch64,
-        Architecture::RiscV64 | Architecture::RiscV32 => hexray_analysis::CallingConvention::RiscV,
-        _ => hexray_analysis::CallingConvention::SystemV,
-    };
+    let calling_convention = default_calling_convention(
+        match binary {
+            Binary::Elf(_) => BinaryType::Elf,
+            Binary::MachO(_) => BinaryType::MachO,
+            Binary::Pe(_) => BinaryType::Pe,
+        },
+        arch,
+    );
 
     let mut decompiler = Decompiler::new()
         .with_addresses(show_addresses)
@@ -2470,13 +2487,14 @@ fn decompile_with_follow(
         };
 
         // Decompile
-        let calling_convention = match arch {
-            Architecture::Arm64 => hexray_analysis::CallingConvention::Aarch64,
-            Architecture::RiscV64 | Architecture::RiscV32 => {
-                hexray_analysis::CallingConvention::RiscV
-            }
-            _ => hexray_analysis::CallingConvention::SystemV,
-        };
+        let calling_convention = default_calling_convention(
+            match binary {
+                Binary::Elf(_) => BinaryType::Elf,
+                Binary::MachO(_) => BinaryType::MachO,
+                Binary::Pe(_) => BinaryType::Pe,
+            },
+            arch,
+        );
         let mut decompiler = Decompiler::new()
             .with_addresses(show_addresses)
             .with_string_table(string_table.clone())
@@ -4423,13 +4441,14 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     .unwrap_or_else(|| format!("sub_{:x}", addr));
 
                 let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
-                let calling_convention = match fmt.architecture() {
-                    Architecture::Arm64 => hexray_analysis::CallingConvention::Aarch64,
-                    Architecture::RiscV64 | Architecture::RiscV32 => {
-                        hexray_analysis::CallingConvention::RiscV
-                    }
-                    _ => hexray_analysis::CallingConvention::SystemV,
-                };
+                let calling_convention = default_calling_convention(
+                    match binary {
+                        Binary::Elf(_) => BinaryType::Elf,
+                        Binary::MachO(_) => BinaryType::MachO,
+                        Binary::Pe(_) => BinaryType::Pe,
+                    },
+                    fmt.architecture(),
+                );
                 let decompiler = Decompiler::new()
                     .with_addresses(false)
                     .with_symbol_table(symbols)
@@ -5057,11 +5076,13 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
-        parse_address_str, truncate_for_display, SessionExportFormat, SymbolLookupMode,
+        default_calling_convention, ensure_distinct_export_paths, find_symbol_in_candidates,
+        format_callgraph_text, parse_address_str, truncate_for_display, SessionExportFormat,
+        SymbolLookupMode,
     };
     use hexray_analysis::{CallGraph, CallSite, CallType};
-    use hexray_core::{Symbol, SymbolBinding, SymbolKind};
+    use hexray_core::{Architecture, Symbol, SymbolBinding, SymbolKind};
+    use hexray_formats::BinaryType;
     use std::fs;
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
@@ -5237,5 +5258,25 @@ mod tests {
         assert!(err
             .to_string()
             .contains("format 'asciinema' not supported; valid: text, json"));
+    }
+
+    #[test]
+    fn default_calling_convention_uses_win64_for_pe_x86_64() {
+        assert_eq!(
+            default_calling_convention(BinaryType::Pe, Architecture::X86_64),
+            hexray_analysis::CallingConvention::Win64
+        );
+    }
+
+    #[test]
+    fn default_calling_convention_keeps_sysv_for_non_pe_x86_64() {
+        assert_eq!(
+            default_calling_convention(BinaryType::Elf, Architecture::X86_64),
+            hexray_analysis::CallingConvention::SystemV
+        );
+        assert_eq!(
+            default_calling_convention(BinaryType::MachO, Architecture::X86_64),
+            hexray_analysis::CallingConvention::SystemV
+        );
     }
 }

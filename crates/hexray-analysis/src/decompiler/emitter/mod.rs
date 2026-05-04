@@ -599,13 +599,46 @@ impl PseudoCodeEmitter {
             .unwrap_or_else(|| name.to_string())
     }
 
+    fn rename_register_for_display(&self, name: &str) -> String {
+        if let Some(rendered) = self.arg_register_display_name(name) {
+            return rendered;
+        }
+        rename_register(name)
+    }
+
+    fn arg_register_display_name(&self, name: &str) -> Option<String> {
+        let lower = name.to_lowercase();
+        let idx = self
+            .calling_convention
+            .integer_arg_registers()
+            .iter()
+            .position(|reg| reg.eq_ignore_ascii_case(&lower))
+            .or_else(|| {
+                self.calling_convention
+                    .integer_arg_registers_32()
+                    .iter()
+                    .position(|reg| reg.eq_ignore_ascii_case(&lower))
+            })
+            .or_else(|| {
+                self.calling_convention
+                    .float_arg_registers()
+                    .iter()
+                    .position(|reg| reg.eq_ignore_ascii_case(&lower))
+            })?;
+
+        Some(match self.calling_convention {
+            CallingConvention::RiscV => format!("a{}", idx),
+            _ => format!("arg{}", idx),
+        })
+    }
+
     fn resolve_display_identifier_name(&self, name: &str) -> String {
         if let Some(semantic_name) = self.try_get_semantic_var_name(name) {
             let overridden = self.apply_param_name_override(&semantic_name);
             return normalize_variable_name(&overridden);
         }
 
-        let renamed = rename_register(name);
+        let renamed = self.rename_register_for_display(name);
         let overridden = self.apply_param_name_override(&renamed);
         normalize_variable_name(&overridden)
     }
@@ -2146,7 +2179,7 @@ impl PseudoCodeEmitter {
                     } else {
                         // Rename callee-saved registers to meaningful names
                         // These are commonly used to hold return values/error codes
-                        let renamed = rename_register(&var.name);
+                        let renamed = self.rename_register_for_display(&var.name);
                         let overridden = self.apply_param_name_override(&renamed);
                         normalize_variable_name(&overridden)
                     }
@@ -3416,7 +3449,7 @@ impl PseudoCodeEmitter {
         let raw = match &lhs.kind {
             ExprKind::Unknown(name) => self.resolve_display_identifier_name(name),
             ExprKind::Var(var) => {
-                let renamed = rename_register(&var.name);
+                let renamed = self.rename_register_for_display(&var.name);
                 self.apply_param_name_override(&renamed)
             }
             _ => return None,
@@ -3437,7 +3470,7 @@ impl PseudoCodeEmitter {
                 // Collect simple variable references that need declaration
                 // This includes both original names (var_N, local_N, arg_N) and
                 // semantically renamed variables (iter, idx, tmp0, saved1, etc.)
-                let display_name = rename_register(&v.name);
+                let display_name = self.rename_register_for_display(&v.name);
                 if is_declarable_variable(&v.name)
                     || (display_name != v.name
                         && is_declarable_variable(&display_name)
@@ -5081,7 +5114,7 @@ impl PseudoCodeEmitter {
                 // Include both original and semantically renamed variables
                 if is_declarable_variable(&v.name) {
                     // Return the renamed name for consistency with format_expr
-                    Some(rename_register(&v.name))
+                    Some(self.rename_register_for_display(&v.name))
                 } else {
                     None
                 }
@@ -5559,6 +5592,41 @@ mod tests {
         assert!(
             !output.contains(" arg0"),
             "Did not expect leaked arg0 names in output:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_win64_param_names_match_body_usage() {
+        use super::super::expression::Variable;
+
+        let product = Expr::binop(
+            BinOpKind::Mul,
+            Expr::var(Variable::reg("ecx", 4)),
+            Expr::var(Variable::reg("edx", 4)),
+        );
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(product))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_calling_convention(CallingConvention::Win64);
+        let output = emitter.emit(&cfg, "mul");
+
+        assert!(
+            output.contains("mul(") && output.contains("arg0") && output.contains("arg1"),
+            "Expected Win64 parameter names in signature/body, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("return arg0 * arg1;"),
+            "Expected Win64 body argument numbering, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("arg2") && !output.contains("arg3"),
+            "Did not expect SysV-only numbering in Win64 output:\n{}",
             output
         );
     }

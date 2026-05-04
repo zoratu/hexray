@@ -293,13 +293,6 @@ pub(super) fn rename_register(name: &str) -> String {
         "r13" | "r13d" | "r13w" | "r13b" => "saved1".to_string(),
         "r14" | "r14d" | "r14w" | "r14b" => "saved2".to_string(),
         "r15" | "r15d" | "r15w" | "r15b" => "saved3".to_string(),
-        // x86-64 argument registers (64-bit only for function args)
-        "rdi" => "arg0".to_string(),
-        "rsi" => "arg1".to_string(),
-        "rdx" => "arg2".to_string(),
-        "rcx" => "arg3".to_string(),
-        "r8" => "arg4".to_string(),
-        "r9" => "arg5".to_string(),
         // ARM64 callee-saved registers (x19-x28)
         "x19" | "w19" => "err".to_string(),
         "x20" | "w20" => "result".to_string(),
@@ -336,16 +329,6 @@ pub(super) fn rename_register(name: &str) -> String {
         "x17" | "w17" => "tmp9".to_string(),
         // x18 is the platform register (reserved on some OSes)
         "x18" | "w18" => "platform_reg".to_string(),
-        // ARM64 argument registers (x0 is both arg0 and return value - treat as arg0 here,
-        // return value handling is done separately by the return statement)
-        "x0" | "w0" => "arg0".to_string(),
-        "x1" | "w1" => "arg1".to_string(),
-        "x2" | "w2" => "arg2".to_string(),
-        "x3" | "w3" => "arg3".to_string(),
-        "x4" | "w4" => "arg4".to_string(),
-        "x5" | "w5" => "arg5".to_string(),
-        "x6" | "w6" => "arg6".to_string(),
-        "x7" | "w7" => "arg7".to_string(),
         // x86-64 low-byte and partial registers used as temporaries
         // These are often used for boolean conditions (setcc results)
         "al" | "ah" => "tmp_a".to_string(),
@@ -360,12 +343,6 @@ pub(super) fn rename_register(name: &str) -> String {
         "r9b" | "r9w" => "tmp_r9".to_string(),
         "r10b" | "r10w" => "tmp_r10".to_string(),
         "r11b" | "r11w" => "tmp_r11".to_string(),
-        // 32-bit subregister forms of the first argument registers.
-        // These appear frequently in parameter setup and should keep arg naming.
-        "edi" => "arg0".to_string(),
-        "esi" => "arg1".to_string(),
-        "edx" => "arg2".to_string(),
-        "ecx" => "arg3".to_string(),
         "r8d" => "tmp_r8".to_string(),
         "r9d" => "tmp_r9".to_string(),
         "r10d" => "tmp_r10".to_string(),
