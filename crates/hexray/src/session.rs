@@ -219,6 +219,10 @@ impl Session {
 
     /// Resume an existing session
     pub fn resume(session_path: &Path) -> Result<Self> {
+        if !session_path.exists() {
+            bail!("session not found at {}", session_path.display());
+        }
+
         let conn = Connection::open(session_path)
             .with_context(|| format!("Failed to open session: {}", session_path.display()))?;
 
@@ -1246,4 +1250,29 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<(PathBuf, SessionMeta)>> {
     sessions.sort_by_key(|b| std::cmp::Reverse(b.1.last_accessed));
 
     Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+
+    fn unique_temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hexray-{}-{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn resume_rejects_missing_session_without_creating_file() {
+        let session_path = unique_temp_path("missing-session.hrp");
+        let _ = std::fs::remove_file(&session_path);
+
+        let err = match Session::resume(&session_path) {
+            Ok(_) => panic!("expected missing session to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains(&format!("session not found at {}", session_path.display())));
+        assert!(!session_path.exists());
+    }
 }
