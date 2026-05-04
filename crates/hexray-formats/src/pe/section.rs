@@ -88,14 +88,30 @@ impl SectionHeader {
     }
 
     /// Populate the section data cache from file data.
-    pub fn populate_data(&mut self, file_data: &[u8], image_base: u64) {
+    pub fn populate_data(&mut self, file_data: &[u8], image_base: u64) -> Result<(), ParseError> {
         self.image_base = image_base;
         let start = self.pointer_to_raw_data as usize;
         let size = self.size_of_raw_data as usize;
-        let end = start.saturating_add(size);
-        if let Some(slice) = file_data.get(start..end) {
-            self.data_cache = slice.to_vec();
+        if size == 0 {
+            self.data_cache.clear();
+            return Ok(());
         }
+
+        let end = start.checked_add(size).ok_or_else(|| {
+            ParseError::invalid_structure("section", start as u64, "raw data overflow")
+        })?;
+        let Some(slice) = file_data.get(start..end) else {
+            return Err(ParseError::invalid_structure(
+                "section",
+                start as u64,
+                format!(
+                    "raw data extends past end of file (end {end:#x}, file size {:#x})",
+                    file_data.len()
+                ),
+            ));
+        };
+        self.data_cache = slice.to_vec();
+        Ok(())
     }
 
     /// Returns true if this section contains code.

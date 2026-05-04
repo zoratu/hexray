@@ -111,7 +111,7 @@ impl<'a> Pe<'a> {
                 break;
             };
             let mut section = SectionHeader::parse(sec_chunk)?;
-            section.populate_data(data, image_base);
+            section.populate_data(data, image_base)?;
             sections.push(section);
         }
 
@@ -296,5 +296,27 @@ impl BinaryFormat for Pe<'_> {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIMPLE_X64_PE: &[u8] = include_bytes!("../../../../tests/fixtures/pe/simple_x64.exe");
+
+    #[test]
+    fn parse_rejects_truncated_section_raw_data() {
+        for len in [512usize, 513usize] {
+            let truncated = &SIMPLE_X64_PE[..len];
+            let err = Pe::parse(truncated).expect_err("truncated PE should fail to parse");
+            assert!(
+                matches!(
+                    err,
+                    ParseError::InvalidStructure { .. } | ParseError::TooShort { .. }
+                ),
+                "unexpected error for len {len}: {err:?}"
+            );
+        }
     }
 }
