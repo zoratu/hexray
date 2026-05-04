@@ -464,6 +464,8 @@ impl PseudoCodeEmitter {
         func_name: &str,
         params: &[String],
     ) -> String {
+        let (func_name, trailing_qualifiers) =
+            Self::split_embedded_signature(func_name).unwrap_or((func_name, ""));
         let params_str = if params.is_empty() {
             "void".to_string()
         } else {
@@ -493,12 +495,42 @@ impl PseudoCodeEmitter {
                 )
             }
             _ => format!(
-                "{} {}({})",
+                "{} {}({}){}",
                 return_type.to_c_string(),
                 func_name,
-                params_str
+                params_str,
+                trailing_qualifiers
             ),
         }
+    }
+
+    fn split_embedded_signature(func_name: &str) -> Option<(&str, &str)> {
+        let close_idx = func_name.rfind(')')?;
+        let bytes = func_name.as_bytes();
+        let mut depth = 0usize;
+        let mut open_idx = None;
+
+        for idx in (0..=close_idx).rev() {
+            match bytes[idx] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        open_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let open_idx = open_idx?;
+        let suffix = &func_name[close_idx + 1..];
+        if suffix.contains('(') || suffix.contains(')') {
+            return None;
+        }
+
+        Some((func_name[..open_idx].trim_end(), suffix))
     }
 
     /// Creates a new emitter.
@@ -5395,6 +5427,17 @@ mod tests {
         assert!(output.contains("y = 1"));
         assert!(output.contains("else"));
         assert!(output.contains("y = 2"));
+    }
+
+    #[test]
+    fn test_format_function_header_reuses_demangled_qualifiers_without_double_parens() {
+        let header = PseudoCodeEmitter::format_function_header(
+            &super::super::signature::ParamType::SignedInt(32),
+            "Square::area() const",
+            &[String::from("int32_t* this")],
+        );
+
+        assert_eq!(header, "int32_t Square::area(int32_t* this) const");
     }
 
     #[test]
