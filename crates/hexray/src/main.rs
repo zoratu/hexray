@@ -20,8 +20,8 @@ use hexray_analysis::{
     is_noreturn_function_name, AnalysisProject, BinaryDataContext, BinaryDiff, CallGraphBuilder,
     CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CfgBuilder, CfgDotExporter,
     CfgHtmlExporter, CfgJsonExporter, Decompiler, DecompilerConfig, FunctionInfo,
-    OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder, PatchType, RelocationTable,
-    StringConfig, StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
+    OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder, Patch, PatchType,
+    RelocationTable, StringConfig, StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -3521,6 +3521,160 @@ struct JsonAffectedFunction {
     size: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileAddressRange {
+    file_start: u64,
+    file_end: u64,
+    va_start: u64,
+}
+
+enum DiffPatchAddressSpace {
+    FileOffsets(Vec<FileAddressRange>),
+    VirtualAddresses,
+}
+
+fn build_diff_patch_address_space(binary: &Binary<'_>) -> DiffPatchAddressSpace {
+    const ELF_PT_LOAD: u32 = 1;
+
+    match binary {
+        Binary::Elf(elf) => {
+            let mut ranges = Vec::new();
+
+            ranges.extend(
+                elf.segments
+                    .iter()
+                    .filter(|segment| segment.p_type == ELF_PT_LOAD && segment.p_filesz > 0)
+                    .map(|segment| FileAddressRange {
+                        file_start: segment.p_offset,
+                        file_end: segment.p_offset.saturating_add(segment.p_filesz),
+                        va_start: segment.p_vaddr,
+                    }),
+            );
+
+            ranges.extend(
+                elf.sections
+                    .iter()
+                    .filter(|section| section.sh_size > 0)
+                    .map(|section| FileAddressRange {
+                        file_start: section.sh_offset,
+                        file_end: section.sh_offset.saturating_add(section.sh_size),
+                        va_start: section.virtual_address(),
+                    }),
+            );
+
+            if ranges.is_empty() {
+                DiffPatchAddressSpace::VirtualAddresses
+            } else {
+                DiffPatchAddressSpace::FileOffsets(ranges)
+            }
+        }
+        Binary::MachO(macho) if !macho.is_fat_slice() => {
+            let mut ranges: Vec<FileAddressRange> = macho
+                .segments
+                .iter()
+                .filter(|segment| segment.filesize > 0)
+                .map(|segment| FileAddressRange {
+                    file_start: segment.fileoff,
+                    file_end: segment.fileoff.saturating_add(segment.filesize),
+                    va_start: segment.vmaddr,
+                })
+                .collect();
+
+            ranges.extend(
+                macho
+                    .segments
+                    .iter()
+                    .flat_map(|segment| segment.sections.iter())
+                    .filter(|section| section.size > 0)
+                    .map(|section| FileAddressRange {
+                        file_start: section.offset as u64,
+                        file_end: (section.offset as u64).saturating_add(section.size),
+                        va_start: section.addr,
+                    }),
+            );
+
+            if ranges.is_empty() {
+                DiffPatchAddressSpace::VirtualAddresses
+            } else {
+                DiffPatchAddressSpace::FileOffsets(ranges)
+            }
+        }
+        Binary::Pe(pe) => {
+            let ranges: Vec<FileAddressRange> = pe
+                .sections
+                .iter()
+                .filter(|section| section.size_of_raw_data > 0)
+                .map(|section| FileAddressRange {
+                    file_start: section.pointer_to_raw_data as u64,
+                    file_end: (section.pointer_to_raw_data as u64)
+                        .saturating_add(section.size_of_raw_data as u64),
+                    va_start: section.virtual_address(),
+                })
+                .collect();
+            if ranges.is_empty() {
+                DiffPatchAddressSpace::VirtualAddresses
+            } else {
+                DiffPatchAddressSpace::FileOffsets(ranges)
+            }
+        }
+        Binary::MachO(_) => DiffPatchAddressSpace::VirtualAddresses,
+    }
+}
+
+fn translate_patch_offset(ranges: &[FileAddressRange], offset: u64) -> Option<u64> {
+    ranges.iter().find_map(|range| {
+        if offset < range.file_start || offset >= range.file_end {
+            return None;
+        }
+        Some(
+            range
+                .va_start
+                .saturating_add(offset.saturating_sub(range.file_start)),
+        )
+    })
+}
+
+fn translated_patch_overlaps_function(
+    ranges: &[FileAddressRange],
+    patch: &Patch,
+    func_start: u64,
+    func_end: u64,
+) -> bool {
+    if patch.old_bytes.is_empty() {
+        return translate_patch_offset(ranges, patch.address)
+            .is_some_and(|va| va >= func_start && va < func_end);
+    }
+
+    let patch_end = patch.address.saturating_add(patch.old_bytes.len() as u64);
+    ranges.iter().any(|range| {
+        let overlap_start = patch.address.max(range.file_start);
+        let overlap_end = patch_end.min(range.file_end);
+        if overlap_start >= overlap_end {
+            return false;
+        }
+
+        let va_start = range
+            .va_start
+            .saturating_add(overlap_start.saturating_sub(range.file_start));
+        let va_end = va_start.saturating_add(overlap_end.saturating_sub(overlap_start));
+        va_start < func_end && va_end > func_start
+    })
+}
+
+fn patch_affects_function(
+    address_space: &DiffPatchAddressSpace,
+    patch: &Patch,
+    func_start: u64,
+    func_end: u64,
+) -> bool {
+    match address_space {
+        DiffPatchAddressSpace::FileOffsets(ranges) => {
+            translated_patch_overlaps_function(ranges, patch, func_start, func_end)
+        }
+        DiffPatchAddressSpace::VirtualAddresses => patch.affects_range(func_start, func_end),
+    }
+}
+
 fn handle_diff_command(
     original_path: &Path,
     modified_path: &Path,
@@ -3565,6 +3719,7 @@ fn handle_diff_command(
     };
 
     let fmt = original_binary.as_format();
+    let patch_address_space = build_diff_patch_address_space(&original_binary);
 
     // Find functions affected by the patches
     let mut affected_functions: Vec<(u64, String, u64)> = Vec::new();
@@ -3576,7 +3731,12 @@ fn handle_diff_command(
         let func_end = sym.address + sym.size;
 
         // Check if any patch overlaps with this function
-        if diff.patches.affects_range(func_start, func_end) {
+        if diff
+            .patches
+            .patches
+            .iter()
+            .any(|patch| patch_affects_function(&patch_address_space, patch, func_start, func_end))
+        {
             let name = demangle_or_original(&sym.name);
             affected_functions.push((sym.address, name, sym.size));
         }
@@ -5243,10 +5403,11 @@ fn format_arch_for_info(arch: Architecture) -> String {
 mod tests {
     use super::{
         default_calling_convention, ensure_distinct_export_paths, find_symbol_in_candidates,
-        format_callgraph_text, parse_address_str, string_tags, truncate_for_display,
-        SessionExportFormat, SymbolLookupMode,
+        format_callgraph_text, parse_address_str, patch_affects_function, string_tags,
+        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, SessionExportFormat,
+        SymbolLookupMode,
     };
-    use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, StringEncoding};
+    use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding};
     use hexray_core::{Architecture, Symbol, SymbolBinding, SymbolKind};
     use hexray_formats::BinaryType;
     use std::fs;
@@ -5473,5 +5634,83 @@ mod tests {
             default_calling_convention(BinaryType::MachO, Architecture::X86_64),
             hexray_analysis::CallingConvention::SystemV
         );
+    }
+
+    #[test]
+    fn diff_attribution_translates_et_exec_file_offsets_to_virtual_addresses() {
+        let address_space = DiffPatchAddressSpace::FileOffsets(vec![FileAddressRange {
+            file_start: 0x1000,
+            file_end: 0x2000,
+            va_start: 0x401000,
+        }]);
+        let add_start = 0x401106;
+        let add_end = 0x40111e;
+        let factorial_start = 0x40111e;
+        let factorial_end = 0x401150;
+
+        let mid_add = Patch::new(0x111a, vec![0x01], vec![0x29]);
+        assert!(patch_affects_function(
+            &address_space,
+            &mid_add,
+            add_start,
+            add_end
+        ));
+        assert!(!patch_affects_function(
+            &address_space,
+            &mid_add,
+            factorial_start,
+            factorial_end
+        ));
+
+        let last_add_byte = Patch::new(0x111d, vec![0x02], vec![0x2a]);
+        assert!(patch_affects_function(
+            &address_space,
+            &last_add_byte,
+            add_start,
+            add_end
+        ));
+        assert!(!patch_affects_function(
+            &address_space,
+            &last_add_byte,
+            factorial_start,
+            factorial_end
+        ));
+
+        let first_factorial_byte = Patch::new(0x111e, vec![0x03], vec![0x2b]);
+        assert!(!patch_affects_function(
+            &address_space,
+            &first_factorial_byte,
+            add_start,
+            add_end
+        ));
+        assert!(patch_affects_function(
+            &address_space,
+            &first_factorial_byte,
+            factorial_start,
+            factorial_end
+        ));
+    }
+
+    #[test]
+    fn diff_attribution_ignores_unmapped_eof_insertions() {
+        let address_space = DiffPatchAddressSpace::FileOffsets(vec![FileAddressRange {
+            file_start: 0x1000,
+            file_end: 0x2000,
+            va_start: 0x401000,
+        }]);
+        let eof_append = Patch::new(0xab80, vec![], vec![0x00]);
+
+        assert!(!patch_affects_function(
+            &address_space,
+            &eof_append,
+            0x401106,
+            0x40111e
+        ));
+        assert!(!patch_affects_function(
+            &address_space,
+            &eof_append,
+            0x4011f0,
+            0x401260
+        ));
     }
 }
