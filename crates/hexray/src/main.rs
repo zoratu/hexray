@@ -374,6 +374,55 @@ impl<'a> Binary<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ProjectAddressRule {
+    AnySection,
+    Executable,
+    ExecutableOrData,
+}
+
+fn validate_project_address(
+    binary_path: &Path,
+    address: u64,
+    rule: ProjectAddressRule,
+) -> Result<()> {
+    let data = fs::read(binary_path)
+        .with_context(|| format!("Failed to read binary: {}", binary_path.display()))?;
+    let binary = match detect_format(&data) {
+        BinaryType::Elf => Binary::Elf(Elf::parse(&data).context("Failed to parse ELF file")?),
+        BinaryType::MachO => Binary::MachO(
+            MachO::parse_with_arch(&data, None).context("Failed to parse Mach-O file")?,
+        ),
+        BinaryType::Pe => Binary::Pe(Pe::parse(&data).context("Failed to parse PE file")?),
+        BinaryType::Unknown => {
+            bail!("Unknown binary format. Supported formats: ELF, Mach-O, PE");
+        }
+    };
+
+    let Some(section) = binary.as_format().section_containing(address) else {
+        bail!("address {:#x} not in any section", address);
+    };
+
+    match rule {
+        ProjectAddressRule::AnySection => Ok(()),
+        ProjectAddressRule::Executable if section.is_executable() => Ok(()),
+        ProjectAddressRule::Executable => {
+            bail!("address {:#x} is not in an executable section", address)
+        }
+        ProjectAddressRule::ExecutableOrData
+            if section.is_executable() || section.is_allocated() =>
+        {
+            Ok(())
+        }
+        ProjectAddressRule::ExecutableOrData => {
+            bail!(
+                "address {:#x} is not in an executable or data section",
+                address
+            )
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Restore the Unix default so piped output exits quietly on EPIPE.
     sigpipe::reset();
@@ -2972,6 +3021,11 @@ fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> 
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
+            validate_project_address(
+                &project.binary_path,
+                address,
+                ProjectAddressRule::ExecutableOrData,
+            )?;
             project.set_comment(address, &comment);
             project.save(&project_path)?;
 
@@ -2986,6 +3040,11 @@ fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> 
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
+            validate_project_address(
+                &project.binary_path,
+                address,
+                ProjectAddressRule::Executable,
+            )?;
             project.set_function_name(address, &name);
             project.save(&project_path)?;
 
@@ -3000,6 +3059,11 @@ fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> 
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
+            validate_project_address(
+                &project.binary_path,
+                address,
+                ProjectAddressRule::AnySection,
+            )?;
             project.set_label(address, &label);
             project.save(&project_path)?;
 
@@ -3014,6 +3078,11 @@ fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> 
             let mut project = AnalysisProject::load(&project_path)
                 .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
 
+            validate_project_address(
+                &project.binary_path,
+                address,
+                ProjectAddressRule::ExecutableOrData,
+            )?;
             project.add_bookmark(address, label.clone());
             project.save(&project_path)?;
 

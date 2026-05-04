@@ -33,6 +33,19 @@ fn run_hexray(args: &[&str]) -> Output {
         .expect("Failed to execute hexray")
 }
 
+fn temp_path(prefix: &str, extension: &str) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!(
+        "hexray-{}-{}-{}.{}",
+        prefix,
+        std::process::id(),
+        stamp,
+        extension
+    ))
+}
+
 // Helper used by macOS-snapshot-locked tests; on Linux it would
 // otherwise trip the `dead_code` lint.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1215,6 +1228,51 @@ fn test_invalid_address() {
     // Invalid hex address should be handled gracefully
     let output = run_hexray(&[&fixture_path("elf/simple_x86_64"), "--address", "not_a_hex"]);
     assert!(!output.status.success(), "Should fail for invalid address");
+}
+
+#[test]
+fn test_project_rejects_addresses_outside_the_binary() {
+    skip_if_missing!("elf/test_with_symbols");
+
+    let project_path = temp_path("project-invalid-address", "hxp");
+    let project_str = project_path.to_string_lossy().to_string();
+    let binary = fixture_path("elf/test_with_symbols");
+
+    let create = run_hexray(&[&binary, "project", "create", "-o", &project_str]);
+    assert!(
+        create.status.success(),
+        "project create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let comment = run_hexray(&[
+        "project",
+        "comment",
+        &project_str,
+        "0xffffffffffffffff",
+        "nope",
+    ]);
+    assert!(
+        !comment.status.success(),
+        "invalid comment address should fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&comment.stderr).contains("not in any section"),
+        "comment failure should explain the address is outside the binary: {}",
+        String::from_utf8_lossy(&comment.stderr)
+    );
+
+    let rename = run_hexray(&["project", "name", &project_str, "0x400000", "far_name"]);
+    assert!(
+        !rename.status.success(),
+        "invalid rename address should fail"
+    );
+
+    let bookmark = run_hexray(&["project", "bookmark", &project_str, "0x400000"]);
+    assert!(
+        !bookmark.status.success(),
+        "invalid bookmark address should fail"
+    );
 }
 
 // =============================================================================
