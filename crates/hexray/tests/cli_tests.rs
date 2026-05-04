@@ -19,6 +19,14 @@ fn fixture_path(name: &str) -> String {
     format!("tests/fixtures/{}", name)
 }
 
+fn workspace_fixture_path(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name)
+        .display()
+        .to_string()
+}
+
 /// Check if a fixture exists.
 fn fixture_exists(name: &str) -> bool {
     Path::new(&fixture_path(name)).exists()
@@ -358,6 +366,62 @@ fn test_strings_json() {
     assert!(
         stdout.starts_with('[') || stdout.starts_with('{'),
         "JSON output should start with [ or {{"
+    );
+}
+
+#[test]
+fn test_emulate_run_json_success_includes_ok() {
+    let binary = workspace_fixture_path("pe/simple_x64.exe");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture pe/simple_x64.exe not found");
+        return;
+    }
+
+    let output = run_hexray(&[
+        &binary,
+        "emulate",
+        "run",
+        "--json",
+        "--max-instructions",
+        "2",
+        "0x140001000",
+    ]);
+    assert!(
+        output.status.success(),
+        "bounded emulate run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("emulate run --json should emit valid JSON");
+    assert_eq!(json["ok"], true, "success JSON should set ok=true");
+}
+
+#[test]
+fn test_emulate_run_json_errors_stay_json() {
+    let binary = workspace_fixture_path("pe/simple_x64.exe");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture pe/simple_x64.exe not found");
+        return;
+    }
+
+    let output = run_hexray(&[&binary, "emulate", "run", "--json", "0x140001000"]);
+    assert!(
+        !output.status.success(),
+        "unbounded emulate run should fail to exercise JSON error path"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("emulate run failures should still emit JSON");
+    assert_eq!(json["ok"], false, "error JSON should set ok=false");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("Stack underflow")),
+        "error JSON should preserve the runtime error: {}",
+        stdout
     );
 }
 

@@ -9,6 +9,7 @@ use hexray_core::Architecture;
 use hexray_disasm::{Disassembler, X86_64Disassembler};
 use hexray_emulate::{state::x86_regs, Emulator, EmulatorConfig, Value};
 use hexray_formats::BinaryFormat;
+use serde::Serialize;
 
 /// Static emulation actions.
 #[derive(Subcommand)]
@@ -183,7 +184,7 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             stop_at_calls,
             json,
             reg,
-        } => {
+        } => run_emulate_json_action(json, || {
             let (func_addr, func_size) = resolve_function(&target)?;
             let instructions = get_instructions(func_addr, func_size)?;
 
@@ -219,7 +220,9 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             } else {
                 print_run_result(&result, &instructions);
             }
-        }
+
+            Ok(())
+        })?,
 
         EmulateAction::Resolve {
             function,
@@ -228,7 +231,7 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             min_index,
             max_index,
             json,
-        } => {
+        } => run_emulate_json_action(json, || {
             let (func_addr, func_size) = resolve_function(&function)?;
             let instructions = get_instructions(func_addr, func_size)?;
 
@@ -259,7 +262,9 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
             } else {
                 print_resolve_result(fmt, address, index_register, min_index, max_index, &targets);
             }
-        }
+
+            Ok(())
+        })?,
 
         EmulateAction::State {
             target,
@@ -304,33 +309,78 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
     Ok(())
 }
 
+fn run_emulate_json_action<F>(json: bool, action: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    match action() {
+        Ok(()) => Ok(()),
+        Err(err) if json => {
+            print_emulate_error_json(&err);
+            std::process::exit(1);
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Serialize)]
+struct JsonEmulateError<'a> {
+    ok: bool,
+    error: &'a str,
+}
+
+fn print_emulate_error_json(err: &anyhow::Error) {
+    let payload = JsonEmulateError {
+        ok: false,
+        error: &err.to_string(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).expect("emulate error JSON should serialize")
+    );
+}
+
+#[derive(Serialize)]
+struct JsonRunResult {
+    ok: bool,
+    instruction_count: usize,
+    stop_reason: String,
+    path: Vec<String>,
+    indirect_targets: Vec<JsonIndirectTarget>,
+}
+
+#[derive(Serialize)]
+struct JsonIndirectTarget {
+    address: String,
+    targets: Vec<u64>,
+}
+
 fn print_run_result_json(
     result: &hexray_emulate::ExecutionResult,
     _instructions: &[hexray_core::Instruction],
 ) {
-    println!("{{");
-    println!("  \"instruction_count\": {},", result.instruction_count);
-    println!("  \"stop_reason\": \"{:?}\",", result.stop_reason);
-    println!("  \"path\": [");
-    for (i, addr) in result.path.iter().enumerate() {
-        let comma = if i < result.path.len() - 1 { "," } else { "" };
-        println!("    \"{:#x}\"{}", addr, comma);
-    }
-    println!("  ],");
-    println!("  \"indirect_targets\": [");
-    for (i, target) in result.indirect_targets.iter().enumerate() {
-        let comma = if i < result.indirect_targets.len() - 1 {
-            ","
-        } else {
-            ""
-        };
-        println!(
-            "    {{ \"address\": \"{:#x}\", \"targets\": {:?} }}{}",
-            target.instruction_address, target.targets, comma
-        );
-    }
-    println!("  ]");
-    println!("}}");
+    let payload = JsonRunResult {
+        ok: true,
+        instruction_count: result.instruction_count,
+        stop_reason: format!("{:?}", result.stop_reason),
+        path: result
+            .path
+            .iter()
+            .map(|addr| format!("{:#x}", addr))
+            .collect(),
+        indirect_targets: result
+            .indirect_targets
+            .iter()
+            .map(|target| JsonIndirectTarget {
+                address: format!("{:#x}", target.instruction_address),
+                targets: target.targets.clone(),
+            })
+            .collect(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).expect("emulate run JSON should serialize")
+    );
 }
 
 fn print_run_result(
