@@ -413,7 +413,7 @@ pub(super) fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Ex
                 // Check if source is a memory operand (stack variable or global)
                 if let Operand::Memory { .. } = &inst.operands[1] {
                     let value = Expr::from_operand_with_inst(&inst.operands[1], inst);
-                    reg_values.insert(dst_name, value);
+                    insert_register_value_aliases(&mut reg_values, &dst_name, value);
                     at_block_start = false;
                 }
                 // Check for return value capture: mov dest, ret_reg at block start or after call
@@ -436,7 +436,11 @@ pub(super) fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Ex
                                     kind: super::super::expression::VarKind::Register(dst_reg.id),
                                     size: (dst_reg.size / 8) as u8,
                                 };
-                                reg_values.insert(src_name, Expr::var(dest_var));
+                                insert_register_value_aliases(
+                                    &mut reg_values,
+                                    &src_name,
+                                    Expr::var(dest_var),
+                                );
                             }
                             at_block_start = false;
                             saw_call = false;
@@ -454,10 +458,33 @@ pub(super) fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Ex
                 // Track if source is a memory operand (stack variable or global)
                 if let Operand::Memory { .. } = &inst.operands[1] {
                     let value = Expr::from_operand_with_inst(&inst.operands[1], inst);
-                    reg_values.insert(reg_name, value);
+                    insert_register_value_aliases(&mut reg_values, &reg_name, value);
                 }
             }
             at_block_start = false;
+        }
+
+        // Track simple ALU updates so later TEST/CMP instructions see the computed value,
+        // not just the register's last load.
+        if inst.operands.len() >= 2 {
+            if let Operand::Register(dst_reg) = &inst.operands[0] {
+                let dst_name = dst_reg.name().to_lowercase();
+                if let Some(binop) = binop_for_register_update(inst.operation) {
+                    let current = reg_values
+                        .get(&dst_name)
+                        .cloned()
+                        .unwrap_or_else(|| Expr::from_operand_with_inst(&inst.operands[0], inst));
+                    let rhs = substitute_register_in_expr(
+                        Expr::from_operand_with_inst(&inst.operands[1], inst),
+                        &reg_values,
+                    );
+                    insert_register_value_aliases(
+                        &mut reg_values,
+                        &dst_name,
+                        Expr::binop(binop, current, rhs),
+                    );
+                }
+            }
         }
 
         // Reset saw_call after any non-move instruction (except test/cmp which follow immediately)
@@ -471,6 +498,55 @@ pub(super) fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Ex
     }
 
     reg_values
+}
+
+fn binop_for_register_update(operation: Operation) -> Option<BinOpKind> {
+    match operation {
+        Operation::Add => Some(BinOpKind::Add),
+        Operation::Sub => Some(BinOpKind::Sub),
+        Operation::And => Some(BinOpKind::And),
+        Operation::Or => Some(BinOpKind::Or),
+        Operation::Xor => Some(BinOpKind::Xor),
+        _ => None,
+    }
+}
+
+fn insert_register_value_aliases(
+    reg_values: &mut HashMap<String, Expr>,
+    reg_name: &str,
+    value: Expr,
+) {
+    for alias in register_aliases(reg_name) {
+        reg_values.insert(alias, value.clone());
+    }
+}
+
+fn register_aliases(name: &str) -> Vec<String> {
+    match name {
+        "eax" | "rax" => vec!["eax".to_string(), "rax".to_string()],
+        "ebx" | "rbx" => vec!["ebx".to_string(), "rbx".to_string()],
+        "ecx" | "rcx" => vec!["ecx".to_string(), "rcx".to_string()],
+        "edx" | "rdx" => vec!["edx".to_string(), "rdx".to_string()],
+        "esi" | "rsi" => vec!["esi".to_string(), "rsi".to_string()],
+        "edi" | "rdi" => vec!["edi".to_string(), "rdi".to_string()],
+        "r8d" | "r8" => vec!["r8d".to_string(), "r8".to_string()],
+        "r9d" | "r9" => vec!["r9d".to_string(), "r9".to_string()],
+        "r10d" | "r10" => vec!["r10d".to_string(), "r10".to_string()],
+        "r11d" | "r11" => vec!["r11d".to_string(), "r11".to_string()],
+        _ => {
+            if let Some(rest) = name.strip_prefix('w') {
+                if rest.chars().all(|ch| ch.is_ascii_digit()) {
+                    return vec![name.to_string(), format!("x{}", rest)];
+                }
+            }
+            if let Some(rest) = name.strip_prefix('x') {
+                if rest.chars().all(|ch| ch.is_ascii_digit()) {
+                    return vec![format!("w{}", rest), name.to_string()];
+                }
+            }
+            vec![name.to_string()]
+        }
+    }
 }
 
 /// Substitutes register references in an expression with their known values.
@@ -846,5 +922,82 @@ pub(super) fn lift_cmovcc_with_context(
                 vec![src],
             ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hexray_core::{
+        Architecture, BasicBlock, BasicBlockId, Instruction, MemoryRef, Operand, Register,
+        RegisterClass,
+    };
+
+    #[test]
+    fn test_condition_uses_loaded_stack_value_for_32bit_register_alias() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(
+            Instruction::new(0x1000, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -8, 4)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x1003, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x14, 4)),
+                ]),
+        );
+
+        let expr = condition_to_expr_with_block(Condition::Less, &block);
+        let rendered = format!("{expr}");
+        assert!(
+            !rendered.contains("ret"),
+            "expected condition alias resolution to avoid return placeholder, got {rendered}"
+        );
+        assert!(
+            rendered.contains("rbp + -0x8"),
+            "expected cmp lhs to resolve through the loaded stack slot, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_preserves_simple_alu_chain_before_test() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x2000);
+        block.instructions.push(
+            Instruction::new(0x2000, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -8, 4)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x2003, 2, vec![], "and")
+                .with_operation(Operation::And)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x2005, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+
+        let expr = condition_to_expr_with_block(Condition::NotEqual, &block);
+        let rendered = format!("{expr}");
+        assert!(
+            rendered.contains("& 1"),
+            "expected ALU update to survive through TEST lowering, got {rendered}"
+        );
     }
 }
