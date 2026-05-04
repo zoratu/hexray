@@ -2655,10 +2655,43 @@ fn build_xrefs(
     // Build xref database by disassembling all functions
     let mut xref_builder = XrefBuilder::new();
 
-    // Gather function addresses and disassemble
-    let functions: Vec<_> = symbols
+    // Start from known function symbols, but also walk discovered internal
+    // callees so stripped callers still contribute xrefs.
+    let mut functions_to_analyze: Vec<(u64, u64, bool)> = symbols
         .iter()
-        .filter(|s| s.is_function() && s.address != 0)
+        .filter(|s| {
+            s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some()
+        })
+        .map(|s| {
+            (
+                s.address,
+                if s.size > 0 { s.size } else { 4096 },
+                s.size == 0,
+            )
+        })
+        .collect();
+
+    if let Some(entry) = fmt.entry_point() {
+        if !functions_to_analyze
+            .iter()
+            .any(|(addr, _, _)| *addr == entry)
+        {
+            functions_to_analyze.push((entry, 8192, true));
+        }
+    }
+
+    let is_internal_code = |addr: u64| -> bool {
+        fmt.executable_sections().any(|sec| {
+            let sec_start = sec.virtual_address();
+            let sec_end = sec_start + sec.size();
+            let sec_name = sec.name();
+            addr >= sec_start && addr < sec_end && !sec_name.contains("stub")
+        })
+    };
+
+    let mut known_functions: std::collections::HashSet<u64> = functions_to_analyze
+        .iter()
+        .map(|(addr, _, _)| *addr)
         .collect();
 
     let disasm_x86 = X86_64Disassembler::new();
@@ -2666,46 +2699,65 @@ fn build_xrefs(
     let disasm_riscv = RiscVDisassembler::new();
     let disasm_riscv32 = RiscVDisassembler::new_rv32();
 
-    for func in &functions {
-        let (size, heuristic_bounds) = if func.size > 0 {
-            (func.size as usize, false)
-        } else {
-            (4096, true)
-        };
-        if let Some(bytes) = fmt.bytes_at(func.address, size) {
-            let instructions = match arch {
-                Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
-                    &disasm_x86,
-                    bytes,
-                    func.address,
-                    heuristic_bounds,
-                    &noreturn_targets,
-                ),
-                Architecture::Arm64 => disassemble_for_calls(
-                    &disasm_arm64,
-                    bytes,
-                    func.address,
-                    heuristic_bounds,
-                    &noreturn_targets,
-                ),
-                Architecture::RiscV64 => disassemble_for_calls(
-                    &disasm_riscv,
-                    bytes,
-                    func.address,
-                    heuristic_bounds,
-                    &noreturn_targets,
-                ),
-                Architecture::RiscV32 => disassemble_for_calls(
-                    &disasm_riscv32,
-                    bytes,
-                    func.address,
-                    heuristic_bounds,
-                    &noreturn_targets,
-                ),
-                _ => Vec::new(),
-            };
-            xref_builder.analyze_instructions(&instructions);
+    let mut pending_functions = functions_to_analyze;
+    for _iteration in 0..3 {
+        if pending_functions.is_empty() {
+            break;
         }
+
+        let mut new_call_targets = Vec::new();
+        for (address, size, heuristic_bounds) in &pending_functions {
+            let size = (*size).max(64) as usize;
+            if let Some(bytes) = fmt.bytes_at(*address, size) {
+                let instructions = match arch {
+                    Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
+                        &disasm_x86,
+                        bytes,
+                        *address,
+                        *heuristic_bounds,
+                        &noreturn_targets,
+                    ),
+                    Architecture::Arm64 => disassemble_for_calls(
+                        &disasm_arm64,
+                        bytes,
+                        *address,
+                        *heuristic_bounds,
+                        &noreturn_targets,
+                    ),
+                    Architecture::RiscV64 => disassemble_for_calls(
+                        &disasm_riscv,
+                        bytes,
+                        *address,
+                        *heuristic_bounds,
+                        &noreturn_targets,
+                    ),
+                    Architecture::RiscV32 => disassemble_for_calls(
+                        &disasm_riscv32,
+                        bytes,
+                        *address,
+                        *heuristic_bounds,
+                        &noreturn_targets,
+                    ),
+                    _ => Vec::new(),
+                };
+                xref_builder.analyze_instructions(&instructions);
+
+                for instr in instructions {
+                    if let hexray_core::ControlFlow::Call { target, .. } = instr.control_flow {
+                        if known_functions.insert(target) && is_internal_code(target) {
+                            let (size, heuristic_bounds) = symbols
+                                .iter()
+                                .find(|s| s.address == target)
+                                .map(|s| (if s.size > 0 { s.size } else { 4096 }, s.size == 0))
+                                .unwrap_or((4096, true));
+                            new_call_targets.push((target, size, heuristic_bounds));
+                        }
+                    }
+                }
+            }
+        }
+
+        pending_functions = new_call_targets;
     }
 
     let db = xref_builder.build();
