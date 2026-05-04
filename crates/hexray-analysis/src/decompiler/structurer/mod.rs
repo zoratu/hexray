@@ -2039,7 +2039,10 @@ fn attach_shared_return_to_branch(
     mut body: Vec<StructuredNode>,
     shared_return: Option<Expr>,
 ) -> Vec<StructuredNode> {
-    if body_terminates(&body) {
+    let stripped_terminal_bare_return = matches!(body.last(), Some(StructuredNode::Return(None)));
+    if stripped_terminal_bare_return {
+        body.pop();
+    } else if body_terminates(&body) {
         return body;
     }
 
@@ -2058,6 +2061,10 @@ fn attach_shared_return_to_branch(
         Some(StructuredNode::Block { statements, .. }) if statements.is_empty()
     ) {
         body.pop();
+    }
+
+    if body_terminates(&body) {
+        return body;
     }
 
     body.push(StructuredNode::Return(return_value));
@@ -2294,6 +2301,74 @@ mod tests {
         cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
         cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
         cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+
+        cfg
+    }
+
+    fn make_shared_return_intermediary_jump_cfg() -> ControlFlowGraph {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x2100);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x2110);
+        bb1.instructions.push(
+            Instruction::new(0x2110, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(7, 32)]),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x2115, 2, vec![], "neg")
+                .with_operation(Operation::Neg)
+                .with_operands(vec![Operand::Register(eax)]),
+        );
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(5),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x2120);
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x2130);
+        bb3.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb3);
+
+        let mut bb4 = BasicBlock::new(BasicBlockId::new(4), 0x2140);
+        bb4.instructions.push(
+            Instruction::new(0x2140, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(20, 32)]),
+        );
+        bb4.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(5),
+        };
+        cfg.add_block(bb4);
+
+        let mut bb5 = BasicBlock::new(BasicBlockId::new(5), 0x2150);
+        bb5.terminator = BlockTerminator::Return;
+        cfg.add_block(bb5);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(5));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(4), BasicBlockId::new(5));
 
         cfg
     }
@@ -3408,6 +3483,28 @@ mod tests {
         assert!(
             !contains_void_return(structured.body()),
             "Arithmetic shared return join should not degrade to bare returns: {:?}",
+            structured.body()
+        );
+    }
+
+    #[test]
+    fn test_structurer_preserves_shared_return_through_intermediary_jump() {
+        let cfg = make_shared_return_intermediary_jump_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        assert!(
+            contains_return_literal(structured.body(), 20),
+            "Expected intermediary jump branch to preserve the computed return value: {:?}",
+            structured.body()
+        );
+        assert!(
+            contains_return_literal(structured.body(), -7),
+            "Expected shared join branch to preserve its computed return value: {:?}",
+            structured.body()
+        );
+        assert!(
+            !contains_void_return(structured.body()),
+            "Intermediary jump shared return should not degrade to bare returns: {:?}",
             structured.body()
         );
     }
