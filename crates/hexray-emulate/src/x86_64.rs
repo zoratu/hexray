@@ -24,6 +24,8 @@ pub fn execute(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
         Operation::Shl => execute_shl(state, inst),
         Operation::Shr => execute_shr(state, inst),
         Operation::Sar => execute_sar(state, inst),
+        Operation::Rol => execute_rol(state, inst),
+        Operation::Ror => execute_ror(state, inst),
         Operation::Inc => execute_inc(state, inst),
         Operation::Dec => execute_dec(state, inst),
         Operation::Compare => execute_cmp(state, inst),
@@ -62,6 +64,14 @@ fn operand_size(op: &Operand) -> u32 {
         Operand::Memory(mem) => (mem.size as u32) * 8,
         Operand::Immediate(_) => 64,
         Operand::PcRelative { .. } => 64,
+    }
+}
+
+fn mask_for_bits(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
     }
 }
 
@@ -344,6 +354,48 @@ fn execute_sar(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
     Ok(())
 }
 
+fn execute_rol(state: &mut MachineState, inst: &Instruction) -> EmulationResult<()> {
+    execute_rotate(state, inst, true)
+}
+
+fn execute_ror(state: &mut MachineState, inst: &Instruction) -> EmulationResult<()> {
+    execute_rotate(state, inst, false)
+}
+
+fn execute_rotate(state: &mut MachineState, inst: &Instruction, left: bool) -> EmulationResult<()> {
+    if inst.operands.len() < 2 {
+        return Ok(());
+    }
+
+    let width = operand_size(&inst.operands[0]);
+    let value = read_operand(state, &inst.operands[0], inst);
+    let count = read_operand(state, &inst.operands[1], inst);
+    let result = match (value, count) {
+        (Value::Concrete(value), Value::Concrete(count)) => {
+            let mask = if width == 64 { 0x3f } else { 0x1f };
+            let effective = ((count & mask) as u32) % width;
+            let bit_mask = mask_for_bits(width);
+            let truncated = value & bit_mask;
+
+            if effective == 0 {
+                Value::Concrete(truncated)
+            } else if left {
+                Value::Concrete(
+                    ((truncated << effective) | (truncated >> (width - effective))) & bit_mask,
+                )
+            } else {
+                Value::Concrete(
+                    ((truncated >> effective) | (truncated << (width - effective))) & bit_mask,
+                )
+            }
+        }
+        _ => Value::Unknown,
+    };
+
+    write_operand(state, &inst.operands[0], result, inst);
+    Ok(())
+}
+
 fn execute_inc(state: &mut MachineState, inst: &Instruction) -> EmulationResult<()> {
     if inst.operands.is_empty() {
         return Ok(());
@@ -552,4 +604,58 @@ fn execute_cmov(state: &mut MachineState, inst: &Instruction) -> EmulationResult
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute;
+    use crate::state::{x86_regs, MachineState};
+    use crate::Value;
+    use hexray_core::{
+        Architecture, ControlFlow, Instruction, Operand, Operation, Register, RegisterClass,
+    };
+
+    fn reg(id: u16, size: u16) -> Operand {
+        Operand::Register(Register::new(
+            Architecture::X86_64,
+            RegisterClass::General,
+            id,
+            size,
+        ))
+    }
+
+    fn make_inst(op: Operation, mnemonic: &str, operands: Vec<Operand>) -> Instruction {
+        Instruction {
+            address: 0x1000,
+            size: 2,
+            bytes: vec![],
+            operation: op,
+            mnemonic: mnemonic.to_string(),
+            operands,
+            control_flow: ControlFlow::Sequential,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            guard: None,
+        }
+    }
+
+    #[test]
+    fn test_rol_uses_operand_width() {
+        let mut state = MachineState::new();
+        state.set_register(x86_regs::RDX, Value::Concrete(0x1234_5678));
+        state.set_register(x86_regs::RCX, Value::Concrete(8));
+
+        let inst = make_inst(
+            Operation::Rol,
+            "rol",
+            vec![reg(x86_regs::RDX, 32), reg(x86_regs::RCX, 8)],
+        );
+
+        execute(&mut state, &inst).unwrap();
+
+        assert_eq!(
+            state.get_register(x86_regs::RDX),
+            Value::Concrete(0x3456_7812)
+        );
+    }
 }
