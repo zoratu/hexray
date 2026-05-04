@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hexray_core::{ControlFlow, Instruction, Operand};
+use hexray_core::{ControlFlow, Instruction, Operand, Operation, Register, RegisterClass};
 
 /// Type of cross-reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,6 +76,14 @@ impl XrefDatabase {
             to,
             xref_type,
         };
+
+        if self.refs_from.get(&from).is_some_and(|existing| {
+            existing
+                .iter()
+                .any(|candidate| Self::same_xref(candidate, &xref))
+        }) {
+            return;
+        }
 
         self.refs_to.entry(to).or_default().push(xref.clone());
 
@@ -153,13 +161,15 @@ impl XrefDatabase {
 
     /// Merge another xref database into this one.
     pub fn merge(&mut self, other: XrefDatabase) {
-        for (to, xrefs) in other.refs_to {
-            self.refs_to.entry(to).or_default().extend(xrefs);
+        for xrefs in other.refs_from.into_values() {
+            for xref in xrefs {
+                self.add_xref(xref.from, xref.to, xref.xref_type);
+            }
         }
-        for (from, xrefs) in other.refs_from {
-            self.refs_from.entry(from).or_default().extend(xrefs);
-        }
-        self.referenced_addrs.extend(other.referenced_addrs);
+    }
+
+    fn same_xref(left: &Xref, right: &Xref) -> bool {
+        left.from == right.from && left.to == right.to && left.xref_type == right.xref_type
     }
 }
 
@@ -200,6 +210,16 @@ impl XrefBuilder {
             _ => {}
         }
 
+        if instr.operation == Operation::LoadEffectiveAddress {
+            if let Some(target) = instr
+                .operands
+                .get(1)
+                .and_then(|operand| Self::extract_effective_address(instr, operand))
+            {
+                self.db.add_xref(from, target, XrefType::DataRead);
+            }
+        }
+
         // Check operands for data references
         for operand in &instr.operands {
             if let Some(addr) = Self::extract_memory_address(operand) {
@@ -219,6 +239,19 @@ impl XrefBuilder {
     pub fn analyze_instructions(&mut self, instructions: &[Instruction]) {
         for instr in instructions {
             self.analyze_instruction(instr);
+        }
+    }
+
+    fn extract_effective_address(instr: &Instruction, operand: &Operand) -> Option<u64> {
+        match operand {
+            Operand::Memory(mem_ref)
+                if Self::is_pc_relative_base(mem_ref.base.as_ref()) && mem_ref.index.is_none() =>
+            {
+                let target = i128::from(instr.end_address()) + i128::from(mem_ref.displacement);
+                u64::try_from(target).ok()
+            }
+            Operand::PcRelative { target, .. } => Some(*target),
+            _ => None,
         }
     }
 
@@ -246,6 +279,13 @@ impl XrefBuilder {
         }
     }
 
+    fn is_pc_relative_base(base: Option<&Register>) -> bool {
+        base.is_some_and(|register| {
+            register.class == RegisterClass::ProgramCounter
+                || matches!(register.name(), "rip" | "eip" | "pc")
+        })
+    }
+
     /// Build the cross-reference database.
     pub fn build(self) -> XrefDatabase {
         self.db
@@ -255,7 +295,7 @@ impl XrefBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{ControlFlow, Instruction};
+    use hexray_core::{Architecture, ControlFlow, Instruction, MemoryRef, Register};
 
     #[test]
     fn test_xref_database_basic() {
@@ -270,6 +310,16 @@ mod tests {
         assert!(db.is_referenced(0x2000));
         assert!(db.is_referenced(0x3000));
         assert!(!db.is_referenced(0x4000));
+    }
+
+    #[test]
+    fn test_xref_database_deduplicates_identical_edges() {
+        let mut db = XrefDatabase::new();
+        db.add_xref(0x1000, 0x2000, XrefType::DataRead);
+        db.add_xref(0x1000, 0x2000, XrefType::DataRead);
+
+        assert_eq!(db.count_refs_to(0x2000), 1);
+        assert_eq!(db.count_refs_from(0x1000), 1);
     }
 
     #[test]
@@ -365,5 +415,69 @@ mod tests {
         assert_eq!(db1.count_refs_to(0x2000), 2);
         assert_eq!(db1.count_refs_to(0x3000), 1);
         assert_eq!(db1.total_xrefs(), 3);
+    }
+
+    #[test]
+    fn test_xref_builder_tracks_rip_relative_lea_targets() {
+        let mut builder = XrefBuilder::new();
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let instr = Instruction {
+            address: 0x10b8,
+            size: 7,
+            bytes: vec![0x48, 0x8d, 0x3d, 0xb1, 0x01, 0x00, 0x00],
+            operation: Operation::LoadEffectiveAddress,
+            mnemonic: "lea".to_string(),
+            operands: vec![
+                Operand::Register(Register::new(
+                    Architecture::X86_64,
+                    RegisterClass::General,
+                    7,
+                    64,
+                )),
+                Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x1b1, 8)),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![rip],
+            writes: vec![],
+            guard: None,
+        };
+
+        builder.analyze_instruction(&instr);
+        let db = builder.build();
+        let refs = db.refs_to(0x1270);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from, 0x10b8);
+        assert_eq!(refs[0].xref_type, XrefType::DataRead);
+    }
+
+    #[test]
+    fn test_xref_builder_tracks_pc_relative_operands_for_adrp_like_ops() {
+        let mut builder = XrefBuilder::new();
+        let instr = Instruction {
+            address: 0x4000,
+            size: 4,
+            bytes: vec![0; 4],
+            operation: Operation::LoadEffectiveAddress,
+            mnemonic: "adrp".to_string(),
+            operands: vec![
+                Operand::Register(Register::new(
+                    Architecture::Arm64,
+                    RegisterClass::General,
+                    0,
+                    64,
+                )),
+                Operand::pc_rel(0x2000, 0x6000),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+
+        builder.analyze_instruction(&instr);
+        let db = builder.build();
+        let refs = db.refs_to(0x6000);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].xref_type, XrefType::DataRead);
     }
 }
