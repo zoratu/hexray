@@ -293,16 +293,6 @@ enum ProjectAction {
         #[arg(long)]
         bookmarks: bool,
     },
-    /// Undo the last action
-    Undo {
-        /// Project file path
-        project: PathBuf,
-    },
-    /// Redo the last undone action
-    Redo {
-        /// Project file path
-        project: PathBuf,
-    },
 }
 
 /// Interactive session actions
@@ -3309,40 +3299,6 @@ fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> 
                     }
                 }
                 println!();
-            }
-        }
-
-        ProjectAction::Undo {
-            project: project_path,
-        } => {
-            let mut project = AnalysisProject::load(&project_path)
-                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
-
-            match project.undo() {
-                Ok(msg) => {
-                    project.save(&project_path)?;
-                    println!("{}", msg);
-                }
-                Err(e) => {
-                    println!("Cannot undo: {}", e);
-                }
-            }
-        }
-
-        ProjectAction::Redo {
-            project: project_path,
-        } => {
-            let mut project = AnalysisProject::load(&project_path)
-                .with_context(|| format!("Failed to load project: {}", project_path.display()))?;
-
-            match project.redo() {
-                Ok(msg) => {
-                    project.save(&project_path)?;
-                    println!("{}", msg);
-                }
-                Err(e) => {
-                    println!("Cannot redo: {}", e);
-                }
             }
         }
     }

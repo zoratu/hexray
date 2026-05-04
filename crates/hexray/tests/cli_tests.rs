@@ -1433,6 +1433,28 @@ fn test_project_comments_render_in_decompile_output() {
     );
 }
 
+#[test]
+fn test_project_help_no_longer_exposes_undo_or_redo() {
+    let output = run_hexray(&["project", "--help"]);
+    assert!(
+        output.status.success(),
+        "project --help should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("undo"),
+        "project help should not advertise undo anymore: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("redo"),
+        "project help should not advertise redo anymore: {}",
+        stdout
+    );
+}
+
 // =============================================================================
 // Format Detection Tests
 // =============================================================================
