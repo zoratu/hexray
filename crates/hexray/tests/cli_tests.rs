@@ -331,6 +331,27 @@ fn test_symbols_functions_only() {
 }
 
 #[test]
+fn test_symbols_relocatable_prefers_function_name_at_section_start() {
+    let fixture = workspace_fixture_path("test_relocatable.o");
+    let output = run_hexray(&[&fixture, "symbols"]);
+    assert!(
+        output.status.success(),
+        "symbols on relocatable object should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let function_line = stdout
+        .lines()
+        .find(|line| line.contains(" FUNC ") && line.contains("my_function"))
+        .expect("expected a function line for my_function");
+    assert!(
+        !function_line.ends_with(".text"),
+        "function entry should keep its real name: {function_line}"
+    );
+}
+
+#[test]
 fn test_symbols_macho() {
     skip_if_missing!("test_x86_64_macho");
 

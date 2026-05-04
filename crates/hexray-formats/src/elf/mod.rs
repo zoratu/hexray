@@ -35,6 +35,7 @@ pub use symbol::SymbolEntry;
 
 use crate::{BinaryFormat, ParseError, Section};
 use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
+use std::cmp::Ordering;
 
 /// A parsed ELF binary.
 #[derive(Debug)]
@@ -87,6 +88,29 @@ pub struct KernelModuleInfo {
 }
 
 impl<'a> Elf<'a> {
+    fn compare_symbol_preference(left: &Symbol, right: &Symbol) -> Ordering {
+        Self::symbol_preference_key(right)
+            .cmp(&Self::symbol_preference_key(left))
+            .then_with(|| left.name.len().cmp(&right.name.len()))
+    }
+
+    fn symbol_preference_key(symbol: &Symbol) -> (u8, u8, u8, u64) {
+        let kind_rank = match symbol.kind {
+            SymbolKind::Function => 3u8,
+            SymbolKind::Object => 2u8,
+            SymbolKind::Section => 0u8,
+            _ => 1u8,
+        };
+        let binding_rank = match symbol.binding {
+            SymbolBinding::Global => 2u8,
+            SymbolBinding::Weak => 1u8,
+            _ => 0u8,
+        };
+        let name_rank = u8::from(!symbol.name.is_empty());
+
+        (kind_rank, binding_rank, name_rank, symbol.size)
+    }
+
     /// Parse an ELF file from raw bytes.
     pub fn parse(data: &'a [u8]) -> Result<Self, ParseError> {
         // Parse the ELF header
@@ -778,7 +802,10 @@ impl BinaryFormat for Elf<'_> {
     }
 
     fn symbol_at(&self, addr: u64) -> Option<&Symbol> {
-        self.symbols.iter().find(|s| s.address == addr)
+        self.symbols
+            .iter()
+            .filter(|s| s.address == addr)
+            .min_by(|left, right| Self::compare_symbol_preference(left, right))
     }
 
     fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {

@@ -942,7 +942,11 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool, project: Option<&
     println!("{}", "-".repeat(70));
 
     let mut symbols: Vec<_> = fmt.symbols().collect();
-    symbols.sort_by_key(|s| s.address);
+    symbols.sort_by(|left, right| {
+        left.address
+            .cmp(&right.address)
+            .then_with(|| compare_symbol_display_priority(left, right))
+    });
 
     for symbol in symbols {
         if functions_only && !symbol.is_function() {
@@ -974,6 +978,32 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool, project: Option<&
             symbol.address, symbol.size, type_str, bind_str, demangled
         );
     }
+}
+
+fn compare_symbol_display_priority(
+    left: &hexray_core::Symbol,
+    right: &hexray_core::Symbol,
+) -> std::cmp::Ordering {
+    symbol_display_priority(right)
+        .cmp(&symbol_display_priority(left))
+        .then_with(|| left.name.len().cmp(&right.name.len()))
+}
+
+fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u64) {
+    let kind_rank = match symbol.kind {
+        hexray_core::SymbolKind::Function => 3u8,
+        hexray_core::SymbolKind::Object => 2u8,
+        hexray_core::SymbolKind::Section => 0u8,
+        _ => 1u8,
+    };
+    let binding_rank = match symbol.binding {
+        hexray_core::SymbolBinding::Global => 2u8,
+        hexray_core::SymbolBinding::Weak => 1u8,
+        _ => 0u8,
+    };
+    let name_rank = u8::from(!symbol.name.is_empty());
+
+    (kind_rank, binding_rank, name_rank, symbol.size)
 }
 
 /// Resolve the target for decompilation.

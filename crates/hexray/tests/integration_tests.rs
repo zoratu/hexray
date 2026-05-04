@@ -17,6 +17,14 @@ fn fixture_path(name: &str) -> String {
     format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name)
 }
 
+fn workspace_fixture_path(name: &str) -> String {
+    format!(
+        "{}/../../tests/fixtures/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        name
+    )
+}
+
 /// Check if a fixture exists.
 fn fixture_exists(name: &str) -> bool {
     Path::new(&fixture_path(name)).exists()
@@ -525,6 +533,25 @@ fn test_relocatable_object_parsing() {
         !sections.is_empty(),
         "Relocatable object should have sections"
     );
+}
+
+#[test]
+fn test_relocatable_symbol_lookup_prefers_function_over_section() {
+    let fixture = workspace_fixture_path("test_relocatable.o");
+    let data = fs::read(&fixture).expect("Failed to read fixture");
+    let elf = Elf::parse(&data).expect("Failed to parse relocatable ELF");
+
+    let func_addr = elf
+        .symbols()
+        .find(|symbol| symbol.name == "my_function")
+        .map(|symbol| symbol.address)
+        .expect("my_function symbol should exist");
+
+    let preferred = elf
+        .symbol_at(func_addr)
+        .expect("symbol lookup should resolve relocatable function");
+    assert_eq!(preferred.name, "my_function");
+    assert!(preferred.is_function());
 }
 
 // =============================================================================
