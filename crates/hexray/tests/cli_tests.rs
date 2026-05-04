@@ -1385,6 +1385,54 @@ fn test_global_project_flag_rejects_missing_file() {
     );
 }
 
+#[test]
+fn test_project_comments_render_in_decompile_output() {
+    skip_if_missing!("elf/test_with_symbols");
+
+    let project_path = temp_path("project-comment-render", "hxp");
+    let project_str = project_path.to_string_lossy().to_string();
+    let binary = fixture_path("elf/test_with_symbols");
+
+    let create = run_hexray(&[&binary, "project", "create", "-o", &project_str]);
+    assert!(
+        create.status.success(),
+        "project create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let comment = run_hexray(&[
+        "project",
+        "comment",
+        &project_str,
+        "0x40100f",
+        "visible_comment",
+    ]);
+    assert!(
+        comment.status.success(),
+        "project comment should succeed: {}",
+        String::from_utf8_lossy(&comment.stderr)
+    );
+
+    let decompile = run_hexray(&[
+        &binary,
+        "decompile",
+        "--project",
+        &project_str,
+        "--show-addresses",
+        "0x40100f",
+    ]);
+    assert!(
+        decompile.status.success(),
+        "decompile with project should succeed: {}",
+        String::from_utf8_lossy(&decompile.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&decompile.stdout).contains("// visible_comment"),
+        "decompile output should include the saved project comment: {}",
+        String::from_utf8_lossy(&decompile.stdout)
+    );
+}
+
 // =============================================================================
 // Format Detection Tests
 // =============================================================================

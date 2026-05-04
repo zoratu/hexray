@@ -1529,11 +1529,89 @@ fn decompile_function(
         let signature = decompiler.recover_signature(&cfg);
         print_signature_diagnostics(&name, &signature);
     }
-    let pseudocode = decompiler.decompile(&cfg, &name);
+    let pseudocode = annotate_pseudocode_with_project_comments(
+        decompiler.decompile(&cfg, &name),
+        project,
+        show_addresses,
+    );
 
     println!("{}", pseudocode);
 
     Ok(())
+}
+
+fn annotate_pseudocode_with_project_comments(
+    pseudocode: String,
+    project: Option<&AnalysisProject>,
+    show_addresses: bool,
+) -> String {
+    if !show_addresses {
+        return pseudocode;
+    }
+    let Some(project) = project else {
+        return pseudocode;
+    };
+
+    let mut comments: Vec<(u64, String)> = project
+        .annotated_addresses()
+        .filter_map(|addr| {
+            project
+                .get_comment(addr)
+                .map(|comment| (addr, comment.to_string()))
+        })
+        .collect();
+    comments.sort_by_key(|(addr, _)| *addr);
+    if comments.is_empty() {
+        return pseudocode;
+    }
+
+    let trailing_newline = pseudocode.ends_with('\n');
+    let mut rendered = String::new();
+    let mut next_comment = 0usize;
+
+    for line in pseudocode.lines() {
+        rendered.push_str(line);
+        rendered.push('\n');
+
+        let Some((start, end, indent)) = parse_basic_block_address_line(line) else {
+            continue;
+        };
+
+        while next_comment < comments.len() && comments[next_comment].0 < start {
+            next_comment += 1;
+        }
+        while next_comment < comments.len() && comments[next_comment].0 <= end {
+            rendered.push_str(&indent);
+            rendered.push_str("// ");
+            rendered.push_str(&comments[next_comment].1);
+            rendered.push('\n');
+            next_comment += 1;
+        }
+    }
+
+    if trailing_newline {
+        rendered
+    } else {
+        rendered.trim_end_matches('\n').to_string()
+    }
+}
+
+fn parse_basic_block_address_line(line: &str) -> Option<(u64, u64, String)> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = line[..indent_len].to_string();
+    let trimmed = &line[indent_len..];
+    if !trimmed.starts_with("// bb") {
+        return None;
+    }
+
+    let open = trimmed.find('[')?;
+    let close = trimmed[open + 1..].find(']')? + open + 1;
+    let range = &trimmed[open + 1..close];
+    let (start_str, end_str) = range.split_once("..")?;
+    let start = u64::from_str_radix(start_str.strip_prefix("0x")?, 16).ok()?;
+    let end = u64::from_str_radix(end_str.strip_prefix("0x")?, 16).ok()?;
+
+    Some((start, end, indent))
 }
 
 /// Builds a string table from readable data sections in the binary.
@@ -2435,7 +2513,11 @@ fn decompile_with_follow(
             let signature = decompiler.recover_signature(&cfg);
             print_signature_diagnostics(&func_name, &signature);
         }
-        let pseudocode = decompiler.decompile(&cfg, &func_name);
+        let pseudocode = annotate_pseudocode_with_project_comments(
+            decompiler.decompile(&cfg, &func_name),
+            project,
+            show_addresses,
+        );
 
         println!("{}", pseudocode);
 
