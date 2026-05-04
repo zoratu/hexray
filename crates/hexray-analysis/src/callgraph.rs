@@ -5,7 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hexray_core::{BasicBlock, ControlFlow, Instruction, Symbol};
+use hexray_core::{
+    register::x86, BasicBlock, ControlFlow, Instruction, Operand, Operation, Symbol,
+};
 
 /// A node in the call graph representing a function.
 #[derive(Debug, Clone)]
@@ -391,9 +393,57 @@ impl CallGraphBuilder {
                     _ => {}
                 }
             }
+
+            for instr in *instructions {
+                for target in self.materialized_function_targets(instr) {
+                    self.call_graph.add_call(
+                        caller_entry,
+                        target,
+                        CallSite {
+                            call_address: instr.address,
+                            call_type: CallType::Indirect,
+                        },
+                    );
+                }
+            }
         }
 
         self.call_graph
+    }
+
+    fn materialized_function_targets(&self, instr: &Instruction) -> Vec<u64> {
+        let Some(source) = (match instr.operation {
+            Operation::Move => instr.operands.get(1),
+            Operation::LoadEffectiveAddress => instr.operands.get(1),
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+
+        let target = match source {
+            Operand::Immediate(imm) => Some(imm.value as u64),
+            Operand::PcRelative { target, .. } => Some(*target),
+            Operand::Memory(mem)
+                if matches!(instr.operation, Operation::LoadEffectiveAddress)
+                    && mem.base.as_ref().map(|reg| reg.id) == Some(x86::RIP)
+                    && mem.index.is_none() =>
+            {
+                Some((instr.address + instr.size as u64).wrapping_add(mem.displacement as u64))
+            }
+            _ => None,
+        };
+
+        target
+            .filter(|addr| self.is_known_internal_function(*addr))
+            .into_iter()
+            .collect()
+    }
+
+    fn is_known_internal_function(&self, addr: u64) -> bool {
+        self.call_graph
+            .get_node(addr)
+            .is_some_and(|node| !node.is_external)
+            || self.function_instructions.contains_key(&addr)
     }
 }
 
@@ -407,7 +457,8 @@ impl Default for CallGraphBuilder {
 mod tests {
     use super::*;
     use hexray_core::{
-        ControlFlow, Immediate, Instruction, Operand, Operation, Symbol, SymbolKind,
+        register::x86, Architecture, ControlFlow, Immediate, IndexMode, Instruction, MemoryRef,
+        Operand, Operation, Register, RegisterClass, Symbol, SymbolKind,
     };
 
     fn make_call_instruction(addr: u64, target: u64) -> Instruction {
@@ -458,6 +509,44 @@ mod tests {
             operands: vec![],
             control_flow: ControlFlow::Sequential,
             bytes: vec![0x90],
+            reads: vec![],
+            writes: vec![],
+
+            guard: None,
+        }
+    }
+
+    fn make_stack_store_imm_instruction(addr: u64, imm_value: u64) -> Instruction {
+        Instruction {
+            address: addr,
+            size: 8,
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef {
+                    base: Some(Register::new(
+                        Architecture::X86_64,
+                        RegisterClass::General,
+                        x86::RBP,
+                        64,
+                    )),
+                    index: None,
+                    scale: 1,
+                    displacement: -8,
+                    size: 8,
+                    segment: None,
+                    broadcast: false,
+                    index_mode: IndexMode::None,
+                    space: hexray_core::MemorySpace::Generic,
+                }),
+                Operand::Immediate(Immediate {
+                    value: imm_value as i128,
+                    size: 64,
+                    signed: false,
+                }),
+            ],
+            control_flow: ControlFlow::Sequential,
+            bytes: vec![0; 8],
             reads: vec![],
             writes: vec![],
 
@@ -821,5 +910,53 @@ mod tests {
         assert_eq!(cg.node_count(), 2);
         assert_eq!(cg.get_node(0x1000).unwrap().name.as_deref(), Some("main"));
         assert!(cg.get_node(0x0).unwrap().is_external);
+    }
+
+    #[test]
+    fn test_builder_adds_materialized_function_pointer_edges() {
+        let mut builder = CallGraphBuilder::new();
+        builder.add_symbols(&[
+            Symbol {
+                name: "main".to_string(),
+                address: 0x1000,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+            Symbol {
+                name: "dispatcher".to_string(),
+                address: 0x2000,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+            Symbol {
+                name: "add_op".to_string(),
+                address: 0x3000,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+        ]);
+
+        builder.add_function(
+            0x1000,
+            vec![
+                make_stack_store_imm_instruction(0x1000, 0x3000),
+                make_call_instruction(0x1008, 0x2000),
+                make_ret_instruction(0x100c),
+            ],
+        );
+        builder.add_function(0x2000, vec![make_ret_instruction(0x2000)]);
+        builder.add_function(0x3000, vec![make_ret_instruction(0x3000)]);
+
+        let cg = builder.build();
+
+        let main_callees: Vec<_> = cg.callees(0x1000).map(|(addr, _)| addr).collect();
+        assert!(main_callees.contains(&0x2000));
+        assert!(main_callees.contains(&0x3000));
     }
 }
