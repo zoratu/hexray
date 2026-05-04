@@ -378,20 +378,28 @@ impl Disassembler for X86_64Disassembler {
                 let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
                 offset = offset.saturating_add(1);
 
+                let (reg_operand_size, rm_operand_size) = match (entry.encoding, entry.mnemonic) {
+                    (OperandEncoding::ModRmReg_Rm, "movzx" | "movsx") => {
+                        (prefixes.operand_size(false), operand_size)
+                    }
+                    (OperandEncoding::ModRmReg_Rm, "movsxd") => (operand_size, 32),
+                    _ => (operand_size, operand_size),
+                };
+
                 let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
                 let (rm_operand, rm_consumed) =
-                    decode_modrm_rm(rm_bytes, modrm, &prefixes, operand_size).ok_or_else(|| {
-                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
-                    })?;
+                    decode_modrm_rm(rm_bytes, modrm, &prefixes, rm_operand_size).ok_or_else(
+                        || DecodeError::truncated(address, offset.saturating_add(1), bytes.len()),
+                    )?;
                 offset = offset.saturating_add(rm_consumed);
 
                 match entry.encoding {
                     OperandEncoding::ModRmRm_Reg => {
                         operands.push(rm_operand);
-                        operands.push(decode_modrm_reg(modrm, operand_size));
+                        operands.push(decode_modrm_reg(modrm, reg_operand_size));
                     }
                     OperandEncoding::ModRmReg_Rm => {
-                        operands.push(decode_modrm_reg(modrm, operand_size));
+                        operands.push(decode_modrm_reg(modrm, reg_operand_size));
                         operands.push(rm_operand);
                     }
                     OperandEncoding::ModRmRmOnly => {
@@ -3342,6 +3350,51 @@ mod tests {
             .unwrap();
         assert_eq!(result.instruction.mnemonic, "mov");
         assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_movzx_keeps_wide_destination_register() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0xb6, 0x10], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "movzx");
+        match &result.instruction.operands[0] {
+            Operand::Register(reg) => {
+                assert_eq!(reg.id, x86::RDX);
+                assert_eq!(reg.size, 32);
+            }
+            other => panic!("expected register destination, got {other:?}"),
+        }
+        match &result.instruction.operands[1] {
+            Operand::Memory(mem) => assert_eq!(mem.size, 1),
+            other => panic!("expected byte memory source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_movsxd_reads_dword_source() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x48, 0x63, 0xd0], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "movsxd");
+        match &result.instruction.operands[0] {
+            Operand::Register(reg) => {
+                assert_eq!(reg.id, x86::RDX);
+                assert_eq!(reg.size, 64);
+            }
+            other => panic!("expected register destination, got {other:?}"),
+        }
+        match &result.instruction.operands[1] {
+            Operand::Register(reg) => {
+                assert_eq!(reg.id, x86::RAX);
+                assert_eq!(reg.size, 32);
+            }
+            other => panic!("expected dword register source, got {other:?}"),
+        }
     }
 
     #[test]

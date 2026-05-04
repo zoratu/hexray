@@ -175,7 +175,11 @@ fn execute_mov(state: &mut MachineState, inst: &Instruction) -> EmulationResult<
     if inst.operands.len() < 2 {
         return Ok(());
     }
-    let src = read_operand(state, &inst.operands[1], inst);
+    let mut src = read_operand(state, &inst.operands[1], inst);
+    let mnemonic = inst.mnemonic.to_ascii_lowercase();
+    if mnemonic == "movsx" || mnemonic == "movsxd" {
+        src = src.sext(operand_size(&inst.operands[1]));
+    }
     write_operand(state, &inst.operands[0], src, inst);
     Ok(())
 }
