@@ -1293,39 +1293,72 @@ fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
 
     // Track argument register values and their statement indices
     let mut arg_values: HashMap<String, (usize, Expr)> = HashMap::new();
+    let mut reg_values: HashMap<String, Expr> = HashMap::new();
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for (i, stmt) in statements.into_iter().enumerate() {
-        // Check if this is an assignment to an argument register
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            let new_rhs = substitute_vars(rhs, &reg_values);
+
             if let ExprKind::Var(v) = &lhs.kind {
+                if is_temp_register(&v.name) {
+                    for alias in get_register_aliases(&v.name) {
+                        reg_values.insert(alias, new_rhs.clone());
+                    }
+                }
+
                 if get_arg_register_index(&v.name).is_some() {
-                    // Track this argument value along with its statement index
-                    arg_values.insert(v.name.clone(), (i, (**rhs).clone()));
-                    result.push(stmt);
+                    // If one ABI argument register is only staging a value into another
+                    // argument register, keep the destination but drop the staged source.
+                    if let ExprKind::Var(src_var) = &rhs.kind {
+                        if let Some(src_idx) = get_arg_register_index(&src_var.name) {
+                            if get_arg_register_index(&v.name) != Some(src_idx) {
+                                for alias in get_register_aliases(&src_var.name) {
+                                    arg_values.remove(&alias);
+                                }
+                            }
+                        }
+                    }
+
+                    // Track this argument value along with its statement index.
+                    arg_values.insert(v.name.clone(), (i, new_rhs.clone()));
+                    result.push(Expr::assign((**lhs).clone(), new_rhs));
                     continue;
                 }
             }
+
+            result.push(Expr::assign((**lhs).clone(), new_rhs));
+            continue;
         }
 
+        // Check if this is an assignment to an argument register
         // Check if this is a function call (not push/pop/syscall/etc.)
         if let ExprKind::Call { target, args } = &stmt.kind {
-            if is_real_function_call(target) && args.is_empty() {
+            let substituted_target = substitute_call_target(target.clone(), &reg_values);
+            if is_real_function_call(target) {
+                let excluded_arg_regs = collect_target_argument_registers(target);
                 // Try to extract arguments from tracked registers
-                let new_args = extract_call_arguments_with_indices(&arg_values);
-                if !new_args.0.is_empty() {
+                let new_args = extract_call_arguments_with_indices(&arg_values, &excluded_arg_regs);
+                if args.is_empty() && !new_args.0.is_empty() {
                     // Mark the used arg assignments for removal
                     for idx in new_args.1 {
                         to_remove.insert(idx);
                     }
                     // Create a new call with arguments
-                    let new_call = Expr::call(target.clone(), new_args.0);
+                    let new_call = Expr::call(substituted_target, new_args.0);
                     result.push(new_call);
                     // Clear argument tracking after the call
                     arg_values.clear();
+                    reg_values.clear();
                     continue;
                 }
+
+                let substituted_args = args.iter().map(|arg| substitute_vars(arg, &reg_values));
+                result.push(Expr::call(substituted_target, substituted_args.collect()));
+                arg_values.clear();
+                reg_values.clear();
+                continue;
             }
         }
 
@@ -1364,6 +1397,83 @@ fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
         .collect()
 }
 
+fn substitute_call_target(
+    target: super::super::expression::CallTarget,
+    reg_values: &HashMap<String, Expr>,
+) -> super::super::expression::CallTarget {
+    use super::super::expression::CallTarget;
+
+    match target {
+        CallTarget::Indirect(expr) => {
+            CallTarget::Indirect(Box::new(substitute_vars(&expr, reg_values)))
+        }
+        CallTarget::IndirectGot { got_address, expr } => CallTarget::IndirectGot {
+            got_address,
+            expr: Box::new(substitute_vars(&expr, reg_values)),
+        },
+        other => other,
+    }
+}
+
+fn collect_target_argument_registers(
+    target: &super::super::expression::CallTarget,
+) -> HashSet<String> {
+    fn collect_expr_arg_regs(expr: &Expr, out: &mut HashSet<String>) {
+        use super::super::expression::ExprKind;
+
+        match &expr.kind {
+            ExprKind::Var(v) => {
+                if get_arg_register_index(&v.name).is_some() {
+                    out.insert(v.name.to_lowercase());
+                }
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                collect_expr_arg_regs(left, out);
+                collect_expr_arg_regs(right, out);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => collect_expr_arg_regs(operand, out),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                collect_expr_arg_regs(base, out);
+                collect_expr_arg_regs(index, out);
+            }
+            ExprKind::FieldAccess { base, .. } => collect_expr_arg_regs(base, out),
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+                for arg in args {
+                    collect_expr_arg_regs(arg, out);
+                }
+            }
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                collect_expr_arg_regs(lhs, out);
+                collect_expr_arg_regs(rhs, out);
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                collect_expr_arg_regs(cond, out);
+                collect_expr_arg_regs(then_expr, out);
+                collect_expr_arg_regs(else_expr, out);
+            }
+            ExprKind::IntLit(_) | ExprKind::Unknown(_) | ExprKind::GotRef { .. } => {}
+        }
+    }
+
+    let mut regs = HashSet::new();
+    match target {
+        super::super::expression::CallTarget::Indirect(expr)
+        | super::super::expression::CallTarget::IndirectGot { expr, .. } => {
+            collect_expr_arg_regs(expr, &mut regs);
+        }
+        _ => {}
+    }
+    regs
+}
+
 /// Checks if a call target is a "real" function call (not push/pop/syscall etc.)
 fn is_real_function_call(target: &super::super::expression::CallTarget) -> bool {
     use super::super::expression::CallTarget;
@@ -1378,40 +1488,18 @@ fn is_real_function_call(target: &super::super::expression::CallTarget) -> bool 
     }
 }
 
-/// Extracts function arguments from tracked argument registers.
-fn extract_call_arguments(arg_values: &HashMap<String, Expr>) -> Vec<Expr> {
-    let mut args: Vec<(usize, Expr)> = Vec::new();
-
-    for (reg_name, value) in arg_values {
-        if let Some(idx) = get_arg_register_index(reg_name) {
-            args.push((idx, value.clone()));
-        }
-    }
-
-    // Sort by argument index
-    args.sort_by_key(|(idx, _)| *idx);
-
-    // Only include contiguous arguments starting from 0
-    let mut result = Vec::new();
-    for (expected_idx, (actual_idx, value)) in args.into_iter().enumerate() {
-        if actual_idx == expected_idx {
-            result.push(value);
-        } else {
-            break;
-        }
-    }
-
-    result
-}
-
 /// Extracts call arguments and returns (arguments, statement_indices_used).
 /// The statement indices are used to track which arg assignments should be removed.
 fn extract_call_arguments_with_indices(
     arg_values: &HashMap<String, (usize, Expr)>,
+    excluded_regs: &HashSet<String>,
 ) -> (Vec<Expr>, Vec<usize>) {
     let mut args: Vec<(usize, usize, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
 
     for (reg_name, (stmt_idx, value)) in arg_values {
+        if excluded_regs.contains(&reg_name.to_lowercase()) {
+            continue;
+        }
         if let Some(arg_idx) = get_arg_register_index(reg_name) {
             args.push((arg_idx, *stmt_idx, value.clone()));
         }
@@ -1532,6 +1620,12 @@ pub(super) fn merge_return_value_captures_with_counter(
                         }
                     }
                 }
+
+                capture_return_register_uses_from_previous_block(
+                    &mut result,
+                    &mut statements,
+                    capture_counter,
+                );
             }
             let statements = capture_return_register_uses_in_block(statements, capture_counter);
             result.push(StructuredNode::Block {
@@ -1634,6 +1728,57 @@ pub(super) fn merge_return_value_captures_node(
     }
 }
 
+fn capture_return_register_uses_from_previous_block(
+    result: &mut [StructuredNode],
+    statements: &mut [Expr],
+    capture_counter: &mut u32,
+) {
+    use super::super::expression::{ExprKind, VarKind, Variable};
+
+    let Some(StructuredNode::Block {
+        statements: prev_stmts,
+        ..
+    }) = result.last_mut()
+    else {
+        return;
+    };
+
+    let Some(Expr {
+        kind: ExprKind::Call { target, args },
+    }) = prev_stmts.last().cloned()
+    else {
+        return;
+    };
+
+    if !is_real_function_call(&target) {
+        return;
+    }
+
+    let Some(primary_reg) = first_return_register_use_before_clobber(statements) else {
+        return;
+    };
+
+    let aliases = return_register_aliases(&primary_reg);
+    let reg_size = if matches!(primary_reg.as_str(), "eax" | "w0") {
+        4
+    } else {
+        8
+    };
+    let temp_name = format!("ret_{}", *capture_counter);
+    *capture_counter += 1;
+    let temp_expr = Expr::var(Variable {
+        kind: VarKind::Temp(*capture_counter),
+        name: temp_name,
+        size: reg_size,
+    });
+
+    if let Some(last_stmt) = prev_stmts.last_mut() {
+        *last_stmt = Expr::assign(temp_expr.clone(), Expr::call(target, args));
+    }
+
+    substitute_return_register_uses_until_clobber(statements, &aliases, &temp_expr);
+}
+
 pub(super) fn capture_return_register_uses_in_block(
     statements: Vec<Expr>,
     capture_counter: &mut u32,
@@ -1713,6 +1858,57 @@ pub(super) fn capture_return_register_uses_in_block(
     }
 
     stmts
+}
+
+fn first_return_register_use_before_clobber(statements: &[Expr]) -> Option<String> {
+    let all_aliases = [
+        "eax".to_string(),
+        "rax".to_string(),
+        "w0".to_string(),
+        "x0".to_string(),
+        "arg0".to_string(),
+        "a0".to_string(),
+    ];
+
+    for stmt in statements {
+        if let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind {
+            if is_real_function_call(target) {
+                break;
+            }
+        }
+
+        let uses = collect_return_register_uses(stmt);
+        if let Some(reg) = uses.into_iter().next() {
+            return Some(reg);
+        }
+
+        if statement_clobbers_return_register(stmt, &all_aliases) {
+            break;
+        }
+    }
+
+    None
+}
+
+fn substitute_return_register_uses_until_clobber(
+    statements: &mut [Expr],
+    aliases: &[String],
+    replacement: &Expr,
+) {
+    for stmt in statements.iter_mut() {
+        let original = stmt.clone();
+        if let super::super::expression::ExprKind::Call { target, .. } = &original.kind {
+            if is_real_function_call(target) {
+                break;
+            }
+        }
+
+        *stmt = substitute_return_register_uses(original.clone(), aliases, replacement);
+
+        if statement_clobbers_return_register(&original, aliases) {
+            break;
+        }
+    }
 }
 
 fn return_register_aliases(reg_name: &str) -> Vec<String> {
@@ -1921,4 +2117,118 @@ pub(super) fn substitute_return_register_uses(
     }
 
     sub(expr, aliases, replacement, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decompiler::expression::{BinOpKind, CallTarget, ExprKind, Variable};
+    use hexray_core::BasicBlockId;
+
+    fn reg(name: &str, size: u8) -> Expr {
+        Expr::var(Variable::reg(name, size))
+    }
+
+    fn block(id: u32, statements: Vec<Expr>) -> StructuredNode {
+        StructuredNode::Block {
+            id: BasicBlockId::new(id),
+            statements,
+            address_range: (0x1000 + (id as u64) * 0x10, 0x1008 + (id as u64) * 0x10),
+        }
+    }
+
+    #[test]
+    fn test_propagate_call_args_substitutes_temp_rhs() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::unknown("n")),
+            Expr::assign(
+                reg("eax", 4),
+                Expr::binop(BinOpKind::Sub, reg("eax", 4), Expr::int(1)),
+            ),
+            Expr::assign(reg("edi", 4), reg("eax", 4)),
+            Expr::call(CallTarget::Named("recursive_sum".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        assert_eq!(args.len(), 1);
+        assert_eq!(format!("{}", args[0]), "n - 1");
+    }
+
+    #[test]
+    fn test_propagate_call_args_excludes_indirect_target_and_staging_regs() {
+        let statements = vec![
+            Expr::assign(reg("edx", 4), Expr::int(6)),
+            Expr::assign(reg("eax", 4), Expr::int(4)),
+            Expr::assign(reg("rcx", 8), Expr::unknown("fn")),
+            Expr::assign(reg("esi", 4), reg("edx", 4)),
+            Expr::assign(reg("edi", 4), reg("eax", 4)),
+            Expr::call(CallTarget::Indirect(Box::new(reg("rcx", 8))), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing indirect call after propagation");
+        };
+
+        match target {
+            CallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "fn"),
+            other => panic!("expected indirect call target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["4", "6"]
+        );
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_across_blocks_for_compound_use() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(
+                    CallTarget::Named("foo".to_string()),
+                    vec![Expr::int(1)],
+                )],
+            ),
+            block(
+                1,
+                vec![Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Add,
+                        lhs: Box::new(Expr::unknown("sum")),
+                        rhs: Box::new(reg("eax", 4)),
+                    },
+                }],
+            ),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        let StructuredNode::Block {
+            statements: second_block,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected second node to remain a block");
+        };
+
+        assert_eq!(format!("{}", first_block[0]), "ret_0 = foo(1)");
+        assert_eq!(format!("{}", second_block[0]), "sum += ret_0");
+    }
 }

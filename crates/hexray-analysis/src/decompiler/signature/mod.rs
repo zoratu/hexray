@@ -968,6 +968,7 @@ impl SignatureRecovery {
                             }
                         }
                         if is_callback_slot {
+                            let callback_slots = self.callback_slot_indices(fn_name);
                             let var_name_conflicts_non_callback = var_name_direct_param_idx
                                 .map(|idx| callback_excluded_indices.contains(&idx))
                                 .unwrap_or(false);
@@ -991,8 +992,12 @@ impl SignatureRecovery {
                             }
                             if let Some(param_idx) = resolved_param_idx {
                                 let suppress_shape_reason = used_shape_fallback
-                                    && self.callback_slot_indices(fn_name).len() == 1
+                                    && callback_slots.len() == 1
                                     && !Self::prefer_slot_ordinal_callback_fallback(fn_name);
+                                let inferred_same_slot =
+                                    Self::prefer_slot_ordinal_callback_fallback(fn_name)
+                                        && callback_slots.len() > 1
+                                        && param_idx == i;
                                 let hints = self.param_hints.entry(param_idx).or_default();
                                 hints.is_function_pointer = true;
                                 hints.function_pointer_confidence =
@@ -1017,6 +1022,11 @@ impl SignatureRecovery {
                                 if used_slot_fallback {
                                     hints.add_function_pointer_reason(format!(
                                         "[source=slot-fallback] mapped callback slot '{}' argument {} by slot ordinal",
+                                        fn_name, i
+                                    ));
+                                } else if inferred_same_slot {
+                                    hints.add_function_pointer_reason(format!(
+                                        "[source=slot-fallback] callback slot '{}' argument {} stayed on the matching ordinal parameter",
                                         fn_name, i
                                     ));
                                 }
