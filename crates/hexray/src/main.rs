@@ -17,11 +17,12 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
-    is_noreturn_function_name, AnalysisProject, BinaryDataContext, BinaryDiff, CallGraphBuilder,
-    CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CfgBuilder, CfgDotExporter,
-    CfgHtmlExporter, CfgJsonExporter, Decompiler, DecompilerConfig, FunctionInfo,
-    OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder, Patch, PatchType,
-    RelocationTable, StringConfig, StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
+    is_noreturn_function_name, AnalysisProject, BinaryDataContext, BinaryDiff, CallGraph,
+    CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CallSite,
+    CallType, CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter, Decompiler,
+    DecompilerConfig, FunctionInfo, OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder,
+    Patch, PatchType, RelocationTable, StringConfig, StringDetector, StringTable, SymbolTable,
+    XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -691,7 +692,7 @@ fn main() -> Result<()> {
         }) => {
             let project =
                 load_requested_project(None, global_project_path.as_deref(), binary_path)?;
-            build_callgraph(fmt, &target, dot, json, html, project.as_ref())?;
+            build_callgraph(&binary, &target, dot, json, html, project.as_ref())?;
         }
         Some(Commands::Strings {
             min_length,
@@ -707,7 +708,13 @@ fn main() -> Result<()> {
         }) => {
             let project =
                 load_requested_project(None, global_project_path.as_deref(), binary_path)?;
-            build_xrefs(fmt, target.as_deref(), calls_only, json, project.as_ref())?;
+            build_xrefs(
+                &binary,
+                target.as_deref(),
+                calls_only,
+                json,
+                project.as_ref(),
+            )?;
         }
         Some(Commands::Project { action }) => {
             handle_project_command(Some(binary_path.as_path()), action)?;
@@ -1138,6 +1145,31 @@ fn resolve_analysis_target(
     bail!("Symbol '{}' not found", target)
 }
 
+fn resolve_analysis_target_with_symbols(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    target: &str,
+    symbols: &[hexray_core::Symbol],
+) -> Result<ResolvedAnalysisTarget> {
+    match resolve_analysis_target(fmt, project, target) {
+        Ok(resolved) => Ok(resolved),
+        Err(_) => {
+            if let Some(symbol) =
+                find_symbol_in_candidates(symbols, target, SymbolLookupMode::ExactOnly)
+            {
+                return Ok(ResolvedAnalysisTarget::Symbol(symbol));
+            }
+            if let Some(symbol) =
+                find_symbol_in_candidates(symbols, target, SymbolLookupMode::Fuzzy)
+            {
+                return Ok(ResolvedAnalysisTarget::Symbol(symbol));
+            }
+
+            bail!("Symbol '{}' not found", target)
+        }
+    }
+}
+
 fn display_function_name(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
@@ -1153,9 +1185,10 @@ fn display_function_name(
         .unwrap_or_else(|| format!("sub_{:x}", address))
 }
 
-fn display_symbol_or_label_name(
+fn display_symbol_or_label_name_with_symbols(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
+    symbols: &[hexray_core::Symbol],
     address: u64,
 ) -> String {
     project
@@ -1167,6 +1200,10 @@ fn display_symbol_or_label_name(
         .or_else(|| {
             fmt.symbol_at(address)
                 .map(|s| demangle_or_original(&s.name))
+                .or_else(|| {
+                    find_preferred_symbol_at(symbols, address)
+                        .map(|symbol| demangle_or_original(&symbol.name))
+                })
         })
         .unwrap_or_else(|| format!("sub_{:x}", address))
 }
@@ -1184,6 +1221,20 @@ fn display_symbol_name(
         .and_then(|p| p.get_label(symbol.address))
         .map(|name| name.to_string())
         .unwrap_or_else(|| demangle_or_original(&symbol.name))
+}
+
+fn find_preferred_symbol_at<'a>(
+    symbols: &'a [hexray_core::Symbol],
+    address: u64,
+) -> Option<&'a hexray_core::Symbol> {
+    symbols
+        .iter()
+        .filter(|symbol| symbol.address == address)
+        .max_by(|left, right| {
+            symbol_display_priority(left)
+                .cmp(&symbol_display_priority(right))
+                .then_with(|| right.name.len().cmp(&left.name.len()))
+        })
 }
 
 fn find_symbol_in_candidates(
@@ -1862,6 +1913,57 @@ fn read_cstring_from_elf(data: &[u8], offset: usize) -> Option<String> {
     ))
 }
 
+fn synthetic_external_symbol_address(name: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    0xff00_0000_0000_0000 | (hash & 0x00ff_ffff_ffff_ffff)
+}
+
+fn resolve_relocation_symbol(symbol: &hexray_core::Symbol) -> (u64, bool) {
+    if symbol.section_index.is_some() {
+        (symbol.address, false)
+    } else {
+        (synthetic_external_symbol_address(&symbol.name), true)
+    }
+}
+
+fn collect_analysis_symbols(
+    fmt: &dyn BinaryFormat,
+    relocations: &RelocationTable,
+) -> Vec<hexray_core::Symbol> {
+    let mut symbols: Vec<_> = fmt.symbols().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    for symbol in &symbols {
+        seen.insert((symbol.address, symbol.name.clone()));
+    }
+
+    for (_, relocation) in relocations.call_relocations() {
+        if !relocation.is_external {
+            continue;
+        }
+        if !seen.insert((relocation.target_addr, relocation.symbol.clone())) {
+            continue;
+        }
+        symbols.push(hexray_core::Symbol {
+            name: relocation.symbol.clone(),
+            address: relocation.target_addr,
+            size: 0,
+            kind: hexray_core::SymbolKind::Function,
+            binding: hexray_core::SymbolBinding::Global,
+            section_index: None,
+        });
+    }
+
+    symbols
+}
+
 ///
 /// For kernel modules and other relocatable files, call instructions have
 /// unresolved targets. This table maps call instruction addresses to the
@@ -1900,10 +2002,14 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                 // PC-relative relocations (for calls/jumps in relocatable objects)
                 RelocationType::Pc32 | RelocationType::Plt32 => {
                     if let Some(section) = elf.sections.get(reloc.section_index) {
+                        let (target_addr, is_external) = resolve_relocation_symbol(symbol);
                         // For x86_64 call E8 xx xx xx xx, the relocation points to the displacement
                         // The call opcode (E8) is at offset-1 from the relocation
-                        let call_addr = section.sh_offset + reloc.offset - 1;
-                        table.insert(call_addr, symbol.name.clone());
+                        let call_addr = section
+                            .sh_offset
+                            .saturating_add(reloc.offset)
+                            .saturating_sub(1);
+                        table.insert_call(call_addr, symbol.name.clone(), target_addr, is_external);
                     }
                 }
                 // 32-bit signed immediate relocations (for mov reg, imm32)
@@ -2142,6 +2248,19 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
     instructions
 }
 
+fn apply_call_relocations(
+    instructions: &mut [hexray_core::Instruction],
+    relocations: &RelocationTable,
+) {
+    for instruction in instructions {
+        if let hexray_core::ControlFlow::Call { target, .. } = &mut instruction.control_flow {
+            if let Some(relocation) = relocations.get_call(instruction.address) {
+                *target = relocation.target_addr;
+            }
+        }
+    }
+}
+
 fn has_internal_function_symbols(symbols: &[hexray_core::Symbol]) -> bool {
     symbols
         .iter()
@@ -2288,14 +2407,17 @@ fn discover_materialized_internal_targets(
 }
 
 fn build_callgraph(
-    fmt: &dyn BinaryFormat,
+    binary: &Binary,
     target: &str,
     dot: bool,
     json: bool,
     html: bool,
     project: Option<&AnalysisProject>,
 ) -> Result<()> {
-    let symbols: Vec<_> = fmt.symbols().cloned().collect();
+    let fmt = binary.as_format();
+    let relocation_table = build_relocation_table(binary);
+    let has_call_relocations = relocation_table.call_relocations().len() > 0;
+    let symbols = collect_analysis_symbols(fmt, &relocation_table);
     let arch = fmt.architecture();
     let noreturn_targets: std::collections::HashSet<u64> = symbols
         .iter()
@@ -2310,9 +2432,7 @@ fn build_callgraph(
         discover_function_starts(fmt, arch, &symbols)
             .into_iter()
             .map(|(addr, size, heuristic_bounds)| {
-                let name = symbols
-                    .iter()
-                    .find(|s| s.address == addr)
+                let name = find_preferred_symbol_at(&symbols, addr)
                     .map(|s| demangle_or_original(&s.name))
                     .unwrap_or_else(|| {
                         if Some(addr) == fmt.entry_point() {
@@ -2326,10 +2446,10 @@ fn build_callgraph(
             .collect()
     } else {
         let (addr, name, size, heuristic_bounds) =
-            match resolve_analysis_target(fmt, project, target)? {
+            match resolve_analysis_target_with_symbols(fmt, project, target, &symbols)? {
                 ResolvedAnalysisTarget::Address(address) => (
                     address,
-                    display_function_name(fmt, project, address),
+                    display_symbol_or_label_name_with_symbols(fmt, project, &symbols, address),
                     4096u64,
                     true,
                 ),
@@ -2337,7 +2457,12 @@ fn build_callgraph(
                     let size = if symbol.size > 0 { symbol.size } else { 4096 };
                     (
                         symbol.address,
-                        display_function_name(fmt, project, symbol.address),
+                        display_symbol_or_label_name_with_symbols(
+                            fmt,
+                            project,
+                            &symbols,
+                            symbol.address,
+                        ),
                         size,
                         symbol.size == 0,
                     )
@@ -2388,7 +2513,11 @@ fn build_callgraph(
         let function_infos: Vec<FunctionInfo> = pending_functions
             .iter()
             .filter_map(|(func_addr, _, func_size, heuristic_bounds)| {
-                let size = (*func_size).max(64) as usize;
+                let size = if *heuristic_bounds {
+                    (*func_size).max(64) as usize
+                } else {
+                    (*func_size).max(1) as usize
+                };
                 fmt.bytes_at(*func_addr, size).map(|bytes| FunctionInfo {
                     address: *func_addr,
                     size,
@@ -2401,7 +2530,7 @@ fn build_callgraph(
         // Disassemble and find call targets
         let mut new_call_targets: Vec<(u64, String, u64, bool)> = Vec::new();
         for func_info in &function_infos {
-            let instructions: Vec<hexray_core::Instruction> = match arch {
+            let mut instructions: Vec<hexray_core::Instruction> = match arch {
                 Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
                     &disasm_x86,
                     &func_info.bytes,
@@ -2432,20 +2561,22 @@ fn build_callgraph(
                 ),
                 _ => Vec::new(),
             };
+            if has_call_relocations {
+                apply_call_relocations(&mut instructions, &relocation_table);
+            }
 
             // Extract call targets
             for instr in &instructions {
                 if let hexray_core::ControlFlow::Call { target, .. } = &instr.control_flow {
                     if !known_functions.contains(target) && is_internal_code(*target) {
                         known_functions.insert(*target);
-                        let (name, size, heuristic_bounds) = symbols
-                            .iter()
-                            .find(|s| s.address == *target)
-                            .map(|s| {
-                                let size = if s.size > 0 { s.size } else { 4096 };
-                                (demangle_or_original(&s.name), size, s.size == 0)
-                            })
-                            .unwrap_or_else(|| (format!("sub_{:x}", target), 4096, true));
+                        let (name, size, heuristic_bounds) =
+                            find_preferred_symbol_at(&symbols, *target)
+                                .map(|s| {
+                                    let size = if s.size > 0 { s.size } else { 4096 };
+                                    (demangle_or_original(&s.name), size, s.size == 0)
+                                })
+                                .unwrap_or_else(|| (format!("sub_{:x}", target), 4096, true));
                         new_call_targets.push((*target, name, size, heuristic_bounds));
                     }
                 }
@@ -2454,9 +2585,7 @@ fn build_callgraph(
             for target in discover_materialized_internal_targets(&instructions, fmt) {
                 if !known_functions.contains(&target) && is_internal_code(target) {
                     known_functions.insert(target);
-                    let (name, size, heuristic_bounds) = symbols
-                        .iter()
-                        .find(|s| s.address == target)
+                    let (name, size, heuristic_bounds) = find_preferred_symbol_at(&symbols, target)
                         .map(|s| {
                             let size = if s.size > 0 { s.size } else { 4096 };
                             (demangle_or_original(&s.name), size, s.size == 0)
@@ -2472,24 +2601,87 @@ fn build_callgraph(
     }
 
     // Build call graph using all discovered functions
-    let callgraph = match arch {
-        Architecture::X86_64 | Architecture::X86 => {
-            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_x86, &symbols)
+    let callgraph = if has_call_relocations {
+        let mut callgraph = CallGraph::new();
+        for symbol in &symbols {
+            if symbol.is_function() {
+                callgraph.add_node(symbol.address, Some(symbol.name.clone()), false);
+            }
         }
-        Architecture::Arm64 => {
-            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_arm64, &symbols)
+        for func_info in &all_function_infos {
+            let mut instructions: Vec<hexray_core::Instruction> = match arch {
+                Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
+                    &disasm_x86,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::Arm64 => disassemble_for_calls(
+                    &disasm_arm64,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::RiscV64 => disassemble_for_calls(
+                    &disasm_riscv,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                Architecture::RiscV32 => disassemble_for_calls(
+                    &disasm_riscv32,
+                    &func_info.bytes,
+                    func_info.address,
+                    func_info.heuristic_bounds,
+                    &noreturn_targets,
+                ),
+                _ => Vec::new(),
+            };
+            apply_call_relocations(&mut instructions, &relocation_table);
+            if find_preferred_symbol_at(&symbols, func_info.address).is_none() {
+                callgraph.add_node(func_info.address, None, false);
+            }
+            for instruction in instructions {
+                if let hexray_core::ControlFlow::Call { target, .. } = instruction.control_flow {
+                    if let Some(symbol) = find_preferred_symbol_at(&symbols, target) {
+                        callgraph.add_node(target, Some(symbol.name.clone()), false);
+                    } else {
+                        callgraph.add_node(target, None, false);
+                    }
+                    callgraph.add_call(
+                        func_info.address,
+                        target,
+                        CallSite {
+                            call_address: instruction.address,
+                            call_type: CallType::Direct,
+                        },
+                    );
+                }
+            }
         }
-        Architecture::RiscV64 => {
-            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_riscv, &symbols)
-        }
-        Architecture::RiscV32 => {
-            ParallelCallGraphBuilder::build(&all_function_infos, &disasm_riscv32, &symbols)
-        }
-        _ => {
-            // Fallback to sequential for unsupported architectures
-            let mut builder = CallGraphBuilder::new();
-            builder.add_symbols(&symbols);
-            builder.build()
+        callgraph
+    } else {
+        match arch {
+            Architecture::X86_64 | Architecture::X86 => {
+                ParallelCallGraphBuilder::build(&all_function_infos, &disasm_x86, &symbols)
+            }
+            Architecture::Arm64 => {
+                ParallelCallGraphBuilder::build(&all_function_infos, &disasm_arm64, &symbols)
+            }
+            Architecture::RiscV64 => {
+                ParallelCallGraphBuilder::build(&all_function_infos, &disasm_riscv, &symbols)
+            }
+            Architecture::RiscV32 => {
+                ParallelCallGraphBuilder::build(&all_function_infos, &disasm_riscv32, &symbols)
+            }
+            _ => {
+                let mut builder = CallGraphBuilder::new();
+                builder.add_symbols(&symbols);
+                builder.build()
+            }
         }
     };
     let callgraph = if let Some(root) = target_root {
@@ -3216,14 +3408,16 @@ fn print_optimization_passes() {
 }
 
 fn build_xrefs(
-    fmt: &dyn BinaryFormat,
+    binary: &Binary,
     target: Option<&str>,
     calls_only: bool,
     json: bool,
     project: Option<&AnalysisProject>,
 ) -> Result<()> {
+    let fmt = binary.as_format();
+    let relocation_table = build_relocation_table(binary);
     let arch = fmt.architecture();
-    let symbols: Vec<_> = fmt.symbols().cloned().collect();
+    let symbols = collect_analysis_symbols(fmt, &relocation_table);
     let noreturn_targets: std::collections::HashSet<u64> = symbols
         .iter()
         .filter(|s| is_noreturn_function_name(&s.name))
@@ -3265,9 +3459,13 @@ fn build_xrefs(
 
         let mut new_call_targets = Vec::new();
         for (address, size, heuristic_bounds) in &pending_functions {
-            let size = (*size).max(64) as usize;
+            let size = if *heuristic_bounds {
+                (*size).max(64) as usize
+            } else {
+                (*size).max(1) as usize
+            };
             if let Some(bytes) = fmt.bytes_at(*address, size) {
-                let instructions = match arch {
+                let mut instructions = match arch {
                     Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
                         &disasm_x86,
                         bytes,
@@ -3298,16 +3496,16 @@ fn build_xrefs(
                     ),
                     _ => Vec::new(),
                 };
+                apply_call_relocations(&mut instructions, &relocation_table);
                 xref_builder.analyze_instructions(&instructions);
 
                 for instr in instructions {
                     if let hexray_core::ControlFlow::Call { target, .. } = instr.control_flow {
                         if known_functions.insert(target) && is_internal_code(target) {
-                            let (size, heuristic_bounds) = symbols
-                                .iter()
-                                .find(|s| s.address == target)
-                                .map(|s| (if s.size > 0 { s.size } else { 4096 }, s.size == 0))
-                                .unwrap_or((4096, true));
+                            let (size, heuristic_bounds) =
+                                find_preferred_symbol_at(&symbols, target)
+                                    .map(|s| (if s.size > 0 { s.size } else { 4096 }, s.size == 0))
+                                    .unwrap_or((4096, true));
                             new_call_targets.push((target, size, heuristic_bounds));
                         }
                     }
@@ -3322,10 +3520,11 @@ fn build_xrefs(
 
     // If a target is specified, show refs to that target
     if let Some(target_str) = target {
-        let target_addr = match resolve_analysis_target(fmt, project, target_str)? {
-            ResolvedAnalysisTarget::Address(addr) => addr,
-            ResolvedAnalysisTarget::Symbol(symbol) => symbol.address,
-        };
+        let target_addr =
+            match resolve_analysis_target_with_symbols(fmt, project, target_str, &symbols)? {
+                ResolvedAnalysisTarget::Address(addr) => addr,
+                ResolvedAnalysisTarget::Symbol(symbol) => symbol.address,
+            };
 
         let refs = if calls_only {
             db.call_refs_to(target_addr)
@@ -3333,7 +3532,8 @@ fn build_xrefs(
             db.refs_to(target_addr).iter().collect()
         };
 
-        let target_name = display_symbol_or_label_name(fmt, project, target_addr);
+        let target_name =
+            display_symbol_or_label_name_with_symbols(fmt, project, &symbols, target_addr);
 
         // Function-start lookup table: sorted by address. For any call-site
         // address we use partition_point to find the nearest preceding
@@ -3355,7 +3555,9 @@ fn build_xrefs(
                         let lookup_size = symbol.map(|s| s.size).unwrap_or(size);
                         Some((
                             addr,
-                            Some(display_function_name(fmt, project, addr)),
+                            Some(display_symbol_or_label_name_with_symbols(
+                                fmt, project, &symbols, addr,
+                            )),
                             lookup_size,
                         ))
                     }
@@ -3377,14 +3579,22 @@ fn build_xrefs(
                 {
                     None
                 } else {
-                    Some(display_function_name(fmt, project, target))
+                    Some(display_symbol_or_label_name_with_symbols(
+                        fmt, project, &symbols, target,
+                    ))
                 };
                 function_starts.push((target, name, 0));
             }
         }
         if let Some(entry) = fmt.entry_point() {
             if seen.insert(entry) {
-                function_starts.push((entry, Some(display_function_name(fmt, project, entry)), 0));
+                function_starts.push((
+                    entry,
+                    Some(display_symbol_or_label_name_with_symbols(
+                        fmt, project, &symbols, entry,
+                    )),
+                    0,
+                ));
             }
         }
         function_starts.sort_by_key(|(addr, _, _)| *addr);

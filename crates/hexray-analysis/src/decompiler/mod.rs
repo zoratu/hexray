@@ -264,6 +264,17 @@ impl SymbolTable {
     }
 }
 
+/// A resolved call-site relocation.
+#[derive(Debug, Clone)]
+pub struct CallRelocation {
+    /// The target symbol name.
+    pub symbol: String,
+    /// The resolved address used by analysis.
+    pub target_addr: u64,
+    /// Whether the target is external to the current binary.
+    pub is_external: bool,
+}
+
 /// Relocation table for resolving symbols in relocatable files.
 ///
 /// In kernel modules and other relocatable files, call instructions
@@ -272,7 +283,7 @@ impl SymbolTable {
 #[derive(Debug, Clone, Default)]
 pub struct RelocationTable {
     /// Maps instruction addresses to target symbol names (for calls).
-    call_relocations: HashMap<u64, String>,
+    call_relocations: HashMap<u64, CallRelocation>,
     /// Maps instruction addresses to data symbol names (for mov/lea with immediates).
     data_relocations: HashMap<u64, String>,
     /// Maps GOT/PLT entry addresses to symbol names (for indirect calls).
@@ -287,7 +298,25 @@ impl RelocationTable {
 
     /// Adds a call relocation entry.
     pub fn insert(&mut self, call_addr: u64, target_symbol: String) {
-        self.call_relocations.insert(call_addr, target_symbol);
+        self.insert_call(call_addr, target_symbol, 0, false);
+    }
+
+    /// Adds a resolved call relocation entry.
+    pub fn insert_call(
+        &mut self,
+        call_addr: u64,
+        target_symbol: String,
+        target_addr: u64,
+        is_external: bool,
+    ) {
+        self.call_relocations.insert(
+            call_addr,
+            CallRelocation {
+                symbol: target_symbol,
+                target_addr,
+                is_external,
+            },
+        );
     }
 
     /// Adds a data relocation entry.
@@ -297,7 +326,23 @@ impl RelocationTable {
 
     /// Looks up a call target by call instruction address.
     pub fn get(&self, call_addr: u64) -> Option<&str> {
-        self.call_relocations.get(&call_addr).map(|s| s.as_str())
+        self.call_relocations
+            .get(&call_addr)
+            .map(|reloc| reloc.symbol.as_str())
+    }
+
+    /// Looks up the full resolved call relocation by call instruction address.
+    pub fn get_call(&self, call_addr: u64) -> Option<&CallRelocation> {
+        self.call_relocations.get(&call_addr)
+    }
+
+    /// Returns all resolved call relocations.
+    pub fn call_relocations(
+        &self,
+    ) -> impl Iterator<Item = (u64, &CallRelocation)> + ExactSizeIterator + '_ {
+        self.call_relocations
+            .iter()
+            .map(|(addr, reloc)| (*addr, reloc))
     }
 
     /// Looks up a data symbol by instruction address.

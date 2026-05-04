@@ -1357,6 +1357,27 @@ fn test_callgraph_json() {
     }
 }
 
+#[test]
+fn test_callgraph_relocatable_uses_relocation_target_name() {
+    let fixture = workspace_fixture_path("test_relocatable.o");
+    let output = run_hexray(&[&fixture, "callgraph", "all"]);
+    assert!(
+        output.status.success(),
+        "callgraph on relocatable object should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("external_func"),
+        "callgraph should name the relocated callee: {stdout}"
+    );
+    assert!(
+        !stdout.contains("sub_53"),
+        "callgraph should not invent a fallthrough callee for the relocation: {stdout}"
+    );
+}
+
 // =============================================================================
 // Xrefs Command Tests
 // =============================================================================
@@ -1385,6 +1406,27 @@ fn test_xrefs_json() {
             "JSON output should be valid"
         );
     }
+}
+
+#[test]
+fn test_xrefs_relocatable_resolves_external_symbol_name() {
+    let fixture = workspace_fixture_path("test_relocatable.o");
+    let output = run_hexray(&[&fixture, "xrefs", "external_func"]);
+    assert!(
+        output.status.success(),
+        "xrefs on relocatable external symbol should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Cross-references to external_func"),
+        "xref title should resolve the relocation target name: {stdout}"
+    );
+    assert!(
+        stdout.contains("my_function"),
+        "xref output should identify the caller function: {stdout}"
+    );
 }
 
 // =============================================================================
