@@ -610,7 +610,9 @@ fn main() -> Result<()> {
             print_sections(&binary);
         }
         Some(Commands::Symbols { functions }) => {
-            print_symbols(fmt, functions);
+            let project =
+                load_requested_project(None, global_project_path.as_deref(), binary_path)?;
+            print_symbols(fmt, functions, project.as_ref());
         }
         Some(Commands::Info) => {
             print_info(&binary);
@@ -932,7 +934,7 @@ fn print_sections(binary: &Binary) {
     }
 }
 
-fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool) {
+fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool, project: Option<&AnalysisProject>) {
     println!(
         "{:<16} {:<8} {:<8} {:<8} Name",
         "Address", "Size", "Type", "Bind"
@@ -965,7 +967,7 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool) {
             _ => "OTHER",
         };
 
-        let demangled = demangle_or_original(&symbol.name);
+        let demangled = display_symbol_name(fmt, project, symbol);
 
         println!(
             "{:#016x} {:<8} {:<8} {:<8} {}",
