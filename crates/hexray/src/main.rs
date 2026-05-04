@@ -2161,55 +2161,64 @@ fn build_callgraph(
         let exporter = CallGraphDotExporter::new();
         exporter.export_to_stdout(&callgraph)?;
     } else {
-        // Text output
-        println!("Call Graph Analysis");
-        println!("===================");
-        println!("Functions: {}", callgraph.node_count());
-        println!("Call edges: {}", callgraph.edge_count());
-        println!();
-
-        for node in callgraph.nodes() {
-            let node_name = node
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("sub_{:x}", node.address));
-            let callees: Vec<_> = callgraph
-                .callees(node.address)
-                .filter_map(|(addr, _)| callgraph.get_node(addr))
-                .collect();
-
-            if !callees.is_empty() {
-                println!("{} ({:#x}):", node_name, node.address);
-                let mut seen: std::collections::HashMap<u64, (String, usize)> =
-                    std::collections::HashMap::new();
-                let mut order: Vec<u64> = Vec::new();
-                for callee in callees {
-                    let callee_name = callee
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("sub_{:x}", callee.address));
-                    let entry = seen
-                        .entry(callee.address)
-                        .or_insert_with(|| (callee_name.clone(), 0));
-                    if entry.1 == 0 {
-                        order.push(callee.address);
-                    }
-                    entry.1 += 1;
-                }
-                for addr in order {
-                    let (name, count) = &seen[&addr];
-                    if *count > 1 {
-                        println!("  -> {} ({:#x}) [{}x]", name, addr, count);
-                    } else {
-                        println!("  -> {} ({:#x})", name, addr);
-                    }
-                }
-                println!();
-            }
-        }
+        print!("{}", format_callgraph_text(&callgraph));
     }
 
     Ok(())
+}
+
+fn callgraph_node_display_name(node: &hexray_analysis::CallGraphNode) -> String {
+    node.name
+        .clone()
+        .unwrap_or_else(|| format!("sub_{:x}", node.address))
+}
+
+fn format_callgraph_text(callgraph: &hexray_analysis::CallGraph) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    writeln!(output, "Call Graph Analysis").unwrap();
+    writeln!(output, "===================").unwrap();
+    writeln!(output, "Functions: {}", callgraph.node_count()).unwrap();
+    writeln!(output, "Call edges: {}", callgraph.edge_count()).unwrap();
+    writeln!(output).unwrap();
+
+    let mut nodes: Vec<_> = callgraph.nodes().collect();
+    nodes.sort_by_key(|node| node.address);
+
+    for node in nodes {
+        let mut callees: std::collections::BTreeMap<u64, (String, usize)> =
+            std::collections::BTreeMap::new();
+        for (addr, _) in callgraph.callees(node.address) {
+            let Some(callee) = callgraph.get_node(addr) else {
+                continue;
+            };
+            let entry = callees
+                .entry(callee.address)
+                .or_insert_with(|| (callgraph_node_display_name(callee), 0));
+            entry.1 += 1;
+        }
+
+        if !callees.is_empty() {
+            writeln!(
+                output,
+                "{} ({:#x}):",
+                callgraph_node_display_name(node),
+                node.address
+            )
+            .unwrap();
+            for (addr, (name, count)) in callees {
+                if count > 1 {
+                    writeln!(output, "  -> {} ({:#x}) [{}x]", name, addr, count).unwrap();
+                } else {
+                    writeln!(output, "  -> {} ({:#x})", name, addr).unwrap();
+                }
+            }
+            writeln!(output).unwrap();
+        }
+    }
+
+    output
 }
 
 fn truncate_for_display(content: &str, max_chars: usize) -> String {
@@ -5037,9 +5046,10 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_distinct_export_paths, find_symbol_in_candidates, parse_address_str,
-        truncate_for_display, SessionExportFormat, SymbolLookupMode,
+        ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
+        parse_address_str, truncate_for_display, SessionExportFormat, SymbolLookupMode,
     };
+    use hexray_analysis::{CallGraph, CallSite, CallType};
     use hexray_core::{Symbol, SymbolBinding, SymbolKind};
     use std::fs;
 
@@ -5132,6 +5142,68 @@ mod tests {
         let truncated = truncate_for_display(&content, 80);
 
         assert_eq!(truncated, format!("{}Æ...", "A".repeat(76)));
+    }
+
+    #[test]
+    fn callgraph_text_output_is_sorted_by_address() {
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x2000, Some("callee_b".to_string()), false);
+        callgraph.add_node(0x1000, Some("caller".to_string()), false);
+        callgraph.add_node(0x1500, Some("callee_a".to_string()), false);
+        callgraph.add_node(0x800, Some("root".to_string()), false);
+
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            CallSite {
+                call_address: 0x1010,
+                call_type: CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x1000,
+            0x1500,
+            CallSite {
+                call_address: 0x1020,
+                call_type: CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x1000,
+            0x2000,
+            CallSite {
+                call_address: 0x1030,
+                call_type: CallType::Direct,
+            },
+        );
+        callgraph.add_call(
+            0x800,
+            0x1000,
+            CallSite {
+                call_address: 0x810,
+                call_type: CallType::Direct,
+            },
+        );
+
+        let output = format_callgraph_text(&callgraph);
+
+        assert_eq!(
+            output,
+            concat!(
+                "Call Graph Analysis\n",
+                "===================\n",
+                "Functions: 4\n",
+                "Call edges: 4\n",
+                "\n",
+                "root (0x800):\n",
+                "  -> caller (0x1000)\n",
+                "\n",
+                "caller (0x1000):\n",
+                "  -> callee_a (0x1500)\n",
+                "  -> callee_b (0x2000) [2x]\n",
+                "\n",
+            )
+        );
     }
 
     #[test]
