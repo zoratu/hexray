@@ -11,6 +11,54 @@ use hexray_emulate::{state::x86_regs, Emulator, EmulatorConfig, Value};
 use hexray_formats::BinaryFormat;
 use serde::Serialize;
 
+fn parse_register_id(arch: Architecture, value: &str) -> Result<u16> {
+    if let Ok(register_id) = value.parse::<u16>() {
+        return Ok(register_id);
+    }
+
+    let normalized = value.trim().to_ascii_lowercase();
+    let register_id = match arch {
+        Architecture::X86_64 | Architecture::X86 => match normalized.as_str() {
+            "rax" | "eax" => x86_regs::RAX,
+            "rcx" | "ecx" => x86_regs::RCX,
+            "rdx" | "edx" => x86_regs::RDX,
+            "rbx" | "ebx" => x86_regs::RBX,
+            "rsp" | "esp" => x86_regs::RSP,
+            "rbp" | "ebp" => x86_regs::RBP,
+            "rsi" | "esi" => x86_regs::RSI,
+            "rdi" | "edi" => x86_regs::RDI,
+            "r8" => x86_regs::R8,
+            "r9" => x86_regs::R9,
+            "r10" => x86_regs::R10,
+            "r11" => x86_regs::R11,
+            "r12" => x86_regs::R12,
+            "r13" => x86_regs::R13,
+            "r14" => x86_regs::R14,
+            "r15" => x86_regs::R15,
+            _ => bail!("Unknown x86_64 register '{}'", value),
+        },
+        Architecture::Arm64 => {
+            if normalized == "sp" {
+                31
+            } else if let Some(index) = normalized.strip_prefix('x') {
+                index
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|idx| *idx <= 30)
+                    .with_context(|| format!("Unknown AArch64 register '{}'", value))?
+            } else {
+                bail!("Unknown AArch64 register '{}'", value);
+            }
+        }
+        _ => bail!(
+            "Register names are not supported for architecture {:?}; pass a numeric register id",
+            arch
+        ),
+    };
+
+    Ok(register_id)
+}
+
 /// Static emulation actions.
 #[derive(Subcommand)]
 pub enum EmulateAction {
@@ -43,7 +91,7 @@ pub enum EmulateAction {
         address: u64,
         /// Register containing the index value
         #[arg(short, long)]
-        index_register: u16,
+        index_register: String,
         /// Minimum index value to try
         #[arg(long, default_value = "0")]
         min_index: u64,
@@ -234,6 +282,7 @@ pub fn handle_emulate_command(fmt: &dyn BinaryFormat, action: EmulateAction) -> 
         } => run_emulate_json_action(json, || {
             let (func_addr, func_size) = resolve_function(&function)?;
             let instructions = get_instructions(func_addr, func_size)?;
+            let index_register = parse_register_id(arch, &index_register)?;
 
             // Create emulator
             let config = EmulatorConfig {
@@ -505,4 +554,32 @@ fn print_state_result(result: &hexray_emulate::ExecutionResult) {
         "  OF: {:?}  PF: {:?}  AF: {:?}",
         flags.of, flags.pf, flags.af
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_register_id;
+    use hexray_core::Architecture;
+    use hexray_emulate::state::x86_regs;
+
+    #[test]
+    fn test_parse_emulate_register_accepts_numeric_ids() {
+        assert_eq!(parse_register_id(Architecture::X86_64, "7").unwrap(), 7);
+    }
+
+    #[test]
+    fn test_parse_emulate_register_accepts_x86_register_names() {
+        assert_eq!(
+            parse_register_id(Architecture::X86_64, "rdi").unwrap(),
+            x86_regs::RDI
+        );
+        assert_eq!(
+            parse_register_id(Architecture::X86_64, "RAX").unwrap(),
+            x86_regs::RAX
+        );
+        assert_eq!(
+            parse_register_id(Architecture::X86_64, "edi").unwrap(),
+            x86_regs::RDI
+        );
+    }
 }
