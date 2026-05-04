@@ -8,7 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hexray_core::{ControlFlow, Instruction, Operand, Operation, Register, RegisterClass};
+use hexray_core::{
+    Architecture, ControlFlow, Instruction, Operand, Operation, Register, RegisterClass,
+};
 
 /// Type of cross-reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -176,6 +178,14 @@ impl XrefDatabase {
 /// Builder for constructing a cross-reference database from instructions.
 pub struct XrefBuilder {
     db: XrefDatabase,
+    pending_arm64_page_base: Option<PendingArm64PageBase>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingArm64PageBase {
+    register: Register,
+    page_base: u64,
+    next_address: u64,
 }
 
 impl Default for XrefBuilder {
@@ -189,12 +199,14 @@ impl XrefBuilder {
     pub fn new() -> Self {
         Self {
             db: XrefDatabase::new(),
+            pending_arm64_page_base: None,
         }
     }
 
     /// Analyze a single instruction for cross-references.
     pub fn analyze_instruction(&mut self, instr: &Instruction) {
         let from = instr.address;
+        let pending_arm64_page_base = self.take_matching_arm64_page_base(from);
 
         // Check control flow for code references
         match &instr.control_flow {
@@ -210,7 +222,13 @@ impl XrefBuilder {
             _ => {}
         }
 
-        if instr.operation == Operation::LoadEffectiveAddress {
+        if let Some((target, xref_type)) =
+            Self::extract_arm64_pageoff_target(instr, pending_arm64_page_base)
+        {
+            self.db.add_xref(from, target, xref_type);
+        }
+
+        if instr.operation == Operation::LoadEffectiveAddress && !Self::is_arm64_adrp(instr) {
             if let Some(target) = instr
                 .operands
                 .get(1)
@@ -233,13 +251,17 @@ impl XrefBuilder {
                 self.db.add_xref(from, addr, xref_type);
             }
         }
+
+        self.pending_arm64_page_base = Self::track_arm64_page_base(instr);
     }
 
     /// Analyze a sequence of instructions.
     pub fn analyze_instructions(&mut self, instructions: &[Instruction]) {
+        self.pending_arm64_page_base = None;
         for instr in instructions {
             self.analyze_instruction(instr);
         }
+        self.pending_arm64_page_base = None;
     }
 
     fn extract_effective_address(instr: &Instruction, operand: &Operand) -> Option<u64> {
@@ -251,6 +273,58 @@ impl XrefBuilder {
                 u64::try_from(target).ok()
             }
             Operand::PcRelative { target, .. } => Some(*target),
+            _ => None,
+        }
+    }
+
+    fn extract_arm64_pageoff_target(
+        instr: &Instruction,
+        pending_arm64_page_base: Option<PendingArm64PageBase>,
+    ) -> Option<(u64, XrefType)> {
+        let pending = pending_arm64_page_base?;
+
+        match instr.operation {
+            Operation::Add => {
+                let source = match instr.operands.get(1) {
+                    Some(Operand::Register(register)) => *register,
+                    _ => return None,
+                };
+                let offset = match instr.operands.get(2) {
+                    Some(Operand::Immediate(immediate)) if immediate.value >= 0 => {
+                        u64::try_from(immediate.value).ok()?
+                    }
+                    _ => return None,
+                };
+
+                if source != pending.register {
+                    return None;
+                }
+
+                pending
+                    .page_base
+                    .checked_add(offset)
+                    .map(|target| (target, XrefType::DataRead))
+            }
+            Operation::Load | Operation::Store => {
+                let mem_ref = instr.operands.iter().find_map(|operand| match operand {
+                    Operand::Memory(mem_ref) => Some(mem_ref),
+                    _ => None,
+                })?;
+
+                if mem_ref.base != Some(pending.register) || mem_ref.index.is_some() {
+                    return None;
+                }
+
+                let target = i128::from(pending.page_base) + i128::from(mem_ref.displacement);
+                let target = u64::try_from(target).ok()?;
+                let xref_type = if instr.operation == Operation::Store {
+                    XrefType::DataWrite
+                } else {
+                    XrefType::DataRead
+                };
+
+                Some((target, xref_type))
+            }
             _ => None,
         }
     }
@@ -284,6 +358,43 @@ impl XrefBuilder {
             register.class == RegisterClass::ProgramCounter
                 || matches!(register.name(), "rip" | "eip" | "pc")
         })
+    }
+
+    fn is_arm64_adrp(instr: &Instruction) -> bool {
+        instr.operation == Operation::LoadEffectiveAddress
+            && instr.mnemonic == "adrp"
+            && matches!(
+                instr.operands.first(),
+                Some(Operand::Register(register)) if register.arch == Architecture::Arm64
+            )
+    }
+
+    fn track_arm64_page_base(instr: &Instruction) -> Option<PendingArm64PageBase> {
+        if !Self::is_arm64_adrp(instr) {
+            return None;
+        }
+
+        let register = match instr.operands.first() {
+            Some(Operand::Register(register)) => *register,
+            _ => return None,
+        };
+        let page_base = instr
+            .operands
+            .get(1)
+            .and_then(|operand| Self::extract_effective_address(instr, operand))?;
+
+        Some(PendingArm64PageBase {
+            register,
+            page_base,
+            next_address: instr.end_address(),
+        })
+    }
+
+    fn take_matching_arm64_page_base(&mut self, from: u64) -> Option<PendingArm64PageBase> {
+        match self.pending_arm64_page_base.take() {
+            Some(pending) if pending.next_address == from => Some(pending),
+            _ => None,
+        }
     }
 
     /// Build the cross-reference database.
@@ -451,14 +562,14 @@ mod tests {
     }
 
     #[test]
-    fn test_xref_builder_tracks_pc_relative_operands_for_adrp_like_ops() {
+    fn test_xref_builder_tracks_pc_relative_operands_for_adr_ops() {
         let mut builder = XrefBuilder::new();
         let instr = Instruction {
             address: 0x4000,
             size: 4,
             bytes: vec![0; 4],
             operation: Operation::LoadEffectiveAddress,
-            mnemonic: "adrp".to_string(),
+            mnemonic: "adr".to_string(),
             operands: vec![
                 Operand::Register(Register::new(
                     Architecture::Arm64,
@@ -479,5 +590,92 @@ mod tests {
         let refs = db.refs_to(0x6000);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].xref_type, XrefType::DataRead);
+    }
+
+    #[test]
+    fn test_xref_builder_combines_adrp_and_load_pageoff_targets() {
+        let mut builder = XrefBuilder::new();
+        let page_reg = Register::new(Architecture::Arm64, RegisterClass::General, 16, 64);
+        let load_reg = Register::new(Architecture::Arm64, RegisterClass::General, 0, 64);
+        let adrp = Instruction {
+            address: 0x4000,
+            size: 4,
+            bytes: vec![0; 4],
+            operation: Operation::LoadEffectiveAddress,
+            mnemonic: "adrp".to_string(),
+            operands: vec![Operand::Register(page_reg), Operand::pc_rel(0x2000, 0x6000)],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+        let ldr = Instruction {
+            address: 0x4004,
+            size: 4,
+            bytes: vec![0; 4],
+            operation: Operation::Load,
+            mnemonic: "ldr".to_string(),
+            operands: vec![
+                Operand::Register(load_reg),
+                Operand::Memory(MemoryRef::base_disp(page_reg, 0x28, 8)),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![page_reg],
+            writes: vec![],
+            guard: None,
+        };
+
+        builder.analyze_instructions(&[adrp, ldr]);
+        let db = builder.build();
+
+        let refs = db.refs_to(0x6028);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from, 0x4004);
+        assert_eq!(refs[0].xref_type, XrefType::DataRead);
+        assert!(db.refs_to(0x6000).is_empty());
+    }
+
+    #[test]
+    fn test_xref_builder_combines_adrp_and_add_pageoff_targets() {
+        let mut builder = XrefBuilder::new();
+        let page_reg = Register::new(Architecture::Arm64, RegisterClass::General, 8, 64);
+        let adrp = Instruction {
+            address: 0x5000,
+            size: 4,
+            bytes: vec![0; 4],
+            operation: Operation::LoadEffectiveAddress,
+            mnemonic: "adrp".to_string(),
+            operands: vec![Operand::Register(page_reg), Operand::pc_rel(0x3000, 0x8000)],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+        let add = Instruction {
+            address: 0x5004,
+            size: 4,
+            bytes: vec![0; 4],
+            operation: Operation::Add,
+            mnemonic: "add".to_string(),
+            operands: vec![
+                Operand::Register(page_reg),
+                Operand::Register(page_reg),
+                Operand::imm_unsigned(0x70, 64),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![page_reg],
+            writes: vec![page_reg],
+            guard: None,
+        };
+
+        builder.analyze_instruction(&adrp);
+        builder.analyze_instruction(&add);
+        let db = builder.build();
+
+        let refs = db.refs_to(0x8070);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from, 0x5004);
+        assert_eq!(refs[0].xref_type, XrefType::DataRead);
+        assert!(db.refs_to(0x8000).is_empty());
     }
 }
