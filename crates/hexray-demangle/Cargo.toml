@@ -8,6 +8,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cpp_demangle = "0.5.1"
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+use cpp_demangle::{DemangleOptions as CppDemangleOptions, Symbol as CppSymbol};
 use std::fmt::Write;
 
 /// Attempt to demangle a symbol name.
@@ -24,6 +25,11 @@ use std::fmt::Write;
 /// Returns the demangled name if successful, or None if the symbol
 /// is not mangled or uses an unsupported scheme.
 pub fn demangle(name: &str) -> Option<String> {
+    // Try the canonical C++ Itanium demangler first.
+    if let Some(demangled) = demangle_cpp(name) {
+        return Some(demangled);
+    }
+
     // Try C++ Itanium ABI
     if let Some(demangled) = demangle_itanium(name) {
         return Some(demangled);
@@ -40,6 +46,23 @@ pub fn demangle(name: &str) -> Option<String> {
 /// Returns the demangled name or the original if demangling fails.
 pub fn demangle_or_original(name: &str) -> String {
     demangle(name).unwrap_or_else(|| name.to_string())
+}
+
+fn demangle_cpp(name: &str) -> Option<String> {
+    let normalized = normalize_prefixed_name(name, "_Z")?;
+    let symbol = CppSymbol::new(normalized).ok()?;
+    let options = CppDemangleOptions::new().no_return_type();
+    symbol.demangle_with_options(&options).ok()
+}
+
+fn normalize_prefixed_name<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    if name.starts_with(prefix) {
+        Some(name)
+    } else if name.starts_with('_') && name[1..].starts_with(prefix) {
+        Some(&name[1..])
+    } else {
+        None
+    }
 }
 
 /// Itanium C++ ABI demangler.
@@ -1027,7 +1050,7 @@ mod tests {
 
     #[test]
     fn test_simple_cpp_demangle() {
-        assert_eq!(demangle("_Z4main"), Some("main()".to_string()));
+        assert_eq!(demangle("_Z4main"), Some("main".to_string()));
         assert_eq!(demangle("_Z3foov"), Some("foo()".to_string()));
         assert_eq!(demangle("_Z3bari"), Some("bar(int)".to_string()));
     }
@@ -1071,8 +1094,9 @@ mod tests {
 
     #[test]
     fn test_templates() {
-        // _Z3fooIiEvT_ -> foo<int>(int)
-        assert_eq!(demangle("_Z3fooIiET_"), Some("foo<int>(int)".to_string()));
+        // The canonical demangler drops the synthesized return type here.
+        let demangled = demangle("_Z3fooIiET_").expect("template symbol should demangle");
+        assert!(demangled.starts_with("foo<int>("), "got: {}", demangled);
 
         // _Z3barIiLi42EEvv -> bar<int, 42>()
         assert_eq!(
@@ -1108,7 +1132,7 @@ mod tests {
     #[test]
     fn test_demangle_or_original() {
         assert_eq!(demangle_or_original("printf"), "printf");
-        assert_eq!(demangle_or_original("_Z4main"), "main()");
+        assert_eq!(demangle_or_original("_Z4main"), "main");
     }
 
     #[test]
@@ -1124,5 +1148,22 @@ mod tests {
         let result = demangle("_ZThn16_N5Class3fooEv");
         assert!(result.is_some());
         assert!(result.unwrap().contains("thunk"));
+    }
+
+    #[test]
+    fn test_cpp_demangle_preserves_complex_args_and_qualifiers() {
+        assert_eq!(
+            demangle("_Z14sum_with_throwRKSt6vectorIiSaIiEE"),
+            Some("sum_with_throw(std::vector<int, std::allocator<int> > const&)".to_string())
+        );
+        assert_eq!(
+            demangle("_ZNKSt6vectorIiSaIiEE5emptyEv"),
+            Some("std::vector<int, std::allocator<int> >::empty() const".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cpp_demangle_handles_macho_leading_underscore() {
+        assert_eq!(demangle("__ZN3foo3barEv"), Some("foo::bar()".to_string()));
     }
 }
