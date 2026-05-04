@@ -88,6 +88,8 @@ pub struct SignatureRecovery {
     return_confidence: u8,
     /// Parameter names assigned from stack slot analysis.
     param_names: HashMap<usize, String>,
+    /// DWARF parameter names in declaration order.
+    dwarf_param_names: Vec<String>,
     /// Usage hints for parameters (indexed by arg register index).
     param_hints: HashMap<usize, ParameterUsageHints>,
     /// Aliases from local variable name to candidate function-pointer parameter indices.
@@ -142,6 +144,7 @@ impl SignatureRecovery {
             return_provenance: Vec::new(),
             return_confidence: 0,
             param_names: HashMap::new(),
+            dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
             function_pointer_aliases: HashMap::new(),
             function_pointer_alias_latest: HashMap::new(),
@@ -159,6 +162,12 @@ impl SignatureRecovery {
     /// Sets the function name for known function signature lookup.
     pub fn with_function_name(mut self, name: &str) -> Self {
         self.current_func_name = Some(name.to_string());
+        self
+    }
+
+    /// Provides DWARF parameter names in declaration order.
+    pub fn with_dwarf_param_names(mut self, names: Vec<String>) -> Self {
+        self.dwarf_param_names = names;
         self
     }
 
@@ -2177,6 +2186,13 @@ impl SignatureRecovery {
             }
         }
 
+        for idx in 0..self.dwarf_param_names.len().min(int_regs.len()) {
+            if !used_args.contains(&idx) {
+                used_args.push(idx);
+            }
+        }
+        used_args.sort_unstable();
+
         // Create parameters only for registers that were actually used
         for &idx in &used_args {
             let reg64 = int_regs[idx].to_lowercase();
@@ -2229,7 +2245,13 @@ impl SignatureRecovery {
             };
 
             // Use known name, custom name, infer from hints, or default
-            let name = if let Some(known_nm) = known_name {
+            let name = if let Some(dwarf_name) = self
+                .dwarf_param_names
+                .get(idx)
+                .filter(|name| !name.is_empty())
+            {
+                dwarf_name.clone()
+            } else if let Some(known_nm) = known_name {
                 known_nm.to_string()
             } else if let Some(custom_name) = self.param_names.get(&idx) {
                 custom_name.clone()

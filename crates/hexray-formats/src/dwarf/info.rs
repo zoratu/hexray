@@ -3,7 +3,7 @@
 //! information organized into compilation units.
 
 use super::abbrev::AbbreviationTable;
-use super::die::{Die, DieParser};
+use super::die::{AttributeValue, Die, DieParser};
 use super::types::DwLang;
 use crate::ParseError;
 
@@ -405,11 +405,28 @@ impl<'a> DebugInfoParser<'a> {
             die_start,
         );
 
-        let root_die = parser.parse_die()?.ok_or(ParseError::InvalidValue(
+        let mut root_die = parser.parse_die()?.ok_or(ParseError::InvalidValue(
             "missing root DIE in compilation unit",
         ))?;
+        self.resolve_string_offsets(&mut root_die);
 
         Ok((CompilationUnit { header, root_die }, cu_end))
+    }
+
+    fn resolve_string_offsets(&self, die: &mut Die) {
+        for attr in &mut die.attributes {
+            let offset = match &attr.value {
+                AttributeValue::StringOffset(offset) => *offset,
+                _ => continue,
+            };
+            if let Some(value) = self.get_string(offset) {
+                attr.value = AttributeValue::String(value.to_string());
+            }
+        }
+
+        for child in &mut die.children {
+            self.resolve_string_offsets(child);
+        }
     }
 
     /// Look up a string in .debug_str by offset.
@@ -421,5 +438,41 @@ impl<'a> DebugInfoParser<'a> {
         let pos = tail.iter().position(|&b| b == 0)?;
         let end = start.checked_add(pos)?;
         std::str::from_utf8(debug_str.get(start..end)?).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dwarf::die::Attribute;
+    use crate::dwarf::types::{DwAt, DwTag};
+
+    #[test]
+    fn test_resolve_string_offsets_rewrites_name_attributes() {
+        let parser = DebugInfoParser::new(&[], &[], Some(b"outer\0inner\0"));
+        let mut die = Die {
+            offset: 0,
+            tag: DwTag::Subprogram,
+            has_children: true,
+            attributes: vec![Attribute {
+                name: DwAt::Name,
+                value: AttributeValue::StringOffset(0),
+            }],
+            children: vec![Die {
+                offset: 1,
+                tag: DwTag::Variable,
+                has_children: false,
+                attributes: vec![Attribute {
+                    name: DwAt::Name,
+                    value: AttributeValue::StringOffset(6),
+                }],
+                children: Vec::new(),
+            }],
+        };
+
+        parser.resolve_string_offsets(&mut die);
+
+        assert_eq!(die.name(), Some("outer"));
+        assert_eq!(die.children[0].name(), Some("inner"));
     }
 }

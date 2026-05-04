@@ -321,6 +321,15 @@ impl<'a> FunctionInfo<'a> {
     /// fp-relative stack-slot lookups hit. See
     /// [`Self::frame_base_correction`].
     pub fn variable_names(&self) -> std::collections::HashMap<i128, String> {
+        fn collect_local_variables<'a>(die: &'a Die, out: &mut Vec<&'a Die>) {
+            for child in &die.children {
+                if matches!(child.tag, DwTag::Variable) {
+                    out.push(child);
+                }
+                collect_local_variables(child, out);
+            }
+        }
+
         let mut names = std::collections::HashMap::new();
         let cfa_correction = self.frame_base_correction() as i128;
 
@@ -335,7 +344,9 @@ impl<'a> FunctionInfo<'a> {
         }
 
         // Collect local variables
-        for var in self.local_variables() {
+        let mut locals = Vec::new();
+        collect_local_variables(self.die, &mut locals);
+        for var in locals {
             if let (Some(name), Some(offset)) = (var.name(), var.frame_base_offset()) {
                 names.insert(
                     (offset as i128).saturating_add(cfa_correction),

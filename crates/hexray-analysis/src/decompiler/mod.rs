@@ -360,6 +360,8 @@ pub struct Decompiler {
     /// DWARF variable names (stack_offset -> name).
     /// Comes from DWARF debug info.
     pub dwarf_names: HashMap<i128, String>,
+    /// DWARF parameter names in declaration order.
+    pub dwarf_param_names: Vec<String>,
     /// Whether to enable struct field inference.
     pub enable_struct_inference: bool,
     /// Calling convention for function signature recovery.
@@ -400,6 +402,7 @@ impl Default for Decompiler {
             relocation_table: None,
             type_info: HashMap::new(),
             dwarf_names: HashMap::new(),
+            dwarf_param_names: Vec::new(),
             enable_struct_inference: false,
             calling_convention: CallingConvention::default(),
             enable_signature_recovery: true,
@@ -467,6 +470,12 @@ impl Decompiler {
     /// Keys are stack offsets (frame-relative), values are variable names.
     pub fn with_dwarf_names(mut self, names: HashMap<i128, String>) -> Self {
         self.dwarf_names = names;
+        self
+    }
+
+    /// Sets DWARF parameter names in declaration order.
+    pub fn with_dwarf_param_names(mut self, names: Vec<String>) -> Self {
+        self.dwarf_param_names = names;
         self
     }
 
@@ -743,6 +752,7 @@ impl Decompiler {
             .with_relocation_table(self.relocation_table.clone())
             .with_type_info(merged_types)
             .with_dwarf_names(self.dwarf_names.clone())
+            .with_dwarf_param_names(self.dwarf_param_names.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
         if let Some(ref db) = self.summary_database {
@@ -1003,7 +1013,8 @@ impl Decompiler {
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_relocation_table(self.relocation_table.clone())
             .with_symbol_table(self.symbol_table.clone())
-            .with_summary_database(self.summary_database.clone());
+            .with_summary_database(self.summary_database.clone())
+            .with_dwarf_param_names(self.dwarf_param_names.clone());
         recovery.analyze(&structured)
     }
 
@@ -1097,6 +1108,7 @@ impl Decompiler {
             .with_relocation_table(self.relocation_table.clone())
             .with_type_info(self.type_info.clone())
             .with_dwarf_names(self.dwarf_names.clone())
+            .with_dwarf_param_names(self.dwarf_param_names.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
         if let Some(ref db) = self.summary_database {

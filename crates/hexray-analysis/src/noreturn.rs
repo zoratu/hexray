@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn collects_noreturn_symbol_addresses() {
-        let symbols = vec![
+        let symbols = [
             Symbol {
                 name: "_exit".to_string(),
                 address: 0x1000,

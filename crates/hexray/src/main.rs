@@ -1603,15 +1603,11 @@ fn decompile_function(
     // Build binary data context for jump table reconstruction
     let binary_data_ctx = build_binary_data_context(fmt);
 
-    // Try to load DWARF debug info for variable names
+    // Try to load DWARF debug info for function-scoped variable and parameter names.
     let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary) {
-        // TODO(round-9): only restore a DWARF banner once lifted
-        // local_/arg_ identifiers and signature recovery consume these
-        // names consistently enough that the user can actually see them
-        // in the emitted pseudo-C.
-        get_dwarf_variable_names(&debug_info, start_addr)
+        get_dwarf_function_names(&debug_info, start_addr)
     } else {
-        std::collections::HashMap::new()
+        DwarfFunctionNames::default()
     };
 
     // Decompile
@@ -1634,7 +1630,8 @@ fn decompile_function(
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
         .with_binary_data(binary_data_ctx)
-        .with_dwarf_names(dwarf_names)
+        .with_dwarf_names(dwarf_names.stack_names)
+        .with_dwarf_param_names(dwarf_names.parameter_names)
         .with_constant_database(const_db)
         .with_struct_inference(true)
         .with_calling_convention(calling_convention);
@@ -2047,15 +2044,24 @@ fn load_dwarf_info(binary: &Binary) -> Option<DebugInfo> {
     .ok()
 }
 
-/// Gets DWARF variable names for a function at the given address.
-fn get_dwarf_variable_names(
-    debug_info: &DebugInfo,
-    func_addr: u64,
-) -> std::collections::HashMap<i128, String> {
+#[derive(Default)]
+struct DwarfFunctionNames {
+    stack_names: std::collections::HashMap<i128, String>,
+    parameter_names: Vec<String>,
+}
+
+/// Gets DWARF variable and parameter names for a function at the given address.
+fn get_dwarf_function_names(debug_info: &DebugInfo, func_addr: u64) -> DwarfFunctionNames {
     if let Some(func) = debug_info.find_function(func_addr) {
-        func.variable_names()
+        DwarfFunctionNames {
+            stack_names: func.variable_names(),
+            parameter_names: func
+                .parameters()
+                .map(|param| param.name().map(str::to_string).unwrap_or_default())
+                .collect(),
+        }
     } else {
-        std::collections::HashMap::new()
+        DwarfFunctionNames::default()
     }
 }
 
@@ -2813,11 +2819,11 @@ fn decompile_with_follow(
         // Build CFG
         let cfg = CfgBuilder::build(&instructions, func_addr);
 
-        // Get DWARF variable names for this function
+        // Get DWARF variable and parameter names for this function.
         let dwarf_names = if let Some(ref di) = debug_info {
-            get_dwarf_variable_names(di, func_addr)
+            get_dwarf_function_names(di, func_addr)
         } else {
-            std::collections::HashMap::new()
+            DwarfFunctionNames::default()
         };
 
         // Decompile
@@ -2834,7 +2840,8 @@ fn decompile_with_follow(
             .with_string_table(string_table.clone())
             .with_symbol_table(symbol_table.clone())
             .with_relocation_table(relocation_table.clone())
-            .with_dwarf_names(dwarf_names)
+            .with_dwarf_names(dwarf_names.stack_names)
+            .with_dwarf_param_names(dwarf_names.parameter_names)
             .with_constant_database(const_db.clone())
             .with_struct_inference(true)
             .with_calling_convention(calling_convention);

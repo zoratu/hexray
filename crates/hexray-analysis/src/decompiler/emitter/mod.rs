@@ -366,6 +366,8 @@ pub struct PseudoCodeEmitter {
     type_info: std::collections::HashMap<String, String>,
     /// DWARF variable names (stack_offset -> name).
     dwarf_names: std::collections::HashMap<i128, String>,
+    /// DWARF parameter names in declaration order.
+    dwarf_param_names: Vec<String>,
     /// Naming context for pattern-based variable naming.
     /// Uses RefCell for interior mutability during emission.
     naming_ctx: RefCell<NamingContext>,
@@ -509,6 +511,7 @@ impl PseudoCodeEmitter {
             relocation_table: None,
             type_info: std::collections::HashMap::new(),
             dwarf_names: std::collections::HashMap::new(),
+            dwarf_param_names: Vec::new(),
             naming_ctx: RefCell::new(NamingContext::new()),
             calling_convention: CallingConvention::default(),
             use_signature_recovery: true,
@@ -654,6 +657,21 @@ impl PseudoCodeEmitter {
         name.starts_with("var_") || name.starts_with("local_") || name.starts_with("arg_")
     }
 
+    fn parse_lifted_stack_offset(var_name: &str) -> Option<(i128, bool)> {
+        if let Some(suffix) = var_name.strip_prefix("var_") {
+            let offset = i128::from_str_radix(suffix, 16).ok()?;
+            Some((offset, true))
+        } else if let Some(suffix) = var_name.strip_prefix("local_") {
+            let positive = i128::from_str_radix(suffix, 16).ok()?;
+            Some((-positive, false))
+        } else if let Some(suffix) = var_name.strip_prefix("arg_") {
+            let offset = i128::from_str_radix(suffix, 16).ok()?;
+            Some((offset, true))
+        } else {
+            None
+        }
+    }
+
     /// Sets the calling convention for signature recovery.
     pub fn with_calling_convention(mut self, convention: CallingConvention) -> Self {
         self.calling_convention = convention;
@@ -701,6 +719,12 @@ impl PseudoCodeEmitter {
         self
     }
 
+    /// Sets DWARF parameter names in declaration order.
+    pub fn with_dwarf_param_names(mut self, names: Vec<String>) -> Self {
+        self.dwarf_param_names = names;
+        self
+    }
+
     /// Sets the type database for struct field access and function prototypes.
     ///
     /// When set, the emitter will use the type database to:
@@ -728,7 +752,10 @@ impl PseudoCodeEmitter {
 
     /// Gets the DWARF name for a stack offset, if available.
     fn get_dwarf_name(&self, offset: i128) -> Option<&str> {
-        self.dwarf_names.get(&offset).map(|s| s.as_str())
+        self.dwarf_names
+            .get(&offset)
+            .or_else(|| self.dwarf_names.get(&-offset))
+            .map(|s| s.as_str())
     }
 
     /// Gets the type string for a variable, defaulting to "int".
@@ -2459,6 +2486,7 @@ impl PseudoCodeEmitter {
                 .with_relocation_table(self.relocation_table.clone())
                 .with_symbol_table(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone())
+                .with_dwarf_param_names(self.dwarf_param_names.clone())
                 .with_function_name(func_name);
             let sig = recovery.analyze(cfg);
 
@@ -2877,7 +2905,8 @@ impl PseudoCodeEmitter {
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_relocation_table(self.relocation_table.clone())
             .with_symbol_table(self.symbol_table.clone())
-            .with_summary_database(self.summary_database.clone());
+            .with_summary_database(self.summary_database.clone())
+            .with_dwarf_param_names(self.dwarf_param_names.clone());
         if let Some(name) = func_name {
             recovery = recovery.with_function_name(name);
         }
@@ -5147,25 +5176,18 @@ impl PseudoCodeEmitter {
     /// This handles variables with names like var_8, var_c, tmp0, local_10, etc.
     /// Returns None if the variable doesn't match a pattern or if no semantic name is available.
     fn try_get_semantic_var_name(&self, var_name: &str) -> Option<String> {
-        // Parse stack offset from variable name (var_8 -> 0x8, local_10 -> -0x10)
-        let offset = if let Some(suffix) = var_name.strip_prefix("var_") {
-            // var_8 format (positive offset, hex)
-            i128::from_str_radix(suffix, 16).ok()?
-        } else if let Some(suffix) = var_name.strip_prefix("local_") {
-            // local_10 format (negative offset, hex)
-            let positive = i128::from_str_radix(suffix, 16).ok()?;
-            -positive
-        } else if let Some(suffix) = var_name.strip_prefix("arg_") {
-            // arg_8 format (parameter, positive offset, hex)
-            i128::from_str_radix(suffix, 16).ok()?
-        } else {
-            // Not a stack variable pattern
-            return None;
-        };
+        let (offset, is_param) = Self::parse_lifted_stack_offset(var_name)?;
 
-        // Ask NamingContext for a better name based on usage patterns
-        // Parameters typically have positive offsets in the var_/arg_ namespace
-        let is_param = var_name.starts_with("arg_") || offset > 0;
+        if let Some(name) = self.get_dwarf_name(offset) {
+            return Some(name.to_string());
+        }
+        if var_name.starts_with("var_") {
+            if let Some(name) = self.get_dwarf_name(-offset) {
+                return Some(name.to_string());
+            }
+        }
+
+        // Ask NamingContext for a better name based on usage patterns.
         let semantic_name = self.naming_ctx.borrow_mut().get_name(offset, is_param);
 
         // Only return the semantic name if it's different from the default naming
@@ -5812,6 +5834,44 @@ mod tests {
         assert!(
             output.contains("total = 0;") && output.contains("i = 0;"),
             "Expected DWARF local names in body, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_uses_dwarf_param_names_by_index_without_stack_spills() {
+        use super::super::expression::Variable;
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::assign(
+                Expr::unknown("sum"),
+                Expr::binop(
+                    BinOpKind::Add,
+                    Expr::var(Variable::reg("rdi", 8)),
+                    Expr::var(Variable::reg("rsi", 8)),
+                ),
+            )],
+            address_range: (0x1000, 0x1008),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(Some(Expr::unknown("sum")))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let output = PseudoCodeEmitter::new("    ", false)
+            .with_dwarf_param_names(vec!["lhs".to_string(), "rhs".to_string()])
+            .emit(&cfg, "add_named");
+        let header = output.lines().next().unwrap_or_default();
+
+        assert!(
+            header.contains("lhs") && header.contains("rhs"),
+            "Expected DWARF parameter names in header, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("sum = lhs + rhs;"),
+            "Expected body usage to follow DWARF parameter names, got:\n{}",
             output
         );
     }
