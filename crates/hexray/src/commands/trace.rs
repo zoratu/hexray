@@ -10,6 +10,54 @@ use hexray_core::Architecture;
 use hexray_disasm::{Arm64Disassembler, Disassembler, RiscVDisassembler, X86_64Disassembler};
 use hexray_formats::BinaryFormat;
 
+fn parse_register_id(arch: Architecture, value: &str) -> Result<u16> {
+    if let Ok(register_id) = value.parse::<u16>() {
+        return Ok(register_id);
+    }
+
+    let normalized = value.trim().to_ascii_lowercase();
+    let register_id = match arch {
+        Architecture::X86_64 | Architecture::X86 => match normalized.as_str() {
+            "rax" => 0,
+            "rcx" => 1,
+            "rdx" => 2,
+            "rbx" => 3,
+            "rsp" => 4,
+            "rbp" => 5,
+            "rsi" => 6,
+            "rdi" => 7,
+            "r8" => 8,
+            "r9" => 9,
+            "r10" => 10,
+            "r11" => 11,
+            "r12" => 12,
+            "r13" => 13,
+            "r14" => 14,
+            "r15" => 15,
+            _ => bail!("Unknown x86_64 register '{}'", value),
+        },
+        Architecture::Arm64 => {
+            if normalized == "sp" {
+                31
+            } else if let Some(index) = normalized.strip_prefix('x') {
+                index
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|idx| *idx <= 30)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown AArch64 register '{}'", value))?
+            } else {
+                bail!("Unknown AArch64 register '{}'", value);
+            }
+        }
+        _ => bail!(
+            "Register names are not supported for architecture {:?}; pass a numeric register id",
+            arch
+        ),
+    };
+
+    Ok(register_id)
+}
+
 /// Data flow trace actions.
 #[derive(Subcommand)]
 pub enum TraceAction {
@@ -22,7 +70,7 @@ pub enum TraceAction {
         address: u64,
         /// Register ID to trace
         #[arg(short, long)]
-        register: u16,
+        register: String,
         /// Output in JSON format
         #[arg(long)]
         json: bool,
@@ -36,7 +84,7 @@ pub enum TraceAction {
         address: u64,
         /// Register ID to trace
         #[arg(short, long)]
-        register: u16,
+        register: String,
         /// Output in JSON format
         #[arg(long)]
         json: bool,
@@ -50,7 +98,7 @@ pub enum TraceAction {
         address: u64,
         /// Register ID
         #[arg(short, long)]
-        register: u16,
+        register: String,
     },
     /// Find all definitions reaching a use
     Defs {
@@ -61,7 +109,7 @@ pub enum TraceAction {
         address: u64,
         /// Register ID
         #[arg(short, long)]
-        register: u16,
+        register: String,
     },
 }
 
@@ -183,6 +231,7 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             register,
             json,
         } => {
+            let register = parse_register_id(arch, &register)?;
             let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
@@ -206,6 +255,7 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             register,
             json,
         } => {
+            let register = parse_register_id(arch, &register)?;
             let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
@@ -228,6 +278,7 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             address,
             register,
         } => {
+            let register = parse_register_id(arch, &register)?;
             let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
@@ -246,6 +297,7 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
             address,
             register,
         } => {
+            let register = parse_register_id(arch, &register)?;
             let (func_addr, func_size, heuristic_bounds) = resolve_function(&function)?;
             let cfg = build_cfg(func_addr, func_size, heuristic_bounds)?;
 
@@ -287,4 +339,27 @@ fn print_trace_result_json(result: &hexray_analysis::DataFlowResult) {
     }
     println!("  \"total_steps\": {}", result.steps.len());
     println!("}}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_register_id;
+    use hexray_core::Architecture;
+
+    #[test]
+    fn test_parse_trace_register_accepts_numeric_ids() {
+        assert_eq!(parse_register_id(Architecture::X86_64, "7").unwrap(), 7);
+    }
+
+    #[test]
+    fn test_parse_trace_register_accepts_x86_register_names() {
+        assert_eq!(parse_register_id(Architecture::X86_64, "rdi").unwrap(), 7);
+        assert_eq!(parse_register_id(Architecture::X86_64, "RAX").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_parse_trace_register_accepts_aarch64_register_names() {
+        assert_eq!(parse_register_id(Architecture::Arm64, "x30").unwrap(), 30);
+        assert_eq!(parse_register_id(Architecture::Arm64, "sp").unwrap(), 31);
+    }
 }
