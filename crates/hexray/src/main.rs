@@ -687,7 +687,9 @@ fn main() -> Result<()> {
             json,
             html,
         }) => {
-            build_callgraph(fmt, &target, dot, json, html)?;
+            let project =
+                load_requested_project(None, global_project_path.as_deref(), binary_path)?;
+            build_callgraph(fmt, &target, dot, json, html, project.as_ref())?;
         }
         Some(Commands::Strings {
             min_length,
@@ -701,7 +703,9 @@ fn main() -> Result<()> {
             calls_only,
             json,
         }) => {
-            build_xrefs(fmt, target.as_deref(), calls_only, json)?;
+            let project =
+                load_requested_project(None, global_project_path.as_deref(), binary_path)?;
+            build_xrefs(fmt, target.as_deref(), calls_only, json, project.as_ref())?;
         }
         Some(Commands::Project { action }) => {
             handle_project_command(Some(binary_path.as_path()), action)?;
@@ -1058,6 +1062,54 @@ fn find_symbol_for_project(
     }
 
     find_symbol_in_candidates(&symbols, name, SymbolLookupMode::Fuzzy)
+}
+
+fn display_function_name(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    address: u64,
+) -> String {
+    project
+        .and_then(|p| p.get_function_name(address))
+        .map(|name| name.to_string())
+        .or_else(|| {
+            fmt.symbol_at(address)
+                .map(|s| demangle_or_original(&s.name))
+        })
+        .unwrap_or_else(|| format!("sub_{:x}", address))
+}
+
+fn display_symbol_or_label_name(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    address: u64,
+) -> String {
+    project
+        .and_then(|p| {
+            p.get_function_name(address)
+                .or_else(|| p.get_label(address))
+                .map(|name| name.to_string())
+        })
+        .or_else(|| {
+            fmt.symbol_at(address)
+                .map(|s| demangle_or_original(&s.name))
+        })
+        .unwrap_or_else(|| format!("sub_{:x}", address))
+}
+
+fn display_symbol_name(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    symbol: &hexray_core::Symbol,
+) -> String {
+    if symbol.is_function() {
+        return display_function_name(fmt, project, symbol.address);
+    }
+
+    project
+        .and_then(|p| p.get_label(symbol.address))
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| demangle_or_original(&symbol.name))
 }
 
 fn find_symbol_in_candidates(
@@ -2015,6 +2067,7 @@ fn build_callgraph(
     dot: bool,
     json: bool,
     html: bool,
+    project: Option<&AnalysisProject>,
 ) -> Result<()> {
     let symbols: Vec<_> = fmt.symbols().cloned().collect();
     let arch = fmt.architecture();
@@ -2059,14 +2112,14 @@ fn build_callgraph(
 
         let (addr, name, size, heuristic_bounds) = if let Some(a) = address {
             // For raw addresses, use a default size
-            (a, format!("sub_{:x}", a), 4096u64, true)
+            (a, display_function_name(fmt, project, a), 4096u64, true)
         } else {
-            let symbol = find_symbol(fmt, target)
+            let symbol = find_symbol_for_project(fmt, project, target)
                 .with_context(|| format!("Symbol '{}' not found", target))?;
             let size = if symbol.size > 0 { symbol.size } else { 4096 };
             (
                 symbol.address,
-                demangle_or_original(&symbol.name),
+                display_function_name(fmt, project, symbol.address),
                 size,
                 symbol.size == 0,
             )
@@ -2210,6 +2263,7 @@ fn build_callgraph(
     } else {
         callgraph
     };
+    let callgraph = apply_project_names_to_callgraph(callgraph, project);
 
     if html {
         // Output in interactive HTML format
@@ -2234,6 +2288,36 @@ fn callgraph_node_display_name(node: &hexray_analysis::CallGraphNode) -> String 
     node.name
         .clone()
         .unwrap_or_else(|| format!("sub_{:x}", node.address))
+}
+
+fn apply_project_names_to_callgraph(
+    callgraph: hexray_analysis::CallGraph,
+    project: Option<&AnalysisProject>,
+) -> hexray_analysis::CallGraph {
+    let Some(project) = project else {
+        return callgraph;
+    };
+
+    let mut renamed = hexray_analysis::CallGraph::new();
+    for node in callgraph.nodes() {
+        let name = project
+            .get_function_name(node.address)
+            .map(|name| name.to_string())
+            .or_else(|| node.name.clone());
+        renamed.add_node(node.address, name, node.is_external);
+    }
+
+    for node in callgraph.nodes() {
+        for (callee, site) in callgraph.callees(node.address) {
+            renamed.add_call(node.address, callee, site.clone());
+        }
+    }
+
+    for &(caller, call_address) in callgraph.unresolved_calls() {
+        renamed.add_unresolved_call(caller, call_address);
+    }
+
+    renamed
 }
 
 fn format_callgraph_text(callgraph: &hexray_analysis::CallGraph) -> String {
@@ -2905,6 +2989,7 @@ fn build_xrefs(
     target: Option<&str>,
     calls_only: bool,
     json: bool,
+    project: Option<&AnalysisProject>,
 ) -> Result<()> {
     let arch = fmt.architecture();
     let symbols: Vec<_> = fmt.symbols().cloned().collect();
@@ -3033,7 +3118,7 @@ fn build_xrefs(
             addr
         } else {
             // Try to find symbol
-            let symbol = find_symbol(fmt, target_str)
+            let symbol = find_symbol_for_project(fmt, project, target_str)
                 .with_context(|| format!("Symbol '{}' not found", target_str))?;
             symbol.address
         };
@@ -3044,10 +3129,7 @@ fn build_xrefs(
             db.refs_to(target_addr).iter().collect()
         };
 
-        let target_name = fmt
-            .symbol_at(target_addr)
-            .map(|s| demangle_or_original(&s.name))
-            .unwrap_or_else(|| format!("sub_{:x}", target_addr));
+        let target_name = display_symbol_or_label_name(fmt, project, target_addr);
 
         // Function-start lookup table: sorted by address. For any call-site
         // address we use partition_point to find the nearest preceding
@@ -3065,7 +3147,13 @@ fn build_xrefs(
         let mut function_starts: Vec<(u64, Option<String>, u64)> = symbols
             .iter()
             .filter(|s| s.is_function() && s.address != 0 && !s.name.starts_with("__mh_"))
-            .map(|s| (s.address, Some(demangle_or_original(&s.name)), s.size))
+            .map(|s| {
+                (
+                    s.address,
+                    Some(display_function_name(fmt, project, s.address)),
+                    s.size,
+                )
+            })
             .collect();
         let mut seen: std::collections::HashSet<u64> =
             function_starts.iter().map(|(a, _, _)| *a).collect();
@@ -3077,23 +3165,27 @@ fn build_xrefs(
                 continue;
             }
             if seen.insert(target) {
-                let name = fmt
+                let name = if fmt
                     .symbol_at(target)
-                    .filter(|s| !s.name.starts_with("__mh_"))
-                    .map(|s| demangle_or_original(&s.name));
+                    .is_some_and(|s| s.name.starts_with("__mh_"))
+                {
+                    None
+                } else {
+                    Some(display_function_name(fmt, project, target))
+                };
                 function_starts.push((target, name, 0));
             }
         }
         if let Some(entry) = fmt.entry_point() {
             if seen.insert(entry) {
-                function_starts.push((entry, None, 0));
+                function_starts.push((entry, Some(display_function_name(fmt, project, entry)), 0));
             }
         }
         function_starts.sort_by_key(|(addr, _, _)| *addr);
 
         let resolve_caller = |from: u64| -> (String, Option<u64>) {
             if let Some(s) = fmt.symbol_at(from).filter(|s| !s.name.starts_with("__mh_")) {
-                return (demangle_or_original(&s.name), Some(0));
+                return (display_function_name(fmt, project, s.address), Some(0));
             }
             let idx = function_starts.partition_point(|(addr, _, _)| *addr <= from);
             if idx == 0 {

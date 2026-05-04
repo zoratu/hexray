@@ -54,6 +54,64 @@ fn temp_path(prefix: &str, extension: &str) -> PathBuf {
     ))
 }
 
+const TEST_STRINGS_PRINT_MESSAGE: &str = "0x1000004f8";
+const TEST_STRINGS_MAIN: &str = "0x10000052c";
+const TEST_STRINGS_GREETING: &str = "0x100008000";
+
+fn create_test_strings_project(prefix: &str) -> (String, String) {
+    let project_path = temp_path(prefix, "hxp");
+    let project_str = project_path.to_string_lossy().to_string();
+    let binary = workspace_fixture_path("test_strings");
+
+    let create = run_hexray(&[&binary, "project", "create", "-o", &project_str]);
+    assert!(
+        create.status.success(),
+        "project create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let rename_print = run_hexray(&[
+        "project",
+        "name",
+        &project_str,
+        TEST_STRINGS_PRINT_MESSAGE,
+        "log_message",
+    ]);
+    assert!(
+        rename_print.status.success(),
+        "print_message rename should succeed: {}",
+        String::from_utf8_lossy(&rename_print.stderr)
+    );
+
+    let rename_main = run_hexray(&[
+        "project",
+        "name",
+        &project_str,
+        TEST_STRINGS_MAIN,
+        "entry_alias",
+    ]);
+    assert!(
+        rename_main.status.success(),
+        "main rename should succeed: {}",
+        String::from_utf8_lossy(&rename_main.stderr)
+    );
+
+    let label = run_hexray(&[
+        "project",
+        "label",
+        &project_str,
+        TEST_STRINGS_GREETING,
+        "saved_greeting",
+    ]);
+    assert!(
+        label.status.success(),
+        "greeting label should succeed: {}",
+        String::from_utf8_lossy(&label.stderr)
+    );
+
+    (binary, project_str)
+}
+
 // Helper used by macOS-snapshot-locked tests; on Linux it would
 // otherwise trip the `dead_code` lint.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1484,6 +1542,203 @@ fn test_project_names_propagate_through_cfg_and_lookup() {
         String::from_utf8_lossy(&decompile.stdout).contains("Decompiling rp_name at 0x40100f"),
         "decompile output should use the project name: {}",
         String::from_utf8_lossy(&decompile.stdout)
+    );
+}
+
+#[test]
+fn test_project_names_propagate_through_xrefs_and_callgraph() {
+    let binary = workspace_fixture_path("test_strings");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture test_strings not found");
+        return;
+    }
+
+    let (binary, project_str) = create_test_strings_project("project-xrefs-callgraph");
+
+    let xrefs_by_name = run_hexray(&["-p", &project_str, &binary, "xrefs", "log_message"]);
+    assert!(
+        xrefs_by_name.status.success(),
+        "xrefs should resolve project-renamed names: {}",
+        String::from_utf8_lossy(&xrefs_by_name.stderr)
+    );
+    let xrefs_stdout = String::from_utf8_lossy(&xrefs_by_name.stdout);
+    assert!(
+        xrefs_stdout.contains("Cross-references to log_message"),
+        "xrefs title should use the project function name: {}",
+        xrefs_stdout
+    );
+    assert!(
+        xrefs_stdout.contains("CALL from entry_alias +"),
+        "xrefs caller labels should use project function names: {}",
+        xrefs_stdout
+    );
+
+    let xrefs_data = run_hexray(&["-p", &project_str, &binary, "xrefs", TEST_STRINGS_GREETING]);
+    assert!(
+        xrefs_data.status.success(),
+        "xrefs should succeed for labeled data targets: {}",
+        String::from_utf8_lossy(&xrefs_data.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&xrefs_data.stdout).contains("Cross-references to saved_greeting"),
+        "xrefs title should use the project label for data targets: {}",
+        String::from_utf8_lossy(&xrefs_data.stdout)
+    );
+
+    let callgraph = run_hexray(&["-p", &project_str, &binary, "callgraph", "log_message"]);
+    assert!(
+        callgraph.status.success(),
+        "callgraph should resolve project-renamed roots: {}",
+        String::from_utf8_lossy(&callgraph.stderr)
+    );
+    let callgraph_stdout = String::from_utf8_lossy(&callgraph.stdout);
+    assert!(
+        callgraph_stdout.contains("log_message"),
+        "callgraph text output should use project names: {}",
+        callgraph_stdout
+    );
+    assert!(
+        !callgraph_stdout.contains("print_message"),
+        "callgraph text output should not fall back to original names: {}",
+        callgraph_stdout
+    );
+
+    let callgraph_json = run_hexray(&["-p", &project_str, &binary, "callgraph", "all", "--json"]);
+    assert!(
+        callgraph_json.status.success(),
+        "callgraph JSON should succeed: {}",
+        String::from_utf8_lossy(&callgraph_json.stderr)
+    );
+    let callgraph_json_stdout = String::from_utf8_lossy(&callgraph_json.stdout);
+    assert!(
+        callgraph_json_stdout.contains("\"name\": \"log_message\""),
+        "callgraph JSON should use project names: {}",
+        callgraph_json_stdout
+    );
+    assert!(
+        !callgraph_json_stdout.contains("\"name\": \"print_message\""),
+        "callgraph JSON should not emit stale symbol names: {}",
+        callgraph_json_stdout
+    );
+
+    let callgraph_dot = run_hexray(&["-p", &project_str, &binary, "callgraph", "all", "--dot"]);
+    assert!(
+        callgraph_dot.status.success(),
+        "callgraph DOT should succeed: {}",
+        String::from_utf8_lossy(&callgraph_dot.stderr)
+    );
+    let callgraph_dot_stdout = String::from_utf8_lossy(&callgraph_dot.stdout);
+    assert!(
+        callgraph_dot_stdout.contains("\"log_message\""),
+        "callgraph DOT should use project names: {}",
+        callgraph_dot_stdout
+    );
+    assert!(
+        !callgraph_dot_stdout.contains("print_message"),
+        "callgraph DOT should not emit stale symbol names: {}",
+        callgraph_dot_stdout
+    );
+}
+
+#[test]
+fn test_global_project_flag_rejects_binary_mismatch() {
+    let strings_binary = workspace_fixture_path("test_strings");
+    if !Path::new(&strings_binary).exists() {
+        eprintln!("Skipping test: fixture test_strings not found");
+        return;
+    }
+    let decompile_binary = workspace_fixture_path("test_decompile");
+    if !Path::new(&decompile_binary).exists() {
+        eprintln!("Skipping test: fixture test_decompile not found");
+        return;
+    }
+
+    let (_, project_str) = create_test_strings_project("project-binary-mismatch");
+    let wrong_binary = decompile_binary;
+
+    let output = run_hexray(&["-p", &project_str, &wrong_binary, "cfg", "log_message"]);
+    assert!(
+        !output.status.success(),
+        "cfg should fail before applying a project to the wrong binary"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was created for binary"),
+        "mismatch failure should explain the recorded binary: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("tests/fixtures/test_strings"),
+        "mismatch failure should mention the project binary: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("tests/fixtures/test_decompile"),
+        "mismatch failure should mention the requested binary: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_symbols_apply_project_renames() {
+    let binary = workspace_fixture_path("test_strings");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture test_strings not found");
+        return;
+    }
+
+    let (binary, project_str) = create_test_strings_project("project-symbols");
+
+    let output = run_hexray(&["-p", &project_str, &binary, "symbols", "-f"]);
+    assert!(
+        output.status.success(),
+        "symbols -f with project should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("log_message"),
+        "symbols output should use renamed function names: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("entry_alias"),
+        "symbols output should use renamed caller names: {}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("print_message"),
+        "symbols output should not keep the original function name when a project rename exists: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_project_list_shows_labels() {
+    let binary = workspace_fixture_path("test_strings");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture test_strings not found");
+        return;
+    }
+
+    let (_, project_str) = create_test_strings_project("project-list-labels");
+
+    let output = run_hexray(&["project", "list", &project_str]);
+    assert!(
+        output.status.success(),
+        "project list should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Labels"),
+        "project list should include a Labels section: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("saved_greeting"),
+        "project list should show persisted labels: {}",
+        stdout
     );
 }
 
