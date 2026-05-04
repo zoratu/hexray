@@ -3347,7 +3347,7 @@ struct JsonDiffStats {
     bytes_changed: usize,
     bytes_inserted: usize,
     bytes_deleted: usize,
-    similarity: f64,
+    similarity_ratio: f64,
 }
 
 #[derive(Serialize)]
@@ -3438,7 +3438,7 @@ fn handle_diff_command(
                 bytes_changed: diff.stats.bytes_changed,
                 bytes_inserted: diff.stats.bytes_inserted,
                 bytes_deleted: diff.stats.bytes_deleted,
-                similarity: diff.stats.similarity,
+                similarity_ratio: diff.stats.similarity,
             },
             patches: diff
                 .patches

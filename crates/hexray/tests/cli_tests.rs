@@ -449,6 +449,41 @@ fn test_emulate_run_json_errors_stay_json() {
     );
 }
 
+#[test]
+fn test_diff_json_uses_explicit_similarity_ratio() {
+    let original = workspace_fixture_path("pe/simple_x64.exe");
+    let modified = workspace_fixture_path("pe/complex_x64.exe");
+    if !Path::new(&original).exists() || !Path::new(&modified).exists() {
+        eprintln!("Skipping test: diff PE fixtures not found");
+        return;
+    }
+
+    let output = run_hexray(&["diff", &original, &modified, "--json"]);
+    assert!(
+        output.status.success(),
+        "diff --json should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("diff --json should emit valid JSON");
+    let stats = &json["stats"];
+
+    assert!(
+        stats["similarity_ratio"]
+            .as_f64()
+            .is_some_and(|ratio| (0.0..=1.0).contains(&ratio)),
+        "diff JSON should expose similarity_ratio as a 0..=1 ratio: {}",
+        stdout
+    );
+    assert!(
+        stats.get("similarity").is_none(),
+        "diff JSON should no longer expose an ambiguous similarity field: {}",
+        stdout
+    );
+}
+
 // =============================================================================
 // Disassembly Tests
 // =============================================================================
