@@ -423,6 +423,28 @@ fn validate_project_address(
     }
 }
 
+fn validate_project_function_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("function name must not be empty");
+    }
+    if name.len() > 256 {
+        bail!("function name must be at most 256 characters");
+    }
+
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        bail!("function name must not be empty");
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        bail!("function name must be a valid C identifier");
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        bail!("function name must be a valid C identifier");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Restore the Unix default so piped output exits quietly on EPIPE.
     sigpipe::reset();
@@ -3045,6 +3067,7 @@ fn handle_project_command(binary_path: Option<&Path>, action: ProjectAction) -> 
                 address,
                 ProjectAddressRule::Executable,
             )?;
+            validate_project_function_name(&name)?;
             project.set_function_name(address, &name);
             project.save(&project_path)?;
 

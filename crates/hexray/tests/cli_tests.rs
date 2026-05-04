@@ -1275,6 +1275,41 @@ fn test_project_rejects_addresses_outside_the_binary() {
     );
 }
 
+#[test]
+fn test_project_name_rejects_invalid_identifiers() {
+    skip_if_missing!("elf/test_with_symbols");
+
+    let project_path = temp_path("project-invalid-name", "hxp");
+    let project_str = project_path.to_string_lossy().to_string();
+    let binary = fixture_path("elf/test_with_symbols");
+
+    let create = run_hexray(&[&binary, "project", "create", "-o", &project_str]);
+    assert!(
+        create.status.success(),
+        "project create should succeed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let empty = run_hexray(&["project", "name", &project_str, "0x40100f", ""]);
+    assert!(!empty.status.success(), "empty function names should fail");
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("must not be empty"),
+        "empty-name failure should be explicit: {}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+
+    let multiline = run_hexray(&["project", "name", &project_str, "0x40100f", "line1\nline2"]);
+    assert!(
+        !multiline.status.success(),
+        "multiline function names should fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&multiline.stderr).contains("valid C identifier"),
+        "multiline-name failure should mention identifier validity: {}",
+        String::from_utf8_lossy(&multiline.stderr)
+    );
+}
+
 // =============================================================================
 // Format Detection Tests
 // =============================================================================
