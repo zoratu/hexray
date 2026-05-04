@@ -1013,6 +1013,14 @@ fn find_exact_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::
     find_symbol_with_mode(fmt, name, SymbolLookupMode::ExactOnly)
 }
 
+fn find_exact_symbol_for_project(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    name: &str,
+) -> Option<hexray_core::Symbol> {
+    find_symbol_for_project_with_mode(fmt, project, name, SymbolLookupMode::ExactOnly)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SymbolLookupMode {
     ExactOnly,
@@ -1036,6 +1044,15 @@ fn find_symbol_for_project(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
     name: &str,
+) -> Option<hexray_core::Symbol> {
+    find_symbol_for_project_with_mode(fmt, project, name, SymbolLookupMode::Fuzzy)
+}
+
+fn find_symbol_for_project_with_mode(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    name: &str,
+    mode: SymbolLookupMode,
 ) -> Option<hexray_core::Symbol> {
     let mut symbols: Vec<hexray_core::Symbol> =
         fmt.symbols().filter(|s| s.is_defined()).cloned().collect();
@@ -1063,7 +1080,32 @@ fn find_symbol_for_project(
         }
     }
 
-    find_symbol_in_candidates(&symbols, name, SymbolLookupMode::Fuzzy)
+    find_symbol_in_candidates(&symbols, name, mode)
+}
+
+enum ResolvedAnalysisTarget {
+    Address(u64),
+    Symbol(hexray_core::Symbol),
+}
+
+fn resolve_analysis_target(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    target: &str,
+) -> Result<ResolvedAnalysisTarget> {
+    if let Some(symbol) = find_exact_symbol_for_project(fmt, project, target) {
+        return Ok(ResolvedAnalysisTarget::Symbol(symbol));
+    }
+
+    if let Ok(address) = parse_address_str(target) {
+        return Ok(ResolvedAnalysisTarget::Address(address));
+    }
+
+    if let Some(symbol) = find_symbol_for_project(fmt, project, target) {
+        return Ok(ResolvedAnalysisTarget::Symbol(symbol));
+    }
+
+    bail!("Symbol '{}' not found", target)
 }
 
 fn display_function_name(
@@ -1309,31 +1351,29 @@ fn disassemble_cfg(
     html: bool,
     project: Option<&AnalysisProject>,
 ) -> Result<()> {
-    // Try to parse as address first
-    let address = parse_address_str(target).ok();
-
-    let (start_addr, name, max_bytes, stop_after_first_return) = if let Some(addr) = address {
-        let name = project
-            .and_then(|p| p.get_function_name(addr))
-            .map(|n| n.to_string())
-            .or_else(|| fmt.symbol_at(addr).map(|s| demangle_or_original(&s.name)))
-            .unwrap_or_else(|| format!("sub_{:x}", addr));
-        (addr, name, 4096usize, true)
-    } else {
-        // Find symbol using improved search
-        let symbol = find_symbol_for_project(fmt, project, target)
-            .with_context(|| format!("Symbol '{}' not found", target))?;
-        let max_bytes = if symbol.size > 0 {
-            symbol.size as usize
-        } else {
-            4096usize
+    let (start_addr, name, max_bytes, stop_after_first_return) =
+        match resolve_analysis_target(fmt, project, target)? {
+            ResolvedAnalysisTarget::Address(addr) => {
+                let name = project
+                    .and_then(|p| p.get_function_name(addr))
+                    .map(|n| n.to_string())
+                    .or_else(|| fmt.symbol_at(addr).map(|s| demangle_or_original(&s.name)))
+                    .unwrap_or_else(|| format!("sub_{:x}", addr));
+                (addr, name, 4096usize, true)
+            }
+            ResolvedAnalysisTarget::Symbol(symbol) => {
+                let max_bytes = if symbol.size > 0 {
+                    symbol.size as usize
+                } else {
+                    4096usize
+                };
+                let name = project
+                    .and_then(|p| p.get_function_name(symbol.address))
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| demangle_or_original(&symbol.name));
+                (symbol.address, name, max_bytes, symbol.size == 0)
+            }
         };
-        let name = project
-            .and_then(|p| p.get_function_name(symbol.address))
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| demangle_or_original(&symbol.name));
-        (symbol.address, name, max_bytes, symbol.size == 0)
-    };
 
     // Disassemble instructions
     let bytes = fmt
@@ -1463,31 +1503,34 @@ fn decompile_function(
 ) -> Result<()> {
     let fmt = binary.as_format();
 
-    // Try to parse as address first
-    let address = parse_address_str(target).ok();
-
-    let (start_addr, name, max_bytes, stop_after_first_return) = if let Some(addr) = address {
-        // Check if project has a custom name for this address
-        let name = project
-            .and_then(|p| p.get_function_name(addr))
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| format!("sub_{:x}", addr));
-        (addr, name, 4096usize, true)
-    } else {
-        // Find symbol using improved search
-        let symbol = find_symbol_for_project(fmt, project, target)
-            .with_context(|| format!("Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).", target))?;
-        let max_bytes = if symbol.size > 0 {
-            symbol.size as usize
-        } else {
-            4096usize
-        };
-        // Check if project has a custom name for this address
-        let name = project
-            .and_then(|p| p.get_function_name(symbol.address))
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| demangle_or_original(&symbol.name));
-        (symbol.address, name, max_bytes, symbol.size == 0)
+    let (start_addr, name, max_bytes, stop_after_first_return) = match resolve_analysis_target(
+        fmt, project, target,
+    ) {
+        Ok(ResolvedAnalysisTarget::Address(addr)) => {
+            let name = project
+                .and_then(|p| p.get_function_name(addr))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("sub_{:x}", addr));
+            (addr, name, 4096usize, true)
+        }
+        Ok(ResolvedAnalysisTarget::Symbol(symbol)) => {
+            let max_bytes = if symbol.size > 0 {
+                symbol.size as usize
+            } else {
+                4096usize
+            };
+            let name = project
+                .and_then(|p| p.get_function_name(symbol.address))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| demangle_or_original(&symbol.name));
+            (symbol.address, name, max_bytes, symbol.size == 0)
+        }
+        Err(_) => {
+            bail!(
+                    "Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).",
+                    target
+                )
+        }
     };
 
     // Validate the address is reasonable
@@ -2109,23 +2152,24 @@ fn build_callgraph(
 
         funcs
     } else {
-        // Parse as address or find symbol by name
-        let address = parse_address_str(target).ok();
-
-        let (addr, name, size, heuristic_bounds) = if let Some(a) = address {
-            // For raw addresses, use a default size
-            (a, display_function_name(fmt, project, a), 4096u64, true)
-        } else {
-            let symbol = find_symbol_for_project(fmt, project, target)
-                .with_context(|| format!("Symbol '{}' not found", target))?;
-            let size = if symbol.size > 0 { symbol.size } else { 4096 };
-            (
-                symbol.address,
-                display_function_name(fmt, project, symbol.address),
-                size,
-                symbol.size == 0,
-            )
-        };
+        let (addr, name, size, heuristic_bounds) =
+            match resolve_analysis_target(fmt, project, target)? {
+                ResolvedAnalysisTarget::Address(address) => (
+                    address,
+                    display_function_name(fmt, project, address),
+                    4096u64,
+                    true,
+                ),
+                ResolvedAnalysisTarget::Symbol(symbol) => {
+                    let size = if symbol.size > 0 { symbol.size } else { 4096 };
+                    (
+                        symbol.address,
+                        display_function_name(fmt, project, symbol.address),
+                        size,
+                        symbol.size == 0,
+                    )
+                }
+            };
 
         vec![(addr, name, size, heuristic_bounds)]
     };
@@ -2518,25 +2562,21 @@ fn decompile_with_follow(
     // Queue of (address, name, depth) to decompile
     let mut queue: Vec<(u64, String, usize)> = Vec::new();
 
-    // Resolve the initial target
-    let address = parse_address_str(target).ok();
-
-    let (start_addr, name) = if let Some(addr) = address {
-        // Check if project has a custom name for this address
-        let name = project
-            .and_then(|p| p.get_function_name(addr))
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| format!("sub_{:x}", addr));
-        (addr, name)
-    } else {
-        let symbol = find_symbol_for_project(fmt, project, target)
-            .with_context(|| format!("Symbol '{}' not found", target))?;
-        // Check if project has a custom name for this address
-        let name = project
-            .and_then(|p| p.get_function_name(symbol.address))
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| demangle_or_original(&symbol.name));
-        (symbol.address, name)
+    let (start_addr, name) = match resolve_analysis_target(fmt, project, target)? {
+        ResolvedAnalysisTarget::Address(addr) => {
+            let name = project
+                .and_then(|p| p.get_function_name(addr))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("sub_{:x}", addr));
+            (addr, name)
+        }
+        ResolvedAnalysisTarget::Symbol(symbol) => {
+            let name = project
+                .and_then(|p| p.get_function_name(symbol.address))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| demangle_or_original(&symbol.name));
+            (symbol.address, name)
+        }
     };
 
     queue.push((start_addr, name, 0));
@@ -3113,16 +3153,9 @@ fn build_xrefs(
 
     // If a target is specified, show refs to that target
     if let Some(target_str) = target {
-        let target_addr = if let Some(stripped) = target_str.strip_prefix("0x") {
-            u64::from_str_radix(stripped, 16)
-                .with_context(|| format!("Invalid address: {}", target_str))?
-        } else if let Ok(addr) = u64::from_str_radix(target_str, 16) {
-            addr
-        } else {
-            // Try to find symbol
-            let symbol = find_symbol_for_project(fmt, project, target_str)
-                .with_context(|| format!("Symbol '{}' not found", target_str))?;
-            symbol.address
+        let target_addr = match resolve_analysis_target(fmt, project, target_str)? {
+            ResolvedAnalysisTarget::Address(addr) => addr,
+            ResolvedAnalysisTarget::Symbol(symbol) => symbol.address,
         };
 
         let refs = if calls_only {
@@ -5403,14 +5436,113 @@ fn format_arch_for_info(arch: Architecture) -> String {
 mod tests {
     use super::{
         default_calling_convention, ensure_distinct_export_paths, find_symbol_in_candidates,
-        format_callgraph_text, parse_address_str, patch_affects_function, string_tags,
-        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, SessionExportFormat,
-        SymbolLookupMode,
+        format_callgraph_text, parse_address_str, patch_affects_function, resolve_analysis_target,
+        string_tags, truncate_for_display, DiffPatchAddressSpace, FileAddressRange,
+        ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding};
-    use hexray_core::{Architecture, Symbol, SymbolBinding, SymbolKind};
-    use hexray_formats::BinaryType;
+    use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
+    use hexray_formats::{BinaryFormat, BinaryType, Section};
     use std::fs;
+
+    struct TestBinary {
+        sections: Vec<TestSection>,
+        symbols: Vec<Symbol>,
+    }
+
+    struct TestSection {
+        name: &'static str,
+        address: u64,
+        data: Vec<u8>,
+        executable: bool,
+        allocated: bool,
+    }
+
+    impl BinaryFormat for TestBinary {
+        fn architecture(&self) -> Architecture {
+            Architecture::X86_64
+        }
+
+        fn endianness(&self) -> Endianness {
+            Endianness::Little
+        }
+
+        fn bitness(&self) -> Bitness {
+            Bitness::Bits64
+        }
+
+        fn entry_point(&self) -> Option<u64> {
+            None
+        }
+
+        fn executable_sections(&self) -> Box<dyn Iterator<Item = &dyn Section> + '_> {
+            Box::new(
+                self.sections
+                    .iter()
+                    .filter(|section| section.executable)
+                    .map(|section| section as &dyn Section),
+            )
+        }
+
+        fn sections(&self) -> Box<dyn Iterator<Item = &dyn Section> + '_> {
+            Box::new(self.sections.iter().map(|section| section as &dyn Section))
+        }
+
+        fn symbols(&self) -> Box<dyn Iterator<Item = &Symbol> + '_> {
+            Box::new(self.symbols.iter())
+        }
+
+        fn symbol_at(&self, addr: u64) -> Option<&Symbol> {
+            self.symbols.iter().find(|symbol| symbol.address == addr)
+        }
+
+        fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
+            let section = self.section_containing(addr)?;
+            let start = usize::try_from(addr.checked_sub(section.virtual_address())?).ok()?;
+            section.data().get(start..start.checked_add(len)?)
+        }
+
+        fn section_containing(&self, addr: u64) -> Option<&dyn Section> {
+            self.sections
+                .iter()
+                .find(|section| {
+                    let start = section.address;
+                    let end = start.saturating_add(section.data.len() as u64);
+                    addr >= start && addr < end
+                })
+                .map(|section| section as &dyn Section)
+        }
+    }
+
+    impl Section for TestSection {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn virtual_address(&self) -> u64 {
+            self.address
+        }
+
+        fn size(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+
+        fn is_executable(&self) -> bool {
+            self.executable
+        }
+
+        fn is_writable(&self) -> bool {
+            false
+        }
+
+        fn is_allocated(&self) -> bool {
+            self.allocated
+        }
+    }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("hexray-{}-{}", std::process::id(), name))
@@ -5492,6 +5624,52 @@ mod tests {
             find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
 
         assert_eq!(resolved.name, "nfsd_open.cold");
+    }
+
+    #[test]
+    fn resolve_analysis_target_prefers_exact_symbol_over_hex_parse() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401000,
+                data: vec![0; 0x1000],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![test_symbol("add", 0x401106)],
+        };
+
+        let resolved = resolve_analysis_target(&binary, None, "add").unwrap();
+
+        match resolved {
+            ResolvedAnalysisTarget::Symbol(symbol) => assert_eq!(symbol.address, 0x401106),
+            ResolvedAnalysisTarget::Address(address) => {
+                panic!("resolved {address:#x} instead of the exact symbol")
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_analysis_target_uses_hex_before_fuzzy_fallback_for_hex_looking_queries() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x0,
+                data: vec![0; 0x2000],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![test_symbol("adder", 0x401106)],
+        };
+
+        let resolved = resolve_analysis_target(&binary, None, "add").unwrap();
+
+        match resolved {
+            ResolvedAnalysisTarget::Address(address) => assert_eq!(address, 0xadd),
+            ResolvedAnalysisTarget::Symbol(symbol) => {
+                panic!("resolved {} instead of the hex address", symbol.name)
+            }
+        }
     }
 
     #[test]
