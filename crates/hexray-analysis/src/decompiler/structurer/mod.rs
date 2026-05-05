@@ -32,8 +32,8 @@ pub use cleanup::{
 #[cfg(test)]
 use condition::try_extract_arm64_branch_condition;
 use condition::{
-    condition_to_expr_with_block, generate_writeback_expr, lift_cmovcc_with_context,
-    lift_setcc_with_context, negate_condition,
+    condition_to_expr_with_block, condition_to_expr_with_block_no_alu_updates,
+    generate_writeback_expr, lift_cmovcc_with_context, lift_setcc_with_context, negate_condition,
 };
 #[cfg(test)]
 use gotos::LoopContext;
@@ -853,6 +853,11 @@ impl<'a> Structurer<'a> {
                 let true_in_loop = body.contains(true_target);
                 let false_in_loop = body.contains(false_target);
                 if true_in_loop != false_in_loop {
+                    // A conditional self-loop executes the block body before evaluating
+                    // the terminating branch, so it is structurally a do-while.
+                    if lp.back_edge == lp.header {
+                        return LoopKind::DoWhile;
+                    }
                     return LoopKind::While;
                 }
             }
@@ -1591,10 +1596,12 @@ impl<'a> Structurer<'a> {
                 ..
             } = &block.terminator
             {
-                let cond_expr = self.rewrite_condition_call_return_alias(
-                    back_edge,
-                    condition_to_expr_with_block(*condition, block),
-                );
+                let lifted = if back_edge == info.header {
+                    condition_to_expr_with_block_no_alu_updates(*condition, block)
+                } else {
+                    condition_to_expr_with_block(*condition, block)
+                };
+                let cond_expr = self.rewrite_condition_call_return_alias(back_edge, lifted);
                 if *true_target == info.header {
                     return (cond_expr, back_edge);
                 } else if *false_target == info.header {
@@ -2920,6 +2927,37 @@ mod tests {
         cfg
     }
 
+    fn make_self_loop_conditional_cfg() -> ControlFlowGraph {
+        // bb0 -> bb1 (single-block loop body + condition)
+        //        bb1 -> bb1 (back edge if true)
+        //        bb1 -> bb2 (exit if false)
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::Return;
+        cfg.add_block(bb2);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        cfg
+    }
+
     fn make_infinite_loop_cfg() -> ControlFlowGraph {
         // bb0 -> bb1 (loop header)
         //        bb1 -> bb1 (unconditional back edge)
@@ -4016,6 +4054,20 @@ mod tests {
     }
 
     #[test]
+    fn test_structurer_self_loop_conditional_uses_dowhile() {
+        let cfg = make_self_loop_conditional_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        assert!(
+            structured
+                .body()
+                .iter()
+                .any(|n| matches!(n, StructuredNode::DoWhile { .. })),
+            "Conditional self-loop should structure as do-while"
+        );
+    }
+
+    #[test]
     fn test_structurer_infinite_loop() {
         let cfg = make_infinite_loop_cfg();
         let structured = StructuredCfg::from_cfg(&cfg);
@@ -4182,6 +4234,23 @@ mod tests {
             "Should be DoWhile or While, got {:?}",
             kind
         );
+    }
+
+    #[test]
+    fn test_classify_self_loop_header_as_dowhile() {
+        let cfg = make_self_loop_conditional_cfg();
+        let loops = cfg.find_loops();
+
+        assert!(!loops.is_empty(), "Should detect a self-loop");
+
+        let body_set: HashSet<_> = loops[0].body.iter().copied().collect();
+        let kind = Structurer::classify_loop(
+            &cfg,
+            &loops[0],
+            &body_set,
+            &StructuringAnnotations::default(),
+        );
+        assert_eq!(kind, LoopKind::DoWhile);
     }
 
     // --- Find Loop Exits Tests ---

@@ -481,8 +481,11 @@ fn propagate_temps_in_node(node: StructuredNode) -> StructuredNode {
             exit_block,
         } => {
             let body = propagate_temps_to_conditions(body);
-            // Collect temp values from the body
-            let temps = collect_temps_from_nodes(&body);
+            // Collect temp values from the body, but avoid substituting loop-carried
+            // induction updates back into the post-body condition.
+            let mut temps = collect_temps_from_nodes(&body);
+            let modified = collect_modified_vars_from_nodes(&body);
+            temps.retain(|name, _| !modified.contains(name));
             // Substitute in condition
             let condition = substitute_vars(&condition, &temps);
             StructuredNode::DoWhile {
@@ -574,6 +577,98 @@ fn collect_temps_from_nodes(nodes: &[StructuredNode]) -> HashMap<String, Expr> {
         collect_temps_from_node(node, &mut temps);
     }
     temps
+}
+
+fn collect_modified_vars_from_nodes(nodes: &[StructuredNode]) -> HashSet<String> {
+    let mut modified = HashSet::new();
+    for node in nodes {
+        collect_modified_vars_from_node(node, &mut modified);
+    }
+    modified
+}
+
+fn collect_modified_vars_from_node(node: &StructuredNode, modified: &mut HashSet<String>) {
+    use super::super::expression::ExprKind;
+
+    match node {
+        StructuredNode::Block { statements, .. } => {
+            for stmt in statements {
+                match &stmt.kind {
+                    ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => {
+                        if let ExprKind::Var(v) = &lhs.kind {
+                            modified.insert(v.name.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        StructuredNode::Expr(expr) => {
+            if let ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } = &expr.kind
+            {
+                if let ExprKind::Var(v) = &lhs.kind {
+                    modified.insert(v.name.clone());
+                }
+            }
+        }
+        StructuredNode::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for node in then_body {
+                collect_modified_vars_from_node(node, modified);
+            }
+            if let Some(else_body) = else_body {
+                for node in else_body {
+                    collect_modified_vars_from_node(node, modified);
+                }
+            }
+        }
+        StructuredNode::While { body, .. }
+        | StructuredNode::DoWhile { body, .. }
+        | StructuredNode::Loop { body, .. } => {
+            for node in body {
+                collect_modified_vars_from_node(node, modified);
+            }
+        }
+        StructuredNode::For { body, .. } => {
+            for node in body {
+                collect_modified_vars_from_node(node, modified);
+            }
+        }
+        StructuredNode::Switch { cases, default, .. } => {
+            for (_, body) in cases {
+                for node in body {
+                    collect_modified_vars_from_node(node, modified);
+                }
+            }
+            if let Some(default) = default {
+                for node in default {
+                    collect_modified_vars_from_node(node, modified);
+                }
+            }
+        }
+        StructuredNode::Sequence(nodes) => {
+            for node in nodes {
+                collect_modified_vars_from_node(node, modified);
+            }
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            for node in try_body {
+                collect_modified_vars_from_node(node, modified);
+            }
+            for handler in catch_handlers {
+                for node in &handler.body {
+                    collect_modified_vars_from_node(node, modified);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Collects temp register values from a single node.
@@ -1327,12 +1422,12 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
 
     for (i, stmt) in statements.into_iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
-            let new_rhs = substitute_vars(rhs, &reg_values);
+            let tracked_rhs = substitute_vars(rhs, &reg_values);
 
             if let ExprKind::Var(v) = &lhs.kind {
                 if is_temp_register(&v.name) {
                     for alias in get_register_aliases(&v.name) {
-                        reg_values.insert(alias, new_rhs.clone());
+                        reg_values.insert(alias, tracked_rhs.clone());
                     }
                 }
 
@@ -1350,13 +1445,36 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
                     }
 
                     // Track this argument value along with its statement index.
-                    arg_values.insert(v.name.clone(), (i, new_rhs.clone()));
-                    result.push(Expr::assign((**lhs).clone(), new_rhs));
+                    arg_values.insert(v.name.clone(), (i, tracked_rhs.clone()));
+                    result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
                 }
             }
 
-            result.push(Expr::assign((**lhs).clone(), new_rhs));
+            result.push(stmt);
+            continue;
+        }
+
+        if let ExprKind::CompoundAssign { op, lhs, rhs } = &stmt.kind {
+            let tracked_rhs = substitute_vars(rhs, &reg_values);
+
+            if let ExprKind::Var(v) = &lhs.kind {
+                if is_temp_register(&v.name) {
+                    let current = reg_values
+                        .get(&v.name)
+                        .cloned()
+                        .unwrap_or_else(|| (**lhs).clone());
+                    let new_val = Expr::binop(*op, current, tracked_rhs);
+                    for alias in get_register_aliases(&v.name) {
+                        reg_values.insert(alias, new_val.clone());
+                    }
+                }
+                if get_arg_register_index(&v.name).is_some() {
+                    arg_values.remove(&v.name);
+                }
+            }
+
+            result.push(stmt);
             continue;
         }
 
@@ -3075,5 +3193,83 @@ mod tests {
         assert_eq!(format!("{}", merged[0]), "ret_0 = foo()");
         assert_eq!(format!("{}", merged[1]), "x = *(uint32_t*)(ret_0)");
         assert_eq!(format!("{}", merged[2]), "sum += x");
+    }
+
+    #[test]
+    fn test_propagate_copies_keeps_saved_snapshot_after_induction_update() {
+        let statements = vec![
+            Expr::assign(reg("edx", 4), reg("edi", 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Sub,
+                    lhs: Box::new(reg("edi", 4)),
+                    rhs: Box::new(Expr::int(1)),
+                },
+            },
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Mul,
+                    lhs: Box::new(reg("eax", 4)),
+                    rhs: Box::new(reg("edx", 4)),
+                },
+            },
+        ];
+
+        let propagated = propagate_copies(statements);
+        assert_eq!(format!("{}", propagated[2]), "eax *= edx");
+    }
+
+    #[test]
+    fn test_propagate_call_args_keeps_saved_snapshot_after_induction_update() {
+        let statements = vec![
+            Expr::assign(reg("edx", 4), reg("edi", 4)),
+            Expr::assign(
+                reg("edi", 4),
+                Expr::binop(BinOpKind::Sub, reg("edi", 4), Expr::int(1)),
+            ),
+            Expr::assign(
+                reg("eax", 4),
+                Expr::binop(BinOpKind::Mul, reg("eax", 4), reg("edx", 4)),
+            ),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(format!("{}", propagated[2]), "eax = eax * edx");
+    }
+
+    #[test]
+    fn test_propagate_temps_to_conditions_skips_self_updated_dowhile_induction_var() {
+        let nodes = vec![StructuredNode::DoWhile {
+            body: vec![block(
+                0,
+                vec![
+                    Expr::assign(reg("edx", 4), reg("edi", 4)),
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Sub,
+                            lhs: Box::new(reg("edi", 4)),
+                            rhs: Box::new(Expr::int(1)),
+                        },
+                    },
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Mul,
+                            lhs: Box::new(reg("eax", 4)),
+                            rhs: Box::new(reg("edx", 4)),
+                        },
+                    },
+                ],
+            )],
+            condition: Expr::binop(BinOpKind::Ne, reg("edi", 4), Expr::int(1)),
+            header: Some(BasicBlockId::new(0)),
+            exit_block: Some(BasicBlockId::new(1)),
+        }];
+
+        let propagated = propagate_temps_to_conditions(nodes);
+        let StructuredNode::DoWhile { condition, .. } = &propagated[0] else {
+            panic!("expected do-while node");
+        };
+
+        assert_eq!(format!("{}", condition), "edi != 1");
     }
 }

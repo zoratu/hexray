@@ -125,7 +125,17 @@ fn is_flag_setting_instruction(inst: &Instruction) -> bool {
 /// Also substitutes register names with their values from preceding MOV instructions.
 pub(super) fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
     // Find the last compare in the block (no address limit)
-    condition_to_expr_before_address(cond, block, None)
+    condition_to_expr_before_address_with_options(cond, block, None, true)
+}
+
+/// Converts a condition to an Expr without folding same-block ALU updates into register values.
+/// This is useful for bottom-tested self-loops where the arithmetic update is already emitted
+/// in the loop body and should not be duplicated in the condition.
+pub(super) fn condition_to_expr_with_block_no_alu_updates(
+    cond: Condition,
+    block: &BasicBlock,
+) -> Expr {
+    condition_to_expr_before_address_with_options(cond, block, None, false)
 }
 
 /// Converts a Condition to an Expr, finding the compare instruction before the given address.
@@ -134,6 +144,15 @@ pub(super) fn condition_to_expr_before_address(
     cond: Condition,
     block: &BasicBlock,
     before_addr: Option<u64>,
+) -> Expr {
+    condition_to_expr_before_address_with_options(cond, block, before_addr, true)
+}
+
+fn condition_to_expr_before_address_with_options(
+    cond: Condition,
+    block: &BasicBlock,
+    before_addr: Option<u64>,
+    track_alu_updates: bool,
 ) -> Expr {
     let op = match cond {
         Condition::Equal => BinOpKind::Eq,
@@ -153,7 +172,7 @@ pub(super) fn condition_to_expr_before_address(
     };
 
     // Build a map of register values from MOV instructions before the compare
-    let reg_values = build_register_value_map(block);
+    let reg_values = build_register_value_map_with_options(block, track_alu_updates);
 
     // Check for ARM64 CBZ/CBNZ/TBZ/TBNZ instructions first
     // These have the comparison built into the branch instruction itself
@@ -362,6 +381,13 @@ pub(super) fn condition_to_expr_before_address(
 /// that conditions like `test eax, eax` display as `if (ebx == 0)` when we've merged
 /// the call into `ebx = func()`.
 pub(super) fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
+    build_register_value_map_with_options(block, true)
+}
+
+fn build_register_value_map_with_options(
+    block: &BasicBlock,
+    track_alu_updates: bool,
+) -> HashMap<String, Expr> {
     use super::super::expression::{VarKind, Variable};
     use hexray_core::Operand;
 
@@ -466,7 +492,7 @@ pub(super) fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Ex
 
         // Track simple ALU updates so later TEST/CMP instructions see the computed value,
         // not just the register's last load.
-        if inst.operands.len() >= 2 {
+        if track_alu_updates && inst.operands.len() >= 2 {
             if let Operand::Register(dst_reg) = &inst.operands[0] {
                 let dst_name = dst_reg.name().to_lowercase();
                 if let Some(binop) = binop_for_register_update(inst.operation) {
@@ -1029,6 +1055,26 @@ mod tests {
             rendered.contains("& 1"),
             "expected ALU update to survive through TEST lowering, got {rendered}"
         );
+    }
+
+    #[test]
+    fn test_condition_can_skip_same_block_alu_substitution() {
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x2400);
+        block.instructions.push(
+            Instruction::new(0x2400, 3, vec![], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![Operand::Register(edi), Operand::imm_unsigned(1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x2403, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(edi), Operand::imm_unsigned(1, 32)]),
+        );
+
+        let expr = condition_to_expr_with_block_no_alu_updates(Condition::NotEqual, &block);
+        assert_eq!(format!("{expr}"), "rdi != 1");
     }
 
     #[test]
