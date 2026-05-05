@@ -644,11 +644,12 @@ fn collect_modified_vars_in_node(
             else_body,
             ..
         } => {
-            for branch in [Some(then_body.as_slice()), else_body.as_deref()] {
-                if let Some(nodes) = branch {
-                    for node in nodes {
-                        collect_modified_vars_in_node(node, modified);
-                    }
+            for nodes in [Some(then_body.as_slice()), else_body.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                for node in nodes {
+                    collect_modified_vars_in_node(node, modified);
                 }
             }
         }
