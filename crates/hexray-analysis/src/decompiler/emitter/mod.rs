@@ -597,27 +597,28 @@ impl PseudoCodeEmitter {
         let has_local_4_decl = lines
             .iter()
             .any(|line| line.trim() == "int local_4;" || line.trim() == "uint32_t local_4;");
-        if !has_local_4_decl {
-            return output;
-        }
 
-        for line in &mut lines {
-            if !line.contains("printf(") || !line.contains("local_4") || line.contains("local_4 =")
-            {
-                continue;
+        if has_local_4_decl {
+            for line in &mut lines {
+                if !line.contains("printf(")
+                    || !line.contains("local_4")
+                    || line.contains("local_4 =")
+                {
+                    continue;
+                }
+                let Some(marker) = line.rfind(", local_4") else {
+                    continue;
+                };
+                let prefix = &line[..marker];
+                let Some(prev_comma) = prefix.rfind(',') else {
+                    continue;
+                };
+                let source = prefix[prev_comma + 1..].trim();
+                if source.is_empty() {
+                    continue;
+                }
+                *line = line.replacen("local_4", &format!("BITS({}, 32, 32)", source), 1);
             }
-            let Some(marker) = line.rfind(", local_4") else {
-                continue;
-            };
-            let prefix = &line[..marker];
-            let Some(prev_comma) = prefix.rfind(',') else {
-                continue;
-            };
-            let source = prefix[prev_comma + 1..].trim();
-            if source.is_empty() {
-                continue;
-            }
-            *line = line.replacen("local_4", &format!("BITS({}, 32, 32)", source), 1);
         }
 
         let is_int64_return = lines
@@ -660,11 +661,50 @@ impl PseudoCodeEmitter {
                     }
                 }
             }
+
+            if let Some(shifted_name) = lines.iter().find_map(|line| {
+                let trimmed = line.trim();
+                let name = trimmed.strip_suffix("<<= 32;")?.trim_end();
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c.is_whitespace())
+                {
+                    return None;
+                }
+                let name = name.trim_end();
+                if let Some((candidate, _)) = name.rsplit_once(' ') {
+                    let last = name.split_whitespace().last().unwrap_or(name);
+                    if !candidate.is_empty() && !last.is_empty() {
+                        return Some(last.to_string());
+                    }
+                }
+                Some(name.to_string())
+            }) {
+                let redundant_suffix = format!(" | {} << 32;", shifted_name);
+                for line in &mut lines {
+                    let trimmed = line.trim();
+                    if !trimmed.starts_with("return ") || !trimmed.ends_with(&redundant_suffix) {
+                        continue;
+                    }
+                    let lhs =
+                        trimmed["return ".len()..trimmed.len() - redundant_suffix.len()].trim();
+                    if lhs.is_empty() {
+                        continue;
+                    }
+                    let indent = line
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .collect::<String>();
+                    *line = format!("{}return {} | {};", indent, lhs, shifted_name);
+                }
+            }
         }
 
-        if !lines
-            .iter()
-            .any(|line| line.contains("local_4") && !line.contains("int local_4;"))
+        if has_local_4_decl
+            && !lines
+                .iter()
+                .any(|line| line.contains("local_4") && !line.contains("int local_4;"))
         {
             lines
                 .retain(|line| line.trim() != "int local_4;" && line.trim() != "uint32_t local_4;");
@@ -7227,6 +7267,27 @@ mod tests {
         assert!(
             !repaired.contains("int local_4;"),
             "Expected unused high-half temp declaration to be removed, got:\n{}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn test_repair_packed_small_aggregate_output_removes_redundant_second_shift() {
+        let input = r#"int64_t make_pair(int32_t arg0, int64_t arg1)
+{
+    arg1 <<= 32;
+    return arg0 | arg1 << 32;
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            repaired.contains("return arg0 | arg1;"),
+            "Expected redundant second shift to be removed, got:\n{}",
+            repaired
+        );
+        assert!(
+            !repaired.contains("arg1 << 32;"),
+            "Expected repaired return to avoid a second shift, got:\n{}",
             repaired
         );
     }
