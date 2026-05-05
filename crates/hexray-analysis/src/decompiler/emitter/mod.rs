@@ -3285,6 +3285,16 @@ impl PseudoCodeEmitter {
                 }
             }
             ExprKind::Call { target, args } => {
+                if let CallTarget::Named(name) = target {
+                    if name == "madd" && args.len() == 3 {
+                        let expr = Expr::binop(
+                            BinOpKind::Add,
+                            args[2].clone(),
+                            Expr::binop(BinOpKind::Mul, args[0].clone(), args[1].clone()),
+                        );
+                        return self.format_expr_with_strings(&expr, table);
+                    }
+                }
                 // Strip the `@plt` suffix on lookup-by-address — the
                 // synthesised PLT-stub symbol carries it as a marker
                 // (so downstream tooling can tell it's a thunk), but
@@ -8059,6 +8069,17 @@ mod tests {
         );
 
         assert_eq!(emitter.format_expr(&call), "signal(2, signal_handler)");
+    }
+
+    #[test]
+    fn test_madd_calls_render_as_arithmetic() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let expr = Expr::call(
+            super::super::expression::CallTarget::Named("madd".to_string()),
+            vec![Expr::unknown("count"), Expr::int(4), Expr::unknown("arr")],
+        );
+
+        assert_eq!(emitter.format_expr(&expr), "arr + count * 4");
     }
 
     #[test]
