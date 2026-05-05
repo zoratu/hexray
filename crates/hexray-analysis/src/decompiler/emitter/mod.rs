@@ -5700,17 +5700,8 @@ impl PseudoCodeEmitter {
             // Return value setup: rax/eax = something
             // Also skip ARM64 argument setup patterns
             ExprKind::Assign { lhs, rhs } => {
-                // Note: We DON'T skip all return register assignments here because
-                // return registers (x0, rax) are also parameter registers that may be
-                // used as loop variables. Only epilogue return register setups should
-                // be skipped, which are handled by the skip_statements mechanism.
-                if let ExprKind::Var(v) = &lhs.kind {
-                    // Skip eax/rax assignments (x86 return registers) but NOT x0/w0/a0
-                    // because those are ARM/RISC-V parameter registers that may be loop variables
-                    if matches!(v.name.as_str(), "eax" | "rax") {
-                        return true;
-                    }
-                }
+                // Return-register assignments can be real loop-carried state, not just
+                // epilogue setup. Only skip the epilogue-shaped cases handled elsewhere.
                 // ARM64 argument setup: *(uint64_t*)(x9) = x8 or similar
                 // Store through temporary registers (x8-x17) to stack
                 if let ExprKind::Deref { addr, .. } = &lhs.kind {

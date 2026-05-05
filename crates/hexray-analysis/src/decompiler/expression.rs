@@ -2,7 +2,9 @@
 //!
 //! Converts low-level instructions into high-level expressions.
 
-use hexray_core::{Architecture, Instruction, MemoryRef, Operand, Operation, Register, RegisterClass};
+use hexray_core::{
+    Architecture, Instruction, MemoryRef, Operand, Operation, Register, RegisterClass,
+};
 use std::fmt;
 
 use super::abi;

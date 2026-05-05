@@ -95,6 +95,7 @@ impl ConstantPropagator {
                 header,
                 exit_block,
             } => {
+                let modified = collect_modified_vars(&body);
                 // Don't propagate constants into loops (they may change)
                 let saved = self.constants.clone();
                 self.invalidate_modified_vars(&body);
@@ -103,6 +104,9 @@ impl ConstantPropagator {
                 let body = self.propagate(body);
 
                 self.constants = saved;
+                for var in modified {
+                    self.constants.remove(&var);
+                }
 
                 StructuredNode::While {
                     condition,
@@ -118,6 +122,7 @@ impl ConstantPropagator {
                 header,
                 exit_block,
             } => {
+                let modified = collect_modified_vars(&body);
                 let saved = self.constants.clone();
                 self.invalidate_modified_vars(&body);
 
@@ -125,6 +130,9 @@ impl ConstantPropagator {
                 let condition = self.propagate_expr(condition);
 
                 self.constants = saved;
+                for var in modified {
+                    self.constants.remove(&var);
+                }
 
                 StructuredNode::DoWhile {
                     body,
@@ -142,6 +150,7 @@ impl ConstantPropagator {
                 header,
                 exit_block,
             } => {
+                let modified = collect_modified_vars(&body);
                 let saved = self.constants.clone();
 
                 let init = init.map(|e| self.propagate_expr(e));
@@ -152,6 +161,9 @@ impl ConstantPropagator {
                 let body = self.propagate(body);
 
                 self.constants = saved;
+                for var in modified {
+                    self.constants.remove(&var);
+                }
 
                 StructuredNode::For {
                     init,
@@ -168,12 +180,16 @@ impl ConstantPropagator {
                 header,
                 exit_block,
             } => {
+                let modified = collect_modified_vars(&body);
                 let saved = self.constants.clone();
                 self.invalidate_modified_vars(&body);
 
                 let body = self.propagate(body);
 
                 self.constants = saved;
+                for var in modified {
+                    self.constants.remove(&var);
+                }
 
                 StructuredNode::Loop {
                     body,
@@ -273,6 +289,15 @@ impl ConstantPropagator {
                         // Non-constant assignment invalidates the variable
                         self.constants.remove(&v.name);
                     }
+                }
+            }
+        }
+        if let ExprKind::CompoundAssign { ref lhs, .. } = folded.kind {
+            if let ExprKind::Var(v) = &lhs.kind {
+                if matches!(v.kind, VarKind::Register(_) | VarKind::Temp(_)) {
+                    // Compound assignments both read and write the destination,
+                    // so any previously tracked constant becomes stale.
+                    self.constants.remove(&v.name);
                 }
             }
         }
@@ -595,6 +620,91 @@ impl ConstantPropagator {
     }
 }
 
+fn collect_modified_vars(nodes: &[StructuredNode]) -> std::collections::HashSet<String> {
+    let mut modified = std::collections::HashSet::new();
+    for node in nodes {
+        collect_modified_vars_in_node(node, &mut modified);
+    }
+    modified
+}
+
+fn collect_modified_vars_in_node(
+    node: &StructuredNode,
+    modified: &mut std::collections::HashSet<String>,
+) {
+    match node {
+        StructuredNode::Block { statements, .. } => {
+            for stmt in statements {
+                collect_modified_vars_in_expr(stmt, modified);
+            }
+        }
+        StructuredNode::Expr(expr) => collect_modified_vars_in_expr(expr, modified),
+        StructuredNode::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for branch in [Some(then_body.as_slice()), else_body.as_deref()] {
+                if let Some(nodes) = branch {
+                    for node in nodes {
+                        collect_modified_vars_in_node(node, modified);
+                    }
+                }
+            }
+        }
+        StructuredNode::While { body, .. }
+        | StructuredNode::DoWhile { body, .. }
+        | StructuredNode::For { body, .. }
+        | StructuredNode::Loop { body, .. }
+        | StructuredNode::Sequence(body) => {
+            for node in body {
+                collect_modified_vars_in_node(node, modified);
+            }
+        }
+        StructuredNode::Switch { cases, default, .. } => {
+            for (_, body) in cases {
+                for node in body {
+                    collect_modified_vars_in_node(node, modified);
+                }
+            }
+            if let Some(body) = default {
+                for node in body {
+                    collect_modified_vars_in_node(node, modified);
+                }
+            }
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            for node in try_body {
+                collect_modified_vars_in_node(node, modified);
+            }
+            for handler in catch_handlers {
+                for node in &handler.body {
+                    collect_modified_vars_in_node(node, modified);
+                }
+            }
+        }
+        StructuredNode::Return(_)
+        | StructuredNode::Break
+        | StructuredNode::Continue
+        | StructuredNode::Goto(_)
+        | StructuredNode::Label(_) => {}
+    }
+}
+
+fn collect_modified_vars_in_expr(expr: &Expr, modified: &mut std::collections::HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => {
+            if let ExprKind::Var(var) = &lhs.kind {
+                modified.insert(var.name.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Evaluates a binary operation on constants.
 fn eval_binop(op: BinOpKind, left: i128, right: i128) -> Option<i128> {
     match op {
@@ -822,5 +932,42 @@ mod tests {
         // Using the register variable should substitute
         let folded = prop.fold_expr(reg_var);
         assert!(matches!(folded.kind, ExprKind::IntLit(42)));
+    }
+
+    #[test]
+    fn test_loop_modified_return_register_is_not_restored_to_seed_constant() {
+        let body = vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::assign(make_var("rax"), Expr::int(1))],
+                address_range: (0x1000, 0x1004),
+            },
+            StructuredNode::While {
+                condition: Expr::unknown("cond"),
+                body: vec![StructuredNode::Block {
+                    id: hexray_core::BasicBlockId::new(1),
+                    statements: vec![Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Mul,
+                            lhs: Box::new(make_var("rax")),
+                            rhs: Box::new(make_var("rdx")),
+                        },
+                    }],
+                    address_range: (0x1010, 0x1018),
+                }],
+                header: None,
+                exit_block: None,
+            },
+            StructuredNode::Return(Some(make_var("rax"))),
+        ];
+
+        let propagated = propagate_constants(body);
+        let Some(StructuredNode::Return(Some(expr))) = propagated.last() else {
+            panic!("expected trailing return node");
+        };
+        assert!(
+            matches!(expr.kind, ExprKind::Var(ref v) if v.name == "rax"),
+            "loop-modified return register should not fold back to seed constant: {propagated:?}"
+        );
     }
 }

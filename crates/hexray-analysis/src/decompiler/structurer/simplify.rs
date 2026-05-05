@@ -1078,8 +1078,10 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             // Always substitute known register values in the RHS
             let new_rhs = substitute_vars(rhs, &reg_values);
 
-            // Check if LHS is a temp register
             if let ExprKind::Var(lhs_var) = &lhs.kind {
+                invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
+
+                // Check if LHS is a temp register
                 if is_temp_register(&lhs_var.name) {
                     // Track this assignment for all aliased register names
                     // (e.g., w9 and x9 on ARM64, eax and rax on x86)
@@ -1096,11 +1098,33 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             result.push(Expr::assign((**lhs).clone(), new_rhs));
             continue;
         }
+
+        if let ExprKind::CompoundAssign { op, lhs, rhs } = &stmt.kind {
+            let new_rhs = substitute_vars(rhs, &reg_values);
+            if let ExprKind::Var(lhs_var) = &lhs.kind {
+                invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
+            }
+            result.push(Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: *op,
+                    lhs: lhs.clone(),
+                    rhs: Box::new(new_rhs),
+                },
+            });
+            continue;
+        }
         // Non-assignment statement: pass through
         result.push(stmt);
     }
 
     result
+}
+
+fn invalidate_clobbered_register_mappings(reg_values: &mut HashMap<String, Expr>, written: &str) {
+    let aliases = get_register_aliases(written);
+    reg_values.retain(|name, value| {
+        !aliases.iter().any(|alias| alias == name) && !expr_uses_any_alias(value, &aliases)
+    });
 }
 
 /// Substitute variable references with their GotRef values.

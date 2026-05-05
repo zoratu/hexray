@@ -1567,11 +1567,6 @@ fn disassemble_for_cfg<D: Disassembler>(
                 if stop_after_first_return && (is_ret || is_noreturn_call) {
                     break;
                 }
-                // With known function bounds, allow early returns and continue.
-                // Stop once returns appear in the latter half to avoid trailing junk.
-                if !stop_after_first_return && is_ret && offset >= bytes.len() / 2 {
-                    break;
-                }
             }
             Err(_) => {
                 offset += disasm.min_instruction_size().max(1);

@@ -797,7 +797,7 @@ impl<'a> Structurer<'a> {
         }
 
         // Only return an expression when we saw an explicit return-register assignment.
-        return_value
+        return_value.or_else(|| self.implicit_return_register_expr_for_block(block.id))
     }
 
     /// Checks if a block is a cleanup block (just a call, no other logic).
@@ -1028,6 +1028,8 @@ impl<'a> Structurer<'a> {
                     // If so, extract it as the return value
                     // Note: extract_return_value applies copy propagation internally
                     let (filtered_stmts, return_value) = extract_return_value(statements);
+                    let return_value = return_value
+                        .or_else(|| self.implicit_return_register_expr_for_block(block_id));
 
                     if !filtered_stmts.is_empty() {
                         result.push(StructuredNode::Block {

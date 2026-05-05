@@ -744,10 +744,8 @@ impl SignatureRecovery {
 
                     if right_is_offset {
                         if let ExprKind::Var(var) = &left.kind {
-                            let base_width = self
-                                .infer_expr_size(left)
-                                .unwrap_or(var.size)
-                                .max(var.size);
+                            let base_width =
+                                self.infer_expr_size(left).unwrap_or(var.size).max(var.size);
                             if base_width >= 8 {
                                 self.record_usage_hint(&var.name.to_lowercase(), |h| {
                                     h.is_pointer_arithmetic = true
