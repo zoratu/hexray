@@ -655,10 +655,8 @@ impl PseudoCodeEmitter {
                             .chars()
                             .take_while(|c| c.is_whitespace())
                             .collect::<String>();
-                        lines[return_idx] = format!(
-                            "{}return (uint32_t){} | (uint32_t)local_4 << 32;",
-                            indent, name
-                        );
+                        lines[return_idx] =
+                            format!("{}return {{ .lo = {}, .hi = local_4 }};", indent, name);
                     }
                 }
             }
@@ -7199,7 +7197,7 @@ mod tests {
 
         let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
         assert!(
-            repaired.contains("return (uint32_t)out | (uint32_t)local_4 << 32;"),
+            repaired.contains("return { .lo = out, .hi = local_4 };"),
             "Expected packed return repair, got:\n{}",
             repaired
         );
