@@ -5,15 +5,19 @@
 #![allow(dead_code)]
 
 use hexray_core::{
-    cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, Operation,
+    cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlow, ControlFlowGraph,
+    Operand, Operation,
 };
 use std::collections::{HashMap, HashSet};
 
-use super::expression::{resolve_adrp_patterns, Expr};
+use super::abi;
+use super::expression::{
+    resolve_adrp_patterns, BinOpKind, CallTarget as ExprCallTarget, Expr, ExprKind, UnaryOpKind,
+};
 use super::for_loop_detection::detect_for_loops;
 use super::short_circuit::detect_short_circuit;
 use super::switch_recovery::SwitchRecovery;
-use super::BinaryDataContext;
+use super::{BinaryDataContext, ExceptionInfo};
 
 mod cleanup;
 mod condition;
@@ -37,16 +41,16 @@ use gotos::{
     convert_switch_gotos_to_break,
 };
 #[cfg(test)]
+use hexray_core::Instruction;
+#[cfg(test)]
 use simplify::capture_return_register_uses_in_block;
 use simplify::{
-    extract_return_value, merge_return_value_captures, propagate_call_args, simplify_statements,
-    substitute_return_register_uses,
+    extract_return_value, merge_return_value_captures, propagate_args_in_block,
+    propagate_call_args, simplify_statements, substitute_return_register_uses,
 };
 use switch::{detect_switch_statements, simplify_strcmp_switch_patterns};
 #[cfg(test)]
 use switch::{extract_switch_case_or_range, extract_switch_range_info};
-#[cfg(test)]
-use {super::expression::BinOpKind, hexray_core::Instruction};
 
 /// A structured representation of control flow.
 #[derive(Debug)]
@@ -189,6 +193,152 @@ pub enum LoopKind {
     For,
 }
 
+/// Pre-structuring annotations that adjust how the CFG is consumed
+/// without mutating the underlying graph.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StructuringAnnotations {
+    folded_conditions: HashMap<BasicBlockId, FoldedConditionCall>,
+    folded_predecessor_calls: HashSet<BasicBlockId>,
+    suppressed_side_blocks: HashSet<BasicBlockId>,
+}
+
+#[derive(Debug, Clone)]
+struct FoldedConditionCall {
+    predecessor: BasicBlockId,
+    call_expr: Expr,
+}
+
+impl StructuringAnnotations {
+    pub(crate) fn from_cfg_and_exception_info(
+        cfg: &ControlFlowGraph,
+        exception_info: Option<&ExceptionInfo>,
+    ) -> Self {
+        let mut annotations = Self::default();
+        annotations.detect_folded_call_conditions(cfg);
+
+        if let Some(info) = exception_info {
+            annotations.detect_cleanup_side_blocks(cfg, info);
+        }
+
+        annotations
+    }
+
+    fn detect_folded_call_conditions(&mut self, cfg: &ControlFlowGraph) {
+        for block_id in cfg.block_ids() {
+            let Some(block) = cfg.block(block_id) else {
+                continue;
+            };
+            if !is_foldable_condition_micro_block(block) {
+                continue;
+            }
+
+            let preds = cfg.predecessors(block_id);
+            let unique_preds: HashSet<_> = preds.iter().copied().collect();
+            if unique_preds.len() != 1 {
+                continue;
+            }
+
+            let pred_id = *unique_preds.iter().next().expect("single predecessor");
+            let Some(pred_block) = cfg.block(pred_id) else {
+                continue;
+            };
+            let succs = cfg.successors(pred_id);
+            if succs.is_empty() || succs.iter().any(|succ| *succ != block_id) {
+                continue;
+            }
+
+            let Some(call_inst) = pred_block.instructions.last() else {
+                continue;
+            };
+            if !matches!(&call_inst.control_flow, ControlFlow::Call { .. }) {
+                continue;
+            }
+            let Some(call_expr) = extract_folded_predecessor_call_expr(pred_block) else {
+                continue;
+            };
+
+            self.folded_conditions.insert(
+                block_id,
+                FoldedConditionCall {
+                    predecessor: pred_id,
+                    call_expr,
+                },
+            );
+            self.folded_predecessor_calls.insert(pred_id);
+        }
+    }
+
+    fn detect_cleanup_side_blocks(
+        &mut self,
+        cfg: &ControlFlowGraph,
+        exception_info: &ExceptionInfo,
+    ) {
+        let mut landing_pad_blocks = HashSet::new();
+
+        for cleanup in &exception_info.cleanup_handlers {
+            if let Some(block) = cfg.block_containing(cleanup.landing_pad) {
+                landing_pad_blocks.insert(block.id);
+                continue;
+            }
+
+            if let Some(block_id) = cfg.block_ids().find(|&block_id| {
+                cfg.block(block_id)
+                    .map(|block| {
+                        block.start >= cleanup.landing_pad && block.start < cleanup.landing_pad + 32
+                    })
+                    .unwrap_or(false)
+            }) {
+                landing_pad_blocks.insert(block_id);
+            }
+        }
+
+        self.suppressed_side_blocks.extend(&landing_pad_blocks);
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let current_side_blocks: Vec<_> = self.suppressed_side_blocks.iter().copied().collect();
+
+            for block_id in current_side_blocks {
+                for &succ in cfg.successors(block_id) {
+                    if self.suppressed_side_blocks.contains(&succ) {
+                        continue;
+                    }
+
+                    let preds = cfg.predecessors(succ);
+                    if !preds.is_empty()
+                        && preds
+                            .iter()
+                            .all(|pred| self.suppressed_side_blocks.contains(pred))
+                    {
+                        changed |= self.suppressed_side_blocks.insert(succ);
+                    }
+                }
+            }
+        }
+    }
+
+    fn folded_condition(&self, block_id: BasicBlockId) -> Option<&FoldedConditionCall> {
+        self.folded_conditions.get(&block_id)
+    }
+
+    fn suppresses_predecessor_call(&self, block_id: BasicBlockId) -> bool {
+        self.folded_predecessor_calls.contains(&block_id)
+    }
+
+    fn folded_condition_successor(&self, block_id: BasicBlockId) -> Option<BasicBlockId> {
+        self.folded_conditions
+            .iter()
+            .find_map(|(&cond_block, folded)| {
+                (folded.predecessor == block_id).then_some(cond_block)
+            })
+    }
+
+    fn suppresses_side_block(&self, block_id: BasicBlockId) -> bool {
+        self.suppressed_side_blocks.contains(&block_id)
+    }
+}
+
 impl StructuredCfg {
     /// Creates a structured CFG from an unstructured one with default configuration.
     pub fn from_cfg(cfg: &ControlFlowGraph) -> Self {
@@ -200,9 +350,20 @@ impl StructuredCfg {
         cfg: &ControlFlowGraph,
         config: &super::config::DecompilerConfig,
     ) -> Self {
+        Self::from_cfg_with_config_and_binary_data_and_exception_info(cfg, config, None, None)
+    }
+
+    pub(crate) fn from_cfg_with_config_and_binary_data_and_exception_info(
+        cfg: &ControlFlowGraph,
+        config: &super::config::DecompilerConfig,
+        binary_data: Option<&BinaryDataContext>,
+        exception_info: Option<&ExceptionInfo>,
+    ) -> Self {
         use super::config::OptimizationPass;
 
-        let mut structurer = Structurer::new(cfg);
+        let annotations = StructuringAnnotations::from_cfg_and_exception_info(cfg, exception_info);
+        let mut structurer =
+            Structurer::new_with_binary_data_and_annotations(cfg, binary_data, annotations);
         let mut body = structurer.structure();
 
         // Post-process to propagate arguments into function calls (before copy propagation)
@@ -346,144 +507,12 @@ impl StructuredCfg {
         config: &super::config::DecompilerConfig,
         binary_data: Option<&BinaryDataContext>,
     ) -> Self {
-        use super::config::OptimizationPass;
-
-        let mut structurer = Structurer::new_with_binary_data(cfg, binary_data);
-        let mut body = structurer.structure();
-
-        // Post-process to propagate arguments into function calls (before copy propagation)
-        if config.is_pass_enabled(OptimizationPass::CallArgPropagation) {
-            body = propagate_call_args(body);
-        }
-
-        // Post-process to merge return value captures across block boundaries
-        if config.is_pass_enabled(OptimizationPass::ReturnValueMerge) {
-            body = merge_return_value_captures(body);
-        }
-
-        // Post-process to eliminate temporary register patterns
-        if config.is_pass_enabled(OptimizationPass::TempSimplification) {
-            body = simplify_statements(body);
-        }
-
-        // Post-process to detect for loops from while loops with init/update
-        if config.is_pass_enabled(OptimizationPass::ForLoopDetection) {
-            body = detect_for_loops(body);
-        }
-
-        // Post-process to hoist loop-invariant computations
-        if config.is_pass_enabled(OptimizationPass::LoopInvariantHoisting) {
-            body = super::loop_invariant::hoist_loop_invariants(body);
-        }
-
-        // Post-process to detect memcpy/memset patterns in for loops
-        if config.is_pass_enabled(OptimizationPass::LoopPatternDetection) {
-            body = super::loop_pattern_detection::detect_loop_patterns(body);
-        }
-
-        // Post-process to canonicalize loop forms
-        if config.is_pass_enabled(OptimizationPass::LoopCanonicalization) {
-            body = super::loop_canonicalization::canonicalize_loops(body);
-        }
-
-        // Post-process to detect memset/array initialization idioms
-        if config.is_pass_enabled(OptimizationPass::MemsetIdiomDetection) {
-            body = super::memset_idiom::detect_init_patterns(body);
-        }
-
-        // Post-process to detect switch statements from if-else chains
-        if config.is_pass_enabled(OptimizationPass::SwitchDetection) {
-            body = detect_switch_statements(body);
-        }
-
-        // Post-process to detect short-circuit boolean patterns (a && b, a || b)
-        if config.is_pass_enabled(OptimizationPass::ShortCircuitDetection) {
-            body = detect_short_circuit(body);
-        }
-
-        // Post-process to handle irreducible CFG regions
-        // Should run BEFORE goto conversion to ensure irreducible gotos are preserved
-        if config.is_pass_enabled(OptimizationPass::IrreducibleHandling) {
-            body = super::irreducible_cfg::handle_irreducible_regions(cfg, body);
-        }
-
-        // Post-process to convert gotos to break/continue where applicable
-        if config.is_pass_enabled(OptimizationPass::GotoConversion) {
-            body = convert_gotos_to_break_continue(body, None);
-            // Second pass: convert global gotos (in orphan labeled blocks) to continue
-            // when they target loop headers (common in getopt/switch patterns)
-            let loop_headers = collect_loop_headers(&body);
-            body = convert_global_gotos_to_continue(body, &loop_headers);
-            // Third pass: convert gotos in switch cases to break when they target
-            // a common exit point (common in option parsing switches)
-            body = convert_switch_gotos_to_break(body);
-            // Fourth pass: convert gotos to labeled cleanup blocks into inlined cleanup
-            body = convert_cleanup_gotos(body);
-            // Fifth pass: convert gotos to return labels into direct returns
-            body = convert_gotos_to_early_returns(body);
-            // Sixth pass: convert multi-level escape gotos to breaks
-            body = convert_multilevel_breaks(body);
-            // Seventh pass: structure shared exit paths
-            body = structure_shared_exits(body);
-            // Eighth pass: remove orphan labels that no longer have gotos
-            body = remove_orphan_labels(body);
-            // Final cleanup: remove gotos to non-existent labels
-            body = remove_orphan_gotos(body);
-            // Remove orphan continues (outside any loop context)
-            body = remove_orphan_continues(body);
-        }
-
-        // Post-process to flatten nested if-else into guard clauses
-        if config.is_pass_enabled(OptimizationPass::GuardClauseFlattening) {
-            body = flatten_guard_clauses(body);
-        }
-
-        // Post-process for constant folding and propagation
-        if config.is_pass_enabled(OptimizationPass::ConstantPropagation) {
-            body = super::constant_propagation::propagate_constants(body);
-        }
-
-        // Post-process to simplify expressions (constant folding, algebraic simplifications)
-        if config.is_pass_enabled(OptimizationPass::ExpressionSimplification) {
-            body = simplify_expressions(body);
-        }
-
-        // Post-process to detect string function patterns (strlen, strcpy, etc.)
-        if config.is_pass_enabled(OptimizationPass::StringPatternDetection) {
-            body = super::string_patterns::detect_string_patterns(body);
-            body = simplify_strcmp_switch_patterns(body);
-        }
-
-        // Post-process to simplify architecture-specific patterns (CSEL, min/max, abs)
-        if config.is_pass_enabled(OptimizationPass::ArchPatternSimplification) {
-            body = super::arch_patterns::simplify_arch_patterns(body);
-        }
-
-        // Post-process to eliminate dead stores
-        if config.is_pass_enabled(OptimizationPass::DeadStoreElimination) {
-            body = super::dead_store::eliminate_dead_stores(body);
-        }
-
-        // Post-process to eliminate common subexpressions
-        if config.is_pass_enabled(OptimizationPass::CommonSubexpressionElimination) {
-            body = super::cse::eliminate_common_subexpressions(body);
-        }
-
-        // Post-process to infer better variable names
-        if config.is_pass_enabled(OptimizationPass::VariableNaming) {
-            body = super::variable_naming::suggest_variable_names(body);
-        }
-
-        // Run dead store elimination again after variable naming
-        // This catches duplicates that arise from variables being renamed to the same name
-        if config.is_pass_enabled(OptimizationPass::DeadStoreElimination) {
-            body = super::dead_store::eliminate_dead_stores(body);
-        }
-
-        Self {
-            body,
-            cfg_entry: cfg.entry,
-        }
+        Self::from_cfg_with_config_and_binary_data_and_exception_info(
+            cfg,
+            config,
+            binary_data,
+            None,
+        )
     }
 
     /// Returns the structured body.
@@ -507,12 +536,29 @@ struct Structurer<'a> {
     inline_allowed: HashSet<BasicBlockId>,
     /// Irreducible CFG analysis results.
     irreducible_analysis: super::irreducible_cfg::IrreducibleCfgAnalysis,
+    /// Pre-structuring annotations for folded condition blocks and EH side blocks.
+    annotations: StructuringAnnotations,
     /// Binary data context for jump table reconstruction.
     binary_data: Option<&'a BinaryDataContext>,
 }
 
 impl<'a> Structurer<'a> {
     fn new(cfg: &'a ControlFlowGraph) -> Self {
+        Self::new_with_binary_data_and_annotations(cfg, None, StructuringAnnotations::default())
+    }
+
+    fn new_with_annotations(
+        cfg: &'a ControlFlowGraph,
+        annotations: StructuringAnnotations,
+    ) -> Self {
+        Self::new_with_binary_data_and_annotations(cfg, None, annotations)
+    }
+
+    fn new_with_binary_data_and_annotations(
+        cfg: &'a ControlFlowGraph,
+        binary_data: Option<&'a BinaryDataContext>,
+        annotations: StructuringAnnotations,
+    ) -> Self {
         let loops = cfg.find_loops();
         let mut loop_headers = HashSet::new();
         let mut loop_info = HashMap::new();
@@ -522,7 +568,7 @@ impl<'a> Structurer<'a> {
 
             let body_set: HashSet<_> = lp.body.iter().copied().collect();
             let exit_blocks = Self::find_loop_exits(cfg, &body_set);
-            let kind = Self::classify_loop(cfg, lp, &body_set);
+            let kind = Self::classify_loop(cfg, lp, &body_set, &annotations);
 
             loop_info.insert(
                 lp.header,
@@ -587,7 +633,8 @@ impl<'a> Structurer<'a> {
             multi_pred_blocks,
             inline_allowed: HashSet::new(),
             irreducible_analysis,
-            binary_data: None,
+            annotations,
+            binary_data,
         }
     }
 
@@ -595,9 +642,11 @@ impl<'a> Structurer<'a> {
         cfg: &'a ControlFlowGraph,
         binary_data: Option<&'a BinaryDataContext>,
     ) -> Self {
-        let mut structurer = Self::new(cfg);
-        structurer.binary_data = binary_data;
-        structurer
+        Self::new_with_binary_data_and_annotations(
+            cfg,
+            binary_data,
+            StructuringAnnotations::default(),
+        )
     }
 
     /// Checks if a block (and its successors) eventually return with just cleanup calls.
@@ -783,7 +832,12 @@ impl<'a> Structurer<'a> {
         exits_set.into_iter().collect()
     }
 
-    fn classify_loop(cfg: &ControlFlowGraph, lp: &Loop, body: &HashSet<BasicBlockId>) -> LoopKind {
+    fn classify_loop(
+        cfg: &ControlFlowGraph,
+        lp: &Loop,
+        body: &HashSet<BasicBlockId>,
+        annotations: &StructuringAnnotations,
+    ) -> LoopKind {
         let header_block = cfg.block(lp.header);
         let back_edge_block = cfg.block(lp.back_edge);
 
@@ -803,6 +857,24 @@ impl<'a> Structurer<'a> {
             }
         }
 
+        // Folded call->test headers keep the condition in the successor block.
+        if let Some(cond_block_id) = annotations.folded_condition_successor(lp.header) {
+            if let Some(cond_block) = cfg.block(cond_block_id) {
+                if let BlockTerminator::ConditionalBranch {
+                    true_target,
+                    false_target,
+                    ..
+                } = &cond_block.terminator
+                {
+                    let true_in_loop = body.contains(true_target);
+                    let false_in_loop = body.contains(false_target);
+                    if true_in_loop != false_in_loop {
+                        return LoopKind::While;
+                    }
+                }
+            }
+        }
+
         // Check if back edge block has a conditional branch (do-while loop)
         if let Some(block) = back_edge_block {
             if let BlockTerminator::ConditionalBranch {
@@ -813,6 +885,21 @@ impl<'a> Structurer<'a> {
             {
                 if *true_target == lp.header || *false_target == lp.header {
                     return LoopKind::DoWhile;
+                }
+            }
+        }
+
+        if let Some(cond_block_id) = annotations.folded_condition_successor(lp.back_edge) {
+            if let Some(cond_block) = cfg.block(cond_block_id) {
+                if let BlockTerminator::ConditionalBranch {
+                    true_target,
+                    false_target,
+                    ..
+                } = &cond_block.terminator
+                {
+                    if *true_target == lp.header || *false_target == lp.header {
+                        return LoopKind::DoWhile;
+                    }
                 }
             }
         }
@@ -832,7 +919,7 @@ impl<'a> Structurer<'a> {
 
         let mut unprocessed: Vec<_> = all_block_ids
             .iter()
-            .filter(|b| !self.processed.contains(b))
+            .filter(|b| !self.processed.contains(b) && !self.annotations.suppresses_side_block(**b))
             .copied()
             .collect();
         unprocessed.sort_by_key(|b| self.cfg.block(*b).map(|blk| blk.start).unwrap_or(0));
@@ -866,6 +953,11 @@ impl<'a> Structurer<'a> {
         while let Some(block_id) = current {
             // Stop if we've reached the end of this region
             if end == Some(block_id) {
+                break;
+            }
+
+            if self.annotations.suppresses_side_block(block_id) {
+                self.processed.insert(block_id);
                 break;
             }
 
@@ -1258,6 +1350,35 @@ impl<'a> Structurer<'a> {
             } else {
                 (cond_expr, Some(*true_target))
             }
+        } else if let Some(cond_block_id) = self.annotations.folded_condition_successor(header) {
+            let Some(cond_block) = self.cfg.block(cond_block_id) else {
+                return (Expr::int(1), self.cfg.successors(header).first().copied());
+            };
+            if let BlockTerminator::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+                ..
+            } = &cond_block.terminator
+            {
+                let true_in_loop = info.body.contains(true_target);
+                let false_in_loop = info.body.contains(false_target);
+
+                let cond_expr = self.rewrite_condition_call_return_alias(
+                    cond_block_id,
+                    condition_to_expr_with_block(*condition, cond_block),
+                );
+
+                if true_in_loop && !false_in_loop {
+                    (cond_expr, Some(*true_target))
+                } else if !true_in_loop && false_in_loop {
+                    (negate_condition(cond_expr), Some(*false_target))
+                } else {
+                    (cond_expr, Some(*true_target))
+                }
+            } else {
+                (Expr::int(1), self.cfg.successors(header).first().copied())
+            }
         } else {
             (Expr::int(1), self.cfg.successors(header).first().copied())
         }
@@ -1360,6 +1481,15 @@ impl<'a> Structurer<'a> {
     /// as a call return value alias in condition expressions.
     fn rewrite_condition_call_return_alias(&self, block_id: BasicBlockId, expr: Expr) -> Expr {
         use super::expression::{VarKind, Variable};
+
+        if let Some(folded) = self.annotations.folded_condition(block_id) {
+            let rewritten = substitute_return_register_uses(
+                expr,
+                &return_register_condition_aliases(),
+                &folded.call_expr,
+            );
+            return simplify_folded_call_condition(rewritten);
+        }
 
         let preds = self.cfg.predecessors(block_id);
         if preds.len() != 1 {
@@ -1541,6 +1671,7 @@ impl<'a> Structurer<'a> {
             Some(b) => b,
             None => return vec![],
         };
+        let suppress_terminating_call = self.annotations.suppresses_predecessor_call(block_id);
 
         // Check if block ends with conditional branch
         let has_conditional_branch =
@@ -1598,8 +1729,150 @@ impl<'a> Structurer<'a> {
             .collect();
 
         // Resolve ADRP + ADD patterns (ARM64 PC-relative addressing)
-        resolve_adrp_patterns(exprs)
+        let exprs = resolve_adrp_patterns(exprs);
+
+        if suppress_terminating_call {
+            let mut propagated = propagate_args_in_block(exprs);
+            if matches!(
+                propagated.last(),
+                Some(Expr {
+                    kind: ExprKind::Call { .. },
+                })
+            ) {
+                propagated.pop();
+            }
+            propagated
+        } else {
+            exprs
+        }
     }
+}
+
+fn return_register_condition_aliases() -> Vec<String> {
+    vec![
+        "al".to_string(),
+        "ax".to_string(),
+        "eax".to_string(),
+        "rax".to_string(),
+        "ret_0".to_string(),
+        "arg0".to_string(),
+        "x0".to_string(),
+        "w0".to_string(),
+        "a0".to_string(),
+    ]
+}
+
+fn direct_call_expr(inst: &hexray_core::Instruction) -> Option<Expr> {
+    match &inst.control_flow {
+        ControlFlow::Call { target, .. } => Some(Expr::call(
+            ExprCallTarget::Direct {
+                target: *target,
+                call_site: inst.address,
+            },
+            vec![],
+        )),
+        _ => None,
+    }
+}
+
+fn extract_folded_predecessor_call_expr(block: &BasicBlock) -> Option<Expr> {
+    let exprs: Vec<Expr> = block
+        .instructions
+        .iter()
+        .filter(|inst| !inst.is_branch() || inst.is_call())
+        .flat_map(|inst| {
+            let main_expr = match inst.operation {
+                Operation::SetConditional => lift_setcc_with_context(inst, block),
+                Operation::ConditionalMove => lift_cmovcc_with_context(inst, block),
+                _ => Expr::from_instruction(inst),
+            };
+            let writeback = generate_writeback_expr(inst);
+            if let Some(wb) = writeback {
+                vec![main_expr, wb]
+            } else {
+                vec![main_expr]
+            }
+        })
+        .collect();
+    let propagated = propagate_args_in_block(resolve_adrp_patterns(exprs));
+
+    propagated
+        .last()
+        .filter(|expr| matches!(expr.kind, ExprKind::Call { .. }))
+        .cloned()
+        .or_else(|| block.instructions.last().and_then(direct_call_expr))
+}
+
+fn simplify_folded_call_condition(expr: Expr) -> Expr {
+    match expr.kind {
+        ExprKind::BinOp { op, left, right } => match (&op, &left.kind, &right.kind) {
+            (BinOpKind::Ne, _, ExprKind::IntLit(0)) | (BinOpKind::Ne, ExprKind::IntLit(0), _) => {
+                if matches!(&right.kind, ExprKind::IntLit(0)) {
+                    (*left).simplify()
+                } else {
+                    (*right).simplify()
+                }
+            }
+            (BinOpKind::Eq, _, ExprKind::IntLit(0)) | (BinOpKind::Eq, ExprKind::IntLit(0), _) => {
+                let operand = if matches!(&right.kind, ExprKind::IntLit(0)) {
+                    *left
+                } else {
+                    *right
+                };
+                Expr::unary(UnaryOpKind::LogicalNot, operand).simplify()
+            }
+            _ => Expr::binop(op, *left, *right).simplify(),
+        },
+        _ => expr.simplify(),
+    }
+}
+
+fn is_foldable_condition_micro_block(block: &BasicBlock) -> bool {
+    if !matches!(block.terminator, BlockTerminator::ConditionalBranch { .. }) {
+        return false;
+    }
+
+    let meaningful: Vec<_> = block
+        .instructions
+        .iter()
+        .filter(|inst| !inst.mnemonic.starts_with("nop") && !inst.mnemonic.starts_with("endbr"))
+        .collect();
+    let non_branch: Vec<_> = meaningful
+        .into_iter()
+        .filter(|inst| !inst.is_branch())
+        .collect();
+    if non_branch.len() != 1 {
+        return false;
+    }
+
+    let inst = non_branch[0];
+    match inst.operation {
+        Operation::Test if inst.operands.len() >= 2 => {
+            matches!(
+                (&inst.operands[0], &inst.operands[1]),
+                (Operand::Register(left), Operand::Register(right))
+                    if left == right && abi::is_return_register(&left.name().to_lowercase())
+            )
+        }
+        Operation::Compare if inst.operands.len() >= 2 => {
+            is_return_register_operand(&inst.operands[0])
+                && is_zero_immediate_operand(&inst.operands[1])
+                || is_zero_immediate_operand(&inst.operands[0])
+                    && is_return_register_operand(&inst.operands[1])
+        }
+        _ => false,
+    }
+}
+
+fn is_return_register_operand(op: &Operand) -> bool {
+    match op {
+        Operand::Register(reg) => abi::is_return_register(&reg.name().to_lowercase()),
+        _ => false,
+    }
+}
+
+fn is_zero_immediate_operand(op: &Operand) -> bool {
+    matches!(op, Operand::Immediate(imm) if imm.value == 0)
 }
 
 /// Removes orphan continue statements that appear outside any loop context.
@@ -3686,7 +3959,12 @@ mod tests {
 
         // The loop should be classified as While (condition at header)
         let body_set: HashSet<_> = loops[0].body.iter().copied().collect();
-        let kind = Structurer::classify_loop(&cfg, &loops[0], &body_set);
+        let kind = Structurer::classify_loop(
+            &cfg,
+            &loops[0],
+            &body_set,
+            &StructuringAnnotations::default(),
+        );
         assert_eq!(kind, LoopKind::While);
     }
 
@@ -3699,7 +3977,12 @@ mod tests {
 
         // Find the actual back edge block for do-while classification
         let body_set: HashSet<_> = loops[0].body.iter().copied().collect();
-        let kind = Structurer::classify_loop(&cfg, &loops[0], &body_set);
+        let kind = Structurer::classify_loop(
+            &cfg,
+            &loops[0],
+            &body_set,
+            &StructuringAnnotations::default(),
+        );
         // Do-while has condition at the back edge block
         assert!(
             kind == LoopKind::DoWhile || kind == LoopKind::While,
@@ -3940,10 +4223,12 @@ mod tests {
 
         let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
         bb0.instructions.push(
-            Instruction::new(0x1000, 5, vec![], "call").with_control_flow(ControlFlow::Call {
-                target: 0x2000,
-                return_addr: 0x1005,
-            }),
+            Instruction::new(0x1000, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1005,
+                }),
         );
         bb0.terminator = BlockTerminator::Jump {
             target: BasicBlockId::new(1),
@@ -3983,6 +4268,141 @@ mod tests {
         assert!(
             format!("{rewritten}").contains("ret_0"),
             "expected x86 low-byte return alias to rewrite through predecessor call"
+        );
+    }
+
+    #[test]
+    fn test_folded_condition_annotation_rewrites_to_call_expr_and_suppresses_pred_call() {
+        use crate::decompiler::expression::{ExprKind, Variable};
+        use hexray_core::basic_block::CallTarget as BlockCallTarget;
+
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1005,
+                }),
+        );
+        bb0.terminator = BlockTerminator::Call {
+            target: BlockCallTarget::Direct(0x2000),
+            return_block: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1005);
+        bb1.instructions.push(
+            Instruction::new(0x1005, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(al), Operand::Register(al)]),
+        );
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1010);
+        bb2.terminator = BlockTerminator::Return;
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1020);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+
+        let annotations = StructuringAnnotations::from_cfg_and_exception_info(&cfg, None);
+        let structurer = Structurer::new_with_annotations(&cfg, annotations);
+
+        let pred_statements = structurer.block_to_statements(BasicBlockId::new(0));
+        assert!(
+            pred_statements.is_empty(),
+            "expected folded predecessor call to be suppressed"
+        );
+
+        let raw = Expr::binop(
+            BinOpKind::Ne,
+            Expr::var(Variable::reg("al", 1)),
+            Expr::int(0),
+        );
+        let rewritten = structurer.rewrite_condition_call_return_alias(BasicBlockId::new(1), raw);
+
+        assert!(
+            matches!(rewritten.kind, ExprKind::Call { .. }),
+            "expected folded condition to become a direct call expression, got {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_side_block_annotation_stops_before_shared_block() {
+        use crate::decompiler::CleanupInfo;
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1200);
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1210);
+        bb3.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb3);
+
+        let mut bb4 = BasicBlock::new(BasicBlockId::new(4), 0x1220);
+        bb4.terminator = BlockTerminator::Return;
+        cfg.add_block(bb4);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(4));
+
+        let info = ExceptionInfo {
+            try_blocks: Vec::new(),
+            cleanup_handlers: vec![CleanupInfo {
+                start: 0x1000,
+                end: 0x1010,
+                landing_pad: 0x1200,
+            }],
+        };
+
+        let annotations = StructuringAnnotations::from_cfg_and_exception_info(&cfg, Some(&info));
+
+        assert!(annotations
+            .suppressed_side_blocks
+            .contains(&BasicBlockId::new(2)));
+        assert!(annotations
+            .suppressed_side_blocks
+            .contains(&BasicBlockId::new(3)));
+        assert!(
+            !annotations
+                .suppressed_side_blocks
+                .contains(&BasicBlockId::new(4)),
+            "shared block should remain emittable"
         );
     }
 

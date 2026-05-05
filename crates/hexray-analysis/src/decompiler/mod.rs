@@ -697,19 +697,7 @@ impl Decompiler {
         }
 
         // Step 1: Structure the control flow
-        let structured = if let Some(ref config) = self.config {
-            StructuredCfg::from_cfg_with_config_and_binary_data(
-                cfg,
-                config,
-                self.binary_data.as_ref(),
-            )
-        } else {
-            StructuredCfg::from_cfg_with_config_and_binary_data(
-                cfg,
-                &config::DecompilerConfig::default(),
-                self.binary_data.as_ref(),
-            )
-        };
+        let structured = self.structure(cfg);
 
         // Step 2: Apply struct inference if enabled
         let structured = if self.enable_struct_inference {
@@ -1063,7 +1051,21 @@ impl Decompiler {
 
     /// Decompiles a CFG and returns the structured representation.
     pub fn structure(&self, cfg: &ControlFlowGraph) -> StructuredCfg {
-        StructuredCfg::from_cfg(cfg)
+        if let Some(ref config) = self.config {
+            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info(
+                cfg,
+                config,
+                self.binary_data.as_ref(),
+                self.exception_info.as_ref(),
+            )
+        } else {
+            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info(
+                cfg,
+                &config::DecompilerConfig::default(),
+                self.binary_data.as_ref(),
+                self.exception_info.as_ref(),
+            )
+        }
     }
 
     /// Analyzes a CFG for struct patterns and returns inferred struct definitions.
@@ -1072,7 +1074,7 @@ impl Decompiler {
     /// decompiled output. The returned vector contains all structs inferred
     /// from memory access patterns.
     pub fn infer_structs(&self, cfg: &ControlFlowGraph) -> Vec<InferredStruct> {
-        let structured = StructuredCfg::from_cfg(cfg);
+        let structured = self.structure(cfg);
         let mut inference = StructInference::new();
         inference.analyze(&structured.body);
         inference.structs().to_vec()
@@ -1088,11 +1090,7 @@ impl Decompiler {
         func_name: &str,
     ) -> (String, QualityMetrics) {
         // Get the structured representation
-        let structured = if let Some(ref config) = self.config {
-            StructuredCfg::from_cfg_with_config(cfg, config)
-        } else {
-            StructuredCfg::from_cfg(cfg)
-        };
+        let structured = self.structure(cfg);
 
         // Compute metrics on the structured code
         let metrics = compute_metrics(&structured.body);
@@ -1107,11 +1105,7 @@ impl Decompiler {
     ///
     /// This is useful for quick quality assessment or benchmarking.
     pub fn compute_quality_metrics(&self, cfg: &ControlFlowGraph) -> QualityMetrics {
-        let structured = if let Some(ref config) = self.config {
-            StructuredCfg::from_cfg_with_config(cfg, config)
-        } else {
-            StructuredCfg::from_cfg(cfg)
-        };
+        let structured = self.structure(cfg);
         compute_metrics(&structured.body)
     }
 
@@ -1124,7 +1118,7 @@ impl Decompiler {
         cfg: &ControlFlowGraph,
         func_name: &str,
     ) -> (String, String) {
-        let structured = StructuredCfg::from_cfg(cfg);
+        let structured = self.structure(cfg);
 
         // Run struct inference
         let mut inference = StructInference::new();

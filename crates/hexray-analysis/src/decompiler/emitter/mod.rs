@@ -1473,7 +1473,7 @@ impl PseudoCodeEmitter {
                 exit_block,
             } => StructuredNode::While {
                 condition,
-                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                body: Self::rewrite_tail_call_returns_for_emission(&body, false),
                 header,
                 exit_block,
             },
@@ -1483,7 +1483,7 @@ impl PseudoCodeEmitter {
                 header,
                 exit_block,
             } => StructuredNode::DoWhile {
-                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                body: Self::rewrite_tail_call_returns_for_emission(&body, false),
                 condition,
                 header,
                 exit_block,
@@ -1499,7 +1499,7 @@ impl PseudoCodeEmitter {
                 init,
                 condition,
                 update,
-                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                body: Self::rewrite_tail_call_returns_for_emission(&body, false),
                 header,
                 exit_block,
             },
@@ -1508,7 +1508,7 @@ impl PseudoCodeEmitter {
                 header,
                 exit_block,
             } => StructuredNode::Loop {
-                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                body: Self::rewrite_tail_call_returns_for_emission(&body, false),
                 header,
                 exit_block,
             },
@@ -5742,27 +5742,7 @@ impl PseudoCodeEmitter {
                 }
                 // Get data relocations for this block to resolve `reg = 0` assignments
                 let data_relocs = if let Some(ref reloc_table) = self.relocation_table {
-                    // Debug: show which range we're searching
-                    if address_range.0 >= 0x98ce0 && address_range.0 < 0x99000 {
-                        eprintln!(
-                            "DEBUG EMITTER: searching {} [{:#x}..{:#x}]",
-                            id, address_range.0, address_range.1
-                        );
-                    }
                     let relocs = reloc_table.get_data_in_range(address_range.0, address_range.1);
-                    if !relocs.is_empty() {
-                        eprintln!(
-                            "DEBUG EMITTER: {} [{:#x}..{:#x}] found {} data relocs: {:?}",
-                            id,
-                            address_range.0,
-                            address_range.1,
-                            relocs.len(),
-                            relocs
-                                .iter()
-                                .map(|(a, s)| format!("{:#x}={}", a, s))
-                                .collect::<Vec<_>>()
-                        );
-                    }
                     relocs
                 } else {
                     Vec::new()

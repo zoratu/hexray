@@ -1292,7 +1292,7 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
 ///   func();
 /// Into:
 ///   func(5);
-fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
+pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
     use super::super::expression::ExprKind;
 
     // Track argument register values and their statement indices
