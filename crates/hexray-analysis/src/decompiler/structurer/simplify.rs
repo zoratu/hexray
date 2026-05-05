@@ -1738,9 +1738,13 @@ pub(super) fn merge_return_value_captures_node(
 
 fn capture_return_register_uses_from_previous_block(
     result: &mut [StructuredNode],
-    statements: &mut [Expr],
+    statements: &mut Vec<Expr>,
     capture_counter: &mut u32,
 ) {
+    if capture_deref_load_from_previous_block(result, statements, capture_counter) {
+        return;
+    }
+
     let Some(primary_reg) = first_return_register_use_before_clobber(statements) else {
         return;
     };
@@ -1756,6 +1760,76 @@ fn capture_return_register_uses_from_previous_block(
     };
 
     substitute_return_register_uses_until_clobber(statements, &aliases, &temp_expr);
+}
+
+#[derive(Debug, Clone)]
+struct DerefLoadCapture {
+    statement_index: usize,
+    pointer_reg: String,
+    load_size: u8,
+    dest_aliases: Option<Vec<String>>,
+    can_elide_load: bool,
+    is_self_load: bool,
+}
+
+fn capture_deref_load_from_previous_block(
+    result: &mut [StructuredNode],
+    statements: &mut Vec<Expr>,
+    capture_counter: &mut u32,
+) -> bool {
+    let Some(load) = first_deref_load_from_return_register_before_clobber(statements) else {
+        return false;
+    };
+
+    let pointer_aliases = return_value_aliases(&load.pointer_reg);
+    let Some(block_index) = find_previous_call_capture_block(result, &pointer_aliases) else {
+        return false;
+    };
+    let Some(temp_expr) =
+        capture_previous_call_result(result, block_index, capture_counter, &load.pointer_reg)
+    else {
+        return false;
+    };
+
+    let deref_expr = Expr::deref(temp_expr, load.load_size);
+    let has_following_local_use = load.dest_aliases.as_ref().is_some_and(|aliases| {
+        statements[load.statement_index + 1..]
+            .iter()
+            .take_while(|stmt| !statement_clobbers_return_register(stmt, aliases))
+            .any(|stmt| expr_uses_any_alias(stmt, aliases))
+    });
+
+    if load.can_elide_load && has_following_local_use {
+        let Some(dest_aliases) = load.dest_aliases.as_ref() else {
+            return false;
+        };
+
+        statements.remove(load.statement_index);
+        if load.statement_index < statements.len() {
+            if load.is_self_load {
+                substitute_loaded_return_value_uses_until_clobber(
+                    &mut statements[load.statement_index..],
+                    dest_aliases,
+                    load.load_size,
+                    &deref_expr,
+                );
+            } else {
+                substitute_return_register_uses_until_clobber(
+                    &mut statements[load.statement_index..],
+                    dest_aliases,
+                    &deref_expr,
+                );
+            }
+        }
+        return true;
+    }
+
+    let lhs = match &statements[load.statement_index].kind {
+        super::super::expression::ExprKind::Assign { lhs, .. } => (**lhs).clone(),
+        _ => return false,
+    };
+    statements[load.statement_index] = Expr::assign(lhs, deref_expr);
+    true
 }
 
 fn capture_return_register_uses_in_return(
@@ -1797,6 +1871,46 @@ pub(super) fn capture_return_register_uses_in_block(
         };
         if call_target.is_none() {
             i += 1;
+            continue;
+        }
+
+        if let Some(load) = match_deref_load_from_return_register(&stmts[i + 1], i + 1) {
+            let Some(temp_expr) =
+                capture_current_call_result(&mut stmts, i, capture_counter, &load.pointer_reg)
+            else {
+                i += 1;
+                continue;
+            };
+
+            let deref_expr = Expr::deref(temp_expr, load.load_size);
+
+            if load.can_elide_load {
+                let Some(dest_aliases) = load.dest_aliases.as_ref() else {
+                    i += 1;
+                    continue;
+                };
+
+                stmts.remove(load.statement_index);
+                if load.statement_index < stmts.len() {
+                    substitute_return_register_uses_until_clobber(
+                        &mut stmts[load.statement_index..],
+                        dest_aliases,
+                        &deref_expr,
+                    );
+                }
+                i = load.statement_index;
+                continue;
+            }
+
+            let lhs = match &stmts[load.statement_index].kind {
+                ExprKind::Assign { lhs, .. } => (**lhs).clone(),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            stmts[load.statement_index] = Expr::assign(lhs, deref_expr);
+            i = load.statement_index + 1;
             continue;
         }
 
@@ -1862,15 +1976,48 @@ pub(super) fn capture_return_register_uses_in_block(
     stmts
 }
 
+fn capture_current_call_result(
+    statements: &mut [Expr],
+    call_index: usize,
+    capture_counter: &mut u32,
+    primary_reg: &str,
+) -> Option<Expr> {
+    use super::super::expression::{ExprKind, VarKind, Variable};
+
+    let reg_size = if matches!(primary_reg, "eax" | "w0") {
+        4
+    } else {
+        8
+    };
+    let temp_name = format!("ret_{}", *capture_counter);
+    *capture_counter += 1;
+    let temp_expr = Expr::var(Variable {
+        kind: VarKind::Temp(*capture_counter),
+        name: temp_name,
+        size: reg_size,
+    });
+
+    let Some(Expr {
+        kind: ExprKind::Call { target, args },
+    }) = statements.get(call_index).cloned()
+    else {
+        return None;
+    };
+
+    if !is_real_function_call(&target) {
+        return None;
+    }
+
+    statements[call_index] = Expr::assign(temp_expr.clone(), Expr::call(target, args));
+    Some(temp_expr)
+}
+
 fn first_return_register_use_before_clobber(statements: &[Expr]) -> Option<String> {
-    let all_aliases = [
-        "eax".to_string(),
-        "rax".to_string(),
-        "w0".to_string(),
-        "x0".to_string(),
-        "arg0".to_string(),
-        "a0".to_string(),
-    ];
+    let all_aliases = return_value_aliases("rax")
+        .into_iter()
+        .chain(return_value_aliases("x0"))
+        .chain(return_value_aliases("a0"))
+        .collect::<Vec<_>>();
 
     for stmt in statements {
         if let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind {
@@ -1890,6 +2037,108 @@ fn first_return_register_use_before_clobber(statements: &[Expr]) -> Option<Strin
     }
 
     None
+}
+
+fn first_deref_load_from_return_register_before_clobber(
+    statements: &[Expr],
+) -> Option<DerefLoadCapture> {
+    let all_aliases = [
+        "eax".to_string(),
+        "rax".to_string(),
+        "w0".to_string(),
+        "x0".to_string(),
+        "arg0".to_string(),
+        "a0".to_string(),
+    ];
+
+    for (idx, stmt) in statements.iter().enumerate() {
+        if let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind {
+            if is_real_function_call(target) {
+                break;
+            }
+        }
+
+        if let Some(capture) = match_deref_load_from_return_register(stmt, idx) {
+            return Some(capture);
+        }
+
+        if !collect_return_register_uses(stmt).is_empty() {
+            return None;
+        }
+
+        if statement_clobbers_return_register(stmt, &all_aliases) {
+            break;
+        }
+    }
+
+    None
+}
+
+fn match_deref_load_from_return_register(
+    stmt: &Expr,
+    statement_index: usize,
+) -> Option<DerefLoadCapture> {
+    use super::super::expression::ExprKind;
+
+    let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+        return None;
+    };
+    let ExprKind::Deref { addr, size } = &rhs.kind else {
+        return None;
+    };
+    let ExprKind::Var(pointer_var) = &addr.kind else {
+        return None;
+    };
+
+    let pointer_reg = pointer_var.name.to_lowercase();
+    if pointer_reg == "arg0" {
+        return None;
+    }
+    if !is_return_value_alias(&pointer_reg) {
+        return None;
+    }
+
+    let (dest_aliases, can_elide_load) = match &lhs.kind {
+        ExprKind::Var(dest_var) => {
+            let lower = dest_var.name.to_lowercase();
+            let aliases = if is_return_value_alias(&lower) {
+                return_value_aliases(&lower)
+            } else {
+                vec![lower.clone()]
+            };
+            let can_elide = is_return_value_alias(&lower);
+            (Some(aliases), can_elide)
+        }
+        _ => (None, false),
+    };
+    let is_self_load = match &lhs.kind {
+        ExprKind::Var(dest_var) => {
+            let lower = dest_var.name.to_lowercase();
+            return_value_aliases(&lower).contains(&pointer_reg)
+        }
+        _ => false,
+    };
+
+    Some(DerefLoadCapture {
+        statement_index,
+        pointer_reg,
+        load_size: *size,
+        dest_aliases,
+        can_elide_load,
+        is_self_load,
+    })
+}
+
+fn is_return_value_alias(name: &str) -> bool {
+    is_return_register(name) || name == "arg0" || name == "ret" || name.starts_with("ret_")
+}
+
+fn return_value_aliases(name: &str) -> Vec<String> {
+    if name == "ret" || name.starts_with("ret_") {
+        vec![name.to_string()]
+    } else {
+        return_register_aliases(name)
+    }
 }
 
 fn find_previous_call_capture_block(nodes: &[StructuredNode], aliases: &[String]) -> Option<usize> {
@@ -2077,6 +2326,217 @@ fn statement_clobbers_return_register(stmt: &Expr, aliases: &[String]) -> bool {
     }
 }
 
+fn expr_uses_any_alias(expr: &Expr, aliases: &[String]) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(v) => aliases.contains(&v.name.to_lowercase()),
+        ExprKind::BinOp { left, right, .. } => {
+            expr_uses_any_alias(left, aliases) || expr_uses_any_alias(right, aliases)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_uses_any_alias(operand, aliases),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_uses_any_alias(base, aliases) || expr_uses_any_alias(index, aliases)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_uses_any_alias(base, aliases),
+        ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+            args.iter().any(|arg| expr_uses_any_alias(arg, aliases))
+        }
+        ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            expr_uses_any_alias(lhs, aliases) || expr_uses_any_alias(rhs, aliases)
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_uses_any_alias(cond, aliases)
+                || expr_uses_any_alias(then_expr, aliases)
+                || expr_uses_any_alias(else_expr, aliases)
+        }
+        ExprKind::IntLit(_) | ExprKind::Unknown(_) | ExprKind::GotRef { .. } => false,
+    }
+}
+
+fn substitute_loaded_return_value_uses_until_clobber(
+    statements: &mut [Expr],
+    aliases: &[String],
+    load_size: u8,
+    replacement: &Expr,
+) {
+    for stmt in statements.iter_mut() {
+        let original = stmt.clone();
+        if let super::super::expression::ExprKind::Call { target, .. } = &original.kind {
+            if is_real_function_call(target) {
+                break;
+            }
+        }
+
+        *stmt =
+            substitute_loaded_return_value_uses(original.clone(), aliases, load_size, replacement);
+
+        if statement_clobbers_return_register(&original, aliases) {
+            break;
+        }
+    }
+}
+
+fn substitute_loaded_return_value_uses(
+    expr: Expr,
+    aliases: &[String],
+    load_size: u8,
+    replacement: &Expr,
+) -> Expr {
+    use super::super::expression::ExprKind;
+
+    fn sub(
+        expr: Expr,
+        aliases: &[String],
+        load_size: u8,
+        replacement: &Expr,
+        in_plain_lhs: bool,
+    ) -> Expr {
+        match expr.kind {
+            ExprKind::Var(v) => {
+                let lower = v.name.to_lowercase();
+                if !in_plain_lhs && aliases.contains(&lower) {
+                    replacement.clone()
+                } else {
+                    Expr::var(v)
+                }
+            }
+            ExprKind::Deref { addr, size } => {
+                if size == load_size {
+                    if let ExprKind::Var(v) = &addr.kind {
+                        if aliases.contains(&v.name.to_lowercase()) {
+                            return replacement.clone();
+                        }
+                    }
+                }
+                Expr::deref(sub(*addr, aliases, load_size, replacement, false), size)
+            }
+            ExprKind::BinOp { op, left, right } => Expr::binop(
+                op,
+                sub(*left, aliases, load_size, replacement, false),
+                sub(*right, aliases, load_size, replacement, false),
+            ),
+            ExprKind::UnaryOp { op, operand } => {
+                Expr::unary(op, sub(*operand, aliases, load_size, replacement, false))
+            }
+            ExprKind::AddressOf(inner) => {
+                Expr::address_of(sub(*inner, aliases, load_size, replacement, false))
+            }
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => Expr::array_access(
+                sub(*base, aliases, load_size, replacement, false),
+                sub(*index, aliases, load_size, replacement, false),
+                element_size,
+            ),
+            ExprKind::FieldAccess {
+                base,
+                field_name,
+                offset,
+            } => Expr::field_access(
+                sub(*base, aliases, load_size, replacement, false),
+                field_name,
+                offset,
+            ),
+            ExprKind::Call { target, args } => Expr::call(
+                target,
+                args.into_iter()
+                    .map(|arg| sub(arg, aliases, load_size, replacement, false))
+                    .collect(),
+            ),
+            ExprKind::Assign { lhs, rhs } => {
+                let lhs_is_plain_var = matches!(lhs.kind, ExprKind::Var(_));
+                Expr::assign(
+                    sub(*lhs, aliases, load_size, replacement, lhs_is_plain_var),
+                    sub(*rhs, aliases, load_size, replacement, false),
+                )
+            }
+            ExprKind::CompoundAssign { op, lhs, rhs } => {
+                let lhs_is_plain_var = matches!(lhs.kind, ExprKind::Var(_));
+                Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op,
+                        lhs: Box::new(sub(*lhs, aliases, load_size, replacement, lhs_is_plain_var)),
+                        rhs: Box::new(sub(*rhs, aliases, load_size, replacement, false)),
+                    },
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => Expr {
+                kind: ExprKind::Conditional {
+                    cond: Box::new(sub(*cond, aliases, load_size, replacement, false)),
+                    then_expr: Box::new(sub(*then_expr, aliases, load_size, replacement, false)),
+                    else_expr: Box::new(sub(*else_expr, aliases, load_size, replacement, false)),
+                },
+            },
+            ExprKind::Cast {
+                expr,
+                to_size,
+                signed,
+            } => Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(sub(*expr, aliases, load_size, replacement, false)),
+                    to_size,
+                    signed,
+                },
+            },
+            ExprKind::BitField { expr, start, width } => Expr {
+                kind: ExprKind::BitField {
+                    expr: Box::new(sub(*expr, aliases, load_size, replacement, false)),
+                    start,
+                    width,
+                },
+            },
+            ExprKind::Phi(values) => Expr {
+                kind: ExprKind::Phi(
+                    values
+                        .into_iter()
+                        .map(|value| sub(value, aliases, load_size, replacement, false))
+                        .collect(),
+                ),
+            },
+            ExprKind::IntLit(n) => Expr::int(n),
+            ExprKind::Unknown(name) => Expr::unknown(name),
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                size,
+                display_expr,
+                is_deref,
+            } => Expr {
+                kind: ExprKind::GotRef {
+                    address,
+                    instruction_address,
+                    size,
+                    display_expr: Box::new(sub(
+                        *display_expr,
+                        aliases,
+                        load_size,
+                        replacement,
+                        false,
+                    )),
+                    is_deref,
+                },
+            },
+        }
+    }
+
+    sub(expr, aliases, load_size, replacement, false)
+}
+
 pub(super) fn substitute_return_register_uses(
     expr: Expr,
     aliases: &[String],
@@ -2223,6 +2683,14 @@ mod tests {
         }
     }
 
+    fn pseudo_ret(size: u8) -> Expr {
+        Expr::var(Variable {
+            kind: crate::decompiler::expression::VarKind::Temp(0),
+            name: "ret".to_string(),
+            size,
+        })
+    }
+
     #[test]
     fn test_propagate_call_args_substitutes_temp_rhs() {
         let statements = vec![
@@ -2357,5 +2825,231 @@ mod tests {
             "ret_0 = recursive_sum(n - 1)"
         );
         assert_eq!(format!("{}", ret_expr), "ret_0 + n");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_across_blocks_for_deref_load_into_named_var() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(CallTarget::Named("foo".to_string()), vec![])],
+            ),
+            block(
+                1,
+                vec![
+                    Expr::assign(Expr::unknown("x"), Expr::deref(reg("rax", 8), 4)),
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Add,
+                            lhs: Box::new(Expr::unknown("sum")),
+                            rhs: Box::new(Expr::unknown("x")),
+                        },
+                    },
+                ],
+            ),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        let StructuredNode::Block {
+            statements: second_block,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected second node to remain a block");
+        };
+
+        assert_eq!(format!("{}", first_block[0]), "ret_0 = foo()");
+        assert_eq!(format!("{}", second_block[0]), "x = *(uint32_t*)(ret_0)");
+        assert_eq!(format!("{}", second_block[1]), "sum += x");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_across_blocks_for_deref_load_into_return_reg() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(CallTarget::Named("foo".to_string()), vec![])],
+            ),
+            block(
+                1,
+                vec![
+                    Expr::assign(reg("eax", 4), Expr::deref(reg("rax", 8), 4)),
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Add,
+                            lhs: Box::new(Expr::unknown("sum")),
+                            rhs: Box::new(reg("eax", 4)),
+                        },
+                    },
+                ],
+            ),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        let StructuredNode::Block {
+            statements: second_block,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected second node to remain a block");
+        };
+
+        assert_eq!(format!("{}", first_block[0]), "ret_0 = foo()");
+        assert_eq!(second_block.len(), 1);
+        assert_eq!(format!("{}", second_block[0]), "sum += *(uint32_t*)(ret_0)");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_keeps_cross_block_deref_load_for_later_use() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(CallTarget::Named("foo".to_string()), vec![])],
+            ),
+            block(
+                1,
+                vec![Expr::assign(reg("eax", 4), Expr::deref(reg("rax", 8), 4))],
+            ),
+            block(
+                2,
+                vec![Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Add,
+                        lhs: Box::new(Expr::unknown("sum")),
+                        rhs: Box::new(reg("eax", 4)),
+                    },
+                }],
+            ),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        let StructuredNode::Block {
+            statements: second_block,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected second node to remain a block");
+        };
+        let StructuredNode::Block {
+            statements: third_block,
+            ..
+        } = &merged[2]
+        else {
+            panic!("expected third node to remain a block");
+        };
+
+        assert_eq!(format!("{}", first_block[0]), "ret_0 = foo()");
+        assert_eq!(format!("{}", second_block[0]), "eax = *(uint32_t*)(ret_0)");
+        assert_eq!(format!("{}", third_block[0]), "sum += eax");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_rewrites_self_load_followed_by_named_capture() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(CallTarget::Named("foo".to_string()), vec![])],
+            ),
+            block(
+                1,
+                vec![
+                    Expr::assign(reg("eax", 4), Expr::deref(reg("rax", 8), 4)),
+                    Expr::assign(Expr::unknown("x"), Expr::deref(reg("rax", 8), 4)),
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Add,
+                            lhs: Box::new(Expr::unknown("sum")),
+                            rhs: Box::new(Expr::unknown("x")),
+                        },
+                    },
+                ],
+            ),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        let StructuredNode::Block {
+            statements: second_block,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected second node to remain a block");
+        };
+
+        assert_eq!(format!("{}", first_block[0]), "ret_0 = foo()");
+        assert_eq!(format!("{}", second_block[0]), "x = *(uint32_t*)(ret_0)");
+        assert_eq!(format!("{}", second_block[1]), "sum += x");
+    }
+
+    #[test]
+    fn test_capture_return_register_uses_in_block_for_deref_load_into_return_reg() {
+        let statements = vec![
+            Expr::call(CallTarget::Named("foo".to_string()), vec![]),
+            Expr::assign(reg("eax", 4), Expr::deref(reg("rax", 8), 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(Expr::unknown("sum")),
+                    rhs: Box::new(reg("eax", 4)),
+                },
+            },
+        ];
+
+        let mut counter = 0u32;
+        let merged = capture_return_register_uses_in_block(statements, &mut counter);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(format!("{}", merged[0]), "ret_0 = foo()");
+        assert_eq!(format!("{}", merged[1]), "sum += *(uint32_t*)(ret_0)");
+    }
+
+    #[test]
+    fn test_capture_return_register_uses_in_block_for_deref_load_via_ret_alias() {
+        let statements = vec![
+            Expr::call(CallTarget::Named("foo".to_string()), vec![]),
+            Expr::assign(Expr::unknown("x"), Expr::deref(pseudo_ret(8), 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(Expr::unknown("sum")),
+                    rhs: Box::new(Expr::unknown("x")),
+                },
+            },
+        ];
+
+        let mut counter = 0u32;
+        let merged = capture_return_register_uses_in_block(statements, &mut counter);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(format!("{}", merged[0]), "ret_0 = foo()");
+        assert_eq!(format!("{}", merged[1]), "x = *(uint32_t*)(ret_0)");
+        assert_eq!(format!("{}", merged[2]), "sum += x");
     }
 }
