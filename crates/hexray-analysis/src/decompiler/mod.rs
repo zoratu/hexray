@@ -1179,7 +1179,7 @@ fn apply_exception_handling(
     body: Vec<StructuredNode>,
     exception_info: &ExceptionInfo,
 ) -> Vec<StructuredNode> {
-    if exception_info.try_blocks.is_empty() {
+    if exception_info.try_blocks.is_empty() && exception_info.cleanup_handlers.is_empty() {
         return body;
     }
 
@@ -1188,6 +1188,12 @@ fn apply_exception_handling(
         .try_blocks
         .iter()
         .flat_map(|tb| tb.handlers.iter().map(|h| h.landing_pad))
+        .chain(
+            exception_info
+                .cleanup_handlers
+                .iter()
+                .map(|cleanup| cleanup.landing_pad),
+        )
         .collect();
 
     // Find nodes that belong to landing pads
@@ -1210,6 +1216,10 @@ fn apply_exception_handling(
             }
         }
         remaining_body.push(node.clone());
+    }
+
+    if exception_info.try_blocks.is_empty() {
+        return remaining_body;
     }
 
     let mut result = Vec::new();
@@ -1445,5 +1455,40 @@ mod tests {
         // Should contain if/else structure
         assert!(output.contains("if"));
         assert!(output.contains("else"));
+    }
+
+    #[test]
+    fn test_apply_exception_handling_drops_cleanup_only_landing_pad() {
+        let body = vec![
+            StructuredNode::Block {
+                id: BasicBlockId::new(0),
+                statements: vec![Expr::unknown("live_stmt")],
+                address_range: (0x1000, 0x1008),
+            },
+            StructuredNode::Block {
+                id: BasicBlockId::new(1),
+                statements: vec![Expr::unknown("cleanup_stmt")],
+                address_range: (0x1200, 0x1208),
+            },
+        ];
+        let info = ExceptionInfo {
+            try_blocks: Vec::new(),
+            cleanup_handlers: vec![CleanupInfo {
+                start: 0x1000,
+                end: 0x1010,
+                landing_pad: 0x1200,
+            }],
+        };
+
+        let filtered = apply_exception_handling(body, &info);
+
+        assert_eq!(filtered.len(), 1);
+        match &filtered[0] {
+            StructuredNode::Block { statements, .. } => {
+                assert_eq!(statements.len(), 1);
+                assert_eq!(format!("{}", statements[0]), "live_stmt");
+            }
+            other => panic!("expected surviving live block, got {other:?}"),
+        }
     }
 }

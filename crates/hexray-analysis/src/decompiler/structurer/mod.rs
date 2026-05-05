@@ -1382,6 +1382,10 @@ impl<'a> Structurer<'a> {
             size: 8,
         });
         let aliases = vec![
+            "al".to_string(),
+            "ax".to_string(),
+            "eax".to_string(),
+            "rax".to_string(),
             "arg0".to_string(),
             "x0".to_string(),
             "w0".to_string(),
@@ -2152,8 +2156,8 @@ fn is_noreturn_function(name: &str) -> bool {
 mod tests {
     use super::*;
     use hexray_core::{
-        Architecture, BasicBlock, BlockTerminator, Condition, Operand, Operation, Register,
-        RegisterClass,
+        Architecture, BasicBlock, BlockTerminator, Condition, ControlFlow, Operand, Operation,
+        Register, RegisterClass,
     };
 
     // --- Helper functions to create test CFGs ---
@@ -3926,6 +3930,60 @@ mod tests {
         } else {
             panic!("expected rewritten use assignment");
         }
+    }
+
+    #[test]
+    fn test_rewrite_condition_call_return_alias_handles_x86_low_byte_return() {
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 5, vec![], "call").with_control_flow(ControlFlow::Call {
+                target: 0x2000,
+                return_addr: 0x1005,
+            }),
+        );
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1005);
+        bb1.instructions.push(
+            Instruction::new(0x1005, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(al), Operand::Register(al)]),
+        );
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1010);
+        bb2.terminator = BlockTerminator::Return;
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1020);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+
+        let structurer = Structurer::new(&cfg);
+        let block = cfg.block(BasicBlockId::new(1)).expect("condition block");
+        let raw = condition_to_expr_with_block(Condition::NotEqual, block);
+        let rewritten = structurer.rewrite_condition_call_return_alias(BasicBlockId::new(1), raw);
+
+        assert!(
+            format!("{rewritten}").contains("ret_0"),
+            "expected x86 low-byte return alias to rewrite through predecessor call"
+        );
     }
 
     #[test]

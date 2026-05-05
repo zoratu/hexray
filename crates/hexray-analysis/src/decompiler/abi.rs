@@ -349,7 +349,7 @@ pub fn get_arg_register_index(name: &str) -> Option<usize> {
 /// - ARM64: x0/w0
 /// - RISC-V: a0
 pub fn is_return_register(name: &str) -> bool {
-    matches!(name, "eax" | "rax" | "x0" | "w0" | "a0")
+    matches!(name, "al" | "ax" | "eax" | "rax" | "x0" | "w0" | "a0")
 }
 
 /// Checks if a register is callee-saved (preserved across function calls).

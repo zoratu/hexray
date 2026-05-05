@@ -20,9 +20,9 @@ use hexray_analysis::{
     is_noreturn_function_name, AnalysisProject, BinaryDataContext, BinaryDiff, CallGraph,
     CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CallSite,
     CallType, CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter, Decompiler,
-    DecompilerConfig, FunctionInfo, OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder,
-    Patch, PatchType, RelocationTable, StringConfig, StringDetector, StringTable, SymbolTable,
-    XrefBuilder, XrefType,
+    DecompilerConfig, ExceptionExtractor, ExceptionInfo, FunctionInfo, OptimizationLevel,
+    OptimizationPass, ParallelCallGraphBuilder, Patch, PatchType, RelocationTable, StringConfig,
+    StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -367,6 +367,15 @@ impl<'a> Binary<'a> {
             Self::MachO(_) => "Mach-O",
             Self::Pe(_) => "PE",
         }
+    }
+
+    fn exception_info_for_function(&self, func_start: u64, func_end: u64) -> Option<ExceptionInfo> {
+        let extractor = match self {
+            Self::Elf(elf) => ExceptionExtractor::from_elf(elf).ok()?,
+            Self::MachO(macho) => ExceptionExtractor::from_elf(macho).ok()?,
+            Self::Pe(pe) => ExceptionExtractor::from_elf(pe).ok()?,
+        };
+        extractor.get_exception_info(func_start, func_end)
     }
 }
 
@@ -1716,6 +1725,9 @@ fn decompile_function(
         .with_constant_database(const_db)
         .with_struct_inference(true)
         .with_calling_convention(calling_convention);
+    if let Some(info) = binary.exception_info_for_function(start_addr, start_addr) {
+        decompiler = decompiler.with_exception_info(info);
+    }
     if let Some(db) = type_db {
         decompiler = decompiler.with_type_database(db.clone());
     }
@@ -1851,7 +1863,7 @@ fn build_symbol_table(fmt: &dyn BinaryFormat) -> SymbolTable {
     // Add all symbols (both functions and data) for proper resolution
     for symbol in fmt.symbols() {
         if symbol.address != 0 && !symbol.name.is_empty() {
-            table.insert(symbol.address, symbol.name.clone());
+            table.insert(symbol.address, demangle_or_original(&symbol.name));
         }
     }
 
@@ -3288,6 +3300,9 @@ fn decompile_with_follow(
             .with_constant_database(const_db.clone())
             .with_struct_inference(true)
             .with_calling_convention(calling_convention);
+        if let Some(info) = binary.exception_info_for_function(func_addr, func_addr) {
+            decompiler = decompiler.with_exception_info(info);
+        }
         if let Some(db) = type_db {
             decompiler = decompiler.with_type_database(db.clone());
         }
@@ -5410,12 +5425,15 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     },
                     fmt.architecture(),
                 );
-                let decompiler = Decompiler::new()
+                let mut decompiler = Decompiler::new()
                     .with_addresses(false)
                     .with_symbol_table(symbols)
                     .with_constant_database(const_db)
                     .with_struct_inference(true)
                     .with_calling_convention(calling_convention);
+                if let Some(info) = binary.exception_info_for_function(addr, addr) {
+                    decompiler = decompiler.with_exception_info(info);
+                }
 
                 let pseudo_code = decompiler.decompile(&cfg, &func_name);
 

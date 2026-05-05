@@ -523,12 +523,42 @@ fn insert_register_value_aliases(
 
 fn register_aliases(name: &str) -> Vec<String> {
     match name {
-        "eax" | "rax" => vec!["eax".to_string(), "rax".to_string()],
-        "ebx" | "rbx" => vec!["ebx".to_string(), "rbx".to_string()],
-        "ecx" | "rcx" => vec!["ecx".to_string(), "rcx".to_string()],
-        "edx" | "rdx" => vec!["edx".to_string(), "rdx".to_string()],
-        "esi" | "rsi" => vec!["esi".to_string(), "rsi".to_string()],
-        "edi" | "rdi" => vec!["edi".to_string(), "rdi".to_string()],
+        "al" | "ax" | "eax" | "rax" => vec![
+            "al".to_string(),
+            "ax".to_string(),
+            "eax".to_string(),
+            "rax".to_string(),
+        ],
+        "bl" | "bx" | "ebx" | "rbx" => vec![
+            "bl".to_string(),
+            "bx".to_string(),
+            "ebx".to_string(),
+            "rbx".to_string(),
+        ],
+        "cl" | "cx" | "ecx" | "rcx" => vec![
+            "cl".to_string(),
+            "cx".to_string(),
+            "ecx".to_string(),
+            "rcx".to_string(),
+        ],
+        "dl" | "dx" | "edx" | "rdx" => vec![
+            "dl".to_string(),
+            "dx".to_string(),
+            "edx".to_string(),
+            "rdx".to_string(),
+        ],
+        "sil" | "si" | "esi" | "rsi" => vec![
+            "sil".to_string(),
+            "si".to_string(),
+            "esi".to_string(),
+            "rsi".to_string(),
+        ],
+        "dil" | "di" | "edi" | "rdi" => vec![
+            "dil".to_string(),
+            "di".to_string(),
+            "edi".to_string(),
+            "rdi".to_string(),
+        ],
         "r8d" | "r8" => vec!["r8d".to_string(), "r8".to_string()],
         "r9d" | "r9" => vec!["r9d".to_string(), "r9".to_string()],
         "r10d" | "r10" => vec!["r10d".to_string(), "r10".to_string()],
@@ -929,8 +959,8 @@ pub(super) fn lift_cmovcc_with_context(
 mod tests {
     use super::*;
     use hexray_core::{
-        Architecture, BasicBlock, BasicBlockId, Instruction, MemoryRef, Operand, Register,
-        RegisterClass,
+        Architecture, BasicBlock, BasicBlockId, ControlFlow, Instruction, MemoryRef, Operand,
+        Register, RegisterClass,
     };
 
     #[test]
@@ -998,6 +1028,31 @@ mod tests {
         assert!(
             rendered.contains("& 1"),
             "expected ALU update to survive through TEST lowering, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_uses_call_return_temp_for_low_byte_alias() {
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x3000);
+        block.instructions.push(
+            Instruction::new(0x3000, 5, vec![], "call").with_control_flow(ControlFlow::Call {
+                target: 0x4000,
+                return_addr: 0x3005,
+            }),
+        );
+        block.instructions.push(
+            Instruction::new(0x3005, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(al), Operand::Register(al)]),
+        );
+
+        let expr = condition_to_expr_with_block(Condition::NotEqual, &block);
+        let rendered = format!("{expr}");
+        assert!(
+            rendered.contains("ret_0"),
+            "expected TEST on al to resolve through call return temp, got {rendered}"
         );
     }
 }

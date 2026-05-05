@@ -1034,8 +1034,12 @@ fn get_register_aliases(name: &str) -> Vec<String> {
         "x17" => vec!["w17".to_string(), "x17".to_string()],
         "x18" => vec!["w18".to_string(), "x18".to_string()],
         // x86: 32-bit and 64-bit register aliasing
-        "eax" => vec!["eax".to_string(), "rax".to_string()],
-        "rax" => vec!["eax".to_string(), "rax".to_string()],
+        "al" | "ax" | "eax" | "rax" => vec![
+            "al".to_string(),
+            "ax".to_string(),
+            "eax".to_string(),
+            "rax".to_string(),
+        ],
         "ebx" => vec!["ebx".to_string(), "rbx".to_string()],
         "rbx" => vec!["ebx".to_string(), "rbx".to_string()],
         "ecx" => vec!["ecx".to_string(), "rcx".to_string()],
@@ -1990,7 +1994,12 @@ fn substitute_return_register_uses_until_clobber(
 
 fn return_register_aliases(reg_name: &str) -> Vec<String> {
     match reg_name {
-        "eax" | "rax" => vec!["eax".to_string(), "rax".to_string()],
+        "al" | "ax" | "eax" | "rax" => vec![
+            "al".to_string(),
+            "ax".to_string(),
+            "eax".to_string(),
+            "rax".to_string(),
+        ],
         "w0" | "x0" | "arg0" => vec!["w0".to_string(), "x0".to_string(), "arg0".to_string()],
         "a0" => vec!["a0".to_string()],
         _ => vec![reg_name.to_string()],
