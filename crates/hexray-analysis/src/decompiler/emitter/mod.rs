@@ -589,6 +589,15 @@ impl PseudoCodeEmitter {
     }
 
     fn repair_packed_small_aggregate_output(output: String) -> String {
+        fn is_simple_identifier(name: &str) -> bool {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+
+        fn line_mentions_identifier(line: &str, name: &str) -> bool {
+            line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|token| token == name)
+        }
+
         let mut lines: Vec<String> = output.lines().map(str::to_string).collect();
         if lines.is_empty() {
             return output;
@@ -642,10 +651,7 @@ impl PseudoCodeEmitter {
                     .strip_prefix("return ")
                     .and_then(|s| s.strip_suffix(';'))
                     .map(str::trim)
-                    .filter(|name| {
-                        !name.is_empty()
-                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    });
+                    .filter(|name| is_simple_identifier(name));
                 if let Some(name) = return_var {
                     let has_local4_assign = lines.iter().any(|line| line.contains("local_4 ="));
                     let has_return_var_assign = lines
@@ -662,25 +668,27 @@ impl PseudoCodeEmitter {
                 }
             }
 
-            if let Some(shifted_name) = lines.iter().find_map(|line| {
-                let trimmed = line.trim();
-                let name = trimmed.strip_suffix("<<= 32;")?.trim_end();
-                if name.is_empty()
-                    || !name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c.is_whitespace())
-                {
-                    return None;
-                }
-                let name = name.trim_end();
-                if let Some((candidate, _)) = name.rsplit_once(' ') {
-                    let last = name.split_whitespace().last().unwrap_or(name);
-                    if !candidate.is_empty() && !last.is_empty() {
-                        return Some(last.to_string());
+            if let Some((shift_idx, shifted_name)) =
+                lines.iter().enumerate().find_map(|(idx, line)| {
+                    let trimmed = line.trim();
+                    let name = trimmed.strip_suffix("<<= 32;")?.trim_end();
+                    if name.is_empty()
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c.is_whitespace())
+                    {
+                        return None;
                     }
-                }
-                Some(name.to_string())
-            }) {
+                    let name = name.trim_end();
+                    if let Some((candidate, _)) = name.rsplit_once(' ') {
+                        let last = name.split_whitespace().last().unwrap_or(name);
+                        if !candidate.is_empty() && !last.is_empty() {
+                            return Some((idx, last.to_string()));
+                        }
+                    }
+                    Some((idx, name.to_string()))
+                })
+            {
                 let redundant_suffix = format!(" | {} << 32;", shifted_name);
                 for line in &mut lines {
                     let trimmed = line.trim();
@@ -697,6 +705,55 @@ impl PseudoCodeEmitter {
                         .take_while(|c| c.is_whitespace())
                         .collect::<String>();
                     *line = format!("{}return {} | {};", indent, lhs, shifted_name);
+                }
+
+                if let Some(return_idx) = lines.iter().position(|line| {
+                    let trimmed = line.trim();
+                    if !trimmed.starts_with("return ") || !trimmed.ends_with(';') {
+                        return false;
+                    }
+                    let Some(expr) = trimmed
+                        .strip_prefix("return ")
+                        .and_then(|s| s.strip_suffix(';'))
+                        .map(str::trim)
+                    else {
+                        return false;
+                    };
+                    let Some((lhs, rhs)) = expr.split_once('|') else {
+                        return false;
+                    };
+                    let lhs = lhs.trim();
+                    let rhs = rhs.trim();
+                    (lhs == shifted_name && is_simple_identifier(rhs))
+                        || (rhs == shifted_name && is_simple_identifier(lhs))
+                }) {
+                    let extra_statement_uses = lines
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, line)| {
+                            *idx != shift_idx
+                                && *idx != return_idx
+                                && line.trim().ends_with(';')
+                                && line_mentions_identifier(line, &shifted_name)
+                        })
+                        .count();
+                    if extra_statement_uses == 0 {
+                        let trimmed = lines[return_idx].trim();
+                        let expr = trimmed["return ".len()..trimmed.len() - 1].trim();
+                        let (lhs, rhs) = expr.split_once('|').unwrap();
+                        let (low, high) = if lhs.trim() == shifted_name {
+                            (rhs.trim(), lhs.trim())
+                        } else {
+                            (lhs.trim(), rhs.trim())
+                        };
+                        let indent = lines[return_idx]
+                            .chars()
+                            .take_while(|c| c.is_whitespace())
+                            .collect::<String>();
+                        lines[return_idx] =
+                            format!("{}return {{ .lo = {}, .hi = {} }};", indent, low, high);
+                        lines.remove(shift_idx);
+                    }
                 }
             }
         }
@@ -7272,13 +7329,34 @@ mod tests {
 
         let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
         assert!(
-            repaired.contains("return arg0 | arg1;"),
-            "Expected redundant second shift to be removed, got:\n{}",
+            repaired.contains("return { .lo = arg0, .hi = arg1 };"),
+            "Expected redundant second shift repair to preserve the packed pair field-literal, got:\n{}",
             repaired
         );
         assert!(
-            !repaired.contains("arg1 << 32;"),
-            "Expected repaired return to avoid a second shift, got:\n{}",
+            !repaired.contains("arg1 <<= 32;") && !repaired.contains("arg1 << 32;"),
+            "Expected repaired output to avoid redundant shifts, got:\n{}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn test_repair_packed_small_aggregate_output_rewrites_shift_then_or_return() {
+        let input = r#"int64_t make_pair(int32_t arg0, int64_t arg1)
+{
+    arg1 <<= 32;
+    return arg0 | arg1;
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            repaired.contains("return { .lo = arg0, .hi = arg1 };"),
+            "Expected shift-then-or pair return repair, got:\n{}",
+            repaired
+        );
+        assert!(
+            !repaired.contains("arg1 <<= 32;"),
+            "Expected repaired output to drop the redundant left shift, got:\n{}",
             repaired
         );
     }
