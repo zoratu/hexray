@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use super::abi;
 use super::expression::{
     resolve_adrp_patterns, BinOpKind, CallTarget as ExprCallTarget, Expr, ExprKind, UnaryOpKind,
+    Variable,
 };
 use super::for_loop_detection::detect_for_loops;
 use super::short_circuit::detect_short_circuit;
@@ -1017,7 +1018,7 @@ impl<'a> Structurer<'a> {
             self.processed.insert(block_id);
 
             // Convert block instructions to expressions
-            let statements = self.block_to_statements(block_id);
+            let mut statements = self.block_to_statements(block_id);
             let address_range = (block.start, block.end);
 
             // Handle based on terminator
@@ -1040,6 +1041,24 @@ impl<'a> Structurer<'a> {
                 }
 
                 BlockTerminator::Unreachable => {
+                    if !statements.is_empty() {
+                        result.push(StructuredNode::Block {
+                            id: block_id,
+                            statements,
+                            address_range,
+                        });
+                    }
+                    break;
+                }
+
+                BlockTerminator::Jump { target }
+                    if self.is_empty_placeholder_block(*target)
+                        && Self::tail_jump_call_expr(block).is_some() =>
+                {
+                    if let Some(expr) = Self::tail_jump_call_expr(block) {
+                        statements.push(expr);
+                        statements = propagate_args_in_block(statements);
+                    }
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
                             id: block_id,
@@ -1175,6 +1194,10 @@ impl<'a> Structurer<'a> {
                     }
 
                     // Fallback: emit block and break
+                    if let Some(expr) = Self::tail_jump_call_expr(block) {
+                        statements.push(expr);
+                        statements = propagate_args_in_block(statements);
+                    }
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
                             id: block_id,
@@ -1186,6 +1209,10 @@ impl<'a> Structurer<'a> {
                 }
 
                 BlockTerminator::Unknown => {
+                    if let Some(expr) = Self::tail_jump_call_expr(block) {
+                        statements.push(expr);
+                        statements = propagate_args_in_block(statements);
+                    }
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
                             id: block_id,
@@ -1201,6 +1228,170 @@ impl<'a> Structurer<'a> {
         }
 
         result
+    }
+
+    fn implicit_return_register_expr_for_block(&self, block_id: BasicBlockId) -> Option<Expr> {
+        self.implicit_return_register_expr_for_block_inner(block_id, &mut HashSet::new())
+    }
+
+    fn implicit_return_register_expr_for_block_inner(
+        &self,
+        block_id: BasicBlockId,
+        visited: &mut HashSet<BasicBlockId>,
+    ) -> Option<Expr> {
+        if !visited.insert(block_id) {
+            return None;
+        }
+
+        let statements = self.block_to_statements(block_id);
+        if let Some(expr) = Self::last_return_register_expr_in_statements(&statements) {
+            return Some(expr);
+        }
+
+        let mut candidate: Option<Variable> = None;
+        for &pred in self.cfg.predecessors(block_id) {
+            let pred_statements = self.block_to_statements(pred);
+            if let Some(expr) = Self::last_return_register_expr_in_statements(&pred_statements) {
+                let ExprKind::Var(var) = expr.kind else {
+                    continue;
+                };
+                match &candidate {
+                    Some(existing) if existing != &var => return None,
+                    Some(_) => {}
+                    None => candidate = Some(var),
+                }
+                continue;
+            }
+
+            let Some(pred_block) = self.cfg.block(pred) else {
+                continue;
+            };
+            let is_passthrough = pred_statements.is_empty()
+                && matches!(
+                    pred_block.terminator,
+                    BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target }
+                        if target == block_id
+                );
+            if !is_passthrough {
+                continue;
+            }
+
+            let Some(expr) = self.implicit_return_register_expr_for_block_inner(pred, visited)
+            else {
+                continue;
+            };
+            let ExprKind::Var(var) = expr.kind else {
+                continue;
+            };
+            match &candidate {
+                Some(existing) if existing != &var => return None,
+                Some(_) => {}
+                None => candidate = Some(var),
+            }
+        }
+
+        candidate.map(Expr::var)
+    }
+
+    fn last_return_register_expr_in_statements(statements: &[Expr]) -> Option<Expr> {
+        statements.iter().rev().find_map(|stmt| match &stmt.kind {
+            ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => {
+                let ExprKind::Var(var) = &lhs.kind else {
+                    return None;
+                };
+                if abi::is_return_register(&var.name) {
+                    Some(Expr::var(var.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+    }
+
+    fn is_empty_placeholder_block(&self, block_id: BasicBlockId) -> bool {
+        self.cfg
+            .block(block_id)
+            .is_some_and(|block| block.instructions.is_empty())
+    }
+
+    fn tail_jump_call_expr(block: &BasicBlock) -> Option<Expr> {
+        let inst = block.instructions.last()?;
+
+        match (&block.terminator, &inst.control_flow) {
+            (BlockTerminator::Unknown, ControlFlow::UnconditionalBranch { target }) => {
+                Some(Expr::call(
+                    ExprCallTarget::Direct {
+                        target: *target,
+                        call_site: inst.address,
+                    },
+                    Self::direct_tail_passthrough_args(block),
+                ))
+            }
+            (BlockTerminator::Jump { .. }, ControlFlow::UnconditionalBranch { target }) => {
+                Some(Expr::call(
+                    ExprCallTarget::Direct {
+                        target: *target,
+                        call_site: inst.address,
+                    },
+                    Self::direct_tail_passthrough_args(block),
+                ))
+            }
+            (
+                BlockTerminator::IndirectJump {
+                    possible_targets, ..
+                },
+                ControlFlow::IndirectBranch { .. },
+            ) if possible_targets.is_empty() => {
+                Some(Expr::call(Self::tail_jump_indirect_target(inst), vec![]))
+            }
+            _ => None,
+        }
+    }
+
+    fn direct_tail_passthrough_args(block: &BasicBlock) -> Vec<Expr> {
+        let is_pure_jump_wrapper = block.instructions.iter().all(|inst| {
+            inst.operation == Operation::Jump
+                || inst.operation == Operation::Nop
+                || inst.mnemonic.starts_with("endbr")
+        });
+
+        if is_pure_jump_wrapper {
+            vec![Expr::var(Variable::reg("edi", 4))]
+        } else {
+            vec![]
+        }
+    }
+
+    fn tail_jump_indirect_target(inst: &hexray_core::Instruction) -> ExprCallTarget {
+        let Some(target_op) = inst.operands.first() else {
+            return ExprCallTarget::Named("unknown".to_string());
+        };
+
+        match target_op {
+            Operand::PcRelative { target, .. } => ExprCallTarget::Direct {
+                target: *target,
+                call_site: inst.address,
+            },
+            Operand::Immediate(imm) => ExprCallTarget::Direct {
+                target: imm.as_u64(),
+                call_site: inst.address,
+            },
+            Operand::Memory(mem) => {
+                if mem.base.as_ref().map(|r| r.name()).unwrap_or("") == "rip" && mem.index.is_none()
+                {
+                    let got_address =
+                        (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+                    ExprCallTarget::IndirectGot {
+                        got_address,
+                        expr: Box::new(Expr::from_operand(target_op)),
+                    }
+                } else {
+                    ExprCallTarget::Indirect(Box::new(Expr::from_operand(target_op)))
+                }
+            }
+            _ => ExprCallTarget::Indirect(Box::new(Expr::from_operand(target_op))),
+        }
     }
 
     fn structure_loop(&mut self, header: BasicBlockId) -> StructuredNode {
@@ -4450,5 +4641,97 @@ mod tests {
             }
             _ => panic!("expected If after rewrite"),
         }
+    }
+
+    #[test]
+    fn test_structure_unknown_direct_tail_jump_as_call() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 5, vec![0xe9, 0, 0, 0, 0], "jmp")
+                .with_operation(Operation::Jump)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000), Operand::Register(edi)])
+                .with_control_flow(ControlFlow::UnconditionalBranch { target: 0x2000 }),
+        );
+        bb0.terminator = BlockTerminator::Unknown;
+        cfg.add_block(bb0);
+
+        let mut structurer = Structurer::new(&cfg);
+        let structured = structurer.structure();
+        let Some(StructuredNode::Block { statements, .. }) = structured.first() else {
+            panic!("expected single block body");
+        };
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = statements.last()
+        else {
+            panic!("expected synthesized tail call");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["edi"]
+        );
+    }
+
+    #[test]
+    fn test_structure_indirect_tail_jump_propagates_target_and_args() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1270);
+        bb0.instructions.push(
+            Instruction::new(0x1274, 3, vec![0x48, 0x89, 0xf8], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rax), Operand::Register(rdi)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1277, 2, vec![0x89, 0xf7], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(edi), Operand::Register(esi)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1279, 2, vec![0xff, 0xe0], "jmp")
+                .with_operation(Operation::Jump)
+                .with_operands(vec![Operand::Register(rax)])
+                .with_control_flow(ControlFlow::IndirectBranch {
+                    possible_targets: vec![],
+                }),
+        );
+        bb0.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        cfg.add_block(bb0);
+
+        let mut structurer = Structurer::new(&cfg);
+        let structured = structurer.structure();
+        let Some(StructuredNode::Block { statements, .. }) = structured.first() else {
+            panic!("expected single block body");
+        };
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = statements.last()
+        else {
+            panic!("expected synthesized indirect tail call");
+        };
+
+        match target {
+            ExprCallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "rdi"),
+            other => panic!("expected indirect target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rsi"]
+        );
     }
 }
