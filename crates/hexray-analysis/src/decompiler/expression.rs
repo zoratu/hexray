@@ -2,7 +2,7 @@
 //!
 //! Converts low-level instructions into high-level expressions.
 
-use hexray_core::{Architecture, Instruction, MemoryRef, Operand, Operation, Register};
+use hexray_core::{Architecture, Instruction, MemoryRef, Operand, Operation, Register, RegisterClass};
 use std::fmt;
 
 use super::abi;
@@ -1017,17 +1017,36 @@ impl Expr {
         }
     }
 
-    /// Converts a memory reference to an expression.
-    fn from_memory_ref(mem: &MemoryRef) -> Self {
+    fn address_register_expr(reg: &Register, forced_size_bytes: Option<u8>) -> Self {
+        let adjusted = if matches!(reg.arch, Architecture::X86_64 | Architecture::X86)
+            && reg.class == RegisterClass::General
+        {
+            forced_size_bytes
+                .filter(|size| u16::from(*size) * 8 < reg.size)
+                .map(|size| Register::new(reg.arch, reg.class, reg.id, u16::from(size) * 8))
+                .unwrap_or(*reg)
+        } else {
+            *reg
+        };
+
+        Self::var(Variable::from_register(&adjusted))
+    }
+
+    /// Converts a memory reference into its effective address expression.
+    fn memory_address_expr(mem: &MemoryRef) -> Self {
+        Self::memory_address_expr_with_size(mem, None)
+    }
+
+    fn memory_address_expr_with_size(mem: &MemoryRef, forced_size_bytes: Option<u8>) -> Self {
         let mut addr_expr: Option<Expr> = None;
 
         // Build address expression: base + index*scale + disp
         if let Some(ref base) = mem.base {
-            addr_expr = Some(Self::var(Variable::from_register(base)));
+            addr_expr = Some(Self::address_register_expr(base, forced_size_bytes));
         }
 
         if let Some(ref index) = mem.index {
-            let index_expr = Self::var(Variable::from_register(index));
+            let index_expr = Self::address_register_expr(index, forced_size_bytes);
             let scaled = if mem.scale > 1 {
                 Self::binop(BinOpKind::Mul, index_expr, Self::int(mem.scale as i128))
             } else {
@@ -1048,8 +1067,12 @@ impl Expr {
             });
         }
 
-        let addr = addr_expr.unwrap_or_else(|| Self::int(0));
-        Self::deref(addr, mem.size)
+        addr_expr.unwrap_or_else(|| Self::int(0))
+    }
+
+    /// Converts a memory reference to an expression.
+    fn from_memory_ref(mem: &MemoryRef) -> Self {
+        Self::deref(Self::memory_address_expr(mem), mem.size)
     }
 
     /// Converts a memory operand with instruction context to handle RIP-relative addressing.
@@ -1529,7 +1552,11 @@ impl Expr {
                                 let display_expr = Self::int(abs_addr as i128);
                                 Self::got_addr(abs_addr, inst.address, display_expr)
                             } else {
-                                Self::from_memory_ref(mem)
+                                let forced_size = match &ops[0] {
+                                    Operand::Register(dst) => Some((dst.size / 8) as u8),
+                                    _ => None,
+                                };
+                                Self::memory_address_expr_with_size(mem, forced_size)
                             }
                         }
                         Operand::Immediate(imm) => Self::int(imm.value),
@@ -4717,6 +4744,29 @@ mod tests {
             is_memory_access,
             "Expected Deref or ArrayAccess for array indexing, got {:?}",
             simplified.kind
+        );
+    }
+
+    #[test]
+    fn test_load_effective_address_lifts_plain_address_arithmetic() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let inst = Instruction::new(0x4011e4, 3, vec![0x8d, 0x47, 0x01], "lea")
+            .with_operation(Operation::LoadEffectiveAddress)
+            .with_operands(vec![
+                Operand::Register(eax),
+                Operand::Memory(MemoryRef::base_disp(rdi, 1, 4)),
+            ]);
+
+        let expr = Expr::from_instruction(&inst);
+        let rendered = expr.simplify().to_string();
+
+        assert_eq!(rendered, "rax = rdi + 1");
+        assert!(
+            !rendered.contains("*("),
+            "LEA should not produce a dereference: {rendered}"
         );
     }
 }

@@ -37,7 +37,7 @@
 //! // Produces: int64_t function(int64_t arg0, int64_t arg1, int32_t arg2)
 //! ```
 
-use super::expression::{BinOpKind, Expr, ExprKind};
+use super::expression::{BinOpKind, Expr, ExprKind, Variable};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, SymbolTable};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -601,7 +601,7 @@ impl SignatureRecovery {
                     if self.is_arg_register(&rhs_name) && !self.written_regs.contains(&rhs_name) {
                         self.read_regs.insert(rhs_name.clone());
                         // Track the size from the register variant
-                        let size = self.reg_size_from_name(&rhs_var.name);
+                        let size = self.effective_var_size(rhs_var);
                         if size > 0 {
                             self.reg_sizes.insert(rhs_name, size);
                         }
@@ -678,7 +678,7 @@ impl SignatureRecovery {
                 if self.is_arg_register(&name) && !self.written_regs.contains(&name) {
                     self.read_regs.insert(name.clone());
                     // Track the size
-                    let size = self.reg_size_from_name(&var.name);
+                    let size = self.effective_var_size(var);
                     if size > 0 {
                         self.reg_sizes.insert(name.clone(), size);
                     }
@@ -743,8 +743,16 @@ impl SignatureRecovery {
                     };
 
                     if right_is_offset {
-                        if let Some(base_name) = self.extract_var_name(left) {
-                            self.record_usage_hint(&base_name, |h| h.is_pointer_arithmetic = true);
+                        if let ExprKind::Var(var) = &left.kind {
+                            let base_width = self
+                                .infer_expr_size(left)
+                                .unwrap_or(var.size)
+                                .max(var.size);
+                            if base_width >= 8 {
+                                self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                                    h.is_pointer_arithmetic = true
+                                });
+                            }
                         }
                     }
                 }
@@ -2061,7 +2069,7 @@ impl SignatureRecovery {
                     }
                 }
                 // First try to infer from register name (w0 = 4, x0 = 8, etc.)
-                let size = self.reg_size_from_name(&var.name);
+                let size = self.effective_var_size(var);
                 if size > 0 {
                     Some(size)
                 } else if let Some(size) = self.value_sizes.get(&var_name_lower) {
@@ -2097,6 +2105,15 @@ impl SignatureRecovery {
                 }
             }
             _ => None,
+        }
+    }
+
+    fn effective_var_size(&self, var: &Variable) -> u8 {
+        let named_size = self.reg_size_from_name(&var.name);
+        if var.size > 0 && (named_size == 0 || var.size < named_size) {
+            var.size
+        } else {
+            named_size.max(var.size)
         }
     }
 
@@ -2669,6 +2686,7 @@ mod tests {
 
         let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
         let sig = recovery.analyze(&cfg);
+        println!("sig = {:?}", sig);
 
         assert!(sig.has_return);
         // Return type should be detected
@@ -4351,6 +4369,37 @@ mod tests {
 
         assert!(sig.has_return);
         assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_keeps_lea_int_wrapper_as_int32() {
+        use hexray_core::BasicBlockId;
+
+        let set_ret = Expr::assign(
+            Expr::var(Variable::reg("rax", 4)),
+            Expr::binop(
+                BinOpKind::Add,
+                Expr::var(Variable::reg("rdi", 4)),
+                Expr::int(1),
+            ),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![set_ret],
+            address_range: (0x2300, 0x2303),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].param_type, ParamType::SignedInt(32));
     }
 
     #[test]
