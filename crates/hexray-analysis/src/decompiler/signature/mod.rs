@@ -294,14 +294,47 @@ impl SignatureRecovery {
         }
     }
 
+    fn is_tail_padding_statement(expr: &Expr) -> bool {
+        matches!(&expr.kind, ExprKind::Unknown(name) if name.trim() == "/* nop */")
+    }
+
+    fn node_is_tail_padding(node: &StructuredNode) -> bool {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                !statements.is_empty() && statements.iter().all(Self::is_tail_padding_statement)
+            }
+            StructuredNode::Sequence(nodes) => {
+                !nodes.is_empty() && nodes.iter().all(Self::node_is_tail_padding)
+            }
+            _ => false,
+        }
+    }
+
+    fn suffix_is_tail_return_path(nodes: &[StructuredNode]) -> bool {
+        if nodes.is_empty() {
+            return true;
+        }
+
+        let mut saw_bare_return = false;
+        for node in nodes {
+            match node {
+                StructuredNode::Return(None) => {
+                    saw_bare_return = true;
+                }
+                _ if saw_bare_return => return false,
+                _ if Self::node_is_tail_padding(node) => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
     /// Analyzes a list of structured nodes.
     fn analyze_nodes(&mut self, nodes: &[StructuredNode], in_return_path: bool) {
         for (i, node) in nodes.iter().enumerate() {
-            // Check if this node is on, or directly feeds, a return path.
-            let next_is_void_return = nodes
-                .get(i + 1)
-                .is_some_and(|n| matches!(n, StructuredNode::Return(None)));
-            let is_near_return = in_return_path || (i == nodes.len() - 1) || next_is_void_return;
+            let is_near_return =
+                in_return_path || Self::suffix_is_tail_return_path(&nodes[i + 1..]);
             self.analyze_node(node, is_near_return);
         }
     }
@@ -1204,11 +1237,15 @@ impl SignatureRecovery {
 
     fn infer_tail_call_return_type(&self, expr: &Expr) -> Option<ParamType> {
         if let ExprKind::Call { target, .. } = &expr.kind {
-            let name = self.extract_call_name(target)?;
-            if let Some(summary_ty) = self.return_type_from_summary(&name) {
-                return Some(summary_ty);
+            if let Some(name) = self.extract_call_name(target) {
+                if let Some(summary_ty) = self.return_type_from_summary(&name) {
+                    return Some(summary_ty);
+                }
+                if let Some(known_ty) = Self::known_call_return_type(&name) {
+                    return Some(known_ty);
+                }
             }
-            return Self::known_call_return_type(&name);
+            return Some(ParamType::SignedInt(32));
         }
         None
     }
@@ -4403,6 +4440,63 @@ mod tests {
         let ret = StructuredNode::Return(None);
         let cfg = StructuredCfg {
             body: vec![block, ret],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_falls_back_for_unresolved_tail_call_return() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("helper".to_string()),
+            vec![Expr::var(Variable::reg("edi", 4))],
+        );
+
+        let call_block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1100, 0x1110),
+        };
+        let padding_block = StructuredNode::Block {
+            id: BasicBlockId::new(1),
+            statements: vec![Expr::unknown("/* nop */")],
+            address_range: (0x1110, 0x1112),
+        };
+        let cfg = StructuredCfg {
+            body: vec![call_block, padding_block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_falls_back_for_indirect_tail_call_return() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Indirect(Box::new(Expr::var(Variable::reg("rdx", 8)))),
+            vec![Expr::var(Variable::reg("rdi", 8))],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1200, 0x1210),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
             cfg_entry: BasicBlockId::new(0),
         };
 

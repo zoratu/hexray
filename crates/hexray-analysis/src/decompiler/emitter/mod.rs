@@ -575,6 +575,212 @@ impl PseudoCodeEmitter {
         *self.return_fallback_expr.borrow_mut() = None;
     }
 
+    fn rewrite_tail_call_returns_for_emission(
+        nodes: &[StructuredNode],
+        fold_bare_tail_returns: bool,
+    ) -> Vec<StructuredNode> {
+        let mut rewritten: Vec<StructuredNode> = nodes
+            .iter()
+            .cloned()
+            .map(|node| Self::rewrite_tail_call_return_node(node, fold_bare_tail_returns))
+            .collect();
+
+        if fold_bare_tail_returns {
+            Self::fold_terminal_tail_call_return(&mut rewritten);
+        }
+
+        rewritten
+    }
+
+    fn rewrite_tail_call_return_node(
+        node: StructuredNode,
+        fold_bare_tail_returns: bool,
+    ) -> StructuredNode {
+        match node {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => StructuredNode::If {
+                condition,
+                then_body: Self::rewrite_tail_call_returns_for_emission(
+                    &then_body,
+                    fold_bare_tail_returns,
+                ),
+                else_body: else_body.map(|nodes| {
+                    Self::rewrite_tail_call_returns_for_emission(&nodes, fold_bare_tail_returns)
+                }),
+            },
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::While {
+                condition,
+                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                header,
+                exit_block,
+            },
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+                exit_block,
+            } => StructuredNode::DoWhile {
+                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                condition,
+                header,
+                exit_block,
+            },
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                header,
+                exit_block,
+            },
+            StructuredNode::Loop {
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::Loop {
+                body: Self::rewrite_tail_call_returns_for_emission(&body, fold_bare_tail_returns),
+                header,
+                exit_block,
+            },
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => StructuredNode::Switch {
+                value,
+                cases: cases
+                    .into_iter()
+                    .map(|(values, body)| {
+                        (
+                            values,
+                            Self::rewrite_tail_call_returns_for_emission(
+                                &body,
+                                fold_bare_tail_returns,
+                            ),
+                        )
+                    })
+                    .collect(),
+                default: default.map(|nodes| {
+                    Self::rewrite_tail_call_returns_for_emission(&nodes, fold_bare_tail_returns)
+                }),
+            },
+            StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
+                Self::rewrite_tail_call_returns_for_emission(&nodes, fold_bare_tail_returns),
+            ),
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => StructuredNode::TryCatch {
+                try_body: Self::rewrite_tail_call_returns_for_emission(
+                    &try_body,
+                    fold_bare_tail_returns,
+                ),
+                catch_handlers: catch_handlers
+                    .into_iter()
+                    .map(|handler| super::structurer::CatchHandler {
+                        exception_type: handler.exception_type,
+                        variable_name: handler.variable_name,
+                        body: Self::rewrite_tail_call_returns_for_emission(
+                            &handler.body,
+                            fold_bare_tail_returns,
+                        ),
+                        landing_pad: handler.landing_pad,
+                    })
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn is_tail_padding_statement(expr: &Expr) -> bool {
+        matches!(&expr.kind, ExprKind::Unknown(name) if name.trim() == "/* nop */")
+    }
+
+    fn node_is_tail_padding(node: &StructuredNode) -> bool {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                !statements.is_empty() && statements.iter().all(Self::is_tail_padding_statement)
+            }
+            StructuredNode::Sequence(nodes) => {
+                !nodes.is_empty() && nodes.iter().all(Self::node_is_tail_padding)
+            }
+            _ => false,
+        }
+    }
+
+    fn fold_terminal_tail_call_return(nodes: &mut Vec<StructuredNode>) {
+        if nodes.is_empty() {
+            return;
+        }
+
+        let has_bare_return = matches!(nodes.last(), Some(StructuredNode::Return(None)));
+        let search_end = if has_bare_return {
+            nodes.len().saturating_sub(1)
+        } else {
+            nodes.len()
+        };
+        let mut call_index = search_end;
+        while call_index > 0 && Self::node_is_tail_padding(&nodes[call_index - 1]) {
+            call_index -= 1;
+        }
+        if call_index == 0 {
+            return;
+        }
+        call_index -= 1;
+
+        let Some(call_expr) = ({
+            let StructuredNode::Block { statements, .. } = &mut nodes[call_index] else {
+                return;
+            };
+
+            let Some(Expr {
+                kind: ExprKind::Call { .. },
+            }) = statements.last()
+            else {
+                return;
+            };
+
+            statements.pop()
+        }) else {
+            return;
+        };
+
+        if call_index + 1 < search_end {
+            nodes.drain(call_index + 1..search_end);
+        }
+
+        let remove_empty_block = matches!(
+            nodes.get(call_index),
+            Some(StructuredNode::Block { statements, .. }) if statements.is_empty()
+        );
+        if remove_empty_block {
+            nodes.remove(call_index);
+        }
+
+        if has_bare_return {
+            if let Some(last) = nodes.last_mut() {
+                *last = StructuredNode::Return(Some(call_expr));
+            }
+        } else {
+            nodes.push(StructuredNode::Return(Some(call_expr)));
+        }
+    }
+
     fn emit_return_line(&self, output: &mut String, indent: &str, expr: Option<&Expr>) {
         if let Some(e) = expr {
             writeln!(output, "{}return {};", indent, self.format_expr(e)).unwrap();
@@ -2505,27 +2711,37 @@ impl PseudoCodeEmitter {
             }
         };
 
-        // Analyze function body for pattern-based variable naming (loop indices, etc.)
-        self.naming_ctx.borrow_mut().analyze(&cfg.body);
-
-        // Pre-scan for global access patterns before emission
-        // This allows us to infer read-only, write-heavy, counter patterns
-        self.prescan_global_accesses(&cfg.body);
-
         // Use advanced signature recovery if enabled
-        let (signature, func_info) = if self.use_signature_recovery {
+        let signature = if self.use_signature_recovery {
             let mut recovery = SignatureRecovery::new(self.calling_convention)
                 .with_relocation_table(self.relocation_table.clone())
                 .with_symbol_table(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone())
                 .with_dwarf_param_names(self.dwarf_param_names.clone())
                 .with_function_name(func_name);
-            let sig = recovery.analyze(cfg);
+            Some(recovery.analyze(cfg))
+        } else {
+            None
+        };
 
+        let display_body = if let Some(ref sig) = signature {
+            Self::rewrite_tail_call_returns_for_emission(&cfg.body, sig.has_return)
+        } else {
+            cfg.body.clone()
+        };
+
+        // Analyze function body for pattern-based variable naming (loop indices, etc.)
+        self.naming_ctx.borrow_mut().analyze(&display_body);
+
+        // Pre-scan for global access patterns before emission
+        // This allows us to infer read-only, write-heavy, counter patterns
+        self.prescan_global_accesses(&display_body);
+
+        let func_info = if let Some(ref sig) = signature {
             // Convert recovered signature to FunctionInfo for compatibility
             let params: Vec<String> = sig.parameters.iter().map(|p| p.name.clone()).collect();
 
-            let info = self.analyze_function(&cfg.body);
+            let info = self.analyze_function(&display_body);
             let mut merged_param_names = params.clone();
             if merged_param_names.len() < info.parameters.len() {
                 merged_param_names.resize(info.parameters.len(), String::new());
@@ -2535,7 +2751,7 @@ impl PseudoCodeEmitter {
                     merged_param_names[idx] = name.clone();
                 }
             }
-            let merged_info = FunctionInfo {
+            FunctionInfo {
                 parameters: if merged_param_names.is_empty() {
                     info.parameters
                 } else {
@@ -2543,11 +2759,9 @@ impl PseudoCodeEmitter {
                 },
                 has_return_value: sig.has_return || info.has_return_value,
                 skip_statements: info.skip_statements,
-            };
-
-            (Some(sig), merged_info)
+            }
         } else {
-            (None, self.analyze_function(&cfg.body))
+            self.analyze_function(&display_body)
         };
 
         let param_override_sources: Vec<String> = if let Some(ref sig) = signature {
@@ -2698,8 +2912,8 @@ impl PseudoCodeEmitter {
         let param_exclusion_list: Vec<String> = param_exclusion_names.into_iter().collect();
 
         // Collect all local variables used in the function (excluding parameters)
-        let all_vars = self.collect_local_variables(&cfg.body, &param_exclusion_list);
-        let loop_zero_init_vars = self.find_loop_condition_vars_needing_init(&cfg.body);
+        let all_vars = self.collect_local_variables(&display_body, &param_exclusion_list);
+        let loop_zero_init_vars = self.find_loop_condition_vars_needing_init(&display_body);
 
         // Emit body into a temporary buffer first so declarations can be filtered
         // to only identifiers that actually appear after skip/noise pruning.
@@ -2707,14 +2921,14 @@ impl PseudoCodeEmitter {
         let mut declared_vars: HashSet<String> = param_exclusion_list.clone().into_iter().collect();
         declared_vars.extend(all_vars.iter().cloned());
         self.emit_nodes_with_skip_and_decls(
-            &cfg.body,
+            &display_body,
             &mut body_output,
             1,
             &func_info.skip_statements,
             &mut declared_vars,
         );
         if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
-            if !self.body_ends_with_control_exit(&cfg.body)
+            if !self.body_ends_with_control_exit(&display_body)
                 && !Self::output_ends_with_return_stmt(&body_output)
             {
                 writeln!(body_output, "{}return {};", self.indent, fallback).unwrap();
@@ -2789,8 +3003,11 @@ impl PseudoCodeEmitter {
             }
         };
 
+        let display_body =
+            Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return);
+
         // Analyze function body for pattern-based variable naming
-        self.naming_ctx.borrow_mut().analyze(&cfg.body);
+        self.naming_ctx.borrow_mut().analyze(&display_body);
         let signature_param_names: Vec<String> = signature
             .parameters
             .iter()
@@ -2839,7 +3056,7 @@ impl PseudoCodeEmitter {
         writeln!(output, "{{").unwrap();
 
         // Legacy analysis for skipping parameter statements
-        let func_info = self.analyze_function(&cfg.body);
+        let func_info = self.analyze_function(&display_body);
 
         let mut param_exclusion_names = HashSet::new();
         for (idx, _) in signature_param_names.iter().enumerate() {
@@ -2849,8 +3066,8 @@ impl PseudoCodeEmitter {
         let param_exclusion_list: Vec<String> = param_exclusion_names.into_iter().collect();
 
         // Collect all local variables used in the function (excluding parameters)
-        let all_vars = self.collect_local_variables(&cfg.body, &param_exclusion_list);
-        let loop_zero_init_vars = self.find_loop_condition_vars_needing_init(&cfg.body);
+        let all_vars = self.collect_local_variables(&display_body, &param_exclusion_list);
+        let loop_zero_init_vars = self.find_loop_condition_vars_needing_init(&display_body);
 
         // Emit body into a temporary buffer first so declarations can be filtered
         // to only identifiers that survive statement skipping.
@@ -2858,14 +3075,14 @@ impl PseudoCodeEmitter {
         let mut declared_vars: HashSet<String> = param_exclusion_list.clone().into_iter().collect();
         declared_vars.extend(all_vars.iter().cloned());
         self.emit_nodes_with_skip_and_decls(
-            &cfg.body,
+            &display_body,
             &mut body_output,
             1,
             &func_info.skip_statements,
             &mut declared_vars,
         );
         if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
-            if !self.body_ends_with_control_exit(&cfg.body)
+            if !self.body_ends_with_control_exit(&display_body)
                 && !Self::output_ends_with_return_stmt(&body_output)
             {
                 writeln!(body_output, "{}return {};", self.indent, fallback).unwrap();
@@ -6204,6 +6421,119 @@ mod tests {
         assert!(
             output.contains("return;"),
             "void bare return should be preserved:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_folds_terminal_tail_call_return() {
+        let tail_call = Expr::call(
+            CallTarget::Named("helper".to_string()),
+            vec![Expr::unknown("argc")],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![tail_call],
+            address_range: (0x1000, 0x1010),
+        };
+        let padding = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(1),
+            statements: vec![Expr::unknown("/* nop */")],
+            address_range: (0x1010, 0x1012),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, padding, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "main", &sig);
+        assert!(
+            output.contains("return helper(argc);"),
+            "expected terminal tail call to become a return:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    helper(argc);\n"),
+            "tail call should not remain a standalone statement:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_folds_terminal_tail_call_fallthrough() {
+        let tail_call = Expr::call(
+            CallTarget::Named("helper".to_string()),
+            vec![Expr::unknown("argc")],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![tail_call],
+            address_range: (0x1100, 0x1110),
+        };
+        let padding = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(1),
+            statements: vec![Expr::unknown("/* nop */")],
+            address_range: (0x1110, 0x1112),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, padding],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "main", &sig);
+        assert!(
+            output.contains("return helper(argc);"),
+            "expected fallthrough tail call to become a return:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return 0;"),
+            "tail-call fold should suppress fallback return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_keeps_void_tail_call_as_statement() {
+        let tail_call = Expr::call(
+            CallTarget::Named("cleanup".to_string()),
+            vec![Expr::unknown("arg0")],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![tail_call],
+            address_range: (0x1020, 0x1030),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "cleanup_wrapper", &sig);
+        assert!(
+            output.contains("\n    cleanup(arg0);\n"),
+            "void tail call should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            output.contains("return;"),
+            "void signature should preserve bare return:\n{}",
             output
         );
     }
