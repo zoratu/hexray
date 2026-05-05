@@ -772,18 +772,19 @@ impl PseudoCodeEmitter {
 
     fn rewrite_tail_call_returns_for_emission(
         nodes: &[StructuredNode],
-        fold_bare_tail_returns: bool,
+        in_tail_return_path: bool,
     ) -> Vec<StructuredNode> {
-        let mut rewritten: Vec<StructuredNode> = nodes
-            .iter()
-            .cloned()
-            .map(|node| Self::rewrite_tail_call_return_node(node, fold_bare_tail_returns))
-            .collect();
-
-        if fold_bare_tail_returns {
-            Self::fold_terminal_tail_call_return(&mut rewritten);
+        let mut rewritten = Vec::with_capacity(nodes.len());
+        for (idx, node) in nodes.iter().cloned().enumerate() {
+            let node_in_tail_return_path =
+                in_tail_return_path && Self::suffix_is_tail_return_path(&nodes[idx + 1..]);
+            rewritten.push(Self::rewrite_tail_call_return_node(
+                node,
+                node_in_tail_return_path,
+            ));
         }
 
+        Self::fold_terminal_tail_call_return(&mut rewritten, in_tail_return_path);
         rewritten
     }
 
@@ -1544,7 +1545,7 @@ impl PseudoCodeEmitter {
 
     fn rewrite_tail_call_return_node(
         node: StructuredNode,
-        fold_bare_tail_returns: bool,
+        in_tail_return_path: bool,
     ) -> StructuredNode {
         match node {
             StructuredNode::If {
@@ -1555,10 +1556,10 @@ impl PseudoCodeEmitter {
                 condition,
                 then_body: Self::rewrite_tail_call_returns_for_emission(
                     &then_body,
-                    fold_bare_tail_returns,
+                    in_tail_return_path,
                 ),
                 else_body: else_body.map(|nodes| {
-                    Self::rewrite_tail_call_returns_for_emission(&nodes, fold_bare_tail_returns)
+                    Self::rewrite_tail_call_returns_for_emission(&nodes, in_tail_return_path)
                 }),
             },
             StructuredNode::While {
@@ -1620,17 +1621,17 @@ impl PseudoCodeEmitter {
                             values,
                             Self::rewrite_tail_call_returns_for_emission(
                                 &body,
-                                fold_bare_tail_returns,
+                                in_tail_return_path,
                             ),
                         )
                     })
                     .collect(),
                 default: default.map(|nodes| {
-                    Self::rewrite_tail_call_returns_for_emission(&nodes, fold_bare_tail_returns)
+                    Self::rewrite_tail_call_returns_for_emission(&nodes, in_tail_return_path)
                 }),
             },
             StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
-                Self::rewrite_tail_call_returns_for_emission(&nodes, fold_bare_tail_returns),
+                Self::rewrite_tail_call_returns_for_emission(&nodes, in_tail_return_path),
             ),
             StructuredNode::TryCatch {
                 try_body,
@@ -1638,7 +1639,7 @@ impl PseudoCodeEmitter {
             } => StructuredNode::TryCatch {
                 try_body: Self::rewrite_tail_call_returns_for_emission(
                     &try_body,
-                    fold_bare_tail_returns,
+                    in_tail_return_path,
                 ),
                 catch_handlers: catch_handlers
                     .into_iter()
@@ -1647,7 +1648,7 @@ impl PseudoCodeEmitter {
                         variable_name: handler.variable_name,
                         body: Self::rewrite_tail_call_returns_for_emission(
                             &handler.body,
-                            fold_bare_tail_returns,
+                            in_tail_return_path,
                         ),
                         landing_pad: handler.landing_pad,
                     })
@@ -1673,8 +1674,31 @@ impl PseudoCodeEmitter {
         }
     }
 
-    fn fold_terminal_tail_call_return(nodes: &mut Vec<StructuredNode>) {
+    fn suffix_is_tail_return_path(nodes: &[StructuredNode]) -> bool {
         if nodes.is_empty() {
+            return true;
+        }
+
+        let mut saw_bare_return = false;
+        for node in nodes {
+            match node {
+                StructuredNode::Return(None) => {
+                    saw_bare_return = true;
+                }
+                _ if saw_bare_return => return false,
+                _ if Self::node_is_tail_padding(node) => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+
+    fn fold_terminal_tail_call_return(
+        nodes: &mut Vec<StructuredNode>,
+        allow_fallthrough_tail_return: bool,
+    ) {
+        if nodes.is_empty() || !allow_fallthrough_tail_return {
             return;
         }
 
@@ -7769,6 +7793,65 @@ mod tests {
         assert!(
             output.contains("return;"),
             "void signature should preserve bare return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_does_not_fold_branch_local_fallthrough_call() {
+        let branch_call = Expr::call(
+            CallTarget::Named("atoi".to_string()),
+            vec![Expr::unknown("arg0")],
+        );
+        let tail_call = Expr::call(
+            CallTarget::Named("finish".to_string()),
+            vec![Expr::unknown("arg1")],
+        );
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::If {
+                    condition: Expr::unknown("cond"),
+                    then_body: vec![StructuredNode::Block {
+                        id: hexray_core::BasicBlockId::new(0),
+                        statements: vec![Expr::assign(Expr::unknown("x"), Expr::int(2))],
+                        address_range: (0x1200, 0x1204),
+                    }],
+                    else_body: Some(vec![StructuredNode::Block {
+                        id: hexray_core::BasicBlockId::new(1),
+                        statements: vec![branch_call],
+                        address_range: (0x1210, 0x1218),
+                    }]),
+                },
+                StructuredNode::Block {
+                    id: hexray_core::BasicBlockId::new(2),
+                    statements: vec![tail_call],
+                    address_range: (0x1220, 0x1228),
+                },
+                StructuredNode::Return(None),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "main", &sig);
+        assert!(
+            output.contains("\n        atoi(arg0);\n"),
+            "branch-local fallthrough call should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return atoi(arg0);"),
+            "branch-local fallthrough call should not become a return:\n{}",
+            output
+        );
+        assert!(
+            output.contains("return finish(arg1);"),
+            "top-level tail call should still fold into a return:\n{}",
             output
         );
     }
