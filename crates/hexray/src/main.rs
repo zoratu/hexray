@@ -2406,6 +2406,215 @@ fn discover_materialized_internal_targets(
     targets
 }
 
+fn is_executable_callback_target(fmt: &dyn BinaryFormat, addr: u64) -> bool {
+    if addr == 0 {
+        return false;
+    }
+
+    fmt.sections().any(|section| {
+        let section_start = section.virtual_address();
+        let section_end = section_start.saturating_add(section.size());
+        let section_name = section.name().to_ascii_lowercase();
+        addr >= section_start
+            && addr < section_end
+            && section.is_executable()
+            && !section_name.contains("plt")
+            && !section_name.contains("stub")
+    })
+}
+
+fn read_pointer_at(fmt: &dyn BinaryFormat, addr: u64) -> Option<u64> {
+    let ptr_size = match fmt.bitness() {
+        hexray_core::Bitness::Bits32 => 4usize,
+        hexray_core::Bitness::Bits64 => 8usize,
+    };
+    let bytes = fmt.bytes_at(addr, ptr_size)?;
+
+    match (fmt.endianness(), ptr_size) {
+        (hexray_core::Endianness::Little, 4) => {
+            let value = u32::from_le_bytes(bytes.try_into().ok()?);
+            Some(value as u64)
+        }
+        (hexray_core::Endianness::Big, 4) => {
+            let value = u32::from_be_bytes(bytes.try_into().ok()?);
+            Some(value as u64)
+        }
+        (hexray_core::Endianness::Little, 8) => Some(u64::from_le_bytes(bytes.try_into().ok()?)),
+        (hexray_core::Endianness::Big, 8) => Some(u64::from_be_bytes(bytes.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+fn resolve_materialized_callback_targets(
+    fmt: &dyn BinaryFormat,
+    call: &hexray_analysis::callgraph::MaterializedIndirectCall,
+) -> Vec<u64> {
+    const MAX_SCAN_SLOTS: usize = 32;
+    const MAX_STRIDE_SLOTS: usize = 8;
+
+    let Some(section) = fmt.section_containing(call.table_base) else {
+        return Vec::new();
+    };
+    if section.is_executable() || !section.is_allocated() {
+        return Vec::new();
+    }
+
+    let ptr_size = match fmt.bitness() {
+        hexray_core::Bitness::Bits32 => 4u64,
+        hexray_core::Bitness::Bits64 => 8u64,
+    };
+    if call.deref_offset % ptr_size != 0 {
+        return Vec::new();
+    }
+
+    let Some(scan_start) = call.table_base.checked_add(call.deref_offset) else {
+        return Vec::new();
+    };
+    if scan_start % ptr_size != 0 {
+        return Vec::new();
+    }
+
+    let section_start = section.virtual_address();
+    let section_end = section_start.saturating_add(section.size());
+    if scan_start < section_start || scan_start.saturating_add(ptr_size) > section_end {
+        return Vec::new();
+    }
+
+    let remaining_slots = ((section_end - scan_start) / ptr_size) as usize;
+    let slot_count = remaining_slots.min(MAX_SCAN_SLOTS);
+    if slot_count < 2 {
+        return Vec::new();
+    }
+
+    let mut slots = Vec::with_capacity(slot_count);
+    for index in 0..slot_count {
+        let slot_addr = scan_start + index as u64 * ptr_size;
+        let Some(value) = read_pointer_at(fmt, slot_addr) else {
+            break;
+        };
+        slots.push(value);
+    }
+    if slots.len() < 2 || !is_executable_callback_target(fmt, slots[0]) {
+        return Vec::new();
+    }
+
+    let mut best_run = Vec::new();
+    let max_stride = slots.len().min(MAX_STRIDE_SLOTS + 1);
+    for stride in 1..max_stride {
+        if !is_executable_callback_target(fmt, slots[stride]) {
+            continue;
+        }
+        if (1..stride).any(|index| is_executable_callback_target(fmt, slots[index])) {
+            continue;
+        }
+
+        let mut run = vec![slots[0]];
+        let mut index = stride;
+        while index < slots.len() {
+            if stride > 1
+                && slots[index - stride + 1..index]
+                    .iter()
+                    .any(|value| *value == 0 || is_executable_callback_target(fmt, *value))
+            {
+                break;
+            }
+
+            let value = slots[index];
+            if !is_executable_callback_target(fmt, value) {
+                break;
+            }
+            run.push(value);
+            index += stride;
+        }
+
+        if run.len() >= 2 && run.len() > best_run.len() {
+            best_run = run;
+        }
+    }
+
+    best_run
+}
+
+struct MaterializedCallbackEdgeContext<'a> {
+    fmt: &'a dyn BinaryFormat,
+    arch: Architecture,
+    function_infos: &'a [FunctionInfo],
+    has_call_relocations: bool,
+    relocation_table: &'a RelocationTable,
+    symbols: &'a [hexray_core::Symbol],
+    noreturn_targets: &'a std::collections::HashSet<u64>,
+}
+
+fn add_materialized_callback_edges(
+    callgraph: &mut CallGraph,
+    ctx: MaterializedCallbackEdgeContext<'_>,
+) {
+    let disasm_x86 = X86_64Disassembler::new();
+    let disasm_arm64 = Arm64Disassembler::new();
+    let disasm_riscv = RiscVDisassembler::new();
+    let disasm_riscv32 = RiscVDisassembler::new_rv32();
+    let mut seen_edges = std::collections::HashSet::new();
+
+    for func_info in ctx.function_infos {
+        let mut instructions: Vec<hexray_core::Instruction> = match ctx.arch {
+            Architecture::X86_64 | Architecture::X86 => disassemble_for_calls(
+                &disasm_x86,
+                &func_info.bytes,
+                func_info.address,
+                func_info.heuristic_bounds,
+                ctx.noreturn_targets,
+            ),
+            Architecture::Arm64 => disassemble_for_calls(
+                &disasm_arm64,
+                &func_info.bytes,
+                func_info.address,
+                func_info.heuristic_bounds,
+                ctx.noreturn_targets,
+            ),
+            Architecture::RiscV64 => disassemble_for_calls(
+                &disasm_riscv,
+                &func_info.bytes,
+                func_info.address,
+                func_info.heuristic_bounds,
+                ctx.noreturn_targets,
+            ),
+            Architecture::RiscV32 => disassemble_for_calls(
+                &disasm_riscv32,
+                &func_info.bytes,
+                func_info.address,
+                func_info.heuristic_bounds,
+                ctx.noreturn_targets,
+            ),
+            _ => Vec::new(),
+        };
+        if ctx.has_call_relocations {
+            apply_call_relocations(&mut instructions, ctx.relocation_table);
+        }
+
+        for call in hexray_analysis::callgraph::discover_materialized_indirect_calls(&instructions)
+        {
+            for target in resolve_materialized_callback_targets(ctx.fmt, &call) {
+                if !seen_edges.insert((func_info.address, call.call_address, target)) {
+                    continue;
+                }
+                if let Some(symbol) = find_preferred_symbol_at(ctx.symbols, target) {
+                    callgraph.add_node(target, Some(symbol.name.clone()), false);
+                } else {
+                    callgraph.add_node(target, None, false);
+                }
+                callgraph.add_call(
+                    func_info.address,
+                    target,
+                    CallSite {
+                        call_address: call.call_address,
+                        call_type: CallType::Indirect,
+                    },
+                );
+            }
+        }
+    }
+}
+
 fn build_callgraph(
     binary: &Binary,
     target: &str,
@@ -2601,7 +2810,7 @@ fn build_callgraph(
     }
 
     // Build call graph using all discovered functions
-    let callgraph = if has_call_relocations {
+    let mut callgraph = if has_call_relocations {
         let mut callgraph = CallGraph::new();
         for symbol in &symbols {
             if symbol.is_function() {
@@ -2684,6 +2893,18 @@ fn build_callgraph(
             }
         }
     };
+    add_materialized_callback_edges(
+        &mut callgraph,
+        MaterializedCallbackEdgeContext {
+            fmt,
+            arch,
+            function_infos: &all_function_infos,
+            has_call_relocations,
+            relocation_table: &relocation_table,
+            symbols: &symbols,
+            noreturn_targets: &noreturn_targets,
+        },
+    );
     let callgraph = if let Some(root) = target_root {
         callgraph.subgraph_from(root)
     } else {
@@ -5819,9 +6040,10 @@ mod tests {
         default_calling_convention, discover_function_starts,
         discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
         ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
-        parse_address_str, patch_affects_function, resolve_analysis_target, string_tags,
-        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
-        SessionExportFormat, SymbolLookupMode,
+        parse_address_str, patch_affects_function, resolve_analysis_target,
+        resolve_materialized_callback_targets, string_tags, truncate_for_display,
+        DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat,
+        SymbolLookupMode,
     };
     use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding};
     use hexray_core::{
@@ -6188,6 +6410,64 @@ mod tests {
         let targets = discover_materialized_internal_targets(&instructions, &binary);
 
         assert_eq!(targets, vec![0x401080]);
+    }
+
+    #[test]
+    fn materialized_callback_targets_follow_fixed_stride_exec_entries() {
+        let mut table = vec![0u8; 0x60];
+        let mut write_ptr = |offset: usize, value: u64| {
+            table[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        };
+
+        write_ptr(0x00, 0x1228d3);
+        write_ptr(0x08, 0x0ee4f0);
+        write_ptr(0x10, 0x122ba1);
+        write_ptr(0x18, 0x0eb850);
+        write_ptr(0x20, 0x11f780);
+        write_ptr(0x28, 0x0eb7e0);
+        write_ptr(0x30, 0x122ba7);
+        write_ptr(0x38, 0x0f5a80);
+        write_ptr(0x40, 0x0);
+        write_ptr(0x48, 0x0ef000);
+
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x0eb000,
+                    data: vec![0x90; 0x10000],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".rodata",
+                    address: 0x122000,
+                    data: vec![0; 0x2000],
+                    executable: false,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".data.rel.ro",
+                    address: 0x1554c0,
+                    data: table,
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: None,
+        };
+
+        let targets = resolve_materialized_callback_targets(
+            &binary,
+            &hexray_analysis::callgraph::MaterializedIndirectCall {
+                call_address: 0x0f5357,
+                table_base: 0x1554c0,
+                deref_offset: 8,
+            },
+        );
+
+        assert_eq!(targets, vec![0x0ee4f0, 0x0eb850, 0x0eb7e0, 0x0f5a80]);
     }
 
     #[test]

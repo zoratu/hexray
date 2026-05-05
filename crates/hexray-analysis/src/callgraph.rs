@@ -40,6 +40,17 @@ pub struct CallSite {
     pub call_type: CallType,
 }
 
+/// An indirect memory call whose base register was materialized in the same function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MaterializedIndirectCall {
+    /// Address of the indirect call instruction.
+    pub call_address: u64,
+    /// Materialized base address loaded into the call's base register.
+    pub table_base: u64,
+    /// Byte offset of the function-pointer field within the referenced record.
+    pub deref_offset: u64,
+}
+
 /// A call graph representing function call relationships.
 #[derive(Debug, Default)]
 pub struct CallGraph {
@@ -412,28 +423,7 @@ impl CallGraphBuilder {
     }
 
     fn materialized_function_targets(&self, instr: &Instruction) -> Vec<u64> {
-        let Some(source) = (match instr.operation {
-            Operation::Move => instr.operands.get(1),
-            Operation::LoadEffectiveAddress => instr.operands.get(1),
-            _ => None,
-        }) else {
-            return Vec::new();
-        };
-
-        let target = match source {
-            Operand::Immediate(imm) => Some(imm.value as u64),
-            Operand::PcRelative { target, .. } => Some(*target),
-            Operand::Memory(mem)
-                if matches!(instr.operation, Operation::LoadEffectiveAddress)
-                    && mem.base.as_ref().map(|reg| reg.id) == Some(x86::RIP)
-                    && mem.index.is_none() =>
-            {
-                Some((instr.address + instr.size as u64).wrapping_add(mem.displacement as u64))
-            }
-            _ => None,
-        };
-
-        target
+        materialized_source_address(instr)
             .filter(|addr| self.is_known_internal_function(*addr))
             .into_iter()
             .collect()
@@ -450,6 +440,112 @@ impl CallGraphBuilder {
 impl Default for CallGraphBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Discover indirect memory calls that dereference a register-backed materialized address.
+pub fn discover_materialized_indirect_calls(
+    instructions: &[Instruction],
+) -> Vec<MaterializedIndirectCall> {
+    let mut register_values = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut discoveries = Vec::new();
+
+    for instr in instructions {
+        let tracked_assignment = tracked_register_assignment(instr, &register_values);
+
+        for reg in &instr.writes {
+            register_values.remove(&reg.id);
+        }
+        if let Some((dest_reg, value)) = tracked_assignment {
+            register_values.insert(dest_reg, value);
+        }
+
+        let Some(Operand::Memory(mem)) = instr.operands.first() else {
+            continue;
+        };
+        if !matches!(instr.control_flow, ControlFlow::IndirectCall { .. }) {
+            continue;
+        }
+        let Some(base_reg) = mem.base.as_ref() else {
+            continue;
+        };
+        let Some(table_base) = register_values.get(&base_reg.id).copied() else {
+            continue;
+        };
+        let Ok(deref_offset) = u64::try_from(mem.displacement) else {
+            continue;
+        };
+
+        let discovery = MaterializedIndirectCall {
+            call_address: instr.address,
+            table_base,
+            deref_offset,
+        };
+        if seen.insert(discovery.clone()) {
+            discoveries.push(discovery);
+        }
+    }
+
+    discoveries
+}
+
+fn tracked_register_assignment(
+    instr: &Instruction,
+    register_values: &HashMap<u16, u64>,
+) -> Option<(u16, u64)> {
+    let dest_reg = match instr.operands.first() {
+        Some(Operand::Register(reg)) => reg.id,
+        _ => return None,
+    };
+
+    match instr.operation {
+        Operation::Move | Operation::LoadEffectiveAddress => {
+            let source = instr.operands.get(1)?;
+            materialized_source_address(instr)
+                .or_else(|| match source {
+                    Operand::Register(reg) => register_values.get(&reg.id).copied(),
+                    Operand::Memory(mem)
+                        if matches!(instr.operation, Operation::LoadEffectiveAddress)
+                            && mem.index.is_none() =>
+                    {
+                        mem.base
+                            .as_ref()
+                            .and_then(|reg| register_values.get(&reg.id).copied())
+                    }
+                    _ => None,
+                })
+                .map(|value| (dest_reg, value))
+        }
+        Operation::Add | Operation::Sub
+            if matches!(instr.operands.get(1), Some(Operand::Immediate(_))) =>
+        {
+            register_values
+                .get(&dest_reg)
+                .copied()
+                .map(|value| (dest_reg, value))
+        }
+        _ => None,
+    }
+}
+
+fn materialized_source_address(instr: &Instruction) -> Option<u64> {
+    let source = match instr.operation {
+        Operation::Move | Operation::LoadEffectiveAddress => instr.operands.get(1),
+        _ => None,
+    }?;
+
+    match source {
+        Operand::Immediate(imm) => Some(imm.value as u64),
+        Operand::PcRelative { target, .. } => Some(*target),
+        Operand::Memory(mem)
+            if matches!(instr.operation, Operation::LoadEffectiveAddress)
+                && mem.base.as_ref().map(|reg| reg.id) == Some(x86::RIP)
+                && mem.index.is_none() =>
+        {
+            Some((instr.address + instr.size as u64).wrapping_add(mem.displacement as u64))
+        }
+        _ => None,
     }
 }
 
@@ -550,6 +646,120 @@ mod tests {
             reads: vec![],
             writes: vec![],
 
+            guard: None,
+        }
+    }
+
+    fn make_move_reg_reg_instruction(addr: u64, dest_id: u16, src_id: u16) -> Instruction {
+        let dest = Register::new(Architecture::X86_64, RegisterClass::General, dest_id, 64);
+        let src = Register::new(Architecture::X86_64, RegisterClass::General, src_id, 64);
+        Instruction {
+            address: addr,
+            size: 3,
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![Operand::Register(dest), Operand::Register(src)],
+            control_flow: ControlFlow::Sequential,
+            bytes: vec![0; 3],
+            reads: vec![src],
+            writes: vec![dest],
+            guard: None,
+        }
+    }
+
+    fn make_load_effective_address_instruction(
+        addr: u64,
+        dest_id: u16,
+        target: u64,
+    ) -> Instruction {
+        let dest = Register::new(Architecture::X86_64, RegisterClass::General, dest_id, 64);
+        let next = addr + 7;
+        let displacement = target.wrapping_sub(next) as i64;
+        Instruction {
+            address: addr,
+            size: 7,
+            operation: Operation::LoadEffectiveAddress,
+            mnemonic: "lea".to_string(),
+            operands: vec![
+                Operand::Register(dest),
+                Operand::Memory(MemoryRef {
+                    base: Some(Register::new(
+                        Architecture::X86_64,
+                        RegisterClass::General,
+                        x86::RIP,
+                        64,
+                    )),
+                    index: None,
+                    scale: 1,
+                    displacement,
+                    size: 8,
+                    segment: None,
+                    broadcast: false,
+                    index_mode: IndexMode::None,
+                    space: hexray_core::MemorySpace::Generic,
+                }),
+            ],
+            control_flow: ControlFlow::Sequential,
+            bytes: vec![0; 7],
+            reads: vec![],
+            writes: vec![dest],
+            guard: None,
+        }
+    }
+
+    fn make_indirect_call_instruction(
+        addr: u64,
+        base_id: u16,
+        index_id: u16,
+        displacement: i64,
+    ) -> Instruction {
+        let base = Register::new(Architecture::X86_64, RegisterClass::General, base_id, 64);
+        let index = Register::new(Architecture::X86_64, RegisterClass::General, index_id, 64);
+        Instruction {
+            address: addr,
+            size: 5,
+            operation: Operation::Call,
+            mnemonic: "call".to_string(),
+            operands: vec![Operand::Memory(MemoryRef {
+                base: Some(base),
+                index: Some(index),
+                scale: 1,
+                displacement,
+                size: 8,
+                segment: None,
+                broadcast: false,
+                index_mode: IndexMode::None,
+                space: hexray_core::MemorySpace::Generic,
+            })],
+            control_flow: ControlFlow::IndirectCall {
+                return_addr: addr + 5,
+            },
+            bytes: vec![0; 5],
+            reads: vec![base, index],
+            writes: vec![],
+            guard: None,
+        }
+    }
+
+    fn make_add_reg_imm_instruction(addr: u64, reg_id: u16, imm_value: i64) -> Instruction {
+        let dest = Register::new(Architecture::X86_64, RegisterClass::General, reg_id, 64);
+        Instruction {
+            address: addr,
+            size: 4,
+            operation: Operation::Add,
+            mnemonic: "add".to_string(),
+            operands: vec![
+                Operand::Register(dest),
+                Operand::Immediate(Immediate {
+                    value: imm_value as i128,
+                    size: 32,
+                    signed: true,
+                }),
+            ],
+            control_flow: ControlFlow::Sequential,
+            bytes: vec![0; 4],
+            reads: vec![dest],
+            writes: vec![dest],
             guard: None,
         }
     }
@@ -958,5 +1168,41 @@ mod tests {
         let main_callees: Vec<_> = cg.callees(0x1000).map(|(addr, _)| addr).collect();
         assert!(main_callees.contains(&0x2000));
         assert!(main_callees.contains(&0x3000));
+    }
+
+    #[test]
+    fn test_discover_materialized_indirect_calls_tracks_lea_and_register_copies() {
+        let discoveries = discover_materialized_indirect_calls(&[
+            make_load_effective_address_instruction(0x1000, x86::R14, 0x1554c0),
+            make_move_reg_reg_instruction(0x1007, x86::RBX, x86::R14),
+            make_indirect_call_instruction(0x100a, x86::RBX, x86::R13, 0x8),
+        ]);
+
+        assert_eq!(
+            discoveries,
+            vec![MaterializedIndirectCall {
+                call_address: 0x100a,
+                table_base: 0x1554c0,
+                deref_offset: 0x8,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_discover_materialized_indirect_calls_preserves_table_origin_through_add() {
+        let discoveries = discover_materialized_indirect_calls(&[
+            make_load_effective_address_instruction(0x1000, x86::RBX, 0x1554c0),
+            make_add_reg_imm_instruction(0x1007, x86::RBX, 0x10),
+            make_indirect_call_instruction(0x100b, x86::RBX, x86::R13, 0x8),
+        ]);
+
+        assert_eq!(
+            discoveries,
+            vec![MaterializedIndirectCall {
+                call_address: 0x100b,
+                table_base: 0x1554c0,
+                deref_offset: 0x8,
+            }]
+        );
     }
 }
