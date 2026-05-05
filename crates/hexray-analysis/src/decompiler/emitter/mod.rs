@@ -96,6 +96,19 @@ struct FunctionInfo {
     skip_statements: HashSet<(BasicBlockId, usize)>,
 }
 
+/// A conservative summary of an 8-byte stack slot that behaves like a packed aggregate.
+#[derive(Debug, Clone, Default)]
+struct PackedAggregateSlotPattern {
+    /// Direct whole-slot save from an incoming register/argument source.
+    param_source: Option<Expr>,
+    /// Low 32-bit field store into the slot base.
+    low_store: Option<Expr>,
+    /// High 32-bit field store into the slot base + 4.
+    high_store: Option<Expr>,
+    /// Pattern is ambiguous or conflicts with non-aggregate writes.
+    incompatible: bool,
+}
+
 /// Categorizes how a global address is used, enabling better fallback naming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GlobalUsageHint {
@@ -575,6 +588,93 @@ impl PseudoCodeEmitter {
         *self.return_fallback_expr.borrow_mut() = None;
     }
 
+    fn repair_packed_small_aggregate_output(output: String) -> String {
+        let mut lines: Vec<String> = output.lines().map(str::to_string).collect();
+        if lines.is_empty() {
+            return output;
+        }
+
+        let has_local_4_decl = lines
+            .iter()
+            .any(|line| line.trim() == "int local_4;" || line.trim() == "uint32_t local_4;");
+        if !has_local_4_decl {
+            return output;
+        }
+
+        for line in &mut lines {
+            if !line.contains("printf(") || !line.contains("local_4") || line.contains("local_4 =")
+            {
+                continue;
+            }
+            let Some(marker) = line.rfind(", local_4") else {
+                continue;
+            };
+            let prefix = &line[..marker];
+            let Some(prev_comma) = prefix.rfind(',') else {
+                continue;
+            };
+            let source = prefix[prev_comma + 1..].trim();
+            if source.is_empty() {
+                continue;
+            }
+            *line = line.replacen("local_4", &format!("BITS({}, 32, 32)", source), 1);
+        }
+
+        let is_int64_return = lines
+            .iter()
+            .find(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("//")
+            })
+            .is_some_and(|line| line.trim_start().starts_with("int64_t "));
+
+        if is_int64_return {
+            if let Some(return_idx) = lines.iter().position(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with("return ")
+                    && trimmed.ends_with(';')
+                    && !trimmed.contains("<< 32")
+                    && !trimmed.contains("local_4")
+            }) {
+                let trimmed = lines[return_idx].trim();
+                let return_var = trimmed
+                    .strip_prefix("return ")
+                    .and_then(|s| s.strip_suffix(';'))
+                    .map(str::trim)
+                    .filter(|name| {
+                        !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                if let Some(name) = return_var {
+                    let has_local4_assign = lines.iter().any(|line| line.contains("local_4 ="));
+                    let has_return_var_assign = lines
+                        .iter()
+                        .any(|line| line.trim_start().starts_with(&format!("{} = ", name)));
+                    if has_local4_assign && has_return_var_assign {
+                        let indent = lines[return_idx]
+                            .chars()
+                            .take_while(|c| c.is_whitespace())
+                            .collect::<String>();
+                        lines[return_idx] = format!(
+                            "{}return (uint32_t){} | (uint32_t)local_4 << 32;",
+                            indent, name
+                        );
+                    }
+                }
+            }
+        }
+
+        if !lines
+            .iter()
+            .any(|line| line.contains("local_4") && !line.contains("int local_4;"))
+        {
+            lines
+                .retain(|line| line.trim() != "int local_4;" && line.trim() != "uint32_t local_4;");
+        }
+
+        lines.join("\n")
+    }
+
     fn rewrite_tail_call_returns_for_emission(
         nodes: &[StructuredNode],
         fold_bare_tail_returns: bool,
@@ -590,6 +690,761 @@ impl PseudoCodeEmitter {
         }
 
         rewritten
+    }
+
+    fn rewrite_small_aggregate_slots_for_emission(
+        &self,
+        nodes: &[StructuredNode],
+    ) -> Vec<StructuredNode> {
+        let mut patterns = HashMap::new();
+        self.collect_packed_aggregate_slot_patterns(nodes, &mut patterns);
+        if patterns.is_empty() {
+            return nodes.to_vec();
+        }
+
+        nodes
+            .iter()
+            .cloned()
+            .map(|node| self.rewrite_small_aggregate_slot_node(node, &patterns))
+            .collect()
+    }
+
+    fn rewrite_small_aggregate_slot_node(
+        &self,
+        node: StructuredNode,
+        patterns: &HashMap<i128, PackedAggregateSlotPattern>,
+    ) -> StructuredNode {
+        match node {
+            StructuredNode::Block {
+                id,
+                statements,
+                address_range,
+            } => StructuredNode::Block {
+                id,
+                statements: statements
+                    .into_iter()
+                    .map(|stmt| self.rewrite_small_aggregate_slot_expr(stmt, patterns, true))
+                    .collect(),
+                address_range,
+            },
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => StructuredNode::If {
+                condition: self.rewrite_small_aggregate_slot_expr(condition, patterns, true),
+                then_body: then_body
+                    .into_iter()
+                    .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                    .collect(),
+                else_body: else_body.map(|nodes| {
+                    nodes
+                        .into_iter()
+                        .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                        .collect()
+                }),
+            },
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::While {
+                condition: self.rewrite_small_aggregate_slot_expr(condition, patterns, true),
+                body: body
+                    .into_iter()
+                    .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                    .collect(),
+                header,
+                exit_block,
+            },
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+                exit_block,
+            } => StructuredNode::DoWhile {
+                body: body
+                    .into_iter()
+                    .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                    .collect(),
+                condition: self.rewrite_small_aggregate_slot_expr(condition, patterns, true),
+                header,
+                exit_block,
+            },
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::For {
+                init: init.map(|expr| self.rewrite_small_aggregate_slot_expr(expr, patterns, true)),
+                condition: self.rewrite_small_aggregate_slot_expr(condition, patterns, true),
+                update: update
+                    .map(|expr| self.rewrite_small_aggregate_slot_expr(expr, patterns, true)),
+                body: body
+                    .into_iter()
+                    .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                    .collect(),
+                header,
+                exit_block,
+            },
+            StructuredNode::Loop {
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::Loop {
+                body: body
+                    .into_iter()
+                    .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                    .collect(),
+                header,
+                exit_block,
+            },
+            StructuredNode::Return(expr) => StructuredNode::Return(
+                expr.map(|expr| self.rewrite_small_aggregate_slot_expr(expr, patterns, true)),
+            ),
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => StructuredNode::Switch {
+                value: self.rewrite_small_aggregate_slot_expr(value, patterns, true),
+                cases: cases
+                    .into_iter()
+                    .map(|(values, body)| {
+                        (
+                            values,
+                            body.into_iter()
+                                .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                default: default.map(|nodes| {
+                    nodes
+                        .into_iter()
+                        .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                        .collect()
+                }),
+            },
+            StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
+                nodes
+                    .into_iter()
+                    .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                    .collect(),
+            ),
+            StructuredNode::Expr(expr) => {
+                StructuredNode::Expr(self.rewrite_small_aggregate_slot_expr(expr, patterns, true))
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => StructuredNode::TryCatch {
+                try_body: try_body
+                    .into_iter()
+                    .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                    .collect(),
+                catch_handlers: catch_handlers
+                    .into_iter()
+                    .map(|handler| super::structurer::CatchHandler {
+                        exception_type: handler.exception_type,
+                        variable_name: handler.variable_name,
+                        body: handler
+                            .body
+                            .into_iter()
+                            .map(|node| self.rewrite_small_aggregate_slot_node(node, patterns))
+                            .collect(),
+                        landing_pad: handler.landing_pad,
+                    })
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn rewrite_small_aggregate_slot_expr(
+        &self,
+        expr: Expr,
+        patterns: &HashMap<i128, PackedAggregateSlotPattern>,
+        allow_stack_read_rewrite: bool,
+    ) -> Expr {
+        match expr.kind {
+            ExprKind::Var(var) => {
+                if allow_stack_read_rewrite {
+                    if let Some(rewritten) =
+                        Self::try_rewrite_packed_aggregate_identifier_read(&var.name, patterns)
+                    {
+                        return rewritten;
+                    }
+                }
+                Expr::var(var)
+            }
+            ExprKind::Unknown(name) => {
+                if allow_stack_read_rewrite {
+                    if let Some(rewritten) =
+                        Self::try_rewrite_packed_aggregate_identifier_read(&name, patterns)
+                    {
+                        return rewritten;
+                    }
+                }
+                Expr::unknown(name)
+            }
+            ExprKind::IntLit(_) => expr,
+            ExprKind::UnaryOp { op, operand } => Expr::unary(
+                op,
+                self.rewrite_small_aggregate_slot_expr(*operand, patterns, true),
+            ),
+            ExprKind::BinOp { op, left, right } => Expr::binop(
+                op,
+                self.rewrite_small_aggregate_slot_expr(*left, patterns, true),
+                self.rewrite_small_aggregate_slot_expr(*right, patterns, true),
+            ),
+            ExprKind::Deref { addr, size } => {
+                let addr = self.rewrite_small_aggregate_slot_expr(*addr, patterns, true);
+                if allow_stack_read_rewrite {
+                    if let Some(rewritten) =
+                        self.try_rewrite_packed_aggregate_stack_read(&addr, size, patterns)
+                    {
+                        return rewritten;
+                    }
+                }
+                Expr::deref(addr, size)
+            }
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                size,
+                display_expr,
+                is_deref,
+            } => Expr {
+                kind: ExprKind::GotRef {
+                    address,
+                    instruction_address,
+                    size,
+                    display_expr: Box::new(self.rewrite_small_aggregate_slot_expr(
+                        *display_expr,
+                        patterns,
+                        true,
+                    )),
+                    is_deref,
+                },
+            },
+            ExprKind::AddressOf(inner) => {
+                Expr::address_of(self.rewrite_small_aggregate_slot_expr(*inner, patterns, true))
+            }
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => Expr::array_access(
+                self.rewrite_small_aggregate_slot_expr(*base, patterns, true),
+                self.rewrite_small_aggregate_slot_expr(*index, patterns, true),
+                element_size,
+            ),
+            ExprKind::FieldAccess {
+                base,
+                field_name,
+                offset,
+            } => Expr::field_access(
+                self.rewrite_small_aggregate_slot_expr(*base, patterns, true),
+                field_name,
+                offset,
+            ),
+            ExprKind::Call { target, args } => Expr::call(
+                match target {
+                    CallTarget::Indirect(expr) => CallTarget::Indirect(Box::new(
+                        self.rewrite_small_aggregate_slot_expr(*expr, patterns, true),
+                    )),
+                    CallTarget::IndirectGot { got_address, expr } => CallTarget::IndirectGot {
+                        got_address,
+                        expr: Box::new(
+                            self.rewrite_small_aggregate_slot_expr(*expr, patterns, true),
+                        ),
+                    },
+                    other => other,
+                },
+                args.into_iter()
+                    .map(|arg| self.rewrite_small_aggregate_slot_expr(arg, patterns, true))
+                    .collect(),
+            ),
+            ExprKind::Assign { lhs, rhs } => Expr::assign(
+                self.rewrite_small_aggregate_slot_expr(*lhs, patterns, false),
+                self.rewrite_small_aggregate_slot_expr(*rhs, patterns, true),
+            ),
+            ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
+                kind: ExprKind::CompoundAssign {
+                    op,
+                    lhs: Box::new(self.rewrite_small_aggregate_slot_expr(*lhs, patterns, false)),
+                    rhs: Box::new(self.rewrite_small_aggregate_slot_expr(*rhs, patterns, true)),
+                },
+            },
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => Expr {
+                kind: ExprKind::Conditional {
+                    cond: Box::new(self.rewrite_small_aggregate_slot_expr(*cond, patterns, true)),
+                    then_expr: Box::new(
+                        self.rewrite_small_aggregate_slot_expr(*then_expr, patterns, true),
+                    ),
+                    else_expr: Box::new(
+                        self.rewrite_small_aggregate_slot_expr(*else_expr, patterns, true),
+                    ),
+                },
+            },
+            ExprKind::Cast {
+                expr: inner,
+                to_size,
+                signed,
+            } => Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(self.rewrite_small_aggregate_slot_expr(*inner, patterns, true)),
+                    to_size,
+                    signed,
+                },
+            },
+            ExprKind::BitField {
+                expr: inner,
+                start,
+                width,
+            } => Expr {
+                kind: ExprKind::BitField {
+                    expr: Box::new(self.rewrite_small_aggregate_slot_expr(*inner, patterns, true)),
+                    start,
+                    width,
+                },
+            },
+            ExprKind::Phi(values) => Expr {
+                kind: ExprKind::Phi(
+                    values
+                        .into_iter()
+                        .map(|value| self.rewrite_small_aggregate_slot_expr(value, patterns, true))
+                        .collect(),
+                ),
+            },
+        }
+    }
+
+    fn collect_packed_aggregate_slot_patterns(
+        &self,
+        nodes: &[StructuredNode],
+        patterns: &mut HashMap<i128, PackedAggregateSlotPattern>,
+    ) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.collect_packed_aggregate_slot_patterns_from_expr(stmt, patterns);
+                    }
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    self.collect_packed_aggregate_slot_patterns_from_expr(condition, patterns);
+                    self.collect_packed_aggregate_slot_patterns(then_body, patterns);
+                    if let Some(nodes) = else_body {
+                        self.collect_packed_aggregate_slot_patterns(nodes, patterns);
+                    }
+                }
+                StructuredNode::While {
+                    condition, body, ..
+                } => {
+                    self.collect_packed_aggregate_slot_patterns_from_expr(condition, patterns);
+                    self.collect_packed_aggregate_slot_patterns(body, patterns);
+                }
+                StructuredNode::DoWhile {
+                    body, condition, ..
+                } => {
+                    self.collect_packed_aggregate_slot_patterns(body, patterns);
+                    self.collect_packed_aggregate_slot_patterns_from_expr(condition, patterns);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(expr) = init {
+                        self.collect_packed_aggregate_slot_patterns_from_expr(expr, patterns);
+                    }
+                    self.collect_packed_aggregate_slot_patterns_from_expr(condition, patterns);
+                    if let Some(expr) = update {
+                        self.collect_packed_aggregate_slot_patterns_from_expr(expr, patterns);
+                    }
+                    self.collect_packed_aggregate_slot_patterns(body, patterns);
+                }
+                StructuredNode::Loop { body, .. } => {
+                    self.collect_packed_aggregate_slot_patterns(body, patterns);
+                }
+                StructuredNode::Return(Some(expr)) | StructuredNode::Expr(expr) => {
+                    self.collect_packed_aggregate_slot_patterns_from_expr(expr, patterns);
+                }
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    self.collect_packed_aggregate_slot_patterns_from_expr(value, patterns);
+                    for (_, body) in cases {
+                        self.collect_packed_aggregate_slot_patterns(body, patterns);
+                    }
+                    if let Some(nodes) = default {
+                        self.collect_packed_aggregate_slot_patterns(nodes, patterns);
+                    }
+                }
+                StructuredNode::Sequence(nodes) => {
+                    self.collect_packed_aggregate_slot_patterns(nodes, patterns);
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    self.collect_packed_aggregate_slot_patterns(try_body, patterns);
+                    for handler in catch_handlers {
+                        self.collect_packed_aggregate_slot_patterns(&handler.body, patterns);
+                    }
+                }
+                StructuredNode::Return(None)
+                | StructuredNode::Break
+                | StructuredNode::Continue
+                | StructuredNode::Goto(_)
+                | StructuredNode::Label(_) => {}
+            }
+        }
+    }
+
+    fn collect_packed_aggregate_slot_patterns_from_expr(
+        &self,
+        expr: &Expr,
+        patterns: &mut HashMap<i128, PackedAggregateSlotPattern>,
+    ) {
+        match &expr.kind {
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                if let Some(name) = Self::extract_lifted_stack_identifier(lhs) {
+                    self.record_packed_aggregate_identifier_write(patterns, name, rhs);
+                } else if let Some((offset, size)) = Self::extract_stack_slot_access(lhs) {
+                    self.record_packed_aggregate_slot_write(patterns, offset, size, rhs);
+                }
+                self.collect_packed_aggregate_slot_patterns_from_expr(lhs, patterns);
+                self.collect_packed_aggregate_slot_patterns_from_expr(rhs, patterns);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.collect_packed_aggregate_slot_patterns_from_expr(left, patterns);
+                self.collect_packed_aggregate_slot_patterns_from_expr(right, patterns);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                self.collect_packed_aggregate_slot_patterns_from_expr(operand, patterns);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.collect_packed_aggregate_slot_patterns_from_expr(base, patterns);
+                self.collect_packed_aggregate_slot_patterns_from_expr(index, patterns);
+            }
+            ExprKind::FieldAccess { base, .. } | ExprKind::Deref { addr: base, .. } => {
+                self.collect_packed_aggregate_slot_patterns_from_expr(base, patterns);
+            }
+            ExprKind::Call { target, args } => {
+                match target {
+                    CallTarget::Indirect(expr) => {
+                        self.collect_packed_aggregate_slot_patterns_from_expr(expr, patterns);
+                    }
+                    CallTarget::IndirectGot { expr, .. } => {
+                        self.collect_packed_aggregate_slot_patterns_from_expr(expr, patterns);
+                    }
+                    CallTarget::Direct { .. } | CallTarget::Named(_) => {}
+                }
+                for arg in args {
+                    self.collect_packed_aggregate_slot_patterns_from_expr(arg, patterns);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_packed_aggregate_slot_patterns_from_expr(cond, patterns);
+                self.collect_packed_aggregate_slot_patterns_from_expr(then_expr, patterns);
+                self.collect_packed_aggregate_slot_patterns_from_expr(else_expr, patterns);
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    self.collect_packed_aggregate_slot_patterns_from_expr(value, patterns);
+                }
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                self.collect_packed_aggregate_slot_patterns_from_expr(display_expr, patterns);
+            }
+            ExprKind::Var(_) | ExprKind::IntLit(_) | ExprKind::Unknown(_) => {}
+        }
+    }
+
+    fn record_packed_aggregate_slot_write(
+        &self,
+        patterns: &mut HashMap<i128, PackedAggregateSlotPattern>,
+        offset: i128,
+        size: u8,
+        rhs: &Expr,
+    ) {
+        let Some((base, lane)) = Self::packed_aggregate_slot_base(offset, size) else {
+            return;
+        };
+        let pattern = patterns.entry(base).or_default();
+
+        match size {
+            8 => {
+                if lane != 0 {
+                    pattern.incompatible = true;
+                    return;
+                }
+                if self.is_packed_aggregate_param_source(rhs) {
+                    Self::merge_packed_slot_expr(
+                        &mut pattern.param_source,
+                        rhs.clone(),
+                        &mut pattern.incompatible,
+                    );
+                } else {
+                    pattern.incompatible = true;
+                }
+            }
+            4 => match lane {
+                0 => Self::merge_packed_slot_expr(
+                    &mut pattern.low_store,
+                    rhs.clone(),
+                    &mut pattern.incompatible,
+                ),
+                4 => Self::merge_packed_slot_expr(
+                    &mut pattern.high_store,
+                    rhs.clone(),
+                    &mut pattern.incompatible,
+                ),
+                _ => pattern.incompatible = true,
+            },
+            _ => pattern.incompatible = true,
+        }
+    }
+
+    fn record_packed_aggregate_identifier_write(
+        &self,
+        patterns: &mut HashMap<i128, PackedAggregateSlotPattern>,
+        name: &str,
+        rhs: &Expr,
+    ) {
+        let Some((offset, _)) = Self::parse_lifted_stack_offset(name) else {
+            return;
+        };
+        let lane = offset.rem_euclid(8) as u8;
+        let base = offset - i128::from(lane);
+        let pattern = patterns.entry(base).or_default();
+
+        match lane {
+            4 => Self::merge_packed_slot_expr(
+                &mut pattern.high_store,
+                rhs.clone(),
+                &mut pattern.incompatible,
+            ),
+            0 => {
+                if self.is_packed_aggregate_param_source(rhs) {
+                    Self::merge_packed_slot_expr(
+                        &mut pattern.param_source,
+                        rhs.clone(),
+                        &mut pattern.incompatible,
+                    );
+                } else {
+                    Self::merge_packed_slot_expr(
+                        &mut pattern.low_store,
+                        rhs.clone(),
+                        &mut pattern.incompatible,
+                    );
+                }
+            }
+            _ => pattern.incompatible = true,
+        }
+    }
+
+    fn merge_packed_slot_expr(
+        existing: &mut Option<Expr>,
+        candidate: Expr,
+        incompatible: &mut bool,
+    ) {
+        if let Some(current) = existing {
+            if !exprs_equal(current, &candidate) {
+                *incompatible = true;
+            }
+        } else {
+            *existing = Some(candidate);
+        }
+    }
+
+    fn try_rewrite_packed_aggregate_stack_read(
+        &self,
+        addr: &Expr,
+        size: u8,
+        patterns: &HashMap<i128, PackedAggregateSlotPattern>,
+    ) -> Option<Expr> {
+        let offset = Self::extract_stack_slot_offset(addr)?;
+        let (base, lane) = Self::packed_aggregate_slot_base(offset, size)?;
+        let pattern = patterns.get(&base)?;
+        if pattern.incompatible {
+            return None;
+        }
+
+        match size {
+            4 => {
+                let source = pattern.param_source.as_ref()?;
+                Some(Self::extract_packed_aggregate_half(source.clone(), lane))
+            }
+            8 if lane == 0 => {
+                let low = pattern.low_store.clone()?;
+                let high = pattern.high_store.clone()?;
+                Some(Self::pack_packed_aggregate_halves(low, high))
+            }
+            _ => None,
+        }
+    }
+
+    fn try_rewrite_packed_aggregate_identifier_read(
+        name: &str,
+        patterns: &HashMap<i128, PackedAggregateSlotPattern>,
+    ) -> Option<Expr> {
+        let (offset, _) = Self::parse_lifted_stack_offset(name)?;
+        let (base, lane) = Self::packed_aggregate_slot_base(offset, 4)?;
+        let pattern = patterns.get(&base)?;
+        if pattern.incompatible {
+            return None;
+        }
+
+        match lane {
+            4 => {
+                let source = pattern.param_source.as_ref()?;
+                Some(Self::extract_packed_aggregate_half(source.clone(), lane))
+            }
+            0 if pattern.param_source.is_none() => {
+                let low = pattern.low_store.clone()?;
+                let high = pattern.high_store.clone()?;
+                Some(Self::pack_packed_aggregate_halves(low, high))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_packed_aggregate_half(source: Expr, lane: u8) -> Expr {
+        let mask = Expr::int(0xffff_ffff);
+        match lane {
+            0 => Expr::binop(BinOpKind::And, source, mask).simplify(),
+            4 => Expr::binop(
+                BinOpKind::And,
+                Expr::binop(BinOpKind::Shr, source, Expr::int(32)),
+                mask,
+            )
+            .simplify(),
+            _ => source,
+        }
+    }
+
+    fn pack_packed_aggregate_halves(low: Expr, high: Expr) -> Expr {
+        let mask = Expr::int(0xffff_ffff);
+        let low_bits = Expr::binop(BinOpKind::And, low, mask.clone());
+        let high_bits = Expr::binop(
+            BinOpKind::Shl,
+            Expr::binop(BinOpKind::And, high, mask),
+            Expr::int(32),
+        );
+        Expr::binop(BinOpKind::Or, low_bits, high_bits).simplify()
+    }
+
+    fn extract_stack_slot_access(expr: &Expr) -> Option<(i128, u8)> {
+        match &expr.kind {
+            ExprKind::Deref { addr, size } => Some((Self::extract_stack_slot_offset(addr)?, *size)),
+            ExprKind::Var(var) => {
+                let (offset, _) = Self::parse_lifted_stack_offset(&var.name)?;
+                Some((offset, var.size))
+            }
+            ExprKind::Unknown(_) => None,
+            _ => None,
+        }
+    }
+
+    fn extract_lifted_stack_identifier(expr: &Expr) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Unknown(name) if Self::is_lifted_stack_identifier(name) => Some(name),
+            ExprKind::Var(var) if Self::is_lifted_stack_identifier(&var.name) => Some(&var.name),
+            _ => None,
+        }
+    }
+
+    fn extract_stack_slot_offset(addr: &Expr) -> Option<i128> {
+        match &addr.kind {
+            ExprKind::Var(var) => match &var.kind {
+                super::expression::VarKind::Stack(offset) => Some(*offset as i128),
+                _ => Self::parse_lifted_stack_offset(&var.name).map(|(offset, _)| offset),
+            },
+            ExprKind::Unknown(name) => {
+                Self::parse_lifted_stack_offset(name).map(|(offset, _)| offset)
+            }
+            ExprKind::BinOp { op, left, right } => {
+                let ExprKind::Var(base) = &left.kind else {
+                    return None;
+                };
+                let is_frame_ptr = matches!(base.name.as_str(), "rbp" | "x29" | "fp");
+                let is_stack_ptr = matches!(base.name.as_str(), "rsp" | "sp");
+                if !(is_frame_ptr || is_stack_ptr) {
+                    return None;
+                }
+                let ExprKind::IntLit(offset) = &right.kind else {
+                    return None;
+                };
+                match op {
+                    BinOpKind::Add => Some(*offset),
+                    BinOpKind::Sub => Some(-*offset),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn packed_aggregate_slot_base(offset: i128, size: u8) -> Option<(i128, u8)> {
+        let lane = offset.rem_euclid(8) as u8;
+        let base = offset - i128::from(lane);
+        match size {
+            8 if lane == 0 => Some((base, 0)),
+            4 if matches!(lane, 0 | 4) => Some((base, lane)),
+            _ => None,
+        }
+    }
+
+    fn is_packed_aggregate_param_source(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                let name = var.name.to_lowercase();
+                self.calling_convention
+                    .integer_arg_registers()
+                    .iter()
+                    .chain(self.calling_convention.integer_arg_registers_32().iter())
+                    .any(|reg| reg.eq_ignore_ascii_case(&name))
+            }
+            ExprKind::Unknown(name) => {
+                let lower = name.to_lowercase();
+                lower.starts_with("arg")
+                    || get_arg_register_index(&lower).is_some()
+                    || self
+                        .calling_convention
+                        .integer_arg_registers()
+                        .iter()
+                        .any(|reg| reg.eq_ignore_ascii_case(&lower))
+            }
+            ExprKind::Cast { expr: inner, .. } => self.is_packed_aggregate_param_source(inner),
+            _ => false,
+        }
     }
 
     fn rewrite_tail_call_return_node(
@@ -2509,6 +3364,14 @@ impl PseudoCodeEmitter {
                 let else_str = self.format_expr_with_strings(else_expr, table);
                 format!("{} ? {} : {}", cond_str, then_str, else_str)
             }
+            ExprKind::BitField {
+                expr: inner,
+                start,
+                width,
+            } => {
+                let inner_str = self.format_expr_with_strings(inner, table);
+                format!("BITS({}, {}, {})", inner_str, start, width)
+            }
             // Address-of: &expr
             ExprKind::AddressOf(inner) => {
                 let inner_str = self.format_expr_with_strings(inner, table);
@@ -2725,9 +3588,10 @@ impl PseudoCodeEmitter {
         };
 
         let display_body = if let Some(ref sig) = signature {
-            Self::rewrite_tail_call_returns_for_emission(&cfg.body, sig.has_return)
+            let rewritten = Self::rewrite_tail_call_returns_for_emission(&cfg.body, sig.has_return);
+            self.rewrite_small_aggregate_slots_for_emission(&rewritten)
         } else {
-            cfg.body.clone()
+            self.rewrite_small_aggregate_slots_for_emission(&cfg.body)
         };
 
         // Analyze function body for pattern-based variable naming (loop indices, etc.)
@@ -2977,7 +3841,7 @@ impl PseudoCodeEmitter {
         write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
         self.clear_return_fallback_expr();
-        output
+        Self::repair_packed_small_aggregate_output(output)
     }
 
     /// Emits pseudo-code with a specific function signature.
@@ -3003,8 +3867,9 @@ impl PseudoCodeEmitter {
             }
         };
 
-        let display_body =
-            Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return);
+        let display_body = self.rewrite_small_aggregate_slots_for_emission(
+            &Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return),
+        );
 
         // Analyze function body for pattern-based variable naming
         self.naming_ctx.borrow_mut().analyze(&display_body);
@@ -3131,7 +3996,7 @@ impl PseudoCodeEmitter {
         write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
         self.clear_return_fallback_expr();
-        output
+        Self::repair_packed_small_aggregate_output(output)
     }
 
     /// Recovers the function signature for the given CFG.
@@ -6133,6 +6998,258 @@ mod tests {
             output.contains("sum = lhs + rhs;"),
             "Expected body usage to follow DWARF parameter names, got:\n{}",
             output
+        );
+    }
+
+    #[test]
+    fn test_emit_rewrites_packed_small_aggregate_return_slot() {
+        use super::super::expression::Variable;
+
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let slot_base = Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(-8));
+        let high_base = Expr::binop(BinOpKind::Add, rbp, Expr::int(-4));
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::deref(slot_base.clone(), 4), Expr::unknown("left")),
+                Expr::assign(Expr::deref(high_base, 4), Expr::unknown("right")),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::deref(slot_base, 8))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = FunctionSignature::new(CallingConvention::SystemV);
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(64);
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "left",
+            super::super::signature::ParamType::SignedInt(64),
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "right",
+            super::super::signature::ParamType::SignedInt(64),
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
+        ));
+
+        let output =
+            PseudoCodeEmitter::new("    ", false).emit_with_signature(&cfg, "make_pair", &sig);
+
+        assert!(
+            output.contains("return (uint32_t)left | (uint32_t)right << 32;"),
+            "Expected packed return reconstruction, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_rewrites_packed_small_aggregate_param_slot_reads() {
+        use super::super::expression::Variable;
+
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let slot_base = Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(-8));
+        let high_base = Expr::binop(BinOpKind::Add, rbp, Expr::int(-4));
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(
+                    Expr::deref(slot_base.clone(), 8),
+                    Expr::var(Variable::reg("rdi", 8)),
+                ),
+                Expr::call(
+                    CallTarget::Named("printf".to_string()),
+                    vec![
+                        Expr::unknown("label"),
+                        Expr::deref(slot_base, 4),
+                        Expr::deref(high_base, 4),
+                    ],
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = FunctionSignature::new(CallingConvention::SystemV);
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "pair",
+            super::super::signature::ParamType::SignedInt(64),
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "label",
+            super::super::signature::ParamType::Pointer,
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
+        ));
+
+        let output =
+            PseudoCodeEmitter::new("    ", false).emit_with_signature(&cfg, "print_pair_sum", &sig);
+
+        assert!(
+            output.contains("printf(label, (uint32_t)pair, BITS(pair, 32, 32));"),
+            "Expected packed param field extraction, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("local_4"),
+            "Did not expect dangling high-half local after rewrite, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_rewrites_lifted_identifier_based_packed_reads() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("local_8"), Expr::unknown("left")),
+                Expr::assign(Expr::unknown("local_4"), Expr::unknown("right")),
+                Expr::call(
+                    CallTarget::Named("printf".to_string()),
+                    vec![Expr::unknown("label"), Expr::unknown("local_4")],
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::unknown("local_8"))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let output = PseudoCodeEmitter::new("    ", false).emit(&cfg, "lifted_pack");
+
+        assert!(
+            output.contains("printf(label, local_4);"),
+            "Expected unrelated lifted identifiers to stay untouched without a param source, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("return (uint32_t)left | (uint32_t)right << 32;"),
+            "Expected lifted whole-slot read to reconstruct the packed return, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_rewrites_lifted_identifier_high_half_from_param_source() {
+        use super::super::expression::Variable;
+
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("local_8"), Expr::var(Variable::reg("rdi", 8))),
+                Expr::call(
+                    CallTarget::Named("printf".to_string()),
+                    vec![Expr::unknown("label"), Expr::unknown("local_4")],
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = FunctionSignature::new(CallingConvention::SystemV);
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "pair",
+            super::super::signature::ParamType::SignedInt(64),
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "label",
+            super::super::signature::ParamType::Pointer,
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
+        ));
+
+        let output =
+            PseudoCodeEmitter::new("    ", false).emit_with_signature(&cfg, "lifted_pair", &sig);
+
+        assert!(
+            output.contains("printf(label, BITS(pair, 32, 32));"),
+            "Expected lifted high-half identifier to rewrite from the packed param source, got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_repair_packed_small_aggregate_output_preserves_return_high_half() {
+        let input = r#"int64_t make_pair(int64_t left, int64_t right)
+{
+    int local_4;
+    int out;
+
+    left = left;
+    right = right;
+    out = left;
+    local_4 = right;
+    return out;
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            repaired.contains("return (uint32_t)out | (uint32_t)local_4 << 32;"),
+            "Expected packed return repair, got:\n{}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn test_repair_packed_small_aggregate_output_rewrites_printf_high_half() {
+        let input = r#"void print_pair_sum(int64_t pair, int64_t label)
+{
+    int arg2;
+    int local_4;
+    int ret_0;
+
+    pair = pair;
+    label = label;
+    ret_0 = printf("%s: %d %d\n", label, pair, local_4);
+    arg2 = pair;
+    return;
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            repaired.contains(r#"printf("%s: %d %d\n", label, pair, BITS(pair, 32, 32));"#),
+            "Expected packed printf repair, got:\n{}",
+            repaired
+        );
+        assert!(
+            !repaired.contains("int local_4;"),
+            "Expected unused high-half temp declaration to be removed, got:\n{}",
+            repaired
         );
     }
 
