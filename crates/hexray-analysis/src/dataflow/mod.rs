@@ -90,6 +90,30 @@ impl InstructionEffects {
                 }
             }
 
+            Operation::Syscall => {
+                if let Some(arch) = infer_arch_from_instruction(inst).or(default_arch) {
+                    match arch {
+                        Architecture::X86_64 | Architecture::X86 => {
+                            for reg in [
+                                x86::RAX,
+                                x86::RDI,
+                                x86::RSI,
+                                x86::RDX,
+                                x86::R10,
+                                x86::R8,
+                                x86::R9,
+                            ] {
+                                effects.uses.push(Location::Register(reg));
+                            }
+                            for reg in [x86::RAX, x86::RCX, x86::R11] {
+                                effects.defs.push(Location::Register(reg));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // Store: [mem] = src
             Operation::Store => {
                 if inst.operands.len() >= 2 {
@@ -356,6 +380,13 @@ fn infer_arch_from_instruction(inst: &Instruction) -> Option<Architecture> {
         .find_map(arch_from_operand)
         .or_else(|| inst.reads.first().map(|reg| reg.arch))
         .or_else(|| inst.writes.first().map(|reg| reg.arch))
+        .or_else(|| match (inst.operation, inst.mnemonic.as_str()) {
+            (Operation::Syscall, "syscall") => Some(Architecture::X86_64),
+            (Operation::Syscall, "svc") => Some(Architecture::Arm64),
+            (Operation::Syscall, "ecall") => Some(Architecture::RiscV64),
+            (Operation::ReadTsc | Operation::ReadTscP, _) => Some(Architecture::X86_64),
+            _ => None,
+        })
 }
 
 pub(crate) fn infer_cfg_arch(cfg: &ControlFlowGraph) -> Option<Architecture> {
@@ -507,8 +538,8 @@ impl DataflowSolver {
 mod tests {
     use super::*;
     use hexray_core::{
-        Architecture, BasicBlock, BlockTerminator, Immediate, IndexMode, Instruction, MemoryRef,
-        Operand, Operation, Register, RegisterClass,
+        register::x86, Architecture, BasicBlock, BlockTerminator, Immediate, IndexMode,
+        Instruction, MemoryRef, Operand, Operation, Register, RegisterClass,
     };
 
     // --- Location Tests ---
@@ -790,6 +821,21 @@ mod tests {
     fn test_instruction_effects_default() {
         assert!(InstructionEffects::default().defs.is_empty());
         assert!(InstructionEffects::default().uses.is_empty());
+    }
+
+    #[test]
+    fn test_instruction_effects_syscall_x86_64() {
+        let mut inst = Instruction::new(0x1000, 2, vec![0x0f, 0x05], "syscall");
+        inst.operation = Operation::Syscall;
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.uses.contains(&Location::Register(x86::RAX)));
+        assert!(effects.uses.contains(&Location::Register(x86::RDI)));
+        assert!(effects.uses.contains(&Location::Register(x86::R10)));
+        assert!(effects.defs.contains(&Location::Register(x86::RAX)));
+        assert!(effects.defs.contains(&Location::Register(x86::RCX)));
+        assert!(effects.defs.contains(&Location::Register(x86::R11)));
     }
 
     // --- is_stack_pointer / is_frame_pointer Tests ---

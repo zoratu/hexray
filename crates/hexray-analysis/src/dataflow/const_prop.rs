@@ -9,7 +9,7 @@
 //! - Improving decompiler output quality
 
 use super::Location;
-use hexray_core::{BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation};
+use hexray_core::{register::x86, BasicBlockId, ControlFlowGraph, Instruction, Operand, Operation};
 use std::collections::{HashMap, HashSet};
 
 /// The value of a location in constant propagation.
@@ -256,6 +256,12 @@ impl ConstantPropagation {
             Operation::Call => {
                 // Conservatively clobber common return registers
                 state.set(Location::Register(0), ConstValue::NotConstant); // rax/x0
+            }
+
+            Operation::Syscall => {
+                state.set(Location::Register(x86::RAX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::RCX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::R11), ConstValue::NotConstant);
             }
 
             // Other operations: conservatively mark destination as non-constant
@@ -725,6 +731,28 @@ mod tests {
         // rax should be NotConstant after call (return value register)
         assert_eq!(
             analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(0)),
+            ConstValue::NotConstant
+        );
+    }
+
+    #[test]
+    fn test_constant_propagation_syscall_clobbers_rax() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        bb.push_instruction(make_mov_reg_imm(0x1000, x86::RAX, 39));
+
+        let mut syscall_inst = Instruction::new(0x1007, 2, vec![0x0f, 0x05], "syscall");
+        syscall_inst.operation = Operation::Syscall;
+        bb.push_instruction(syscall_inst);
+
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(x86::RAX)),
             ConstValue::NotConstant
         );
     }

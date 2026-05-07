@@ -1342,7 +1342,17 @@ impl Expr {
             }
             Operation::Return => Self::unknown("return"),
             Operation::Nop => Self::unknown("/* nop */"),
-            Operation::Syscall => Self::call(CallTarget::Named("syscall".to_string()), vec![]),
+            Operation::Syscall => {
+                if inst.mnemonic.eq_ignore_ascii_case("syscall") {
+                    let rax = Self::var(Variable::reg("rax", 8));
+                    Self::assign(
+                        rax.clone(),
+                        Self::call(CallTarget::Named("syscall".to_string()), vec![rax]),
+                    )
+                } else {
+                    Self::call(CallTarget::Named("syscall".to_string()), vec![])
+                }
+            }
             Operation::Interrupt => {
                 if !ops.is_empty() {
                     Self::call(
@@ -4770,5 +4780,15 @@ mod tests {
             !rendered.contains("*("),
             "LEA should not produce a dereference: {rendered}"
         );
+    }
+
+    #[test]
+    fn test_syscall_lifts_to_opaque_rax_assignment() {
+        let inst = Instruction::new(0x401141, 2, vec![0x0f, 0x05], "syscall")
+            .with_operation(Operation::Syscall);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "rax = syscall(rax)");
     }
 }

@@ -1934,7 +1934,7 @@ impl<'a> Structurer<'a> {
             .enumerate()
             .filter(|(idx, inst)| {
                 // Skip branch instructions, but keep calls
-                if inst.is_branch() && !inst.is_call() {
+                if inst.is_branch() && !inst.is_call() && inst.operation != Operation::Syscall {
                     return false;
                 }
                 // Skip the compare/subs instruction if it's used for a conditional branch

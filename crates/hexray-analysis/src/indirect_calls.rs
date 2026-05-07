@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use hexray_core::{ControlFlow, Instruction, Operand, Operation, Symbol};
+use hexray_core::{register::x86, ControlFlow, Instruction, Operand, Operation, Symbol};
 
 use crate::dataflow::{ConstState, ConstValue, Location};
 use crate::xrefs::{XrefDatabase, XrefType};
@@ -624,6 +624,12 @@ impl IndirectCallResolver {
             // Call clobbers return register
             Operation::Call => {
                 state.set(Location::Register(0), ConstValue::NotConstant); // rax/x0
+            }
+
+            Operation::Syscall => {
+                state.set(Location::Register(x86::RAX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::RCX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::R11), ConstValue::NotConstant);
             }
 
             // Other operations conservatively clobber destination
