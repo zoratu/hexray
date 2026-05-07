@@ -1274,6 +1274,76 @@ fn find_preferred_symbol_at(
         })
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CompilerGeneratedAliasRank {
+    SplitVariant,
+    OptimizedClone,
+    PrivateClone,
+}
+
+fn compiler_generated_alias_rank(
+    candidate: &str,
+    query: &str,
+) -> Option<CompilerGeneratedAliasRank> {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum SuffixKind {
+        SplitVariant,
+        OptimizedClone,
+        PrivateClone,
+    }
+
+    fn strip_one_suffix(name: &str) -> Option<(&str, SuffixKind)> {
+        let (prefix, suffix) = name.rsplit_once('.')?;
+        match suffix {
+            "cold" | "hot" | "unlikely" => return Some((prefix, SuffixKind::SplitVariant)),
+            _ => {}
+        }
+
+        if !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+
+        let (prefix, class) = prefix.rsplit_once('.')?;
+        let kind = match class {
+            "cold" | "hot" | "unlikely" => SuffixKind::SplitVariant,
+            "lto_priv" | "lto_partition" => SuffixKind::PrivateClone,
+            "constprop" | "isra" | "part" | "clone" | "prop" | "llvm" => SuffixKind::OptimizedClone,
+            _ => return None,
+        };
+
+        Some((prefix, kind))
+    }
+
+    let mut current = candidate;
+    let mut best_rank: Option<CompilerGeneratedAliasRank> = None;
+    let mut saw_split_variant = false;
+
+    while let Some((stripped, kind)) = strip_one_suffix(current) {
+        current = stripped;
+        saw_split_variant |= kind == SuffixKind::SplitVariant;
+
+        if current != query {
+            continue;
+        }
+
+        let rank = if saw_split_variant {
+            CompilerGeneratedAliasRank::SplitVariant
+        } else {
+            match kind {
+                SuffixKind::SplitVariant => CompilerGeneratedAliasRank::SplitVariant,
+                SuffixKind::OptimizedClone => CompilerGeneratedAliasRank::OptimizedClone,
+                SuffixKind::PrivateClone => CompilerGeneratedAliasRank::PrivateClone,
+            }
+        };
+        best_rank = Some(match best_rank {
+            Some(current_best) => current_best.max(rank),
+            None => rank,
+        });
+    }
+
+    best_rank
+}
+
 fn find_symbol_in_candidates(
     symbols: &[hexray_core::Symbol],
     name: &str,
@@ -1352,6 +1422,49 @@ fn find_symbol_in_candidates(
 
     if mode == SymbolLookupMode::ExactOnly {
         return None;
+    }
+
+    let compiler_generated_rank = |symbol: &hexray_core::Symbol| {
+        [
+            compiler_generated_alias_rank(&symbol.name, name),
+            compiler_generated_alias_rank(symbol.name_without_plt(), name),
+            compiler_generated_alias_rank(symbol.unversioned_name(), name),
+            {
+                let demangled = demangle_or_original(&symbol.name);
+                compiler_generated_alias_rank(&demangled, name)
+            },
+            {
+                let demangled = demangle_or_original(&symbol.name);
+                compiler_generated_alias_rank(hexray_core::strip_plt_suffix(&demangled), name)
+            },
+            {
+                let demangled = demangle_or_original(&symbol.name);
+                compiler_generated_alias_rank(
+                    hexray_core::unversioned_symbol_name(&demangled),
+                    name,
+                )
+            },
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    };
+
+    let compiler_generated_matches: Vec<_> = symbols
+        .iter()
+        .filter_map(|symbol| compiler_generated_rank(symbol).map(|rank| (rank, symbol.clone())))
+        .collect();
+    if let Some(best_rank) = compiler_generated_matches
+        .iter()
+        .map(|(rank, _)| *rank)
+        .max()
+    {
+        return pick_best(
+            compiler_generated_matches
+                .into_iter()
+                .filter_map(|(rank, symbol)| (rank == best_rank).then_some(symbol))
+                .collect(),
+        );
     }
 
     // 3. Try prefix match (e.g., "nfsd_open" matches "nfsd_open.cold")
@@ -7026,6 +7139,20 @@ mod tests {
             find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
 
         assert_eq!(resolved.name, "nfsd_open.cold");
+    }
+
+    #[test]
+    fn compiler_generated_aliases_prefer_primary_clone_over_cold_split() {
+        let symbols = vec![
+            test_symbol("compute.cold", 0x401070),
+            test_symbol("compute.lto_priv.1234", 0x4010f0),
+        ];
+
+        let resolved =
+            find_symbol_in_candidates(&symbols, "compute", SymbolLookupMode::Fuzzy).unwrap();
+
+        assert_eq!(resolved.name, "compute.lto_priv.1234");
+        assert_eq!(resolved.address, 0x4010f0);
     }
 
     #[test]
