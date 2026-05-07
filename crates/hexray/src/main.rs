@@ -1960,22 +1960,30 @@ fn build_symbol_table(binary: &Binary) -> SymbolTable {
     let mut table = SymbolTable::new();
     let mut best_symbols: std::collections::HashMap<u64, hexray_core::Symbol> =
         std::collections::HashMap::new();
+    let mut symbols: Vec<_> = fmt
+        .symbols()
+        .cloned()
+        .map(|mut symbol| {
+            symbol.address = normalize_symbol_address(&symbol, tls_layout);
+            symbol
+        })
+        .collect();
+    add_ifunc_plt_aliases(binary, &mut symbols);
 
     // Add all symbols (both functions and data) for proper resolution.
     // TLS symbols are normalized to their TLS image address so rewritten
     // fs:/gs: references can resolve to names instead of raw offsets.
-    for symbol in fmt.symbols() {
+    for symbol in &symbols {
         if symbol.name.is_empty() {
             continue;
         }
 
-        let address = normalize_symbol_address(symbol, tls_layout);
+        let address = symbol.address;
         if address == 0 {
             continue;
         }
 
-        let mut candidate = symbol.clone();
-        candidate.address = address;
+        let candidate = symbol.clone();
         match best_symbols.entry(address) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(candidate);
@@ -2071,6 +2079,186 @@ fn resolve_relocation_symbol(symbol: &hexray_core::Symbol) -> (u64, bool) {
     }
 }
 
+const R_X86_64_IRELATIVE: u32 = 37;
+
+fn ifunc_symbol_alias(
+    symbols: &[hexray_core::Symbol],
+    resolver_addr: u64,
+) -> Option<hexray_core::Symbol> {
+    symbols
+        .iter()
+        .find(|symbol| {
+            symbol.address == resolver_addr
+                && matches!(symbol.kind, hexray_core::SymbolKind::Other(10))
+                && !symbol.name.is_empty()
+        })
+        .cloned()
+}
+
+fn add_ifunc_plt_aliases(binary: &Binary, symbols: &mut Vec<hexray_core::Symbol>) {
+    let Binary::Elf(elf) = binary else {
+        return;
+    };
+
+    let mut plt_sec = None;
+    let mut plt = None;
+    for section in &elf.sections {
+        match elf.section_name(section) {
+            Some(".plt.sec") => plt_sec = Some(section),
+            Some(".plt") => plt = Some(section),
+            _ => {}
+        }
+    }
+
+    let (stub_base, stub_size, stub_count, has_header) = match (plt_sec, plt) {
+        (Some(section), _) => (
+            section.sh_addr,
+            section.sh_entsize.max(16),
+            section.sh_size / section.sh_entsize.max(16),
+            false,
+        ),
+        (None, Some(section)) => (
+            section.sh_addr,
+            section.sh_entsize.max(16),
+            section.sh_size / section.sh_entsize.max(16),
+            true,
+        ),
+        _ => return,
+    };
+
+    let mut seen: std::collections::HashSet<(u64, String)> = symbols
+        .iter()
+        .map(|symbol| (symbol.address, symbol.name.clone()))
+        .collect();
+
+    for rel_section in &elf.sections {
+        let rel_name = elf.section_name(rel_section).unwrap_or("");
+        if rel_name != ".rela.plt" && rel_name != ".rel.plt" {
+            continue;
+        }
+
+        let rel_start = rel_section.sh_offset as usize;
+        let rel_end = rel_start.saturating_add(rel_section.sh_size as usize);
+        let rel_entsize = rel_section.sh_entsize as usize;
+        if rel_end > elf.data().len() || rel_end <= rel_start || rel_entsize == 0 {
+            continue;
+        }
+
+        let mut reloc_entries = Vec::new();
+        let mut rel_offset = rel_start;
+        while let Some(rel_next) = rel_offset.checked_add(rel_entsize) {
+            if rel_next > rel_end {
+                break;
+            }
+
+            let entry_bytes = elf.data().get(rel_offset..rel_next).unwrap_or(&[]);
+            let (offset, sym_index, reloc_type, addend) = match elf.header.class {
+                hexray_formats::elf::ElfClass::Elf64 => {
+                    if entry_bytes.len() < 16 {
+                        break;
+                    }
+                    let offset_bytes: [u8; 8] = entry_bytes
+                        .get(0..8)
+                        .unwrap_or(&[0; 8])
+                        .try_into()
+                        .unwrap_or([0; 8]);
+                    let offset = match elf.header.endianness {
+                        hexray_core::Endianness::Little => u64::from_le_bytes(offset_bytes),
+                        hexray_core::Endianness::Big => u64::from_be_bytes(offset_bytes),
+                    };
+                    let info_bytes: [u8; 8] = entry_bytes
+                        .get(8..16)
+                        .unwrap_or(&[0; 8])
+                        .try_into()
+                        .unwrap_or([0; 8]);
+                    let r_info = match elf.header.endianness {
+                        hexray_core::Endianness::Little => u64::from_le_bytes(info_bytes),
+                        hexray_core::Endianness::Big => u64::from_be_bytes(info_bytes),
+                    };
+                    let addend = if rel_name == ".rela.plt" && entry_bytes.len() >= 24 {
+                        let addend_bytes: [u8; 8] = entry_bytes
+                            .get(16..24)
+                            .unwrap_or(&[0; 8])
+                            .try_into()
+                            .unwrap_or([0; 8]);
+                        match elf.header.endianness {
+                            hexray_core::Endianness::Little => i64::from_le_bytes(addend_bytes),
+                            hexray_core::Endianness::Big => i64::from_be_bytes(addend_bytes),
+                        }
+                    } else {
+                        0
+                    };
+                    (offset, (r_info >> 32) as u32, r_info as u32, addend)
+                }
+                hexray_formats::elf::ElfClass::Elf32 => {
+                    if entry_bytes.len() < 8 {
+                        break;
+                    }
+                    let offset_bytes: [u8; 4] = entry_bytes
+                        .get(0..4)
+                        .unwrap_or(&[0; 4])
+                        .try_into()
+                        .unwrap_or([0; 4]);
+                    let offset = match elf.header.endianness {
+                        hexray_core::Endianness::Little => u32::from_le_bytes(offset_bytes) as u64,
+                        hexray_core::Endianness::Big => u32::from_be_bytes(offset_bytes) as u64,
+                    };
+                    let info_bytes: [u8; 4] = entry_bytes
+                        .get(4..8)
+                        .unwrap_or(&[0; 4])
+                        .try_into()
+                        .unwrap_or([0; 4]);
+                    let r_info = match elf.header.endianness {
+                        hexray_core::Endianness::Little => u32::from_le_bytes(info_bytes),
+                        hexray_core::Endianness::Big => u32::from_be_bytes(info_bytes),
+                    };
+                    let addend = if rel_name == ".rela.plt" && entry_bytes.len() >= 12 {
+                        let addend_bytes: [u8; 4] = entry_bytes
+                            .get(8..12)
+                            .unwrap_or(&[0; 4])
+                            .try_into()
+                            .unwrap_or([0; 4]);
+                        let raw = match elf.header.endianness {
+                            hexray_core::Endianness::Little => i32::from_le_bytes(addend_bytes),
+                            hexray_core::Endianness::Big => i32::from_be_bytes(addend_bytes),
+                        };
+                        i64::from(raw)
+                    } else {
+                        0
+                    };
+                    (offset, r_info >> 8, r_info & 0xff, addend)
+                }
+            };
+
+            reloc_entries.push((offset, sym_index, reloc_type, addend));
+            rel_offset = rel_next;
+        }
+
+        reloc_entries.sort_by_key(|(offset, _, _, _)| *offset);
+        let header_shift = u64::from(has_header && (reloc_entries.len() as u64) < stub_count);
+
+        for (stub_index, (_, sym_index, reloc_type, addend)) in
+            reloc_entries.into_iter().enumerate()
+        {
+            if sym_index == 0 && reloc_type == R_X86_64_IRELATIVE {
+                if let Ok(resolver_addr) = u64::try_from(addend) {
+                    if let Some(mut alias) = ifunc_symbol_alias(symbols, resolver_addr) {
+                        let stub_idx = (stub_index as u64).saturating_add(header_shift);
+                        alias.address =
+                            stub_base.saturating_add(stub_size.saturating_mul(stub_idx));
+                        alias.size = stub_size;
+                        alias.kind = hexray_core::SymbolKind::Function;
+                        alias.section_index = None;
+                        if seen.insert((alias.address, alias.name.clone())) {
+                            symbols.push(alias);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn collect_analysis_symbols(
     binary: &Binary,
     relocations: &RelocationTable,
@@ -2085,6 +2273,7 @@ fn collect_analysis_symbols(
             symbol
         })
         .collect();
+    add_ifunc_plt_aliases(binary, &mut symbols);
     let mut seen = std::collections::HashSet::new();
     for symbol in &symbols {
         seen.insert((symbol.address, symbol.name.clone()));
@@ -6495,6 +6684,27 @@ mod tests {
             find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
 
         assert_eq!(resolved.name, "nfsd_open.cold");
+    }
+
+    #[test]
+    fn exact_lookup_prefers_callable_alias_over_ifunc_symbol() {
+        let symbols = vec![
+            Symbol {
+                name: "strlen".to_string(),
+                address: 0x4115f0,
+                size: 112,
+                kind: SymbolKind::Other(10),
+                binding: SymbolBinding::Global,
+                section_index: Some(7),
+            },
+            test_symbol("strlen", 0x401160),
+        ];
+
+        let resolved =
+            find_symbol_in_candidates(&symbols, "strlen", SymbolLookupMode::ExactOnly).unwrap();
+
+        assert_eq!(resolved.address, 0x401160);
+        assert!(resolved.is_function());
     }
 
     #[test]
