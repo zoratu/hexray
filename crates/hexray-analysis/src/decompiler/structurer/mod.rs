@@ -45,7 +45,8 @@ use gotos::{
 use simplify::capture_return_register_uses_in_block;
 use simplify::{
     extract_return_value, merge_return_value_captures, propagate_args_in_block,
-    propagate_call_args, simplify_statements, substitute_return_register_uses,
+    propagate_call_args, simplify_statements, statement_contains_real_call,
+    substitute_return_register_uses,
 };
 use switch::{detect_switch_statements, simplify_strcmp_switch_patterns};
 #[cfg(test)]
@@ -366,12 +367,14 @@ impl StructuredCfg {
         exception_info: Option<&ExceptionInfo>,
     ) -> Self {
         let known_noreturn_targets = HashMap::new();
-        Self::from_cfg_with_config_and_binary_data_and_exception_info_and_noreturn_targets(
+        let known_ubsan_targets = HashMap::new();
+        Self::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
             cfg,
             config,
             binary_data,
             exception_info,
             &known_noreturn_targets,
+            &known_ubsan_targets,
         )
     }
 
@@ -382,14 +385,34 @@ impl StructuredCfg {
         exception_info: Option<&ExceptionInfo>,
         known_noreturn_targets: &HashMap<u64, String>,
     ) -> Self {
+        let known_ubsan_targets = HashMap::new();
+        Self::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
+            cfg,
+            config,
+            binary_data,
+            exception_info,
+            known_noreturn_targets,
+            &known_ubsan_targets,
+        )
+    }
+
+    pub(crate) fn from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
+        cfg: &ControlFlowGraph,
+        config: &super::config::DecompilerConfig,
+        binary_data: Option<&BinaryDataContext>,
+        exception_info: Option<&ExceptionInfo>,
+        known_noreturn_targets: &HashMap<u64, String>,
+        known_ubsan_targets: &HashMap<u64, String>,
+    ) -> Self {
         use super::config::OptimizationPass;
 
         let annotations = StructuringAnnotations::from_cfg_and_exception_info(cfg, exception_info);
-        let mut structurer = Structurer::new_with_binary_data_annotations_and_noreturn_targets(
+        let mut structurer = Structurer::new_with_binary_data_annotations_and_known_targets(
             cfg,
             binary_data,
             annotations,
             known_noreturn_targets.clone(),
+            known_ubsan_targets.clone(),
         );
         let mut body = structurer.structure();
         if !structurer.known_noreturn_targets.is_empty() {
@@ -572,6 +595,8 @@ struct Structurer<'a> {
     binary_data: Option<&'a BinaryDataContext>,
     /// Known noreturn call targets resolved from the enclosing decompiler context.
     known_noreturn_targets: HashMap<u64, String>,
+    /// Known recoverable UBSan helper targets resolved from the enclosing decompiler context.
+    known_ubsan_targets: HashMap<u64, String>,
 }
 
 impl<'a> Structurer<'a> {
@@ -614,6 +639,22 @@ impl<'a> Structurer<'a> {
         binary_data: Option<&'a BinaryDataContext>,
         annotations: StructuringAnnotations,
         known_noreturn_targets: HashMap<u64, String>,
+    ) -> Self {
+        Self::new_with_binary_data_annotations_and_known_targets(
+            cfg,
+            binary_data,
+            annotations,
+            known_noreturn_targets,
+            HashMap::new(),
+        )
+    }
+
+    fn new_with_binary_data_annotations_and_known_targets(
+        cfg: &'a ControlFlowGraph,
+        binary_data: Option<&'a BinaryDataContext>,
+        annotations: StructuringAnnotations,
+        known_noreturn_targets: HashMap<u64, String>,
+        known_ubsan_targets: HashMap<u64, String>,
     ) -> Self {
         let loops = cfg.find_loops();
         let mut loop_headers = HashSet::new();
@@ -692,6 +733,7 @@ impl<'a> Structurer<'a> {
             annotations,
             binary_data,
             known_noreturn_targets,
+            known_ubsan_targets,
         }
     }
 
@@ -753,8 +795,11 @@ impl<'a> Structurer<'a> {
             let original_statements = std::mem::take(statements);
             let (filtered_statements, branch_return) =
                 extract_return_value(original_statements.clone());
-            let branch_is_pure_return_setup = filtered_statements.is_empty();
-            if branch_is_pure_return_setup && branch_return.is_some() {
+            let branch_return_is_safe = branch_return.is_some()
+                && filtered_statements
+                    .last()
+                    .map_or(true, |stmt| !statement_contains_real_call(stmt));
+            if branch_return_is_safe {
                 *statements = filtered_statements;
                 return_value = branch_return;
             } else {
@@ -1009,6 +1054,56 @@ impl<'a> Structurer<'a> {
         None
     }
 
+    fn is_recoverable_ubsan_handler_block(
+        &self,
+        block_id: BasicBlockId,
+        normal_target: BasicBlockId,
+    ) -> bool {
+        let Some(block) = self.cfg.block(block_id) else {
+            return false;
+        };
+        let Some(call_inst) = block.instructions.last() else {
+            return false;
+        };
+        let ControlFlow::Call { target, .. } = &call_inst.control_flow else {
+            return false;
+        };
+        let Some(name) = self.known_ubsan_targets.get(target) else {
+            return false;
+        };
+        if !crate::is_ubsan_handler_function_name(name) {
+            return false;
+        }
+        if !matches!(
+            block.terminator,
+            BlockTerminator::Call { return_block, .. } if return_block == normal_target
+        ) && !matches!(
+            block.terminator,
+            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target }
+                if target == normal_target
+        ) {
+            return false;
+        }
+
+        block.instructions[..block.instructions.len().saturating_sub(1)]
+            .iter()
+            .all(|inst| !inst.is_branch() && inst.operation != Operation::Syscall)
+    }
+
+    fn ubsan_probe_normal_target(
+        &self,
+        true_target: BasicBlockId,
+        false_target: BasicBlockId,
+    ) -> Option<(BasicBlockId, BasicBlockId)> {
+        if self.is_recoverable_ubsan_handler_block(true_target, false_target) {
+            return Some((true_target, false_target));
+        }
+        if self.is_recoverable_ubsan_handler_block(false_target, true_target) {
+            return Some((false_target, true_target));
+        }
+        None
+    }
+
     fn asan_probe_setup_end_index(
         &self,
         block: &BasicBlock,
@@ -1038,6 +1133,70 @@ impl<'a> Structurer<'a> {
                 ) || instruction_transfers_from_any_reg(inst, &access_regs)
             })
             .map(|(idx, _)| idx)
+    }
+
+    fn recoverable_ubsan_setup_end_index(
+        &self,
+        block: &BasicBlock,
+        normal_target: BasicBlockId,
+    ) -> Option<usize> {
+        let has_explicit_guard_setup = block.instructions.iter().any(|inst| {
+            matches!(inst.operation, Operation::Compare | Operation::Test)
+                || matches!(inst.operation, Operation::Sub if inst.operands.len() < 3)
+        });
+        if !has_explicit_guard_setup {
+            return block.instructions.len().checked_sub(1);
+        }
+
+        let live_in_regs = self.block_live_in_registers(normal_target)?;
+        if live_in_regs.is_empty() {
+            return None;
+        }
+
+        block
+            .instructions
+            .iter()
+            .enumerate()
+            .rfind(|(_, inst)| {
+                inst.writes
+                    .iter()
+                    .map(canonical_register_key)
+                    .any(|reg| live_in_regs.contains(&reg))
+            })
+            .map(|(idx, _)| idx)
+    }
+
+    fn block_live_in_registers(&self, block_id: BasicBlockId) -> Option<HashSet<String>> {
+        let block = self.cfg.block(block_id)?;
+        let mut defined = HashSet::new();
+        let mut live_in = HashSet::new();
+
+        for inst in &block.instructions {
+            for reg in &inst.reads {
+                let reg = canonical_register_key(reg);
+                if !defined.contains(&reg) {
+                    live_in.insert(reg);
+                }
+            }
+            for reg in &inst.writes {
+                defined.insert(canonical_register_key(reg));
+            }
+        }
+
+        Some(live_in)
+    }
+
+    fn can_inline_ubsan_continuation(
+        &self,
+        block_id: BasicBlockId,
+        handler_target: BasicBlockId,
+        normal_target: BasicBlockId,
+    ) -> bool {
+        let preds = self.cfg.predecessors(normal_target);
+        !preds.is_empty()
+            && preds
+                .iter()
+                .all(|pred| *pred == block_id || *pred == handler_target)
     }
 
     fn find_loop_exits(cfg: &ControlFlowGraph, body: &HashSet<BasicBlockId>) -> Vec<BasicBlockId> {
@@ -1338,6 +1497,124 @@ impl<'a> Structurer<'a> {
                             });
                         }
                         self.processed.insert(report_target);
+                        current = Some(normal_target);
+                        continue;
+                    }
+                    if let Some((handler_target, normal_target)) =
+                        self.ubsan_probe_normal_target(*true_target, *false_target)
+                    {
+                        self.processed.insert(handler_target);
+
+                        let mut trimmed_normal = self.block_to_statements(normal_target);
+                        trim_trailing_epilogue_statements(&mut trimmed_normal);
+                        let (filtered_normal, normal_return) =
+                            extract_return_value(trimmed_normal.clone());
+                        if filtered_normal.is_empty() && normal_return.is_some() {
+                            self.processed.insert(normal_target);
+
+                            let mut merged_statements = statements.clone();
+                            merged_statements.extend(trimmed_normal);
+                            let (filtered_stmts, return_value) =
+                                extract_return_value(merged_statements);
+
+                            if !filtered_stmts.is_empty() {
+                                result.push(StructuredNode::Block {
+                                    id: block_id,
+                                    statements: filtered_stmts,
+                                    address_range,
+                                });
+                            }
+                            result.push(StructuredNode::Return(return_value));
+                            break;
+                        }
+
+                        if self.can_inline_ubsan_continuation(
+                            block_id,
+                            handler_target,
+                            normal_target,
+                        ) {
+                            let Some(normal_block) = self.cfg.block(normal_target) else {
+                                break;
+                            };
+
+                            self.processed.insert(normal_target);
+                            let mut merged_statements = statements.clone();
+                            let mut normal_statements = self.block_to_statements(normal_target);
+                            trim_trailing_epilogue_statements(&mut normal_statements);
+                            merged_statements.append(&mut normal_statements);
+                            let merged_range = (block.start, normal_block.end);
+
+                            match &normal_block.terminator {
+                                BlockTerminator::Return => {
+                                    let (mut filtered_stmts, return_value) =
+                                        extract_return_value(merged_statements);
+                                    let implicit_return = return_value
+                                        .is_none()
+                                        .then(|| {
+                                            self.implicit_return_register_expr_for_block(
+                                                normal_target,
+                                            )
+                                        })
+                                        .flatten();
+                                    if matches!(
+                                        implicit_return,
+                                        Some(Expr {
+                                            kind: ExprKind::Call { .. }
+                                        })
+                                    ) && matches!(
+                                        filtered_stmts.last(),
+                                        Some(Expr {
+                                            kind: ExprKind::Call { .. },
+                                        })
+                                    ) {
+                                        filtered_stmts.pop();
+                                    }
+                                    let return_value = return_value.or(implicit_return);
+
+                                    if !filtered_stmts.is_empty() {
+                                        result.push(StructuredNode::Block {
+                                            id: block_id,
+                                            statements: filtered_stmts,
+                                            address_range: merged_range,
+                                        });
+                                    }
+                                    result.push(StructuredNode::Return(return_value));
+                                    break;
+                                }
+                                BlockTerminator::Jump { target }
+                                | BlockTerminator::Fallthrough { target } => {
+                                    if !merged_statements.is_empty() {
+                                        result.push(StructuredNode::Block {
+                                            id: block_id,
+                                            statements: merged_statements,
+                                            address_range: merged_range,
+                                        });
+                                    }
+                                    current = Some(*target);
+                                    continue;
+                                }
+                                BlockTerminator::Call { return_block, .. } => {
+                                    if !merged_statements.is_empty() {
+                                        result.push(StructuredNode::Block {
+                                            id: block_id,
+                                            statements: merged_statements,
+                                            address_range: merged_range,
+                                        });
+                                    }
+                                    current = Some(*return_block);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !statements.is_empty() {
+                            result.push(StructuredNode::Block {
+                                id: block_id,
+                                statements,
+                                address_range,
+                            });
+                        }
                         current = Some(normal_target);
                         continue;
                     }
@@ -2174,12 +2451,34 @@ impl<'a> Structurer<'a> {
                 }),
             _ => None,
         };
+        let recoverable_ubsan_setup_end = match block.terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } => self
+                .ubsan_probe_normal_target(true_target, false_target)
+                .map(|(_, normal_target)| {
+                    self.recoverable_ubsan_setup_end_index(block, normal_target)
+                }),
+            _ => None,
+        };
 
         let exprs: Vec<Expr> = block
             .instructions
             .iter()
             .enumerate()
             .filter(|(idx, inst)| {
+                if let Some(last_keep_idx) = recoverable_ubsan_setup_end {
+                    match last_keep_idx {
+                        Some(last_keep_idx) => {
+                            if *idx > last_keep_idx {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
                 if let Some(last_keep_idx) = probe_setup_end {
                     if *idx > last_keep_idx {
                         return false;
@@ -2252,6 +2551,42 @@ fn operand_uses_any_reg(operand: &Operand, regs: &HashSet<u16>) -> bool {
             mem.base.as_ref().is_some_and(|reg| regs.contains(&reg.id))
                 || mem.index.as_ref().is_some_and(|reg| regs.contains(&reg.id))
         }
+        _ => false,
+    }
+}
+
+fn canonical_register_key(reg: &hexray_core::Register) -> String {
+    let name = reg.name().to_ascii_lowercase();
+    abi::normalize_x86_64_register(&name, (reg.size / 8) as u8)
+        .map(|(normalized, _)| normalized.to_string())
+        .unwrap_or(name)
+}
+
+fn trim_trailing_epilogue_statements(statements: &mut Vec<Expr>) {
+    while statements
+        .last()
+        .is_some_and(is_trailing_epilogue_statement)
+    {
+        statements.pop();
+    }
+}
+
+fn is_trailing_epilogue_statement(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Assign { lhs, .. } => match &lhs.kind {
+            ExprKind::Var(var) => {
+                abi::is_callee_saved_or_renamed(&var.name)
+                    || matches!(
+                        var.name.as_str(),
+                        "sp" | "rsp" | "esp" | "fp" | "rbp" | "ebp"
+                    )
+            }
+            _ => false,
+        },
+        ExprKind::CompoundAssign { lhs, .. } => match &lhs.kind {
+            ExprKind::Var(var) => matches!(var.name.as_str(), "sp" | "rsp" | "esp"),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -3146,8 +3481,11 @@ fn attach_shared_return_to_branch(
         let original_statements = std::mem::take(statements);
         let (filtered_statements, branch_return) =
             extract_return_value(original_statements.clone());
-        let branch_is_pure_return_setup = filtered_statements.is_empty();
-        if branch_is_pure_return_setup && branch_return.is_some() {
+        let branch_return_is_safe = branch_return.is_some()
+            && filtered_statements
+                .last()
+                .map_or(true, |stmt| !statement_contains_real_call(stmt));
+        if branch_return_is_safe {
             *statements = filtered_statements;
             return_value = branch_return;
         } else {
@@ -5458,6 +5796,295 @@ mod tests {
     }
 
     #[test]
+    fn test_recoverable_ubsan_setup_end_index_tracks_continuation_live_ins() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+        let ebx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 32);
+        let r12d = Register::new(Architecture::X86_64, RegisterClass::General, 12, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let dl = Register::new(Architecture::X86_64, RegisterClass::General, 2, 8);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut probe = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let mut load_rhs = Instruction::new(0x1000, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(esi)]);
+        load_rhs.reads = vec![esi];
+        load_rhs.writes = vec![ebx];
+        probe.instructions.push(load_rhs);
+
+        let mut load_lhs = Instruction::new(0x1003, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(r12d), Operand::Register(edi)]);
+        load_lhs.reads = vec![edi];
+        load_lhs.writes = vec![r12d];
+        probe.instructions.push(load_lhs);
+
+        let mut guard_test = Instruction::new(0x1006, 2, vec![], "test")
+            .with_operation(Operation::Test)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(ebx)]);
+        guard_test.reads = vec![ebx, ebx];
+        probe.instructions.push(guard_test);
+
+        let mut guard_set = Instruction::new(0x1008, 2, vec![], "sete")
+            .with_operation(Operation::SetConditional)
+            .with_operands(vec![Operand::Register(dl)]);
+        guard_set.writes = vec![dl];
+        probe.instructions.push(guard_set);
+        cfg.add_block(probe.clone());
+
+        let mut normal = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        let mut move_result = Instruction::new(0x1010, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(eax), Operand::Register(r12d)]);
+        move_result.reads = vec![r12d];
+        move_result.writes = vec![eax];
+        normal.instructions.push(move_result);
+
+        let mut use_divisor = Instruction::new(0x1013, 2, vec![], "cmp")
+            .with_operation(Operation::Compare)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(eax)]);
+        use_divisor.reads = vec![ebx, eax];
+        normal.instructions.push(use_divisor);
+        cfg.add_block(normal);
+
+        let structurer = Structurer::new(&cfg);
+        assert_eq!(
+            structurer.recoverable_ubsan_setup_end_index(&probe, BasicBlockId::new(1)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_structure_elides_recoverable_ubsan_handler_branch() {
+        use hexray_core::basic_block::CallTarget as BlockCallTarget;
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+        let ebx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let mut load_lhs = Instruction::new(0x1000, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(edi)]);
+        load_lhs.reads = vec![edi];
+        load_lhs.writes = vec![ebx];
+        bb0.instructions.push(load_lhs);
+
+        let mut add = Instruction::new(0x1003, 2, vec![], "add")
+            .with_operation(Operation::Add)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(esi)]);
+        add.reads = vec![ebx, esi];
+        add.writes = vec![ebx];
+        bb0.instructions.push(add);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotOverflow,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut handler = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        handler.instructions.push(
+            Instruction::new(0x1010, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x5000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x5000,
+                    return_addr: 0x1015,
+                }),
+        );
+        handler.terminator = BlockTerminator::Call {
+            target: BlockCallTarget::Direct(0x5000),
+            return_block: BasicBlockId::new(2),
+        };
+        cfg.add_block(handler);
+
+        let mut cont = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        let mut move_ret = Instruction::new(0x1020, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(eax), Operand::Register(ebx)]);
+        move_ret.reads = vec![ebx];
+        move_ret.writes = vec![eax];
+        cont.instructions.push(move_ret);
+        cont.instructions.push(
+            Instruction::new(0x1023, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        cont.terminator = BlockTerminator::Return;
+        cfg.add_block(cont);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        let mut structurer = Structurer::new_with_binary_data_annotations_and_known_targets(
+            &cfg,
+            None,
+            StructuringAnnotations::default(),
+            HashMap::new(),
+            HashMap::from([(0x5000, "__ubsan_handle_add_overflow@plt".to_string())]),
+        );
+        let structured = structurer.structure();
+
+        assert!(
+            structured
+                .iter()
+                .all(|node| !matches!(node, StructuredNode::If { .. })),
+            "recoverable UBSan branch should be elided, got {structured:?}"
+        );
+        assert!(
+            structurer.processed.contains(&BasicBlockId::new(1)),
+            "UBSan handler block should be marked processed"
+        );
+    }
+
+    #[test]
+    fn test_recoverable_ubsan_block_to_statements_keeps_signed_add_prefix() {
+        use hexray_core::basic_block::CallTarget as BlockCallTarget;
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ebx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 32);
+        let rbx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let mut store_a = Instruction::new(0x1000, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x14, 4)),
+                Operand::Register(edi),
+            ]);
+        store_a.reads = vec![rbp, edi];
+        bb0.instructions.push(store_a);
+
+        let mut store_b = Instruction::new(0x1003, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x18, 4)),
+                Operand::Register(esi),
+            ]);
+        store_b.reads = vec![rbp, esi];
+        bb0.instructions.push(store_b);
+
+        let mut load_a = Instruction::new(0x1006, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Register(edx),
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x14, 4)),
+            ]);
+        load_a.reads = vec![rbp];
+        load_a.writes = vec![edx];
+        bb0.instructions.push(load_a);
+
+        let mut load_b = Instruction::new(0x1009, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Register(eax),
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x18, 4)),
+            ]);
+        load_b.reads = vec![rbp];
+        load_b.writes = vec![eax];
+        bb0.instructions.push(load_b);
+
+        let mut copy = Instruction::new(0x100c, 2, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(edx)]);
+        copy.reads = vec![edx];
+        copy.writes = vec![ebx];
+        bb0.instructions.push(copy);
+
+        let mut add = Instruction::new(0x100e, 2, vec![], "add")
+            .with_operation(Operation::Add)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(eax)]);
+        add.reads = vec![ebx, eax];
+        add.writes = vec![ebx];
+        bb0.instructions.push(add);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotOverflow,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut handler = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        handler.instructions.push(
+            Instruction::new(0x1010, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x5000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x5000,
+                    return_addr: 0x1015,
+                }),
+        );
+        handler.terminator = BlockTerminator::Call {
+            target: BlockCallTarget::Direct(0x5000),
+            return_block: BasicBlockId::new(2),
+        };
+        cfg.add_block(handler);
+
+        let mut cont = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        let mut move_ret = Instruction::new(0x1020, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(eax), Operand::Register(ebx)]);
+        move_ret.reads = vec![ebx];
+        move_ret.writes = vec![eax];
+        cont.instructions.push(move_ret);
+
+        let mut restore_rbx = Instruction::new(0x1023, 4, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Register(rbx),
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x8, 8)),
+            ]);
+        restore_rbx.reads = vec![rbp];
+        restore_rbx.writes = vec![rbx];
+        cont.instructions.push(restore_rbx);
+        cont.instructions.push(
+            Instruction::new(0x1027, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        cont.terminator = BlockTerminator::Return;
+        cfg.add_block(cont);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        let structurer = Structurer::new_with_binary_data_annotations_and_known_targets(
+            &cfg,
+            None,
+            StructuringAnnotations::default(),
+            HashMap::new(),
+            HashMap::from([(0x5000, "__ubsan_handle_add_overflow@plt".to_string())]),
+        );
+        let statements = structurer.block_to_statements(BasicBlockId::new(0));
+        let rendered: Vec<_> = statements.iter().map(|expr| format!("{expr}")).collect();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|expr| expr.contains("+=") || expr.contains(" + ")),
+            "expected signed-add user op to survive UBSan trimming, got {rendered:?}"
+        );
+    }
+
+    #[test]
     fn test_structure_split_tail_call_leaves_bare_return_for_emitter_fold() {
         use hexray_core::{Architecture, Register, RegisterClass};
 
@@ -5578,6 +6205,180 @@ mod tests {
                 })
             ),
             "same-block tail call should remain available for emitter folding"
+        );
+    }
+
+    #[test]
+    fn test_structure_stack_backed_tail_call_leaves_bare_return_for_emitter_fold() {
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let rsi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x4, 4)),
+                    Operand::Register(edi),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1003, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x10, 8)),
+                    Operand::Register(rsi),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1007, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x4, 4)),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x100a, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(edi), Operand::Register(eax)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x100c, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1011,
+                }),
+        );
+        bb0.terminator = BlockTerminator::Fallthrough {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1011);
+        bb1.instructions.push(
+            Instruction::new(0x1011, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+
+        let mut structurer = Structurer::new(&cfg);
+        let structured = structurer.structure();
+
+        assert!(
+            matches!(structured.last(), Some(StructuredNode::Return(None))),
+            "expected bare return for stack-backed tail call, got {structured:?}"
+        );
+        let Some(StructuredNode::Block { statements, .. }) = structured.first() else {
+            panic!("expected setup block");
+        };
+        assert!(
+            matches!(
+                statements.last(),
+                Some(Expr {
+                    kind: ExprKind::Call { .. },
+                })
+            ),
+            "stack-backed tail call should remain available for emitter folding"
+        );
+    }
+
+    #[test]
+    fn test_structured_cfg_stack_backed_tail_call_keeps_bare_return_for_emitter_fold() {
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let rsi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1100);
+        bb0.instructions.push(
+            Instruction::new(0x1100, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x4, 4)),
+                    Operand::Register(edi),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1103, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x10, 8)),
+                    Operand::Register(rsi),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1107, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x4, 4)),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x110a, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(edi), Operand::Register(eax)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x110c, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1111,
+                }),
+        );
+        bb0.terminator = BlockTerminator::Fallthrough {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1111);
+        bb1.instructions.push(
+            Instruction::new(0x1111, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        assert!(
+            matches!(structured.body().last(), Some(StructuredNode::Return(None))),
+            "post-processed structured cfg should keep a bare return, got {:?}",
+            structured.body()
+        );
+        let Some(StructuredNode::Block { statements, .. }) = structured.body().first() else {
+            panic!("expected leading block");
+        };
+        assert!(
+            matches!(
+                statements.last(),
+                Some(Expr {
+                    kind: ExprKind::Call { .. },
+                })
+            ),
+            "post-processed tail call should remain available for emitter folding"
         );
     }
 
@@ -5738,6 +6539,54 @@ mod tests {
             ),
             "call should remain in the branch body"
         );
+    }
+
+    #[test]
+    fn test_attach_shared_return_to_branch_keeps_nontrivial_branch_return_capture() {
+        use crate::decompiler::expression::{CallTarget, VarKind, Variable};
+
+        let ret_0 = Expr::var(Variable {
+            kind: VarKind::Temp(1),
+            name: "ret_0".to_string(),
+            size: 4,
+        });
+        let body = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(
+                    ret_0.clone(),
+                    Expr::call(
+                        CallTarget::Named("recursive_sum".to_string()),
+                        vec![Expr::unknown("n - 1")],
+                    ),
+                ),
+                Expr::assign(Expr::var(Variable::reg("edx", 4)), Expr::unknown("n")),
+                Expr::assign(
+                    Expr::var(Variable::reg("eax", 4)),
+                    Expr::binop(
+                        BinOpKind::Add,
+                        ret_0.clone(),
+                        Expr::var(Variable::reg("edx", 4)),
+                    ),
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        }];
+
+        let attached =
+            attach_shared_return_to_branch(body, Some(Expr::var(Variable::reg("eax", 4))));
+
+        let Some(StructuredNode::Block { statements, .. }) = attached.first() else {
+            panic!("expected branch body block");
+        };
+        let Some(StructuredNode::Return(Some(expr))) = attached.last() else {
+            panic!("expected attached return");
+        };
+
+        assert_eq!(statements.len(), 2);
+        assert_eq!(format!("{}", statements[0]), "ret_0 = recursive_sum(n - 1)");
+        assert_eq!(format!("{}", statements[1]), "edx = n");
+        assert_eq!(format!("{}", expr), "ret_0 + n");
     }
 
     #[test]

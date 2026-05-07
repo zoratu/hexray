@@ -36,7 +36,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::super::abi::{
-    get_arg_register_index, is_argument_register, is_return_register, is_temp_register,
+    get_arg_register_index, is_argument_register, is_callee_saved_or_renamed, is_return_register,
+    is_temp_register,
 };
 use super::super::dead_store::collect_all_uses;
 use super::super::expression::Expr;
@@ -65,10 +66,16 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
 
     let mut return_value = None;
     let mut indices_to_remove = Vec::new();
+    let mut saw_real_call_after = false;
 
     // Search backwards for an assignment to a return register, collecting epilogue statements
     for i in (0..statements.len()).rev() {
         let stmt = &statements[i];
+
+        if statement_contains_real_call(stmt) {
+            saw_real_call_after = true;
+            continue;
+        }
 
         // Check for return register assignment
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
@@ -79,6 +86,9 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                 // RISC-V: a0
                 let is_return_reg = matches!(v.name.as_str(), "eax" | "rax" | "w0" | "x0" | "a0");
                 if is_return_reg {
+                    if saw_real_call_after {
+                        continue;
+                    }
                     // Use the fully substituted value from reg_values if available,
                     // otherwise substitute the RHS directly
                     return_value = Some(
@@ -110,6 +120,12 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     }
                 }
 
+                // Callee-saved register restore near the end of the block.
+                if is_callee_saved_or_renamed(&v.name) {
+                    indices_to_remove.push(i);
+                    continue;
+                }
+
                 // Skip other temp register assignments (they'll be removed by propagate_copies later)
                 if is_temp_register(&v.name) {
                     indices_to_remove.push(i);
@@ -125,6 +141,9 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                 let is_return_reg =
                     matches!(v.name.as_str(), "eax" | "rax" | "w0" | "x0" | "a0" | "xmm0");
                 if is_return_reg {
+                    if saw_real_call_after {
+                        continue;
+                    }
                     return_value = Some((**lhs).clone());
                     break;
                 }
@@ -181,8 +200,470 @@ pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredN
     // Fifth pass: remove temp register assignments that have been propagated.
     let nodes = remove_temp_assignments(nodes);
 
-    // Sixth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
+    // Sixth pass: prune dead register artifacts that only exist to shuttle
+    // machine state between adjacent lowered blocks.
+    let nodes = prune_dead_register_artifacts(nodes);
+
+    // Seventh pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
     nodes.into_iter().map(simplify_conditions_in_node).collect()
+}
+
+fn prune_dead_register_artifacts(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    prune_dead_register_artifacts_in_list(nodes, HashSet::new()).0
+}
+
+fn prune_dead_register_artifacts_in_list(
+    nodes: Vec<StructuredNode>,
+    live_after: HashSet<String>,
+) -> (Vec<StructuredNode>, HashSet<String>) {
+    let mut live = live_after;
+    let mut pruned = Vec::with_capacity(nodes.len());
+
+    for node in nodes.into_iter().rev() {
+        let (node, live_before) = prune_dead_register_artifacts_in_node(node, &live);
+        live = live_before;
+        pruned.push(node);
+    }
+
+    pruned.reverse();
+    (pruned, live)
+}
+
+fn prune_dead_register_artifacts_in_node(
+    node: StructuredNode,
+    live_after: &HashSet<String>,
+) -> (StructuredNode, HashSet<String>) {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => {
+            let (statements, live_before) =
+                prune_dead_register_artifacts_in_block(statements, live_after.clone());
+            (
+                StructuredNode::Block {
+                    id,
+                    statements,
+                    address_range,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::Expr(expr) => {
+            let (mut statements, live_before) =
+                prune_dead_register_artifacts_in_block(vec![expr], live_after.clone());
+            let expr = statements
+                .pop()
+                .unwrap_or_else(|| Expr::unknown("/* nop */"));
+            (StructuredNode::Expr(expr), live_before)
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            let (then_body, then_live_in) =
+                prune_dead_register_artifacts_in_list(then_body, live_after.clone());
+            let (else_body, else_live_in) = if let Some(else_body) = else_body {
+                let (else_body, live_in) =
+                    prune_dead_register_artifacts_in_list(else_body, live_after.clone());
+                (Some(else_body), live_in)
+            } else {
+                (None, live_after.clone())
+            };
+
+            let mut live_before = then_live_in;
+            live_before.extend(else_live_in);
+            collect_live_uses_in_expr(&condition, &mut live_before);
+
+            (
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => {
+            let mut loop_live_after = live_after.clone();
+            collect_live_uses_in_expr(&condition, &mut loop_live_after);
+            let (body, body_live_in) =
+                prune_dead_register_artifacts_in_list(body, loop_live_after.clone());
+
+            let mut live_before = loop_live_after;
+            live_before.extend(body_live_in);
+
+            (
+                StructuredNode::While {
+                    condition,
+                    body,
+                    header,
+                    exit_block,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => {
+            let mut loop_live_after = live_after.clone();
+            collect_live_uses_in_expr(&condition, &mut loop_live_after);
+            let (body, body_live_in) =
+                prune_dead_register_artifacts_in_list(body, loop_live_after.clone());
+
+            let mut live_before = loop_live_after;
+            live_before.extend(body_live_in);
+
+            (
+                StructuredNode::DoWhile {
+                    body,
+                    condition,
+                    header,
+                    exit_block,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => {
+            let mut loop_live_after = live_after.clone();
+            collect_live_uses_in_expr(&condition, &mut loop_live_after);
+            if let Some(update) = &update {
+                collect_live_uses_in_expr(update, &mut loop_live_after);
+            }
+            let (body, body_live_in) =
+                prune_dead_register_artifacts_in_list(body, loop_live_after.clone());
+
+            let mut live_before = loop_live_after;
+            live_before.extend(body_live_in);
+            if let Some(init) = &init {
+                collect_live_uses_in_expr(init, &mut live_before);
+            }
+
+            (
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    header,
+                    exit_block,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => {
+            let (body, body_live_in) =
+                prune_dead_register_artifacts_in_list(body, live_after.clone());
+            let mut live_before = live_after.clone();
+            live_before.extend(body_live_in);
+            (
+                StructuredNode::Loop {
+                    body,
+                    header,
+                    exit_block,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            let mut live_before = live_after.clone();
+            collect_live_uses_in_expr(&value, &mut live_before);
+
+            let cases = cases
+                .into_iter()
+                .map(|(values, body)| {
+                    let (body, body_live_in) =
+                        prune_dead_register_artifacts_in_list(body, live_after.clone());
+                    live_before.extend(body_live_in);
+                    (values, body)
+                })
+                .collect();
+            let default = default.map(|body| {
+                let (body, body_live_in) =
+                    prune_dead_register_artifacts_in_list(body, live_after.clone());
+                live_before.extend(body_live_in);
+                body
+            });
+
+            (
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::Sequence(nodes) => {
+            let (nodes, live_before) =
+                prune_dead_register_artifacts_in_list(nodes, live_after.clone());
+            (StructuredNode::Sequence(nodes), live_before)
+        }
+        StructuredNode::Return(Some(expr)) => {
+            let mut live_before = HashSet::new();
+            collect_live_uses_in_expr(&expr, &mut live_before);
+            (StructuredNode::Return(Some(expr)), live_before)
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            let (try_body, try_live_in) =
+                prune_dead_register_artifacts_in_list(try_body, live_after.clone());
+            let mut live_before = try_live_in;
+            let catch_handlers = catch_handlers
+                .into_iter()
+                .map(|handler| {
+                    let (body, body_live_in) =
+                        prune_dead_register_artifacts_in_list(handler.body, live_after.clone());
+                    live_before.extend(body_live_in);
+                    CatchHandler { body, ..handler }
+                })
+                .collect();
+
+            (
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                },
+                live_before,
+            )
+        }
+        StructuredNode::Return(None)
+        | StructuredNode::Break
+        | StructuredNode::Continue
+        | StructuredNode::Goto(_) => (node, HashSet::new()),
+        StructuredNode::Label(_) => (node, live_after.clone()),
+    }
+}
+
+fn prune_dead_register_artifacts_in_block(
+    statements: Vec<Expr>,
+    live_after: HashSet<String>,
+) -> (Vec<Expr>, HashSet<String>) {
+    let mut live = live_after;
+    let mut pruned = Vec::with_capacity(statements.len());
+
+    for stmt in statements.into_iter().rev() {
+        if let Some(affected_aliases) = register_state_pseudo_call_aliases(&stmt) {
+            if affected_aliases.iter().all(|alias| !live.contains(alias)) {
+                continue;
+            }
+            live.extend(affected_aliases);
+            pruned.push(stmt);
+            continue;
+        }
+
+        if let Some(defined_aliases) = ephemeral_statement_def_aliases(&stmt) {
+            if defined_aliases.iter().all(|alias| !live.contains(alias))
+                && !expr_has_side_effects_from_assignment(&stmt)
+            {
+                continue;
+            }
+        }
+
+        for defined_name in defined_statement_names(&stmt) {
+            live.remove(&defined_name);
+        }
+        collect_live_uses_in_expr(&stmt, &mut live);
+        pruned.push(stmt);
+    }
+
+    pruned.reverse();
+    (pruned, live)
+}
+
+fn defined_statement_names(stmt: &Expr) -> Vec<String> {
+    use super::super::expression::ExprKind;
+
+    match &stmt.kind {
+        ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => {
+            defined_lhs_names(lhs)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn defined_lhs_names(lhs: &Expr) -> Vec<String> {
+    use super::super::expression::ExprKind;
+
+    match &lhs.kind {
+        ExprKind::Var(v) => vec![v.name.to_lowercase()],
+        ExprKind::Unknown(name) => vec![name.to_lowercase()],
+        _ => Vec::new(),
+    }
+}
+
+fn ephemeral_statement_def_aliases(stmt: &Expr) -> Option<Vec<String>> {
+    use super::super::expression::{ExprKind, VarKind};
+
+    let ExprKind::Assign { lhs, .. } = &stmt.kind else {
+        return None;
+    };
+    let ExprKind::Var(var) = &lhs.kind else {
+        return None;
+    };
+    if matches!(var.kind, VarKind::Register(_) | VarKind::Arg(_)) {
+        return Some(vec![var.name.to_lowercase()]);
+    }
+    None
+}
+
+fn register_state_pseudo_call_aliases(stmt: &Expr) -> Option<Vec<String>> {
+    use super::super::expression::{CallTarget, ExprKind};
+
+    let ExprKind::Call { target, .. } = &stmt.kind else {
+        return None;
+    };
+    let CallTarget::Named(name) = target else {
+        return None;
+    };
+
+    let aliases = match name.as_str() {
+        "cbw" | "cwde" | "cdqe" | "cbtw" | "cwtl" | "cltq" => {
+            vec!["al", "ax", "eax", "rax"]
+        }
+        "cwd" | "cdq" | "cqo" | "cwtd" | "cltd" | "cqto" => {
+            vec!["ax", "eax", "rax", "dx", "edx", "rdx"]
+        }
+        _ => return None,
+    };
+
+    Some(aliases.into_iter().map(str::to_string).collect())
+}
+
+fn collect_live_uses_in_expr(expr: &Expr, live: &mut HashSet<String>) {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(v) => {
+            live.insert(v.name.to_lowercase());
+        }
+        ExprKind::Unknown(name) => {
+            live.insert(name.to_lowercase());
+        }
+        ExprKind::Assign { lhs, rhs } => {
+            collect_live_uses_in_lhs(lhs, live);
+            collect_live_uses_in_expr(rhs, live);
+        }
+        ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            collect_live_uses_in_expr(lhs, live);
+            collect_live_uses_in_expr(rhs, live);
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            collect_live_uses_in_expr(left, live);
+            collect_live_uses_in_expr(right, live);
+        }
+        ExprKind::UnaryOp { operand, .. } => collect_live_uses_in_expr(operand, live),
+        ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+            for arg in args {
+                collect_live_uses_in_expr(arg, live);
+            }
+        }
+        ExprKind::Deref { addr, .. } => collect_live_uses_in_expr(addr, live),
+        ExprKind::AddressOf(inner) => collect_live_uses_in_expr(inner, live),
+        ExprKind::Cast { expr, .. } => collect_live_uses_in_expr(expr, live),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            collect_live_uses_in_expr(base, live);
+            collect_live_uses_in_expr(index, live);
+        }
+        ExprKind::FieldAccess { base, .. } => collect_live_uses_in_expr(base, live),
+        ExprKind::BitField { expr, .. } => collect_live_uses_in_expr(expr, live),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_live_uses_in_expr(cond, live);
+            collect_live_uses_in_expr(then_expr, live);
+            collect_live_uses_in_expr(else_expr, live);
+        }
+        ExprKind::IntLit(_) | ExprKind::GotRef { .. } => {}
+    }
+}
+
+fn collect_live_uses_in_lhs(lhs: &Expr, live: &mut HashSet<String>) {
+    use super::super::expression::ExprKind;
+
+    match &lhs.kind {
+        ExprKind::Deref { addr, .. } => collect_live_uses_in_expr(addr, live),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            collect_live_uses_in_expr(base, live);
+            collect_live_uses_in_expr(index, live);
+        }
+        ExprKind::FieldAccess { base, .. } => collect_live_uses_in_expr(base, live),
+        ExprKind::BitField { expr, .. } => collect_live_uses_in_expr(expr, live),
+        _ => {}
+    }
+}
+
+fn expr_has_side_effects_from_assignment(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Assign { rhs, .. } => expr_has_side_effects(rhs),
+        ExprKind::CompoundAssign { .. } => true,
+        _ => expr_has_side_effects(expr),
+    }
+}
+
+fn expr_has_side_effects(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Call { target, .. } => is_real_function_call(target),
+        ExprKind::Assign { .. } | ExprKind::CompoundAssign { .. } => true,
+        ExprKind::BinOp { left, right, .. } => {
+            expr_has_side_effects(left) || expr_has_side_effects(right)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_has_side_effects(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_has_side_effects(base) || expr_has_side_effects(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_has_side_effects(base),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_side_effects(cond)
+                || expr_has_side_effects(then_expr)
+                || expr_has_side_effects(else_expr)
+        }
+        ExprKind::Phi(args) => args.iter().any(expr_has_side_effects),
+        ExprKind::IntLit(_) | ExprKind::Unknown(_) | ExprKind::Var(_) | ExprKind::GotRef { .. } => {
+            false
+        }
+    }
 }
 
 fn merge_adjacent_blocks(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
@@ -1750,6 +2231,18 @@ fn collect_target_argument_registers(
     regs
 }
 
+pub(super) fn statement_contains_real_call(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Call { target, .. } => is_real_function_call(target),
+        ExprKind::Assign { rhs, .. } | ExprKind::CompoundAssign { rhs, .. } => {
+            statement_contains_real_call(rhs)
+        }
+        _ => false,
+    }
+}
+
 /// Checks if a call target is a "real" function call (not push/pop/syscall etc.)
 fn is_real_function_call(target: &super::super::expression::CallTarget) -> bool {
     use super::super::expression::CallTarget;
@@ -3183,6 +3676,113 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(format!("{}", filtered[1]), "xmm0 += xmm1");
         assert_eq!(format!("{}", return_value.expect("return value")), "xmm0");
+    }
+
+    #[test]
+    fn test_extract_return_value_drops_callee_saved_restore_after_return_copy() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("ebx", 4)),
+            Expr::assign(reg("rbx", 8), Expr::unknown("var_8")),
+        ];
+
+        let (filtered, return_value) = extract_return_value(statements);
+
+        assert!(filtered.is_empty(), "epilogue restore should be stripped");
+        assert_eq!(format!("{}", return_value.expect("return value")), "ebx");
+    }
+
+    #[test]
+    fn test_extract_return_value_ignores_pre_call_return_reg_setup() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::unknown("argc")),
+            Expr::assign(reg("edi", 4), reg("eax", 4)),
+            Expr::call(
+                CallTarget::Named("helper".to_string()),
+                vec![Expr::unknown("argc")],
+            ),
+        ];
+
+        let (filtered, return_value) = extract_return_value(statements);
+
+        assert!(
+            return_value.is_none(),
+            "pre-call eax setup should not become the function return"
+        );
+        assert!(
+            !filtered.is_empty(),
+            "call should remain in the filtered statement list"
+        );
+        assert_eq!(format!("{}", filtered.last().unwrap()), "helper(argc)");
+    }
+
+    #[test]
+    fn test_simplify_statements_keeps_register_value_live_into_following_return() {
+        let nodes = vec![
+            block(0, vec![Expr::assign(reg("eax", 4), Expr::int(7))]),
+            StructuredNode::Return(Some(reg("eax", 4))),
+        ];
+
+        let simplified = simplify_statements(nodes);
+        let StructuredNode::Block { statements, .. } = &simplified[0] else {
+            panic!("expected leading block");
+        };
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(format!("{}", statements[0]), "eax = 7");
+    }
+
+    #[test]
+    fn test_simplify_statements_prunes_dead_register_artifacts_across_following_block() {
+        let nodes = vec![
+            block(
+                0,
+                vec![
+                    Expr::assign(reg("eax", 4), Expr::unknown("i")),
+                    Expr::call(CallTarget::Named("cdqe".to_string()), vec![]),
+                    Expr::assign(
+                        reg("rdx", 8),
+                        Expr::binop(BinOpKind::Mul, reg("rax", 8), Expr::int(4)),
+                    ),
+                    Expr::assign(reg("rax", 8), Expr::unknown("arr")),
+                    Expr::assign(
+                        reg("rcx", 8),
+                        Expr::binop(BinOpKind::Add, reg("rdx", 8), reg("rax", 8)),
+                    ),
+                    Expr::assign(reg("eax", 4), Expr::deref(reg("rcx", 8), 4)),
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Add,
+                            lhs: Box::new(Expr::unknown("total")),
+                            rhs: Box::new(Expr::deref(reg("rcx", 8), 4)),
+                        },
+                    },
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Add,
+                            lhs: Box::new(Expr::unknown("i")),
+                            rhs: Box::new(Expr::int(1)),
+                        },
+                    },
+                ],
+            ),
+            block(1, vec![Expr::assign(reg("eax", 4), Expr::unknown("total"))]),
+            StructuredNode::Return(Some(reg("eax", 4))),
+        ];
+
+        let simplified = simplify_statements(nodes);
+        let StructuredNode::Block { statements, .. } = &simplified[0] else {
+            panic!("expected first block");
+        };
+        let rendered: Vec<_> = statements.iter().map(|stmt| format!("{stmt}")).collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "total += arr[i]".to_string(),
+                "i += 1".to_string(),
+                "eax = total".to_string(),
+            ]
+        );
     }
 
     #[test]

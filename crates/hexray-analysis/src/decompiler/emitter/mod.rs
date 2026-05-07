@@ -1704,6 +1704,7 @@ impl PseudoCodeEmitter {
 
     fn is_tail_padding_statement(expr: &Expr) -> bool {
         matches!(&expr.kind, ExprKind::Unknown(name) if name.trim() == "/* nop */")
+            || is_epilogue_statement(expr)
     }
 
     fn node_is_tail_padding(node: &StructuredNode) -> bool {
@@ -1766,14 +1767,22 @@ impl PseudoCodeEmitter {
                 return;
             };
 
+            let call_stmt_index = statements
+                .iter()
+                .rposition(|stmt| !Self::is_tail_padding_statement(stmt));
+            let Some(call_stmt_index) = call_stmt_index else {
+                return;
+            };
             let Some(Expr {
                 kind: ExprKind::Call { .. },
-            }) = statements.last()
+            }) = statements.get(call_stmt_index)
             else {
                 return;
             };
 
-            statements.pop()
+            let call_expr = statements.get(call_stmt_index).cloned();
+            statements.truncate(call_stmt_index);
+            call_expr
         }) else {
             return;
         };
@@ -3825,11 +3834,16 @@ impl PseudoCodeEmitter {
             None
         };
 
-        let display_body = if let Some(ref sig) = signature {
-            let rewritten = Self::rewrite_tail_call_returns_for_emission(&cfg.body, sig.has_return);
+        let provisional_body = self.rewrite_small_aggregate_slots_for_emission(&cfg.body);
+        let legacy_func_info = self.analyze_function(&provisional_body);
+        let allow_tail_return_folding = signature.as_ref().is_some_and(|sig| sig.has_return)
+            || legacy_func_info.has_return_value;
+        let display_body = if signature.is_some() && allow_tail_return_folding {
+            let rewritten =
+                Self::rewrite_tail_call_returns_for_emission(&cfg.body, allow_tail_return_folding);
             self.rewrite_small_aggregate_slots_for_emission(&rewritten)
         } else {
-            self.rewrite_small_aggregate_slots_for_emission(&cfg.body)
+            provisional_body
         };
 
         // Analyze function body for pattern-based variable naming (loop indices, etc.)
@@ -7957,6 +7971,141 @@ mod tests {
     }
 
     #[test]
+    fn test_emit_folds_terminal_tail_call_from_legacy_return_analysis() {
+        let tail_call = Expr::call(
+            CallTarget::Named("helper".to_string()),
+            vec![Expr::unknown("argc")],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![tail_call],
+            address_range: (0x1200, 0x1210),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_signature_recovery(true);
+        let output = emitter.emit(&cfg, "main");
+        assert!(
+            output.contains("return helper(argc);"),
+            "emit() should still fold a non-void tail call:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    helper(argc);\n"),
+            "tail call should not remain a standalone statement:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_folds_stack_backed_terminal_tail_call() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("local_4"), Expr::unknown("argc")),
+                Expr::assign(Expr::unknown("local_10"), Expr::unknown("argv")),
+                Expr::call(
+                    CallTarget::Named("helper".to_string()),
+                    vec![Expr::unknown("local_4")],
+                ),
+            ],
+            address_range: (0x1220, 0x1230),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_signature_recovery(true);
+        let output = emitter.emit(&cfg, "main");
+        assert!(
+            output.contains("return helper(local_4);"),
+            "emit() should fold stack-backed tail-call returns:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    helper(local_4);\n"),
+            "tail call should not remain a standalone statement:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_folds_terminal_tail_call_across_epilogue_padding() {
+        use super::super::expression::Variable;
+
+        let call_block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::call(
+                CallTarget::Named("helper".to_string()),
+                vec![Expr::unknown("argc")],
+            )],
+            address_range: (0x1240, 0x1250),
+        };
+        let epilogue_block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(1),
+            statements: vec![Expr::call(
+                CallTarget::Named("pop".to_string()),
+                vec![Expr::var(Variable::reg("rbp", 8))],
+            )],
+            address_range: (0x1250, 0x1252),
+        };
+        let cfg = StructuredCfg {
+            body: vec![call_block, epilogue_block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_signature_recovery(true);
+        let output = emitter.emit(&cfg, "main");
+        assert!(
+            output.contains("return helper(argc);"),
+            "emit() should fold tail calls across epilogue-only padding:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    helper(argc);\n"),
+            "tail call should not remain a standalone statement:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_folds_terminal_tail_call_with_same_block_padding() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("local_4"), Expr::unknown("argc")),
+                Expr::call(
+                    CallTarget::Named("helper".to_string()),
+                    vec![Expr::unknown("local_4")],
+                ),
+                Expr::unknown("/* nop */"),
+            ],
+            address_range: (0x1260, 0x1270),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_signature_recovery(true);
+        let output = emitter.emit(&cfg, "main");
+        assert!(
+            output.contains("return helper(local_4);"),
+            "emit() should fold terminal calls past same-block tail padding:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    helper(local_4);\n"),
+            "tail call should not remain a standalone statement:\n{}",
+            output
+        );
+    }
+
+    #[test]
     fn test_emit_with_signature_folds_terminal_tail_call_fallthrough() {
         let tail_call = Expr::call(
             CallTarget::Named("helper".to_string()),
@@ -7992,6 +8141,87 @@ mod tests {
         assert!(
             !output.contains("return 0;"),
             "tail-call fold should suppress fallback return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_folds_terminal_tail_call_across_epilogue_padding() {
+        use super::super::expression::Variable;
+
+        let call_block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::call(
+                CallTarget::Named("helper".to_string()),
+                vec![Expr::unknown("argc")],
+            )],
+            address_range: (0x1120, 0x1130),
+        };
+        let epilogue_block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(1),
+            statements: vec![Expr::call(
+                CallTarget::Named("pop".to_string()),
+                vec![Expr::var(Variable::reg("rbp", 8))],
+            )],
+            address_range: (0x1130, 0x1132),
+        };
+        let cfg = StructuredCfg {
+            body: vec![call_block, epilogue_block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "main", &sig);
+        assert!(
+            output.contains("return helper(argc);"),
+            "expected terminal tail call to fold across epilogue padding:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    helper(argc);\n"),
+            "tail call should not remain a standalone statement:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_folds_terminal_tail_call_with_same_block_padding() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::call(
+                    CallTarget::Named("helper".to_string()),
+                    vec![Expr::unknown("argc")],
+                ),
+                Expr::unknown("/* nop */"),
+            ],
+            address_range: (0x1140, 0x1150),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "main", &sig);
+        assert!(
+            output.contains("return helper(argc);"),
+            "expected terminal tail call to fold across same-block padding:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    helper(argc);\n"),
+            "tail call should not remain a standalone statement:\n{}",
             output
         );
     }
