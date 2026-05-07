@@ -2312,6 +2312,22 @@ fn discover_function_starts(
         starts.extend(discover_stripped_x86_function_seeds(fmt, arch));
     }
 
+    starts.extend(
+        discover_lifecycle_array_entries(fmt)
+            .into_iter()
+            .map(|(_, target)| {
+                find_preferred_symbol_at(symbols, target)
+                    .map(|symbol| {
+                        (
+                            target,
+                            if symbol.size > 0 { symbol.size } else { 4096 },
+                            symbol.size == 0,
+                        )
+                    })
+                    .unwrap_or((target, 4096, true))
+            }),
+    );
+
     if let Some(entry) = fmt.entry_point() {
         if !starts.iter().any(|(addr, _, _)| *addr == entry) {
             starts.push((entry, 8192, true));
@@ -2463,6 +2479,38 @@ fn read_pointer_at(fmt: &dyn BinaryFormat, addr: u64) -> Option<u64> {
     }
 }
 
+fn discover_lifecycle_array_entries(fmt: &dyn BinaryFormat) -> Vec<(u64, u64)> {
+    let ptr_size = match fmt.bitness() {
+        hexray_core::Bitness::Bits32 => 4u64,
+        hexray_core::Bitness::Bits64 => 8u64,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+
+    for section in fmt.sections() {
+        if !matches!(section.name(), ".init_array" | ".fini_array") {
+            continue;
+        }
+
+        let section_start = section.virtual_address();
+        let slot_count = section.size() / ptr_size;
+        for index in 0..slot_count {
+            let slot_addr = section_start + index * ptr_size;
+            let Some(target) = read_pointer_at(fmt, slot_addr) else {
+                continue;
+            };
+            if !is_executable_callback_target(fmt, target) {
+                continue;
+            }
+            if seen.insert((slot_addr, target)) {
+                entries.push((slot_addr, target));
+            }
+        }
+    }
+
+    entries
+}
+
 fn resolve_materialized_callback_targets(
     fmt: &dyn BinaryFormat,
     call: &hexray_analysis::callgraph::MaterializedIndirectCall,
@@ -2561,6 +2609,36 @@ struct MaterializedCallbackEdgeContext<'a> {
     relocation_table: &'a RelocationTable,
     symbols: &'a [hexray_core::Symbol],
     noreturn_targets: &'a std::collections::HashSet<u64>,
+}
+
+fn add_lifecycle_array_edges(
+    callgraph: &mut CallGraph,
+    fmt: &dyn BinaryFormat,
+    symbols: &[hexray_core::Symbol],
+) {
+    let Some(entry) = fmt.entry_point() else {
+        return;
+    };
+
+    let mut seen_edges = std::collections::HashSet::new();
+    for (slot_addr, target) in discover_lifecycle_array_entries(fmt) {
+        if !seen_edges.insert((entry, slot_addr, target)) {
+            continue;
+        }
+        if let Some(symbol) = find_preferred_symbol_at(symbols, target) {
+            callgraph.add_node(target, Some(symbol.name.clone()), false);
+        } else {
+            callgraph.add_node(target, None, false);
+        }
+        callgraph.add_call(
+            entry,
+            target,
+            CallSite {
+                call_address: slot_addr,
+                call_type: CallType::Indirect,
+            },
+        );
+    }
 }
 
 fn add_materialized_callback_edges(
@@ -2923,6 +3001,7 @@ fn build_callgraph(
             noreturn_targets: &noreturn_targets,
         },
     );
+    add_lifecycle_array_edges(&mut callgraph, fmt, &symbols);
     let callgraph = if let Some(root) = target_root {
         callgraph.subgraph_from(root)
     } else {
@@ -3758,7 +3837,10 @@ fn build_xrefs(
         pending_functions = new_call_targets;
     }
 
-    let db = xref_builder.build();
+    let mut db = xref_builder.build();
+    for (slot_addr, target) in discover_lifecycle_array_entries(fmt) {
+        db.add_xref(slot_addr, target, XrefType::DataRead);
+    }
 
     // If a target is specified, show refs to that target
     if let Some(target_str) = target {
@@ -3842,6 +3924,24 @@ fn build_xrefs(
         function_starts.sort_by_key(|(addr, _, _)| *addr);
 
         let resolve_caller = |from: u64| -> (String, Option<u64>) {
+            let mut data_section = None;
+            for section in fmt.sections() {
+                let section_start = section.virtual_address();
+                let section_end = section_start.saturating_add(section.size());
+                if from < section_start || from >= section_end || section.is_executable() {
+                    continue;
+                }
+                if matches!(section.name(), ".init_array" | ".fini_array") {
+                    return (
+                        section.name().to_string(),
+                        Some(from.saturating_sub(section_start)),
+                    );
+                }
+                data_section.get_or_insert((section.name().to_string(), section_start));
+            }
+            if let Some((section_name, section_start)) = data_section {
+                return (section_name, Some(from.saturating_sub(section_start)));
+            }
             if let Some(s) = fmt.symbol_at(from).filter(|s| !s.name.starts_with("__mh_")) {
                 return (display_function_name(fmt, project, s.address), Some(0));
             }
@@ -6357,6 +6457,124 @@ mod tests {
                 (0x401028, 6, false),
             ]
         );
+    }
+
+    #[test]
+    fn lifecycle_arrays_seed_function_discovery() {
+        let mut init_array = vec![0u8; 16];
+        init_array[..8].copy_from_slice(&0x401156u64.to_le_bytes());
+        init_array[8..].copy_from_slice(&0x401193u64.to_le_bytes());
+
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x401100,
+                    data: vec![0x90; 0x200],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".init_array",
+                    address: 0x403de0,
+                    data: init_array,
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: None,
+        };
+
+        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols);
+
+        assert!(starts.iter().any(|(addr, _, _)| *addr == 0x401156));
+        assert!(starts.iter().any(|(addr, _, _)| *addr == 0x401193));
+    }
+
+    #[test]
+    fn lifecycle_array_entries_capture_slot_addresses() {
+        let mut init_array = vec![0u8; 16];
+        init_array[..8].copy_from_slice(&0x401156u64.to_le_bytes());
+        init_array[8..].copy_from_slice(&0x401193u64.to_le_bytes());
+        let mut fini_array = vec![0u8; 8];
+        fini_array[..8].copy_from_slice(&0x4011b7u64.to_le_bytes());
+
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x401100,
+                    data: vec![0x90; 0x200],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".init_array",
+                    address: 0x403de0,
+                    data: init_array,
+                    executable: false,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".fini_array",
+                    address: 0x403df0,
+                    data: fini_array,
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: None,
+        };
+
+        let entries = crate::discover_lifecycle_array_entries(&binary);
+
+        assert_eq!(
+            entries,
+            vec![
+                (0x403de0, 0x401156),
+                (0x403de8, 0x401193),
+                (0x403df0, 0x4011b7)
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_arrays_add_entry_edges_to_callgraph() {
+        let mut init_array = vec![0u8; 8];
+        init_array[..8].copy_from_slice(&0x401156u64.to_le_bytes());
+
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x401000,
+                    data: vec![0x90; 0x200],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".init_array",
+                    address: 0x403de0,
+                    data: init_array,
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![
+                test_symbol("_start", 0x401000),
+                test_symbol("init_runtime", 0x401156),
+            ],
+            entry_point: Some(0x401000),
+        };
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x401000, Some("_start".to_string()), false);
+
+        crate::add_lifecycle_array_edges(&mut callgraph, &binary, &binary.symbols);
+
+        let callees: Vec<_> = callgraph.callees(0x401000).map(|(addr, _)| addr).collect();
+        assert_eq!(callees, vec![0x401156]);
     }
 
     #[test]
