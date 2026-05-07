@@ -382,6 +382,14 @@ impl CallGraphBuilder {
                         if !self.call_graph.nodes.contains_key(target) {
                             self.call_graph.add_node(*target, None, false);
                         }
+                        if self
+                            .call_graph
+                            .get_node(*target)
+                            .and_then(|node| node.name.as_deref())
+                            .is_some_and(crate::is_ubsan_handler_function_name)
+                        {
+                            continue;
+                        }
 
                         self.call_graph.add_call(
                             caller_entry,
@@ -641,6 +649,17 @@ mod tests {
         }
     }
 
+    fn make_function_symbol(name: &str, address: u64) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            address,
+            size: 0,
+            kind: SymbolKind::Function,
+            binding: hexray_core::SymbolBinding::Global,
+            section_index: Some(1),
+        }
+    }
+
     fn make_stack_store_imm_instruction(addr: u64, imm_value: u64) -> Instruction {
         Instruction {
             address: addr,
@@ -757,6 +776,29 @@ mod tests {
             writes: vec![dest],
             guard: None,
         }
+    }
+
+    #[test]
+    fn callgraph_builder_filters_ubsan_helper_edges() {
+        let mut builder = CallGraphBuilder::new();
+        builder.add_symbols(&[
+            make_function_symbol("caller", 0x1000),
+            make_function_symbol("__ubsan_handle_add_overflow@plt", 0x2000),
+            make_function_symbol("callee", 0x3000),
+        ]);
+        builder.add_function(
+            0x1000,
+            vec![
+                make_call_instruction(0x1000, 0x2000),
+                make_call_instruction(0x1004, 0x3000),
+                make_ret_instruction(0x1008),
+            ],
+        );
+
+        let callgraph = builder.build();
+        let callees: Vec<_> = callgraph.callees(0x1000).map(|(addr, _)| addr).collect();
+
+        assert_eq!(callees, vec![0x3000]);
     }
 
     fn make_indirect_call_instruction(

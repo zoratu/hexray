@@ -37,6 +37,11 @@ pub fn is_noreturn_function_name(name: &str) -> bool {
         )
 }
 
+/// Returns true when `name` names a recoverable UBSan helper.
+pub fn is_ubsan_handler_function_name(name: &str) -> bool {
+    name.trim_start_matches('_').starts_with("ubsan_handle_")
+}
+
 fn is_asan_report_function(name: &str) -> bool {
     name.starts_with("asan_report_") && !name.ends_with("_noabort")
 }
@@ -52,7 +57,9 @@ pub fn collect_noreturn_targets<'a>(symbols: impl IntoIterator<Item = &'a Symbol
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_noreturn_targets, is_noreturn_function_name};
+    use super::{
+        collect_noreturn_targets, is_noreturn_function_name, is_ubsan_handler_function_name,
+    };
     use hexray_core::{Symbol, SymbolBinding, SymbolKind};
     use std::collections::HashSet;
 
@@ -91,6 +98,21 @@ mod tests {
         ] {
             assert!(is_noreturn_function_name(name), "{name} should be noreturn");
         }
+    }
+
+    #[test]
+    fn matches_ubsan_handler_functions() {
+        for name in [
+            "__ubsan_handle_add_overflow",
+            "__ubsan_handle_divrem_overflow@plt",
+            "___ubsan_handle_pointer_overflow",
+        ] {
+            assert!(
+                is_ubsan_handler_function_name(name),
+                "{name} should be recognized as a UBSan helper"
+            );
+        }
+        assert!(!is_ubsan_handler_function_name("__asan_report_load4"));
     }
 
     #[test]

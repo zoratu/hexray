@@ -97,7 +97,9 @@ pub use incremental::{
     IncrementalError, IncrementalResult, IncrementalStats, InvalidationLevel, Patch, PatchSet,
     PatchType,
 };
-pub use noreturn::{collect_noreturn_targets, is_noreturn_function_name};
+pub use noreturn::{
+    collect_noreturn_targets, is_noreturn_function_name, is_ubsan_handler_function_name,
+};
 pub use output::{
     CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CfgDotExporter,
     CfgHtmlExporter, CfgJsonExporter,

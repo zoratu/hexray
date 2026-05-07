@@ -17,12 +17,12 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
-    is_noreturn_function_name, AnalysisProject, BinaryDataContext, BinaryDiff, CallGraph,
-    CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CallSite,
-    CallType, CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter, Decompiler,
-    DecompilerConfig, ExceptionExtractor, ExceptionInfo, FunctionInfo, OptimizationLevel,
-    OptimizationPass, ParallelCallGraphBuilder, Patch, PatchType, RelocationTable, StringConfig,
-    StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
+    is_noreturn_function_name, is_ubsan_handler_function_name, AnalysisProject, BinaryDataContext,
+    BinaryDiff, CallGraph, CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter,
+    CallGraphJsonExporter, CallSite, CallType, CfgBuilder, CfgDotExporter, CfgHtmlExporter,
+    CfgJsonExporter, Decompiler, DecompilerConfig, ExceptionExtractor, ExceptionInfo, FunctionInfo,
+    OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder, Patch, PatchType,
+    RelocationTable, StringConfig, StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -3661,6 +3661,9 @@ fn build_callgraph(
             for instruction in instructions {
                 if let hexray_core::ControlFlow::Call { target, .. } = instruction.control_flow {
                     if let Some(symbol) = find_preferred_symbol_at(&symbols, target) {
+                        if suppress_callgraph_edge_to_name(&symbol.name) {
+                            continue;
+                        }
                         callgraph.add_node(
                             target,
                             Some(symbol.name.clone()),
@@ -3750,6 +3753,10 @@ fn callgraph_node_display_name(node: &hexray_analysis::CallGraphNode) -> String 
 
 fn callgraph_symbol_is_external(symbol: &hexray_core::Symbol) -> bool {
     !symbol.is_defined() || symbol.is_plt()
+}
+
+fn suppress_callgraph_edge_to_name(name: &str) -> bool {
+    is_ubsan_handler_function_name(name)
 }
 
 fn mark_callgraph_stub_nodes_external(
@@ -7179,6 +7186,14 @@ mod tests {
         assert!(!crate::callgraph_symbol_is_external(&test_symbol(
             "main", 0x6000
         )));
+    }
+
+    #[test]
+    fn suppress_callgraph_edge_helper_filters_ubsan_targets() {
+        assert!(crate::suppress_callgraph_edge_to_name(
+            "__ubsan_handle_add_overflow@plt"
+        ));
+        assert!(!crate::suppress_callgraph_edge_to_name("main"));
     }
 
     #[test]
