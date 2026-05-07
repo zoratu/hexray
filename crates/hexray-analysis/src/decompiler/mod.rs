@@ -60,7 +60,7 @@ pub use type_propagation::{ExprType, ExpressionTypePropagation, KnownSignature};
 
 use hexray_core::ControlFlowGraph;
 use hexray_types::TypeDatabase;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::cpp_special::{CppSpecialDetector, SpecialMemberAnalysis};
@@ -157,7 +157,7 @@ impl BinaryDataContext {
 #[derive(Debug, Clone, Default)]
 pub struct StringTable {
     /// Maps addresses to string values.
-    strings: HashMap<u64, String>,
+    strings: BTreeMap<u64, String>,
 }
 
 impl StringTable {
@@ -173,7 +173,16 @@ impl StringTable {
 
     /// Looks up a string at a given address.
     pub fn get(&self, address: u64) -> Option<&str> {
-        self.strings.get(&address).map(|s| s.as_str())
+        if let Some(value) = self.strings.get(&address) {
+            return Some(value.as_str());
+        }
+
+        let (&start, value) = self.strings.range(..=address).next_back()?;
+        let offset = usize::try_from(address.checked_sub(start)?).ok()?;
+        value
+            .as_bytes()
+            .get(offset..)
+            .and_then(|suffix| std::str::from_utf8(suffix).ok())
     }
 
     /// Returns an iterator over all (address, string) pairs.
@@ -1484,5 +1493,16 @@ mod tests {
             }
             other => panic!("expected surviving live block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn string_table_resolves_suffix_addresses_inside_printable_runs() {
+        let bytes = b"\x01\x00@@n = %d\0";
+        let table = StringTable::from_binary_data(bytes, 0x1000);
+
+        assert_eq!(table.get(0x1002), Some("@@n = %d"));
+        assert_eq!(table.get(0x1004), Some("n = %d"));
+        assert_eq!(table.get(0x100a), Some("d"));
+        assert_eq!(table.get(0x100b), None);
     }
 }
