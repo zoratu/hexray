@@ -2902,12 +2902,68 @@ impl PseudoCodeEmitter {
         false
     }
 
+    /// Checks if a statement is a gcov counter increment/readback artifact.
+    fn is_gcov_counter_statement(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Assign { lhs, rhs } => self.is_gcov_counter_increment(lhs, rhs),
+            ExprKind::CompoundAssign { op, lhs, rhs } => {
+                matches!(op, BinOpKind::Add | BinOpKind::Sub)
+                    && Self::is_unit_step_literal(rhs)
+                    && self.expr_references_gcov_counter(lhs)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_gcov_counter_increment(&self, _lhs: &Expr, rhs: &Expr) -> bool {
+        let ExprKind::BinOp { op, left, right } = &rhs.kind else {
+            return false;
+        };
+        if !matches!(op, BinOpKind::Add | BinOpKind::Sub) || !Self::is_unit_step_literal(right) {
+            return false;
+        }
+
+        self.expr_references_gcov_counter(left)
+    }
+
+    fn expr_references_gcov_counter(&self, expr: &Expr) -> bool {
+        if let Some(address) = Self::extract_gotref_address(expr) {
+            if let Some(symbol_table) = self.symbol_table.as_ref() {
+                if let Some(name) = symbol_table
+                    .get(address)
+                    .or_else(|| symbol_table.get_containing(address))
+                {
+                    return Self::is_gcov_symbol_name(name);
+                }
+            }
+        }
+
+        match &expr.kind {
+            ExprKind::Var(var) => Self::is_gcov_symbol_name(&var.name),
+            ExprKind::Unknown(name) => Self::is_gcov_symbol_name(name),
+            ExprKind::AddressOf(inner) | ExprKind::Cast { expr: inner, .. } => {
+                self.expr_references_gcov_counter(inner)
+            }
+            ExprKind::Deref { addr, .. } => self.expr_references_gcov_counter(addr),
+            _ => false,
+        }
+    }
+
+    fn is_gcov_symbol_name(name: &str) -> bool {
+        name.starts_with("__gcov") || name.starts_with("_gcov")
+    }
+
+    fn is_unit_step_literal(expr: &Expr) -> bool {
+        matches!(expr.kind, ExprKind::IntLit(1))
+    }
+
     /// Extracts the GotRef address from an expression, if present.
     /// Traverses through Deref and Cast to find the underlying GotRef.
     fn extract_gotref_address(expr: &Expr) -> Option<u64> {
         match &expr.kind {
             ExprKind::GotRef { address, .. } => Some(*address),
             ExprKind::Deref { addr, .. } => Self::extract_gotref_address(addr),
+            ExprKind::AddressOf(inner) => Self::extract_gotref_address(inner),
             ExprKind::Cast { expr: inner, .. } => Self::extract_gotref_address(inner),
             _ => None,
         }
@@ -5822,6 +5878,9 @@ impl PseudoCodeEmitter {
             // Return value setup: rax/eax = something
             // Also skip ARM64 argument setup patterns
             ExprKind::Assign { lhs, rhs } => {
+                if self.is_gcov_counter_statement(expr) {
+                    return true;
+                }
                 // Return-register assignments can be real loop-carried state, not just
                 // epilogue setup. Only skip the epilogue-shaped cases handled elsewhere.
                 // ARM64 argument setup: *(uint64_t*)(x9) = x8 or similar
@@ -5870,6 +5929,7 @@ impl PseudoCodeEmitter {
                 }
                 false
             }
+            ExprKind::CompoundAssign { .. } => self.is_gcov_counter_statement(expr),
             _ => false,
         }
     }
@@ -8771,5 +8831,53 @@ mod tests {
         // Test that empty suffix returns None
         let result = emitter.try_get_semantic_var_name("var_");
         assert!(result.is_none(), "Empty suffix should return None");
+    }
+
+    #[test]
+    fn test_emit_skips_gcov_counter_increment_noise() {
+        let mut sym = SymbolTable::new();
+        sym.insert_with_size(0x4062e0, "__gcov0.classify".to_string(), 40);
+
+        let exact = Expr::got_ref(0x4062e0, 0, 8, Expr::unknown("rip_ref"));
+        let interior = Expr::got_ref(0x4062f8, 0, 8, Expr::unknown("rip_ref"));
+
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Expr(Expr::assign(
+                    Expr::unknown("ret"),
+                    Expr::binop(BinOpKind::Add, exact.clone(), Expr::int(1)),
+                )),
+                StructuredNode::Expr(Expr::assign(
+                    exact.clone(),
+                    Expr::binop(BinOpKind::Add, exact, Expr::int(1)),
+                )),
+                StructuredNode::Expr(Expr::assign(
+                    interior.clone(),
+                    Expr::binop(BinOpKind::Add, interior, Expr::int(1)),
+                )),
+                StructuredNode::Expr(Expr::assign(Expr::unknown("result"), Expr::int(42))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(
+            output.contains("result = 42;"),
+            "expected live code, got:\n{output}"
+        );
+        assert!(
+            !output.contains("__gcov0.classify"),
+            "did not expect exact gcov symbol noise:\n{output}"
+        );
+        assert!(
+            !output.contains("g_ptr_4062f8"),
+            "did not expect interior gcov counter noise:\n{output}"
+        );
+        assert!(
+            !output.contains("ret ="),
+            "did not expect gcov temp readback to survive:\n{output}"
+        );
     }
 }

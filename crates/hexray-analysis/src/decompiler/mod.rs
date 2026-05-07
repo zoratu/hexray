@@ -257,9 +257,9 @@ fn collect_known_noreturn_targets(
     let mut targets = HashMap::new();
 
     if let Some(symbol_table) = symbol_table {
-        for (address, name) in &symbol_table.symbols {
-            if crate::is_noreturn_function_name(name) {
-                targets.insert(*address, name.clone());
+        for (address, symbol) in &symbol_table.symbols {
+            if crate::is_noreturn_function_name(&symbol.name) {
+                targets.insert(*address, symbol.name.clone());
             }
         }
     }
@@ -278,10 +278,18 @@ fn collect_known_noreturn_targets(
 }
 
 /// Symbol table for resolving function addresses to names.
+#[derive(Debug, Clone)]
+struct SymbolRecord {
+    name: String,
+    size: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SymbolTable {
     /// Maps addresses to symbol names.
-    symbols: HashMap<u64, String>,
+    symbols: HashMap<u64, SymbolRecord>,
+    /// Sorted symbol addresses for contained-range lookups.
+    ordered_addresses: Vec<u64>,
 }
 
 impl SymbolTable {
@@ -292,12 +300,51 @@ impl SymbolTable {
 
     /// Adds a symbol at a given address.
     pub fn insert(&mut self, address: u64, name: String) {
-        self.symbols.insert(address, name);
+        self.insert_with_size(address, name, 0);
+    }
+
+    /// Adds a symbol at a given address with size metadata.
+    pub fn insert_with_size(&mut self, address: u64, name: String, size: u64) {
+        let is_new = self
+            .symbols
+            .insert(address, SymbolRecord { name, size })
+            .is_none();
+        if is_new {
+            match self.ordered_addresses.binary_search(&address) {
+                Ok(_) => {}
+                Err(idx) => self.ordered_addresses.insert(idx, address),
+            }
+        }
     }
 
     /// Looks up a symbol at a given address.
     pub fn get(&self, address: u64) -> Option<&str> {
-        self.symbols.get(&address).map(|s| s.as_str())
+        self.symbols.get(&address).map(|s| s.name.as_str())
+    }
+
+    /// Looks up the symbol that contains a given address.
+    pub fn get_containing(&self, address: u64) -> Option<&str> {
+        if let Some(name) = self.get(address) {
+            return Some(name);
+        }
+
+        let idx = match self.ordered_addresses.binary_search(&address) {
+            Ok(idx) => idx,
+            Err(0) => return None,
+            Err(idx) => idx - 1,
+        };
+        let start = self.ordered_addresses[idx];
+        let symbol = self.symbols.get(&start)?;
+        if symbol.size == 0 {
+            return None;
+        }
+
+        let end = start.checked_add(symbol.size)?;
+        if address < end {
+            Some(symbol.name.as_str())
+        } else {
+            None
+        }
     }
 }
 
@@ -1549,5 +1596,15 @@ mod tests {
         assert_eq!(table.get(0x1004), Some("n = %d"));
         assert_eq!(table.get(0x1009), Some("d"));
         assert_eq!(table.get(0x100a), None);
+    }
+
+    #[test]
+    fn symbol_table_resolves_containing_symbol_ranges() {
+        let mut table = SymbolTable::new();
+        table.insert_with_size(0x4062e0, "__gcov0.classify".to_string(), 40);
+
+        assert_eq!(table.get(0x4062e0), Some("__gcov0.classify"));
+        assert_eq!(table.get_containing(0x4062f8), Some("__gcov0.classify"));
+        assert_eq!(table.get_containing(0x406308), None);
     }
 }

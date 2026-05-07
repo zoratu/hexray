@@ -2379,7 +2379,7 @@ fn build_symbol_table(binary: &Binary) -> SymbolTable {
     }
 
     for (address, symbol) in best_symbols {
-        table.insert(address, demangle_or_original(&symbol.name));
+        table.insert_with_size(address, demangle_or_original(&symbol.name), symbol.size);
     }
 
     table
