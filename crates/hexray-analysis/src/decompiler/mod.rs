@@ -179,10 +179,11 @@ impl StringTable {
 
         let (&start, value) = self.strings.range(..=address).next_back()?;
         let offset = usize::try_from(address.checked_sub(start)?).ok()?;
-        value
-            .as_bytes()
-            .get(offset..)
-            .and_then(|suffix| std::str::from_utf8(suffix).ok())
+        let bytes = value.as_bytes();
+        if offset >= bytes.len() {
+            return None;
+        }
+        std::str::from_utf8(&bytes[offset..]).ok()
     }
 
     /// Returns an iterator over all (address, string) pairs.
@@ -1502,7 +1503,7 @@ mod tests {
 
         assert_eq!(table.get(0x1002), Some("@@n = %d"));
         assert_eq!(table.get(0x1004), Some("n = %d"));
-        assert_eq!(table.get(0x100a), Some("d"));
-        assert_eq!(table.get(0x100b), None);
+        assert_eq!(table.get(0x1009), Some("d"));
+        assert_eq!(table.get(0x100a), None);
     }
 }
