@@ -1654,19 +1654,106 @@ fn extract_call_arguments_with_indices(
     // Sort by argument index
     args.sort_by_key(|(arg_idx, _, _)| *arg_idx);
 
-    // Only include contiguous arguments starting from 0
+    let family = infer_argument_abi_family(
+        arg_values
+            .keys()
+            .map(String::as_str)
+            .chain(excluded_regs.iter().map(String::as_str)),
+    );
+    let explicit_by_index: HashMap<usize, (usize, Expr)> = args
+        .into_iter()
+        .map(|(arg_idx, stmt_idx, value)| (arg_idx, (stmt_idx, value)))
+        .collect();
+    let Some(max_idx) = explicit_by_index.keys().copied().max() else {
+        return (Vec::new(), Vec::new());
+    };
+
+    // Include contiguous arguments starting from 0. If a thin wrapper only
+    // materializes later ABI registers (e.g. edx = 64; jmp memcmp), synthesize
+    // untouched leading entry registers as pass-through arguments.
     let mut result = Vec::new();
     let mut used_indices = Vec::new();
-    for (expected_idx, (actual_idx, stmt_idx, value)) in args.into_iter().enumerate() {
-        if actual_idx == expected_idx {
-            result.push(value);
-            used_indices.push(stmt_idx);
-        } else {
+    for expected_idx in 0..=max_idx {
+        if let Some((stmt_idx, value)) = explicit_by_index.get(&expected_idx) {
+            result.push(value.clone());
+            used_indices.push(*stmt_idx);
+            continue;
+        }
+
+        let Some(family) = family else {
+            break;
+        };
+        let Some(reg_name) = pass_through_arg_register_name(family, expected_idx) else {
+            break;
+        };
+        if excluded_regs.contains(reg_name) {
             break;
         }
+        result.push(pass_through_arg_expr(reg_name));
     }
 
     (result, used_indices)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArgumentAbiFamily {
+    X86_64SysV,
+    Aarch64,
+    RiscV,
+}
+
+fn infer_argument_abi_family<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> Option<ArgumentAbiFamily> {
+    for name in names {
+        let lower = name.to_lowercase();
+        if get_arg_register_index(&lower).is_none() {
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "rdi"
+                | "edi"
+                | "rsi"
+                | "esi"
+                | "rdx"
+                | "edx"
+                | "rcx"
+                | "ecx"
+                | "r8"
+                | "r8d"
+                | "r9"
+                | "r9d"
+        ) {
+            return Some(ArgumentAbiFamily::X86_64SysV);
+        }
+        if lower.starts_with('x') || lower.starts_with('w') {
+            return Some(ArgumentAbiFamily::Aarch64);
+        }
+        if lower.starts_with('a') {
+            return Some(ArgumentAbiFamily::RiscV);
+        }
+    }
+
+    None
+}
+
+fn pass_through_arg_register_name(family: ArgumentAbiFamily, index: usize) -> Option<&'static str> {
+    match family {
+        ArgumentAbiFamily::X86_64SysV => {
+            ["rdi", "rsi", "rdx", "rcx", "r8", "r9"].get(index).copied()
+        }
+        ArgumentAbiFamily::Aarch64 => ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+            .get(index)
+            .copied(),
+        ArgumentAbiFamily::RiscV => ["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"]
+            .get(index)
+            .copied(),
+    }
+}
+
+fn pass_through_arg_expr(reg_name: &str) -> Expr {
+    Expr::var(super::super::expression::Variable::reg(reg_name, 8))
 }
 
 /// Merges return value captures across basic block boundaries.
@@ -2883,6 +2970,31 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["4", "6"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_synthesizes_leading_passthrough_wrapper_args() {
+        let statements = vec![
+            Expr::assign(reg("edx", 4), Expr::int(64)),
+            Expr::call(CallTarget::Named("memcmp".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "memcmp"),
+            other => panic!("expected direct memcmp call, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rdi", "rsi", "0x40"]
         );
     }
 
