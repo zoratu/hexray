@@ -1647,6 +1647,39 @@ fn is_real_function_call(target: &super::super::expression::CallTarget) -> bool 
     }
 }
 
+fn should_capture_call_result_directly(target: &super::super::expression::CallTarget) -> bool {
+    matches!(
+        target,
+        super::super::expression::CallTarget::Named(name)
+            if matches!(name.as_str(), "rdtsc" | "rdtscp")
+    )
+}
+
+fn secondary_call_result_replacements(
+    target: &super::super::expression::CallTarget,
+    capture_counter: u32,
+) -> Vec<(Vec<String>, Expr)> {
+    use super::super::expression::CallTarget;
+
+    match target {
+        CallTarget::Named(name) if name == "rdtsc" => vec![(
+            vec!["edx".to_string(), "rdx".to_string()],
+            Expr::unknown(format!("rdtsc_high_{capture_counter}")),
+        )],
+        CallTarget::Named(name) if name == "rdtscp" => vec![
+            (
+                vec!["edx".to_string(), "rdx".to_string()],
+                Expr::unknown(format!("rdtscp_high_{capture_counter}")),
+            ),
+            (
+                vec!["ecx".to_string(), "rcx".to_string()],
+                Expr::unknown(format!("rdtscp_aux_{capture_counter}")),
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 /// Extracts call arguments and returns (arguments, statement_indices_used).
 /// The statement indices are used to track which arg assignments should be removed.
 fn extract_call_arguments_with_indices(
@@ -2157,17 +2190,75 @@ pub(super) fn capture_return_register_uses_in_block(
         }
 
         let next_regs = collect_return_register_uses(&stmts[i + 1]);
-        if next_regs.is_empty() {
+        let direct_capture =
+            call_target.is_some_and(|target| should_capture_call_result_directly(target));
+        let primary_reg = if !next_regs.is_empty() {
+            next_regs
+                .iter()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "x0".to_string())
+        } else if direct_capture {
+            let Some(reg) = first_return_register_use_before_clobber(&stmts[i + 1..]) else {
+                i += 1;
+                continue;
+            };
+            reg
+        } else {
             i += 1;
+            continue;
+        };
+        let aliases = return_register_aliases(&primary_reg);
+
+        if direct_capture {
+            let secondary_replacements = call_target
+                .map(|target| {
+                    secondary_call_result_replacements(target, capture_counter.saturating_add(1))
+                })
+                .unwrap_or_default();
+            let Some(temp_expr) =
+                capture_current_call_result(&mut stmts, i, capture_counter, &primary_reg)
+            else {
+                i += 1;
+                continue;
+            };
+
+            let mut j = i + 1;
+            while j < stmts.len() {
+                if j > i + 1 {
+                    if let ExprKind::Call { target, .. } = &stmts[j].kind {
+                        if is_real_function_call(target) {
+                            break;
+                        }
+                    }
+                }
+                if statement_clobbers_return_register(&stmts[j], &aliases) {
+                    break;
+                }
+                if secondary_replacements
+                    .iter()
+                    .any(|(aliases, _)| statement_clobbers_aliases(&stmts[j], aliases))
+                {
+                    break;
+                }
+                let mut rewritten =
+                    substitute_return_register_uses(stmts[j].clone(), &aliases, &temp_expr);
+                for (aliases, replacement) in &secondary_replacements {
+                    let substitutions: HashMap<String, Expr> = aliases
+                        .iter()
+                        .cloned()
+                        .map(|alias| (alias, replacement.clone()))
+                        .collect();
+                    rewritten = substitute_vars(&rewritten, &substitutions);
+                }
+                stmts[j] = rewritten;
+                j += 1;
+            }
+
+            i = j;
             continue;
         }
 
-        let primary_reg = next_regs
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "x0".to_string());
-        let aliases = return_register_aliases(&primary_reg);
         let reg_size = if matches!(primary_reg.as_str(), "eax" | "w0") {
             4
         } else {
@@ -2556,6 +2647,10 @@ fn collect_return_register_uses(stmt: &Expr) -> HashSet<String> {
 }
 
 fn statement_clobbers_return_register(stmt: &Expr, aliases: &[String]) -> bool {
+    statement_clobbers_aliases(stmt, aliases)
+}
+
+fn statement_clobbers_aliases(stmt: &Expr, aliases: &[String]) -> bool {
     use super::super::expression::ExprKind;
     match &stmt.kind {
         ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => {
@@ -3339,6 +3434,22 @@ mod tests {
         assert_eq!(format!("{}", merged[0]), "ret_0 = foo()");
         assert_eq!(format!("{}", merged[1]), "x = *(uint32_t*)(ret_0)");
         assert_eq!(format!("{}", merged[2]), "sum += x");
+    }
+
+    #[test]
+    fn test_capture_return_register_uses_in_block_for_rdtsc_with_secondary_result() {
+        let statements = vec![
+            Expr::call(CallTarget::Named("rdtsc".to_string()), vec![]),
+            Expr::assign(Expr::unknown("lo"), reg("eax", 4)),
+            Expr::assign(Expr::unknown("hi"), reg("edx", 4)),
+        ];
+
+        let mut counter = 0u32;
+        let merged = capture_return_register_uses_in_block(statements, &mut counter);
+
+        assert_eq!(format!("{}", merged[0]), "ret_0 = rdtsc()");
+        assert_eq!(format!("{}", merged[1]), "lo = ret_0");
+        assert_eq!(format!("{}", merged[2]), "hi = rdtsc_high_1");
     }
 
     #[test]

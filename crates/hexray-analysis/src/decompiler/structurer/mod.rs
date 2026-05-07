@@ -1956,11 +1956,11 @@ impl<'a> Structurer<'a> {
                 // Generate writeback expressions for post-indexed loads/stores
                 let writeback = generate_writeback_expr(inst);
 
+                let mut exprs = vec![main_expr];
                 if let Some(wb) = writeback {
-                    vec![main_expr, wb]
-                } else {
-                    vec![main_expr]
+                    exprs.push(wb);
                 }
+                exprs
             })
             .collect();
 
@@ -2023,11 +2023,11 @@ fn extract_folded_predecessor_call_expr(block: &BasicBlock) -> Option<Expr> {
                 _ => Expr::from_instruction(inst),
             };
             let writeback = generate_writeback_expr(inst);
+            let mut exprs = vec![main_expr];
             if let Some(wb) = writeback {
-                vec![main_expr, wb]
-            } else {
-                vec![main_expr]
+                exprs.push(wb);
             }
+            exprs
         })
         .collect();
     let propagated = propagate_args_in_block(resolve_adrp_patterns(exprs));

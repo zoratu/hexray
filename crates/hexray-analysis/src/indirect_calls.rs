@@ -632,6 +632,14 @@ impl IndirectCallResolver {
                 state.set(Location::Register(x86::R11), ConstValue::NotConstant);
             }
 
+            Operation::ReadTsc | Operation::ReadTscP => {
+                state.set(Location::Register(x86::RAX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::RDX), ConstValue::NotConstant);
+                if matches!(instr.operation, Operation::ReadTscP) {
+                    state.set(Location::Register(x86::RCX), ConstValue::NotConstant);
+                }
+            }
+
             // Other operations conservatively clobber destination
             _ => {
                 if !instr.operands.is_empty() {

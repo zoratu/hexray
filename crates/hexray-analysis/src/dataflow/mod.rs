@@ -114,6 +114,21 @@ impl InstructionEffects {
                 }
             }
 
+            Operation::ReadTsc | Operation::ReadTscP => {
+                if let Some(arch) = infer_arch_from_instruction(inst).or(default_arch) {
+                    match arch {
+                        Architecture::X86_64 | Architecture::X86 => {
+                            effects.defs.push(Location::Register(x86::RAX));
+                            effects.defs.push(Location::Register(x86::RDX));
+                            if matches!(inst.operation, Operation::ReadTscP) {
+                                effects.defs.push(Location::Register(x86::RCX));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             // Store: [mem] = src
             Operation::Store => {
                 if inst.operands.len() >= 2 {
@@ -836,6 +851,18 @@ mod tests {
         assert!(effects.defs.contains(&Location::Register(x86::RAX)));
         assert!(effects.defs.contains(&Location::Register(x86::RCX)));
         assert!(effects.defs.contains(&Location::Register(x86::R11)));
+    }
+
+    #[test]
+    fn test_instruction_effects_rdtsc_x86_64() {
+        let mut inst = Instruction::new(0x1000, 2, vec![0x0f, 0x31], "rdtsc");
+        inst.operation = Operation::ReadTsc;
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.defs.contains(&Location::Register(x86::RAX)));
+        assert!(effects.defs.contains(&Location::Register(x86::RDX)));
+        assert!(effects.uses.is_empty());
     }
 
     // --- is_stack_pointer / is_frame_pointer Tests ---
