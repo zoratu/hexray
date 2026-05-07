@@ -5534,6 +5534,40 @@ impl PseudoCodeEmitter {
         .unwrap();
     }
 
+    fn is_comment_statement_text(text: &str) -> bool {
+        let trimmed = text.trim();
+        (trimmed.starts_with("/*") && trimmed.ends_with("*/")) || trimmed.starts_with("//")
+    }
+
+    fn opaque_x86_integer_simd_statement(expr: &Expr) -> Option<String> {
+        let ExprKind::Call { target, .. } = &expr.kind else {
+            return None;
+        };
+        let CallTarget::Named(name) = target else {
+            return None;
+        };
+        if Self::looks_like_x86_integer_simd_mnemonic(name) {
+            Some(format!("/* SSE: {} */", name.to_ascii_lowercase()))
+        } else {
+            None
+        }
+    }
+
+    fn looks_like_x86_integer_simd_mnemonic(name: &str) -> bool {
+        let mnemonic = name.to_ascii_lowercase();
+        [
+            "punpck", "vpunpck", "pshuf", "vpshuf", "padd", "vpadd", "psub", "vpsub", "pmul",
+            "vpmul", "pack", "vpack", "pcmp", "vpcmp", "pand", "vpand", "por", "vpor", "pxor",
+            "vpxor", "psll", "vpsll", "psrl", "vpsrl", "psra", "vpsra", "palignr", "vpalignr",
+            "pblend", "vpblend", "pinsr", "vpinsr", "pextr", "vpextr", "phadd", "vphadd", "phsub",
+            "vphsub", "pabs", "vpabs", "pavg", "vpavg", "pmax", "vpmax", "pmin", "vpmin", "pmadd",
+            "vpmadd", "pmov", "vpmov", "ptest", "vptest", "psadbw", "vpsadbw", "mpsadbw",
+            "vmpsadbw",
+        ]
+        .iter()
+        .any(|prefix| mnemonic.starts_with(prefix))
+    }
+
     /// Emits a statement (variables are declared at function top, so no inline declarations).
     fn emit_statement_with_decl(
         &self,
@@ -5558,6 +5592,10 @@ impl PseudoCodeEmitter {
         }
 
         let indent = self.indent.repeat(depth);
+        if let Some(comment) = Self::opaque_x86_integer_simd_statement(expr) {
+            writeln!(output, "{}{}", indent, comment).unwrap();
+            return;
+        }
         let expr_str = self.format_expr(expr);
 
         // Skip empty/nop statements and trivial literal statements
@@ -5568,6 +5606,11 @@ impl PseudoCodeEmitter {
         // Skip stack adjustment patterns that result from ARM64 sp operations
         // These appear as "0 -= N" or "0 += N" when the stack pointer isn't resolved
         if expr_str.starts_with("0 -= ") || expr_str.starts_with("0 += ") {
+            return;
+        }
+
+        if Self::is_comment_statement_text(&expr_str) {
+            writeln!(output, "{}{}", indent, expr_str).unwrap();
             return;
         }
 
@@ -6238,6 +6281,10 @@ impl PseudoCodeEmitter {
         }
 
         let indent = self.indent.repeat(depth);
+        if let Some(comment) = Self::opaque_x86_integer_simd_statement(expr) {
+            writeln!(output, "{}{}", indent, comment).unwrap();
+            return;
+        }
         let expr_str = self.format_expr(expr);
 
         // Skip empty/nop statements and trivial literal statements
@@ -6248,6 +6295,11 @@ impl PseudoCodeEmitter {
         // Skip stack adjustment patterns that result from ARM64 sp operations
         // These appear as "0 -= N" or "0 += N" when the stack pointer isn't resolved
         if expr_str.starts_with("0 -= ") || expr_str.starts_with("0 += ") {
+            return;
+        }
+
+        if Self::is_comment_statement_text(&expr_str) {
+            writeln!(output, "{}{}", indent, expr_str).unwrap();
             return;
         }
 
@@ -7558,6 +7610,49 @@ mod tests {
         assert!(vars.contains("var_148"));
         assert!(!vars.contains("var_148 ^"));
         assert!(!is_declarable_variable("var_148 ^"));
+    }
+
+    #[test]
+    fn test_emit_statement_preserves_comment_without_semicolon() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Expr(Expr::unknown("/* SSE: punpcklqdq */"))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(
+            output.contains("    /* SSE: punpcklqdq */\n"),
+            "expected standalone comment emission, got:\n{output}"
+        );
+        assert!(
+            !output.contains("/* SSE: punpcklqdq */;"),
+            "did not expect a comment statement to gain a semicolon, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_emit_statement_rewrites_integer_simd_call_to_comment() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Expr(Expr::call(
+                CallTarget::Named("punpcklqdq".to_string()),
+                vec![Expr::unknown("arr"), Expr::unknown("var_108")],
+            ))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(
+            output.contains("    /* SSE: punpcklqdq */\n"),
+            "expected integer SIMD call to be suppressed into a comment, got:\n{output}"
+        );
+        assert!(
+            !output.contains("punpcklqdq(arr, var_108);"),
+            "did not expect raw SIMD pseudo-call to survive, got:\n{output}"
+        );
     }
 
     #[test]

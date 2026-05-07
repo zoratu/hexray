@@ -696,7 +696,7 @@ pub(super) fn collect_decl_identifiers_from_emitted_body(body: &str) -> HashSet<
     let mut vars = HashSet::new();
     for line in body.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") {
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") {
             continue;
         }
         if trimmed.starts_with("if ")

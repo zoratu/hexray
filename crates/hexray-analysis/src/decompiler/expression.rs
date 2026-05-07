@@ -1114,8 +1114,35 @@ impl Expr {
         }
     }
 
+    fn opaque_x86_integer_simd_comment(mnemonic: &str) -> Self {
+        Self::unknown(format!("/* SSE: {} */", mnemonic.to_ascii_lowercase()))
+    }
+
+    fn should_lift_as_opaque_x86_integer_simd(inst: &Instruction) -> bool {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        Self::looks_like_x86_integer_simd_mnemonic(&mnemonic)
+    }
+
+    fn looks_like_x86_integer_simd_mnemonic(mnemonic: &str) -> bool {
+        [
+            "punpck", "vpunpck", "pshuf", "vpshuf", "padd", "vpadd", "psub", "vpsub", "pmul",
+            "vpmul", "pack", "vpack", "pcmp", "vpcmp", "pand", "vpand", "por", "vpor", "pxor",
+            "vpxor", "psll", "vpsll", "psrl", "vpsrl", "psra", "vpsra", "palignr", "vpalignr",
+            "pblend", "vpblend", "pinsr", "vpinsr", "pextr", "vpextr", "phadd", "vphadd", "phsub",
+            "vphsub", "pabs", "vpabs", "pavg", "vpavg", "pmax", "vpmax", "pmin", "vpmin", "pmadd",
+            "vpmadd", "pmov", "vpmov", "ptest", "vptest", "psadbw", "vpsadbw", "mpsadbw",
+            "vmpsadbw",
+        ]
+        .iter()
+        .any(|prefix| mnemonic.starts_with(prefix))
+    }
+
     /// Converts an instruction to an expression/statement.
     pub fn from_instruction(inst: &Instruction) -> Self {
+        if Self::should_lift_as_opaque_x86_integer_simd(inst) {
+            return Self::opaque_x86_integer_simd_comment(&inst.mnemonic);
+        }
+
         let ops = &inst.operands;
 
         match inst.operation {
@@ -4820,6 +4847,40 @@ mod tests {
 
         assert!(matches!(expr.kind, ExprKind::Unknown(ref s) if s == "__stack_chk_guard"));
         assert_eq!(expr.to_string(), "__stack_chk_guard");
+    }
+
+    #[test]
+    fn test_x86_integer_simd_mnemonic_lifts_to_opaque_comment() {
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
+        let inst = Instruction::new(0x401000, 4, vec![0x66, 0x0f, 0x6c, 0xc1], "punpcklqdq")
+            .with_operation(Operation::Other(0x6c))
+            .with_operands(vec![Operand::Register(xmm0), Operand::Register(xmm1)]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "/* SSE: punpcklqdq */");
+    }
+
+    #[test]
+    fn test_x86_integer_simd_add_lifts_to_opaque_comment_before_binop_lowering() {
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
+        let inst = Instruction::new(0x401010, 4, vec![0x66, 0x0f, 0xd4, 0xc1], "paddq")
+            .with_operation(Operation::Add)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Register(xmm1)]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "/* SSE: paddq */");
     }
 
     #[test]
