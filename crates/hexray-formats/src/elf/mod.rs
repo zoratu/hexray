@@ -9,6 +9,7 @@
 
 pub mod amdgpu;
 pub mod cuda;
+mod gnu_version;
 mod header;
 mod relocation;
 mod section;
@@ -34,6 +35,7 @@ pub use symbol::SymbolEntry;
 // KernelModuleInfo is defined in this module and is public
 
 use crate::{BinaryFormat, ParseError, Section};
+use gnu_version::GnuVersionTable;
 use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
 use std::cmp::Ordering;
 
@@ -94,12 +96,17 @@ impl<'a> Elf<'a> {
             .then_with(|| left.name.len().cmp(&right.name.len()))
     }
 
-    fn symbol_preference_key(symbol: &Symbol) -> (u8, u8, u8, u64) {
+    fn symbol_preference_key(symbol: &Symbol) -> (u8, u8, u8, u8, u64) {
         let kind_rank = match symbol.kind {
             SymbolKind::Function => 3u8,
             SymbolKind::Object => 2u8,
             SymbolKind::Section => 0u8,
             _ => 1u8,
+        };
+        let version_rank = match symbol.version() {
+            Some(version) if version.is_default => 2u8,
+            Some(_) => 1u8,
+            None => 0u8,
         };
         let binding_rank = match symbol.binding {
             SymbolBinding::Global => 2u8,
@@ -108,7 +115,13 @@ impl<'a> Elf<'a> {
         };
         let name_rank = u8::from(!symbol.name.is_empty());
 
-        (kind_rank, binding_rank, name_rank, symbol.size)
+        (
+            kind_rank,
+            version_rank,
+            binding_rank,
+            name_rank,
+            symbol.size,
+        )
     }
 
     /// Parse an ELF file from raw bytes.
@@ -176,8 +189,9 @@ impl<'a> Elf<'a> {
         // We keep the raw `SymbolEntry`s alongside the simplified `Symbol`s
         // so downstream ELF-specific views (e.g. CUDA) can inspect fields
         // like `st_other` that the simplified form discards.
+        let gnu_versions = GnuVersionTable::parse(data, &sections, header.endianness);
         let (mut symbols, raw_symbols) =
-            Self::parse_symbols(data, &sections, &header, &section_names)?;
+            Self::parse_symbols(data, &sections, &header, &section_names, &gnu_versions)?;
 
         // Parse relocations for relocatable files and dynamic binaries
         // - Relocatable files: need relocations for symbol resolution in decompilation
@@ -189,7 +203,14 @@ impl<'a> Elf<'a> {
         // name rather than `sub_NNN`. The decompiler's
         // `normalize_function_name` strips the `@plt` suffix, so the
         // emitted code calls `qsort(...)`.
-        Self::synthesize_plt_symbols(data, &sections, &section_names, &header, &mut symbols)?;
+        Self::synthesize_plt_symbols(
+            data,
+            &sections,
+            &section_names,
+            &header,
+            &gnu_versions,
+            &mut symbols,
+        )?;
 
         // Parse kernel module info if present
         let modinfo = Self::parse_modinfo(data, &sections, &section_names);
@@ -285,6 +306,7 @@ impl<'a> Elf<'a> {
         sections: &[SectionHeader],
         header: &ElfHeader,
         section_names: &StringTable,
+        gnu_versions: &GnuVersionTable,
     ) -> Result<(Vec<Symbol>, Vec<SymbolEntry>), ParseError> {
         let mut symbols = Vec::new();
         let mut raw_symbols = Vec::new();
@@ -294,7 +316,7 @@ impl<'a> Elf<'a> {
             header.file_type == ElfType::Relocatable || header.machine == Machine::Cuda;
 
         // Find symbol table sections (.symtab and .dynsym)
-        for section in sections.iter() {
+        for (section_index, section) in sections.iter().enumerate() {
             if section.sh_type != section::SHT_SYMTAB && section.sh_type != section::SHT_DYNSYM {
                 continue;
             }
@@ -327,6 +349,7 @@ impl<'a> Elf<'a> {
             }
 
             let mut offset = sym_start;
+            let mut symbol_index = 0usize;
             while let Some(next) = offset.checked_add(entry_size) {
                 if next > sym_end {
                     break;
@@ -348,6 +371,15 @@ impl<'a> Elf<'a> {
                     }
                 }
 
+                if !name.is_empty() && section.sh_type == section::SHT_DYNSYM {
+                    name = gnu_versions.decorate_symbol_name(
+                        section_index,
+                        symbol_index,
+                        &name,
+                        entry.st_shndx != symbol::SHN_UNDEF,
+                    );
+                }
+
                 let mut sym = entry.to_symbol(name);
 
                 // For relocatable files, adjust symbol address to be globally unique
@@ -366,6 +398,7 @@ impl<'a> Elf<'a> {
                 raw_symbols.push(entry);
 
                 offset = next;
+                symbol_index = symbol_index.saturating_add(1);
             }
         }
 
@@ -398,6 +431,7 @@ impl<'a> Elf<'a> {
         sections: &[SectionHeader],
         section_names: &StringTable,
         header: &ElfHeader,
+        gnu_versions: &GnuVersionTable,
         symbols: &mut Vec<Symbol>,
     ) -> Result<(), ParseError> {
         // Find the PLT stub-bearing section. CET-aware binaries put
@@ -521,11 +555,8 @@ impl<'a> Elf<'a> {
                 if sym_off_end <= dynsym_end {
                     let sym_chunk = data.get(sym_offset..).unwrap_or(&[]);
                     let sym_entry = SymbolEntry::parse(sym_chunk, header.class, header.endianness)?;
-                    if let Some(name) = strtab.get(sym_entry.st_name as usize) {
-                        if !name.is_empty() {
-                            // Strip the GLIBC version suffix
-                            // (`qsort@GLIBC_2.2.5` → `qsort`).
-                            let bare = name.split('@').next().unwrap_or(name);
+                    if let Some(base_name) = strtab.get(sym_entry.st_name as usize) {
+                        if !base_name.is_empty() {
                             let stub_idx = if has_header {
                                 stub_index.saturating_add(1)
                             } else {
@@ -533,8 +564,14 @@ impl<'a> Elf<'a> {
                             };
                             let stub_addr =
                                 stub_base.saturating_add(stub_size.saturating_mul(stub_idx));
+                            let versioned_name = gnu_versions.decorate_symbol_name(
+                                dynsym_idx,
+                                sym_index as usize,
+                                base_name,
+                                sym_entry.st_shndx != symbol::SHN_UNDEF,
+                            );
                             symbols.push(Symbol {
-                                name: format!("{bare}@plt"),
+                                name: format!("{versioned_name}@plt"),
                                 address: stub_addr,
                                 size: stub_size,
                                 kind: SymbolKind::Function,

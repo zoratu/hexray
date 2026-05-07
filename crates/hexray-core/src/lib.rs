@@ -27,4 +27,7 @@ pub use instruction::{Condition, ControlFlow, Instruction, Operation, PredicateG
 pub use operand::{Immediate, IndexMode, MemoryRef, MemorySpace, Operand};
 pub use output::{escape_dot_string, DotConfig};
 pub use register::{Register, RegisterClass};
-pub use symbol::{Symbol, SymbolBinding, SymbolKind};
+pub use symbol::{
+    gnu_symbol_version, strip_plt_suffix, unversioned_symbol_name, Symbol, SymbolBinding,
+    SymbolKind, SymbolVersion,
+};

@@ -1,5 +1,62 @@
 //! Symbol and relocation types.
 
+/// Parsed GNU symbol-version metadata from a symbol name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolVersion<'a> {
+    /// Version name, such as `GLIBC_2.2.5`.
+    pub name: &'a str,
+    /// Whether this is the default exported version (`@@name`).
+    pub is_default: bool,
+}
+
+/// Strip a synthesized `@plt` suffix from a symbol name.
+pub fn strip_plt_suffix(name: &str) -> &str {
+    name.strip_suffix("@plt").unwrap_or(name)
+}
+
+/// Parse a GNU version suffix from a symbol name, if present.
+pub fn gnu_symbol_version(name: &str) -> Option<SymbolVersion<'_>> {
+    let bare = strip_plt_suffix(name);
+
+    if let Some((base, version)) = bare.split_once("@@") {
+        if !base.is_empty() && !version.is_empty() {
+            return Some(SymbolVersion {
+                name: version,
+                is_default: true,
+            });
+        }
+    }
+
+    let (base, version) = bare.rsplit_once('@')?;
+    if base.is_empty() || version.is_empty() {
+        return None;
+    }
+
+    Some(SymbolVersion {
+        name: version,
+        is_default: false,
+    })
+}
+
+/// Return the symbol name without any GNU version or synthesized `@plt` suffix.
+pub fn unversioned_symbol_name(name: &str) -> &str {
+    let bare = strip_plt_suffix(name);
+
+    if let Some((base, version)) = bare.split_once("@@") {
+        if !base.is_empty() && !version.is_empty() {
+            return base;
+        }
+    }
+
+    if let Some((base, version)) = bare.rsplit_once('@') {
+        if !base.is_empty() && !version.is_empty() {
+            return base;
+        }
+    }
+
+    bare
+}
+
 /// A symbol from the binary's symbol table.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -37,6 +94,31 @@ impl Symbol {
     /// Returns true if this symbol is global.
     pub fn is_global(&self) -> bool {
         matches!(self.binding, SymbolBinding::Global)
+    }
+
+    /// Returns the symbol name without any synthesized `@plt` suffix.
+    pub fn name_without_plt(&self) -> &str {
+        strip_plt_suffix(&self.name)
+    }
+
+    /// Returns the symbol name without any GNU version or `@plt` suffix.
+    pub fn unversioned_name(&self) -> &str {
+        unversioned_symbol_name(&self.name)
+    }
+
+    /// Returns GNU version metadata parsed from the symbol name, if present.
+    pub fn version(&self) -> Option<SymbolVersion<'_>> {
+        gnu_symbol_version(&self.name)
+    }
+
+    /// Returns true if this symbol has the default exported GNU version.
+    pub fn is_default_version(&self) -> bool {
+        self.version().is_some_and(|version| version.is_default)
+    }
+
+    /// Returns true if this symbol name carries the synthesized `@plt` suffix.
+    pub fn is_plt(&self) -> bool {
+        self.name_without_plt().len() != self.name.len()
     }
 }
 

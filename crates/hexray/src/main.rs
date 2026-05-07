@@ -1005,13 +1005,18 @@ fn compare_symbol_display_priority(
         .then_with(|| left.name.len().cmp(&right.name.len()))
 }
 
-fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u64) {
+fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u8, u64) {
     let kind_rank = match symbol.kind {
         hexray_core::SymbolKind::Function => 3u8,
         hexray_core::SymbolKind::Tls => 2u8,
         hexray_core::SymbolKind::Object => 2u8,
         hexray_core::SymbolKind::Section => 0u8,
         _ => 1u8,
+    };
+    let version_rank = match symbol.version() {
+        Some(version) if version.is_default => 2u8,
+        Some(_) => 1u8,
+        None => 0u8,
     };
     let binding_rank = match symbol.binding {
         hexray_core::SymbolBinding::Global => 2u8,
@@ -1020,7 +1025,13 @@ fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u64) {
     };
     let name_rank = u8::from(!symbol.name.is_empty());
 
-    (kind_rank, binding_rank, name_rank, symbol.size)
+    (
+        kind_rank,
+        version_rank,
+        binding_rank,
+        name_rank,
+        symbol.size,
+    )
 }
 
 /// Resolve the target for decompilation.
@@ -1232,12 +1243,15 @@ fn display_symbol_or_label_name_with_symbols(
 }
 
 fn display_symbol_name(
-    fmt: &dyn BinaryFormat,
+    _fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
     symbol: &hexray_core::Symbol,
 ) -> String {
     if symbol.is_function() {
-        return display_function_name(fmt, project, symbol.address);
+        return project
+            .and_then(|p| p.get_function_name(symbol.address))
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| demangle_or_original(&symbol.name));
     }
 
     project
@@ -1272,12 +1286,18 @@ fn find_symbol_in_candidates(
     };
     let symbol_priority = |s: &hexray_core::Symbol| {
         let is_func = if s.is_function() { 1u8 } else { 0u8 };
+        let is_defined = u8::from(s.is_defined());
+        let version_rank = match s.version() {
+            Some(version) if version.is_default => 2u8,
+            Some(_) => 1u8,
+            None => 0u8,
+        };
         let binding_rank = match s.binding {
             hexray_core::SymbolBinding::Global => 2u8,
             hexray_core::SymbolBinding::Weak => 1u8,
             _ => 0u8,
         };
-        (is_func, binding_rank, s.size)
+        (is_func, is_defined, version_rank, binding_rank, s.size)
     };
     let pick_best = |mut candidates: Vec<hexray_core::Symbol>| {
         candidates.sort_by(|a, b| {
@@ -1315,6 +1335,21 @@ fn find_symbol_in_candidates(
         return pick_best(exact_alias_matches);
     }
 
+    let version_base_matches: Vec<_> = symbols
+        .iter()
+        .filter(|s| {
+            if s.unversioned_name() == name {
+                return true;
+            }
+            let demangled = demangle_or_original(&s.name);
+            hexray_core::unversioned_symbol_name(&demangled) == name
+        })
+        .cloned()
+        .collect();
+    if !version_base_matches.is_empty() {
+        return pick_best(version_base_matches);
+    }
+
     if mode == SymbolLookupMode::ExactOnly {
         return None;
     }
@@ -1323,7 +1358,19 @@ fn find_symbol_in_candidates(
     //    Prefer function symbols and shorter names
     let mut prefix_matches: Vec<hexray_core::Symbol> = symbols
         .iter()
-        .filter(|s| s.name.starts_with(name) || demangle_or_original(&s.name).starts_with(name))
+        .filter(|s| {
+            if s.name.starts_with(name)
+                || s.name_without_plt().starts_with(name)
+                || s.unversioned_name().starts_with(name)
+            {
+                return true;
+            }
+
+            let demangled = demangle_or_original(&s.name);
+            demangled.starts_with(name)
+                || hexray_core::strip_plt_suffix(&demangled).starts_with(name)
+                || hexray_core::unversioned_symbol_name(&demangled).starts_with(name)
+        })
         .cloned()
         .collect();
     prefix_matches.sort_by(|a, b| {
@@ -1339,6 +1386,144 @@ fn find_symbol_in_candidates(
     }
 
     None
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum XrefSymbolMatchRank {
+    Prefix,
+    Unversioned,
+    Exact,
+}
+
+fn exact_symbol_alias_match(candidate: &str, query: &str) -> bool {
+    candidate
+        .strip_prefix('_')
+        .is_some_and(|stripped| stripped == query)
+}
+
+fn xref_symbol_match_rank(
+    symbol: &hexray_core::Symbol,
+    query: &str,
+) -> Option<XrefSymbolMatchRank> {
+    let demangled = demangle_or_original(&symbol.name);
+    let demangled_no_plt = hexray_core::strip_plt_suffix(&demangled);
+
+    if symbol.name == query
+        || demangled == query
+        || exact_symbol_alias_match(&symbol.name, query)
+        || exact_symbol_alias_match(&demangled, query)
+    {
+        return Some(XrefSymbolMatchRank::Exact);
+    }
+
+    if symbol.name_without_plt() == query
+        || demangled_no_plt == query
+        || exact_symbol_alias_match(symbol.name_without_plt(), query)
+        || exact_symbol_alias_match(demangled_no_plt, query)
+    {
+        return Some(XrefSymbolMatchRank::Exact);
+    }
+
+    if symbol.unversioned_name() == query
+        || hexray_core::unversioned_symbol_name(&demangled) == query
+    {
+        return Some(XrefSymbolMatchRank::Unversioned);
+    }
+
+    if symbol.name.starts_with(query)
+        || symbol.name_without_plt().starts_with(query)
+        || symbol.unversioned_name().starts_with(query)
+        || demangled.starts_with(query)
+        || demangled_no_plt.starts_with(query)
+        || hexray_core::unversioned_symbol_name(&demangled).starts_with(query)
+    {
+        return Some(XrefSymbolMatchRank::Prefix);
+    }
+
+    None
+}
+
+fn collect_xref_symbol_matches(
+    symbols: &[hexray_core::Symbol],
+    query: &str,
+) -> Vec<hexray_core::Symbol> {
+    let mut best_rank = None;
+    let mut matches = Vec::new();
+
+    for symbol in symbols {
+        let Some(rank) = xref_symbol_match_rank(symbol, query) else {
+            continue;
+        };
+
+        match best_rank {
+            None => {
+                best_rank = Some(rank);
+                matches.push(symbol.clone());
+            }
+            Some(current) if rank > current => {
+                best_rank = Some(rank);
+                matches.clear();
+                matches.push(symbol.clone());
+            }
+            Some(current) if rank == current => matches.push(symbol.clone()),
+            Some(_) => {}
+        }
+    }
+
+    matches
+}
+
+fn resolve_xref_target_addresses(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    target: &str,
+    symbols: &[hexray_core::Symbol],
+    db: &hexray_analysis::XrefDatabase,
+    calls_only: bool,
+) -> Result<Vec<u64>> {
+    if let Ok(address) = parse_address_str(target) {
+        return Ok(vec![address]);
+    }
+
+    let has_refs = |addr: u64| {
+        if calls_only {
+            !db.call_refs_to(addr).is_empty()
+        } else {
+            !db.refs_to(addr).is_empty()
+        }
+    };
+    let matching_symbols = collect_xref_symbol_matches(symbols, target);
+
+    let mut referenced_targets = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for symbol in &matching_symbols {
+        if symbol.address == 0 || !has_refs(symbol.address) || !seen.insert(symbol.address) {
+            continue;
+        }
+        referenced_targets.push(symbol.address);
+    }
+    if !referenced_targets.is_empty() {
+        referenced_targets.sort_unstable();
+        return Ok(referenced_targets);
+    }
+
+    let mut resolved_matches = Vec::new();
+    for symbol in matching_symbols {
+        if symbol.address == 0 || !seen.insert(symbol.address) {
+            continue;
+        }
+        resolved_matches.push(symbol.address);
+    }
+    if !resolved_matches.is_empty() {
+        resolved_matches.sort_unstable();
+        return Ok(resolved_matches);
+    }
+
+    let resolved = resolve_analysis_target_with_symbols(fmt, project, target, symbols)?;
+    Ok(vec![match resolved {
+        ResolvedAnalysisTarget::Address(address) => address,
+        ResolvedAnalysisTarget::Symbol(symbol) => symbol.address,
+    }])
 }
 
 fn disassemble_symbol(fmt: &dyn BinaryFormat, name: &str, max_count: usize) -> Result<()> {
@@ -2601,16 +2786,10 @@ fn apply_call_relocations(
     }
 }
 
-fn has_internal_function_symbols(symbols: &[hexray_core::Symbol]) -> bool {
-    symbols
-        .iter()
-        .any(|s| s.is_function() && s.address != 0 && s.is_defined() && s.section_index.is_some())
-}
-
 // Shared function-start recovery for analyses that need whole-function
-// coverage on stripped binaries. When symbols are absent, reuse the
-// round-21 x86 ENDBR seeding; callers can still layer additional
-// discoveries on top (for example round-6.5's xref call-target seeding).
+// coverage, including partially symbolized CET/IBT binaries. Callers
+// can still layer additional discoveries on top (for example
+// round-6.5's xref call-target seeding).
 fn discover_function_starts(
     fmt: &dyn BinaryFormat,
     arch: Architecture,
@@ -2630,9 +2809,11 @@ fn discover_function_starts(
         })
         .collect();
 
-    if !has_internal_function_symbols(symbols) {
-        starts.extend(discover_stripped_x86_function_seeds(fmt, arch));
-    }
+    // CET/IBT binaries often expose only partial function-symbol coverage
+    // (for example dynsym plus a handful of local labels). Always fold in
+    // ENDBR-derived starts on x86 so xref/callgraph scans still reach the
+    // unsymbolized bodies that make direct calls into PLT stubs.
+    starts.extend(discover_stripped_x86_function_seeds(fmt, arch));
 
     starts.extend(
         discover_lifecycle_array_entries(fmt)
@@ -4170,20 +4351,58 @@ fn build_xrefs(
 
     // If a target is specified, show refs to that target
     if let Some(target_str) = target {
-        let target_addr =
-            match resolve_analysis_target_with_symbols(fmt, project, target_str, &symbols)? {
-                ResolvedAnalysisTarget::Address(addr) => addr,
-                ResolvedAnalysisTarget::Symbol(symbol) => symbol.address,
-            };
-
-        let refs = if calls_only {
-            db.call_refs_to(target_addr)
+        let target_addrs =
+            resolve_xref_target_addresses(fmt, project, target_str, &symbols, &db, calls_only)?;
+        let resolved_targets: Vec<_> = target_addrs
+            .iter()
+            .map(|addr| {
+                (
+                    *addr,
+                    display_symbol_or_label_name_with_symbols(fmt, project, &symbols, *addr),
+                )
+            })
+            .collect();
+        let target_name = if resolved_targets.len() == 1 {
+            resolved_targets[0].1.clone()
         } else {
-            db.refs_to(target_addr).iter().collect()
+            target_str.to_string()
         };
-
-        let target_name =
-            display_symbol_or_label_name_with_symbols(fmt, project, &symbols, target_addr);
+        let mut refs = Vec::new();
+        let mut seen_refs = std::collections::HashSet::new();
+        for target_addr in &target_addrs {
+            let target_refs: Vec<_> = if calls_only {
+                db.call_refs_to(*target_addr).into_iter().cloned().collect()
+            } else {
+                db.refs_to(*target_addr).to_vec()
+            };
+            for xref in target_refs {
+                if seen_refs.insert((xref.from, xref.to, xref.xref_type)) {
+                    refs.push(xref);
+                }
+            }
+        }
+        refs.sort_by(|left, right| {
+            left.from
+                .cmp(&right.from)
+                .then_with(|| left.to.cmp(&right.to))
+                .then_with(|| {
+                    let left_rank = match left.xref_type {
+                        XrefType::Call => 0u8,
+                        XrefType::Jump => 1u8,
+                        XrefType::DataRead => 2u8,
+                        XrefType::DataWrite => 3u8,
+                        XrefType::Unknown => 4u8,
+                    };
+                    let right_rank = match right.xref_type {
+                        XrefType::Call => 0u8,
+                        XrefType::Jump => 1u8,
+                        XrefType::DataRead => 2u8,
+                        XrefType::DataWrite => 3u8,
+                        XrefType::Unknown => 4u8,
+                    };
+                    left_rank.cmp(&right_rank)
+                })
+        });
 
         // Function-start lookup table: sorted by address. For any call-site
         // address we use partition_point to find the nearest preceding
@@ -4288,8 +4507,25 @@ fn build_xrefs(
 
         if json {
             println!("{{");
-            println!("  \"target\": \"{:#x}\",", target_addr);
-            println!("  \"target_name\": \"{}\",", target_name);
+            println!("  \"target_query\": \"{}\",", target_str);
+            if resolved_targets.len() == 1 {
+                println!("  \"target\": \"{:#x}\",", resolved_targets[0].0);
+                println!("  \"target_name\": \"{}\",", target_name);
+            } else {
+                println!("  \"targets\": [");
+                for (index, (addr, name)) in resolved_targets.iter().enumerate() {
+                    let comma = if index + 1 < resolved_targets.len() {
+                        ","
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "    {{ \"address\": \"{:#x}\", \"name\": \"{}\" }}{}",
+                        addr, name, comma
+                    );
+                }
+                println!("  ],");
+            }
             println!("  \"references\": [");
             for (i, xref) in refs.iter().enumerate() {
                 let (from_name, from_offset) = resolve_caller(xref.from);
@@ -4307,9 +4543,27 @@ fn build_xrefs(
             println!("  \"count\": {}", refs.len());
             println!("}}");
         } else {
-            println!("Cross-references to {} ({:#x})", target_name, target_addr);
+            if resolved_targets.len() == 1 {
+                println!(
+                    "Cross-references to {} ({:#x})",
+                    target_name, resolved_targets[0].0
+                );
+            } else {
+                println!(
+                    "Cross-references to {} ({} targets)",
+                    target_name,
+                    resolved_targets.len()
+                );
+            }
             println!("{}", "=".repeat(50));
             println!();
+            if resolved_targets.len() > 1 {
+                println!("Resolved targets:");
+                for (addr, name) in &resolved_targets {
+                    println!("{:#016x} {}", addr, name);
+                }
+                println!();
+            }
 
             if refs.is_empty() {
                 println!("No references found.");
@@ -6491,11 +6745,13 @@ mod tests {
         discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
         ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
         parse_address_str, patch_affects_function, resolve_analysis_target,
-        resolve_materialized_callback_targets, string_tags, truncate_for_display,
-        DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat,
-        SymbolLookupMode,
+        resolve_materialized_callback_targets, resolve_xref_target_addresses, string_tags,
+        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
+        SessionExportFormat, SymbolLookupMode,
     };
-    use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding};
+    use hexray_analysis::{
+        CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding, XrefType,
+    };
     use hexray_core::{
         register::x86, Architecture, Bitness, ControlFlow, Endianness, Immediate, Instruction,
         MemoryRef, Operand, Operation, Register, RegisterClass, Symbol, SymbolBinding, SymbolKind,
@@ -6684,6 +6940,106 @@ mod tests {
             find_symbol_in_candidates(&symbols, "nfsd_open", SymbolLookupMode::Fuzzy).unwrap();
 
         assert_eq!(resolved.name, "nfsd_open.cold");
+    }
+
+    #[test]
+    fn unversioned_lookup_prefers_default_gnu_export() {
+        let symbols = vec![
+            test_symbol("foo@VER_1", 0x10f9),
+            test_symbol("foo@@VER_2", 0x110c),
+        ];
+
+        let resolved = find_symbol_in_candidates(&symbols, "foo", SymbolLookupMode::ExactOnly)
+            .expect("default version should resolve");
+
+        assert_eq!(resolved.name, "foo@@VER_2");
+        assert_eq!(resolved.address, 0x110c);
+    }
+
+    #[test]
+    fn xrefs_resolve_unversioned_imports_to_all_referenced_plt_targets() {
+        let binary = TestBinary {
+            sections: Vec::new(),
+            symbols: Vec::new(),
+            entry_point: None,
+        };
+        let symbols = vec![
+            Symbol {
+                name: "foo@VER_1".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: None,
+            },
+            Symbol {
+                name: "foo@VER_1@plt".to_string(),
+                address: 0x1060,
+                size: 16,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            },
+            Symbol {
+                name: "foo@VER_2".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: None,
+            },
+            Symbol {
+                name: "foo@VER_2@plt".to_string(),
+                address: 0x1070,
+                size: 16,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            },
+        ];
+        let mut db = hexray_analysis::XrefDatabase::new();
+        db.add_xref(0x117b, 0x1060, XrefType::Call);
+        db.add_xref(0x1187, 0x1070, XrefType::Call);
+
+        let resolved = resolve_xref_target_addresses(&binary, None, "foo", &symbols, &db, true)
+            .expect("versioned PLT targets should resolve");
+
+        assert_eq!(resolved, vec![0x1060, 0x1070]);
+    }
+
+    #[test]
+    fn xrefs_resolve_explicit_version_to_matching_plt_target() {
+        let binary = TestBinary {
+            sections: Vec::new(),
+            symbols: Vec::new(),
+            entry_point: None,
+        };
+        let symbols = vec![
+            Symbol {
+                name: "foo@VER_1".to_string(),
+                address: 0,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: None,
+            },
+            Symbol {
+                name: "foo@VER_1@plt".to_string(),
+                address: 0x1060,
+                size: 16,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            },
+        ];
+        let mut db = hexray_analysis::XrefDatabase::new();
+        db.add_xref(0x117b, 0x1060, XrefType::Call);
+
+        let resolved =
+            resolve_xref_target_addresses(&binary, None, "foo@VER_1", &symbols, &db, true)
+                .expect("versioned PLT target should resolve");
+
+        assert_eq!(resolved, vec![0x1060]);
     }
 
     #[test]
