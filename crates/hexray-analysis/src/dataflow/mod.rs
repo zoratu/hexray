@@ -395,7 +395,7 @@ fn infer_arch_from_instruction(inst: &Instruction) -> Option<Architecture> {
         .find_map(arch_from_operand)
         .or_else(|| inst.reads.first().map(|reg| reg.arch))
         .or_else(|| inst.writes.first().map(|reg| reg.arch))
-        .or_else(|| match (inst.operation, inst.mnemonic.as_str()) {
+        .or(match (inst.operation, inst.mnemonic.as_str()) {
             (Operation::Syscall, "syscall") => Some(Architecture::X86_64),
             (Operation::Syscall, "svc") => Some(Architecture::Arm64),
             (Operation::Syscall, "ecall") => Some(Architecture::RiscV64),

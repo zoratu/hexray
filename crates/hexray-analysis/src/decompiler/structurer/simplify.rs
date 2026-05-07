@@ -2190,8 +2190,7 @@ pub(super) fn capture_return_register_uses_in_block(
         }
 
         let next_regs = collect_return_register_uses(&stmts[i + 1]);
-        let direct_capture =
-            call_target.is_some_and(|target| should_capture_call_result_directly(target));
+        let direct_capture = call_target.is_some_and(should_capture_call_result_directly);
         let primary_reg = if !next_regs.is_empty() {
             next_regs
                 .iter()

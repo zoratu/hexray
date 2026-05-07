@@ -1870,7 +1870,8 @@ fn decompile_function(
         }
     };
     let tls_tpoff_map = build_tls_tpoff_map(binary);
-    rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
+    let tls_slot_map = build_tls_slot_map(binary);
+    rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
 
     // Build CFG
     let cfg = CfgBuilder::build(&instructions, start_addr);
@@ -2102,15 +2103,75 @@ fn build_tls_tpoff_map(binary: &Binary) -> std::collections::HashMap<i64, u64> {
     map
 }
 
+fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
+    let Binary::Elf(elf) = binary else {
+        return std::collections::HashMap::new();
+    };
+
+    let Some((tls_vaddr, _)) = elf_tls_layout(binary) else {
+        return std::collections::HashMap::new();
+    };
+
+    let mut map = std::collections::HashMap::new();
+    for reloc in &elf.relocations {
+        if !matches!(reloc.r_type, hexray_formats::RelocationType::Tpoff64) {
+            continue;
+        }
+        let Ok(raw_offset) = u64::try_from(reloc.addend) else {
+            continue;
+        };
+        map.insert(reloc.offset, tls_vaddr.saturating_add(raw_offset));
+    }
+
+    map
+}
+
+fn rip_relative_memory_target(
+    mem: &hexray_core::MemoryRef,
+    inst: &hexray_core::Instruction,
+) -> Option<u64> {
+    let base = mem.base.as_ref()?;
+    if base.name() != "rip" || mem.index.is_some() {
+        return None;
+    }
+
+    let inst_size = i128::try_from(inst.size).ok()?;
+    let target = i128::from(inst.address) + inst_size + i128::from(mem.displacement);
+    u64::try_from(target).ok()
+}
+
+fn add_signed_offset(base: u64, displacement: i64) -> Option<i64> {
+    let target = i128::from(base) + i128::from(displacement);
+    i64::try_from(target).ok()
+}
+
 fn rewrite_tls_memory_operands(
     instructions: &mut [hexray_core::Instruction],
     tls_tpoff_map: &std::collections::HashMap<i64, u64>,
+    tls_slot_map: &std::collections::HashMap<u64, u64>,
 ) {
-    if tls_tpoff_map.is_empty() {
+    if tls_tpoff_map.is_empty() && tls_slot_map.is_empty() {
         return;
     }
 
+    let mut tls_regs: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+
     for instruction in instructions {
+        let tls_reg_load = if instruction.operation == hexray_core::Operation::Move {
+            match instruction.operands.as_slice() {
+                [hexray_core::Operand::Register(dest), hexray_core::Operand::Memory(mem), ..]
+                    if dest.class == hexray_core::RegisterClass::General =>
+                {
+                    rip_relative_memory_target(mem, instruction)
+                        .and_then(|slot| tls_slot_map.get(&slot).copied())
+                        .map(|target| (dest.id, target))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         for operand in &mut instruction.operands {
             let hexray_core::Operand::Memory(mem) = operand else {
                 continue;
@@ -2124,6 +2185,17 @@ fn rewrite_tls_memory_operands(
             ) {
                 continue;
             }
+            if mem.index.is_none() {
+                if let Some(base) = mem.base.as_ref() {
+                    if let Some(&target) = tls_regs.get(&base.id) {
+                        let Some(target_addr) = add_signed_offset(target, mem.displacement) else {
+                            continue;
+                        };
+                        *mem = hexray_core::MemoryRef::absolute(target_addr, mem.size);
+                        continue;
+                    }
+                }
+            }
             if mem.base.is_some() || mem.index.is_some() {
                 continue;
             }
@@ -2134,6 +2206,18 @@ fn rewrite_tls_memory_operands(
                 continue;
             };
             *mem = hexray_core::MemoryRef::absolute(target_addr, mem.size);
+        }
+
+        for reg in &instruction.writes {
+            if matches!(reg.arch, Architecture::X86_64 | Architecture::X86)
+                && reg.class == hexray_core::RegisterClass::General
+            {
+                tls_regs.remove(&reg.id);
+            }
+        }
+
+        if let Some((reg_id, target)) = tls_reg_load {
+            tls_regs.insert(reg_id, target);
         }
     }
 }
@@ -3795,6 +3879,7 @@ fn decompile_with_follow(
     }
     let relocation_table = build_relocation_table(binary);
     let tls_tpoff_map = build_tls_tpoff_map(binary);
+    let tls_slot_map = build_tls_slot_map(binary);
 
     // Create constant database for magic number recognition
     let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
@@ -3859,7 +3944,7 @@ fn decompile_with_follow(
             }
             _ => continue,
         };
-        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
 
         // Build CFG
         let cfg = CfgBuilder::build(&instructions, func_addr);
@@ -4250,6 +4335,7 @@ fn build_xrefs(
         .map(|s| s.address)
         .collect();
     let tls_tpoff_map = build_tls_tpoff_map(binary);
+    let tls_slot_map = build_tls_slot_map(binary);
 
     // Build xref database by disassembling all functions
     let mut xref_builder = XrefBuilder::new();
@@ -4324,7 +4410,7 @@ fn build_xrefs(
                     _ => Vec::new(),
                 };
                 apply_call_relocations(&mut instructions, &relocation_table);
-                rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
+                rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
                 xref_builder.analyze_instructions(&instructions);
 
                 for instr in instructions {
@@ -7532,12 +7618,67 @@ mod tests {
         }];
         let tls_tpoff_map = std::collections::HashMap::from([(-0x50, 0x403de0)]);
 
-        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
+        let tls_slot_map = std::collections::HashMap::new();
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
 
         let Operand::Memory(mem) = &instructions[0].operands[1] else {
             panic!("expected rewritten TLS memory operand");
         };
         assert_eq!(mem.displacement, 0x403de0);
+        assert!(mem.segment.is_none());
+    }
+
+    #[test]
+    fn tls_slot_loaded_register_rewrites_segmented_store() {
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        let mut instructions = vec![
+            Instruction {
+                address: 0x1000,
+                size: 7,
+                bytes: vec![],
+                operation: Operation::Move,
+                mnemonic: "mov".to_string(),
+                operands: vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rip, 0x100, 8)),
+                ],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![],
+                writes: vec![rax],
+                guard: None,
+            },
+            Instruction {
+                address: 0x1007,
+                size: 7,
+                bytes: vec![],
+                operation: Operation::Move,
+                mnemonic: "mov".to_string(),
+                operands: vec![
+                    Operand::Memory(MemoryRef::base_disp(rax, 0, 4).with_segment(fs)),
+                    Operand::Immediate(Immediate {
+                        value: 0x26,
+                        size: 4,
+                        signed: false,
+                    }),
+                ],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![],
+                writes: vec![],
+                guard: None,
+            },
+        ];
+        let tls_tpoff_map = std::collections::HashMap::new();
+        let tls_slot_map = std::collections::HashMap::from([(0x1107, 0x403de0)]);
+
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
+
+        let Operand::Memory(mem) = &instructions[1].operands[0] else {
+            panic!("expected rewritten TLS store operand");
+        };
+        assert_eq!(mem.displacement, 0x403de0);
+        assert!(mem.base.is_none());
         assert!(mem.segment.is_none());
     }
 

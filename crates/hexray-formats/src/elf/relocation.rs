@@ -105,6 +105,8 @@ pub enum RelocationType {
     Pc8,
     /// PC-relative 64-bit
     Pc64,
+    /// TLS offset from thread pointer
+    Tpoff64,
     /// 64-bit GOT offset
     GotOff64,
     /// 32-bit signed PC-relative offset to GOT
@@ -137,6 +139,7 @@ impl RelocationType {
             13 => Self::Pc16,
             14 => Self::R8,
             15 => Self::Pc8,
+            18 => Self::Tpoff64,
             24 => Self::Pc64,
             25 => Self::GotOff64,
             26 => Self::GotPc32,
