@@ -3611,7 +3611,11 @@ fn build_callgraph(
         let mut callgraph = CallGraph::new();
         for symbol in &symbols {
             if symbol.is_function() {
-                callgraph.add_node(symbol.address, Some(symbol.name.clone()), false);
+                callgraph.add_node(
+                    symbol.address,
+                    Some(symbol.name.clone()),
+                    callgraph_symbol_is_external(symbol),
+                );
             }
         }
         for func_info in &all_function_infos {
@@ -3653,7 +3657,11 @@ fn build_callgraph(
             for instruction in instructions {
                 if let hexray_core::ControlFlow::Call { target, .. } = instruction.control_flow {
                     if let Some(symbol) = find_preferred_symbol_at(&symbols, target) {
-                        callgraph.add_node(target, Some(symbol.name.clone()), false);
+                        callgraph.add_node(
+                            target,
+                            Some(symbol.name.clone()),
+                            callgraph_symbol_is_external(symbol),
+                        );
                     } else {
                         callgraph.add_node(target, None, false);
                     }
@@ -3703,6 +3711,7 @@ fn build_callgraph(
         },
     );
     add_lifecycle_array_edges(&mut callgraph, fmt, &symbols);
+    mark_callgraph_stub_nodes_external(&mut callgraph, fmt);
     let callgraph = if let Some(root) = target_root {
         callgraph.subgraph_from(root)
     } else {
@@ -3733,6 +3742,51 @@ fn callgraph_node_display_name(node: &hexray_analysis::CallGraphNode) -> String 
     node.name
         .clone()
         .unwrap_or_else(|| format!("sub_{:x}", node.address))
+}
+
+fn callgraph_symbol_is_external(symbol: &hexray_core::Symbol) -> bool {
+    !symbol.is_defined() || symbol.is_plt()
+}
+
+fn mark_callgraph_stub_nodes_external(
+    callgraph: &mut hexray_analysis::CallGraph,
+    fmt: &dyn BinaryFormat,
+) {
+    let stub_ranges: Vec<_> = fmt
+        .sections()
+        .filter_map(|section| {
+            if !section.is_executable() {
+                return None;
+            }
+
+            let name = section.name().to_ascii_lowercase();
+            if !(name.contains("plt") || name.contains("stub")) {
+                return None;
+            }
+
+            Some((
+                section.virtual_address(),
+                section.virtual_address().saturating_add(section.size()),
+            ))
+        })
+        .collect();
+
+    let external_nodes: Vec<_> = callgraph
+        .nodes()
+        .filter(|node| {
+            node.name
+                .as_deref()
+                .is_some_and(|name| name.ends_with("@plt"))
+                || stub_ranges
+                    .iter()
+                    .any(|(start, end)| node.address >= *start && node.address < *end)
+        })
+        .map(|node| node.address)
+        .collect();
+
+    for address in external_nodes {
+        callgraph.mark_node_external(address);
+    }
 }
 
 fn apply_project_names_to_callgraph(
@@ -7113,6 +7167,17 @@ mod tests {
     }
 
     #[test]
+    fn callgraph_symbol_helper_marks_plt_symbols_external() {
+        assert!(crate::callgraph_symbol_is_external(&test_symbol(
+            "textdomain@plt",
+            0x4860,
+        )));
+        assert!(!crate::callgraph_symbol_is_external(&test_symbol(
+            "main", 0x6000
+        )));
+    }
+
+    #[test]
     fn demangled_exact_match_is_preserved() {
         let symbols = vec![test_symbol("_ZN3foo4mainEv", 0x7000)];
 
@@ -7537,6 +7602,41 @@ mod tests {
 
         let callees: Vec<_> = callgraph.callees(0x401000).map(|(addr, _)| addr).collect();
         assert_eq!(callees, vec![0x401156]);
+    }
+
+    #[test]
+    fn mark_callgraph_stub_nodes_external_uses_section_ranges_and_plt_names() {
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".plt",
+                    address: 0x401000,
+                    data: vec![0x90; 0x20],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".text",
+                    address: 0x402000,
+                    data: vec![0x90; 0x20],
+                    executable: true,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: None,
+        };
+
+        let mut callgraph = CallGraph::new();
+        callgraph.add_node(0x401010, None, false);
+        callgraph.add_node(0x402000, Some("puts@GLIBC_2.2.5@plt".to_string()), false);
+        callgraph.add_node(0x402010, Some("main".to_string()), false);
+
+        crate::mark_callgraph_stub_nodes_external(&mut callgraph, &binary);
+
+        assert!(callgraph.get_node(0x401010).unwrap().is_external);
+        assert!(callgraph.get_node(0x402000).unwrap().is_external);
+        assert!(!callgraph.get_node(0x402010).unwrap().is_external);
     }
 
     #[test]

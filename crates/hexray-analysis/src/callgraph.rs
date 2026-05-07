@@ -3,7 +3,7 @@
 //! This module provides call graph construction from disassembled functions,
 //! tracking caller-callee relationships for program analysis.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use hexray_core::{
     register::x86, BasicBlock, ControlFlow, Instruction, Operand, Operation, Symbol,
@@ -72,11 +72,31 @@ impl CallGraph {
 
     /// Add a function node to the graph.
     pub fn add_node(&mut self, address: u64, name: Option<String>, is_external: bool) {
-        self.nodes.entry(address).or_insert(CallGraphNode {
-            address,
-            name,
-            is_external,
-        });
+        match self.nodes.entry(address) {
+            Entry::Vacant(entry) => {
+                entry.insert(CallGraphNode {
+                    address,
+                    name,
+                    is_external,
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                let node = entry.get_mut();
+                if node.name.is_none() && name.is_some() {
+                    node.name = name;
+                }
+                if is_external {
+                    node.is_external = true;
+                }
+            }
+        }
+    }
+
+    /// Mark an existing node as external/imported.
+    pub fn mark_node_external(&mut self, address: u64) {
+        if let Some(node) = self.nodes.get_mut(&address) {
+            node.is_external = true;
+        }
     }
 
     /// Add a call edge from caller to callee.
@@ -315,10 +335,14 @@ impl CallGraphBuilder {
                 self.call_graph.add_node(
                     symbol.address,
                     Some(symbol.name.clone()),
-                    !symbol.is_defined(),
+                    Self::symbol_is_external(symbol),
                 );
             }
         }
+    }
+
+    fn symbol_is_external(symbol: &Symbol) -> bool {
+        !symbol.is_defined() || symbol.is_plt()
     }
 
     /// Add a function's instructions for analysis.
@@ -1144,6 +1168,36 @@ mod tests {
         assert_eq!(cg.node_count(), 2);
         assert_eq!(cg.get_node(0x1000).unwrap().name.as_deref(), Some("main"));
         assert!(cg.get_node(0x0).unwrap().is_external);
+    }
+
+    #[test]
+    fn test_add_node_upgrades_existing_name_and_externality() {
+        let mut cg = CallGraph::new();
+
+        cg.add_node(0x401000, None, false);
+        cg.add_node(0x401000, Some("puts@GLIBC_2.2.5@plt".to_string()), true);
+
+        let node = cg.get_node(0x401000).unwrap();
+        assert_eq!(node.name.as_deref(), Some("puts@GLIBC_2.2.5@plt"));
+        assert!(node.is_external);
+    }
+
+    #[test]
+    fn test_builder_marks_plt_symbols_external() {
+        let mut builder = CallGraphBuilder::new();
+
+        builder.add_symbols(&[Symbol {
+            name: "puts@GLIBC_2.2.5@plt".to_string(),
+            address: 0x401020,
+            size: 16,
+            kind: SymbolKind::Function,
+            binding: hexray_core::SymbolBinding::Global,
+            section_index: None,
+        }]);
+
+        let cg = builder.build();
+
+        assert!(cg.get_node(0x401020).unwrap().is_external);
     }
 
     #[test]
