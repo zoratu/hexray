@@ -186,6 +186,11 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
                     match disassembler.decode_instruction(remaining, addr) {
                         Ok(decoded) => {
                             let is_ret = decoded.instruction.is_return();
+                            let is_heuristic_tail_jump = heuristic_bounds
+                                && matches!(
+                                    decoded.instruction.control_flow,
+                                    hexray_core::ControlFlow::UnconditionalBranch { .. }
+                                );
                             let is_noreturn_call = matches!(
                                 decoded.instruction.control_flow,
                                 hexray_core::ControlFlow::Call { target, .. }
@@ -195,7 +200,9 @@ pub fn handle_trace_command(fmt: &dyn BinaryFormat, action: TraceAction) -> Resu
                             instructions.push(decoded.instruction);
                             inst_offset += decoded.size;
 
-                            if heuristic_bounds && (is_ret || is_noreturn_call) {
+                            if heuristic_bounds
+                                && (is_ret || is_noreturn_call || is_heuristic_tail_jump)
+                            {
                                 break;
                             }
                             if !heuristic_bounds && is_ret && inst_offset >= func_data.len() / 2 {

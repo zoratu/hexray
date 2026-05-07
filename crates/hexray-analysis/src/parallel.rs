@@ -95,6 +95,11 @@ fn disassemble_function<D: Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_heuristic_tail_jump = heuristic_bounds
+                    && matches!(
+                        decoded.instruction.control_flow,
+                        hexray_core::ControlFlow::UnconditionalBranch { .. }
+                    );
                 let is_noreturn_call = heuristic_bounds
                     && matches!(
                         decoded.instruction.control_flow,
@@ -105,7 +110,7 @@ fn disassemble_function<D: Disassembler>(
                 offset += decoded.size;
 
                 // Heuristic fallback windows should also stop at terminating calls.
-                if is_ret || is_noreturn_call {
+                if is_ret || is_noreturn_call || is_heuristic_tail_jump {
                     break;
                 }
             }

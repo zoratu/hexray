@@ -1552,6 +1552,11 @@ fn disassemble_for_cfg<D: Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_heuristic_tail_jump = stop_after_first_return
+                    && matches!(
+                        decoded.instruction.control_flow,
+                        hexray_core::ControlFlow::UnconditionalBranch { .. }
+                    );
                 let is_noreturn_call = matches!(
                     decoded.instruction.control_flow,
                     hexray_core::ControlFlow::Call { target, .. }
@@ -1564,7 +1569,8 @@ fn disassemble_for_cfg<D: Disassembler>(
 
                 // If we only have a fallback byte window (unknown function size),
                 // stop at the first return/noreturn call to avoid spilling into neighbors.
-                if stop_after_first_return && (is_ret || is_noreturn_call) {
+                if stop_after_first_return && (is_ret || is_noreturn_call || is_heuristic_tail_jump)
+                {
                     break;
                 }
             }
@@ -2227,6 +2233,11 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_heuristic_tail_jump = heuristic_bounds
+                    && matches!(
+                        decoded.instruction.control_flow,
+                        hexray_core::ControlFlow::UnconditionalBranch { .. }
+                    );
                 let is_noreturn_call = heuristic_bounds
                     && matches!(
                         decoded.instruction.control_flow,
@@ -2236,7 +2247,7 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
-                if is_noreturn_call {
+                if is_noreturn_call || is_heuristic_tail_jump {
                     break;
                 }
                 // Don't stop at return - we want to find all calls in the function
@@ -6063,6 +6074,7 @@ mod tests {
         register::x86, Architecture, Bitness, ControlFlow, Endianness, Immediate, Instruction,
         Operand, Operation, Register, RegisterClass, Symbol, SymbolBinding, SymbolKind,
     };
+    use hexray_disasm::X86_64Disassembler;
     use hexray_formats::{BinaryFormat, BinaryType, Section};
     use std::fs;
 
@@ -6481,6 +6493,52 @@ mod tests {
         );
 
         assert_eq!(targets, vec![0x0ee4f0, 0x0eb850, 0x0eb7e0, 0x0f5a80]);
+    }
+
+    #[test]
+    fn heuristic_disassembly_stops_at_unconditional_tail_jump() {
+        let bytes = vec![
+            0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+            0xeb, 0xfa, // jmp 0x401150
+            0xf3, 0x0f, 0x1e, 0xfa, // adjacent function
+            0xc3, // ret
+        ];
+        let disasm = X86_64Disassembler::new();
+
+        let instructions =
+            crate::disassemble_for_calls(&disasm, &bytes, 0x401150, true, &Default::default());
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "jmp");
+    }
+
+    #[test]
+    fn heuristic_cfg_disassembly_stops_at_unconditional_tail_jump() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401150,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0xeb, 0xfa, // jmp 0x401150
+                    0xf3, 0x0f, 0x1e, 0xfa, // adjacent function
+                    0xc3, // ret
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x401150, 11).unwrap();
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x401150, true);
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "jmp");
     }
 
     #[test]
