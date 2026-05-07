@@ -555,6 +555,10 @@ fn tracked_register_assignment(
 }
 
 fn materialized_source_address(instr: &Instruction) -> Option<u64> {
+    let Some(Operand::Register(_)) = instr.operands.first() else {
+        return None;
+    };
+
     let source = match instr.operation {
         Operation::Move | Operation::LoadEffectiveAddress => instr.operands.get(1),
         _ => None,
@@ -1201,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_adds_materialized_function_pointer_edges() {
+    fn test_builder_adds_materialized_register_function_pointer_edges() {
         let mut builder = CallGraphBuilder::new();
         builder.add_symbols(&[
             Symbol {
@@ -1233,7 +1237,7 @@ mod tests {
         builder.add_function(
             0x1000,
             vec![
-                make_stack_store_imm_instruction(0x1000, 0x3000),
+                make_move_reg_imm_instruction(0x1000, x86::RAX, 0x3000),
                 make_call_instruction(0x1008, 0x2000),
                 make_ret_instruction(0x100c),
             ],
@@ -1246,6 +1250,54 @@ mod tests {
         let main_callees: Vec<_> = cg.callees(0x1000).map(|(addr, _)| addr).collect();
         assert!(main_callees.contains(&0x2000));
         assert!(main_callees.contains(&0x3000));
+    }
+
+    #[test]
+    fn test_builder_ignores_materialized_function_store_edges() {
+        let mut builder = CallGraphBuilder::new();
+        builder.add_symbols(&[
+            Symbol {
+                name: "main".to_string(),
+                address: 0x1000,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+            Symbol {
+                name: "dispatcher".to_string(),
+                address: 0x2000,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+            Symbol {
+                name: "helper".to_string(),
+                address: 0x3000,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+        ]);
+
+        builder.add_function(
+            0x1000,
+            vec![
+                make_stack_store_imm_instruction(0x1000, 0x3000),
+                make_call_instruction(0x1008, 0x2000),
+                make_ret_instruction(0x100c),
+            ],
+        );
+        builder.add_function(0x2000, vec![make_ret_instruction(0x2000)]);
+        builder.add_function(0x3000, vec![make_ret_instruction(0x3000)]);
+
+        let cg = builder.build();
+
+        let main_callees: Vec<_> = cg.callees(0x1000).map(|(addr, _)| addr).collect();
+        assert!(main_callees.contains(&0x2000));
+        assert!(!main_callees.contains(&0x3000));
     }
 
     #[test]

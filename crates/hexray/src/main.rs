@@ -3111,6 +3111,10 @@ fn discover_materialized_internal_targets(
     let mut seen = std::collections::HashSet::new();
     let mut targets = Vec::new();
     for instr in instructions {
+        if !matches!(instr.operands.first(), Some(Operand::Register(_))) {
+            continue;
+        }
+
         let Some(source) = (match instr.operation {
             Operation::Move | Operation::LoadEffectiveAddress => instr.operands.get(1),
             _ => None,
@@ -7715,6 +7719,59 @@ mod tests {
         let targets = discover_materialized_internal_targets(&instructions, &binary);
 
         assert_eq!(targets, vec![0x401080]);
+    }
+
+    #[test]
+    fn materialized_internal_targets_ignore_memory_stores() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401000,
+                data: vec![0x90; 0x200],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let instructions = vec![Instruction {
+            address: 0x401020,
+            size: 8,
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef {
+                    base: Some(Register::new(
+                        Architecture::X86_64,
+                        RegisterClass::General,
+                        x86::RBP,
+                        64,
+                    )),
+                    index: None,
+                    scale: 1,
+                    displacement: 0x10,
+                    size: 8,
+                    segment: None,
+                    broadcast: false,
+                    index_mode: hexray_core::IndexMode::None,
+                    space: hexray_core::MemorySpace::Generic,
+                }),
+                Operand::Immediate(Immediate {
+                    value: 0x401080,
+                    size: 64,
+                    signed: false,
+                }),
+            ],
+            control_flow: ControlFlow::Sequential,
+            bytes: vec![0; 8],
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        }];
+
+        let targets = discover_materialized_internal_targets(&instructions, &binary);
+
+        assert!(targets.is_empty());
     }
 
     #[test]
