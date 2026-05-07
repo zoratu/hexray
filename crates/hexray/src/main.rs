@@ -1008,6 +1008,7 @@ fn compare_symbol_display_priority(
 fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u64) {
     let kind_rank = match symbol.kind {
         hexray_core::SymbolKind::Function => 3u8,
+        hexray_core::SymbolKind::Tls => 2u8,
         hexray_core::SymbolKind::Object => 2u8,
         hexray_core::SymbolKind::Section => 0u8,
         _ => 1u8,
@@ -1492,7 +1493,6 @@ fn disassemble_cfg(
             bail!("Unsupported architecture: {:?}", arch);
         }
     };
-
     // Build CFG
     let cfg = CfgBuilder::build(&instructions, start_addr);
 
@@ -1650,7 +1650,7 @@ fn decompile_function(
         .context("Cannot read bytes")?;
 
     let arch = fmt.architecture();
-    let instructions = match arch {
+    let mut instructions = match arch {
         Architecture::X86_64 | Architecture::X86 => {
             let disasm = X86_64Disassembler::new();
             disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
@@ -1671,6 +1671,8 @@ fn decompile_function(
             bail!("Unsupported architecture: {:?}", arch);
         }
     };
+    let tls_tpoff_map = build_tls_tpoff_map(binary);
+    rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
 
     // Build CFG
     let cfg = CfgBuilder::build(&instructions, start_addr);
@@ -1679,7 +1681,7 @@ fn decompile_function(
     let string_table = build_string_table(fmt);
 
     // Build symbol table for function names, merging with project overrides
-    let mut symbol_table = build_symbol_table(fmt);
+    let mut symbol_table = build_symbol_table(binary);
     if let Some(proj) = project {
         for addr in proj.overridden_functions() {
             if let Some(name) = proj.get_function_name(addr) {
@@ -1857,15 +1859,124 @@ fn build_string_table(fmt: &dyn BinaryFormat) -> StringTable {
     table
 }
 
-/// Builds a symbol table from the binary's symbols.
-fn build_symbol_table(fmt: &dyn BinaryFormat) -> SymbolTable {
-    let mut table = SymbolTable::new();
+fn elf_tls_layout(binary: &Binary) -> Option<(u64, u64)> {
+    const PT_TLS: u32 = 7;
 
-    // Add all symbols (both functions and data) for proper resolution
-    for symbol in fmt.symbols() {
-        if symbol.address != 0 && !symbol.name.is_empty() {
-            table.insert(symbol.address, demangle_or_original(&symbol.name));
+    match binary {
+        Binary::Elf(elf) => elf
+            .segments
+            .iter()
+            .find(|segment| segment.p_type == PT_TLS && segment.p_memsz > 0)
+            .map(|segment| (segment.p_vaddr, segment.p_memsz)),
+        _ => None,
+    }
+}
+
+fn normalize_symbol_address(symbol: &hexray_core::Symbol, tls_layout: Option<(u64, u64)>) -> u64 {
+    if symbol.kind == hexray_core::SymbolKind::Tls {
+        if let Some((tls_vaddr, _)) = tls_layout {
+            return tls_vaddr.saturating_add(symbol.address);
         }
+    }
+
+    symbol.address
+}
+
+fn build_tls_tpoff_map(binary: &Binary) -> std::collections::HashMap<i64, u64> {
+    let Some((tls_vaddr, tls_memsz)) = elf_tls_layout(binary) else {
+        return std::collections::HashMap::new();
+    };
+
+    let mut map = std::collections::HashMap::new();
+    for symbol in binary.as_format().symbols() {
+        if symbol.kind != hexray_core::SymbolKind::Tls || !symbol.is_defined() {
+            continue;
+        }
+        let Ok(raw_offset) = i64::try_from(symbol.address) else {
+            continue;
+        };
+        let Ok(memsz) = i64::try_from(tls_memsz) else {
+            continue;
+        };
+        map.insert(raw_offset - memsz, tls_vaddr.saturating_add(symbol.address));
+    }
+
+    map
+}
+
+fn rewrite_tls_memory_operands(
+    instructions: &mut [hexray_core::Instruction],
+    tls_tpoff_map: &std::collections::HashMap<i64, u64>,
+) {
+    if tls_tpoff_map.is_empty() {
+        return;
+    }
+
+    for instruction in instructions {
+        for operand in &mut instruction.operands {
+            let hexray_core::Operand::Memory(mem) = operand else {
+                continue;
+            };
+            let Some(segment) = mem.segment.as_ref() else {
+                continue;
+            };
+            if !matches!(
+                segment.id,
+                hexray_core::register::x86::FS | hexray_core::register::x86::GS
+            ) {
+                continue;
+            }
+            if mem.base.is_some() || mem.index.is_some() {
+                continue;
+            }
+            let Some(&target) = tls_tpoff_map.get(&mem.displacement) else {
+                continue;
+            };
+            let Ok(target_addr) = i64::try_from(target) else {
+                continue;
+            };
+            *mem = hexray_core::MemoryRef::absolute(target_addr, mem.size);
+        }
+    }
+}
+
+/// Builds a symbol table from the binary's symbols.
+fn build_symbol_table(binary: &Binary) -> SymbolTable {
+    let fmt = binary.as_format();
+    let tls_layout = elf_tls_layout(binary);
+    let mut table = SymbolTable::new();
+    let mut best_symbols: std::collections::HashMap<u64, hexray_core::Symbol> =
+        std::collections::HashMap::new();
+
+    // Add all symbols (both functions and data) for proper resolution.
+    // TLS symbols are normalized to their TLS image address so rewritten
+    // fs:/gs: references can resolve to names instead of raw offsets.
+    for symbol in fmt.symbols() {
+        if symbol.name.is_empty() {
+            continue;
+        }
+
+        let address = normalize_symbol_address(symbol, tls_layout);
+        if address == 0 {
+            continue;
+        }
+
+        let mut candidate = symbol.clone();
+        candidate.address = address;
+        match best_symbols.entry(address) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if compare_symbol_display_priority(&candidate, entry.get()).is_lt() {
+                    entry.insert(candidate);
+                }
+            }
+        }
+    }
+
+    for (address, symbol) in best_symbols {
+        table.insert(address, demangle_or_original(&symbol.name));
     }
 
     table
@@ -3281,7 +3392,7 @@ fn decompile_with_follow(
 
     // Build tables once for all decompilations
     let string_table = build_string_table(fmt);
-    let mut symbol_table = build_symbol_table(fmt);
+    let mut symbol_table = build_symbol_table(binary);
     // Merge project function names into symbol table
     if let Some(proj) = project {
         for addr in proj.overridden_functions() {
@@ -3291,6 +3402,7 @@ fn decompile_with_follow(
         }
     }
     let relocation_table = build_relocation_table(binary);
+    let tls_tpoff_map = build_tls_tpoff_map(binary);
 
     // Create constant database for magic number recognition
     let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
@@ -3336,7 +3448,7 @@ fn decompile_with_follow(
             None => continue,
         };
 
-        let instructions = match arch {
+        let mut instructions = match arch {
             Architecture::X86_64 | Architecture::X86 => {
                 let disasm = X86_64Disassembler::new();
                 disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
@@ -3355,6 +3467,7 @@ fn decompile_with_follow(
             }
             _ => continue,
         };
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
 
         // Build CFG
         let cfg = CfgBuilder::build(&instructions, func_addr);
@@ -6172,7 +6285,7 @@ mod tests {
     use hexray_analysis::{CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding};
     use hexray_core::{
         register::x86, Architecture, Bitness, ControlFlow, Endianness, Immediate, Instruction,
-        Operand, Operation, Register, RegisterClass, Symbol, SymbolBinding, SymbolKind,
+        MemoryRef, Operand, Operation, Register, RegisterClass, Symbol, SymbolBinding, SymbolKind,
     };
     use hexray_disasm::X86_64Disassembler;
     use hexray_formats::{BinaryFormat, BinaryType, Section};
@@ -6757,6 +6870,40 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].mnemonic, "endbr64");
         assert_eq!(instructions[1].mnemonic, "jmp");
+    }
+
+    #[test]
+    fn tls_memory_operands_rewrite_to_absolute_symbol_addresses() {
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+        let mut instructions = vec![Instruction {
+            address: 0x4011bf,
+            size: 8,
+            bytes: vec![],
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Register(Register::new(
+                    Architecture::X86_64,
+                    RegisterClass::General,
+                    x86::RAX,
+                    64,
+                )),
+                Operand::Memory(MemoryRef::absolute(-0x50, 4).with_segment(fs)),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        }];
+        let tls_tpoff_map = std::collections::HashMap::from([(-0x50, 0x403de0)]);
+
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
+
+        let Operand::Memory(mem) = &instructions[0].operands[1] else {
+            panic!("expected rewritten TLS memory operand");
+        };
+        assert_eq!(mem.displacement, 0x403de0);
+        assert!(mem.segment.is_none());
     }
 
     #[test]

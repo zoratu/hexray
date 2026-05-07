@@ -3132,6 +3132,18 @@ impl PseudoCodeEmitter {
                 if let Some(simplified) = self.try_format_libc_global_deref_chain(addr) {
                     return simplified;
                 }
+                if let ExprKind::IntLit(address) = &addr.kind {
+                    if let Ok(address) = u64::try_from(*address) {
+                        if let Some(ref sym_table) = self.symbol_table {
+                            if let Some(name) = sym_table.get(address) {
+                                if let Some(alias) = self.simplify_libc_global_name(name) {
+                                    return alias.to_string();
+                                }
+                                return name.to_string();
+                            }
+                        }
+                    }
+                }
                 // Check if this is a stack slot access (rbp + offset or rbp - offset)
                 if let Some(var_name) = self.try_format_stack_slot(addr, *size) {
                     return var_name;
@@ -8115,6 +8127,17 @@ mod tests {
         let expr = Expr::deref(Expr::got_ref(0x2000, 0, 8, Expr::unknown("rip_ref")), 8);
 
         assert_eq!(emitter.format_expr(&expr), "*stdout");
+    }
+
+    #[test]
+    fn test_absolute_deref_symbol_resolution() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x403de0, "counter".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::deref(Expr::int(0x403de0), 4);
+
+        assert_eq!(emitter.format_expr(&expr), "counter");
     }
 
     #[test]

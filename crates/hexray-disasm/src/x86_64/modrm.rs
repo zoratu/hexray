@@ -1,6 +1,6 @@
 //! ModR/M and SIB byte decoding.
 
-use super::prefix::{Evex, Prefixes, Rex};
+use super::prefix::{Evex, Prefixes, Rex, Segment};
 use hexray_core::{
     register::{x86, RegisterClass},
     Architecture, IndexMode, MemoryRef, Operand, Register,
@@ -142,6 +142,18 @@ pub fn decode_tmm(reg: u8) -> Register {
     )
 }
 
+fn decode_segment(segment: Segment) -> Register {
+    let id = match segment {
+        Segment::CS => x86::CS,
+        Segment::SS => x86::SS,
+        Segment::DS => x86::DS,
+        Segment::ES => x86::ES,
+        Segment::FS => x86::FS,
+        Segment::GS => x86::GS,
+    };
+    Register::new(Architecture::X86_64, RegisterClass::Segment, id, 16)
+}
+
 /// Decode the reg field of ModR/M as a register operand.
 pub fn decode_modrm_reg(modrm: ModRM, size: u16) -> Operand {
     Operand::Register(decode_gpr(modrm.reg, size))
@@ -218,7 +230,7 @@ pub fn decode_modrm_rm(
                 scale: 1,
                 displacement,
                 size: (operand_size / 8) as u8,
-                segment: None,
+                segment: prefixes.segment.map(decode_segment),
                 broadcast: false,
                 index_mode: IndexMode::None,
                 space: hexray_core::MemorySpace::Generic,
@@ -251,7 +263,7 @@ pub fn decode_modrm_rm(
             scale,
             displacement,
             size: (operand_size / 8) as u8,
-            segment: None,
+            segment: prefixes.segment.map(decode_segment),
             broadcast: false,
             index_mode: IndexMode::None,
             space: hexray_core::MemorySpace::Generic,
@@ -276,4 +288,35 @@ pub fn decode_modrm_rm_xmm(
     // Otherwise, it's a memory operand - use the same decoding but with vector size
     // Memory operand size is the vector size / 8
     decode_modrm_rm(bytes, modrm, prefixes, vector_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_modrm_rm_preserves_segment_override() {
+        let prefixes = Prefixes {
+            segment: Some(Segment::FS),
+            ..Default::default()
+        };
+        let modrm = ModRM {
+            mod_: 0b00,
+            reg: 0,
+            rm: 0b100,
+        };
+        let bytes = [0x25, 0xb0, 0xff, 0xff, 0xff];
+
+        let (operand, consumed) = decode_modrm_rm(&bytes, modrm, &prefixes, 32).unwrap();
+
+        assert_eq!(consumed, 5);
+        let Operand::Memory(mem) = operand else {
+            panic!("expected memory operand");
+        };
+        assert_eq!(mem.displacement, -0x50);
+        assert_eq!(
+            mem.segment.as_ref().map(|segment| segment.id),
+            Some(x86::FS)
+        );
+    }
 }
