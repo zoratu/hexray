@@ -447,15 +447,59 @@ impl PseudoCodeEmitter {
         let arg_fallback = format!("arg{}", param_index);
         let candidates = [source_name, rendered_name, arg_fallback.as_str()];
         for candidate in candidates {
-            if let Some(ty) = self.type_info.get(candidate) {
-                return Some(ty.clone());
-            }
-            let candidate_lower = candidate.to_lowercase();
-            if let Some(ty) = self.type_info.get(&candidate_lower) {
-                return Some(ty.clone());
+            if let Some(ty) = self.lookup_type_info(candidate) {
+                return Some(ty.to_string());
             }
         }
         None
+    }
+
+    fn lookup_type_info<'a>(&'a self, candidate: &str) -> Option<&'a str> {
+        if let Some(ty) = self.type_info.get(candidate) {
+            return Some(ty.as_str());
+        }
+        let candidate_lower = candidate.to_lowercase();
+        if let Some(ty) = self.type_info.get(&candidate_lower) {
+            return Some(ty.as_str());
+        }
+        for alias in self.argument_type_aliases(candidate) {
+            if let Some(ty) = self.type_info.get(alias) {
+                return Some(ty.as_str());
+            }
+        }
+        None
+    }
+
+    fn argument_type_aliases(&self, candidate: &str) -> Vec<&'static str> {
+        let lower = candidate.to_lowercase();
+        let (prefix, index) = if let Some(rest) = lower.strip_prefix("farg") {
+            ("farg", rest.parse::<usize>().ok())
+        } else if let Some(rest) = lower.strip_prefix("arg") {
+            ("arg", rest.parse::<usize>().ok())
+        } else {
+            return Vec::new();
+        };
+        let Some(index) = index else {
+            return Vec::new();
+        };
+
+        let mut aliases = Vec::new();
+        if prefix == "arg" {
+            if let Some(name) = self.calling_convention.integer_arg_registers().get(index) {
+                aliases.push(*name);
+            }
+            if let Some(name) = self
+                .calling_convention
+                .integer_arg_registers_32()
+                .get(index)
+            {
+                aliases.push(*name);
+            }
+        }
+        if let Some(name) = self.calling_convention.float_arg_registers().get(index) {
+            aliases.push(*name);
+        }
+        aliases
     }
 
     fn format_signature_param_with_type_hint(
@@ -1972,10 +2016,7 @@ impl PseudoCodeEmitter {
 
     /// Gets the type string for a variable, defaulting to "int".
     fn get_type(&self, var_name: &str) -> &str {
-        self.type_info
-            .get(var_name)
-            .map(|s| s.as_str())
-            .unwrap_or("int")
+        self.lookup_type_info(var_name).unwrap_or("int")
     }
 
     /// Gets the type of an expression if known.
@@ -8105,6 +8146,25 @@ mod tests {
 
         // Unknown variables should still default to "int"
         assert_eq!(emitter.get_type("unknown_var"), "int");
+    }
+
+    #[test]
+    fn test_type_lookup_uses_argument_register_aliases() {
+        let mut type_info = HashMap::new();
+        type_info.insert("rdi".to_string(), "void*".to_string());
+        type_info.insert("xmm1".to_string(), "double".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+
+        assert_eq!(emitter.get_type("arg1"), "double");
+        assert_eq!(
+            emitter.find_param_type_hint(0, "arg0", "arg0"),
+            Some("void*".to_string())
+        );
+        assert_eq!(
+            emitter.find_param_type_hint(1, "farg1", "farg1"),
+            Some("double".to_string())
+        );
     }
 
     #[test]

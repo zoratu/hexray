@@ -416,9 +416,23 @@ impl SignatureRecovery {
                         .push("explicit return expression".to_string());
                 }
                 self.return_confidence = self.return_confidence.max(200);
+                if self.expr_is_float_abi_value(expr) {
+                    self.float_return = true;
+                    self.return_size = 8;
+                    if !self
+                        .return_provenance
+                        .iter()
+                        .any(|r| r == "explicit return expression uses float ABI value")
+                    {
+                        self.return_provenance
+                            .push("explicit return expression uses float ABI value".to_string());
+                    }
+                }
                 // Infer return type from expression
                 if let Some(size) = self.infer_expr_size(expr) {
-                    let inferred_size = if matches!(expr.kind, ExprKind::IntLit(_)) {
+                    let inferred_size = if self.float_return {
+                        8
+                    } else if matches!(expr.kind, ExprKind::IntLit(_)) {
                         size.max(4)
                     } else {
                         size
@@ -493,105 +507,7 @@ impl SignatureRecovery {
 
                 // Check if LHS is a register being written
                 if let Some(reg_name) = self.extract_register_name(lhs) {
-                    let reg_lower = reg_name.to_lowercase();
-                    self.written_regs.insert(reg_lower.clone());
-
-                    // If this is an argument register being assigned from a stack slot,
-                    // it might be a parameter being saved
-                    if self.is_arg_register(&reg_lower) {
-                        if let Some(offset) = self.extract_stack_offset(rhs) {
-                            // This is reading an argument and storing it
-                            // The argument was already read, mark it
-                            if !self.written_regs.contains(&reg_lower) {
-                                self.read_regs.insert(reg_lower.clone());
-                            }
-                            // Track the parameter name from the stack slot
-                            if let Some(idx) = self.arg_register_index(&reg_lower) {
-                                self.param_names
-                                    .insert(idx, format!("var_{:x}", offset.unsigned_abs()));
-                            }
-                        }
-                    }
-
-                    // Check for return value setup near return
-                    if near_return && self.is_return_register(&reg_lower) {
-                        self.return_value_set = true;
-                        let reason = format!(
-                            "value assigned to return register '{}' near return",
-                            reg_lower
-                        );
-                        if !self.return_provenance.iter().any(|r| r == &reason) {
-                            self.return_provenance.push(reason);
-                        }
-                        self.return_confidence = self.return_confidence.max(160);
-                        let reg_size = self.reg_size_from_name(&reg_lower);
-                        if reg_size > 0 {
-                            let mut inferred_size = reg_size;
-                            if let Some(rhs_size) = self.infer_expr_size(rhs) {
-                                if rhs_size > 0
-                                    && rhs_size < reg_size
-                                    && !matches!(rhs.kind, ExprKind::IntLit(_))
-                                {
-                                    inferred_size = rhs_size;
-                                }
-                            }
-                            self.return_size = inferred_size;
-                            let reason = format!(
-                                "return register value width inferred as {} byte(s)",
-                                inferred_size
-                            );
-                            if !self.return_provenance.iter().any(|r| r == &reason) {
-                                self.return_provenance.push(reason);
-                            }
-                            self.return_confidence = self.return_confidence.max(170);
-                        } else if let Some(size) = self.infer_expr_size(rhs) {
-                            self.return_size = size;
-                            let reason =
-                                format!("return register value width inferred as {} byte(s)", size);
-                            if !self.return_provenance.iter().any(|r| r == &reason) {
-                                self.return_provenance.push(reason);
-                            }
-                            self.return_confidence = self.return_confidence.max(170);
-                        }
-                        // Check if return value is a pointer
-                        if self.is_expr_likely_pointer(rhs) {
-                            self.return_is_pointer = true;
-                            if !self
-                                .return_provenance
-                                .iter()
-                                .any(|r| r == "return register assignment inferred as pointer")
-                            {
-                                self.return_provenance.push(
-                                    "return register assignment inferred as pointer".to_string(),
-                                );
-                            }
-                            self.return_confidence = self.return_confidence.max(190);
-                        }
-                        if let Some(fp) = self.infer_return_function_pointer(rhs) {
-                            self.return_function_pointer = Some(fp);
-                            if !self.return_provenance.iter().any(|r| {
-                                r == "return register assignment inferred as function pointer"
-                            }) {
-                                self.return_provenance.push(
-                                    "return register assignment inferred as function pointer"
-                                        .to_string(),
-                                );
-                            }
-                            self.return_confidence = self.return_confidence.max(230);
-                        }
-                        if self.is_float_return_register(&reg_lower) {
-                            self.float_return = true;
-                            if !self
-                                .return_provenance
-                                .iter()
-                                .any(|r| r == "float return register observed")
-                            {
-                                self.return_provenance
-                                    .push("float return register observed".to_string());
-                            }
-                            self.return_confidence = self.return_confidence.max(200);
-                        }
-                    }
+                    self.record_register_write(&reg_name, rhs, near_return);
                 }
 
                 // For parameter detection: check if an arg register is read and stored to stack
@@ -651,10 +567,109 @@ impl SignatureRecovery {
                         }
                     }
                 }
+                if let Some(reg_name) = self.extract_register_name(lhs) {
+                    self.record_register_write(&reg_name, rhs, near_return);
+                }
             }
             _ => {
                 self.analyze_expr_reads(expr);
             }
+        }
+    }
+
+    fn record_register_write(&mut self, reg_name: &str, rhs: &Expr, near_return: bool) {
+        let reg_lower = reg_name.to_lowercase();
+        self.written_regs.insert(reg_lower.clone());
+
+        // If this is an argument register being assigned from a stack slot,
+        // it might be a parameter being saved.
+        if self.is_arg_register(&reg_lower) {
+            if let Some(offset) = self.extract_stack_offset(rhs) {
+                if !self.written_regs.contains(&reg_lower) {
+                    self.read_regs.insert(reg_lower.clone());
+                }
+                if let Some(idx) = self.arg_register_index(&reg_lower) {
+                    self.param_names
+                        .insert(idx, format!("var_{:x}", offset.unsigned_abs()));
+                }
+            }
+        }
+
+        if !near_return || !self.is_return_register(&reg_lower) {
+            return;
+        }
+
+        self.return_value_set = true;
+        let reason = format!(
+            "value assigned to return register '{}' near return",
+            reg_lower
+        );
+        if !self.return_provenance.iter().any(|r| r == &reason) {
+            self.return_provenance.push(reason);
+        }
+        self.return_confidence = self.return_confidence.max(160);
+
+        let reg_size = self.reg_size_from_name(&reg_lower);
+        if reg_size > 0 {
+            let mut inferred_size = reg_size;
+            if let Some(rhs_size) = self.infer_expr_size(rhs) {
+                if rhs_size > 0 && rhs_size < reg_size && !matches!(rhs.kind, ExprKind::IntLit(_)) {
+                    inferred_size = rhs_size;
+                }
+            }
+            self.return_size = inferred_size;
+            let reason = format!(
+                "return register value width inferred as {} byte(s)",
+                inferred_size
+            );
+            if !self.return_provenance.iter().any(|r| r == &reason) {
+                self.return_provenance.push(reason);
+            }
+            self.return_confidence = self.return_confidence.max(170);
+        } else if let Some(size) = self.infer_expr_size(rhs) {
+            self.return_size = size;
+            let reason = format!("return register value width inferred as {} byte(s)", size);
+            if !self.return_provenance.iter().any(|r| r == &reason) {
+                self.return_provenance.push(reason);
+            }
+            self.return_confidence = self.return_confidence.max(170);
+        }
+
+        if self.is_expr_likely_pointer(rhs) {
+            self.return_is_pointer = true;
+            if !self
+                .return_provenance
+                .iter()
+                .any(|r| r == "return register assignment inferred as pointer")
+            {
+                self.return_provenance
+                    .push("return register assignment inferred as pointer".to_string());
+            }
+            self.return_confidence = self.return_confidence.max(190);
+        }
+        if let Some(fp) = self.infer_return_function_pointer(rhs) {
+            self.return_function_pointer = Some(fp);
+            if !self
+                .return_provenance
+                .iter()
+                .any(|r| r == "return register assignment inferred as function pointer")
+            {
+                self.return_provenance
+                    .push("return register assignment inferred as function pointer".to_string());
+            }
+            self.return_confidence = self.return_confidence.max(230);
+        }
+        if self.is_float_return_register(&reg_lower) {
+            self.float_return = true;
+            if !self
+                .return_provenance
+                .iter()
+                .any(|r| r == "float return register observed")
+            {
+                self.return_provenance
+                    .push("float return register observed".to_string());
+            }
+            self.return_confidence = self.return_confidence.max(200);
         }
     }
 
@@ -1937,9 +1952,32 @@ impl SignatureRecovery {
             || name_lower == self.convention.float_return_register()
     }
 
+    fn is_float_arg_register(&self, name: &str) -> bool {
+        let name_lower = name.to_lowercase();
+        self.convention
+            .float_arg_registers()
+            .iter()
+            .any(|reg| reg.eq_ignore_ascii_case(&name_lower))
+            || name_lower
+                .strip_prefix("farg")
+                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+    }
+
     /// Checks if a register is a float return register.
     fn is_float_return_register(&self, name: &str) -> bool {
-        name.to_lowercase() == self.convention.float_return_register()
+        let name_lower = name.to_lowercase();
+        name_lower == self.convention.float_return_register()
+            || name_lower
+                .strip_prefix("farg")
+                .is_some_and(|suffix| suffix.parse::<usize>().ok() == Some(0))
+    }
+
+    fn expr_is_float_abi_value(&self, expr: &Expr) -> bool {
+        let Some(name) = self.extract_var_name(expr) else {
+            return false;
+        };
+        let name_lower = name.to_lowercase();
+        self.is_float_return_register(&name_lower) || self.is_float_arg_register(&name_lower)
     }
 
     /// Returns the size in bytes based on register name variant.
@@ -2058,6 +2096,11 @@ impl SignatureRecovery {
         match &expr.kind {
             ExprKind::Var(var) => {
                 let var_name_lower = var.name.to_lowercase();
+                if self.is_float_return_register(&var_name_lower)
+                    || self.is_float_arg_register(&var_name_lower)
+                {
+                    return Some(8);
+                }
                 if let Some(size) = self.value_sizes.get(&var_name_lower) {
                     // Prefer tracked value width for non-ABI temporaries/registers.
                     if !self.is_arg_register(&var_name_lower)
@@ -4624,6 +4667,76 @@ mod tests {
         let fparam = Parameter::from_float_register(0, "xmm0");
         assert_eq!(fparam.name, "farg0");
         assert_eq!(fparam.param_type, ParamType::Float(64));
+    }
+
+    #[test]
+    fn test_signature_recovery_marks_compound_write_to_xmm0_as_float_return() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(
+                    Expr::var(Variable::reg("xmm1", 16)),
+                    Expr::var(Variable::reg("xmm0", 16)),
+                ),
+                Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Mul,
+                        lhs: Box::new(Expr::var(Variable::reg("xmm0", 16))),
+                        rhs: Box::new(Expr::var(Variable::reg("xmm0", 16))),
+                    },
+                },
+                Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Add,
+                        lhs: Box::new(Expr::var(Variable::reg("xmm0", 16))),
+                        rhs: Box::new(Expr::var(Variable::reg("xmm1", 16))),
+                    },
+                },
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Float(64));
+    }
+
+    #[test]
+    fn test_signature_recovery_keeps_explicit_xmm0_return_as_float() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Mul,
+                    lhs: Box::new(Expr::var(Variable::reg("xmm0", 16))),
+                    rhs: Box::new(Expr::var(Variable::reg("xmm0", 16))),
+                },
+            }],
+            address_range: (0x1000, 0x1008),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::var(Variable::reg("xmm0", 16)))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Float(64));
     }
 
     #[test]

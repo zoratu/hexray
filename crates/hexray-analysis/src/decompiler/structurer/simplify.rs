@@ -118,6 +118,19 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
             }
         }
 
+        // Compound updates to the return register still leave the final value
+        // live in-place, so keep the statement and return the updated register.
+        if let ExprKind::CompoundAssign { lhs, .. } = &stmt.kind {
+            if let ExprKind::Var(v) = &lhs.kind {
+                let is_return_reg =
+                    matches!(v.name.as_str(), "eax" | "rax" | "w0" | "x0" | "a0" | "xmm0");
+                if is_return_reg {
+                    return_value = Some((**lhs).clone());
+                    break;
+                }
+            }
+        }
+
         // x86 epilogue: push/pop calls
         if let ExprKind::Call {
             target: super::super::expression::CallTarget::Named(name),
@@ -2478,6 +2491,7 @@ fn return_register_aliases(reg_name: &str) -> Vec<String> {
             "eax".to_string(),
             "rax".to_string(),
         ],
+        "xmm0" => vec!["xmm0".to_string()],
         "w0" | "x0" | "arg0" => vec!["w0".to_string(), "x0".to_string(), "arg0".to_string()],
         "a0" => vec!["a0".to_string()],
         _ => vec![reg_name.to_string()],
@@ -2918,6 +2932,26 @@ mod tests {
             name: "ret".to_string(),
             size,
         })
+    }
+
+    #[test]
+    fn test_extract_return_value_keeps_terminal_compound_update_to_float_return_reg() {
+        let statements = vec![
+            Expr::assign(reg("xmm1", 16), reg("xmm0", 16)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(reg("xmm0", 16)),
+                    rhs: Box::new(reg("xmm1", 16)),
+                },
+            },
+        ];
+
+        let (filtered, return_value) = extract_return_value(statements);
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(format!("{}", filtered[1]), "xmm0 += xmm1");
+        assert_eq!(format!("{}", return_value.expect("return value")), "xmm0");
     }
 
     #[test]

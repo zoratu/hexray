@@ -638,6 +638,11 @@ impl ExpressionTypePropagation {
 
     /// Analyzes structured code to propagate types.
     pub fn analyze(&mut self, nodes: &[StructuredNode]) {
+        // Pass 0: seed obvious scalar FP temporaries before copy propagation.
+        for node in nodes {
+            self.seed_float_abi_hints_from_node(node);
+        }
+
         // Pass 1: Collect type hints from context
         for node in nodes {
             self.collect_type_hints_from_node(node);
@@ -651,6 +656,148 @@ impl ExpressionTypePropagation {
         // Pass 3: Propagate through function calls
         for node in nodes {
             self.propagate_call_types_in_node(node);
+        }
+    }
+
+    fn seed_float_abi_hints_from_node(&mut self, node: &StructuredNode) {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    self.seed_float_abi_hints_from_expr(stmt);
+                }
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                self.seed_float_abi_hints_from_expr(condition);
+                for n in then_body {
+                    self.seed_float_abi_hints_from_node(n);
+                }
+                if let Some(else_nodes) = else_body {
+                    for n in else_nodes {
+                        self.seed_float_abi_hints_from_node(n);
+                    }
+                }
+            }
+            StructuredNode::While {
+                condition, body, ..
+            }
+            | StructuredNode::DoWhile {
+                body, condition, ..
+            } => {
+                self.seed_float_abi_hints_from_expr(condition);
+                for n in body {
+                    self.seed_float_abi_hints_from_node(n);
+                }
+            }
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(e) = init {
+                    self.seed_float_abi_hints_from_expr(e);
+                }
+                self.seed_float_abi_hints_from_expr(condition);
+                if let Some(e) = update {
+                    self.seed_float_abi_hints_from_expr(e);
+                }
+                for n in body {
+                    self.seed_float_abi_hints_from_node(n);
+                }
+            }
+            StructuredNode::Loop { body, .. } | StructuredNode::Sequence(body) => {
+                for n in body {
+                    self.seed_float_abi_hints_from_node(n);
+                }
+            }
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                self.seed_float_abi_hints_from_expr(value);
+                for (_, body) in cases {
+                    for n in body {
+                        self.seed_float_abi_hints_from_node(n);
+                    }
+                }
+                if let Some(nodes) = default {
+                    for n in nodes {
+                        self.seed_float_abi_hints_from_node(n);
+                    }
+                }
+            }
+            StructuredNode::Return(Some(expr)) | StructuredNode::Expr(expr) => {
+                self.seed_float_abi_hints_from_expr(expr);
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                for n in try_body {
+                    self.seed_float_abi_hints_from_node(n);
+                }
+                for handler in catch_handlers {
+                    for n in &handler.body {
+                        self.seed_float_abi_hints_from_node(n);
+                    }
+                }
+            }
+            StructuredNode::Return(None)
+            | StructuredNode::Break
+            | StructuredNode::Continue
+            | StructuredNode::Goto(_)
+            | StructuredNode::Label(_) => {}
+        }
+    }
+
+    fn seed_float_abi_hints_from_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::CompoundAssign { op, lhs, rhs } => {
+                self.seed_float_abi_hints_from_expr(lhs);
+                self.seed_float_abi_hints_from_expr(rhs);
+                if matches!(
+                    op,
+                    BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul | BinOpKind::Div
+                ) {
+                    if let ExprKind::Var(var) = &lhs.kind {
+                        if Self::looks_like_float_abi_name(&var.name) {
+                            self.set_variable_type(&var.name, ExprType::Float { size: 8 });
+                        }
+                    }
+                }
+            }
+            ExprKind::Assign { lhs, rhs }
+            | ExprKind::BinOp {
+                left: lhs,
+                right: rhs,
+                ..
+            } => {
+                self.seed_float_abi_hints_from_expr(lhs);
+                self.seed_float_abi_hints_from_expr(rhs);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::AddressOf(operand) => {
+                self.seed_float_abi_hints_from_expr(operand);
+            }
+            ExprKind::Deref { addr, .. } => self.seed_float_abi_hints_from_expr(addr),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.seed_float_abi_hints_from_expr(base);
+                self.seed_float_abi_hints_from_expr(index);
+            }
+            ExprKind::FieldAccess { base, .. } => self.seed_float_abi_hints_from_expr(base),
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.seed_float_abi_hints_from_expr(arg);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -758,6 +905,22 @@ impl ExpressionTypePropagation {
                 if let ExprKind::Var(var) = &lhs.kind {
                     if let Some(rhs_type) = self.infer_expr_type(rhs) {
                         self.set_variable_type(&var.name, rhs_type);
+                    }
+                }
+            }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.collect_type_hints_from_expr(lhs);
+                self.collect_type_hints_from_expr(rhs);
+
+                if let ExprKind::Var(var) = &lhs.kind {
+                    let lhs_type = self.infer_expr_type(lhs);
+                    let rhs_type = self.infer_expr_type(rhs);
+                    if let Some(merged) = match (lhs_type, rhs_type) {
+                        (Some(l), Some(r)) => Some(l.merge(&r)),
+                        (Some(t), None) | (None, Some(t)) => Some(t),
+                        (None, None) => None,
+                    } {
+                        self.set_variable_type(&var.name, merged);
                     }
                 }
             }
@@ -1020,6 +1183,22 @@ impl ExpressionTypePropagation {
                     }
                 }
             }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.propagate_types_in_expr(lhs);
+                self.propagate_types_in_expr(rhs);
+
+                if let ExprKind::Var(var) = &lhs.kind {
+                    let lhs_type = self.infer_expr_type(lhs);
+                    let rhs_type = self.infer_expr_type(rhs);
+                    if let Some(merged) = match (lhs_type, rhs_type) {
+                        (Some(l), Some(r)) => Some(l.merge(&r)),
+                        (Some(t), None) | (None, Some(t)) => Some(t),
+                        (None, None) => None,
+                    } {
+                        self.set_variable_type(&var.name, merged);
+                    }
+                }
+            }
             ExprKind::BinOp { left, right, .. } => {
                 self.propagate_types_in_expr(left);
                 self.propagate_types_in_expr(right);
@@ -1163,6 +1342,10 @@ impl ExpressionTypePropagation {
                 self.propagate_call_types_in_expr(lhs);
                 self.propagate_call_types_in_expr(rhs);
             }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.propagate_call_types_in_expr(lhs);
+                self.propagate_call_types_in_expr(rhs);
+            }
             ExprKind::BinOp { left, right, .. } => {
                 self.propagate_call_types_in_expr(left);
                 self.propagate_call_types_in_expr(right);
@@ -1231,6 +1414,9 @@ impl ExpressionTypePropagation {
                 if let Some(ty) = self.variable_types.get(&var.name) {
                     return Some(ty.clone());
                 }
+                if Self::looks_like_float_abi_name(&var.name) {
+                    return Some(ExprType::Float { size: 8 });
+                }
                 // Default based on size
                 Some(ExprType::Int {
                     size: var.size,
@@ -1292,6 +1478,15 @@ impl ExpressionTypePropagation {
                 }
                 None
             }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                let lhs_type = self.infer_expr_type(lhs);
+                let rhs_type = self.infer_expr_type(rhs);
+                match (lhs_type, rhs_type) {
+                    (Some(l), Some(r)) => Some(l.merge(&r)),
+                    (Some(t), None) | (None, Some(t)) => Some(t),
+                    (None, None) => None,
+                }
+            }
             ExprKind::ArrayAccess { base, .. } => {
                 // Element type of array
                 self.infer_expr_type(base)
@@ -1332,6 +1527,16 @@ impl ExpressionTypePropagation {
             ExprKind::Cast { expr: inner, .. } => self.extract_var_name(inner),
             _ => None,
         }
+    }
+
+    fn looks_like_float_abi_name(name: &str) -> bool {
+        let lower = name.to_lowercase();
+        lower
+            .strip_prefix("xmm")
+            .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+            || lower
+                .strip_prefix("farg")
+                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
     }
 
     /// Sets or merges a variable type.
@@ -1973,5 +2178,35 @@ mod tests {
         assert!(ExprType::Float { size: 4 }.is_numeric());
         assert!(ExprType::Char { signed: true }.is_numeric());
         assert!(!ExprType::ptr(ExprType::Void).is_numeric());
+    }
+
+    #[test]
+    fn test_analyze_propagates_scalar_xmm_temporaries_as_double() {
+        use hexray_core::BasicBlockId;
+
+        let body = vec![
+            StructuredNode::Block {
+                id: BasicBlockId::new(0),
+                statements: vec![
+                    Expr::assign(make_var("xmm1", 16), make_var("xmm0", 16)),
+                    Expr {
+                        kind: ExprKind::CompoundAssign {
+                            op: BinOpKind::Mul,
+                            lhs: Box::new(make_var("xmm0", 16)),
+                            rhs: Box::new(make_var("xmm0", 16)),
+                        },
+                    },
+                ],
+                address_range: (0x1000, 0x1008),
+            },
+            StructuredNode::Return(Some(make_var("xmm0", 16))),
+        ];
+
+        let mut engine = ExpressionTypePropagation::new();
+        engine.analyze(&body);
+        let exported = engine.export_for_decompiler();
+
+        assert_eq!(exported.get("xmm0"), Some(&"double".to_string()));
+        assert_eq!(exported.get("xmm1"), Some(&"double".to_string()));
     }
 }

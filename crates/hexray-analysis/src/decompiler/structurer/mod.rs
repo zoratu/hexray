@@ -758,13 +758,13 @@ impl<'a> Structurer<'a> {
         let mut return_value: Option<Expr> = None;
 
         for inst in &block.instructions {
-            // Check for return value setup: eax/rax/x0/w0 = something (Move or Load)
+            // Check for return value setup in the architecture return register.
             if matches!(inst.operation, Operation::Move | Operation::Load)
                 && inst.operands.len() >= 2
             {
                 if let hexray_core::Operand::Register(dst) = &inst.operands[0] {
                     let dst_name = dst.name().to_lowercase();
-                    if matches!(dst_name.as_str(), "eax" | "rax" | "x0" | "w0" | "a0") {
+                    if abi::is_return_register(&dst_name) {
                         return_value = Some(Expr::from_operand_with_inst(&inst.operands[1], inst));
                         continue;
                     }
@@ -5063,6 +5063,29 @@ mod tests {
                 .is_none(),
             "mid-function call chain should not be treated as a pure return"
         );
+    }
+
+    #[test]
+    fn test_last_safe_return_register_expr_in_statements_accepts_xmm0() {
+        use crate::decompiler::expression::Variable;
+
+        let statements = vec![
+            Expr::assign(
+                Expr::var(Variable::reg("xmm1", 16)),
+                Expr::var(Variable::reg("xmm0", 16)),
+            ),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(Expr::var(Variable::reg("xmm0", 16))),
+                    rhs: Box::new(Expr::var(Variable::reg("xmm1", 16))),
+                },
+            },
+        ];
+
+        let expr = Structurer::last_safe_return_register_expr_in_statements(&statements)
+            .expect("xmm0 should be treated as an implicit return register");
+        assert_eq!(format!("{}", expr), "xmm0");
     }
 
     #[test]
