@@ -3,7 +3,8 @@
 //! Converts low-level instructions into high-level expressions.
 
 use hexray_core::{
-    Architecture, Instruction, MemoryRef, Operand, Operation, Register, RegisterClass,
+    register::x86, Architecture, Instruction, MemoryRef, Operand, Operation, Register,
+    RegisterClass,
 };
 use std::fmt;
 
@@ -1039,6 +1040,19 @@ impl Expr {
         Self::memory_address_expr_with_size(mem, None)
     }
 
+    fn known_segmented_memory_symbol(mem: &MemoryRef) -> Option<&'static str> {
+        let segment = mem.segment.as_ref()?;
+        if mem.base.is_some() || mem.index.is_some() {
+            return None;
+        }
+
+        match (segment.id, mem.displacement) {
+            // Linux x86_64 and x86 stack-protector canary slots in TLS.
+            (x86::FS, 0x28) | (x86::GS, 0x14) => Some("__stack_chk_guard"),
+            _ => None,
+        }
+    }
+
     fn memory_address_expr_with_size(mem: &MemoryRef, forced_size_bytes: Option<u8>) -> Self {
         let mut addr_expr: Option<Expr> = None;
 
@@ -1074,6 +1088,9 @@ impl Expr {
 
     /// Converts a memory reference to an expression.
     fn from_memory_ref(mem: &MemoryRef) -> Self {
+        if let Some(symbol) = Self::known_segmented_memory_symbol(mem) {
+            return Self::unknown(symbol);
+        }
         Self::deref(Self::memory_address_expr(mem), mem.size)
     }
 
@@ -4780,6 +4797,29 @@ mod tests {
             !rendered.contains("*("),
             "LEA should not produce a dereference: {rendered}"
         );
+    }
+
+    #[test]
+    fn test_fs_stack_canary_slot_lifts_to_guard_symbol() {
+        use hexray_core::{Architecture, IndexMode, MemoryRef, Operand, Register, RegisterClass};
+
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+        let operand = Operand::Memory(MemoryRef {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0x28,
+            size: 8,
+            segment: Some(fs),
+            broadcast: false,
+            index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
+        });
+
+        let expr = Expr::from_operand(&operand);
+
+        assert!(matches!(expr.kind, ExprKind::Unknown(ref s) if s == "__stack_chk_guard"));
+        assert_eq!(expr.to_string(), "__stack_chk_guard");
     }
 
     #[test]

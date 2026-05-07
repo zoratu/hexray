@@ -4217,6 +4217,7 @@ impl PseudoCodeEmitter {
         vars = vars
             .into_iter()
             .filter_map(|name| canonical_decl_var_name(&name))
+            .filter(|name| !is_likely_global_identifier(name))
             .collect();
 
         // Remove parameters
@@ -6996,6 +6997,36 @@ mod tests {
         assert!(
             output.contains("int sum;"),
             "Expected declaration for inferred local 'sum', got:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_does_not_declare_global_like_unknown_names() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::assign(
+                Expr::unknown("ret"),
+                Expr::unknown("__stack_chk_guard"),
+            )],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(Some(Expr::unknown("ret")))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "guard_read");
+
+        assert!(
+            !output.contains("int __stack_chk_guard;"),
+            "Did not expect a local declaration for __stack_chk_guard, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("__stack_chk_guard"),
+            "Expected symbolic guard reference to remain in output, got:\n{}",
             output
         );
     }
