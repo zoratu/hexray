@@ -537,6 +537,16 @@ pub(super) fn is_declarable_variable(name: &str) -> bool {
         return false;
     }
 
+    // Numeric literals and addresses are never local declarations.
+    if name.starts_with("0x") || name.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    // Reject leaked operator or punctuation tokens before any pattern-based fast path.
+    if !is_plain_identifier(name) {
+        return false;
+    }
+
     // Original variable patterns that always need declaration
     if name.starts_with("var_")
         || name.starts_with("local_")
@@ -629,22 +639,6 @@ pub(super) fn is_declarable_variable(name: &str) -> bool {
         return false;
     }
 
-    // Numeric literals and addresses - don't declare
-    if name.starts_with("0x") || name.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
-        return false;
-    }
-
     // Default: if not a register and not a literal, likely a local variable
     // This catches any other semantic names we might have missed
     true
@@ -661,18 +655,7 @@ pub(super) fn is_assignable_unknown_name(name: &str) -> bool {
     }
 
     // Accept generic identifier-shaped names on assignment LHS (e.g., sum, total, value).
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
-        return false;
-    }
-
-    true
+    is_plain_identifier(name)
 }
 
 pub(super) fn is_likely_global_identifier(name: &str) -> bool {
@@ -741,7 +724,9 @@ pub(super) fn collect_decl_identifiers_from_emitted_body(body: &str) -> HashSet<
 }
 
 pub(super) fn extract_assignment_lhs(line: &str) -> Option<&str> {
-    const OPS: [&str; 10] = ["<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "="];
+    const OPS: [&str; 11] = [
+        "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "=",
+    ];
 
     let mut best: Option<(usize, &str)> = None;
     for op in OPS {
@@ -790,6 +775,17 @@ pub(super) fn canonical_decl_var_name(name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 pub(super) fn is_loop_counter_like_name(name: &str) -> bool {

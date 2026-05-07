@@ -7545,6 +7545,22 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_assignment_lhs_handles_xor_assign() {
+        assert_eq!(
+            super::predicates::extract_assignment_lhs("var_148 ^= saved3;"),
+            Some("var_148")
+        );
+    }
+
+    #[test]
+    fn test_collect_decl_identifiers_from_emitted_body_handles_xor_assign() {
+        let vars = collect_decl_identifiers_from_emitted_body("    var_148 ^= saved3;\n");
+        assert!(vars.contains("var_148"));
+        assert!(!vars.contains("var_148 ^"));
+        assert!(!is_declarable_variable("var_148 ^"));
+    }
+
+    #[test]
     fn test_type_inference_integration() {
         use super::super::expression::Variable;
 
