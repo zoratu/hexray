@@ -1161,7 +1161,20 @@ fn resolve_analysis_target_with_symbols(
     target: &str,
     symbols: &[hexray_core::Symbol],
 ) -> Result<ResolvedAnalysisTarget> {
+    if let Some(symbol) = find_symbol_in_candidates(symbols, target, SymbolLookupMode::ExactOnly) {
+        return Ok(ResolvedAnalysisTarget::Symbol(symbol));
+    }
+
     match resolve_analysis_target(fmt, project, target) {
+        Ok(ResolvedAnalysisTarget::Symbol(symbol)) => {
+            if let Some(candidate) =
+                find_symbol_in_candidates(symbols, &symbol.name, SymbolLookupMode::ExactOnly)
+            {
+                Ok(ResolvedAnalysisTarget::Symbol(candidate))
+            } else {
+                Ok(ResolvedAnalysisTarget::Symbol(symbol))
+            }
+        }
         Ok(resolved) => Ok(resolved),
         Err(_) => {
             if let Some(symbol) =
@@ -1208,10 +1221,10 @@ fn display_symbol_or_label_name_with_symbols(
                 .map(|name| name.to_string())
         })
         .or_else(|| {
-            fmt.symbol_at(address)
+            find_preferred_symbol_at(symbols, address)
                 .map(|s| demangle_or_original(&s.name))
                 .or_else(|| {
-                    find_preferred_symbol_at(symbols, address)
+                    fmt.symbol_at(address)
                         .map(|symbol| demangle_or_original(&symbol.name))
                 })
         })
@@ -2059,10 +2072,19 @@ fn resolve_relocation_symbol(symbol: &hexray_core::Symbol) -> (u64, bool) {
 }
 
 fn collect_analysis_symbols(
-    fmt: &dyn BinaryFormat,
+    binary: &Binary,
     relocations: &RelocationTable,
 ) -> Vec<hexray_core::Symbol> {
-    let mut symbols: Vec<_> = fmt.symbols().cloned().collect();
+    let fmt = binary.as_format();
+    let tls_layout = elf_tls_layout(binary);
+    let mut symbols: Vec<_> = fmt
+        .symbols()
+        .cloned()
+        .map(|mut symbol| {
+            symbol.address = normalize_symbol_address(&symbol, tls_layout);
+            symbol
+        })
+        .collect();
     let mut seen = std::collections::HashSet::new();
     for symbol in &symbols {
         seen.insert((symbol.address, symbol.name.clone()));
@@ -2833,7 +2855,7 @@ fn build_callgraph(
     let fmt = binary.as_format();
     let relocation_table = build_relocation_table(binary);
     let has_call_relocations = relocation_table.call_relocations().len() > 0;
-    let symbols = collect_analysis_symbols(fmt, &relocation_table);
+    let symbols = collect_analysis_symbols(binary, &relocation_table);
     let arch = fmt.architecture();
     let noreturn_targets: std::collections::HashSet<u64> = symbols
         .iter()
@@ -3851,12 +3873,13 @@ fn build_xrefs(
     let fmt = binary.as_format();
     let relocation_table = build_relocation_table(binary);
     let arch = fmt.architecture();
-    let symbols = collect_analysis_symbols(fmt, &relocation_table);
+    let symbols = collect_analysis_symbols(binary, &relocation_table);
     let noreturn_targets: std::collections::HashSet<u64> = symbols
         .iter()
         .filter(|s| is_noreturn_function_name(&s.name))
         .map(|s| s.address)
         .collect();
+    let tls_tpoff_map = build_tls_tpoff_map(binary);
 
     // Build xref database by disassembling all functions
     let mut xref_builder = XrefBuilder::new();
@@ -3931,6 +3954,7 @@ fn build_xrefs(
                     _ => Vec::new(),
                 };
                 apply_call_relocations(&mut instructions, &relocation_table);
+                rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map);
                 xref_builder.analyze_instructions(&instructions);
 
                 for instr in instructions {
@@ -6517,6 +6541,51 @@ mod tests {
             ResolvedAnalysisTarget::Address(address) => assert_eq!(address, 0xadd),
             ResolvedAnalysisTarget::Symbol(symbol) => {
                 panic!("resolved {} instead of the hex address", symbol.name)
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_analysis_target_with_symbols_prefers_normalized_tls_exact_match() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".tdata",
+                address: 0x403de4,
+                data: vec![0; 4],
+                executable: false,
+                allocated: true,
+            }],
+            symbols: vec![Symbol {
+                name: "seeded".to_string(),
+                address: 0,
+                size: 4,
+                kind: SymbolKind::Tls,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            }],
+            entry_point: None,
+        };
+        let normalized_symbols = vec![Symbol {
+            name: "seeded".to_string(),
+            address: 0x403de4,
+            size: 4,
+            kind: SymbolKind::Tls,
+            binding: SymbolBinding::Global,
+            section_index: Some(1),
+        }];
+
+        let resolved = crate::resolve_analysis_target_with_symbols(
+            &binary,
+            None,
+            "seeded",
+            &normalized_symbols,
+        )
+        .unwrap();
+
+        match resolved {
+            ResolvedAnalysisTarget::Symbol(symbol) => assert_eq!(symbol.address, 0x403de4),
+            ResolvedAnalysisTarget::Address(address) => {
+                panic!("resolved {address:#x} instead of the normalized TLS symbol")
             }
         }
     }
