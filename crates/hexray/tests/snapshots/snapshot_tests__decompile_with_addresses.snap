@@ -14,11 +14,8 @@ int32_t _main(void)
     int var_0;
 
     // bb0 [[ADDR]..[ADDR]]
-    // bb1 [[ADDR]..[ADDR]]
     ret = _factorial(5);
-    // bb2 [[ADDR]..[ADDR]]
     local_4 = _sum_while(10);
-    // bb3 [[ADDR]..[ADDR]]
     var_0 = _conditional(7);
     return ret + local_4 + var_0;
 }

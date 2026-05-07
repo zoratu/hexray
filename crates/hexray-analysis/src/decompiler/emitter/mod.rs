@@ -5683,30 +5683,7 @@ impl PseudoCodeEmitter {
 
     /// Checks if a function name is a known noreturn function.
     fn is_noreturn_function(name: &str) -> bool {
-        // Strip leading underscore(s) for Mach-O symbols
-        let name = name.trim_start_matches('_');
-        matches!(
-            name,
-            "exit"
-                | "_exit"
-                | "_Exit"
-                | "abort"
-                | "__assert_fail"
-                | "__assert_rtn"
-                | "__assert"
-                | "panic"
-                | "longjmp"
-                | "siglongjmp"
-                | "__cxa_throw"
-                | "__cxa_rethrow"
-                | "err"
-                | "errx"
-                | "verr"
-                | "verrx"
-                | "pthread_exit"
-                | "thrd_exit"
-                | "quick_exit"
-        )
+        crate::is_noreturn_function_name(name)
     }
 
     /// Checks if a body (list of nodes) is empty or contains only empty/skippable blocks.

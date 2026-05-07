@@ -250,6 +250,33 @@ fn is_printable_ascii(b: u8) -> bool {
     (0x20..=0x7e).contains(&b) || b == b'\t' || b == b'\n' || b == b'\r'
 }
 
+fn collect_known_noreturn_targets(
+    symbol_table: Option<&SymbolTable>,
+    relocation_table: Option<&RelocationTable>,
+) -> HashMap<u64, String> {
+    let mut targets = HashMap::new();
+
+    if let Some(symbol_table) = symbol_table {
+        for (address, name) in &symbol_table.symbols {
+            if crate::is_noreturn_function_name(name) {
+                targets.insert(*address, name.clone());
+            }
+        }
+    }
+
+    if let Some(relocation_table) = relocation_table {
+        for relocation in relocation_table.call_relocations.values() {
+            if relocation.target_addr != 0 && crate::is_noreturn_function_name(&relocation.symbol) {
+                targets
+                    .entry(relocation.target_addr)
+                    .or_insert_with(|| relocation.symbol.clone());
+            }
+        }
+    }
+
+    targets
+}
+
 /// Symbol table for resolving function addresses to names.
 #[derive(Debug, Clone, Default)]
 pub struct SymbolTable {
@@ -1050,7 +1077,18 @@ impl Decompiler {
     /// This performs signature recovery without generating decompiled code,
     /// useful for building symbol tables or function prototypes.
     pub fn recover_signature(&self, cfg: &ControlFlowGraph) -> FunctionSignature {
-        let structured = StructuredCfg::from_cfg(cfg);
+        let noreturn_targets = collect_known_noreturn_targets(
+            self.symbol_table.as_ref(),
+            self.relocation_table.as_ref(),
+        );
+        let structured =
+            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_noreturn_targets(
+                cfg,
+                &config::DecompilerConfig::default(),
+                None,
+                None,
+                &noreturn_targets,
+            );
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_relocation_table(self.relocation_table.clone())
             .with_symbol_table(self.symbol_table.clone())
@@ -1061,19 +1099,25 @@ impl Decompiler {
 
     /// Decompiles a CFG and returns the structured representation.
     pub fn structure(&self, cfg: &ControlFlowGraph) -> StructuredCfg {
+        let noreturn_targets = collect_known_noreturn_targets(
+            self.symbol_table.as_ref(),
+            self.relocation_table.as_ref(),
+        );
         if let Some(ref config) = self.config {
-            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info(
+            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_noreturn_targets(
                 cfg,
                 config,
                 self.binary_data.as_ref(),
                 self.exception_info.as_ref(),
+                &noreturn_targets,
             )
         } else {
-            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info(
+            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_noreturn_targets(
                 cfg,
                 &config::DecompilerConfig::default(),
                 self.binary_data.as_ref(),
                 self.exception_info.as_ref(),
+                &noreturn_targets,
             )
         }
     }

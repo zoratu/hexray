@@ -159,6 +159,8 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
 /// Simplifies statements by performing copy propagation on temporary registers.
 /// Transforms patterns like `eax = x; y = eax;` into `y = x;`.
 pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let nodes = merge_adjacent_blocks(nodes);
+
     // First pass: collect all GotRef assignments
     let global_refs = collect_global_refs(&nodes);
 
@@ -181,6 +183,121 @@ pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredN
 
     // Sixth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
     nodes.into_iter().map(simplify_conditions_in_node).collect()
+}
+
+fn merge_adjacent_blocks(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut merged = Vec::new();
+
+    for node in nodes {
+        let node = match node {
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => StructuredNode::If {
+                condition,
+                then_body: merge_adjacent_blocks(then_body),
+                else_body: else_body.map(merge_adjacent_blocks),
+            },
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::While {
+                condition,
+                body: merge_adjacent_blocks(body),
+                header,
+                exit_block,
+            },
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+                exit_block,
+            } => StructuredNode::DoWhile {
+                body: merge_adjacent_blocks(body),
+                condition,
+                header,
+                exit_block,
+            },
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::For {
+                init,
+                condition,
+                update,
+                body: merge_adjacent_blocks(body),
+                header,
+                exit_block,
+            },
+            StructuredNode::Loop {
+                body,
+                header,
+                exit_block,
+            } => StructuredNode::Loop {
+                body: merge_adjacent_blocks(body),
+                header,
+                exit_block,
+            },
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => StructuredNode::Switch {
+                value,
+                cases: cases
+                    .into_iter()
+                    .map(|(values, body)| (values, merge_adjacent_blocks(body)))
+                    .collect(),
+                default: default.map(merge_adjacent_blocks),
+            },
+            StructuredNode::Sequence(inner) => {
+                StructuredNode::Sequence(merge_adjacent_blocks(inner))
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => StructuredNode::TryCatch {
+                try_body: merge_adjacent_blocks(try_body),
+                catch_handlers: catch_handlers
+                    .into_iter()
+                    .map(|handler| CatchHandler {
+                        body: merge_adjacent_blocks(handler.body),
+                        ..handler
+                    })
+                    .collect(),
+            },
+            other => other,
+        };
+
+        if let (
+            Some(StructuredNode::Block {
+                statements: prev_statements,
+                address_range: prev_range,
+                ..
+            }),
+            StructuredNode::Block {
+                statements,
+                address_range,
+                ..
+            },
+        ) = (merged.last_mut(), &node)
+        {
+            prev_statements.extend(statements.iter().cloned());
+            prev_range.1 = address_range.1;
+            continue;
+        }
+
+        merged.push(node);
+    }
+
+    merged
 }
 
 /// Simplifies conditions in all nodes (convert | to ||, & to && for comparisons, etc.)
@@ -1637,14 +1754,34 @@ fn collect_target_argument_registers(
 fn is_real_function_call(target: &super::super::expression::CallTarget) -> bool {
     use super::super::expression::CallTarget;
     match target {
-        CallTarget::Named(name) => !matches!(
-            name.as_str(),
-            "push" | "pop" | "syscall" | "int" | "halt" | "swap" | "rol" | "ror"
-        ),
+        CallTarget::Named(name) => {
+            !matches!(
+                name.as_str(),
+                "push" | "pop" | "syscall" | "int" | "halt" | "swap" | "rol" | "ror"
+            ) && !is_register_state_pseudo_call(name)
+        }
         CallTarget::Direct { .. } | CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => {
             true
         }
     }
+}
+
+fn is_register_state_pseudo_call(name: &str) -> bool {
+    matches!(
+        name,
+        "cbw"
+            | "cwde"
+            | "cdqe"
+            | "cwd"
+            | "cdq"
+            | "cqo"
+            | "cbtw"
+            | "cwtl"
+            | "cltq"
+            | "cwtd"
+            | "cltd"
+            | "cqto"
+    )
 }
 
 fn should_capture_call_result_directly(target: &super::super::expression::CallTarget) -> bool {
@@ -3491,6 +3628,27 @@ mod tests {
 
         let propagated = propagate_args_in_block(statements);
         assert_eq!(format!("{}", propagated[2]), "eax = eax * edx");
+    }
+
+    #[test]
+    fn test_propagate_call_args_keeps_snapshot_across_cdqe_pseudo_call() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("edi", 4)),
+            Expr::call(CallTarget::Named("cdqe".to_string()), vec![]),
+            Expr::assign(
+                reg("rdx", 8),
+                Expr::binop(BinOpKind::Mul, reg("rax", 8), Expr::int(4)),
+            ),
+            Expr::assign(reg("rax", 8), reg("rsi", 8)),
+            Expr::assign(
+                reg("rcx", 8),
+                Expr::binop(BinOpKind::Add, reg("rdx", 8), reg("rax", 8)),
+            ),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(format!("{}", propagated[2]), "rdx = edi * 4");
+        assert_eq!(format!("{}", propagated[4]), "rcx = edi * 4 + rsi");
     }
 
     #[test]

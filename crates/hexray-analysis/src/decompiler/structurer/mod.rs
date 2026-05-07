@@ -6,7 +6,7 @@
 
 use hexray_core::{
     cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlow, ControlFlowGraph,
-    Operand, Operation,
+    Instruction, Operand, Operation,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -41,8 +41,6 @@ use gotos::{
     collect_loop_headers, convert_global_gotos_to_continue, convert_gotos_to_break_continue,
     convert_switch_gotos_to_break,
 };
-#[cfg(test)]
-use hexray_core::Instruction;
 #[cfg(test)]
 use simplify::capture_return_register_uses_in_block;
 use simplify::{
@@ -351,7 +349,14 @@ impl StructuredCfg {
         cfg: &ControlFlowGraph,
         config: &super::config::DecompilerConfig,
     ) -> Self {
-        Self::from_cfg_with_config_and_binary_data_and_exception_info(cfg, config, None, None)
+        let known_noreturn_targets = HashMap::new();
+        Self::from_cfg_with_config_and_binary_data_and_exception_info_and_noreturn_targets(
+            cfg,
+            config,
+            None,
+            None,
+            &known_noreturn_targets,
+        )
     }
 
     pub(crate) fn from_cfg_with_config_and_binary_data_and_exception_info(
@@ -360,12 +365,36 @@ impl StructuredCfg {
         binary_data: Option<&BinaryDataContext>,
         exception_info: Option<&ExceptionInfo>,
     ) -> Self {
+        let known_noreturn_targets = HashMap::new();
+        Self::from_cfg_with_config_and_binary_data_and_exception_info_and_noreturn_targets(
+            cfg,
+            config,
+            binary_data,
+            exception_info,
+            &known_noreturn_targets,
+        )
+    }
+
+    pub(crate) fn from_cfg_with_config_and_binary_data_and_exception_info_and_noreturn_targets(
+        cfg: &ControlFlowGraph,
+        config: &super::config::DecompilerConfig,
+        binary_data: Option<&BinaryDataContext>,
+        exception_info: Option<&ExceptionInfo>,
+        known_noreturn_targets: &HashMap<u64, String>,
+    ) -> Self {
         use super::config::OptimizationPass;
 
         let annotations = StructuringAnnotations::from_cfg_and_exception_info(cfg, exception_info);
-        let mut structurer =
-            Structurer::new_with_binary_data_and_annotations(cfg, binary_data, annotations);
+        let mut structurer = Structurer::new_with_binary_data_annotations_and_noreturn_targets(
+            cfg,
+            binary_data,
+            annotations,
+            known_noreturn_targets.clone(),
+        );
         let mut body = structurer.structure();
+        if !structurer.known_noreturn_targets.is_empty() {
+            body = rewrite_known_noreturn_calls(body, &structurer.known_noreturn_targets);
+        }
 
         // Post-process to propagate arguments into function calls (before copy propagation)
         if config.is_pass_enabled(OptimizationPass::CallArgPropagation) {
@@ -541,24 +570,50 @@ struct Structurer<'a> {
     annotations: StructuringAnnotations,
     /// Binary data context for jump table reconstruction.
     binary_data: Option<&'a BinaryDataContext>,
+    /// Known noreturn call targets resolved from the enclosing decompiler context.
+    known_noreturn_targets: HashMap<u64, String>,
 }
 
 impl<'a> Structurer<'a> {
     fn new(cfg: &'a ControlFlowGraph) -> Self {
-        Self::new_with_binary_data_and_annotations(cfg, None, StructuringAnnotations::default())
+        Self::new_with_binary_data_annotations_and_noreturn_targets(
+            cfg,
+            None,
+            StructuringAnnotations::default(),
+            HashMap::new(),
+        )
     }
 
     fn new_with_annotations(
         cfg: &'a ControlFlowGraph,
         annotations: StructuringAnnotations,
     ) -> Self {
-        Self::new_with_binary_data_and_annotations(cfg, None, annotations)
+        Self::new_with_binary_data_annotations_and_noreturn_targets(
+            cfg,
+            None,
+            annotations,
+            HashMap::new(),
+        )
     }
 
     fn new_with_binary_data_and_annotations(
         cfg: &'a ControlFlowGraph,
         binary_data: Option<&'a BinaryDataContext>,
         annotations: StructuringAnnotations,
+    ) -> Self {
+        Self::new_with_binary_data_annotations_and_noreturn_targets(
+            cfg,
+            binary_data,
+            annotations,
+            HashMap::new(),
+        )
+    }
+
+    fn new_with_binary_data_annotations_and_noreturn_targets(
+        cfg: &'a ControlFlowGraph,
+        binary_data: Option<&'a BinaryDataContext>,
+        annotations: StructuringAnnotations,
+        known_noreturn_targets: HashMap<u64, String>,
     ) -> Self {
         let loops = cfg.find_loops();
         let mut loop_headers = HashSet::new();
@@ -636,7 +691,90 @@ impl<'a> Structurer<'a> {
             irreducible_analysis,
             annotations,
             binary_data,
+            known_noreturn_targets,
         }
+    }
+
+    fn is_noreturn_call(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Call {
+                target: ExprCallTarget::Named(name),
+                ..
+            } => crate::is_noreturn_function_name(name),
+            ExprKind::Call {
+                target: ExprCallTarget::Direct { target, .. },
+                ..
+            } => self.known_noreturn_targets.contains_key(target),
+            ExprKind::Assign { rhs, .. } => self.is_noreturn_call(rhs),
+            _ => false,
+        }
+    }
+
+    fn body_terminates(&self, body: &[StructuredNode]) -> bool {
+        if body.is_empty() {
+            return false;
+        }
+
+        match body.last() {
+            Some(StructuredNode::Return(_)) => true,
+            Some(StructuredNode::Break) => true,
+            Some(StructuredNode::Continue) => true,
+            Some(StructuredNode::Goto(_)) => true,
+            Some(StructuredNode::If {
+                then_body,
+                else_body: Some(else_body),
+                ..
+            }) => self.body_terminates(then_body) && self.body_terminates(else_body),
+            Some(StructuredNode::Sequence(nodes)) => self.body_terminates(nodes),
+            Some(StructuredNode::Expr(expr)) => self.is_noreturn_call(expr),
+            Some(StructuredNode::Block { statements, .. }) => statements
+                .last()
+                .is_some_and(|expr| self.is_noreturn_call(expr)),
+            _ => false,
+        }
+    }
+
+    fn attach_shared_return_to_branch(
+        &self,
+        mut body: Vec<StructuredNode>,
+        shared_return: Option<Expr>,
+    ) -> Vec<StructuredNode> {
+        let stripped_terminal_bare_return =
+            matches!(body.last(), Some(StructuredNode::Return(None)));
+        if stripped_terminal_bare_return {
+            body.pop();
+        } else if self.body_terminates(&body) {
+            return body;
+        }
+
+        let mut return_value = shared_return;
+
+        if let Some(StructuredNode::Block { statements, .. }) = body.last_mut() {
+            let original_statements = std::mem::take(statements);
+            let (filtered_statements, branch_return) =
+                extract_return_value(original_statements.clone());
+            let branch_is_pure_return_setup = filtered_statements.is_empty();
+            if branch_is_pure_return_setup && branch_return.is_some() {
+                *statements = filtered_statements;
+                return_value = branch_return;
+            } else {
+                *statements = original_statements;
+            }
+        }
+
+        if matches!(
+            body.last(),
+            Some(StructuredNode::Block { statements, .. }) if statements.is_empty()
+        ) {
+            body.pop();
+        }
+
+        if self.body_terminates(&body) {
+            return body;
+        }
+
+        body.push(StructuredNode::Return(return_value));
+        body
     }
 
     fn new_with_binary_data(
@@ -821,6 +959,85 @@ impl<'a> Structurer<'a> {
             return false;
         }
         true
+    }
+
+    fn is_pure_asan_report_block(&self, block_id: BasicBlockId) -> bool {
+        let Some(block) = self.cfg.block(block_id) else {
+            return false;
+        };
+        let Some(call_inst) = block.instructions.last() else {
+            return false;
+        };
+        let ControlFlow::Call { target, .. } = &call_inst.control_flow else {
+            return false;
+        };
+        let Some(name) = self.known_noreturn_targets.get(target) else {
+            return false;
+        };
+        let stripped = name.trim_start_matches('_');
+        if !stripped.starts_with("asan_report_") || stripped.ends_with("_noabort") {
+            return false;
+        }
+
+        for inst in &block.instructions[..block.instructions.len().saturating_sub(1)] {
+            if inst.mnemonic.starts_with("nop") || inst.mnemonic.starts_with("endbr") {
+                continue;
+            }
+            if !inst
+                .writes
+                .iter()
+                .all(|reg| abi::is_argument_register(reg.name()))
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn asan_probe_normal_target(
+        &self,
+        true_target: BasicBlockId,
+        false_target: BasicBlockId,
+    ) -> Option<(BasicBlockId, BasicBlockId)> {
+        if self.is_pure_asan_report_block(true_target) {
+            return Some((true_target, false_target));
+        }
+        if self.is_pure_asan_report_block(false_target) {
+            return Some((false_target, true_target));
+        }
+        None
+    }
+
+    fn asan_probe_setup_end_index(
+        &self,
+        block: &BasicBlock,
+        normal_target: BasicBlockId,
+    ) -> Option<usize> {
+        let normal_block = self.cfg.block(normal_target)?;
+        let access_regs: HashSet<u16> = normal_block.instructions.iter().find_map(|inst| {
+            let regs: HashSet<u16> = inst
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::Memory(mem) => mem.base.as_ref().map(|reg| reg.id),
+                    _ => None,
+                })
+                .collect();
+            (!regs.is_empty()).then_some(regs)
+        })?;
+
+        block
+            .instructions
+            .iter()
+            .enumerate()
+            .rfind(|(_, inst)| {
+                matches!(
+                    inst.operands.first(),
+                    Some(Operand::Register(reg)) if access_regs.contains(&reg.id)
+                ) || instruction_transfers_from_any_reg(inst, &access_regs)
+            })
+            .map(|(idx, _)| idx)
     }
 
     fn find_loop_exits(cfg: &ControlFlowGraph, body: &HashSet<BasicBlockId>) -> Vec<BasicBlockId> {
@@ -1110,6 +1327,21 @@ impl<'a> Structurer<'a> {
                     true_target,
                     false_target,
                 } => {
+                    if let Some((report_target, normal_target)) =
+                        self.asan_probe_normal_target(*true_target, *false_target)
+                    {
+                        if !statements.is_empty() {
+                            result.push(StructuredNode::Block {
+                                id: block_id,
+                                statements,
+                                address_range,
+                            });
+                        }
+                        self.processed.insert(report_target);
+                        current = Some(normal_target);
+                        continue;
+                    }
+
                     // Add block statements first
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
@@ -1688,14 +1920,16 @@ impl<'a> Structurer<'a> {
         };
 
         if let Some(ret_expr) = shared_return.clone() {
-            then_body = attach_shared_return_to_branch(then_body, ret_expr.clone());
+            then_body = self.attach_shared_return_to_branch(then_body, ret_expr.clone());
             else_body =
-                else_body.map(|body| attach_shared_return_to_branch(body, ret_expr.clone()));
+                else_body.map(|body| self.attach_shared_return_to_branch(body, ret_expr.clone()));
         }
 
         let consumes_join = shared_return.is_some()
-            && body_terminates(&then_body)
-            && else_body.as_ref().is_some_and(|body| body_terminates(body));
+            && self.body_terminates(&then_body)
+            && else_body
+                .as_ref()
+                .is_some_and(|body| self.body_terminates(body));
 
         if consumes_join {
             if let Some(join_id) = join {
@@ -1928,11 +2162,29 @@ impl<'a> Structurer<'a> {
             None
         };
 
+        let probe_setup_end = match block.terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } => self
+                .asan_probe_normal_target(true_target, false_target)
+                .and_then(|(_, normal_target)| {
+                    self.asan_probe_setup_end_index(block, normal_target)
+                }),
+            _ => None,
+        };
+
         let exprs: Vec<Expr> = block
             .instructions
             .iter()
             .enumerate()
             .filter(|(idx, inst)| {
+                if let Some(last_keep_idx) = probe_setup_end {
+                    if *idx > last_keep_idx {
+                        return false;
+                    }
+                }
                 // Skip branch instructions, but keep calls
                 if inst.is_branch() && !inst.is_call() && inst.operation != Operation::Syscall {
                     return false;
@@ -1981,6 +2233,26 @@ impl<'a> Structurer<'a> {
         } else {
             exprs
         }
+    }
+}
+
+fn instruction_transfers_from_any_reg(inst: &Instruction, regs: &HashSet<u16>) -> bool {
+    matches!(inst.operands.first(), Some(Operand::Register(_)))
+        && inst
+            .operands
+            .iter()
+            .skip(1)
+            .any(|operand| operand_uses_any_reg(operand, regs))
+}
+
+fn operand_uses_any_reg(operand: &Operand, regs: &HashSet<u16>) -> bool {
+    match operand {
+        Operand::Register(reg) => regs.contains(&reg.id),
+        Operand::Memory(mem) => {
+            mem.base.as_ref().is_some_and(|reg| regs.contains(&reg.id))
+                || mem.index.as_ref().is_some_and(|reg| regs.contains(&reg.id))
+        }
+        _ => false,
     }
 }
 
@@ -2548,6 +2820,315 @@ fn flatten_node_into(output: &mut Vec<StructuredNode>, node: StructuredNode) {
     }
 }
 
+fn rewrite_known_noreturn_calls(
+    nodes: Vec<StructuredNode>,
+    known_noreturn_targets: &HashMap<u64, String>,
+) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .map(|node| rewrite_known_noreturn_calls_in_node(node, known_noreturn_targets))
+        .collect()
+}
+
+fn rewrite_known_noreturn_calls_in_node(
+    node: StructuredNode,
+    known_noreturn_targets: &HashMap<u64, String>,
+) -> StructuredNode {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => StructuredNode::Block {
+            id,
+            statements: statements
+                .into_iter()
+                .map(|expr| rewrite_known_noreturn_calls_in_expr(expr, known_noreturn_targets))
+                .collect(),
+            address_range,
+        },
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition: rewrite_known_noreturn_calls_in_expr(condition, known_noreturn_targets),
+            then_body: rewrite_known_noreturn_calls(then_body, known_noreturn_targets),
+            else_body: else_body
+                .map(|body| rewrite_known_noreturn_calls(body, known_noreturn_targets)),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition: rewrite_known_noreturn_calls_in_expr(condition, known_noreturn_targets),
+            body: rewrite_known_noreturn_calls(body, known_noreturn_targets),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: rewrite_known_noreturn_calls(body, known_noreturn_targets),
+            condition: rewrite_known_noreturn_calls_in_expr(condition, known_noreturn_targets),
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init: init
+                .map(|expr| rewrite_known_noreturn_calls_in_expr(expr, known_noreturn_targets)),
+            condition: rewrite_known_noreturn_calls_in_expr(condition, known_noreturn_targets),
+            update: update
+                .map(|expr| rewrite_known_noreturn_calls_in_expr(expr, known_noreturn_targets)),
+            body: rewrite_known_noreturn_calls(body, known_noreturn_targets),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: rewrite_known_noreturn_calls(body, known_noreturn_targets),
+            header,
+            exit_block,
+        },
+        StructuredNode::Return(expr) => StructuredNode::Return(
+            expr.map(|value| rewrite_known_noreturn_calls_in_expr(value, known_noreturn_targets)),
+        ),
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value: rewrite_known_noreturn_calls_in_expr(value, known_noreturn_targets),
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| {
+                    (
+                        values,
+                        rewrite_known_noreturn_calls(body, known_noreturn_targets),
+                    )
+                })
+                .collect(),
+            default: default.map(|body| rewrite_known_noreturn_calls(body, known_noreturn_targets)),
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(rewrite_known_noreturn_calls(nodes, known_noreturn_targets))
+        }
+        StructuredNode::Expr(expr) => StructuredNode::Expr(rewrite_known_noreturn_calls_in_expr(
+            expr,
+            known_noreturn_targets,
+        )),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: rewrite_known_noreturn_calls(try_body, known_noreturn_targets),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: rewrite_known_noreturn_calls(handler.body, known_noreturn_targets),
+                    ..handler
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn rewrite_known_noreturn_calls_in_expr(
+    expr: Expr,
+    known_noreturn_targets: &HashMap<u64, String>,
+) -> Expr {
+    let kind = match expr.kind {
+        ExprKind::Var(var) => ExprKind::Var(var),
+        ExprKind::IntLit(value) => ExprKind::IntLit(value),
+        ExprKind::BinOp { op, left, right } => ExprKind::BinOp {
+            op,
+            left: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *left,
+                known_noreturn_targets,
+            )),
+            right: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *right,
+                known_noreturn_targets,
+            )),
+        },
+        ExprKind::UnaryOp { op, operand } => ExprKind::UnaryOp {
+            op,
+            operand: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *operand,
+                known_noreturn_targets,
+            )),
+        },
+        ExprKind::Deref { addr, size } => ExprKind::Deref {
+            addr: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *addr,
+                known_noreturn_targets,
+            )),
+            size,
+        },
+        ExprKind::GotRef {
+            address,
+            instruction_address,
+            size,
+            display_expr,
+            is_deref,
+        } => ExprKind::GotRef {
+            address,
+            instruction_address,
+            size,
+            display_expr: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *display_expr,
+                known_noreturn_targets,
+            )),
+            is_deref,
+        },
+        ExprKind::AddressOf(inner) => ExprKind::AddressOf(Box::new(
+            rewrite_known_noreturn_calls_in_expr(*inner, known_noreturn_targets),
+        )),
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => ExprKind::ArrayAccess {
+            base: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *base,
+                known_noreturn_targets,
+            )),
+            index: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *index,
+                known_noreturn_targets,
+            )),
+            element_size,
+        },
+        ExprKind::FieldAccess {
+            base,
+            field_name,
+            offset,
+        } => ExprKind::FieldAccess {
+            base: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *base,
+                known_noreturn_targets,
+            )),
+            field_name,
+            offset,
+        },
+        ExprKind::Call { target, args } => {
+            let target = match target {
+                ExprCallTarget::Direct { target, call_site } => known_noreturn_targets
+                    .get(&target)
+                    .cloned()
+                    .map(ExprCallTarget::Named)
+                    .unwrap_or(ExprCallTarget::Direct { target, call_site }),
+                ExprCallTarget::Named(name) => ExprCallTarget::Named(name),
+                ExprCallTarget::Indirect(inner) => ExprCallTarget::Indirect(Box::new(
+                    rewrite_known_noreturn_calls_in_expr(*inner, known_noreturn_targets),
+                )),
+                ExprCallTarget::IndirectGot { got_address, expr } => ExprCallTarget::IndirectGot {
+                    got_address,
+                    expr: Box::new(rewrite_known_noreturn_calls_in_expr(
+                        *expr,
+                        known_noreturn_targets,
+                    )),
+                },
+            };
+            ExprKind::Call {
+                target,
+                args: args
+                    .into_iter()
+                    .map(|arg| rewrite_known_noreturn_calls_in_expr(arg, known_noreturn_targets))
+                    .collect(),
+            }
+        }
+        ExprKind::Assign { lhs, rhs } => ExprKind::Assign {
+            lhs: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *lhs,
+                known_noreturn_targets,
+            )),
+            rhs: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *rhs,
+                known_noreturn_targets,
+            )),
+        },
+        ExprKind::CompoundAssign { op, lhs, rhs } => ExprKind::CompoundAssign {
+            op,
+            lhs: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *lhs,
+                known_noreturn_targets,
+            )),
+            rhs: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *rhs,
+                known_noreturn_targets,
+            )),
+        },
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => ExprKind::Conditional {
+            cond: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *cond,
+                known_noreturn_targets,
+            )),
+            then_expr: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *then_expr,
+                known_noreturn_targets,
+            )),
+            else_expr: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *else_expr,
+                known_noreturn_targets,
+            )),
+        },
+        ExprKind::Cast {
+            expr: inner,
+            to_size,
+            signed,
+        } => ExprKind::Cast {
+            expr: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *inner,
+                known_noreturn_targets,
+            )),
+            to_size,
+            signed,
+        },
+        ExprKind::BitField {
+            expr: inner,
+            start,
+            width,
+        } => ExprKind::BitField {
+            expr: Box::new(rewrite_known_noreturn_calls_in_expr(
+                *inner,
+                known_noreturn_targets,
+            )),
+            start,
+            width,
+        },
+        ExprKind::Phi(values) => ExprKind::Phi(
+            values
+                .into_iter()
+                .map(|value| rewrite_known_noreturn_calls_in_expr(value, known_noreturn_targets))
+                .collect(),
+        ),
+        ExprKind::Unknown(name) => ExprKind::Unknown(name),
+    };
+
+    Expr { kind }
+}
+
 fn attach_shared_return_to_branch(
     mut body: Vec<StructuredNode>,
     shared_return: Option<Expr>,
@@ -2638,32 +3219,7 @@ pub(super) fn is_noreturn_call(expr: &Expr) -> bool {
 
 /// Checks if a function name is a known noreturn function.
 fn is_noreturn_function(name: &str) -> bool {
-    // Strip leading underscore(s) for comparison
-    let name = name.trim_start_matches('_');
-
-    matches!(
-        name,
-        "exit"
-            | "Exit"
-            | "abort"
-            | "err"
-            | "errx"
-            | "verr"
-            | "verrx"
-            | "assert_fail"
-            | "cxa_throw"
-            | "cxa_rethrow"
-            | "cxa_bad_cast"
-            | "cxa_bad_typeid"
-            | "Unwind_Resume"
-            | "longjmp"
-            | "siglongjmp"
-            | "pthread_exit"
-            | "thrd_exit"
-            | "quick_exit"
-            | "stack_chk_fail"
-            | "fortify_fail"
-    )
+    crate::is_noreturn_function_name(name)
 }
 
 #[cfg(test)]
@@ -3956,6 +4512,13 @@ mod tests {
     }
 
     #[test]
+    fn test_is_noreturn_function_asan_reports() {
+        assert!(is_noreturn_function("__asan_report_load4"));
+        assert!(is_noreturn_function("__asan_report_store1"));
+        assert!(!is_noreturn_function("__asan_report_load4_noabort"));
+    }
+
+    #[test]
     fn test_is_noreturn_function_false() {
         assert!(!is_noreturn_function("printf"));
         assert!(!is_noreturn_function("malloc"));
@@ -4844,6 +5407,53 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rsi"]
+        );
+    }
+
+    #[test]
+    fn test_asan_probe_setup_end_index_tracks_access_register_bridge_copy() {
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 64);
+        let rdx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 64);
+        let sil = Register::new(Architecture::X86_64, RegisterClass::General, 6, 8);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut probe = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        probe.instructions.push(
+            Instruction::new(0x1000, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rax), Operand::Register(rcx)]),
+        );
+        probe.instructions.push(
+            Instruction::new(0x1003, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rdx), Operand::Register(rax)]),
+        );
+        probe.instructions.push(
+            Instruction::new(0x1006, 4, vec![], "shr")
+                .with_operation(Operation::Shr)
+                .with_operands(vec![Operand::Register(rdx), Operand::imm_unsigned(3, 8)]),
+        );
+        cfg.add_block(probe.clone());
+
+        let mut normal = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        normal.instructions.push(
+            Instruction::new(0x1010, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base(rcx, 1)),
+                    Operand::Register(sil),
+                ]),
+        );
+        cfg.add_block(normal);
+
+        let structurer = Structurer::new(&cfg);
+        assert_eq!(
+            structurer.asan_probe_setup_end_index(&probe, BasicBlockId::new(1)),
+            Some(0)
         );
     }
 
