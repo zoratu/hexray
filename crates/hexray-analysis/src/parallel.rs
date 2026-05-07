@@ -109,8 +109,13 @@ fn disassemble_function<D: Disassembler>(
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
-                // Heuristic fallback windows should also stop at terminating calls.
-                if is_ret || is_noreturn_call || is_heuristic_tail_jump {
+                if is_noreturn_call || is_heuristic_tail_jump {
+                    break;
+                }
+
+                // Exact symbol bounds should keep scanning across early returns
+                // so later cold/error blocks still contribute call edges.
+                if heuristic_bounds && is_ret {
                     break;
                 }
             }
@@ -160,6 +165,9 @@ impl ParallelCallGraphBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hexray_core::ControlFlow;
+    use hexray_disasm::X86_64Disassembler;
+    use std::collections::HashSet;
 
     #[test]
     fn test_function_info() {
@@ -182,5 +190,28 @@ mod tests {
         };
         assert_eq!(func.entry, 0x1000);
         assert!(func.instructions.is_empty());
+    }
+
+    #[test]
+    fn exact_sized_parallel_disassembly_keeps_scanning_past_return() {
+        let bytes = vec![
+            0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+            0xc3, // ret
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call 0x100a
+            0xc3, // ret
+        ];
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = disassemble_function(&disasm, &bytes, 0x1000, false, &HashSet::new());
+
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "ret");
+        assert_eq!(instructions[2].mnemonic, "call");
+        assert_eq!(instructions[3].mnemonic, "ret");
+        assert!(matches!(
+            instructions[2].control_flow,
+            ControlFlow::Call { target: 0x100a, .. }
+        ));
     }
 }

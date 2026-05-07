@@ -2954,9 +2954,10 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
                 if is_noreturn_call || is_heuristic_tail_jump {
                     break;
                 }
-                // Don't stop at return - we want to find all calls in the function
-                // including those after conditional returns
-                if is_ret && offset >= bytes.len() / 2 {
+                // With exact symbol bounds we can keep scanning across early returns
+                // to pick up later cold/error blocks that still belong to the same
+                // function body. The midpoint cutoff is only for heuristic windows.
+                if heuristic_bounds && is_ret && offset >= bytes.len() / 2 {
                     // Only stop if we're past the midpoint
                     break;
                 }
@@ -7690,6 +7691,33 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].mnemonic, "endbr64");
         assert_eq!(instructions[1].mnemonic, "jmp");
+    }
+
+    #[test]
+    fn exact_sized_disassembly_keeps_scanning_past_mid_function_return() {
+        let bytes = vec![
+            0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+            0xc3, // ret
+            0xe8, 0x00, 0x00, 0x00, 0x00, // call 0x40115a
+            0xc3, // ret
+        ];
+        let disasm = X86_64Disassembler::new();
+
+        let instructions =
+            crate::disassemble_for_calls(&disasm, &bytes, 0x401150, false, &Default::default());
+
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "ret");
+        assert_eq!(instructions[2].mnemonic, "call");
+        assert_eq!(instructions[3].mnemonic, "ret");
+        assert!(matches!(
+            instructions[2].control_flow,
+            ControlFlow::Call {
+                target: 0x40115a,
+                ..
+            }
+        ));
     }
 
     #[test]
