@@ -424,6 +424,7 @@ impl CallGraphBuilder {
 
     fn materialized_function_targets(&self, instr: &Instruction) -> Vec<u64> {
         materialized_source_address(instr)
+            .filter(|addr| *addr != 0)
             .filter(|addr| self.is_known_internal_function(*addr))
             .into_iter()
             .collect()
@@ -662,6 +663,29 @@ mod tests {
             control_flow: ControlFlow::Sequential,
             bytes: vec![0; 3],
             reads: vec![src],
+            writes: vec![dest],
+            guard: None,
+        }
+    }
+
+    fn make_move_reg_imm_instruction(addr: u64, dest_id: u16, imm_value: u64) -> Instruction {
+        let dest = Register::new(Architecture::X86_64, RegisterClass::General, dest_id, 64);
+        Instruction {
+            address: addr,
+            size: 7,
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Register(dest),
+                Operand::Immediate(Immediate {
+                    value: imm_value as i128,
+                    size: 64,
+                    signed: false,
+                }),
+            ],
+            control_flow: ControlFlow::Sequential,
+            bytes: vec![0; 7],
+            reads: vec![],
             writes: vec![dest],
             guard: None,
         }
@@ -1168,6 +1192,42 @@ mod tests {
         let main_callees: Vec<_> = cg.callees(0x1000).map(|(addr, _)| addr).collect();
         assert!(main_callees.contains(&0x2000));
         assert!(main_callees.contains(&0x3000));
+    }
+
+    #[test]
+    fn test_builder_ignores_materialized_null_function_targets() {
+        let mut builder = CallGraphBuilder::new();
+        builder.add_symbols(&[
+            Symbol {
+                name: "main".to_string(),
+                address: 0x1000,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+            Symbol {
+                name: "bogus_zero".to_string(),
+                address: 0x0,
+                size: 0x20,
+                kind: SymbolKind::Function,
+                binding: hexray_core::SymbolBinding::Global,
+                section_index: Some(1),
+            },
+        ]);
+
+        builder.add_function(
+            0x1000,
+            vec![
+                make_move_reg_imm_instruction(0x1000, x86::RAX, 0),
+                make_ret_instruction(0x1007),
+            ],
+        );
+
+        let cg = builder.build();
+
+        let main_callees: Vec<_> = cg.callees(0x1000).map(|(addr, _)| addr).collect();
+        assert!(!main_callees.contains(&0x0));
     }
 
     #[test]
