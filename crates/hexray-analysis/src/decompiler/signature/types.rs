@@ -426,6 +426,7 @@ impl ParamType {
             ParamType::TypedPointer(inner) => format!("{}*", inner.to_c_string()),
             ParamType::Float(32) => "float".to_string(),
             ParamType::Float(64) => "double".to_string(),
+            ParamType::Float(80) => "long double".to_string(),
             ParamType::Float(_) => "double".to_string(),
             ParamType::SimdInt128 => "__m128i".to_string(),
             ParamType::FunctionPointer {

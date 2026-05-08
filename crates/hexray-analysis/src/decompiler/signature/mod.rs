@@ -82,6 +82,12 @@ pub struct SignatureRecovery {
     integer_simd_ops_observed: bool,
     /// The final scalar result is extracted from a float ABI register into the integer return.
     return_from_integer_simd_lane: bool,
+    /// x87 stack operations were observed in the function body.
+    x87_ops_observed: bool,
+    /// Entry-like x87 input was observed via ST(0).
+    x87_st0_input_observed: bool,
+    /// Stack argument offsets consumed by x87 operations.
+    x87_stack_arg_offsets: BTreeSet<i64>,
     /// Recovered function-pointer return type when applicable.
     return_function_pointer: Option<ParamType>,
     /// Candidate return type inferred from tail-position call forwarding.
@@ -147,6 +153,9 @@ impl SignatureRecovery {
             observed_float_arg_regs: HashSet::new(),
             integer_simd_ops_observed: false,
             return_from_integer_simd_lane: false,
+            x87_ops_observed: false,
+            x87_st0_input_observed: false,
+            x87_stack_arg_offsets: BTreeSet::new(),
             return_function_pointer: None,
             tail_call_return_type: None,
             return_is_pointer: false,
@@ -214,6 +223,9 @@ impl SignatureRecovery {
         self.observed_float_arg_regs.clear();
         self.integer_simd_ops_observed = false;
         self.return_from_integer_simd_lane = false;
+        self.x87_ops_observed = false;
+        self.x87_st0_input_observed = false;
+        self.x87_stack_arg_offsets.clear();
         self.return_function_pointer = None;
         self.tail_call_return_type = None;
         self.return_is_pointer = false;
@@ -236,6 +248,9 @@ impl SignatureRecovery {
                 if !matches!(candidate, ParamType::Void | ParamType::Unknown) {
                     self.return_value_set = true;
                     self.return_size = candidate.size().max(1);
+                    if matches!(candidate, ParamType::Float(_)) {
+                        self.float_return = true;
+                    }
                     if matches!(candidate, ParamType::FunctionPointer { .. }) {
                         self.return_function_pointer = Some(candidate);
                     } else {
@@ -431,7 +446,7 @@ impl SignatureRecovery {
                 if self.expr_is_float_abi_value(expr) {
                     if !self.return_from_integer_simd_lane {
                         self.float_return = true;
-                        self.return_size = 8;
+                        self.return_size = self.return_size.max(8);
                         if !self
                             .return_provenance
                             .iter()
@@ -443,10 +458,26 @@ impl SignatureRecovery {
                         }
                     }
                 }
+                if self.expr_is_x87_return_value(expr) {
+                    self.x87_ops_observed = true;
+                    self.float_return = true;
+                    self.return_size = self.return_size.max(10);
+                    if !self
+                        .return_provenance
+                        .iter()
+                        .any(|r| r == "explicit return expression uses x87 fp80 value")
+                    {
+                        self.return_provenance
+                            .push("explicit return expression uses x87 fp80 value".to_string());
+                    }
+                    self.return_confidence = self.return_confidence.max(215);
+                }
                 // Infer return type from expression
                 if let Some(size) = self.infer_expr_size(expr) {
                     let inferred_size = if self.return_from_integer_simd_lane {
                         self.return_size.min(size).max(1)
+                    } else if self.float_return && self.return_size >= 10 {
+                        self.return_size
                     } else if self.float_return {
                         8
                     } else if matches!(expr.kind, ExprKind::IntLit(_)) {
@@ -923,6 +954,7 @@ impl SignatureRecovery {
                 }
             }
             ExprKind::Call { target, args } => {
+                self.observe_x87_call(target, args);
                 if let super::expression::CallTarget::Indirect(inner) = target {
                     if let ExprKind::Var(var) = &inner.kind {
                         let name = var.name.to_lowercase();
@@ -1340,6 +1372,9 @@ impl SignatureRecovery {
     fn infer_tail_call_return_type(&self, expr: &Expr) -> Option<ParamType> {
         if let ExprKind::Call { target, .. } = &expr.kind {
             if let Some(name) = self.extract_call_name(target) {
+                if Self::is_x87_mnemonic(&name) {
+                    return Some(ParamType::Float(80));
+                }
                 if let Some(summary_ty) = self.return_type_from_summary(&name) {
                     return Some(summary_ty);
                 }
@@ -2054,6 +2089,74 @@ impl SignatureRecovery {
                 .is_some_and(|suffix| suffix.parse::<usize>().ok() == Some(0))
     }
 
+    fn is_x87_stack_register(name: &str) -> bool {
+        name.to_lowercase()
+            .strip_prefix("st(")
+            .and_then(|suffix| suffix.strip_suffix(')'))
+            .is_some_and(|suffix| suffix.parse::<usize>().ok().is_some_and(|idx| idx < 8))
+    }
+
+    fn x87_stack_arg_offset(name: &str) -> Option<i64> {
+        let lowered = name.to_lowercase();
+        if let Some(idx) = Self::lifted_arg_slot_index(&lowered) {
+            return Some((8 * (idx + 1)) as i64);
+        }
+        if let Some(offset) = Self::parse_lifted_hex_suffix(&lowered, "var_") {
+            return Some(offset as i64);
+        }
+        if let Some(offset) = lowered.strip_prefix("stack_") {
+            return offset.parse::<i64>().ok().filter(|offset| *offset >= 8);
+        }
+        None
+    }
+
+    fn is_x87_mnemonic(name: &str) -> bool {
+        let lowered = name.to_ascii_lowercase();
+        [
+            "fld", "fst", "fstp", "fild", "fist", "fistp", "fisttp", "fadd", "faddp", "fiadd",
+            "fsub", "fsubr", "fsubp", "fsubrp", "fisub", "fisubr", "fmul", "fmulp", "fimul",
+            "fdiv", "fdivr", "fdivp", "fdivrp", "fidiv", "fidivr", "fcom", "fcomp", "fucom",
+            "fucomp", "fucompp", "fcomi", "fucomi", "ftst", "fxam", "fxch", "fld1", "fldz",
+            "fldpi", "fabs", "fchs", "fsqrt", "frndint", "fscale", "f2xm1", "fyl2x", "fyl2xp1",
+            "fptan", "fpatan", "fsin", "fcos", "fsincos", "fincstp", "fdecstp",
+        ]
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    }
+
+    fn observe_x87_call(&mut self, target: &super::expression::CallTarget, args: &[Expr]) {
+        let super::expression::CallTarget::Named(name) = target else {
+            return;
+        };
+        if !Self::is_x87_mnemonic(name) {
+            return;
+        }
+
+        self.x87_ops_observed = true;
+        for arg in args {
+            if let Some(var_name) = self.extract_var_name(arg) {
+                if Self::is_x87_stack_register(&var_name) {
+                    self.x87_st0_input_observed |= var_name.eq_ignore_ascii_case("st(0)");
+                }
+                if let Some(offset) = Self::x87_stack_arg_offset(&var_name) {
+                    self.x87_stack_arg_offsets.insert(offset);
+                }
+            }
+        }
+    }
+
+    fn expr_is_x87_return_value(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => Self::is_x87_stack_register(&var.name),
+            ExprKind::Unknown(name) => Self::is_x87_stack_register(name),
+            ExprKind::Call { target, .. } => {
+                matches!(target, super::expression::CallTarget::Named(name) if Self::is_x87_mnemonic(name))
+            }
+            ExprKind::Cast { expr, .. } => self.expr_is_x87_return_value(expr),
+            _ => false,
+        }
+    }
+
     fn is_opaque_x86_integer_simd_comment(name: &str) -> bool {
         let trimmed = name.trim();
         let Some(mnemonic) = trimmed
@@ -2317,6 +2420,9 @@ impl SignatureRecovery {
         match &expr.kind {
             ExprKind::Var(var) => {
                 let var_name_lower = var.name.to_lowercase();
+                if Self::is_x87_stack_register(&var_name_lower) {
+                    return Some(10);
+                }
                 if self.is_float_return_register(&var_name_lower)
                     || self.is_float_arg_register(&var_name_lower)
                 {
@@ -2357,6 +2463,10 @@ impl SignatureRecovery {
             ExprKind::Deref { size, .. } => Some(*size),
             ExprKind::ArrayAccess { element_size, .. } => Some(*element_size as u8),
             ExprKind::Cast { to_size, .. } => Some(*to_size),
+            ExprKind::Call { target, .. } => {
+                matches!(target, super::expression::CallTarget::Named(name) if Self::is_x87_mnemonic(name))
+                    .then_some(10)
+            }
             ExprKind::BinOp { left, right, .. } => {
                 let left_size = self.infer_expr_size(left);
                 let right_size = self.infer_expr_size(right);
@@ -2612,6 +2722,24 @@ impl SignatureRecovery {
         // Detect pointer+size parameter pairs
         self.detect_param_pairs(&mut sig);
 
+        if self.x87_ops_observed
+            && (self.x87_st0_input_observed || !self.x87_stack_arg_offsets.is_empty())
+            && sig.parameters.is_empty()
+        {
+            let stack_offsets: Vec<_> = if self.x87_stack_arg_offsets.is_empty() {
+                vec![8_i64]
+            } else {
+                self.x87_stack_arg_offsets.iter().copied().collect()
+            };
+            for (idx, offset) in stack_offsets.into_iter().enumerate() {
+                sig.parameters.push(Parameter::new(
+                    format!("arg{}", idx),
+                    ParamType::Float(80),
+                    ParameterLocation::Stack { offset },
+                ));
+            }
+        }
+
         // Check for float arguments
         let float_regs = self.convention.float_arg_registers();
         let integer_simd_signature =
@@ -2654,7 +2782,11 @@ impl SignatureRecovery {
                     _ => ParamType::SignedInt(32),
                 };
             } else if self.float_return {
-                sig.return_type = ParamType::Float(64);
+                sig.return_type = match self.return_size {
+                    0..=4 => ParamType::Float(32),
+                    5..=8 => ParamType::Float(64),
+                    size => ParamType::Float(size * 8),
+                };
             } else if self.return_is_pointer && self.return_size == 8 {
                 // Return value is a pointer
                 sig.return_type = ParamType::Pointer;
@@ -2771,6 +2903,7 @@ mod tests {
         assert_eq!(ParamType::UnsignedInt(8).to_c_string(), "uint8_t");
         assert_eq!(ParamType::Float(32).to_c_string(), "float");
         assert_eq!(ParamType::Float(64).to_c_string(), "double");
+        assert_eq!(ParamType::Float(80).to_c_string(), "long double");
         assert_eq!(ParamType::Pointer.to_c_string(), "void*");
         let fp = ParamType::FunctionPointer {
             return_type: Box::new(ParamType::SignedInt(32)),
@@ -3338,6 +3471,7 @@ mod tests {
         assert_eq!(ParamType::SignedInt(64).size(), 8);
         assert_eq!(ParamType::Float(32).size(), 4);
         assert_eq!(ParamType::Float(64).size(), 8);
+        assert_eq!(ParamType::Float(80).size(), 10);
         assert_eq!(ParamType::Pointer.size(), 8);
         assert_eq!(
             ParamType::FunctionPointer {
@@ -5052,6 +5186,58 @@ mod tests {
         assert_eq!(sig.return_type, ParamType::SignedInt(32));
         assert_eq!(sig.parameters.len(), 1);
         assert_eq!(sig.parameters[0].param_type, ParamType::SimdInt128);
+    }
+
+    #[test]
+    fn test_signature_recovery_classifies_x87_fp80_stack_signature() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::call(
+                    CallTarget::Named("fld".to_string()),
+                    vec![Expr::unknown("var_8")],
+                ),
+                Expr::call(
+                    CallTarget::Named("fld".to_string()),
+                    vec![Expr::var(Variable::reg("st(0)", 10))],
+                ),
+                Expr::call(
+                    CallTarget::Named("fmul".to_string()),
+                    vec![
+                        Expr::var(Variable::reg("st(0)", 10)),
+                        Expr::var(Variable::reg("st(1)", 10)),
+                    ],
+                ),
+            ],
+            address_range: (0x1000, 0x100c),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::call(
+                    CallTarget::Named("faddp".to_string()),
+                    vec![
+                        Expr::var(Variable::reg("st(1)", 10)),
+                        Expr::var(Variable::reg("st(0)", 10)),
+                    ],
+                ))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Float(80));
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].param_type, ParamType::Float(80));
+        assert!(matches!(
+            sig.parameters[0].location,
+            ParameterLocation::Stack { offset: 8 }
+        ));
     }
 
     #[test]
