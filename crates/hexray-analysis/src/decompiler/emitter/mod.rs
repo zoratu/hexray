@@ -12,7 +12,7 @@ use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, StringTable, SummaryDatabase, SymbolTable};
 use hexray_core::BasicBlockId;
 use hexray_types::{get_argument_category, ConstantCategory, ConstantDatabase, TypeDatabase};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -403,6 +403,10 @@ pub struct PseudoCodeEmitter {
     /// Fallback expression for bare returns when signature is non-void.
     /// Uses RefCell for interior mutability during emission.
     return_fallback_expr: RefCell<Option<String>>,
+    /// Preserve raw machine register names while formatting selected expressions.
+    preserve_register_names: Cell<bool>,
+    /// Emit raw register names for low-level register snapshot helpers such as __sigsetjmp.
+    register_snapshot_mode: Cell<bool>,
 }
 
 impl PseudoCodeEmitter {
@@ -610,6 +614,8 @@ impl PseudoCodeEmitter {
             global_tracker: RefCell::new(GlobalAccessTracker::new()),
             param_name_overrides: RefCell::new(HashMap::new()),
             return_fallback_expr: RefCell::new(None),
+            preserve_register_names: Cell::new(false),
+            register_snapshot_mode: Cell::new(false),
         }
     }
 
@@ -1868,10 +1874,190 @@ impl PseudoCodeEmitter {
     }
 
     fn rename_register_for_display(&self, name: &str) -> String {
+        if self.preserve_register_names.get() {
+            return name.to_string();
+        }
         if let Some(rendered) = self.arg_register_display_name(name) {
             return rendered;
         }
         rename_register(name)
+    }
+
+    fn with_preserved_register_names<T>(&self, f: impl FnOnce() -> T) -> T {
+        let previous = self.preserve_register_names.replace(true);
+        let result = f();
+        self.preserve_register_names.set(previous);
+        result
+    }
+
+    fn format_expr_preserving_register_names(&self, expr: &Expr, table: &StringTable) -> String {
+        self.with_preserved_register_names(|| self.format_expr_with_strings(expr, table))
+    }
+
+    fn format_lvalue_preserving_register_names(&self, expr: &Expr, table: &StringTable) -> String {
+        self.with_preserved_register_names(|| self.format_lvalue(expr, table))
+    }
+
+    fn lhs_is_snapshot_register(&self, expr: &Expr) -> bool {
+        let ExprKind::Var(var) = &expr.kind else {
+            return false;
+        };
+        let lower = var.name.to_lowercase();
+        rename_register(&lower) != lower || get_arg_register_index(&lower).is_some()
+    }
+
+    fn expr_contains_snapshot_register_source(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                let lower = var.name.to_lowercase();
+                is_callee_saved_register(&lower)
+                    || matches!(
+                        lower.as_str(),
+                        "rax" | "eax" | "rdx" | "edx" | "rbp" | "ebp" | "rsp" | "esp" | "sp"
+                    )
+                    || get_arg_register_index(&lower).is_some()
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                Self::expr_contains_snapshot_register_source(operand)
+            }
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                Self::expr_contains_snapshot_register_source(left)
+                    || Self::expr_contains_snapshot_register_source(right)
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                Self::expr_contains_snapshot_register_source(base)
+                    || Self::expr_contains_snapshot_register_source(index)
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                Self::expr_contains_snapshot_register_source(base)
+            }
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => args
+                .iter()
+                .any(Self::expr_contains_snapshot_register_source),
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_contains_snapshot_register_source(cond)
+                    || Self::expr_contains_snapshot_register_source(then_expr)
+                    || Self::expr_contains_snapshot_register_source(else_expr)
+            }
+            ExprKind::IntLit(_) | ExprKind::GotRef { .. } | ExprKind::Unknown(_) => false,
+        }
+    }
+
+    fn expr_is_parameter_derived(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                looks_like_parameter_name(&var.name)
+                    || get_arg_register_index(&var.name.to_lowercase()).is_some()
+            }
+            ExprKind::Unknown(name) => looks_like_parameter_name(name),
+            ExprKind::AddressOf(inner) | ExprKind::Cast { expr: inner, .. } => {
+                Self::expr_is_parameter_derived(inner)
+            }
+            ExprKind::BinOp { op, left, right } => {
+                matches!(op, BinOpKind::Add | BinOpKind::Sub)
+                    && ((Self::expr_is_parameter_derived(left)
+                        && matches!(right.kind, ExprKind::IntLit(_)))
+                        || (Self::expr_is_parameter_derived(right)
+                            && matches!(left.kind, ExprKind::IntLit(_))))
+            }
+            _ => false,
+        }
+    }
+
+    fn is_parameter_snapshot_target(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Deref { addr, .. } => Self::expr_is_parameter_derived(addr),
+            ExprKind::ArrayAccess { base, .. } | ExprKind::FieldAccess { base, .. } => {
+                Self::expr_is_parameter_derived(base)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_register_snapshot_store(stmt: &Expr) -> bool {
+        let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+            return false;
+        };
+        Self::is_parameter_snapshot_target(lhs) && Self::expr_contains_snapshot_register_source(rhs)
+    }
+
+    // TODO(32.3): lift jmp_buf register-save helpers earlier in the pipeline so
+    // __sigsetjmp-style functions structure as named buffer fields instead of raw stores.
+    fn should_enable_register_snapshot_mode(nodes: &[StructuredNode]) -> bool {
+        fn count_snapshot_stores(node: &StructuredNode) -> usize {
+            match node {
+                StructuredNode::Block { statements, .. } => statements
+                    .iter()
+                    .filter(|stmt| PseudoCodeEmitter::is_register_snapshot_store(stmt))
+                    .count(),
+                StructuredNode::Expr(expr) => {
+                    usize::from(PseudoCodeEmitter::is_register_snapshot_store(expr))
+                }
+                StructuredNode::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    then_body.iter().map(count_snapshot_stores).sum::<usize>()
+                        + else_body
+                            .as_ref()
+                            .map(|nodes| nodes.iter().map(count_snapshot_stores).sum())
+                            .unwrap_or(0)
+                }
+                StructuredNode::While { body, .. }
+                | StructuredNode::DoWhile { body, .. }
+                | StructuredNode::Loop { body, .. } => body.iter().map(count_snapshot_stores).sum(),
+                StructuredNode::For { body, .. } => body.iter().map(count_snapshot_stores).sum(),
+                StructuredNode::Switch { cases, default, .. } => {
+                    let case_count: usize = cases
+                        .iter()
+                        .map(|(_, body)| body.iter().map(count_snapshot_stores).sum::<usize>())
+                        .sum();
+                    let default_count = default
+                        .as_ref()
+                        .map(|body| body.iter().map(count_snapshot_stores).sum())
+                        .unwrap_or(0);
+                    case_count + default_count
+                }
+                StructuredNode::Sequence(nodes) => nodes.iter().map(count_snapshot_stores).sum(),
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    try_body.iter().map(count_snapshot_stores).sum::<usize>()
+                        + catch_handlers
+                            .iter()
+                            .map(|handler| {
+                                handler
+                                    .body
+                                    .iter()
+                                    .map(count_snapshot_stores)
+                                    .sum::<usize>()
+                            })
+                            .sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+
+        nodes.iter().map(count_snapshot_stores).sum::<usize>() >= 3
     }
 
     fn arg_register_display_name(&self, name: &str) -> Option<String> {
@@ -3307,6 +3493,11 @@ impl PseudoCodeEmitter {
                 format!("{}({})", prefix, addr_text)
             }
             ExprKind::Assign { lhs, rhs } => {
+                let preserve_snapshot_rhs = self.register_snapshot_mode.get()
+                    && Self::expr_contains_snapshot_register_source(rhs);
+                let preserve_snapshot_lhs =
+                    self.register_snapshot_mode.get() && self.lhs_is_snapshot_register(lhs);
+
                 // Check for compound assignment patterns: x = x op y → x op= y
                 if let ExprKind::BinOp { op, left, right } = &rhs.kind {
                     if exprs_equal(lhs, left) {
@@ -3328,8 +3519,16 @@ impl PseudoCodeEmitter {
                             }
                         }
                         // For lhs, don't resolve strings (can't write to string literals)
-                        let lhs_str = self.format_lvalue(lhs, table);
-                        let rhs_str = self.format_expr_with_strings(right, table);
+                        let lhs_str = if preserve_snapshot_lhs {
+                            self.format_lvalue_preserving_register_names(lhs, table)
+                        } else {
+                            self.format_lvalue(lhs, table)
+                        };
+                        let rhs_str = if preserve_snapshot_rhs {
+                            self.format_expr_preserving_register_names(right, table)
+                        } else {
+                            self.format_expr_with_strings(right, table)
+                        };
 
                         // Special case: x = x + 1 → x++ and x = x - 1 → x--
                         if let ExprKind::IntLit(1) = right.kind {
@@ -3360,9 +3559,17 @@ impl PseudoCodeEmitter {
                 }
                 format!(
                     "{} = {}",
-                    // For lhs, don't resolve strings (can't write to string literals)
-                    self.format_lvalue(lhs, table),
-                    self.format_expr_with_strings(rhs, table)
+                    if preserve_snapshot_lhs {
+                        self.format_lvalue_preserving_register_names(lhs, table)
+                    } else {
+                        // For lhs, don't resolve strings (can't write to string literals)
+                        self.format_lvalue(lhs, table)
+                    },
+                    if preserve_snapshot_rhs {
+                        self.format_expr_preserving_register_names(rhs, table)
+                    } else {
+                        self.format_expr_with_strings(rhs, table)
+                    }
                 )
             }
             ExprKind::GotRef {
@@ -3519,8 +3726,15 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, a)| {
-                        // Try to resolve argument as a magic constant
-                        self.format_call_arg(a, &target_str, idx, table)
+                        if self.register_snapshot_mode.get()
+                            && target_str == "rdsspq"
+                            && Self::expr_contains_snapshot_register_source(a)
+                        {
+                            self.format_expr_preserving_register_names(a, table)
+                        } else {
+                            // Try to resolve argument as a magic constant
+                            self.format_call_arg(a, &target_str, idx, table)
+                        }
                     })
                     .collect();
                 format!("{}({})", target_str, args_str.join(", "))
@@ -3845,6 +4059,9 @@ impl PseudoCodeEmitter {
         } else {
             provisional_body
         };
+        let previous_snapshot_mode = self
+            .register_snapshot_mode
+            .replace(Self::should_enable_register_snapshot_mode(&display_body));
 
         // Analyze function body for pattern-based variable naming (loop indices, etc.)
         self.naming_ctx.borrow_mut().analyze(&display_body);
@@ -4093,6 +4310,7 @@ impl PseudoCodeEmitter {
         write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
         self.clear_return_fallback_expr();
+        self.register_snapshot_mode.set(previous_snapshot_mode);
         Self::repair_packed_small_aggregate_output(output)
     }
 
@@ -4122,6 +4340,9 @@ impl PseudoCodeEmitter {
         let display_body = self.rewrite_small_aggregate_slots_for_emission(
             &Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return),
         );
+        let previous_snapshot_mode = self
+            .register_snapshot_mode
+            .replace(Self::should_enable_register_snapshot_mode(&display_body));
 
         // Analyze function body for pattern-based variable naming
         self.naming_ctx.borrow_mut().analyze(&display_body);
@@ -4248,6 +4469,7 @@ impl PseudoCodeEmitter {
         write!(output, "{}", body_output).unwrap();
         writeln!(output, "}}").unwrap();
         self.clear_return_fallback_expr();
+        self.register_snapshot_mode.set(previous_snapshot_mode);
         Self::repair_packed_small_aggregate_output(output)
     }
 
@@ -9219,6 +9441,82 @@ mod tests {
         assert!(
             !output.contains("ret ="),
             "did not expect gcov temp readback to survive:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_emit_register_snapshot_store_preserves_raw_register_names() {
+        use super::super::expression::Variable;
+
+        let env = Expr::var(Variable::reg("rdi", 8));
+        let rax = Expr::var(Variable::reg("rax", 8));
+        let rbx = Expr::var(Variable::reg("rbx", 8));
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let r12 = Expr::var(Variable::reg("r12", 8));
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![
+                    Expr::assign(Expr::deref(env.clone(), 8), rbx),
+                    Expr::assign(
+                        rax.clone(),
+                        Expr::binop(BinOpKind::Xor, rbp, Expr::int(0x30)),
+                    ),
+                    Expr::assign(
+                        Expr {
+                            kind: ExprKind::ArrayAccess {
+                                base: Box::new(env.clone()),
+                                index: Box::new(Expr::int(1)),
+                                element_size: 8,
+                            },
+                        },
+                        rax,
+                    ),
+                    Expr::assign(
+                        Expr {
+                            kind: ExprKind::ArrayAccess {
+                                base: Box::new(env),
+                                index: Box::new(Expr::int(2)),
+                                element_size: 8,
+                            },
+                        },
+                        r12,
+                    ),
+                ],
+                address_range: (0x1000, 0x1010),
+            }],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::default();
+        sig.parameters.push(super::super::signature::Parameter::new(
+            "env",
+            super::super::signature::ParamType::Pointer,
+            super::super::signature::ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+
+        let output =
+            PseudoCodeEmitter::new("    ", false).emit_with_signature(&cfg, "snapshot", &sig);
+
+        assert!(
+            output.contains("*(uint64_t*)(env) = rbx;"),
+            "expected raw rbx store, got:\n{output}"
+        );
+        assert!(
+            output.contains("rbp ^ 48"),
+            "expected raw register setup, got:\n{output}"
+        );
+        assert!(
+            output.contains("env[1] = rax;") && output.contains("env[2] = r12;"),
+            "expected raw register saves in buffer stores, got:\n{output}"
+        );
+        assert!(
+            !output.contains("err") && !output.contains("result") && !output.contains("ret ="),
+            "did not expect semantic pseudo-locals in snapshot helper, got:\n{output}"
         );
     }
 }
