@@ -7453,6 +7453,24 @@ mod tests {
     }
 
     #[test]
+    fn exact_lookup_accepts_unversioned_demangled_cpp_export() {
+        let symbols = vec![test_symbol(
+            "_ZSt21ios_base_library_initv@GLIBCXX_3.4.32",
+            0x401140,
+        )];
+
+        let resolved = find_symbol_in_candidates(
+            &symbols,
+            "std::ios_base_library_init()",
+            SymbolLookupMode::ExactOnly,
+        )
+        .expect("versioned C++ export should resolve by demangled base name");
+
+        assert_eq!(resolved.name, "_ZSt21ios_base_library_initv@GLIBCXX_3.4.32");
+        assert_eq!(resolved.address, 0x401140);
+    }
+
+    #[test]
     fn xrefs_resolve_unversioned_imports_to_all_referenced_plt_targets() {
         let binary = TestBinary {
             sections: Vec::new(),

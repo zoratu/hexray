@@ -26,6 +26,17 @@ use std::fmt::Write;
 /// Returns the demangled name if successful, or None if the symbol
 /// is not mangled or uses an unsupported scheme.
 pub fn demangle(name: &str) -> Option<String> {
+    let (core_name, suffix) = split_symbol_suffix(name);
+
+    let demangled = demangle_inner(core_name)?;
+    if suffix.is_empty() {
+        Some(demangled)
+    } else {
+        Some(format!("{demangled}{suffix}"))
+    }
+}
+
+fn demangle_inner(name: &str) -> Option<String> {
     // Try the canonical Rust demangler first so legacy _ZN... symbols do not
     // get misclassified as C++.
     if let Some(demangled) = demangle_rust(name) {
@@ -48,6 +59,13 @@ pub fn demangle(name: &str) -> Option<String> {
     }
 
     None
+}
+
+fn split_symbol_suffix(name: &str) -> (&str, &str) {
+    let Some(suffix_start) = name.find('@') else {
+        return (name, "");
+    };
+    (&name[..suffix_start], &name[suffix_start..])
 }
 
 /// Returns the demangled name or the original if demangling fails.
@@ -1182,6 +1200,28 @@ mod tests {
     #[test]
     fn test_cpp_demangle_handles_macho_leading_underscore() {
         assert_eq!(demangle("__ZN3foo3barEv"), Some("foo::bar()".to_string()));
+    }
+
+    #[test]
+    fn test_cpp_demangle_preserves_elf_symbol_suffixes() {
+        assert_eq!(
+            demangle("_ZSt21ios_base_library_initv@GLIBCXX_3.4.32"),
+            Some("std::ios_base_library_init()@GLIBCXX_3.4.32".to_string())
+        );
+
+        let demangled =
+            demangle("_ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc@GLIBCXX_3.4@plt")
+                .expect("versioned operator<< export should demangle");
+        assert!(
+            demangled.starts_with("std::operator<<"),
+            "got: {}",
+            demangled
+        );
+        assert!(
+            demangled.ends_with("@GLIBCXX_3.4@plt"),
+            "got: {}",
+            demangled
+        );
     }
 
     #[test]
