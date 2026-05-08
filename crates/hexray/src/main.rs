@@ -1166,6 +1166,21 @@ fn resolve_analysis_target(
     bail!("Symbol '{}' not found", target)
 }
 
+fn resolve_analysis_target_with_entry_main(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    target: &str,
+    relocation_table: &RelocationTable,
+) -> Result<ResolvedAnalysisTarget> {
+    match resolve_analysis_target(fmt, project, target) {
+        Ok(resolved) => Ok(resolved),
+        Err(err) if target == "main" => infer_main_symbol_from_entry(fmt, relocation_table)
+            .map(ResolvedAnalysisTarget::Symbol)
+            .ok_or(err),
+        Err(err) => Err(err),
+    }
+}
+
 fn resolve_analysis_target_with_symbols(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
@@ -1496,6 +1511,140 @@ fn find_symbol_in_candidates(
     });
     if !prefix_matches.is_empty() {
         return Some(prefix_matches.remove(0));
+    }
+
+    None
+}
+
+fn infer_main_symbol_from_entry(
+    fmt: &dyn BinaryFormat,
+    relocation_table: &RelocationTable,
+) -> Option<hexray_core::Symbol> {
+    use hexray_core::{register::x86, ControlFlow, Operand, Operation, SymbolBinding, SymbolKind};
+
+    if fmt.architecture() != Architecture::X86_64 {
+        return None;
+    }
+
+    let entry = fmt.entry_point()?;
+    let section = fmt.section_containing(entry)?;
+    if !section.is_executable() {
+        return None;
+    }
+
+    let max_bytes = section
+        .virtual_address()
+        .saturating_add(section.size())
+        .saturating_sub(entry)
+        .min(0x100) as usize;
+    let bytes = fmt.bytes_at(entry, max_bytes)?;
+    let disasm = X86_64Disassembler::new();
+
+    let is_internal_exec_addr = |addr: u64| {
+        if addr == 0 {
+            return false;
+        }
+        fmt.sections().any(|section| {
+            let start = section.virtual_address();
+            let end = start.saturating_add(section.size());
+            let name = section.name().to_ascii_lowercase();
+            addr >= start
+                && addr < end
+                && section.is_executable()
+                && !name.contains("plt")
+                && !name.contains("stub")
+        })
+    };
+
+    let mut register_values: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    let mut offset = 0usize;
+    let mut decoded_count = 0usize;
+
+    while offset < bytes.len() && decoded_count < 64 {
+        let addr = entry + offset as u64;
+        let remaining = &bytes[offset..];
+        let Ok(decoded) = disasm.decode_instruction(remaining, addr) else {
+            break;
+        };
+        let instruction = &decoded.instruction;
+
+        let tracked_assignment = if matches!(
+            instruction.operation,
+            Operation::Move | Operation::LoadEffectiveAddress
+        ) {
+            match instruction.operands.first() {
+                Some(Operand::Register(dest)) => {
+                    let source = instruction.operands.get(1);
+                    let value = match source {
+                        Some(Operand::Immediate(imm)) => Some(imm.value as u64),
+                        Some(Operand::PcRelative { target, .. }) => Some(*target),
+                        Some(Operand::Register(reg)) => register_values.get(&reg.id).copied(),
+                        Some(Operand::Memory(mem))
+                            if matches!(instruction.operation, Operation::LoadEffectiveAddress)
+                                && mem.base.as_ref().map(|reg| reg.id) == Some(x86::RIP)
+                                && mem.index.is_none() =>
+                        {
+                            Some(
+                                (instruction.address + instruction.size as u64)
+                                    .wrapping_add(mem.displacement as u64),
+                            )
+                        }
+                        _ => None,
+                    };
+
+                    value
+                        .filter(|target| is_internal_exec_addr(*target))
+                        .map(|value| (dest.id, value))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some((dest_reg, value)) = tracked_assignment {
+            register_values.insert(dest_reg, value);
+        } else if let Some(Operand::Register(dest)) = instruction.operands.first() {
+            register_values.remove(&dest.id);
+        }
+
+        let calls_libc_start_main = match instruction.control_flow {
+            ControlFlow::Call { target, .. } => relocation_table
+                .get_call(instruction.address)
+                .map(|reloc| reloc.symbol.contains("libc_start_main"))
+                .unwrap_or_else(|| {
+                    fmt.symbol_at(target)
+                        .is_some_and(|symbol| symbol.name.contains("libc_start_main"))
+                }),
+            ControlFlow::IndirectCall { .. } => match instruction.operands.first() {
+                Some(Operand::Memory(mem)) => rip_relative_memory_target(mem, instruction)
+                    .and_then(|slot| relocation_table.get_got(slot))
+                    .is_some_and(|symbol| symbol.contains("libc_start_main")),
+                _ => false,
+            },
+            _ => false,
+        };
+        if calls_libc_start_main {
+            let address = *register_values.get(&x86::RDI)?;
+            return Some(hexray_core::Symbol {
+                name: "main".to_string(),
+                address,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Local,
+                section_index: fmt.section_containing(address).map(|_| 0),
+            });
+        }
+
+        offset += decoded.size;
+        decoded_count += 1;
+
+        if matches!(
+            instruction.control_flow,
+            ControlFlow::Return | ControlFlow::Halt
+        ) {
+            break;
+        }
     }
 
     None
@@ -1911,36 +2060,36 @@ fn decompile_function(
     config: Option<&DecompilerConfig>,
 ) -> Result<()> {
     let fmt = binary.as_format();
+    let relocation_table = build_relocation_table(binary);
 
-    let (start_addr, name, max_bytes, stop_after_first_return) = match resolve_analysis_target(
-        fmt, project, target,
-    ) {
-        Ok(ResolvedAnalysisTarget::Address(addr)) => {
-            let name = project
-                .and_then(|p| p.get_function_name(addr))
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| format!("sub_{:x}", addr));
-            (addr, name, 4096usize, true)
-        }
-        Ok(ResolvedAnalysisTarget::Symbol(symbol)) => {
-            let max_bytes = if symbol.size > 0 {
-                symbol.size as usize
-            } else {
-                4096usize
-            };
-            let name = project
-                .and_then(|p| p.get_function_name(symbol.address))
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| demangle_or_original(&symbol.name));
-            (symbol.address, name, max_bytes, symbol.size == 0)
-        }
-        Err(_) => {
-            bail!(
+    let (start_addr, name, max_bytes, stop_after_first_return) =
+        match resolve_analysis_target_with_entry_main(fmt, project, target, &relocation_table) {
+            Ok(ResolvedAnalysisTarget::Address(addr)) => {
+                let name = project
+                    .and_then(|p| p.get_function_name(addr))
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| format!("sub_{:x}", addr));
+                (addr, name, 4096usize, true)
+            }
+            Ok(ResolvedAnalysisTarget::Symbol(symbol)) => {
+                let max_bytes = if symbol.size > 0 {
+                    symbol.size as usize
+                } else {
+                    4096usize
+                };
+                let name = project
+                    .and_then(|p| p.get_function_name(symbol.address))
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| demangle_or_original(&symbol.name));
+                (symbol.address, name, max_bytes, symbol.size == 0)
+            }
+            Err(_) => {
+                bail!(
                     "Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).",
                     target
                 )
-        }
-    };
+            }
+        };
 
     // Validate the address is reasonable
     if start_addr == 0 {
@@ -2010,8 +2159,6 @@ fn decompile_function(
     }
 
     // Build relocation table for kernel modules
-    let relocation_table = build_relocation_table(binary);
-
     // Build binary data context for jump table reconstruction
     let binary_data_ctx = build_binary_data_context(fmt);
 
@@ -4067,6 +4214,7 @@ fn decompile_with_follow(
 
     let fmt = binary.as_format();
     let arch = fmt.architecture();
+    let relocation_table = build_relocation_table(binary);
 
     // Track which functions we've already decompiled to avoid duplicates
     let mut decompiled: HashSet<u64> = HashSet::new();
@@ -4074,22 +4222,23 @@ fn decompile_with_follow(
     // Queue of (address, name, depth) to decompile
     let mut queue: Vec<(u64, String, usize)> = Vec::new();
 
-    let (start_addr, name) = match resolve_analysis_target(fmt, project, target)? {
-        ResolvedAnalysisTarget::Address(addr) => {
-            let name = project
-                .and_then(|p| p.get_function_name(addr))
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| format!("sub_{:x}", addr));
-            (addr, name)
-        }
-        ResolvedAnalysisTarget::Symbol(symbol) => {
-            let name = project
-                .and_then(|p| p.get_function_name(symbol.address))
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| demangle_or_original(&symbol.name));
-            (symbol.address, name)
-        }
-    };
+    let (start_addr, name) =
+        match resolve_analysis_target_with_entry_main(fmt, project, target, &relocation_table)? {
+            ResolvedAnalysisTarget::Address(addr) => {
+                let name = project
+                    .and_then(|p| p.get_function_name(addr))
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| format!("sub_{:x}", addr));
+                (addr, name)
+            }
+            ResolvedAnalysisTarget::Symbol(symbol) => {
+                let name = project
+                    .and_then(|p| p.get_function_name(symbol.address))
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| demangle_or_original(&symbol.name));
+                (symbol.address, name)
+            }
+        };
 
     queue.push((start_addr, name, 0));
 
@@ -4104,7 +4253,6 @@ fn decompile_with_follow(
             }
         }
     }
-    let relocation_table = build_relocation_table(binary);
     let tls_tpoff_map = build_tls_tpoff_map(binary);
     let tls_slot_map = build_tls_slot_map(binary);
 
@@ -7057,13 +7205,15 @@ mod tests {
         default_calling_convention, discover_function_starts,
         discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
         ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
-        parse_address_str, patch_affects_function, resolve_analysis_target,
+        infer_main_symbol_from_entry, parse_address_str, patch_affects_function,
+        resolve_analysis_target, resolve_analysis_target_with_entry_main,
         resolve_materialized_callback_targets, resolve_xref_target_addresses, string_tags,
         truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
         SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{
-        CallGraph, CallSite, CallType, DetectedString, Patch, StringEncoding, XrefType,
+        CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
+        XrefType,
     };
     use hexray_core::{
         register::x86, Architecture, Bitness, ControlFlow, Endianness, Immediate, Instruction,
@@ -7453,6 +7603,119 @@ mod tests {
             ResolvedAnalysisTarget::Address(address) => assert_eq!(address, 0xadd),
             ResolvedAnalysisTarget::Symbol(symbol) => {
                 panic!("resolved {} instead of the hex address", symbol.name)
+            }
+        }
+    }
+
+    #[test]
+    fn infer_main_symbol_from_entry_tracks_mov_rdi_before_libc_start_main() {
+        let mut text = vec![0x90; 0x500];
+        let start = 0x3a0usize;
+        text[start..start + 38].copy_from_slice(&[
+            0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+            0x31, 0xed, // xor ebp, ebp
+            0x49, 0x89, 0xd1, // mov r9, rdx
+            0x5e, // pop rsi
+            0x48, 0x89, 0xe2, // mov rdx, rsp
+            0x48, 0x83, 0xe4, 0xf0, // and rsp, -16
+            0x50, // push rax
+            0x54, // push rsp
+            0x45, 0x31, 0xc0, // xor r8d, r8d
+            0x31, 0xc9, // xor ecx, ecx
+            0x48, 0xc7, 0xc7, 0xc0, 0x12, 0x40, 0x00, // mov rdi, 0x4012c0
+            0xff, 0x15, 0x13, 0x2c, 0x00, 0x00, // call [rip + 0x2c13]
+            0xf4, // hlt
+        ]);
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x401000,
+                    data: text,
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".got.plt",
+                    address: 0x403fd8,
+                    data: vec![0; 8],
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: Some(0x4013a0),
+        };
+        let relocation_table = {
+            let mut table = RelocationTable::new();
+            table.insert_got(0x403fd8, "__libc_start_main@GLIBC_2.34".to_string());
+            table
+        };
+
+        let main = infer_main_symbol_from_entry(&binary, &relocation_table)
+            .expect("entry sequence should recover main");
+
+        assert_eq!(main.name, "main");
+        assert_eq!(main.address, 0x4012c0);
+        assert!(main.is_function());
+    }
+
+    #[test]
+    fn resolve_analysis_target_with_entry_main_falls_back_when_symbol_is_missing() {
+        let mut text = vec![0x90; 0x500];
+        let start = 0x3a0usize;
+        text[start..start + 38].copy_from_slice(&[
+            0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+            0x31, 0xed, // xor ebp, ebp
+            0x49, 0x89, 0xd1, // mov r9, rdx
+            0x5e, // pop rsi
+            0x48, 0x89, 0xe2, // mov rdx, rsp
+            0x48, 0x83, 0xe4, 0xf0, // and rsp, -16
+            0x50, // push rax
+            0x54, // push rsp
+            0x45, 0x31, 0xc0, // xor r8d, r8d
+            0x31, 0xc9, // xor ecx, ecx
+            0x48, 0xc7, 0xc7, 0xc0, 0x12, 0x40, 0x00, // mov rdi, 0x4012c0
+            0xff, 0x15, 0x13, 0x2c, 0x00, 0x00, // call [rip + 0x2c13]
+            0xf4, // hlt
+        ]);
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x401000,
+                    data: text,
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".got.plt",
+                    address: 0x403fd8,
+                    data: vec![0; 8],
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: Some(0x4013a0),
+        };
+        let relocation_table = {
+            let mut table = RelocationTable::new();
+            table.insert_got(0x403fd8, "__libc_start_main@GLIBC_2.34".to_string());
+            table
+        };
+
+        let resolved =
+            resolve_analysis_target_with_entry_main(&binary, None, "main", &relocation_table)
+                .expect("stripped entry fallback should resolve main");
+
+        match resolved {
+            ResolvedAnalysisTarget::Symbol(symbol) => {
+                assert_eq!(symbol.name, "main");
+                assert_eq!(symbol.address, 0x4012c0);
+            }
+            ResolvedAnalysisTarget::Address(address) => {
+                panic!("resolved {address:#x} instead of synthesized main symbol")
             }
         }
     }
