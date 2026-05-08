@@ -1863,10 +1863,17 @@ fn disassemble_for_cfg<D: Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let next_offset = offset + decoded.size;
+                let next_addr = addr + decoded.size as u64;
                 let is_heuristic_tail_jump = stop_after_first_return
-                    && matches!(
-                        decoded.instruction.control_flow,
-                        hexray_core::ControlFlow::UnconditionalBranch { .. }
+                    && heuristic_tail_jump_stops_scan(
+                        disasm,
+                        bytes,
+                        next_offset,
+                        next_addr,
+                        &decoded.instruction,
+                        fmt.symbol_at(next_addr)
+                            .is_some_and(|symbol| symbol.is_function()),
                     );
                 let is_noreturn_call = matches!(
                     decoded.instruction.control_flow,
@@ -2937,10 +2944,16 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let next_offset = offset + decoded.size;
+                let next_addr = addr + decoded.size as u64;
                 let is_heuristic_tail_jump = heuristic_bounds
-                    && matches!(
-                        decoded.instruction.control_flow,
-                        hexray_core::ControlFlow::UnconditionalBranch { .. }
+                    && heuristic_tail_jump_stops_scan(
+                        disasm,
+                        bytes,
+                        next_offset,
+                        next_addr,
+                        &decoded.instruction,
+                        false,
                     );
                 let is_noreturn_call = heuristic_bounds
                     && matches!(
@@ -2969,6 +2982,41 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
     }
 
     instructions
+}
+
+fn heuristic_tail_jump_stops_scan<D: Disassembler>(
+    disasm: &D,
+    bytes: &[u8],
+    next_offset: usize,
+    next_addr: u64,
+    instruction: &hexray_core::Instruction,
+    next_addr_is_function_start: bool,
+) -> bool {
+    match instruction.control_flow {
+        hexray_core::ControlFlow::UnconditionalBranch { .. } => true,
+        hexray_core::ControlFlow::IndirectBranch { .. } => {
+            next_addr_is_function_start
+                || next_decoded_instruction_looks_like_padding_or_entry(
+                    disasm,
+                    bytes.get(next_offset..).unwrap_or(&[]),
+                    next_addr,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn next_decoded_instruction_looks_like_padding_or_entry<D: Disassembler>(
+    disasm: &D,
+    remaining: &[u8],
+    addr: u64,
+) -> bool {
+    let Ok(decoded) = disasm.decode_instruction(remaining, addr) else {
+        return false;
+    };
+
+    matches!(decoded.instruction.operation, hexray_core::Operation::Nop)
+        || decoded.instruction.mnemonic == "endbr64"
 }
 
 fn apply_call_relocations(
@@ -7866,6 +7914,31 @@ mod tests {
     }
 
     #[test]
+    fn heuristic_disassembly_stops_at_indirect_tail_jump_before_padding() {
+        let bytes = vec![
+            0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+            0x48, 0x8b, 0x07, // mov rax, [rdi]
+            0xff, 0x60, 0x10, // jmp [rax + 0x10]
+            0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, // nopw [rax + rax]
+            0xf3, 0x0f, 0x1e, 0xfa, // adjacent function
+            0xc3, // ret
+        ];
+        let disasm = X86_64Disassembler::new();
+
+        let instructions =
+            crate::disassemble_for_calls(&disasm, &bytes, 0x401490, true, &Default::default());
+
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "mov");
+        assert_eq!(instructions[2].mnemonic, "jmp");
+        assert!(matches!(
+            instructions[2].control_flow,
+            ControlFlow::IndirectBranch { .. }
+        ));
+    }
+
+    #[test]
     fn exact_sized_disassembly_keeps_scanning_past_mid_function_return() {
         let bytes = vec![
             0xf3, 0x0f, 0x1e, 0xfa, // endbr64
@@ -7918,6 +7991,41 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].mnemonic, "endbr64");
         assert_eq!(instructions[1].mnemonic, "jmp");
+    }
+
+    #[test]
+    fn heuristic_cfg_disassembly_stops_at_indirect_tail_jump_before_padding() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401490,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0x48, 0x8b, 0x07, // mov rax, [rdi]
+                    0xff, 0x60, 0x10, // jmp [rax + 0x10]
+                    0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00, // nopw [rax + rax]
+                    0xf3, 0x0f, 0x1e, 0xfa, // adjacent function
+                    0xc3, // ret
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x401490, 18).unwrap();
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x401490, true);
+
+        assert_eq!(instructions.len(), 3);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "mov");
+        assert_eq!(instructions[2].mnemonic, "jmp");
+        assert!(matches!(
+            instructions[2].control_flow,
+            ControlFlow::IndirectBranch { .. }
+        ));
     }
 
     #[test]
