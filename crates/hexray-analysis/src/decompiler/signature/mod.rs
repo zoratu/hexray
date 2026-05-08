@@ -76,6 +76,12 @@ pub struct SignatureRecovery {
     return_size: u8,
     /// Whether a float return register was used.
     float_return: bool,
+    /// Float ABI registers observed in expressions even if the value was rewritten before use.
+    observed_float_arg_regs: HashSet<String>,
+    /// Integer SSE/AVX-style opaque operations observed in the function body.
+    integer_simd_ops_observed: bool,
+    /// The final scalar result is extracted from a float ABI register into the integer return.
+    return_from_integer_simd_lane: bool,
     /// Recovered function-pointer return type when applicable.
     return_function_pointer: Option<ParamType>,
     /// Candidate return type inferred from tail-position call forwarding.
@@ -138,6 +144,9 @@ impl SignatureRecovery {
             return_value_set: false,
             return_size: 8,
             float_return: false,
+            observed_float_arg_regs: HashSet::new(),
+            integer_simd_ops_observed: false,
+            return_from_integer_simd_lane: false,
             return_function_pointer: None,
             tail_call_return_type: None,
             return_is_pointer: false,
@@ -202,6 +211,9 @@ impl SignatureRecovery {
         self.return_value_set = false;
         self.return_size = 8;
         self.float_return = false;
+        self.observed_float_arg_regs.clear();
+        self.integer_simd_ops_observed = false;
+        self.return_from_integer_simd_lane = false;
         self.return_function_pointer = None;
         self.tail_call_return_type = None;
         self.return_is_pointer = false;
@@ -417,20 +429,25 @@ impl SignatureRecovery {
                 }
                 self.return_confidence = self.return_confidence.max(200);
                 if self.expr_is_float_abi_value(expr) {
-                    self.float_return = true;
-                    self.return_size = 8;
-                    if !self
-                        .return_provenance
-                        .iter()
-                        .any(|r| r == "explicit return expression uses float ABI value")
-                    {
-                        self.return_provenance
-                            .push("explicit return expression uses float ABI value".to_string());
+                    if !self.return_from_integer_simd_lane {
+                        self.float_return = true;
+                        self.return_size = 8;
+                        if !self
+                            .return_provenance
+                            .iter()
+                            .any(|r| r == "explicit return expression uses float ABI value")
+                        {
+                            self.return_provenance.push(
+                                "explicit return expression uses float ABI value".to_string(),
+                            );
+                        }
                     }
                 }
                 // Infer return type from expression
                 if let Some(size) = self.infer_expr_size(expr) {
-                    let inferred_size = if self.float_return {
+                    let inferred_size = if self.return_from_integer_simd_lane {
+                        self.return_size.min(size).max(1)
+                    } else if self.float_return {
                         8
                     } else if matches!(expr.kind, ExprKind::IntLit(_)) {
                         size.max(4)
@@ -507,6 +524,45 @@ impl SignatureRecovery {
 
                 // Check if LHS is a register being written
                 if let Some(reg_name) = self.extract_register_name(lhs) {
+                    let reg_lower = reg_name.to_lowercase();
+                    if (reg_lower == self.convention.integer_return_register()
+                        || reg_lower == self.convention.integer_return_register_32())
+                        && self.integer_simd_ops_observed
+                        && self.expr_uses_float_abi_value(rhs)
+                    {
+                        self.return_from_integer_simd_lane = true;
+                        if !self
+                            .return_provenance
+                            .iter()
+                            .any(|r| r == "integer return extracted from SIMD lane")
+                        {
+                            self.return_provenance
+                                .push("integer return extracted from SIMD lane".to_string());
+                        }
+                        self.return_confidence = self.return_confidence.max(205);
+                    }
+                    if self.is_float_return_register(&reg_lower)
+                        && self.integer_simd_ops_observed
+                        && self.expr_uses_integer_return_register(rhs)
+                    {
+                        self.return_from_integer_simd_lane = true;
+                        if let Some(size) = match &rhs.kind {
+                            ExprKind::Var(var) if var.size > 0 => Some(var.size),
+                            _ => self.infer_expr_size(rhs),
+                        } {
+                            self.return_size = size.max(1);
+                        }
+                        if !self
+                            .return_provenance
+                            .iter()
+                            .any(|r| r == "integer return forwarded through SIMD ABI register")
+                        {
+                            self.return_provenance.push(
+                                "integer return forwarded through SIMD ABI register".to_string(),
+                            );
+                        }
+                        self.return_confidence = self.return_confidence.max(205);
+                    }
                     self.record_register_write(&reg_name, rhs, near_return);
                 }
 
@@ -671,6 +727,22 @@ impl SignatureRecovery {
             }
             self.return_confidence = self.return_confidence.max(200);
         }
+        if (reg_lower == self.convention.integer_return_register()
+            || reg_lower == self.convention.integer_return_register_32())
+            && self.integer_simd_ops_observed
+            && self.expr_uses_float_abi_value(rhs)
+        {
+            self.return_from_integer_simd_lane = true;
+            if !self
+                .return_provenance
+                .iter()
+                .any(|r| r == "integer return extracted from SIMD lane")
+            {
+                self.return_provenance
+                    .push("integer return extracted from SIMD lane".to_string());
+            }
+            self.return_confidence = self.return_confidence.max(205);
+        }
     }
 
     /// Analyzes an expression for register reads (argument detection).
@@ -688,6 +760,9 @@ impl SignatureRecovery {
         match &expr.kind {
             ExprKind::Var(var) => {
                 let name = var.name.to_lowercase();
+                if self.is_float_arg_register(&name) {
+                    self.observed_float_arg_regs.insert(name.clone());
+                }
                 // If this register is an argument register and hasn't been written yet,
                 // it's being used as an argument
                 if self.is_arg_register(&name) && !self.written_regs.contains(&name) {
@@ -709,6 +784,12 @@ impl SignatureRecovery {
             }
             ExprKind::Unknown(name) => {
                 let lowered = name.to_lowercase();
+                if Self::is_opaque_x86_integer_simd_comment(name) {
+                    self.integer_simd_ops_observed = true;
+                }
+                if self.is_float_arg_register(&lowered) {
+                    self.observed_float_arg_regs.insert(lowered.clone());
+                }
                 // Lifted IR often represents argument aliases as unknown identifiers
                 // (e.g., arg0/arg_8); treat them as reads for use-before-def.
                 if self.is_arg_register(&lowered) && !self.written_regs.contains(&lowered) {
@@ -1326,6 +1407,7 @@ impl SignatureRecovery {
             (ParamType::Unknown, t) | (t, ParamType::Unknown) => t.clone(),
             (ParamType::Pointer, _) | (_, ParamType::Pointer) => ParamType::Pointer,
             (ParamType::Float(sa), ParamType::Float(sb)) => ParamType::Float((*sa).max(*sb)),
+            (ParamType::SimdInt128, ParamType::SimdInt128) => ParamType::SimdInt128,
             (ParamType::UnsignedInt(sa), ParamType::UnsignedInt(sb)) => {
                 ParamType::UnsignedInt((*sa).max(*sb))
             }
@@ -1972,12 +2054,151 @@ impl SignatureRecovery {
                 .is_some_and(|suffix| suffix.parse::<usize>().ok() == Some(0))
     }
 
+    fn is_opaque_x86_integer_simd_comment(name: &str) -> bool {
+        let trimmed = name.trim();
+        let Some(mnemonic) = trimmed
+            .strip_prefix("/* SSE: ")
+            .and_then(|rest| rest.strip_suffix(" */"))
+        else {
+            return false;
+        };
+
+        // TODO(31.2): replace opaque SSE comment heuristics with actual XMM def-use
+        // tracking so multi-parameter integer SIMD functions recover precise vector types.
+        Self::looks_like_x86_integer_simd_mnemonic(mnemonic)
+    }
+
+    fn looks_like_x86_integer_simd_mnemonic(mnemonic: &str) -> bool {
+        [
+            "punpck", "vpunpck", "pshuf", "vpshuf", "padd", "vpadd", "psub", "vpsub", "pmul",
+            "vpmul", "pack", "vpack", "pcmp", "vpcmp", "pand", "vpand", "por", "vpor", "pxor",
+            "vpxor", "psll", "vpsll", "psrl", "vpsrl", "psra", "vpsra", "palignr", "vpalignr",
+            "pblend", "vpblend", "pinsr", "vpinsr", "pextr", "vpextr", "phadd", "vphadd", "phsub",
+            "vphsub", "pabs", "vpabs", "pavg", "vpavg", "pmax", "vpmax", "pmin", "vpmin", "pmadd",
+            "vpmadd", "pmov", "vpmov", "ptest", "vptest", "psadbw", "vpsadbw", "mpsadbw",
+            "vmpsadbw",
+        ]
+        .iter()
+        .any(|prefix| mnemonic.starts_with(prefix))
+    }
+
     fn expr_is_float_abi_value(&self, expr: &Expr) -> bool {
         let Some(name) = self.extract_var_name(expr) else {
             return false;
         };
         let name_lower = name.to_lowercase();
         self.is_float_return_register(&name_lower) || self.is_float_arg_register(&name_lower)
+    }
+
+    fn expr_uses_float_abi_value(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => self.expr_is_float_abi_value(&Expr::var(var.clone())),
+            ExprKind::Unknown(name) => {
+                let lowered = name.to_lowercase();
+                self.is_float_return_register(&lowered) || self.is_float_arg_register(&lowered)
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.expr_uses_float_abi_value(left) || self.expr_uses_float_abi_value(right)
+            }
+            ExprKind::UnaryOp { operand, .. } => self.expr_uses_float_abi_value(operand),
+            ExprKind::Deref { addr, .. } => self.expr_uses_float_abi_value(addr),
+            ExprKind::AddressOf(expr) => self.expr_uses_float_abi_value(expr),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.expr_uses_float_abi_value(base) || self.expr_uses_float_abi_value(index)
+            }
+            ExprKind::FieldAccess { base, .. } => self.expr_uses_float_abi_value(base),
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.expr_uses_float_abi_value(lhs) || self.expr_uses_float_abi_value(rhs)
+            }
+            ExprKind::Call { target, args } => {
+                let target_uses_float = match target {
+                    super::expression::CallTarget::Indirect(inner) => {
+                        self.expr_uses_float_abi_value(inner)
+                    }
+                    super::expression::CallTarget::IndirectGot { expr, .. } => {
+                        self.expr_uses_float_abi_value(expr)
+                    }
+                    _ => false,
+                };
+                target_uses_float || args.iter().any(|arg| self.expr_uses_float_abi_value(arg))
+            }
+            ExprKind::Cast { expr, .. } => self.expr_uses_float_abi_value(expr),
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_uses_float_abi_value(cond)
+                    || self.expr_uses_float_abi_value(then_expr)
+                    || self.expr_uses_float_abi_value(else_expr)
+            }
+            ExprKind::BitField { expr, .. } => self.expr_uses_float_abi_value(expr),
+            ExprKind::Phi(exprs) => exprs
+                .iter()
+                .any(|expr| self.expr_uses_float_abi_value(expr)),
+            ExprKind::IntLit(_) | ExprKind::GotRef { .. } => false,
+        }
+    }
+
+    fn expr_uses_integer_return_register(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                let lowered = var.name.to_lowercase();
+                lowered == self.convention.integer_return_register()
+                    || lowered == self.convention.integer_return_register_32()
+            }
+            ExprKind::Unknown(name) => {
+                let lowered = name.to_lowercase();
+                lowered == self.convention.integer_return_register()
+                    || lowered == self.convention.integer_return_register_32()
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.expr_uses_integer_return_register(left)
+                    || self.expr_uses_integer_return_register(right)
+            }
+            ExprKind::UnaryOp { operand, .. } => self.expr_uses_integer_return_register(operand),
+            ExprKind::Deref { addr, .. } => self.expr_uses_integer_return_register(addr),
+            ExprKind::AddressOf(expr) => self.expr_uses_integer_return_register(expr),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.expr_uses_integer_return_register(base)
+                    || self.expr_uses_integer_return_register(index)
+            }
+            ExprKind::FieldAccess { base, .. } => self.expr_uses_integer_return_register(base),
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.expr_uses_integer_return_register(lhs)
+                    || self.expr_uses_integer_return_register(rhs)
+            }
+            ExprKind::Call { target, args } => {
+                let target_uses_return = match target {
+                    super::expression::CallTarget::Indirect(inner) => {
+                        self.expr_uses_integer_return_register(inner)
+                    }
+                    super::expression::CallTarget::IndirectGot { expr, .. } => {
+                        self.expr_uses_integer_return_register(expr)
+                    }
+                    _ => false,
+                };
+                target_uses_return
+                    || args
+                        .iter()
+                        .any(|arg| self.expr_uses_integer_return_register(arg))
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_uses_integer_return_register(cond)
+                    || self.expr_uses_integer_return_register(then_expr)
+                    || self.expr_uses_integer_return_register(else_expr)
+            }
+            ExprKind::Cast { expr, .. } => self.expr_uses_integer_return_register(expr),
+            ExprKind::BitField { expr, .. } => self.expr_uses_integer_return_register(expr),
+            ExprKind::Phi(exprs) => exprs
+                .iter()
+                .any(|expr| self.expr_uses_integer_return_register(expr)),
+            ExprKind::IntLit(_) | ExprKind::GotRef { .. } => false,
+        }
     }
 
     /// Returns the size in bytes based on register name variant.
@@ -2393,11 +2614,27 @@ impl SignatureRecovery {
 
         // Check for float arguments
         let float_regs = self.convention.float_arg_registers();
+        let integer_simd_signature =
+            self.integer_simd_ops_observed && self.return_from_integer_simd_lane;
         for (idx, reg) in float_regs.iter().enumerate() {
             let reg_lower = reg.to_lowercase();
-            if self.read_regs.contains(&reg_lower) {
-                sig.parameters
-                    .push(Parameter::from_float_register(idx, reg));
+            let seen_as_param = self.read_regs.contains(&reg_lower)
+                || self.observed_float_arg_regs.contains(&reg_lower)
+                || (integer_simd_signature && idx == 0);
+            if seen_as_param {
+                if integer_simd_signature {
+                    sig.parameters.push(Parameter::new(
+                        format!("arg{}", idx),
+                        ParamType::SimdInt128,
+                        ParameterLocation::FloatRegister {
+                            name: reg.to_string(),
+                            index: idx,
+                        },
+                    ));
+                } else {
+                    sig.parameters
+                        .push(Parameter::from_float_register(idx, reg));
+                }
             }
         }
 
@@ -2408,6 +2645,14 @@ impl SignatureRecovery {
         if self.return_value_set {
             if let Some(ref fp_ty) = self.return_function_pointer {
                 sig.return_type = fp_ty.clone();
+            } else if self.return_from_integer_simd_lane {
+                sig.return_type = match self.return_size {
+                    1 => ParamType::SignedInt(8),
+                    2 => ParamType::SignedInt(16),
+                    4 => ParamType::SignedInt(32),
+                    8 => ParamType::SignedInt(64),
+                    _ => ParamType::SignedInt(32),
+                };
             } else if self.float_return {
                 sig.return_type = ParamType::Float(64);
             } else if self.return_is_pointer && self.return_size == 8 {
@@ -4737,6 +4982,76 @@ mod tests {
 
         assert!(sig.has_return);
         assert_eq!(sig.return_type, ParamType::Float(64));
+    }
+
+    #[test]
+    fn test_signature_recovery_classifies_integer_simd_lane_extract() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::unknown("/* SSE: punpckhdq */"),
+                Expr::unknown("/* SSE: paddd */"),
+                Expr::assign(
+                    Expr::var(Variable::reg("eax", 4)),
+                    Expr::var(Variable::reg("xmm0", 16)),
+                ),
+            ],
+            address_range: (0x1000, 0x100c),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::var(Variable::reg("eax", 4)))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].param_type, ParamType::SimdInt128);
+        assert!(matches!(
+            sig.parameters[0].location,
+            ParameterLocation::FloatRegister { ref name, index: 0 } if name == "xmm0"
+        ));
+    }
+
+    #[test]
+    fn test_signature_recovery_classifies_integer_simd_return_forwarded_via_xmm0() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::unknown("/* SSE: paddd */"),
+                Expr::assign(
+                    Expr::var(Variable::reg("xmm0", 16)),
+                    Expr::var(Variable::reg("rax", 4)),
+                ),
+            ],
+            address_range: (0x1000, 0x1008),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::var(Variable::reg("xmm0", 16)))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_function_name("sse_hsum");
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].param_type, ParamType::SimdInt128);
     }
 
     #[test]
