@@ -280,6 +280,12 @@ impl ParameterUsageHints {
             return ParamType::UnsignedInt(base_size * 8);
         }
 
+        // Signed comparisons are a stronger scalar hint than incidental unsigned ops
+        // such as shifts or masks.
+        if self.is_signed_comparison {
+            return ParamType::SignedInt(base_size * 8);
+        }
+
         // If unsigned operations, use unsigned
         if self.is_unsigned_ops {
             return ParamType::UnsignedInt(base_size * 8);

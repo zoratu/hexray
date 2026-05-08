@@ -82,6 +82,8 @@ pub struct SignatureRecovery {
     integer_simd_ops_observed: bool,
     /// The final scalar result is extracted from a float ABI register into the integer return.
     return_from_integer_simd_lane: bool,
+    /// Direct argument-register copies that shadow an earlier ABI parameter.
+    arg_register_copy_sources: HashMap<usize, usize>,
     /// x87 stack operations were observed in the function body.
     x87_ops_observed: bool,
     /// Entry-like x87 input was observed via ST(0).
@@ -153,6 +155,7 @@ impl SignatureRecovery {
             observed_float_arg_regs: HashSet::new(),
             integer_simd_ops_observed: false,
             return_from_integer_simd_lane: false,
+            arg_register_copy_sources: HashMap::new(),
             x87_ops_observed: false,
             x87_st0_input_observed: false,
             x87_stack_arg_offsets: BTreeSet::new(),
@@ -223,6 +226,7 @@ impl SignatureRecovery {
         self.observed_float_arg_regs.clear();
         self.integer_simd_ops_observed = false;
         self.return_from_integer_simd_lane = false;
+        self.arg_register_copy_sources.clear();
         self.x87_ops_observed = false;
         self.x87_st0_input_observed = false;
         self.x87_stack_arg_offsets.clear();
@@ -276,6 +280,76 @@ impl SignatureRecovery {
         if let Some(idx) = self.resolve_param_index_from_name_internal(&name, false) {
             let hints = self.param_hints.entry(idx).or_default();
             hint_fn(hints);
+        }
+    }
+
+    fn copied_arg_root(&self, idx: usize) -> usize {
+        let mut current = idx;
+        let mut seen = HashSet::new();
+        while let Some(next) = self.arg_register_copy_sources.get(&current).copied() {
+            if !seen.insert(current) || next == current {
+                break;
+            }
+            current = next;
+        }
+        current
+    }
+
+    fn note_direct_arg_register_copy(&mut self, lhs_reg: &str, rhs: &Expr) {
+        let Some(lhs_idx) = self.direct_arg_register_index(lhs_reg) else {
+            return;
+        };
+        let lhs_read =
+            self.read_regs.contains(lhs_reg) || self.read_regs.contains(&format!("arg{}", lhs_idx));
+        if lhs_read {
+            return;
+        }
+
+        let Some(rhs_idx) = self.resolve_param_index_from_expr_shallow(rhs) else {
+            self.arg_register_copy_sources.remove(&lhs_idx);
+            return;
+        };
+        if lhs_idx == rhs_idx {
+            self.arg_register_copy_sources.remove(&lhs_idx);
+            return;
+        }
+
+        self.arg_register_copy_sources
+            .insert(lhs_idx, self.copied_arg_root(rhs_idx));
+    }
+
+    fn record_arg_register_read(&mut self, reg_name: &str, size: u8) {
+        let name = reg_name.to_lowercase();
+        let Some(idx) = self.direct_arg_register_index(&name) else {
+            self.read_regs.insert(name.clone());
+            if size > 0 {
+                self.reg_sizes.insert(name, size);
+            }
+            return;
+        };
+
+        let root = self.copied_arg_root(idx);
+        self.read_regs.insert(format!("arg{}", root));
+        if size == 0 {
+            return;
+        }
+
+        let size_key = if size >= 8 {
+            self.convention
+                .integer_arg_registers()
+                .get(root)
+                .map(|name| name.to_lowercase())
+        } else {
+            self.convention
+                .integer_arg_registers_32()
+                .get(root)
+                .map(|name| name.to_lowercase())
+        };
+        if let Some(key) = size_key {
+            self.reg_sizes
+                .entry(key)
+                .and_modify(|seen| *seen = (*seen).max(size))
+                .or_insert(size);
         }
     }
 
@@ -556,6 +630,7 @@ impl SignatureRecovery {
                 // Check if LHS is a register being written
                 if let Some(reg_name) = self.extract_register_name(lhs) {
                     let reg_lower = reg_name.to_lowercase();
+                    self.note_direct_arg_register_copy(&reg_lower, rhs);
                     if (reg_lower == self.convention.integer_return_register()
                         || reg_lower == self.convention.integer_return_register_32())
                         && self.integer_simd_ops_observed
@@ -602,12 +677,17 @@ impl SignatureRecovery {
                 if let ExprKind::Var(rhs_var) = &rhs.kind {
                     let rhs_name = rhs_var.name.to_lowercase();
                     if self.is_arg_register(&rhs_name) && !self.written_regs.contains(&rhs_name) {
-                        self.read_regs.insert(rhs_name.clone());
-                        // Track the size from the register variant
-                        let size = self.effective_var_size(rhs_var);
-                        if size > 0 {
-                            self.reg_sizes.insert(rhs_name, size);
-                        }
+                        let rhs_size = self.effective_var_size(rhs_var);
+                        let copy_size = if let ExprKind::Var(lhs_var) = &lhs.kind {
+                            let lhs_size = self.effective_var_size(lhs_var);
+                            match (lhs_size, rhs_size) {
+                                (0, size) | (size, 0) => size,
+                                (lhs_size, rhs_size) => lhs_size.min(rhs_size),
+                            }
+                        } else {
+                            rhs_size
+                        };
+                        self.record_arg_register_read(&rhs_name, copy_size);
                     }
                 }
 
@@ -655,6 +735,9 @@ impl SignatureRecovery {
                     }
                 }
                 if let Some(reg_name) = self.extract_register_name(lhs) {
+                    if let Some(idx) = self.direct_arg_register_index(&reg_name.to_lowercase()) {
+                        self.arg_register_copy_sources.remove(&idx);
+                    }
                     self.record_register_write(&reg_name, rhs, near_return);
                 }
             }
@@ -797,12 +880,7 @@ impl SignatureRecovery {
                 // If this register is an argument register and hasn't been written yet,
                 // it's being used as an argument
                 if self.is_arg_register(&name) && !self.written_regs.contains(&name) {
-                    self.read_regs.insert(name.clone());
-                    // Track the size
-                    let size = self.effective_var_size(var);
-                    if size > 0 {
-                        self.reg_sizes.insert(name.clone(), size);
-                    }
+                    self.record_arg_register_read(&name, self.effective_var_size(var));
                 }
 
                 // Record context hints for direct arguments and aliased arguments.
@@ -824,11 +902,7 @@ impl SignatureRecovery {
                 // Lifted IR often represents argument aliases as unknown identifiers
                 // (e.g., arg0/arg_8); treat them as reads for use-before-def.
                 if self.is_arg_register(&lowered) && !self.written_regs.contains(&lowered) {
-                    self.read_regs.insert(lowered.clone());
-                    let size = self.reg_size_from_name(name);
-                    if size > 0 {
-                        self.reg_sizes.insert(lowered.clone(), size);
-                    }
+                    self.record_arg_register_read(&lowered, self.reg_size_from_name(name));
                 }
 
                 if is_dereferenced {
@@ -1773,7 +1847,21 @@ impl SignatureRecovery {
         if self.alias_candidate_indices(var_name).len() > 1 {
             return None;
         }
-        if let Some(idx) = self.arg_register_index(var_name) {
+        if let Some(idx) = self.direct_arg_register_index(var_name) {
+            let root = self.copied_arg_root(idx);
+            if root != idx {
+                return Some(root);
+            }
+
+            let lowered = var_name.to_lowercase();
+            let seen_as_input = self.read_regs.contains(&lowered)
+                || self.read_regs.contains(&format!("arg{}", idx));
+            if self.written_regs.contains(&lowered) && !seen_as_input {
+                return None;
+            }
+            return Some(idx);
+        }
+        if let Some(idx) = Self::lifted_arg_slot_index(&var_name.to_lowercase()) {
             return Some(idx);
         }
         None
@@ -2166,8 +2254,8 @@ impl SignatureRecovery {
             return false;
         };
 
-        // TODO(31.2): replace opaque SSE comment heuristics with actual XMM def-use
-        // tracking so multi-parameter integer SIMD functions recover precise vector types.
+        // TODO(31.1): model opaque YMM/XMM vector values directly instead of relying on
+        // comment mnemonics and shadowed scalar carriers during signature recovery.
         Self::looks_like_x86_integer_simd_mnemonic(mnemonic)
     }
 
@@ -2634,7 +2722,25 @@ impl SignatureRecovery {
             let hints = self.param_hints.get(&idx);
 
             // Determine the size from register usage
-            let size = if let Some(s) = self.reg_sizes.get(&reg64) {
+            let size = if let (Some(s64), Some(s32)) =
+                (self.reg_sizes.get(&reg64), self.reg_sizes.get(&reg32))
+            {
+                let prefer_narrow_integer = hints.is_some_and(|h| {
+                    !h.is_dereferenced
+                        && !h.is_pointer_arithmetic
+                        && !h.is_null_checked
+                        && !h.is_string_arg
+                        && (h.is_signed_comparison
+                            || h.is_unsigned_ops
+                            || h.is_array_index
+                            || h.is_loop_bound)
+                });
+                if prefer_narrow_integer {
+                    (*s64).min(*s32)
+                } else {
+                    *s64
+                }
+            } else if let Some(s) = self.reg_sizes.get(&reg64) {
                 *s
             } else if let Some(s) = self.reg_sizes.get(&reg32) {
                 *s
@@ -2847,7 +2953,19 @@ impl SignatureRecovery {
                     if let Some(hints) = self.param_hints.get(&idx) {
                         if hints.is_loop_bound || hints.is_array_index {
                             // This is likely a size parameter
-                            sig.parameters[i + 1].param_type = ParamType::UnsignedInt(64);
+                            sig.parameters[i + 1].param_type = match sig.parameters[i + 1]
+                                .param_type
+                            {
+                                ParamType::SignedInt(bits) if hints.is_signed_comparison => {
+                                    ParamType::SignedInt(bits.max(32))
+                                }
+                                ParamType::UnsignedInt(bits) => {
+                                    ParamType::UnsignedInt(bits.max(32))
+                                }
+                                ParamType::SignedInt(bits) => ParamType::UnsignedInt(bits.max(32)),
+                                _ if hints.is_signed_comparison => ParamType::SignedInt(32),
+                                _ => ParamType::UnsignedInt(32),
+                            };
                             if sig.parameters[i + 1].name.starts_with("arg") {
                                 sig.parameters[i + 1].name = match i {
                                     0 => "size".to_string(),
@@ -5238,6 +5356,73 @@ mod tests {
             sig.parameters[0].location,
             ParameterLocation::Stack { offset: 8 }
         ));
+    }
+
+    #[test]
+    fn test_signature_recovery_redirects_shadow_arg_hints_to_original_param() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(
+                    Expr::var(Variable::reg("r8", 8)),
+                    Expr::var(Variable::reg("rdi", 8)),
+                ),
+                Expr::assign(
+                    Expr::var(Variable::reg("edx", 4)),
+                    Expr::var(Variable::reg("esi", 4)),
+                ),
+                Expr::assign(
+                    Expr::var(Variable::reg("ecx", 4)),
+                    Expr::var(Variable::reg("edx", 4)),
+                ),
+                Expr::assign(
+                    Expr::var(Variable::reg("eax", 4)),
+                    Expr::array_access(
+                        Expr::var(Variable::reg("r8", 8)),
+                        Expr::var(Variable::reg("ecx", 4)),
+                        4,
+                    ),
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::var(Variable::reg("eax", 4)))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(
+            sig.parameters.len(),
+            2,
+            "shadow arg copies should not become new params"
+        );
+        assert!(matches!(
+            sig.parameters[0].param_type,
+            ParamType::TypedPointer(_)
+        ));
+        assert!(matches!(
+            sig.parameters[1].param_type,
+            ParamType::SignedInt(32) | ParamType::UnsignedInt(32)
+        ));
+    }
+
+    #[test]
+    fn test_parameter_usage_hints_prefers_signed_scalar_comparisons() {
+        let hints = ParameterUsageHints {
+            is_signed_comparison: true,
+            is_unsigned_ops: true,
+            ..Default::default()
+        };
+
+        assert_eq!(hints.infer_type(4), ParamType::SignedInt(32));
     }
 
     #[test]
