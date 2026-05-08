@@ -23,6 +23,8 @@ pub enum XrefType {
     DataRead,
     /// Data write access.
     DataWrite,
+    /// Address materialization without dereference.
+    DataAddress,
     /// Unknown or indirect reference.
     Unknown,
 }
@@ -35,7 +37,10 @@ impl XrefType {
 
     /// Returns true if this is a data reference.
     pub fn is_data(&self) -> bool {
-        matches!(self, XrefType::DataRead | XrefType::DataWrite)
+        matches!(
+            self,
+            XrefType::DataRead | XrefType::DataWrite | XrefType::DataAddress
+        )
     }
 }
 
@@ -188,6 +193,13 @@ struct PendingArm64PageBase {
     next_address: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperandAccess {
+    Read,
+    Write,
+    Address,
+}
+
 impl Default for XrefBuilder {
     fn default() -> Self {
         Self::new()
@@ -228,27 +240,14 @@ impl XrefBuilder {
             self.db.add_xref(from, target, xref_type);
         }
 
-        if instr.operation == Operation::LoadEffectiveAddress && !Self::is_arm64_adrp(instr) {
-            if let Some(target) = instr
-                .operands
-                .get(1)
-                .and_then(|operand| Self::extract_effective_address(instr, operand))
-            {
-                self.db.add_xref(from, target, XrefType::DataRead);
-            }
-        }
+        for (index, operand) in instr.operands.iter().enumerate() {
+            let Some(target) = Self::extract_operand_target(instr, operand) else {
+                continue;
+            };
 
-        // Check operands for data references
-        for operand in &instr.operands {
-            if let Some(addr) = Self::extract_memory_address(operand) {
-                // Determine if this is a read or write based on operand position
-                // First operand is typically the destination (write)
-                let xref_type = if instr.operands.first() == Some(operand) {
-                    XrefType::DataWrite
-                } else {
-                    XrefType::DataRead
-                };
-                self.db.add_xref(from, addr, xref_type);
+            for access in Self::operand_accesses(instr, index, operand) {
+                self.db
+                    .add_xref(from, target, Self::xref_type_for_access(*access));
             }
         }
 
@@ -271,6 +270,27 @@ impl XrefBuilder {
             {
                 let target = i128::from(instr.end_address()) + i128::from(mem_ref.displacement);
                 u64::try_from(target).ok()
+            }
+            Operand::PcRelative { target, .. } => Some(*target),
+            _ => None,
+        }
+    }
+
+    fn extract_operand_target(instr: &Instruction, operand: &Operand) -> Option<u64> {
+        match operand {
+            Operand::Memory(mem_ref) => {
+                if Self::is_pc_relative_base(mem_ref.base.as_ref()) && mem_ref.index.is_none() {
+                    Self::extract_effective_address(instr, operand)
+                } else {
+                    Self::extract_absolute_memory_address(mem_ref)
+                }
+            }
+            Operand::Immediate(imm) => {
+                if imm.value > 0x1000 && imm.value < 0x7fff_ffff_ffff_ffff {
+                    Some(imm.value as u64)
+                } else {
+                    None
+                }
             }
             Operand::PcRelative { target, .. } => Some(*target),
             _ => None,
@@ -329,27 +349,77 @@ impl XrefBuilder {
         }
     }
 
-    /// Extract a memory address from an operand if it's a direct address.
-    fn extract_memory_address(operand: &Operand) -> Option<u64> {
+    fn extract_absolute_memory_address(mem_ref: &hexray_core::MemoryRef) -> Option<u64> {
+        if mem_ref.base.is_none()
+            && mem_ref.index.is_none()
+            && mem_ref.displacement > 0x1000
+            && mem_ref.displacement < i64::MAX
+        {
+            Some(mem_ref.displacement as u64)
+        } else {
+            None
+        }
+    }
+
+    fn operand_accesses(
+        instr: &Instruction,
+        index: usize,
+        operand: &Operand,
+    ) -> &'static [OperandAccess] {
         match operand {
-            Operand::Memory(mem_ref) => {
-                // Only return addresses that look like absolute addresses
-                // (large values, typically in the binary's address space)
-                if mem_ref.displacement != 0 && mem_ref.displacement > 0x1000 {
-                    Some(mem_ref.displacement as u64)
+            Operand::Immediate(_) => &[OperandAccess::Address],
+            Operand::PcRelative { .. } => {
+                if instr.operation == Operation::LoadEffectiveAddress && Self::is_arm64_adrp(instr)
+                {
+                    &[]
                 } else {
-                    None
+                    &[OperandAccess::Address]
                 }
             }
-            Operand::Immediate(imm) => {
-                // Immediate values that look like addresses (positive values only)
-                if imm.value > 0x1000 && imm.value < 0x7fff_ffff_ffff_ffff {
-                    Some(imm.value as u64)
-                } else {
-                    None
+            Operand::Memory(_) => match instr.operation {
+                Operation::LoadEffectiveAddress if !Self::is_arm64_adrp(instr) => {
+                    &[OperandAccess::Address]
                 }
-            }
-            _ => None,
+                Operation::Move => {
+                    if index == 0 {
+                        &[OperandAccess::Write]
+                    } else {
+                        &[OperandAccess::Read]
+                    }
+                }
+                Operation::Load => &[OperandAccess::Read],
+                Operation::Store => {
+                    if index == 0 {
+                        &[OperandAccess::Read]
+                    } else {
+                        &[OperandAccess::Write]
+                    }
+                }
+                Operation::Compare | Operation::Test | Operation::BitTest => &[OperandAccess::Read],
+                Operation::Neg | Operation::Not | Operation::Inc | Operation::Dec => {
+                    &[OperandAccess::Read, OperandAccess::Write]
+                }
+                _ => {
+                    if index == 0 {
+                        if instr.operands.len() == 2 {
+                            &[OperandAccess::Read, OperandAccess::Write]
+                        } else {
+                            &[OperandAccess::Write]
+                        }
+                    } else {
+                        &[OperandAccess::Read]
+                    }
+                }
+            },
+            _ => &[],
+        }
+    }
+
+    fn xref_type_for_access(access: OperandAccess) -> XrefType {
+        match access {
+            OperandAccess::Read => XrefType::DataRead,
+            OperandAccess::Write => XrefType::DataWrite,
+            OperandAccess::Address => XrefType::DataAddress,
         }
     }
 
@@ -441,6 +511,7 @@ mod tests {
 
         assert!(XrefType::DataRead.is_data());
         assert!(XrefType::DataWrite.is_data());
+        assert!(XrefType::DataAddress.is_data());
         assert!(!XrefType::DataRead.is_code());
     }
 
@@ -558,7 +629,87 @@ mod tests {
         let refs = db.refs_to(0x1270);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].from, 0x10b8);
-        assert_eq!(refs[0].xref_type, XrefType::DataRead);
+        assert_eq!(refs[0].xref_type, XrefType::DataAddress);
+    }
+
+    #[test]
+    fn test_xref_builder_tracks_rip_relative_mov_load_and_store() {
+        let mut builder = XrefBuilder::new();
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let load = Instruction {
+            address: 0x2000,
+            size: 7,
+            bytes: vec![0; 7],
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Register(rax),
+                Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x20, 8)),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![rip],
+            writes: vec![rax],
+            guard: None,
+        };
+        let store = Instruction {
+            address: 0x2010,
+            size: 7,
+            bytes: vec![0; 7],
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x10, 8)),
+                Operand::Register(rax),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![rip, rax],
+            writes: vec![],
+            guard: None,
+        };
+
+        builder.analyze_instructions(&[load, store]);
+        let db = builder.build();
+        let refs = db.refs_to(0x2027);
+
+        assert_eq!(refs.len(), 2);
+        assert!(refs
+            .iter()
+            .any(|xref| { xref.from == 0x2000 && xref.xref_type == XrefType::DataRead }));
+        assert!(refs
+            .iter()
+            .any(|xref| { xref.from == 0x2010 && xref.xref_type == XrefType::DataWrite }));
+    }
+
+    #[test]
+    fn test_xref_builder_tracks_rip_relative_rmw_accesses() {
+        let mut builder = XrefBuilder::new();
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let instr = Instruction {
+            address: 0x3000,
+            size: 7,
+            bytes: vec![0; 7],
+            operation: Operation::Add,
+            mnemonic: "add".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x24, 4)),
+                Operand::imm_unsigned(1, 32),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![rip],
+            writes: vec![],
+            guard: None,
+        };
+
+        builder.analyze_instruction(&instr);
+        let db = builder.build();
+        let refs = db.refs_to(0x302b);
+
+        assert_eq!(refs.len(), 2);
+        assert!(refs.iter().any(|xref| xref.xref_type == XrefType::DataRead));
+        assert!(refs
+            .iter()
+            .any(|xref| xref.xref_type == XrefType::DataWrite));
     }
 
     #[test]
@@ -589,7 +740,7 @@ mod tests {
         let db = builder.build();
         let refs = db.refs_to(0x6000);
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].xref_type, XrefType::DataRead);
+        assert_eq!(refs[0].xref_type, XrefType::DataAddress);
     }
 
     #[test]

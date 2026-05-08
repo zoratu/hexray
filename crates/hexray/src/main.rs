@@ -4898,14 +4898,16 @@ fn build_xrefs(
                         XrefType::Jump => 1u8,
                         XrefType::DataRead => 2u8,
                         XrefType::DataWrite => 3u8,
-                        XrefType::Unknown => 4u8,
+                        XrefType::DataAddress => 4u8,
+                        XrefType::Unknown => 5u8,
                     };
                     let right_rank = match right.xref_type {
                         XrefType::Call => 0u8,
                         XrefType::Jump => 1u8,
                         XrefType::DataRead => 2u8,
                         XrefType::DataWrite => 3u8,
-                        XrefType::Unknown => 4u8,
+                        XrefType::DataAddress => 4u8,
+                        XrefType::Unknown => 5u8,
                     };
                     left_rank.cmp(&right_rank)
                 })
@@ -5049,6 +5051,7 @@ fn build_xrefs(
                         XrefType::Jump => "JUMP",
                         XrefType::DataRead => "READ",
                         XrefType::DataWrite => "WRITE",
+                        XrefType::DataAddress => "ADDR",
                         XrefType::Unknown => "???",
                     };
                     let caller_label = match from_offset {
@@ -6674,6 +6677,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                             XrefType::Jump => "jump",
                             XrefType::DataRead => "read",
                             XrefType::DataWrite => "write",
+                            XrefType::DataAddress => "addr",
                             XrefType::Unknown => "unknown",
                         };
                         JsonXref {
@@ -6699,6 +6703,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                         XrefType::Jump => "JUMP",
                         XrefType::DataRead => "READ",
                         XrefType::DataWrite => "WRITE",
+                        XrefType::DataAddress => "ADDR",
                         XrefType::Unknown => "UNKNOWN",
                     };
                     output.push_str(&format!("{:#016x}  {}\n", xref.from, type_str));

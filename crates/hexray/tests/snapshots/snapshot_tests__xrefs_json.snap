@@ -1,8 +1,9 @@
 ---
 source: crates/hexray/tests/snapshot_tests.rs
+assertion_line: 132
 expression: redacted
 ---
 {
   "referenced_addresses": "[ADDR]",
-  "total_xrefs": 21
+  "total_xrefs": 41
 }
