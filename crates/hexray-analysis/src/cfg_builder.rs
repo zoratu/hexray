@@ -101,6 +101,51 @@ impl CfgBuilder {
             blocks.push(block);
         }
 
+        let instruction_addresses: std::collections::HashSet<u64> =
+            instructions.iter().map(|inst| inst.address).collect();
+
+        // Preserve out-of-range conditional targets as synthetic external blocks
+        // so split hot/cold bodies stay visible in the structured output.
+        for &idx in &sorted_indices {
+            let inst = &instructions[idx];
+            let ControlFlow::ConditionalBranch {
+                target,
+                fallthrough,
+                ..
+            } = &inst.control_flow
+            else {
+                continue;
+            };
+
+            for branch_target in [*target, *fallthrough] {
+                if instruction_addresses.contains(&branch_target) {
+                    continue;
+                }
+
+                if let Some(block_id) = address_to_block.get(&branch_target).copied() {
+                    if let Some(block) = blocks.iter_mut().find(|block| block.id == block_id) {
+                        if block.instructions.is_empty() {
+                            block.terminator = BlockTerminator::ExternalJump {
+                                target: branch_target,
+                            };
+                        }
+                    }
+                    continue;
+                }
+
+                // TODO(33.1): materialize known <func>.cold byte ranges into the same CFG
+                // instead of falling back to synthetic external tail-call blocks here.
+                let block_id = BasicBlockId::new(blocks.len() as u32);
+                address_to_block.insert(branch_target, block_id);
+
+                let mut block = BasicBlock::new(block_id, branch_target);
+                block.terminator = BlockTerminator::ExternalJump {
+                    target: branch_target,
+                };
+                blocks.push(block);
+            }
+        }
+
         // Step 3: Build CFG with edges
         let entry_id = address_to_block
             .get(&entry)
@@ -248,5 +293,37 @@ mod tests {
         let block = cfg.entry_block().unwrap();
         assert!(cfg.successors(block.id).is_empty());
         assert!(matches!(block.terminator, BlockTerminator::Unknown));
+    }
+
+    #[test]
+    fn conditional_branch_to_out_of_range_target_gets_external_block() {
+        let instructions = vec![Instruction::new(0x1000, 2, vec![0x75, 0x0e], "jne")
+            .with_operation(Operation::Jump)
+            .with_control_flow(ControlFlow::ConditionalBranch {
+                target: 0x2000,
+                condition: hexray_core::Condition::NotEqual,
+                fallthrough: 0x1002,
+            })];
+
+        let cfg = CfgBuilder::build(&instructions, 0x1000);
+
+        let entry = cfg.entry_block().unwrap();
+        let (true_target, false_target) = match &entry.terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } => (*true_target, *false_target),
+            other => panic!("expected conditional branch, got {other:?}"),
+        };
+
+        let true_block = cfg.block(true_target).unwrap();
+        assert!(matches!(
+            true_block.terminator,
+            BlockTerminator::ExternalJump { target: 0x2000 }
+        ));
+
+        let false_block = cfg.block(false_target).unwrap();
+        assert_eq!(false_block.start, 0x1002);
     }
 }

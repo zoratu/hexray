@@ -1481,6 +1481,26 @@ impl<'a> Structurer<'a> {
                     current = Some(*target);
                 }
 
+                BlockTerminator::ExternalJump { target } => {
+                    let call = Expr::call(
+                        ExprCallTarget::Direct {
+                            target: *target,
+                            call_site: block.start,
+                        },
+                        vec![],
+                    );
+                    if !statements.is_empty() {
+                        statements = propagate_args_in_block(statements);
+                        result.push(StructuredNode::Block {
+                            id: block_id,
+                            statements,
+                            address_range,
+                        });
+                    }
+                    result.push(StructuredNode::Return(Some(call)));
+                    break;
+                }
+
                 BlockTerminator::ConditionalBranch {
                     condition,
                     true_target,
@@ -1955,6 +1975,19 @@ impl<'a> Structurer<'a> {
         // Get the primary exit block (first one, if any)
         let exit_block = info.exit_blocks.first().copied();
 
+        if matches!(info.kind, LoopKind::While) && self.external_loop_guard(header, &info).is_some()
+        {
+            let (condition, _) = self.get_dowhile_condition(&info);
+            let body = self.structure_loop_body(header, &info);
+
+            return StructuredNode::While {
+                condition,
+                body,
+                header: Some(header),
+                exit_block,
+            };
+        }
+
         match info.kind {
             LoopKind::While => {
                 // Get condition from header's conditional branch
@@ -2042,6 +2075,21 @@ impl<'a> Structurer<'a> {
             });
         }
 
+        if let Some((condition, external_target, loop_target)) =
+            self.external_loop_guard(header, info)
+        {
+            let then_body = self.structure_region(external_target, None);
+            result.push(StructuredNode::If {
+                condition,
+                then_body,
+                else_body: None,
+            });
+
+            let mut rest = self.structure_region(loop_target, Some(header));
+            result.append(&mut rest);
+            return result;
+        }
+
         // Continue with successors that are in the loop
         let succs: Vec<_> = self
             .cfg
@@ -2057,6 +2105,50 @@ impl<'a> Structurer<'a> {
         }
 
         result
+    }
+
+    fn external_loop_guard(
+        &self,
+        header: BasicBlockId,
+        info: &LoopInfo,
+    ) -> Option<(Expr, BasicBlockId, BasicBlockId)> {
+        let block = self.cfg.block(header)?;
+        let BlockTerminator::ConditionalBranch {
+            condition,
+            true_target,
+            false_target,
+        } = &block.terminator
+        else {
+            return None;
+        };
+
+        let true_in_loop = info.body.contains(true_target);
+        let false_in_loop = info.body.contains(false_target);
+        if true_in_loop == false_in_loop {
+            return None;
+        }
+
+        let lifted = self.rewrite_condition_call_return_alias(
+            header,
+            condition_to_expr_with_block(*condition, block),
+        );
+
+        let (loop_target, external_target, external_condition) = if true_in_loop {
+            (*true_target, *false_target, negate_condition(lifted))
+        } else {
+            (*false_target, *true_target, lifted)
+        };
+
+        if !matches!(
+            self.cfg
+                .block(external_target)
+                .map(|block| &block.terminator),
+            Some(BlockTerminator::ExternalJump { .. })
+        ) {
+            return None;
+        }
+
+        Some((external_condition, external_target, loop_target))
     }
 
     fn get_while_condition(

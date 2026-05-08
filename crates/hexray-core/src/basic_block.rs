@@ -103,6 +103,12 @@ pub enum BlockTerminator {
         false_target: BasicBlockId,
     },
 
+    /// Branches to code outside the currently materialized CFG.
+    ///
+    /// This is used for split hot/cold bodies or other out-of-range branch
+    /// targets so the decompiler can surface the edge instead of dropping it.
+    ExternalJump { target: u64 },
+
     /// Indirect jump (computed target).
     IndirectJump {
         /// The operand containing the target address.
@@ -128,7 +134,9 @@ impl BlockTerminator {
     /// Returns the successor block IDs.
     pub fn successors(&self) -> Vec<BasicBlockId> {
         match self {
-            Self::Unknown | Self::Return | Self::Unreachable => vec![],
+            Self::Unknown | Self::ExternalJump { .. } | Self::Return | Self::Unreachable => {
+                vec![]
+            }
             Self::Fallthrough { target } | Self::Jump { target } => vec![*target],
             Self::ConditionalBranch {
                 true_target,
