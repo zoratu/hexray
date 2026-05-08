@@ -40,7 +40,7 @@ use super::super::abi::{
     is_temp_register,
 };
 use super::super::dead_store::collect_all_uses;
-use super::super::expression::Expr;
+use super::super::expression::{BinOpKind, Expr, Variable};
 use super::{CatchHandler, StructuredNode};
 
 /// Extracts the return value from a return register assignment near the end of the block.
@@ -197,15 +197,25 @@ pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredN
         .map(|node| substitute_globals_in_node(node, &global_refs))
         .collect();
 
-    // Fifth pass: remove temp register assignments that have been propagated.
+    // Fifth pass: when a condition reconstructs an arithmetic expression that was
+    // already saved in the preheader, reuse the saved value so the local stays live.
+    let nodes = reuse_saved_condition_values(nodes);
+
+    // Sixth pass: remove temp register assignments that have been propagated.
     let nodes = remove_temp_assignments(nodes);
 
-    // Sixth pass: prune dead register artifacts that only exist to shuttle
+    // Seventh pass: prune dead register artifacts that only exist to shuttle
     // machine state between adjacent lowered blocks.
     let nodes = prune_dead_register_artifacts(nodes);
 
-    // Seventh pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
+    // Eighth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
     nodes.into_iter().map(simplify_conditions_in_node).collect()
+}
+
+#[derive(Debug, Clone)]
+struct SavedConditionValue {
+    var: Variable,
+    rhs: Expr,
 }
 
 fn prune_dead_register_artifacts(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
@@ -1387,6 +1397,424 @@ fn substitute_temps_in_conditions(
         },
         // Other nodes don't have conditions to substitute
         other => other,
+    }
+}
+
+fn reuse_saved_condition_values(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    reuse_saved_condition_values_in_list(nodes)
+}
+
+fn reuse_saved_condition_values_in_list(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut result = Vec::with_capacity(nodes.len());
+    let mut saved = Vec::new();
+
+    for node in nodes {
+        let node = reuse_saved_condition_values_in_node(node, &saved);
+        collect_saved_condition_values_from_node(&node, &mut saved);
+        result.push(node);
+    }
+
+    result
+}
+
+fn reuse_saved_condition_values_in_node(
+    node: StructuredNode,
+    saved: &[SavedConditionValue],
+) -> StructuredNode {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition: substitute_saved_condition_values(&condition, saved),
+            then_body: reuse_saved_condition_values_in_list(then_body),
+            else_body: else_body.map(reuse_saved_condition_values_in_list),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => {
+            let body = reuse_saved_condition_values_in_list(body);
+            let reusable_saved = filter_saved_condition_values_for_loop(saved, &body);
+            StructuredNode::While {
+                condition: substitute_saved_condition_values(&condition, &reusable_saved),
+                body,
+                header,
+                exit_block,
+            }
+        }
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => {
+            let body = reuse_saved_condition_values_in_list(body);
+            let reusable_saved = filter_saved_condition_values_for_loop(saved, &body);
+            StructuredNode::DoWhile {
+                body,
+                condition: substitute_saved_condition_values(&condition, &reusable_saved),
+                header,
+                exit_block,
+            }
+        }
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => {
+            let body = reuse_saved_condition_values_in_list(body);
+            let reusable_saved = filter_saved_condition_values_for_loop(saved, &body);
+            StructuredNode::For {
+                init,
+                condition: substitute_saved_condition_values(&condition, &reusable_saved),
+                update,
+                body,
+                header,
+                exit_block,
+            }
+        }
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: reuse_saved_condition_values_in_list(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value: substitute_saved_condition_values(&value, saved),
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| (vals, reuse_saved_condition_values_in_list(body)))
+                .collect(),
+            default: default.map(reuse_saved_condition_values_in_list),
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(reuse_saved_condition_values_in_list(nodes))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: reuse_saved_condition_values_in_list(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: reuse_saved_condition_values_in_list(handler.body),
+                    ..handler
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn filter_saved_condition_values_for_loop(
+    saved: &[SavedConditionValue],
+    body: &[StructuredNode],
+) -> Vec<SavedConditionValue> {
+    let modified = collect_modified_vars_from_nodes(body);
+    saved
+        .iter()
+        .filter(|candidate| !modified.contains(&candidate.var.name))
+        .cloned()
+        .collect()
+}
+
+fn collect_saved_condition_values_from_node(
+    node: &StructuredNode,
+    saved: &mut Vec<SavedConditionValue>,
+) {
+    let statements = match node {
+        StructuredNode::Block { statements, .. } => Some(statements.as_slice()),
+        StructuredNode::Expr(expr) => Some(std::slice::from_ref(expr)),
+        _ => None,
+    };
+
+    let Some(statements) = statements else {
+        return;
+    };
+
+    for stmt in statements {
+        let Some(candidate) = extract_saved_condition_value(stmt) else {
+            continue;
+        };
+        saved.retain(|existing| existing.var.name != candidate.var.name);
+        saved.push(candidate);
+    }
+}
+
+fn extract_saved_condition_value(stmt: &Expr) -> Option<SavedConditionValue> {
+    use super::super::expression::ExprKind;
+
+    let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+        return None;
+    };
+    let ExprKind::Var(var) = &lhs.kind else {
+        return None;
+    };
+    if expr_has_side_effects(rhs) || !is_condition_reuse_candidate(rhs) {
+        return None;
+    }
+
+    Some(SavedConditionValue {
+        var: var.clone(),
+        rhs: rhs.clone().simplify(),
+    })
+}
+
+fn is_condition_reuse_candidate(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::BinOp { op, .. } => {
+            !op.is_comparison() && !matches!(op, BinOpKind::LogicalAnd | BinOpKind::LogicalOr)
+        }
+        ExprKind::UnaryOp { .. }
+        | ExprKind::Deref { .. }
+        | ExprKind::AddressOf(_)
+        | ExprKind::ArrayAccess { .. }
+        | ExprKind::FieldAccess { .. }
+        | ExprKind::Cast { .. }
+        | ExprKind::BitField { .. } => true,
+        ExprKind::Var(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::GotRef { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Assign { .. }
+        | ExprKind::CompoundAssign { .. }
+        | ExprKind::Conditional { .. }
+        | ExprKind::Phi(_)
+        | ExprKind::Unknown(_) => false,
+    }
+}
+
+fn substitute_saved_condition_values(expr: &Expr, saved: &[SavedConditionValue]) -> Expr {
+    use super::super::expression::{CallTarget, ExprKind};
+
+    if let Some(candidate) = saved
+        .iter()
+        .rev()
+        .find(|candidate| exprs_structurally_equal(expr, &candidate.rhs))
+    {
+        return Expr::var(candidate.var.clone());
+    }
+
+    match &expr.kind {
+        ExprKind::BinOp { op, left, right } => Expr::binop(
+            *op,
+            substitute_saved_condition_values(left, saved),
+            substitute_saved_condition_values(right, saved),
+        ),
+        ExprKind::UnaryOp { op, operand } => {
+            Expr::unary(*op, substitute_saved_condition_values(operand, saved))
+        }
+        ExprKind::Deref { addr, size } => {
+            Expr::deref(substitute_saved_condition_values(addr, saved), *size)
+        }
+        ExprKind::AddressOf(inner) => {
+            Expr::address_of(substitute_saved_condition_values(inner, saved))
+        }
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(substitute_saved_condition_values(base, saved)),
+                index: Box::new(substitute_saved_condition_values(index, saved)),
+                element_size: *element_size,
+            },
+        },
+        ExprKind::FieldAccess {
+            base,
+            field_name,
+            offset,
+        } => Expr {
+            kind: ExprKind::FieldAccess {
+                base: Box::new(substitute_saved_condition_values(base, saved)),
+                field_name: field_name.clone(),
+                offset: *offset,
+            },
+        },
+        ExprKind::Call { target, args } => {
+            let target = match target {
+                CallTarget::Indirect(expr) => {
+                    CallTarget::Indirect(Box::new(substitute_saved_condition_values(expr, saved)))
+                }
+                CallTarget::IndirectGot { got_address, expr } => CallTarget::IndirectGot {
+                    got_address: *got_address,
+                    expr: Box::new(substitute_saved_condition_values(expr, saved)),
+                },
+                other => other.clone(),
+            };
+            Expr::call(
+                target,
+                args.iter()
+                    .map(|arg| substitute_saved_condition_values(arg, saved))
+                    .collect(),
+            )
+        }
+        ExprKind::Assign { lhs, rhs } => Expr::assign(
+            substitute_saved_condition_values(lhs, saved),
+            substitute_saved_condition_values(rhs, saved),
+        ),
+        ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
+            kind: ExprKind::CompoundAssign {
+                op: *op,
+                lhs: Box::new(substitute_saved_condition_values(lhs, saved)),
+                rhs: Box::new(substitute_saved_condition_values(rhs, saved)),
+            },
+        },
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr {
+            kind: ExprKind::Conditional {
+                cond: Box::new(substitute_saved_condition_values(cond, saved)),
+                then_expr: Box::new(substitute_saved_condition_values(then_expr, saved)),
+                else_expr: Box::new(substitute_saved_condition_values(else_expr, saved)),
+            },
+        },
+        ExprKind::Cast {
+            expr,
+            to_size,
+            signed,
+        } => Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(substitute_saved_condition_values(expr, saved)),
+                to_size: *to_size,
+                signed: *signed,
+            },
+        },
+        ExprKind::BitField { expr, start, width } => Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(substitute_saved_condition_values(expr, saved)),
+                start: *start,
+                width: *width,
+            },
+        },
+        ExprKind::Phi(args) => Expr {
+            kind: ExprKind::Phi(
+                args.iter()
+                    .map(|arg| substitute_saved_condition_values(arg, saved))
+                    .collect(),
+            ),
+        },
+        ExprKind::Var(_) | ExprKind::IntLit(_) | ExprKind::GotRef { .. } | ExprKind::Unknown(_) => {
+            expr.clone()
+        }
+    }
+    .simplify()
+}
+
+fn exprs_structurally_equal(a: &Expr, b: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match (&a.kind, &b.kind) {
+        (ExprKind::Var(va), ExprKind::Var(vb)) => va == vb,
+        (ExprKind::IntLit(ia), ExprKind::IntLit(ib)) => ia == ib,
+        (
+            ExprKind::BinOp {
+                op: opa,
+                left: la,
+                right: ra,
+            },
+            ExprKind::BinOp {
+                op: opb,
+                left: lb,
+                right: rb,
+            },
+        ) => opa == opb && exprs_structurally_equal(la, lb) && exprs_structurally_equal(ra, rb),
+        (
+            ExprKind::UnaryOp {
+                op: opa,
+                operand: oa,
+            },
+            ExprKind::UnaryOp {
+                op: opb,
+                operand: ob,
+            },
+        ) => opa == opb && exprs_structurally_equal(oa, ob),
+        (ExprKind::Deref { addr: aa, size: sa }, ExprKind::Deref { addr: ab, size: sb }) => {
+            sa == sb && exprs_structurally_equal(aa, ab)
+        }
+        (ExprKind::AddressOf(ia), ExprKind::AddressOf(ib)) => exprs_structurally_equal(ia, ib),
+        (
+            ExprKind::ArrayAccess {
+                base: ba,
+                index: ia,
+                element_size: ea,
+            },
+            ExprKind::ArrayAccess {
+                base: bb,
+                index: ib,
+                element_size: eb,
+            },
+        ) => ea == eb && exprs_structurally_equal(ba, bb) && exprs_structurally_equal(ia, ib),
+        (
+            ExprKind::FieldAccess {
+                base: ba,
+                field_name: fa,
+                offset: oa,
+            },
+            ExprKind::FieldAccess {
+                base: bb,
+                field_name: fb,
+                offset: ob,
+            },
+        ) => oa == ob && fa == fb && exprs_structurally_equal(ba, bb),
+        (
+            ExprKind::Cast {
+                expr: ea,
+                to_size: sa,
+                signed: siga,
+            },
+            ExprKind::Cast {
+                expr: eb,
+                to_size: sb,
+                signed: sigb,
+            },
+        ) => sa == sb && siga == sigb && exprs_structurally_equal(ea, eb),
+        (
+            ExprKind::BitField {
+                expr: ea,
+                start: sa,
+                width: wa,
+            },
+            ExprKind::BitField {
+                expr: eb,
+                start: sb,
+                width: wb,
+            },
+        ) => sa == sb && wa == wb && exprs_structurally_equal(ea, eb),
+        (
+            ExprKind::GotRef {
+                address: aa,
+                size: sa,
+                ..
+            },
+            ExprKind::GotRef {
+                address: ab,
+                size: sb,
+                ..
+            },
+        ) => aa == ab && sa == sb,
+        (ExprKind::Unknown(ua), ExprKind::Unknown(ub)) => ua == ub,
+        _ => false,
     }
 }
 
@@ -4285,5 +4713,48 @@ mod tests {
         };
 
         assert_eq!(format!("{}", condition), "edi != 1");
+    }
+
+    #[test]
+    fn test_reuse_saved_condition_values_keeps_preheader_loop_bound() {
+        let bound_expr = Expr::binop(
+            BinOpKind::Add,
+            reg("rdi", 8),
+            Expr::binop(BinOpKind::Mul, reg("rsi", 8), Expr::int(4)),
+        );
+        let nodes = vec![
+            block(0, vec![Expr::assign(reg("rdx", 8), bound_expr.clone())]),
+            StructuredNode::DoWhile {
+                body: vec![block(
+                    1,
+                    vec![
+                        Expr {
+                            kind: ExprKind::CompoundAssign {
+                                op: BinOpKind::Add,
+                                lhs: Box::new(reg("eax", 4)),
+                                rhs: Box::new(Expr::deref(reg("rdi", 8), 4)),
+                            },
+                        },
+                        Expr {
+                            kind: ExprKind::CompoundAssign {
+                                op: BinOpKind::Add,
+                                lhs: Box::new(reg("rdi", 8)),
+                                rhs: Box::new(Expr::int(4)),
+                            },
+                        },
+                    ],
+                )],
+                condition: Expr::binop(BinOpKind::Ne, reg("rdi", 8), bound_expr),
+                header: Some(BasicBlockId::new(1)),
+                exit_block: Some(BasicBlockId::new(2)),
+            },
+        ];
+
+        let reused = reuse_saved_condition_values(nodes);
+        let StructuredNode::DoWhile { condition, .. } = &reused[1] else {
+            panic!("expected do-while node");
+        };
+
+        assert_eq!(format!("{}", condition), "rdi != rdx");
     }
 }
