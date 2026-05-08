@@ -1257,6 +1257,52 @@ fn display_symbol_or_label_name_with_symbols(
         .unwrap_or_else(|| format!("sub_{:x}", address))
 }
 
+fn resolve_xref_source_label(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    function_starts: &[(u64, Option<String>, u64)],
+    from: u64,
+) -> (String, Option<u64>) {
+    let mut data_section = None;
+    for section in fmt.sections() {
+        let section_start = section.virtual_address();
+        let section_end = section_start.saturating_add(section.size());
+        if from < section_start
+            || from >= section_end
+            || section.is_executable()
+            || !section.is_allocated()
+        {
+            continue;
+        }
+        if matches!(section.name(), ".init_array" | ".fini_array") {
+            return (
+                section.name().to_string(),
+                Some(from.saturating_sub(section_start)),
+            );
+        }
+        data_section.get_or_insert((section.name().to_string(), section_start));
+    }
+    if let Some((section_name, section_start)) = data_section {
+        return (section_name, Some(from.saturating_sub(section_start)));
+    }
+    if let Some(s) = fmt.symbol_at(from).filter(|s| !s.name.starts_with("__mh_")) {
+        return (display_function_name(fmt, project, s.address), Some(0));
+    }
+    let idx = function_starts.partition_point(|(addr, _, _)| *addr <= from);
+    if idx == 0 {
+        return (format!("sub_{:x}", from), None);
+    }
+    let (start, name, size) = &function_starts[idx - 1];
+    let offset = from - start;
+    let limit = if *size > 0 { *size } else { 0x2000 };
+    if offset < limit {
+        let display = name.clone().unwrap_or_else(|| format!("sub_{:x}", start));
+        (display, Some(offset))
+    } else {
+        (format!("sub_{:x}", from), None)
+    }
+}
+
 fn display_symbol_name(
     _fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
@@ -4930,40 +4976,7 @@ fn build_xrefs(
         function_starts.sort_by_key(|(addr, _, _)| *addr);
 
         let resolve_caller = |from: u64| -> (String, Option<u64>) {
-            let mut data_section = None;
-            for section in fmt.sections() {
-                let section_start = section.virtual_address();
-                let section_end = section_start.saturating_add(section.size());
-                if from < section_start || from >= section_end || section.is_executable() {
-                    continue;
-                }
-                if matches!(section.name(), ".init_array" | ".fini_array") {
-                    return (
-                        section.name().to_string(),
-                        Some(from.saturating_sub(section_start)),
-                    );
-                }
-                data_section.get_or_insert((section.name().to_string(), section_start));
-            }
-            if let Some((section_name, section_start)) = data_section {
-                return (section_name, Some(from.saturating_sub(section_start)));
-            }
-            if let Some(s) = fmt.symbol_at(from).filter(|s| !s.name.starts_with("__mh_")) {
-                return (display_function_name(fmt, project, s.address), Some(0));
-            }
-            let idx = function_starts.partition_point(|(addr, _, _)| *addr <= from);
-            if idx == 0 {
-                return (format!("sub_{:x}", from), None);
-            }
-            let (start, name, size) = &function_starts[idx - 1];
-            let offset = from - start;
-            let limit = if *size > 0 { *size } else { 0x2000 };
-            if offset < limit {
-                let display = name.clone().unwrap_or_else(|| format!("sub_{:x}", start));
-                (display, Some(offset))
-            } else {
-                (format!("sub_{:x}", from), None)
-            }
+            resolve_xref_source_label(fmt, project, &function_starts, from)
         };
 
         if json {
@@ -7207,9 +7220,9 @@ mod tests {
         ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
         infer_main_symbol_from_entry, parse_address_str, patch_affects_function,
         resolve_analysis_target, resolve_analysis_target_with_entry_main,
-        resolve_materialized_callback_targets, resolve_xref_target_addresses, string_tags,
-        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
-        SessionExportFormat, SymbolLookupMode,
+        resolve_materialized_callback_targets, resolve_xref_source_label,
+        resolve_xref_target_addresses, string_tags, truncate_for_display, DiffPatchAddressSpace,
+        FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{
         CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
@@ -7554,6 +7567,36 @@ mod tests {
                 .expect("versioned PLT target should resolve");
 
         assert_eq!(resolved, vec![0x1060]);
+    }
+
+    #[test]
+    fn xrefs_ignore_unallocated_debug_sections_when_labeling_callers() {
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".debug_str",
+                    address: 0x0,
+                    data: vec![0; 0x2000],
+                    executable: false,
+                    allocated: false,
+                },
+                TestSection {
+                    name: ".text",
+                    address: 0x1060,
+                    data: vec![0; 0x40],
+                    executable: true,
+                    allocated: true,
+                },
+            ],
+            symbols: Vec::new(),
+            entry_point: None,
+        };
+        let function_starts = vec![(0x1060, Some("sub_1060".to_string()), 0x40)];
+
+        let (name, offset) = resolve_xref_source_label(&binary, None, &function_starts, 0x106c);
+
+        assert_eq!(name, "sub_1060");
+        assert_eq!(offset, Some(0xc));
     }
 
     #[test]
