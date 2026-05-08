@@ -2579,7 +2579,9 @@ fn build_symbol_table(binary: &Binary) -> SymbolTable {
     }
 
     for (address, symbol) in best_symbols {
-        table.insert_with_size(address, demangle_or_original(&symbol.name), symbol.size);
+        let mut symbol = symbol;
+        symbol.address = address;
+        table.insert_symbol(&symbol, demangle_or_original(&symbol.name));
     }
 
     table
@@ -6565,7 +6567,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 }
                 // Add original symbols
                 for sym in fmt.symbols() {
-                    symbols.insert(sym.address, demangle_or_original(&sym.name));
+                    symbols.insert_symbol(sym, demangle_or_original(&sym.name));
                 }
 
                 // Get function name

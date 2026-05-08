@@ -40,6 +40,11 @@ enum CaseRange {
     Range(i128, i128),
 }
 
+enum GlobalSymbolResolution {
+    Exact(String),
+    Interior { base_name: String, offset: u64 },
+}
+
 /// Collapses consecutive case values into ranges for cleaner output.
 /// Uses GCC extension syntax `case 1 ... 5:` for ranges of 3+ consecutive values.
 fn collapse_case_values(values: &[i128]) -> Vec<CaseRange> {
@@ -2741,6 +2746,110 @@ impl PseudoCodeEmitter {
         }
     }
 
+    fn simplify_symbol_name(&self, raw: &str) -> String {
+        self.simplify_libc_global_name(raw)
+            .unwrap_or(raw)
+            .to_string()
+    }
+
+    fn global_deref_prefix(size: u8) -> &'static str {
+        match size {
+            1 => "*(uint8_t*)",
+            2 => "*(uint16_t*)",
+            4 => "*(uint32_t*)",
+            8 => "*(uint64_t*)",
+            _ => "*",
+        }
+    }
+
+    fn resolve_global_symbol(&self, address: u64) -> Option<GlobalSymbolResolution> {
+        let table = self.symbol_table.as_ref()?;
+
+        if let Some(symbol) = table.get_match(address) {
+            if symbol.is_defined && symbol.is_data_symbol {
+                return Some(GlobalSymbolResolution::Exact(
+                    self.simplify_symbol_name(symbol.name),
+                ));
+            }
+        }
+
+        if let Some(symbol) = table.get_containing_match(address) {
+            let offset = address.saturating_sub(symbol.address);
+            if offset == 0 {
+                return Some(GlobalSymbolResolution::Exact(
+                    self.simplify_symbol_name(symbol.name),
+                ));
+            }
+            return Some(GlobalSymbolResolution::Interior {
+                base_name: self.simplify_symbol_name(symbol.name),
+                offset,
+            });
+        }
+
+        table
+            .get_match(address)
+            .map(|symbol| GlobalSymbolResolution::Exact(self.simplify_symbol_name(symbol.name)))
+    }
+
+    fn format_global_address(&self, address: u64) -> Option<String> {
+        match self.resolve_global_symbol(address)? {
+            GlobalSymbolResolution::Exact(name) => Some(format!("&{}", name)),
+            GlobalSymbolResolution::Interior { base_name, offset } => {
+                Some(format!("{} + {}", base_name, offset))
+            }
+        }
+    }
+
+    fn format_global_value(&self, address: u64, size: u8) -> Option<String> {
+        match self.resolve_global_symbol(address)? {
+            GlobalSymbolResolution::Exact(name) => Some(name),
+            GlobalSymbolResolution::Interior { base_name, offset } => Some(format!(
+                "{}({} + {})",
+                Self::global_deref_prefix(size),
+                base_name,
+                offset
+            )),
+        }
+    }
+
+    fn try_format_global_address_materialization(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::GotRef {
+                address,
+                is_deref: false,
+                ..
+            } => self.format_global_address(*address),
+            ExprKind::IntLit(value) if *value > 0 && *value < i128::from(u64::MAX) => {
+                self.format_global_address(*value as u64)
+            }
+            _ => None,
+        }
+    }
+
+    fn try_format_global_array_base(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::IntLit(value) if *value > 0 && *value < i128::from(u64::MAX) => {
+                match self.resolve_global_symbol(*value as u64)? {
+                    GlobalSymbolResolution::Exact(name) => Some(name),
+                    GlobalSymbolResolution::Interior { base_name, offset } => {
+                        Some(format!("{} + {}", base_name, offset))
+                    }
+                }
+            }
+            ExprKind::GotRef {
+                address,
+                is_deref: false,
+                ..
+            } => match self.resolve_global_symbol(*address)? {
+                GlobalSymbolResolution::Exact(name) => Some(name),
+                GlobalSymbolResolution::Interior { base_name, offset } => {
+                    Some(format!("{} + {}", base_name, offset))
+                }
+            },
+            _ => None,
+        }
+    }
+
     /// Generates a fallback name for an unknown global address based on usage context.
     ///
     /// The naming strategy (in priority order):
@@ -3334,33 +3443,24 @@ impl PseudoCodeEmitter {
                         return name.to_string();
                     }
                 }
-                // Try symbol table
-                if let Some(ref sym_table) = self.symbol_table {
-                    if let Some(name) = sym_table.get(*address) {
-                        if let Some(alias) = self.simplify_libc_global_name(name) {
-                            return alias.to_string();
-                        }
-                        return name.to_string();
+                if *is_deref {
+                    if let Some(value) = self.format_global_value(*address, *size) {
+                        return value;
                     }
+                } else if let Some(address_text) = self.format_global_address(*address) {
+                    return address_text;
                 }
                 // Skip string table lookup for lvalues - you can't write to string literals
                 // Fall back to context-aware naming (lvalues are pointer derefs)
                 // Record as a write access since this is an lvalue
                 self.record_global_write(*address);
                 if *is_deref {
-                    let prefix = match size {
-                        1 => "*(uint8_t*)",
-                        2 => "*(uint16_t*)",
-                        4 => "*(uint32_t*)",
-                        8 => "*(uint64_t*)",
-                        _ => "*",
-                    };
                     let name = self.record_and_name_global_with_size(
                         *address,
                         GlobalUsageHint::PointerDeref,
                         *size,
                     );
-                    format!("{}(&{})", prefix, name)
+                    format!("{}(&{})", Self::global_deref_prefix(*size), name)
                 } else {
                     self.record_and_name_global(*address, GlobalUsageHint::PointerDeref)
                 }
@@ -3426,13 +3526,8 @@ impl PseudoCodeEmitter {
                 }
                 if let ExprKind::IntLit(address) = &addr.kind {
                     if let Ok(address) = u64::try_from(*address) {
-                        if let Some(ref sym_table) = self.symbol_table {
-                            if let Some(name) = sym_table.get(address) {
-                                if let Some(alias) = self.simplify_libc_global_name(name) {
-                                    return alias.to_string();
-                                }
-                                return name.to_string();
-                            }
+                        if let Some(value) = self.format_global_value(address, *size) {
+                            return value;
                         }
                     }
                 }
@@ -3451,46 +3546,27 @@ impl PseudoCodeEmitter {
                     // Don't resolve strings in array base/index - those should be pointers
                     // Use format_postfix_base to add parentheses if base is a binary operation
                     let empty = super::StringTable::new();
-                    let base_str = self.format_postfix_base(&base, &empty);
+                    let base_str = self
+                        .try_format_global_array_base(&base)
+                        .unwrap_or_else(|| self.format_postfix_base(&base, &empty));
                     let index_str = self.format_expr_no_string_resolve(&index);
                     return format!("{}[{}]", base_str, index_str);
                 }
                 // Check if this is a RIP/EIP-relative address (global variable reference)
                 if let Some(offset) = try_extract_rip_relative_offset(addr) {
-                    // Try to find a symbol at this relative offset
-                    if let Some(ref sym_table) = self.symbol_table {
-                        if let Some(name) = sym_table.get(offset) {
-                            if let Some(alias) = self.simplify_libc_global_name(name) {
-                                return alias.to_string();
-                            }
-                            return name.to_string();
-                        }
+                    if let Some(value) = self.format_global_value(offset, *size) {
+                        return value;
                     }
-                    // Fall back to a typed dereference of a global address
-                    let prefix = match size {
-                        1 => "*(uint8_t*)",
-                        2 => "*(uint16_t*)",
-                        4 => "*(uint32_t*)",
-                        8 => "*(uint64_t*)",
-                        _ => "*",
-                    };
-                    return format!("{}(&g_{:x})", prefix, offset);
+                    return format!("{}(&g_{:x})", Self::global_deref_prefix(*size), offset);
                 }
                 // Fall back to default deref formatting
-                let prefix = match size {
-                    1 => "*(uint8_t*)",
-                    2 => "*(uint16_t*)",
-                    4 => "*(uint32_t*)",
-                    8 => "*(uint64_t*)",
-                    _ => "*",
-                };
                 // Don't resolve strings in deref address - dereferencing a string literal
                 // doesn't make sense. Show the pointer/data variable instead.
                 let addr_text = self.format_expr_no_string_resolve(addr);
                 if let Some(alias) = self.simplify_libc_global_text(&addr_text) {
                     return format!("*{}", alias);
                 }
-                format!("{}({})", prefix, addr_text)
+                format!("{}({})", Self::global_deref_prefix(*size), addr_text)
             }
             ExprKind::Assign { lhs, rhs } => {
                 let preserve_snapshot_rhs = self.register_snapshot_mode.get()
@@ -3526,6 +3602,10 @@ impl PseudoCodeEmitter {
                         };
                         let rhs_str = if preserve_snapshot_rhs {
                             self.format_expr_preserving_register_names(right, table)
+                        } else if let Some(address_str) =
+                            self.try_format_global_address_materialization(right)
+                        {
+                            address_str
                         } else {
                             self.format_expr_with_strings(right, table)
                         };
@@ -3567,6 +3647,10 @@ impl PseudoCodeEmitter {
                     },
                     if preserve_snapshot_rhs {
                         self.format_expr_preserving_register_names(rhs, table)
+                    } else if let Some(address_str) =
+                        self.try_format_global_address_materialization(rhs)
+                    {
+                        address_str
                     } else {
                         self.format_expr_with_strings(rhs, table)
                     }
@@ -3583,27 +3667,28 @@ impl PseudoCodeEmitter {
                 // This uses the relocation at the instruction to find the symbol
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get_got(*instruction_address) {
-                        if let Some(alias) = self.simplify_libc_global_name(name) {
-                            return alias.to_string();
+                        let resolved = self.simplify_symbol_name(name);
+                        if *is_deref {
+                            return resolved;
                         }
-                        return name.to_string();
+                        return format!("&{}", resolved);
                     }
                     // Fall back to computed address (for linked binaries)
                     if let Some(name) = reloc_table.get_got(*address) {
-                        if let Some(alias) = self.simplify_libc_global_name(name) {
-                            return alias.to_string();
+                        let resolved = self.simplify_symbol_name(name);
+                        if *is_deref {
+                            return resolved;
                         }
-                        return name.to_string();
+                        return format!("&{}", resolved);
                     }
                 }
                 // Try symbol table
-                if let Some(ref sym_table) = self.symbol_table {
-                    if let Some(name) = sym_table.get(*address) {
-                        if let Some(alias) = self.simplify_libc_global_name(name) {
-                            return alias.to_string();
-                        }
-                        return name.to_string();
+                if *is_deref {
+                    if let Some(value) = self.format_global_value(*address, *size) {
+                        return value;
                     }
+                } else if let Some(address_text) = self.format_global_address(*address) {
+                    return address_text;
                 }
                 // Try string table
                 if let Some(s) = table.get(*address) {
@@ -3612,13 +3697,6 @@ impl PseudoCodeEmitter {
                 // Fall back to showing computed address (better than "rip + offset")
                 // Use context-aware naming based on usage pattern with size info
                 if *is_deref {
-                    let prefix = match size {
-                        1 => "*(uint8_t*)",
-                        2 => "*(uint16_t*)",
-                        4 => "*(uint32_t*)",
-                        8 => "*(uint64_t*)",
-                        _ => "*",
-                    };
                     // Pointer dereference pattern - record size for type inference
                     let name = self.record_and_name_global_with_size(
                         *address,
@@ -3627,10 +3705,11 @@ impl PseudoCodeEmitter {
                     );
                     // Record as a read access
                     self.record_global_read(*address);
-                    format!("{}(&{})", prefix, name)
+                    format!("{}(&{})", Self::global_deref_prefix(*size), name)
                 } else {
-                    // Address-of (LEA) - use default naming, tracker will categorize later if needed
-                    self.record_and_name_global(*address, GlobalUsageHint::Unknown)
+                    // Address-of (LEA) - preserve the address semantics in the emitted text.
+                    let name = self.record_and_name_global(*address, GlobalUsageHint::Unknown);
+                    format!("&{}", name)
                 }
             }
             ExprKind::Call { target, args } => {
@@ -3810,8 +3889,10 @@ impl PseudoCodeEmitter {
             }
             // Compound assignment: x op= y
             ExprKind::CompoundAssign { op, lhs, rhs } => {
-                let lhs_str = self.format_expr_with_strings(lhs, table);
-                let rhs_str = self.format_expr_with_strings(rhs, table);
+                let lhs_str = self.format_lvalue(lhs, table);
+                let rhs_str = self
+                    .try_format_global_address_materialization(rhs)
+                    .unwrap_or_else(|| self.format_expr_with_strings(rhs, table));
                 format!("{} {}= {}", lhs_str, op.as_str(), rhs_str)
             }
             // Conditional: cond ? then : else
@@ -3971,7 +4052,9 @@ impl PseudoCodeEmitter {
                 }
                 // Default array access formatting
                 // Use parentheses if base is a binary operation (postfix has highest precedence)
-                let base_str = self.format_postfix_base(base, table);
+                let base_str = self
+                    .try_format_global_array_base(base)
+                    .unwrap_or_else(|| self.format_postfix_base(base, table));
                 let index_str = self.format_expr_with_strings(index, table);
                 format!("{}[{}]", base_str, index_str)
             }
@@ -8832,6 +8915,28 @@ mod tests {
     }
 
     #[test]
+    fn test_global_address_materialization_uses_address_of_symbol() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x4040e4, "g_counter".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::got_addr(0x4040e4, 0, Expr::int(0x4040e4));
+
+        assert_eq!(emitter.format_expr(&expr), "&g_counter");
+    }
+
+    #[test]
+    fn test_assignment_of_absolute_global_address_uses_symbol() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x4040e4, "g_counter".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::assign(Expr::deref(Expr::unknown("out"), 8), Expr::int(0x4040e4));
+
+        assert_eq!(emitter.format_expr(&expr), "*(uint64_t*)(out) = &g_counter");
+    }
+
+    #[test]
     fn test_array_notation_for_constant_array_access() {
         use super::super::expression::Variable;
 
@@ -8840,6 +8945,29 @@ mod tests {
         // Note: x8 is renamed to tmp0 for ARM64 temporary registers
         let expr = Expr::array_access(Expr::var(Variable::reg("x8", 8)), Expr::int(2), 8);
         assert_eq!(emitter.format_expr(&expr), "tmp0[2]");
+    }
+
+    #[test]
+    fn test_array_access_with_absolute_global_base_uses_symbol_name() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x404040, "g_arr".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::array_access(Expr::int(0x404040), Expr::unknown("i"), 4);
+
+        assert_eq!(emitter.format_expr(&expr), "g_arr[i]");
+    }
+
+    #[test]
+    fn test_interior_global_access_prefers_defined_container_over_undefined_alias() {
+        let mut sym = SymbolTable::new();
+        sym.insert_with_metadata(0x5000, "g_struct".to_string(), 16, true, true);
+        sym.insert_with_metadata(0x5008, "stdin".to_string(), 0, false, false);
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::got_ref(0x5008, 0, 4, Expr::unknown("rip_ref"));
+
+        assert_eq!(emitter.format_expr(&expr), "*(uint32_t*)(g_struct + 8)");
     }
 
     #[test]

@@ -1185,7 +1185,7 @@ impl Expr {
                     Self::unknown(&inst.mnemonic)
                 }
             }
-            Operation::Add => Self::make_binop(ops, BinOpKind::Add, &inst.mnemonic),
+            Operation::Add => Self::make_binop(inst, ops, BinOpKind::Add, &inst.mnemonic),
             Operation::Sub => {
                 // Special case: sub reg, reg is a zeroing idiom
                 // For 2-operand (x86): sub eax, eax → ops[0] == ops[1]
@@ -1200,12 +1200,12 @@ impl Expr {
                 if is_zeroing {
                     Self::assign(Self::from_operand(&ops[0]), Self::int(0))
                 } else {
-                    Self::make_binop(ops, BinOpKind::Sub, &inst.mnemonic)
+                    Self::make_binop(inst, ops, BinOpKind::Sub, &inst.mnemonic)
                 }
             }
-            Operation::Mul => Self::make_binop(ops, BinOpKind::Mul, &inst.mnemonic),
-            Operation::Div => Self::make_binop(ops, BinOpKind::Div, &inst.mnemonic),
-            Operation::And => Self::make_binop(ops, BinOpKind::And, &inst.mnemonic),
+            Operation::Mul => Self::make_binop(inst, ops, BinOpKind::Mul, &inst.mnemonic),
+            Operation::Div => Self::make_binop(inst, ops, BinOpKind::Div, &inst.mnemonic),
+            Operation::And => Self::make_binop(inst, ops, BinOpKind::And, &inst.mnemonic),
             Operation::Or => {
                 // ARM64 ORN: orn rd, rn, rm → rd = rn | ~rm
                 let mnem = inst.mnemonic.to_lowercase();
@@ -1219,7 +1219,7 @@ impl Expr {
                         ),
                     )
                 } else {
-                    Self::make_binop(ops, BinOpKind::Or, &inst.mnemonic)
+                    Self::make_binop(inst, ops, BinOpKind::Or, &inst.mnemonic)
                 }
             }
             Operation::Xor => {
@@ -1248,13 +1248,13 @@ impl Expr {
                             ),
                         )
                     } else {
-                        Self::make_binop(ops, BinOpKind::Xor, &inst.mnemonic)
+                        Self::make_binop(inst, ops, BinOpKind::Xor, &inst.mnemonic)
                     }
                 }
             }
-            Operation::Shl => Self::make_binop(ops, BinOpKind::Shl, &inst.mnemonic),
-            Operation::Shr => Self::make_binop(ops, BinOpKind::Shr, &inst.mnemonic),
-            Operation::Sar => Self::make_binop(ops, BinOpKind::Sar, &inst.mnemonic),
+            Operation::Shl => Self::make_binop(inst, ops, BinOpKind::Shl, &inst.mnemonic),
+            Operation::Shr => Self::make_binop(inst, ops, BinOpKind::Shr, &inst.mnemonic),
+            Operation::Sar => Self::make_binop(inst, ops, BinOpKind::Sar, &inst.mnemonic),
             Operation::Rol | Operation::Ror => {
                 // Rotate operations - emit as function-style for now
                 // Could be expanded to proper rotate expressions later
@@ -1286,9 +1286,9 @@ impl Expr {
             }
             Operation::Neg => {
                 if !ops.is_empty() {
-                    let operand = Self::from_operand(&ops[0]);
+                    let operand = Self::from_operand_with_inst(&ops[0], inst);
                     Self::assign(
-                        Self::from_operand(&ops[0]),
+                        Self::from_operand_with_inst(&ops[0], inst),
                         Self::unary(UnaryOpKind::Neg, operand),
                     )
                 } else {
@@ -1297,9 +1297,9 @@ impl Expr {
             }
             Operation::Not => {
                 if !ops.is_empty() {
-                    let operand = Self::from_operand(&ops[0]);
+                    let operand = Self::from_operand_with_inst(&ops[0], inst);
                     Self::assign(
-                        Self::from_operand(&ops[0]),
+                        Self::from_operand_with_inst(&ops[0], inst),
                         Self::unary(UnaryOpKind::Not, operand),
                     )
                 } else {
@@ -1309,8 +1309,12 @@ impl Expr {
             Operation::Inc => {
                 if !ops.is_empty() {
                     Self::assign(
-                        Self::from_operand(&ops[0]),
-                        Self::binop(BinOpKind::Add, Self::from_operand(&ops[0]), Self::int(1)),
+                        Self::from_operand_with_inst(&ops[0], inst),
+                        Self::binop(
+                            BinOpKind::Add,
+                            Self::from_operand_with_inst(&ops[0], inst),
+                            Self::int(1),
+                        ),
                     )
                 } else {
                     Self::unknown(&inst.mnemonic)
@@ -1319,8 +1323,12 @@ impl Expr {
             Operation::Dec => {
                 if !ops.is_empty() {
                     Self::assign(
-                        Self::from_operand(&ops[0]),
-                        Self::binop(BinOpKind::Sub, Self::from_operand(&ops[0]), Self::int(1)),
+                        Self::from_operand_with_inst(&ops[0], inst),
+                        Self::binop(
+                            BinOpKind::Sub,
+                            Self::from_operand_with_inst(&ops[0], inst),
+                            Self::int(1),
+                        ),
                     )
                 } else {
                     Self::unknown(&inst.mnemonic)
@@ -2008,18 +2016,26 @@ impl Expr {
         }
     }
 
-    fn make_binop(ops: &[Operand], op: BinOpKind, mnemonic: &str) -> Self {
+    fn make_binop(inst: &Instruction, ops: &[Operand], op: BinOpKind, mnemonic: &str) -> Self {
         if ops.len() >= 3 {
             // dest = src1 op src2
             Self::assign(
-                Self::from_operand(&ops[0]),
-                Self::binop(op, Self::from_operand(&ops[1]), Self::from_operand(&ops[2])),
+                Self::from_operand_with_inst(&ops[0], inst),
+                Self::binop(
+                    op,
+                    Self::from_operand_with_inst(&ops[1], inst),
+                    Self::from_operand_with_inst(&ops[2], inst),
+                ),
             )
         } else if ops.len() == 2 {
             // dest op= src (common x86 pattern)
             Self::assign(
-                Self::from_operand(&ops[0]),
-                Self::binop(op, Self::from_operand(&ops[0]), Self::from_operand(&ops[1])),
+                Self::from_operand_with_inst(&ops[0], inst),
+                Self::binop(
+                    op,
+                    Self::from_operand_with_inst(&ops[0], inst),
+                    Self::from_operand_with_inst(&ops[1], inst),
+                ),
             )
         } else {
             Self::unknown(mnemonic)
@@ -4824,6 +4840,47 @@ mod tests {
             !rendered.contains("*("),
             "LEA should not produce a dereference: {rendered}"
         );
+    }
+
+    #[test]
+    fn test_rip_relative_rmw_lifts_with_computed_global_address() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let inst = Instruction::new(0x401100, 7, vec![0; 7], "add")
+            .with_operation(Operation::Add)
+            .with_operands(vec![
+                Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x24, 4)),
+                Operand::imm_unsigned(1, 32),
+            ]);
+
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { lhs, rhs } = &expr.kind else {
+            panic!("expected assignment, got {:?}", expr.kind);
+        };
+
+        let ExprKind::GotRef {
+            address,
+            is_deref: true,
+            ..
+        } = &lhs.kind
+        else {
+            panic!("expected rip-relative got-ref lhs, got {:?}", lhs.kind);
+        };
+        assert_eq!(*address, 0x40112b);
+
+        let ExprKind::BinOp { left, .. } = &rhs.kind else {
+            panic!("expected binop rhs, got {:?}", rhs.kind);
+        };
+        let ExprKind::GotRef {
+            address: rhs_address,
+            is_deref: true,
+            ..
+        } = &left.kind
+        else {
+            panic!("expected rip-relative got-ref rhs, got {:?}", left.kind);
+        };
+        assert_eq!(*rhs_address, 0x40112b);
     }
 
     #[test]

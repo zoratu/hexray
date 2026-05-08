@@ -311,6 +311,17 @@ fn collect_known_ubsan_targets(
 struct SymbolRecord {
     name: String,
     size: u64,
+    is_defined: bool,
+    is_data_symbol: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolMatch<'a> {
+    pub address: u64,
+    pub name: &'a str,
+    pub size: u64,
+    pub is_defined: bool,
+    pub is_data_symbol: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -334,9 +345,29 @@ impl SymbolTable {
 
     /// Adds a symbol at a given address with size metadata.
     pub fn insert_with_size(&mut self, address: u64, name: String, size: u64) {
+        self.insert_with_metadata(address, name, size, true, true);
+    }
+
+    /// Adds a symbol with explicit definition and kind metadata.
+    pub fn insert_with_metadata(
+        &mut self,
+        address: u64,
+        name: String,
+        size: u64,
+        is_defined: bool,
+        is_data_symbol: bool,
+    ) {
         let is_new = self
             .symbols
-            .insert(address, SymbolRecord { name, size })
+            .insert(
+                address,
+                SymbolRecord {
+                    name,
+                    size,
+                    is_defined,
+                    is_data_symbol,
+                },
+            )
             .is_none();
         if is_new {
             match self.ordered_addresses.binary_search(&address) {
@@ -346,33 +377,75 @@ impl SymbolTable {
         }
     }
 
+    /// Adds a symbol from a parsed symbol record.
+    pub fn insert_symbol(&mut self, symbol: &hexray_core::Symbol, display_name: String) {
+        let is_data_symbol = matches!(
+            symbol.kind,
+            hexray_core::SymbolKind::Object
+                | hexray_core::SymbolKind::Common
+                | hexray_core::SymbolKind::Tls
+        );
+        self.insert_with_metadata(
+            symbol.address,
+            display_name,
+            symbol.size,
+            symbol.is_defined(),
+            is_data_symbol,
+        );
+    }
+
     /// Looks up a symbol at a given address.
     pub fn get(&self, address: u64) -> Option<&str> {
         self.symbols.get(&address).map(|s| s.name.as_str())
     }
 
+    /// Looks up the exact symbol record at an address.
+    pub fn get_match(&self, address: u64) -> Option<SymbolMatch<'_>> {
+        let symbol = self.symbols.get(&address)?;
+        Some(SymbolMatch {
+            address,
+            name: symbol.name.as_str(),
+            size: symbol.size,
+            is_defined: symbol.is_defined,
+            is_data_symbol: symbol.is_data_symbol,
+        })
+    }
+
     /// Looks up the symbol that contains a given address.
     pub fn get_containing(&self, address: u64) -> Option<&str> {
-        if let Some(name) = self.get(address) {
-            return Some(name);
-        }
+        self.get_containing_match(address).map(|symbol| symbol.name)
+    }
 
-        let idx = match self.ordered_addresses.binary_search(&address) {
+    /// Looks up the defined data symbol that contains a given address.
+    pub fn get_containing_match(&self, address: u64) -> Option<SymbolMatch<'_>> {
+        let mut idx = match self.ordered_addresses.binary_search(&address) {
             Ok(idx) => idx,
             Err(0) => return None,
             Err(idx) => idx - 1,
         };
-        let start = self.ordered_addresses[idx];
-        let symbol = self.symbols.get(&start)?;
-        if symbol.size == 0 {
-            return None;
-        }
+        loop {
+            let start = self.ordered_addresses[idx];
+            let symbol = self.symbols.get(&start)?;
+            if symbol.size != 0 && symbol.is_defined && symbol.is_data_symbol {
+                let end = start.checked_add(symbol.size)?;
+                if address < end {
+                    return Some(SymbolMatch {
+                        address: start,
+                        name: symbol.name.as_str(),
+                        size: symbol.size,
+                        is_defined: symbol.is_defined,
+                        is_data_symbol: symbol.is_data_symbol,
+                    });
+                }
+                if address >= end {
+                    return None;
+                }
+            }
 
-        let end = start.checked_add(symbol.size)?;
-        if address < end {
-            Some(symbol.name.as_str())
-        } else {
-            None
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
         }
     }
 }
@@ -1642,5 +1715,18 @@ mod tests {
         assert_eq!(table.get(0x4062e0), Some("__gcov0.classify"));
         assert_eq!(table.get_containing(0x4062f8), Some("__gcov0.classify"));
         assert_eq!(table.get_containing(0x406308), None);
+    }
+
+    #[test]
+    fn symbol_table_range_lookup_ignores_undefined_or_nondata_symbols() {
+        let mut table = SymbolTable::new();
+        table.insert_with_metadata(0x5000, "g_struct".to_string(), 16, true, true);
+        table.insert_with_metadata(0x5008, "stdin".to_string(), 32, false, false);
+
+        let containing = table
+            .get_containing_match(0x5008)
+            .expect("containing symbol");
+        assert_eq!(containing.address, 0x5000);
+        assert_eq!(containing.name, "g_struct");
     }
 }
