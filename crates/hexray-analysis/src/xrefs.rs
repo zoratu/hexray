@@ -351,7 +351,6 @@ impl XrefBuilder {
 
     fn extract_absolute_memory_address(mem_ref: &hexray_core::MemoryRef) -> Option<u64> {
         if mem_ref.base.is_none()
-            && mem_ref.index.is_none()
             && mem_ref.displacement > 0x1000
             && mem_ref.displacement < i64::MAX
         {
@@ -679,6 +678,35 @@ mod tests {
         assert!(refs
             .iter()
             .any(|xref| { xref.from == 0x2010 && xref.xref_type == XrefType::DataWrite }));
+    }
+
+    #[test]
+    fn test_xref_builder_tracks_absolute_indexed_sib_load_targets() {
+        let mut builder = XrefBuilder::new();
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let instr = Instruction {
+            address: 0x40114a,
+            size: 8,
+            bytes: vec![0; 8],
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Register(rax),
+                Operand::Memory(MemoryRef::sib(None, Some(rax), 8, 0x402008, 8)),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![rax],
+            writes: vec![rax],
+            guard: None,
+        };
+
+        builder.analyze_instruction(&instr);
+        let db = builder.build();
+        let refs = db.refs_to(0x402008);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from, 0x40114a);
+        assert_eq!(refs[0].xref_type, XrefType::DataRead);
     }
 
     #[test]
