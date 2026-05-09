@@ -264,6 +264,13 @@ impl ConstantPropagation {
                 state.set(Location::Register(x86::R11), ConstValue::NotConstant);
             }
 
+            Operation::CpuId => {
+                state.set(Location::Register(x86::RAX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::RBX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::RCX), ConstValue::NotConstant);
+                state.set(Location::Register(x86::RDX), ConstValue::NotConstant);
+            }
+
             Operation::ReadTsc | Operation::ReadTscP => {
                 state.set(Location::Register(x86::RAX), ConstValue::NotConstant);
                 state.set(Location::Register(x86::RDX), ConstValue::NotConstant);
@@ -781,6 +788,40 @@ mod tests {
 
         assert_eq!(
             analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(x86::RAX)),
+            ConstValue::NotConstant
+        );
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(x86::RDX)),
+            ConstValue::NotConstant
+        );
+    }
+
+    #[test]
+    fn test_constant_propagation_cpuid_clobbers_named_outputs() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        bb.push_instruction(make_mov_reg_imm(0x1000, x86::RAX, 0));
+
+        let mut cpuid_inst = Instruction::new(0x1007, 2, vec![0x0f, 0xa2], "cpuid");
+        cpuid_inst.operation = Operation::CpuId;
+        bb.push_instruction(cpuid_inst);
+
+        bb.terminator = BlockTerminator::Return;
+        cfg.add_block(bb);
+
+        let analysis = ConstantPropagation::analyze(&cfg);
+
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(x86::RAX)),
+            ConstValue::NotConstant
+        );
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(x86::RBX)),
+            ConstValue::NotConstant
+        );
+        assert_eq!(
+            analysis.get_at_exit(BasicBlockId::new(0), &Location::Register(x86::RCX)),
             ConstValue::NotConstant
         );
         assert_eq!(

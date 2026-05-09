@@ -1973,15 +1973,25 @@ impl Expr {
             | Operation::LoadMsw
             | Operation::InvalidateTlb
             | Operation::ReadMsr
-            | Operation::WriteMsr
-            | Operation::CpuId
-            | Operation::ReadTsc
-            | Operation::ReadTscP => {
+            | Operation::WriteMsr => {
                 // System instructions - emit as function calls
                 Self::call(
                     CallTarget::Named(inst.mnemonic.clone()),
                     ops.iter().map(Self::from_operand).collect(),
                 )
+            }
+            Operation::CpuId => {
+                // CPUID consumes EAX as the primary leaf selector even though the encoding
+                // has no explicit operands. Materialize it so later passes keep the input.
+                Self::call(
+                    CallTarget::Named(inst.mnemonic.clone()),
+                    vec![Self::var(Variable::reg("eax", 4))],
+                )
+            }
+            Operation::ReadTsc | Operation::ReadTscP => {
+                // RDTSC/RDTSCP expose their outputs through registers; the instruction itself
+                // has no explicit input operands.
+                Self::call(CallTarget::Named(inst.mnemonic.clone()), Vec::new())
             }
             // Atomic/synchronization instructions
             Operation::LoadExclusive | Operation::StoreExclusive => {
@@ -5418,5 +5428,15 @@ mod tests {
         let rendered = Expr::from_instruction(&inst).to_string();
 
         assert_eq!(rendered, "rax = syscall(rax)");
+    }
+
+    #[test]
+    fn test_cpuid_lifts_with_implicit_leaf_input() {
+        let inst = Instruction::new(0x4012b7, 2, vec![0x0f, 0xa2], "cpuid")
+            .with_operation(Operation::CpuId);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "cpuid(eax)");
     }
 }

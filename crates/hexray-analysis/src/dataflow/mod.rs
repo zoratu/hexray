@@ -114,6 +114,22 @@ impl InstructionEffects {
                 }
             }
 
+            Operation::CpuId => {
+                if let Some(arch) = infer_arch_from_instruction(inst).or(default_arch) {
+                    match arch {
+                        Architecture::X86_64 | Architecture::X86 => {
+                            effects.uses.push(Location::Register(x86::RAX));
+                            effects.uses.push(Location::Register(x86::RCX));
+                            effects.defs.push(Location::Register(x86::RAX));
+                            effects.defs.push(Location::Register(x86::RBX));
+                            effects.defs.push(Location::Register(x86::RCX));
+                            effects.defs.push(Location::Register(x86::RDX));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             Operation::ReadTsc | Operation::ReadTscP => {
                 if let Some(arch) = infer_arch_from_instruction(inst).or(default_arch) {
                     match arch {
@@ -418,7 +434,9 @@ fn infer_arch_from_instruction(inst: &Instruction) -> Option<Architecture> {
             (Operation::Syscall, "syscall") => Some(Architecture::X86_64),
             (Operation::Syscall, "svc") => Some(Architecture::Arm64),
             (Operation::Syscall, "ecall") => Some(Architecture::RiscV64),
-            (Operation::ReadTsc | Operation::ReadTscP, _) => Some(Architecture::X86_64),
+            (Operation::CpuId | Operation::ReadTsc | Operation::ReadTscP, _) => {
+                Some(Architecture::X86_64)
+            }
             _ => None,
         })
 }
@@ -907,6 +925,21 @@ mod tests {
         assert!(effects.defs.contains(&Location::Register(x86::RAX)));
         assert!(effects.defs.contains(&Location::Register(x86::RDX)));
         assert!(effects.uses.is_empty());
+    }
+
+    #[test]
+    fn test_instruction_effects_cpuid_x86_64() {
+        let mut inst = Instruction::new(0x1000, 2, vec![0x0f, 0xa2], "cpuid");
+        inst.operation = Operation::CpuId;
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.uses.contains(&Location::Register(x86::RAX)));
+        assert!(effects.uses.contains(&Location::Register(x86::RCX)));
+        assert!(effects.defs.contains(&Location::Register(x86::RAX)));
+        assert!(effects.defs.contains(&Location::Register(x86::RBX)));
+        assert!(effects.defs.contains(&Location::Register(x86::RCX)));
+        assert!(effects.defs.contains(&Location::Register(x86::RDX)));
     }
 
     // --- is_stack_pointer / is_frame_pointer Tests ---

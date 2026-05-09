@@ -2296,6 +2296,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
     for stmt in statements.into_iter() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             // Always substitute known register values in the RHS
+            let new_lhs = substitute_assignment_lhs(lhs, &reg_values);
             let new_rhs = substitute_vars(rhs, &reg_values);
 
             if let ExprKind::Var(lhs_var) = &lhs.kind {
@@ -2315,7 +2316,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             }
 
             // Non-temp LHS (memory location or non-temp register): emit with substitution
-            result.push(Expr::assign((**lhs).clone(), new_rhs));
+            result.push(Expr::assign(new_lhs, new_rhs));
             continue;
         }
 
@@ -2333,6 +2334,15 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             });
             continue;
         }
+
+        if let ExprKind::Call { .. } = &stmt.kind {
+            let substituted = substitute_vars(&stmt, &reg_values);
+            if let ExprKind::Call { target, .. } = &substituted.kind {
+                invalidate_pseudo_call_output_copies(&mut reg_values, target);
+            }
+            result.push(substituted);
+            continue;
+        }
         // Non-assignment statement: pass through
         result.push(stmt);
     }
@@ -2345,6 +2355,21 @@ fn invalidate_clobbered_register_mappings(reg_values: &mut HashMap<String, Expr>
     reg_values.retain(|name, value| {
         !aliases.iter().any(|alias| alias == name) && !expr_uses_any_alias(value, &aliases)
     });
+}
+
+fn invalidate_pseudo_call_output_copies(
+    reg_values: &mut HashMap<String, Expr>,
+    target: &CallTarget,
+) {
+    let written_aliases: HashSet<String> = call_output_alias_groups(target)
+        .into_iter()
+        .flatten()
+        .collect();
+    if written_aliases.is_empty() {
+        return;
+    }
+
+    invalidate_dependent_register_values(reg_values, &written_aliases);
 }
 
 /// Substitute variable references with their GotRef values.
@@ -2797,6 +2822,23 @@ fn propagate_args_in_block_with_binary_data(
                     }
                     result.push(Expr::assign(substituted_lhs, rewritten_call));
                     continue;
+                } else {
+                    let rewritten_call = Expr::call(
+                        substituted_target,
+                        args.iter()
+                            .map(|arg| substitute_vars(arg, &reg_values))
+                            .collect(),
+                    );
+                    if invalidate_pseudo_call_outputs(
+                        target,
+                        &mut reg_values,
+                        &mut arg_values,
+                        &mut call_target_values,
+                        &mut stack_slot_values,
+                    ) {
+                        result.push(Expr::assign(substituted_lhs, rewritten_call));
+                        continue;
+                    }
                 }
             }
 
@@ -2897,6 +2939,21 @@ fn propagate_args_in_block_with_binary_data(
                 reg_values.clear();
                 call_target_values.clear();
                 continue;
+            } else {
+                let substituted_args: Vec<_> = args
+                    .iter()
+                    .map(|arg| substitute_vars(arg, &reg_values))
+                    .collect();
+                if invalidate_pseudo_call_outputs(
+                    target,
+                    &mut reg_values,
+                    &mut arg_values,
+                    &mut call_target_values,
+                    &mut stack_slot_values,
+                ) {
+                    result.push(Expr::call(substituted_target, substituted_args));
+                    continue;
+                }
             }
         }
 
@@ -2977,6 +3034,32 @@ fn track_call_result_aliases(
         reg_values.insert(alias.to_string(), result_expr.clone());
         call_target_values.insert(alias.to_string(), result_expr.clone());
     }
+}
+
+fn invalidate_pseudo_call_outputs(
+    target: &super::super::expression::CallTarget,
+    reg_values: &mut HashMap<String, Expr>,
+    arg_values: &mut HashMap<String, (usize, Expr)>,
+    call_target_values: &mut HashMap<String, Expr>,
+    stack_slot_values: &mut HashMap<String, Expr>,
+) -> bool {
+    let written_aliases: HashSet<String> = call_output_alias_groups(target)
+        .into_iter()
+        .flatten()
+        .collect();
+    if written_aliases.is_empty() {
+        return false;
+    }
+
+    invalidate_dependent_register_values(reg_values, &written_aliases);
+    invalidate_dependent_arg_values(arg_values, &written_aliases);
+    invalidate_written_call_target_values(call_target_values, &written_aliases);
+    invalidate_dependent_stack_slot_values(stack_slot_values, &written_aliases);
+    if aliases_include_stack_base(&written_aliases) {
+        stack_slot_values.clear();
+    }
+
+    true
 }
 
 fn invalidate_dependent_register_values(
@@ -3531,6 +3614,9 @@ fn is_register_state_pseudo_call(name: &str) -> bool {
             | "cwtd"
             | "cltd"
             | "cqto"
+            | "cpuid"
+            | "rdtsc"
+            | "rdtscp"
     )
 }
 
@@ -3538,8 +3624,48 @@ fn should_capture_call_result_directly(target: &super::super::expression::CallTa
     matches!(
         target,
         super::super::expression::CallTarget::Named(name)
-            if matches!(name.as_str(), "rdtsc" | "rdtscp")
+            if matches!(name.as_str(), "cpuid" | "rdtsc" | "rdtscp")
     )
+}
+
+fn is_call_capture_boundary(target: &super::super::expression::CallTarget) -> bool {
+    is_real_function_call(target) || should_capture_call_result_directly(target)
+}
+
+fn direct_capture_primary_register(
+    target: &super::super::expression::CallTarget,
+) -> Option<&'static str> {
+    match target {
+        super::super::expression::CallTarget::Named(name)
+            if matches!(name.as_str(), "cpuid" | "rdtsc" | "rdtscp") =>
+        {
+            Some("eax")
+        }
+        _ => None,
+    }
+}
+
+fn call_output_alias_groups(target: &super::super::expression::CallTarget) -> Vec<Vec<String>> {
+    use super::super::expression::CallTarget;
+
+    match target {
+        CallTarget::Named(name) if name == "cpuid" => vec![
+            vec!["eax".to_string(), "rax".to_string()],
+            vec!["ebx".to_string(), "rbx".to_string()],
+            vec!["ecx".to_string(), "rcx".to_string()],
+            vec!["edx".to_string(), "rdx".to_string()],
+        ],
+        CallTarget::Named(name) if name == "rdtsc" => vec![
+            vec!["eax".to_string(), "rax".to_string()],
+            vec!["edx".to_string(), "rdx".to_string()],
+        ],
+        CallTarget::Named(name) if name == "rdtscp" => vec![
+            vec!["eax".to_string(), "rax".to_string()],
+            vec!["edx".to_string(), "rdx".to_string()],
+            vec!["ecx".to_string(), "rcx".to_string()],
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn secondary_call_result_replacements(
@@ -3549,6 +3675,20 @@ fn secondary_call_result_replacements(
     use super::super::expression::CallTarget;
 
     match target {
+        CallTarget::Named(name) if name == "cpuid" => vec![
+            (
+                vec!["ebx".to_string(), "rbx".to_string()],
+                Expr::unknown(format!("cpuid_ebx_{capture_counter}")),
+            ),
+            (
+                vec!["ecx".to_string(), "rcx".to_string()],
+                Expr::unknown(format!("cpuid_ecx_{capture_counter}")),
+            ),
+            (
+                vec!["edx".to_string(), "rdx".to_string()],
+                Expr::unknown(format!("cpuid_edx_{capture_counter}")),
+            ),
+        ],
         CallTarget::Named(name) if name == "rdtsc" => vec![(
             vec!["edx".to_string(), "rdx".to_string()],
             Expr::unknown(format!("rdtsc_high_{capture_counter}")),
@@ -3565,6 +3705,38 @@ fn secondary_call_result_replacements(
         ],
         _ => Vec::new(),
     }
+}
+
+fn call_has_output_use_before_clobber(
+    statements: &[Expr],
+    target: &super::super::expression::CallTarget,
+) -> bool {
+    let output_aliases = call_output_alias_groups(target);
+    if output_aliases.is_empty() {
+        return false;
+    }
+    let flat_aliases: Vec<String> = output_aliases.iter().flatten().cloned().collect();
+
+    for stmt in statements {
+        if let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind {
+            if is_call_capture_boundary(target) {
+                break;
+            }
+        }
+
+        if output_aliases
+            .iter()
+            .any(|aliases| expr_uses_any_alias(stmt, aliases))
+        {
+            return true;
+        }
+
+        if statement_clobbers_aliases(stmt, &flat_aliases) {
+            break;
+        }
+    }
+
+    false
 }
 
 /// Extracts call arguments and returns (arguments, statement_indices_used).
@@ -4473,7 +4645,7 @@ pub(super) fn capture_return_register_uses_in_block(
 
     while i + 1 < stmts.len() {
         let call_target = match &stmts[i].kind {
-            ExprKind::Call { target, .. } if is_real_function_call(target) => Some(target),
+            ExprKind::Call { target, .. } if is_call_capture_boundary(target) => Some(target),
             _ => None,
         };
         if call_target.is_none() {
@@ -4530,7 +4702,18 @@ pub(super) fn capture_return_register_uses_in_block(
                 .cloned()
                 .unwrap_or_else(|| "x0".to_string())
         } else if direct_capture {
-            let Some(reg) = first_return_register_use_before_clobber(&stmts[i + 1..]) else {
+            let Some(target) = call_target else {
+                i += 1;
+                continue;
+            };
+            if !call_has_output_use_before_clobber(&stmts[i + 1..], target) {
+                i += 1;
+                continue;
+            }
+            let Some(reg) = direct_capture_primary_register(target)
+                .map(str::to_string)
+                .or_else(|| first_return_register_use_before_clobber(&stmts[i + 1..]))
+            else {
                 i += 1;
                 continue;
             };
@@ -4558,7 +4741,7 @@ pub(super) fn capture_return_register_uses_in_block(
             while j < stmts.len() {
                 if j > i + 1 {
                     if let ExprKind::Call { target, .. } = &stmts[j].kind {
-                        if is_real_function_call(target) {
+                        if is_call_capture_boundary(target) {
                             break;
                         }
                     }
@@ -4622,7 +4805,7 @@ pub(super) fn capture_return_register_uses_in_block(
         while j < stmts.len() {
             if j > i + 2 {
                 if let ExprKind::Call { target, .. } = &stmts[j].kind {
-                    if is_real_function_call(target) {
+                    if is_call_capture_boundary(target) {
                         break;
                     }
                 }
@@ -4668,7 +4851,7 @@ fn capture_current_call_result(
         return None;
     };
 
-    if !is_real_function_call(&target) {
+    if !is_call_capture_boundary(&target) {
         return None;
     }
 
@@ -4685,7 +4868,7 @@ fn first_return_register_use_before_clobber(statements: &[Expr]) -> Option<Strin
 
     for stmt in statements {
         if let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind {
-            if is_real_function_call(target) {
+            if is_call_capture_boundary(target) {
                 break;
             }
         }
@@ -4717,7 +4900,7 @@ fn first_deref_load_from_return_register_before_clobber(
 
     for (idx, stmt) in statements.iter().enumerate() {
         if let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind {
-            if is_real_function_call(target) {
+            if is_call_capture_boundary(target) {
                 break;
             }
         }
@@ -4821,14 +5004,16 @@ fn find_previous_call_capture_block(nodes: &[StructuredNode], aliases: &[String]
             kind: ExprKind::Call { target, .. },
         }) = statements.last()
         {
-            if is_real_function_call(target) {
+            if is_call_capture_boundary(target) {
                 return Some(idx);
             }
         }
 
         if statements.iter().any(|stmt| {
-            matches!(&stmt.kind, ExprKind::Call { target, .. } if is_real_function_call(target))
-                || statement_clobbers_return_register(stmt, aliases)
+            matches!(
+                &stmt.kind,
+                ExprKind::Call { target, .. } if is_call_capture_boundary(target)
+            ) || statement_clobbers_return_register(stmt, aliases)
         }) {
             return None;
         }
@@ -4873,7 +5058,7 @@ fn capture_previous_call_result(
         return None;
     };
 
-    if !is_real_function_call(&target) {
+    if !is_call_capture_boundary(&target) {
         return None;
     }
 
@@ -4892,7 +5077,7 @@ fn substitute_return_register_uses_until_clobber(
     for stmt in statements.iter_mut() {
         let original = stmt.clone();
         if let super::super::expression::ExprKind::Call { target, .. } = &original.kind {
-            if is_real_function_call(target) {
+            if is_call_capture_boundary(target) {
                 break;
             }
         }
@@ -5046,7 +5231,7 @@ fn substitute_loaded_return_value_uses_until_clobber(
     for stmt in statements.iter_mut() {
         let original = stmt.clone();
         if let super::super::expression::ExprKind::Call { target, .. } = &original.kind {
-            if is_real_function_call(target) {
+            if is_call_capture_boundary(target) {
                 break;
             }
         }
@@ -6346,6 +6531,57 @@ mod tests {
         assert_eq!(format!("{}", merged[0]), "ret_0 = rdtsc()");
         assert_eq!(format!("{}", merged[1]), "lo = ret_0");
         assert_eq!(format!("{}", merged[2]), "hi = rdtsc_high_1");
+    }
+
+    #[test]
+    fn test_capture_return_register_uses_in_block_for_cpuid_with_named_outputs() {
+        let statements = vec![
+            Expr::call(CallTarget::Named("cpuid".to_string()), vec![]),
+            Expr::assign(Expr::unknown("a"), reg("eax", 4)),
+            Expr::assign(Expr::unknown("b"), reg("ebx", 4)),
+            Expr::assign(Expr::unknown("c"), reg("ecx", 4)),
+            Expr::assign(Expr::unknown("d"), reg("edx", 4)),
+        ];
+
+        let mut counter = 0u32;
+        let merged = capture_return_register_uses_in_block(statements, &mut counter);
+
+        assert_eq!(format!("{}", merged[0]), "ret_0 = cpuid()");
+        assert_eq!(format!("{}", merged[1]), "a = ret_0");
+        assert_eq!(format!("{}", merged[2]), "b = cpuid_ebx_1");
+        assert_eq!(format!("{}", merged[3]), "c = cpuid_ecx_1");
+        assert_eq!(format!("{}", merged[4]), "d = cpuid_edx_1");
+    }
+
+    #[test]
+    fn test_capture_return_register_uses_in_block_for_cpuid_secondary_only_use() {
+        let statements = vec![
+            Expr::call(CallTarget::Named("cpuid".to_string()), vec![]),
+            Expr::assign(Expr::unknown("vendor_b"), reg("ebx", 4)),
+        ];
+
+        let mut counter = 0u32;
+        let merged = capture_return_register_uses_in_block(statements, &mut counter);
+
+        assert_eq!(format!("{}", merged[0]), "ret_0 = cpuid()");
+        assert_eq!(format!("{}", merged[1]), "vendor_b = cpuid_ebx_1");
+    }
+
+    #[test]
+    fn test_propagate_copies_invalidates_cpuid_outputs_but_keeps_other_args() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::unknown("leaf")),
+            Expr::assign(reg("rsi", 8), Expr::unknown("eax_out")),
+            Expr::call(CallTarget::Named("cpuid".to_string()), vec![]),
+            Expr::assign(Expr::deref(reg("rsi", 8), 4), reg("eax", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+
+        assert_eq!(format!("{}", propagated[0]), "eax = leaf");
+        assert_eq!(format!("{}", propagated[1]), "rsi = eax_out");
+        assert_eq!(format!("{}", propagated[2]), "cpuid()");
+        assert_eq!(format!("{}", propagated[3]), "*(uint32_t*)(eax_out) = eax");
     }
 
     #[test]

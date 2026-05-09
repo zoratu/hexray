@@ -634,6 +634,11 @@ impl SignatureRecovery {
                 self.observe_sysv_va_list_assignment(lhs, rhs);
                 // First, analyze the RHS for reads
                 self.analyze_expr_reads(rhs);
+                // Lvalue bases still contribute reads for parameter recovery, e.g.
+                // *(arg1) = ret_0 should keep arg1 as a used pointer parameter.
+                if !matches!(lhs.kind, ExprKind::Var(_) | ExprKind::Unknown(_)) {
+                    self.analyze_expr_reads_with_context(lhs, false, false);
+                }
                 if let Some(lhs_name) = self.extract_var_name(lhs) {
                     if let Some(size) = self.infer_expr_size(rhs) {
                         if size > 0 {
@@ -4023,6 +4028,47 @@ mod tests {
             ),
             "expected arg0 to be inferred as pointer or typed pointer, got {:?}",
             sig.parameters[0].param_type
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_keeps_cpuid_output_pointer_param() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(
+                    Expr::unknown("ret_0"),
+                    Expr::call(
+                        CallTarget::Named("cpuid".to_string()),
+                        vec![Expr::unknown("arg0")],
+                    ),
+                ),
+                Expr::assign(
+                    Expr::deref(Expr::unknown("arg1"), 4),
+                    Expr::unknown("ret_0"),
+                ),
+            ],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2, "params: {:?}", sig.parameters);
+        assert_eq!(sig.parameters[0].name, "arg0");
+        assert!(
+            matches!(
+                sig.parameters[1].param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "expected arg1 to be inferred as pointer, got {:?}",
+            sig.parameters[1].param_type
         );
     }
 
