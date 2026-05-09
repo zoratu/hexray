@@ -2741,6 +2741,10 @@ fn propagate_args_in_block_with_binary_data(
                 let substituted_target =
                     substitute_call_target(target.clone(), &call_target_values);
                 if is_real_function_call(target) {
+                    let mut rewritten_args: Vec<Expr> = args
+                        .iter()
+                        .map(|arg| substitute_vars(arg, &reg_values))
+                        .collect();
                     let excluded_arg_regs = collect_target_argument_registers(target);
                     if let Some((recovered_args, used_stmt_indices)) =
                         try_recover_format_call_arguments(
@@ -2755,15 +2759,30 @@ fn propagate_args_in_block_with_binary_data(
                         for idx in used_stmt_indices {
                             to_remove.insert(idx);
                         }
-                        result.push(Expr::assign(
-                            substituted_lhs,
-                            Expr::call(substituted_target, recovered_args),
-                        ));
-                        arg_values.clear();
-                        reg_values.clear();
-                        call_target_values.clear();
-                        continue;
+                        rewritten_args = recovered_args;
+                    } else if args.is_empty() {
+                        let recovered_args =
+                            extract_call_arguments_with_indices(&arg_values, &excluded_arg_regs);
+                        if !recovered_args.0.is_empty() {
+                            for idx in recovered_args.1 {
+                                to_remove.insert(idx);
+                            }
+                            rewritten_args = recovered_args.0;
+                        }
                     }
+                    let rewritten_call = Expr::call(substituted_target, rewritten_args);
+                    arg_values.clear();
+                    reg_values.clear();
+                    call_target_values.clear();
+                    if let ExprKind::Var(_) = &substituted_lhs.kind {
+                        track_call_result_aliases(
+                            &substituted_lhs,
+                            &mut reg_values,
+                            &mut call_target_values,
+                        );
+                    }
+                    result.push(Expr::assign(substituted_lhs, rewritten_call));
+                    continue;
                 }
             }
 
@@ -2912,6 +2931,17 @@ fn invalidate_written_call_target_values(
     written_aliases: &HashSet<String>,
 ) {
     call_target_values.retain(|alias, _| !written_aliases.contains(alias));
+}
+
+fn track_call_result_aliases(
+    result_expr: &Expr,
+    reg_values: &mut HashMap<String, Expr>,
+    call_target_values: &mut HashMap<String, Expr>,
+) {
+    for alias in ["rax", "eax", "x0", "w0", "a0"] {
+        reg_values.insert(alias.to_string(), result_expr.clone());
+        call_target_values.insert(alias.to_string(), result_expr.clone());
+    }
 }
 
 fn invalidate_dependent_register_values(
@@ -4577,7 +4607,13 @@ fn collect_return_register_uses(stmt: &Expr) -> HashSet<String> {
                 walk(index, out);
             }
             ExprKind::FieldAccess { base, .. } => walk(base, out),
-            ExprKind::Call { args, .. } => {
+            ExprKind::Call { target, args } => {
+                match target {
+                    CallTarget::Indirect(expr) | CallTarget::IndirectGot { expr, .. } => {
+                        walk(expr, out);
+                    }
+                    CallTarget::Direct { .. } | CallTarget::Named(_) => {}
+                }
                 for arg in args {
                     walk(arg, out);
                 }
@@ -4845,7 +4881,7 @@ pub(super) fn substitute_return_register_uses(
     aliases: &[String],
     replacement: &Expr,
 ) -> Expr {
-    use super::super::expression::ExprKind;
+    use super::super::expression::{CallTarget, ExprKind};
 
     fn sub(expr: Expr, aliases: &[String], replacement: &Expr, in_plain_lhs: bool) -> Expr {
         match expr.kind {
@@ -4885,12 +4921,27 @@ pub(super) fn substitute_return_register_uses(
                 field_name,
                 offset,
             } => Expr::field_access(sub(*base, aliases, replacement, false), field_name, offset),
-            ExprKind::Call { target, args } => Expr::call(
-                target,
-                args.into_iter()
-                    .map(|a| sub(a, aliases, replacement, false))
-                    .collect(),
-            ),
+            ExprKind::Call { target, args } => {
+                let target = match target {
+                    CallTarget::Direct { target, call_site } => {
+                        CallTarget::Direct { target, call_site }
+                    }
+                    CallTarget::Named(name) => CallTarget::Named(name),
+                    CallTarget::Indirect(expr) => {
+                        CallTarget::Indirect(Box::new(sub(*expr, aliases, replacement, false)))
+                    }
+                    CallTarget::IndirectGot { got_address, expr } => CallTarget::IndirectGot {
+                        got_address,
+                        expr: Box::new(sub(*expr, aliases, replacement, false)),
+                    },
+                };
+                Expr::call(
+                    target,
+                    args.into_iter()
+                        .map(|a| sub(a, aliases, replacement, false))
+                        .collect(),
+                )
+            }
             ExprKind::Assign { lhs, rhs } => {
                 let lhs_is_plain_var = matches!(lhs.kind, ExprKind::Var(_));
                 Expr::assign(
@@ -4971,12 +5022,20 @@ pub(super) fn substitute_return_register_uses(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompiler::expression::{BinOpKind, CallTarget, ExprKind, Variable};
+    use crate::decompiler::expression::{BinOpKind, CallTarget, ExprKind, VarKind, Variable};
     use crate::decompiler::BinaryDataContext;
     use hexray_core::BasicBlockId;
 
     fn reg(name: &str, size: u8) -> Expr {
         Expr::var(Variable::reg(name, size))
+    }
+
+    fn local(name: &str, size: u8) -> Expr {
+        Expr::var(Variable {
+            kind: VarKind::Temp(0),
+            name: name.to_string(),
+            size,
+        })
     }
 
     fn block(id: u32, statements: Vec<Expr>) -> StructuredNode {
@@ -5522,6 +5581,95 @@ mod tests {
     }
 
     #[test]
+    fn test_propagate_call_args_tracks_call_result_aliases_for_following_calls() {
+        let handle = local("handle", 8);
+        let sym = local("sym", 8);
+        let value = local("value", 4);
+        let statements = vec![
+            Expr::assign(
+                handle.clone(),
+                Expr::call(
+                    CallTarget::Named("dlopen".to_string()),
+                    vec![Expr::unknown("\"/tmp/lib_versioned.so\""), Expr::int(2)],
+                ),
+            ),
+            Expr::assign(reg("rsi", 8), Expr::unknown("\"my_func\"")),
+            Expr::assign(reg("rdi", 8), reg("rax", 8)),
+            Expr::assign(
+                sym.clone(),
+                Expr::call(CallTarget::Named("dlsym".to_string()), vec![]),
+            ),
+            Expr::assign(
+                value.clone(),
+                Expr::call(CallTarget::Indirect(Box::new(reg("rax", 8))), vec![]),
+            ),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(propagated.len(), 3);
+
+        let ExprKind::Assign { rhs, .. } = &propagated[1].kind else {
+            panic!("expected captured dlsym assignment");
+        };
+        let ExprKind::Call { target, args } = &rhs.kind else {
+            panic!("expected dlsym call on assignment rhs");
+        };
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "dlsym"),
+            other => panic!("expected named dlsym target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["handle", "\"my_func\""]
+        );
+
+        let ExprKind::Assign { rhs, .. } = &propagated[2].kind else {
+            panic!("expected captured callback assignment");
+        };
+        let ExprKind::Call { target, args } = &rhs.kind else {
+            panic!("expected callback call on assignment rhs");
+        };
+        match target {
+            CallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "sym"),
+            other => panic!("expected indirect callback target, got {other:?}"),
+        }
+        assert!(args.is_empty(), "callback call should remain nullary");
+    }
+
+    #[test]
+    fn test_propagate_call_args_reuses_assignment_call_result_for_printf_chk_suffix() {
+        let format_addr = 0x6010;
+        let binary_data = binary_data_with_string(format_addr, "s=%d v=%d\n");
+        let sum = local("sum", 4);
+        let value = local("value", 4);
+        let statements = vec![
+            Expr::assign(
+                value.clone(),
+                Expr::call(CallTarget::Indirect(Box::new(Expr::unknown("sym"))), vec![]),
+            ),
+            Expr::assign(reg("ecx", 4), reg("eax", 4)),
+            Expr::call(
+                CallTarget::Named("__printf_chk".to_string()),
+                vec![Expr::int(2), Expr::int(format_addr as i128), sum.clone()],
+            ),
+        ];
+
+        let propagated =
+            propagate_args_in_block_with_binary_data(statements, Some(&binary_data), None);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing printf_chk call");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["2", "0x6010", "sum", "value"]
+        );
+    }
+
+    #[test]
     fn test_merge_return_value_captures_across_blocks_for_compound_use() {
         let nodes = vec![
             block(
@@ -5828,6 +5976,24 @@ mod tests {
         assert_eq!(format!("{}", merged[0]), "ret_0 = foo()");
         assert_eq!(format!("{}", merged[1]), "x = *(uint32_t*)(ret_0)");
         assert_eq!(format!("{}", merged[2]), "sum += x");
+    }
+
+    #[test]
+    fn test_capture_return_register_uses_in_block_rewrites_indirect_call_target() {
+        let statements = vec![
+            Expr::call(CallTarget::Named("dlsym".to_string()), vec![]),
+            Expr::assign(
+                Expr::unknown("value"),
+                Expr::call(CallTarget::Indirect(Box::new(reg("rax", 8))), vec![]),
+            ),
+        ];
+
+        let mut counter = 0u32;
+        let merged = capture_return_register_uses_in_block(statements, &mut counter);
+
+        assert_eq!(format!("{}", merged[0]), "dlsym()");
+        assert_eq!(format!("{}", merged[1]), "ret_0 = rax");
+        assert_eq!(format!("{}", merged[2]), "value = (ret_0)()");
     }
 
     #[test]

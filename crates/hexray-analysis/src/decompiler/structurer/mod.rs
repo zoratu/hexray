@@ -442,6 +442,17 @@ impl StructuredCfg {
             body = merge_return_value_captures(body);
         }
 
+        // Re-run call-arg propagation after return-value capture merges. This
+        // exposes new `lhs = call(...)` shapes whose results can feed later
+        // argument setup or indirect call targets in the same block.
+        if config.is_pass_enabled(OptimizationPass::CallArgPropagation) {
+            body = propagate_call_args_with_binary_data_and_arch(
+                body,
+                structurer.binary_data,
+                infer_cfg_arch(cfg),
+            );
+        }
+
         // Post-process to eliminate temporary register patterns
         if config.is_pass_enabled(OptimizationPass::TempSimplification) {
             body = simplify_statements(body);
