@@ -194,7 +194,7 @@ impl<'a> SwitchRecovery<'a> {
         let mut bound_check: Option<(i64, BasicBlockId)> = None;
         let mut table_base: Option<u64> = None;
         let mut entry_size: u8 = 4; // Default to 4-byte entries
-        let is_relative = true;
+        let mut is_relative = true;
 
         // Helper function to scan a block for patterns
         // We scan in reverse to find the comparison closest to the branch (the actual bounds check)
@@ -202,7 +202,8 @@ impl<'a> SwitchRecovery<'a> {
                           switch_var: &mut Option<Expr>,
                           bound_check: &mut Option<(i64, BasicBlockId)>,
                           table_base: &mut Option<u64>,
-                          entry_size: &mut u8| {
+                          entry_size: &mut u8,
+                          is_relative: &mut bool| {
             // First pass (forward): find table base and entry size
             for inst in &block.instructions {
                 match inst.operation {
@@ -212,6 +213,7 @@ impl<'a> SwitchRecovery<'a> {
                             match &inst.operands[1] {
                                 Operand::PcRelative { target, .. } => {
                                     *table_base = Some(*target);
+                                    *is_relative = true;
                                 }
                                 // Also handle memory operand with PC-relative base
                                 Operand::Memory(mem) => {
@@ -225,6 +227,7 @@ impl<'a> SwitchRecovery<'a> {
                                             let target =
                                                 inst_end.wrapping_add(mem.displacement as u64);
                                             *table_base = Some(target);
+                                            *is_relative = true;
                                         }
                                     }
                                 }
@@ -239,6 +242,12 @@ impl<'a> SwitchRecovery<'a> {
                             if mem.index.is_some() && mem.scale > 1 {
                                 *entry_size = mem.scale;
                             }
+                            if table_base.is_none() {
+                                if let Some(base) = Self::extract_absolute_table_base(mem) {
+                                    *table_base = Some(base);
+                                    *is_relative = false;
+                                }
+                            }
                         }
                     }
 
@@ -249,6 +258,7 @@ impl<'a> SwitchRecovery<'a> {
             // Second pass (reverse): find the bounds check comparison closest to terminator
             // This avoids picking up stack frame setup instructions like "sub $0x10, %rsp"
             let mut cmp_register_name: Option<String> = None;
+            let mut cmp_operand: Option<Operand> = None;
 
             for inst in block.instructions.iter().rev() {
                 match inst.operation {
@@ -263,6 +273,7 @@ impl<'a> SwitchRecovery<'a> {
                                 // Stack frame sizes are often multiples of 8 or 16 (like 0x10, 0x20, etc)
                                 if (0..256).contains(&value) {
                                     *bound_check = Some((value, BasicBlockId::new(0)));
+                                    cmp_operand = inst.operands.first().cloned();
                                     // Remember which register is being compared
                                     if let Operand::Register(reg) = &inst.operands[0] {
                                         cmp_register_name = Some(reg.name().to_string());
@@ -323,6 +334,10 @@ impl<'a> SwitchRecovery<'a> {
                         size: 4,
                     }));
                 }
+            } else if switch_var.is_none() {
+                if let Some(operand) = cmp_operand.as_ref() {
+                    *switch_var = Some(Expr::from_operand(operand));
+                }
             }
         };
 
@@ -333,6 +348,7 @@ impl<'a> SwitchRecovery<'a> {
             &mut bound_check,
             &mut table_base,
             &mut entry_size,
+            &mut is_relative,
         );
 
         // If we didn't find a bounds check, look at predecessor blocks
@@ -347,6 +363,7 @@ impl<'a> SwitchRecovery<'a> {
                         &mut bound_check,
                         &mut table_base,
                         &mut entry_size,
+                        &mut is_relative,
                     );
                     if bound_check.is_some() {
                         // Check if predecessor has conditional branch - default is the other target
@@ -396,6 +413,18 @@ impl<'a> SwitchRecovery<'a> {
         });
 
         Some((switch_var, Some((max_value, default_block)), table_info))
+    }
+
+    fn extract_absolute_table_base(mem: &hexray_core::MemoryRef) -> Option<u64> {
+        if mem.base.is_none()
+            && mem.index.is_some()
+            && mem.displacement > 0x1000
+            && mem.displacement < i64::MAX
+        {
+            Some(mem.displacement as u64)
+        } else {
+            None
+        }
     }
 
     /// Reads case targets from a jump table in binary data.
@@ -914,6 +943,81 @@ mod tests {
         let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
         let candidates = find_switch_candidates(&cfg);
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_jump_table_block_handles_absolute_sib_table_and_memory_switch_var() {
+        use hexray_core::{
+            Architecture, BasicBlock, BlockTerminator, Instruction, MemoryRef, Operand, Operation,
+            Register, RegisterClass,
+        };
+
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut pred = BasicBlock::new(BasicBlockId::new(0), 0x401141);
+        pred.instructions.push(
+            Instruction::new(0x401141, 4, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -4, 4)),
+                    Operand::imm_unsigned(7, 32),
+                ]),
+        );
+        pred.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Above,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(pred);
+
+        let mut jump = BasicBlock::new(BasicBlockId::new(1), 0x401147);
+        jump.instructions.push(
+            Instruction::new(0x401147, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -4, 4)),
+                ]),
+        );
+        jump.instructions.push(
+            Instruction::new(0x40114a, 8, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(None, Some(rax), 8, 0x402008, 8)),
+                ]),
+        );
+        jump.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        cfg.add_block(jump);
+
+        let mut default = BasicBlock::new(BasicBlockId::new(2), 0x40118d);
+        default.terminator = BlockTerminator::Return;
+        cfg.add_block(default);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+
+        let recovery = SwitchRecovery::new(&cfg);
+        let block = cfg.block(BasicBlockId::new(1)).expect("jump table block");
+        let (switch_var, bound_check, table_info) = recovery
+            .analyze_jump_table_block(block)
+            .expect("jump table should be recognized");
+
+        assert_eq!(table_info.table_base, 0x402008);
+        assert_eq!(table_info.entry_size, 8);
+        assert!(!table_info.is_relative);
+        assert_eq!(bound_check, Some((7, BasicBlockId::new(2))));
+        assert!(
+            format!("{switch_var}").contains("rbp + -0x4"),
+            "expected switch value to come from the compared stack slot, got {switch_var}"
+        );
     }
 
     #[test]

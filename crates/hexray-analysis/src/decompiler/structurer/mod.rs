@@ -2553,7 +2553,12 @@ impl<'a> Structurer<'a> {
             .cases
             .into_iter()
             .map(|(values, target)| {
-                let body = self.structure_region(target, switch_end);
+                let body = if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
+                    self.mark_pure_return_chain_processed(target);
+                    vec![StructuredNode::Return(ret_expr)]
+                } else {
+                    self.structure_region(target, switch_end)
+                };
                 (values, body)
             })
             .collect();
@@ -2568,7 +2573,14 @@ impl<'a> Structurer<'a> {
                 // Default was already structured by bounds check, skip it
                 None
             } else {
-                Some(self.structure_region(target, switch_end))
+                Some(
+                    if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
+                        self.mark_pure_return_chain_processed(target);
+                        vec![StructuredNode::Return(ret_expr)]
+                    } else {
+                        self.structure_region(target, switch_end)
+                    },
+                )
             }
         });
 
