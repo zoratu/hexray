@@ -742,7 +742,7 @@ fn main() -> Result<()> {
         Some(Commands::Symbols { functions }) => {
             let project =
                 load_requested_project(None, global_project_path.as_deref(), binary_path)?;
-            print_symbols(fmt, functions, project.as_ref());
+            print_symbols(&binary, functions, project.as_ref());
         }
         Some(Commands::Info) => {
             print_info(&binary);
@@ -1075,14 +1075,19 @@ fn print_sections(binary: &Binary) {
     }
 }
 
-fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool, project: Option<&AnalysisProject>) {
+fn print_symbols(binary: &Binary, functions_only: bool, project: Option<&AnalysisProject>) {
+    let fmt = binary.as_format();
     println!(
         "{:<16} {:<8} {:<8} {:<8} Name",
         "Address", "Size", "Type", "Bind"
     );
     println!("{}", "-".repeat(70));
 
-    let mut symbols: Vec<_> = fmt.symbols().collect();
+    let mut symbols: Vec<_> = fmt.symbols().cloned().collect();
+    if functions_only {
+        let relocation_table = build_relocation_table(binary);
+        synthesize_startup_function_symbols(fmt, &relocation_table, &mut symbols);
+    }
     symbols.sort_by(|left, right| {
         left.address
             .cmp(&right.address)
@@ -1112,7 +1117,7 @@ fn print_symbols(fmt: &dyn BinaryFormat, functions_only: bool, project: Option<&
             _ => "OTHER",
         };
 
-        let demangled = display_symbol_name(fmt, project, symbol);
+        let demangled = display_symbol_name(fmt, project, &symbol);
 
         println!(
             "{:#016x} {:<8} {:<8} {:<8} {}",
@@ -1751,11 +1756,11 @@ fn find_symbol_in_candidates(
     None
 }
 
-fn infer_main_symbol_from_entry(
+fn infer_main_bootstrap_from_entry(
     fmt: &dyn BinaryFormat,
     relocation_table: &RelocationTable,
-) -> Option<hexray_core::Symbol> {
-    use hexray_core::{register::x86, ControlFlow, Operand, Operation, SymbolBinding, SymbolKind};
+) -> Option<(u64, Option<u64>)> {
+    use hexray_core::{register::x86, ControlFlow, Operand, Operation};
 
     if fmt.architecture() != Architecture::X86_64 {
         return None;
@@ -1843,32 +1848,38 @@ fn infer_main_symbol_from_entry(
             register_values.remove(&dest.id);
         }
 
-        let calls_libc_start_main = match instruction.control_flow {
-            ControlFlow::Call { target, .. } => relocation_table
-                .get_call(instruction.address)
-                .map(|reloc| reloc.symbol.contains("libc_start_main"))
-                .unwrap_or_else(|| {
-                    fmt.symbol_at(target)
-                        .is_some_and(|symbol| symbol.name.contains("libc_start_main"))
-                }),
+        let main_addr = register_values
+            .get(&x86::RDI)
+            .copied()
+            .filter(|addr| is_internal_exec_addr(*addr));
+        let bootstrap_target = match instruction.control_flow {
+            ControlFlow::Call { target, .. } => {
+                let named_target = relocation_table
+                    .get_call(instruction.address)
+                    .map(|reloc| reloc.symbol.contains("libc_start_main"))
+                    .unwrap_or_else(|| {
+                        fmt.symbol_at(target)
+                            .is_some_and(|symbol| symbol.name.contains("libc_start_main"))
+                    });
+                if named_target || (main_addr.is_some() && is_internal_exec_addr(target)) {
+                    Some(target)
+                } else {
+                    None
+                }
+            }
             ControlFlow::IndirectCall { .. } => match instruction.operands.first() {
                 Some(Operand::Memory(mem)) => rip_relative_memory_target(mem, instruction)
                     .and_then(|slot| relocation_table.get_got(slot))
-                    .is_some_and(|symbol| symbol.contains("libc_start_main")),
-                _ => false,
+                    .filter(|symbol| symbol.contains("libc_start_main"))
+                    .filter(|_| main_addr.is_some())
+                    .map(|_| 0),
+                _ => None,
             },
-            _ => false,
+            _ => None,
         };
-        if calls_libc_start_main {
-            let address = *register_values.get(&x86::RDI)?;
-            return Some(hexray_core::Symbol {
-                name: "main".to_string(),
-                address,
-                size: 0,
-                kind: SymbolKind::Function,
-                binding: SymbolBinding::Local,
-                section_index: fmt.section_containing(address).map(|_| 0),
-            });
+        if let (Some(address), Some(target)) = (main_addr, bootstrap_target) {
+            let internal_target = is_internal_exec_addr(target).then_some(target);
+            return Some((address, internal_target));
         }
 
         offset += decoded.size;
@@ -1883,6 +1894,88 @@ fn infer_main_symbol_from_entry(
     }
 
     None
+}
+
+fn infer_main_symbol_from_entry(
+    fmt: &dyn BinaryFormat,
+    relocation_table: &RelocationTable,
+) -> Option<hexray_core::Symbol> {
+    use hexray_core::{SymbolBinding, SymbolKind};
+
+    let (address, _) = infer_main_bootstrap_from_entry(fmt, relocation_table)?;
+    Some(hexray_core::Symbol {
+        name: "main".to_string(),
+        address,
+        size: 0,
+        kind: SymbolKind::Function,
+        binding: SymbolBinding::Local,
+        section_index: fmt.section_containing(address).map(|_| 0),
+    })
+}
+
+fn synthesize_startup_function_symbols(
+    fmt: &dyn BinaryFormat,
+    relocation_table: &RelocationTable,
+    symbols: &mut Vec<hexray_core::Symbol>,
+) {
+    use hexray_core::{SymbolBinding, SymbolKind};
+
+    let mut seen: std::collections::HashSet<(u64, String)> = symbols
+        .iter()
+        .map(|symbol| (symbol.address, symbol.name.clone()))
+        .collect();
+
+    let has_named_symbol_at = |addr: u64, symbols: &[hexray_core::Symbol]| {
+        symbols
+            .iter()
+            .any(|symbol| symbol.address == addr && !symbol.name.is_empty())
+    };
+
+    if let Some(entry) = fmt.entry_point() {
+        if !has_named_symbol_at(entry, symbols) && seen.insert((entry, "_start".to_string())) {
+            symbols.push(hexray_core::Symbol {
+                name: "_start".to_string(),
+                address: entry,
+                size: 0,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Local,
+                section_index: fmt.section_containing(entry).map(|_| 0),
+            });
+        }
+    }
+
+    if let Some((main_addr, bootstrap_target)) =
+        infer_main_bootstrap_from_entry(fmt, relocation_table)
+    {
+        let main_symbol = hexray_core::Symbol {
+            name: "main".to_string(),
+            address: main_addr,
+            size: 0,
+            kind: SymbolKind::Function,
+            binding: SymbolBinding::Local,
+            section_index: fmt.section_containing(main_addr).map(|_| 0),
+        };
+        if !has_named_symbol_at(main_symbol.address, symbols)
+            && seen.insert((main_symbol.address, main_symbol.name.clone()))
+        {
+            symbols.push(main_symbol);
+        }
+
+        if let Some(target) = bootstrap_target {
+            if !has_named_symbol_at(target, symbols)
+                && seen.insert((target, "__libc_start_main".to_string()))
+            {
+                symbols.push(hexray_core::Symbol {
+                    name: "__libc_start_main".to_string(),
+                    address: target,
+                    size: 0,
+                    kind: SymbolKind::Function,
+                    binding: SymbolBinding::Local,
+                    section_index: fmt.section_containing(target).map(|_| 0),
+                });
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -8417,6 +8510,47 @@ mod tests {
 
         assert_eq!(main.name, "main");
         assert_eq!(main.address, 0x4012c0);
+        assert!(main.is_function());
+    }
+
+    #[test]
+    fn infer_main_symbol_from_entry_accepts_internal_bootstrap_call_target() {
+        let mut text = vec![0x90; 0x4000];
+        let start = 0x790usize;
+        text[start..start + 38].copy_from_slice(&[
+            0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+            0x31, 0xed, // xor ebp, ebp
+            0x49, 0x89, 0xd1, // mov r9, rdx
+            0x5e, // pop rsi
+            0x48, 0x89, 0xe2, // mov rdx, rsp
+            0x48, 0x83, 0xe4, 0xf0, // and rsp, -16
+            0x50, // push rax
+            0x54, // push rsp
+            0x45, 0x31, 0xc0, // xor r8d, r8d
+            0x31, 0xc9, // xor ecx, ecx
+            0x48, 0xc7, 0xc7, 0x40, 0x17, 0x40, 0x00, // mov rdi, 0x401740
+            0x67, 0xe8, 0x2b, 0x26, 0x00, 0x00, // addr32 call 0x403de0
+            0xf4, // hlt
+        ]);
+        text[0x2de0..0x2de0 + 4].copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
+
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401000,
+                data: text,
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: Some(0x401790),
+        };
+
+        let main = infer_main_symbol_from_entry(&binary, &RelocationTable::new())
+            .expect("direct internal bootstrap call should recover main");
+
+        assert_eq!(main.name, "main");
+        assert_eq!(main.address, 0x401740);
         assert!(main.is_function());
     }
 
