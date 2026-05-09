@@ -3806,7 +3806,7 @@ fn extract_call_arguments_with_indices(
             break;
         };
         if excluded_regs.contains(reg_name) {
-            break;
+            continue;
         }
         result.push(pass_through_arg_expr(reg_name));
     }
@@ -5936,6 +5936,24 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rdi", "rsi"]
+        );
+    }
+
+    #[test]
+    fn test_extract_call_arguments_skips_hidden_target_register_slot() {
+        let mut arg_values = HashMap::new();
+        arg_values.insert(
+            "rsi".to_string(),
+            (0usize, Expr::address_of(Expr::unknown("arg_local"))),
+        );
+        let excluded = HashSet::from(["rdi".to_string()]);
+
+        let (args, used_indices) = extract_call_arguments_with_indices(&arg_values, &excluded);
+
+        assert_eq!(used_indices, vec![0]);
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["&arg_local"]
         );
     }
 
