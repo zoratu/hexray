@@ -4412,6 +4412,73 @@ fn discover_lifecycle_array_entries(fmt: &dyn BinaryFormat) -> Vec<(u64, u64)> {
     entries
 }
 
+fn append_lifecycle_array_relative_relocations(
+    fmt: &dyn BinaryFormat,
+    lifecycle_ranges: &[(u64, u64)],
+    relocations: &[(u64, hexray_formats::RelocationType, i64)],
+    seen: &mut std::collections::HashSet<(u64, u64)>,
+    entries: &mut Vec<(u64, u64)>,
+) {
+    for (slot_addr, reloc_type, addend) in relocations {
+        if *reloc_type != hexray_formats::RelocationType::Relative {
+            continue;
+        }
+        if !lifecycle_ranges
+            .iter()
+            .any(|(start, end)| *slot_addr >= *start && *slot_addr < *end)
+        {
+            continue;
+        }
+
+        let Ok(target) = u64::try_from(*addend) else {
+            continue;
+        };
+        if !is_executable_callback_target(fmt, target) {
+            continue;
+        }
+        if seen.insert((*slot_addr, target)) {
+            entries.push((*slot_addr, target));
+        }
+    }
+}
+
+fn discover_lifecycle_array_entries_for_binary(binary: &Binary) -> Vec<(u64, u64)> {
+    let fmt = binary.as_format();
+    let mut entries = discover_lifecycle_array_entries(fmt);
+    let lifecycle_ranges: Vec<_> = fmt
+        .sections()
+        .filter(|section| matches!(section.name(), ".init_array" | ".fini_array"))
+        .map(|section| {
+            (
+                section.virtual_address(),
+                section.virtual_address().saturating_add(section.size()),
+            )
+        })
+        .collect();
+    if lifecycle_ranges.is_empty() {
+        return entries;
+    }
+
+    if let Binary::Elf(elf) = binary {
+        let relocations: Vec<_> = elf
+            .relocations
+            .iter()
+            .map(|reloc| (reloc.offset, reloc.r_type, reloc.addend))
+            .collect();
+        let mut seen: std::collections::HashSet<_> = entries.iter().copied().collect();
+        append_lifecycle_array_relative_relocations(
+            fmt,
+            &lifecycle_ranges,
+            &relocations,
+            &mut seen,
+            &mut entries,
+        );
+        entries.sort_unstable_by_key(|(slot_addr, _)| *slot_addr);
+    }
+
+    entries
+}
+
 fn resolve_materialized_callback_targets(
     fmt: &dyn BinaryFormat,
     call: &hexray_analysis::callgraph::MaterializedIndirectCall,
@@ -4512,6 +4579,7 @@ struct MaterializedCallbackEdgeContext<'a> {
     noreturn_targets: &'a std::collections::HashSet<u64>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn add_lifecycle_array_edges(
     callgraph: &mut CallGraph,
     fmt: &dyn BinaryFormat,
@@ -4523,6 +4591,37 @@ fn add_lifecycle_array_edges(
 
     let mut seen_edges = std::collections::HashSet::new();
     for (slot_addr, target) in discover_lifecycle_array_entries(fmt) {
+        if !seen_edges.insert((entry, slot_addr, target)) {
+            continue;
+        }
+        if let Some(symbol) = find_preferred_symbol_at(symbols, target) {
+            callgraph.add_node(target, Some(symbol.name.clone()), false);
+        } else {
+            callgraph.add_node(target, None, false);
+        }
+        callgraph.add_call(
+            entry,
+            target,
+            CallSite {
+                call_address: slot_addr,
+                call_type: CallType::Indirect,
+            },
+        );
+    }
+}
+
+fn add_lifecycle_array_edges_for_binary(
+    callgraph: &mut CallGraph,
+    binary: &Binary,
+    symbols: &[hexray_core::Symbol],
+) {
+    let fmt = binary.as_format();
+    let Some(entry) = fmt.entry_point() else {
+        return;
+    };
+
+    let mut seen_edges = std::collections::HashSet::new();
+    for (slot_addr, target) in discover_lifecycle_array_entries_for_binary(binary) {
         if !seen_edges.insert((entry, slot_addr, target)) {
             continue;
         }
@@ -4913,7 +5012,7 @@ fn build_callgraph(
             noreturn_targets: &noreturn_targets,
         },
     );
-    add_lifecycle_array_edges(&mut callgraph, fmt, &symbols);
+    add_lifecycle_array_edges_for_binary(&mut callgraph, binary, &symbols);
     mark_callgraph_stub_nodes_external(&mut callgraph, fmt);
     let callgraph = if let Some(root) = target_root {
         callgraph.subgraph_from(root)
@@ -5806,7 +5905,7 @@ fn build_xrefs(
 
     let mut db = xref_builder.build();
     add_exception_section_xrefs(fmt, &mut db);
-    for (slot_addr, target) in discover_lifecycle_array_entries(fmt) {
+    for (slot_addr, target) in discover_lifecycle_array_entries_for_binary(binary) {
         db.add_xref(slot_addr, target, XrefType::DataRead);
     }
 
@@ -8237,7 +8336,7 @@ mod tests {
         MemoryRef, Operand, Operation, Register, RegisterClass, Symbol, SymbolBinding, SymbolKind,
     };
     use hexray_disasm::X86_64Disassembler;
-    use hexray_formats::{BinaryFormat, BinaryType, Section};
+    use hexray_formats::{BinaryFormat, BinaryType, RelocationType, Section};
     use std::fs;
 
     struct TestBinary {
@@ -9221,6 +9320,62 @@ mod tests {
         };
 
         let entries = crate::discover_lifecycle_array_entries(&binary);
+
+        assert_eq!(
+            entries,
+            vec![
+                (0x403de0, 0x401156),
+                (0x403de8, 0x401193),
+                (0x403df0, 0x4011b7)
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_array_relative_relocations_add_missing_entries() {
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x401100,
+                    data: vec![0x90; 0x200],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".init_array",
+                    address: 0x403de0,
+                    data: vec![0u8; 16],
+                    executable: false,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".fini_array",
+                    address: 0x403df0,
+                    data: vec![0u8; 8],
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: None,
+        };
+
+        let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        crate::append_lifecycle_array_relative_relocations(
+            &binary,
+            &[(0x403de0, 0x403df0), (0x403df0, 0x403df8)],
+            &[
+                (0x403de0, RelocationType::Relative, 0x401156),
+                (0x403de8, RelocationType::Relative, 0x401193),
+                (0x403df0, RelocationType::Relative, 0x4011b7),
+                (0x500000, RelocationType::Relative, 0x401156),
+                (0x403df8, RelocationType::Relative, 0x500000),
+            ],
+            &mut seen,
+            &mut entries,
+        );
 
         assert_eq!(
             entries,
