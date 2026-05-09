@@ -843,6 +843,299 @@ impl PseudoCodeEmitter {
         rewritten
     }
 
+    fn is_destructor_call_target(&self, target: &CallTarget) -> bool {
+        match target {
+            CallTarget::Named(name) => name.contains("::~"),
+            CallTarget::Direct { target, .. } => self
+                .symbol_table
+                .as_ref()
+                .and_then(|table| table.get(*target))
+                .is_some_and(|name| name.contains("::~")),
+            CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => false,
+        }
+    }
+
+    fn expr_simple_name(expr: &Expr) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Var(var) => Some(&var.name),
+            ExprKind::Unknown(name) => Some(name.as_str()),
+            ExprKind::Cast { expr, .. } => Self::expr_simple_name(expr),
+            _ => None,
+        }
+    }
+
+    fn rewrite_destructor_cleanup_returns_for_emission(
+        &self,
+        nodes: &[StructuredNode],
+    ) -> Vec<StructuredNode> {
+        let mut rewritten = Vec::with_capacity(nodes.len());
+        let mut idx = 0usize;
+
+        while idx < nodes.len() {
+            if idx + 1 < nodes.len() {
+                if let (
+                    StructuredNode::Block {
+                        id,
+                        statements,
+                        address_range,
+                    },
+                    StructuredNode::Return(Some(ret_expr)),
+                ) = (&nodes[idx], &nodes[idx + 1])
+                {
+                    if let Some(ret_name) = Self::expr_simple_name(ret_expr) {
+                        if let Some((cleanup_idx, saved_return_expr)) =
+                            self.find_destructor_cleanup_return_rewrite(statements, ret_name)
+                        {
+                            let mut new_statements = statements.clone();
+                            let cleanup_call = match &new_statements[cleanup_idx].kind {
+                                ExprKind::Assign { rhs, .. } => rhs.as_ref().clone(),
+                                _ => unreachable!(),
+                            };
+                            new_statements[cleanup_idx] = cleanup_call;
+                            rewritten.push(StructuredNode::Block {
+                                id: *id,
+                                statements: new_statements,
+                                address_range: *address_range,
+                            });
+                            rewritten.push(StructuredNode::Return(Some(saved_return_expr)));
+                            idx += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let node = match &nodes[idx] {
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => StructuredNode::If {
+                    condition: condition.clone(),
+                    then_body: self.rewrite_destructor_cleanup_returns_for_emission(then_body),
+                    else_body: else_body
+                        .as_ref()
+                        .map(|body| self.rewrite_destructor_cleanup_returns_for_emission(body)),
+                },
+                StructuredNode::While {
+                    condition,
+                    body,
+                    header,
+                    exit_block,
+                } => StructuredNode::While {
+                    condition: condition.clone(),
+                    body: self.rewrite_destructor_cleanup_returns_for_emission(body),
+                    header: *header,
+                    exit_block: *exit_block,
+                },
+                StructuredNode::DoWhile {
+                    body,
+                    condition,
+                    header,
+                    exit_block,
+                } => StructuredNode::DoWhile {
+                    body: self.rewrite_destructor_cleanup_returns_for_emission(body),
+                    condition: condition.clone(),
+                    header: *header,
+                    exit_block: *exit_block,
+                },
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    header,
+                    exit_block,
+                } => StructuredNode::For {
+                    init: init.clone(),
+                    condition: condition.clone(),
+                    update: update.clone(),
+                    body: self.rewrite_destructor_cleanup_returns_for_emission(body),
+                    header: *header,
+                    exit_block: *exit_block,
+                },
+                StructuredNode::Loop {
+                    body,
+                    header,
+                    exit_block,
+                } => StructuredNode::Loop {
+                    body: self.rewrite_destructor_cleanup_returns_for_emission(body),
+                    header: *header,
+                    exit_block: *exit_block,
+                },
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                } => StructuredNode::Switch {
+                    value: value.clone(),
+                    cases: cases
+                        .iter()
+                        .map(|(values, body)| {
+                            (
+                                values.clone(),
+                                self.rewrite_destructor_cleanup_returns_for_emission(body),
+                            )
+                        })
+                        .collect(),
+                    default: default
+                        .as_ref()
+                        .map(|body| self.rewrite_destructor_cleanup_returns_for_emission(body)),
+                },
+                StructuredNode::Sequence(inner) => StructuredNode::Sequence(
+                    self.rewrite_destructor_cleanup_returns_for_emission(inner),
+                ),
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => StructuredNode::TryCatch {
+                    try_body: self.rewrite_destructor_cleanup_returns_for_emission(try_body),
+                    catch_handlers: catch_handlers
+                        .iter()
+                        .map(|handler| super::structurer::CatchHandler {
+                            exception_type: handler.exception_type.clone(),
+                            variable_name: handler.variable_name.clone(),
+                            body: self
+                                .rewrite_destructor_cleanup_returns_for_emission(&handler.body),
+                            landing_pad: handler.landing_pad,
+                        })
+                        .collect(),
+                },
+                other => other.clone(),
+            };
+            rewritten.push(node);
+            idx += 1;
+        }
+
+        rewritten
+    }
+
+    fn find_destructor_cleanup_return_rewrite(
+        &self,
+        statements: &[Expr],
+        cleanup_name: &str,
+    ) -> Option<(usize, Expr)> {
+        let mut cleanup_idx = None;
+        let mut explicit_saved_return = None;
+
+        for (idx, stmt) in statements.iter().enumerate().rev() {
+            if let Some(saved) = Self::extract_saved_return_restore(stmt) {
+                explicit_saved_return = Some(saved);
+                continue;
+            }
+
+            if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+                if Self::expr_simple_name(lhs).is_some_and(|name| name == cleanup_name) {
+                    let ExprKind::Call { target, .. } = &rhs.kind else {
+                        return None;
+                    };
+                    if self.is_destructor_call_target(target) {
+                        cleanup_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+
+            if self.is_cleanup_tail_noise_statement(stmt) {
+                continue;
+            }
+
+            return None;
+        }
+
+        let cleanup_idx = cleanup_idx?;
+        if let Some(saved) = explicit_saved_return {
+            return Some((cleanup_idx, saved));
+        }
+
+        for stmt in statements[..cleanup_idx].iter().rev() {
+            let ExprKind::Assign {
+                lhs: saved_lhs,
+                rhs: saved_rhs,
+            } = &stmt.kind
+            else {
+                continue;
+            };
+            let ExprKind::Call { target, .. } = &saved_rhs.kind else {
+                continue;
+            };
+            if self.is_destructor_call_target(target) {
+                continue;
+            }
+            return Some((cleanup_idx, saved_lhs.as_ref().clone()));
+        }
+
+        None
+    }
+
+    fn extract_saved_return_restore(stmt: &Expr) -> Option<Expr> {
+        let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+            return None;
+        };
+        let ExprKind::Var(var) = &lhs.kind else {
+            return None;
+        };
+        if matches!(var.name.as_str(), "eax" | "rax" | "ret") {
+            return Some(rhs.as_ref().clone());
+        }
+        None
+    }
+
+    fn is_cleanup_tail_noise_statement(&self, stmt: &Expr) -> bool {
+        is_epilogue_statement(stmt)
+            || is_stack_canary_load(stmt)
+            || Self::expr_mentions_stack_canary_guard(stmt)
+            || matches!(&stmt.kind, ExprKind::Unknown(name) if name.trim() == "/* nop */")
+    }
+
+    fn expr_mentions_stack_canary_guard(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => var.name.contains("stack_chk_guard"),
+            ExprKind::Unknown(name) => name.contains("stack_chk_guard"),
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                Self::expr_mentions_stack_canary_guard(left)
+                    || Self::expr_mentions_stack_canary_guard(right)
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                Self::expr_mentions_stack_canary_guard(operand)
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                Self::expr_mentions_stack_canary_guard(base)
+                    || Self::expr_mentions_stack_canary_guard(index)
+            }
+            ExprKind::FieldAccess { base, .. } => Self::expr_mentions_stack_canary_guard(base),
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+                args.iter().any(Self::expr_mentions_stack_canary_guard)
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_mentions_stack_canary_guard(cond)
+                    || Self::expr_mentions_stack_canary_guard(then_expr)
+                    || Self::expr_mentions_stack_canary_guard(else_expr)
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                Self::expr_mentions_stack_canary_guard(display_expr)
+            }
+            ExprKind::IntLit(_) => false,
+        }
+    }
+
     fn rewrite_small_aggregate_slots_for_emission(
         &self,
         nodes: &[StructuredNode],
@@ -1858,13 +2151,21 @@ impl PseudoCodeEmitter {
 
     fn set_lifted_param_slot_overrides(&self, index: usize, rendered_name: &str) {
         let slot = 8 * (index + 1);
-        let aliases = [
-            format!("arg_{:x}", slot),
-            format!("arg_0x{:x}", slot),
-            format!("local_{:x}", slot),
-            format!("local_0x{:x}", slot),
-            format!("stack_-{}", slot),
-        ];
+        let aliases = if rendered_name == "this" {
+            vec![
+                format!("arg_{:x}", slot),
+                format!("arg_0x{:x}", slot),
+                format!("stack_-{}", slot),
+            ]
+        } else {
+            vec![
+                format!("arg_{:x}", slot),
+                format!("arg_0x{:x}", slot),
+                format!("local_{:x}", slot),
+                format!("local_0x{:x}", slot),
+                format!("stack_-{}", slot),
+            ]
+        };
         for alias in aliases {
             self.set_param_name_override(&alias, rendered_name);
         }
@@ -2430,6 +2731,26 @@ impl PseudoCodeEmitter {
         } else {
             Some(format!("{}{}", base_str, field_access))
         }
+    }
+
+    fn try_format_struct_pointer_field_fallback(
+        &self,
+        base: &Expr,
+        offset: usize,
+        table: &StringTable,
+    ) -> Option<String> {
+        let base_name = match &base.kind {
+            ExprKind::Var(var) => var.name.clone(),
+            ExprKind::Unknown(name) => name.clone(),
+            _ => self.try_get_var_name(base)?,
+        };
+        let type_str = self.lookup_type_info(&base_name)?.trim();
+        if !type_str.starts_with("struct ") || !Self::is_pointer_like_type_hint(type_str) {
+            return None;
+        }
+
+        let base_str = self.format_postfix_base(base, table);
+        Some(format!("{}->field_{:x}", base_str, offset))
     }
 
     /// Formats a function call argument with context-aware constant recognition.
@@ -3381,6 +3702,88 @@ impl PseudoCodeEmitter {
         Some(format!("{}{}", "*".repeat(deref_depth), alias))
     }
 
+    fn strip_expr_casts(expr: &Expr) -> &Expr {
+        let mut current = expr;
+        while let ExprKind::Cast { expr, .. } = &current.kind {
+            current = expr;
+        }
+        current
+    }
+
+    fn parse_virtual_target<'a>(&self, expr: &'a Expr) -> Option<(&'a Expr, usize)> {
+        let expr = Self::strip_expr_casts(expr);
+        let ExprKind::Deref { addr, .. } = &expr.kind else {
+            return None;
+        };
+
+        let (vptr_expr, slot_offset) = match &Self::strip_expr_casts(addr).kind {
+            ExprKind::BinOp {
+                op: BinOpKind::Add,
+                left,
+                right,
+            } => {
+                let ExprKind::IntLit(offset) = Self::strip_expr_casts(right).kind else {
+                    return None;
+                };
+                let offset = usize::try_from(offset).ok()?;
+                (left.as_ref(), offset)
+            }
+            _ => (addr.as_ref(), 0),
+        };
+
+        let vptr_expr = Self::strip_expr_casts(vptr_expr);
+        let ExprKind::Deref {
+            addr: object_expr, ..
+        } = &vptr_expr.kind
+        else {
+            return None;
+        };
+        Some((Self::strip_expr_casts(object_expr), slot_offset))
+    }
+
+    fn try_format_virtual_dispatch(
+        &self,
+        target: &CallTarget,
+        args: &[Expr],
+        table: &StringTable,
+    ) -> Option<String> {
+        let CallTarget::Indirect(target_expr) = target else {
+            return None;
+        };
+        let (target_object, slot_offset) = self.parse_virtual_target(target_expr)?;
+        let object_expr = if let Some(object_arg) = args.first() {
+            let object_arg = Self::strip_expr_casts(object_arg);
+            if !exprs_equal(target_object, object_arg) {
+                return None;
+            }
+            object_arg
+        } else {
+            target_object
+        };
+
+        let object_text = self.format_expr_with_strings(object_expr, table);
+        let rendered_args = if args.is_empty() {
+            vec![object_text.clone()]
+        } else {
+            let mut rendered = vec![object_text.clone()];
+            rendered.extend(
+                args.iter()
+                    .skip(1)
+                    .map(|arg| self.format_expr_with_strings(arg, table)),
+            );
+            rendered
+        };
+
+        // TODO: Recover slot names from the vtable database once class metadata
+        // is threaded through the emitter.
+        Some(format!(
+            "(({})->vftable[{}])({})",
+            object_text,
+            slot_offset / 8,
+            rendered_args.join(", ")
+        ))
+    }
+
     /// Formats an lvalue (left-hand side of assignment).
     /// This is like format_expr_with_strings but doesn't resolve addresses to string literals,
     /// since you can't assign to a string literal.
@@ -3713,6 +4116,9 @@ impl PseudoCodeEmitter {
                 }
             }
             ExprKind::Call { target, args } => {
+                if let Some(virtual_call) = self.try_format_virtual_dispatch(target, args, table) {
+                    return virtual_call;
+                }
                 if let CallTarget::Named(name) = target {
                     if name == "madd" && args.len() == 3 {
                         let expr = Expr::binop(
@@ -3954,13 +4360,18 @@ impl PseudoCodeEmitter {
                 }
                 if let ExprKind::IntLit(idx) = &index.kind {
                     if *idx >= 0 {
+                        let off = (*idx as usize) * *element_size;
+                        if let Some(field_access) =
+                            self.try_format_struct_pointer_field_fallback(base, off, table)
+                        {
+                            return field_access;
+                        }
                         if let ExprKind::Var(base_var) = &base.kind {
                             let is_stack_like = matches!(
                                 base_var.name.as_str(),
                                 "sp" | "rsp" | "rbp" | "x29" | "rip" | "eip"
                             );
                             if !is_stack_like {
-                                let off = (*idx as usize) * *element_size;
                                 // Only use struct field notation if we have type database info.
                                 // Otherwise prefer array notation (e.g., argv[1] not argv->field_8).
                                 let addr_expr = if off == 0 {
@@ -4142,6 +4553,7 @@ impl PseudoCodeEmitter {
         } else {
             provisional_body
         };
+        let display_body = self.rewrite_destructor_cleanup_returns_for_emission(&display_body);
         let previous_snapshot_mode = self
             .register_snapshot_mode
             .replace(Self::should_enable_register_snapshot_mode(&display_body));
@@ -4423,6 +4835,7 @@ impl PseudoCodeEmitter {
         let display_body = self.rewrite_small_aggregate_slots_for_emission(
             &Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return),
         );
+        let display_body = self.rewrite_destructor_cleanup_returns_for_emission(&display_body);
         let previous_snapshot_mode = self
             .register_snapshot_mode
             .replace(Self::should_enable_register_snapshot_mode(&display_body));
@@ -7082,6 +7495,102 @@ mod tests {
         );
 
         assert_eq!(header, "int32_t Square::area(int32_t* this) const");
+    }
+
+    #[test]
+    fn test_emit_virtual_dispatch_placeholder_for_itanium_shape() {
+        let err = Expr::var(super::super::expression::Variable::reg("err", 8));
+        let object = Expr::deref(err.clone(), 8);
+        let vptr = Expr::deref(object.clone(), 8);
+        let slot = Expr::deref(vptr, 8);
+        let call = Expr::assign(
+            Expr::unknown("ret_0"),
+            Expr::call(CallTarget::Indirect(Box::new(slot)), vec![object.clone()]),
+        );
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Expr(call)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(output.contains("((*(uint64_t*)(err))->vftable[0])(*(uint64_t*)(err))"));
+    }
+
+    #[test]
+    fn test_emit_virtual_dispatch_placeholder_without_explicit_this_arg() {
+        let err = Expr::var(super::super::expression::Variable::reg("err", 8));
+        let object = Expr::deref(err.clone(), 8);
+        let vptr = Expr::deref(object.clone(), 8);
+        let slot = Expr::deref(vptr, 8);
+        let call = Expr::assign(
+            Expr::unknown("ret_0"),
+            Expr::call(CallTarget::Indirect(Box::new(slot)), vec![]),
+        );
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Expr(call)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(output.contains("((*(uint64_t*)(err))->vftable[0])(*(uint64_t*)(err))"));
+    }
+
+    #[test]
+    fn test_emit_struct_pointer_byte_offset_field_fallback() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Expr(Expr::assign(
+                Expr::array_access(Expr::unknown("ret"), Expr::int(3), 1),
+                Expr::unknown("local_c"),
+            ))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut type_info = HashMap::new();
+        type_info.insert("ret".to_string(), "struct Circle*".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(output.contains("ret->field_3 = local_c;"));
+    }
+
+    #[test]
+    fn test_emit_rewrites_destructor_cleanup_tail_return() {
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Block {
+                    id: hexray_core::BasicBlockId::new(0),
+                    statements: vec![
+                        Expr::assign(
+                            Expr::unknown("err"),
+                            Expr::call(
+                                CallTarget::Named("Circle::area() const".to_string()),
+                                vec![],
+                            ),
+                        ),
+                        Expr::assign(
+                            Expr::unknown("ret_0"),
+                            Expr::call(CallTarget::Named("Circle::~Circle()".to_string()), vec![]),
+                        ),
+                    ],
+                    address_range: (0x1000, 0x1008),
+                },
+                StructuredNode::Return(Some(Expr::unknown("ret_0"))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let output = PseudoCodeEmitter::new("    ", false).emit(&cfg, "cleanup_wrapper");
+
+        assert!(output.contains("Circle::~Circle()();"));
+        assert!(output.contains("return err;"));
+        assert!(!output.contains("return ret_0;"));
     }
 
     #[test]

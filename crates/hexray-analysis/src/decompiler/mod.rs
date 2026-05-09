@@ -60,7 +60,7 @@ pub use type_propagation::{ExprType, ExpressionTypePropagation, KnownSignature};
 
 use hexray_core::ControlFlowGraph;
 use hexray_types::TypeDatabase;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::cpp_special::{CppSpecialDetector, SpecialMemberAnalysis};
@@ -946,6 +946,8 @@ impl Decompiler {
             }
         }
 
+        self.seed_cpp_special_type_info(&structured.body, &mut merged_types);
+
         // Step 3: Apply exception handling if available
         let structured = if let Some(ref eh_info) = self.exception_info {
             StructuredCfg {
@@ -982,7 +984,11 @@ impl Decompiler {
             emitter = emitter.with_constant_database(db.clone());
         }
 
-        let code = emitter.emit(&structured, &display_name);
+        let code = if let Some(signature) = self.adjusted_cpp_special_signature(cfg, func_name) {
+            emitter.emit_with_signature(&structured, &display_name, &signature)
+        } else {
+            emitter.emit(&structured, &display_name)
+        };
 
         // Build final output with all headers
         let mut output = String::new();
@@ -1150,6 +1156,378 @@ impl Decompiler {
 
         // Not a C++ special member, return original name
         func_name.to_string()
+    }
+
+    fn cpp_special_this_type(&self) -> Option<String> {
+        let analysis = self.cpp_special_member.as_ref()?;
+        let kind = analysis.kind.as_ref()?;
+        if !matches!(
+            kind,
+            crate::cpp_special::SpecialMemberKind::Constructor { .. }
+                | crate::cpp_special::SpecialMemberKind::Destructor { .. }
+        ) {
+            return None;
+        }
+        let class_name = analysis.class_name.as_deref()?.trim();
+        if class_name.is_empty() {
+            return None;
+        }
+        Some(format!("struct {}*", class_name))
+    }
+
+    fn collect_cpp_special_this_aliases(
+        nodes: &[StructuredNode],
+        aliases: &mut HashSet<String>,
+        changed: &mut bool,
+    ) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        Self::collect_cpp_special_this_aliases_from_expr(stmt, aliases, changed);
+                    }
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    Self::collect_cpp_special_this_aliases_from_expr(condition, aliases, changed);
+                    Self::collect_cpp_special_this_aliases(then_body, aliases, changed);
+                    if let Some(nodes) = else_body {
+                        Self::collect_cpp_special_this_aliases(nodes, aliases, changed);
+                    }
+                }
+                StructuredNode::While {
+                    condition, body, ..
+                } => {
+                    Self::collect_cpp_special_this_aliases_from_expr(condition, aliases, changed);
+                    Self::collect_cpp_special_this_aliases(body, aliases, changed);
+                }
+                StructuredNode::DoWhile {
+                    body, condition, ..
+                } => {
+                    Self::collect_cpp_special_this_aliases(body, aliases, changed);
+                    Self::collect_cpp_special_this_aliases_from_expr(condition, aliases, changed);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(expr) = init {
+                        Self::collect_cpp_special_this_aliases_from_expr(expr, aliases, changed);
+                    }
+                    Self::collect_cpp_special_this_aliases_from_expr(condition, aliases, changed);
+                    if let Some(expr) = update {
+                        Self::collect_cpp_special_this_aliases_from_expr(expr, aliases, changed);
+                    }
+                    Self::collect_cpp_special_this_aliases(body, aliases, changed);
+                }
+                StructuredNode::Loop { body, .. } => {
+                    Self::collect_cpp_special_this_aliases(body, aliases, changed);
+                }
+                StructuredNode::Return(Some(expr)) | StructuredNode::Expr(expr) => {
+                    Self::collect_cpp_special_this_aliases_from_expr(expr, aliases, changed);
+                }
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    Self::collect_cpp_special_this_aliases_from_expr(value, aliases, changed);
+                    for (_, body) in cases {
+                        Self::collect_cpp_special_this_aliases(body, aliases, changed);
+                    }
+                    if let Some(nodes) = default {
+                        Self::collect_cpp_special_this_aliases(nodes, aliases, changed);
+                    }
+                }
+                StructuredNode::Sequence(nodes) => {
+                    Self::collect_cpp_special_this_aliases(nodes, aliases, changed);
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    Self::collect_cpp_special_this_aliases(try_body, aliases, changed);
+                    for handler in catch_handlers {
+                        Self::collect_cpp_special_this_aliases(&handler.body, aliases, changed);
+                    }
+                }
+                StructuredNode::Return(None)
+                | StructuredNode::Break
+                | StructuredNode::Continue
+                | StructuredNode::Goto(_)
+                | StructuredNode::Label(_) => {}
+            }
+        }
+    }
+
+    fn collect_cpp_special_this_aliases_from_expr(
+        expr: &Expr,
+        aliases: &mut HashSet<String>,
+        changed: &mut bool,
+    ) {
+        match &expr.kind {
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                if let (Some(lhs_name), Some(rhs_name)) = (
+                    Self::expr_identifier_name(lhs),
+                    Self::expr_identifier_name(rhs),
+                ) {
+                    if aliases.contains(rhs_name.as_str()) && aliases.insert(lhs_name) {
+                        *changed = true;
+                    }
+                }
+                Self::collect_cpp_special_this_aliases_from_expr(lhs, aliases, changed);
+                Self::collect_cpp_special_this_aliases_from_expr(rhs, aliases, changed);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                Self::collect_cpp_special_this_aliases_from_expr(left, aliases, changed);
+                Self::collect_cpp_special_this_aliases_from_expr(right, aliases, changed);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                Self::collect_cpp_special_this_aliases_from_expr(operand, aliases, changed);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                Self::collect_cpp_special_this_aliases_from_expr(base, aliases, changed);
+                Self::collect_cpp_special_this_aliases_from_expr(index, aliases, changed);
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                Self::collect_cpp_special_this_aliases_from_expr(base, aliases, changed);
+            }
+            ExprKind::Call { target, args } => {
+                match target {
+                    expression::CallTarget::Indirect(expr) => {
+                        Self::collect_cpp_special_this_aliases_from_expr(expr, aliases, changed);
+                    }
+                    expression::CallTarget::IndirectGot { expr, .. } => {
+                        Self::collect_cpp_special_this_aliases_from_expr(expr, aliases, changed);
+                    }
+                    expression::CallTarget::Direct { .. } | expression::CallTarget::Named(_) => {}
+                }
+                for arg in args {
+                    Self::collect_cpp_special_this_aliases_from_expr(arg, aliases, changed);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_cpp_special_this_aliases_from_expr(cond, aliases, changed);
+                Self::collect_cpp_special_this_aliases_from_expr(then_expr, aliases, changed);
+                Self::collect_cpp_special_this_aliases_from_expr(else_expr, aliases, changed);
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    Self::collect_cpp_special_this_aliases_from_expr(value, aliases, changed);
+                }
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                Self::collect_cpp_special_this_aliases_from_expr(display_expr, aliases, changed);
+            }
+            ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => {}
+        }
+    }
+
+    fn expr_identifier_name(expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Var(var) => Some(var.name.clone()),
+            ExprKind::Unknown(name) => Some(name.clone()),
+            ExprKind::Deref { addr, .. } => Self::stack_slot_identifier_name(addr),
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => Self::stack_slot_identifier_name_from_array(base, index, *element_size),
+            ExprKind::Cast { expr, .. } => Self::expr_identifier_name(expr),
+            _ => None,
+        }
+    }
+
+    fn stack_slot_identifier_name(addr: &Expr) -> Option<String> {
+        match &addr.kind {
+            ExprKind::Var(base) if matches!(base.name.as_str(), "sp" | "rsp") => {
+                Some("var_0".to_string())
+            }
+            ExprKind::BinOp { op, left, right } => {
+                let ExprKind::Var(base) = &left.kind else {
+                    return None;
+                };
+                let ExprKind::IntLit(offset) = &right.kind else {
+                    return None;
+                };
+                let actual_offset = match op {
+                    BinOpKind::Add => *offset,
+                    BinOpKind::Sub => -*offset,
+                    _ => return None,
+                };
+                Self::stack_slot_name_from_base_and_offset(&base.name, actual_offset)
+            }
+            _ => None,
+        }
+    }
+
+    fn stack_slot_identifier_name_from_array(
+        base: &Expr,
+        index: &Expr,
+        element_size: usize,
+    ) -> Option<String> {
+        let ExprKind::Var(base_var) = &base.kind else {
+            return None;
+        };
+        let ExprKind::IntLit(slot_index) = &index.kind else {
+            return None;
+        };
+        let actual_offset = *slot_index * element_size as i128;
+        Self::stack_slot_name_from_base_and_offset(&base_var.name, actual_offset)
+    }
+
+    fn stack_slot_name_from_base_and_offset(
+        base_name: &str,
+        actual_offset: i128,
+    ) -> Option<String> {
+        if matches!(base_name, "rbp" | "x29") {
+            if actual_offset < 0 {
+                return Some(format!("local_{:x}", (-actual_offset) as u128));
+            }
+            if actual_offset > 0 {
+                return Some(format!("arg_{:x}", actual_offset as u128));
+            }
+        } else if matches!(base_name, "rsp" | "sp") && actual_offset >= 0 {
+            return Some(format!("var_{:x}", actual_offset as u128));
+        }
+        None
+    }
+
+    fn seed_cpp_special_type_info(
+        &self,
+        body: &[StructuredNode],
+        merged_types: &mut HashMap<String, String>,
+    ) {
+        let Some(this_type) = self.cpp_special_this_type() else {
+            return;
+        };
+
+        let mut aliases = HashSet::from([
+            "arg0".to_string(),
+            self.calling_convention.integer_arg_registers()[0].to_string(),
+            self.calling_convention.integer_arg_registers_32()[0].to_string(),
+            "this".to_string(),
+            "arg_8".to_string(),
+            "arg_0x8".to_string(),
+            "local_8".to_string(),
+            "local_0x8".to_string(),
+            "stack_-8".to_string(),
+        ]);
+
+        loop {
+            let mut changed = false;
+            Self::collect_cpp_special_this_aliases(body, &mut aliases, &mut changed);
+            if !changed {
+                break;
+            }
+        }
+
+        for alias in aliases {
+            merged_types.insert(alias, this_type.clone());
+        }
+    }
+
+    fn cpp_special_explicit_param_count(
+        &self,
+        func_name: &str,
+        class_name: Option<&str>,
+    ) -> Option<usize> {
+        let class_name = class_name?.trim();
+        let open_idx = func_name.find('(')?;
+        let close_idx = func_name[open_idx..].find(')')? + open_idx;
+        let qualified = func_name[..open_idx].trim();
+        let (_, member_name) = qualified.rsplit_once("::")?;
+        let simple_name = class_name.rsplit("::").next().unwrap_or(class_name);
+        if member_name != simple_name && member_name != format!("~{}", simple_name) {
+            return None;
+        }
+
+        let params = func_name[open_idx + 1..close_idx].trim();
+        if params.is_empty() || params == "void" {
+            return Some(0);
+        }
+
+        let mut count = 1usize;
+        let mut angle_depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        for ch in params.chars() {
+            match ch {
+                '<' => angle_depth += 1,
+                '>' => angle_depth = angle_depth.saturating_sub(1),
+                '(' => paren_depth += 1,
+                ')' => paren_depth = paren_depth.saturating_sub(1),
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                ',' if angle_depth == 0 && paren_depth == 0 && bracket_depth == 0 => count += 1,
+                _ => {}
+            }
+        }
+
+        Some(count)
+    }
+
+    fn adjusted_cpp_special_signature(
+        &self,
+        cfg: &ControlFlowGraph,
+        func_name: &str,
+    ) -> Option<FunctionSignature> {
+        let analysis = self.cpp_special_member.as_ref()?;
+        let kind = analysis.kind.as_ref()?;
+        if !matches!(
+            kind,
+            crate::cpp_special::SpecialMemberKind::Constructor { .. }
+                | crate::cpp_special::SpecialMemberKind::Destructor { .. }
+        ) {
+            return None;
+        }
+
+        let mut signature = self.recover_signature(cfg);
+        let this_reg = self.calling_convention.integer_arg_registers()[0];
+        if signature.parameters.is_empty() {
+            signature.parameters.push(Parameter::from_int_register(
+                0,
+                this_reg,
+                ParamType::Pointer,
+            ));
+        }
+        if let Some(first_param) = signature.parameters.first_mut() {
+            first_param.name = "this".to_string();
+            if !matches!(
+                first_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ) {
+                first_param.param_type = ParamType::Pointer;
+            }
+        }
+
+        if let Some(explicit_count) =
+            self.cpp_special_explicit_param_count(func_name, analysis.class_name.as_deref())
+        {
+            let expected_count = explicit_count + 1;
+            if signature.parameters.len() > expected_count {
+                signature.parameters.truncate(expected_count);
+                signature
+                    .parameter_provenance
+                    .retain(|index, _| *index < expected_count);
+            }
+        }
+
+        Some(signature)
     }
 
     /// Extracts type hints from inter-procedural analysis.

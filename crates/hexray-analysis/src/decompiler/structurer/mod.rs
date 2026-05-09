@@ -1104,6 +1104,56 @@ impl<'a> Structurer<'a> {
         None
     }
 
+    fn is_stack_canary_fail_block(
+        &self,
+        block_id: BasicBlockId,
+        normal_target: BasicBlockId,
+    ) -> bool {
+        let Some(block) = self.cfg.block(block_id) else {
+            return false;
+        };
+        let Some(call_inst) = block.instructions.last() else {
+            return false;
+        };
+        let ControlFlow::Call { target, .. } = &call_inst.control_flow else {
+            return false;
+        };
+        let Some(name) = self.known_noreturn_targets.get(target) else {
+            return false;
+        };
+        if !name.contains("stack_chk_fail") {
+            return false;
+        }
+        if !matches!(
+            block.terminator,
+            BlockTerminator::Call { return_block, .. } if return_block == normal_target
+        ) && !matches!(
+            block.terminator,
+            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target }
+                if target == normal_target
+        ) {
+            return false;
+        }
+
+        block.instructions[..block.instructions.len().saturating_sub(1)]
+            .iter()
+            .all(|inst| !inst.is_branch() && inst.operation != Operation::Syscall)
+    }
+
+    fn stack_canary_probe_normal_target(
+        &self,
+        true_target: BasicBlockId,
+        false_target: BasicBlockId,
+    ) -> Option<(BasicBlockId, BasicBlockId)> {
+        if self.is_stack_canary_fail_block(true_target, false_target) {
+            return Some((true_target, false_target));
+        }
+        if self.is_stack_canary_fail_block(false_target, true_target) {
+            return Some((false_target, true_target));
+        }
+        None
+    }
+
     fn asan_probe_setup_end_index(
         &self,
         block: &BasicBlock,
@@ -1525,6 +1575,77 @@ impl<'a> Structurer<'a> {
                         self.processed.insert(report_target);
                         current = Some(normal_target);
                         continue;
+                    }
+                    if let Some((handler_target, normal_target)) =
+                        self.stack_canary_probe_normal_target(*true_target, *false_target)
+                    {
+                        let Some(normal_block) = self.cfg.block(normal_target) else {
+                            break;
+                        };
+                        self.processed.insert(handler_target);
+                        self.processed.insert(normal_target);
+
+                        let mut merged_statements = statements.clone();
+                        let mut normal_statements = self.block_to_statements(normal_target);
+                        trim_trailing_epilogue_statements(&mut normal_statements);
+                        merged_statements.append(&mut normal_statements);
+                        let merged_range = (block.start, normal_block.end);
+
+                        match &normal_block.terminator {
+                            BlockTerminator::Return => {
+                                let (mut filtered_stmts, return_value) =
+                                    extract_return_value(merged_statements);
+                                let implicit_return = return_value
+                                    .is_none()
+                                    .then(|| {
+                                        self.implicit_return_register_expr_for_block(normal_target)
+                                    })
+                                    .flatten();
+                                if matches!(
+                                    implicit_return,
+                                    Some(Expr {
+                                        kind: ExprKind::Call { .. }
+                                    })
+                                ) && matches!(
+                                    filtered_stmts.last(),
+                                    Some(Expr {
+                                        kind: ExprKind::Call { .. },
+                                    })
+                                ) {
+                                    filtered_stmts.pop();
+                                }
+                                let return_value = return_value.or(implicit_return);
+
+                                if !filtered_stmts.is_empty() {
+                                    result.push(StructuredNode::Block {
+                                        id: block_id,
+                                        statements: filtered_stmts,
+                                        address_range: merged_range,
+                                    });
+                                }
+                                result.push(StructuredNode::Return(return_value));
+                                break;
+                            }
+                            BlockTerminator::Jump { target }
+                            | BlockTerminator::Fallthrough { target } => {
+                                if self.can_inline_ubsan_continuation(
+                                    block_id,
+                                    handler_target,
+                                    normal_target,
+                                ) {
+                                    if !merged_statements.is_empty() {
+                                        result.push(StructuredNode::Block {
+                                            id: block_id,
+                                            statements: merged_statements,
+                                            address_range: merged_range,
+                                        });
+                                    }
+                                    current = Some(*target);
+                                    continue;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     if let Some((handler_target, normal_target)) =
                         self.ubsan_probe_normal_target(*true_target, *false_target)
@@ -6096,6 +6217,97 @@ mod tests {
         assert!(
             structurer.processed.contains(&BasicBlockId::new(1)),
             "UBSan handler block should be marked processed"
+        );
+    }
+
+    #[test]
+    fn test_structure_elides_stack_canary_fail_branch_and_keeps_return_value() {
+        use hexray_core::basic_block::CallTarget as BlockCallTarget;
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let ebx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x2000);
+        let mut save_value = Instruction::new(0x2000, 2, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(ebx), Operand::Register(edi)]);
+        save_value.reads = vec![edi];
+        save_value.writes = vec![ebx];
+        bb0.instructions.push(save_value);
+
+        let mut move_ret = Instruction::new(0x2002, 2, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(eax), Operand::Register(ebx)]);
+        move_ret.reads = vec![ebx];
+        move_ret.writes = vec![eax];
+        bb0.instructions.push(move_ret);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut handler = BasicBlock::new(BasicBlockId::new(1), 0x2010);
+        handler.instructions.push(
+            Instruction::new(0x2010, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x5000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x5000,
+                    return_addr: 0x2015,
+                }),
+        );
+        handler.terminator = BlockTerminator::Call {
+            target: BlockCallTarget::Direct(0x5000),
+            return_block: BasicBlockId::new(2),
+        };
+        cfg.add_block(handler);
+
+        let mut cont = BasicBlock::new(BasicBlockId::new(2), 0x2020);
+        cont.instructions.push(
+            Instruction::new(0x2020, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        cont.terminator = BlockTerminator::Return;
+        cfg.add_block(cont);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        let mut structurer = Structurer::new_with_binary_data_annotations_and_known_targets(
+            &cfg,
+            None,
+            StructuringAnnotations::default(),
+            HashMap::from([(0x5000, "__stack_chk_fail@plt".to_string())]),
+            HashMap::new(),
+        );
+        let structured = structurer.structure();
+
+        assert!(
+            structured
+                .iter()
+                .all(|node| !matches!(node, StructuredNode::If { .. })),
+            "stack canary branch should be elided, got {structured:?}"
+        );
+        assert!(
+            structured.iter().any(|node| matches!(
+                node,
+                StructuredNode::Return(Some(Expr {
+                    kind: ExprKind::Var(var)
+                })) if var.name == "eax" || var.name == "rbx"
+            )),
+            "expected return value to be preserved, got {structured:?}"
+        );
+        assert!(
+            structurer.processed.contains(&BasicBlockId::new(1)),
+            "stack canary fail block should be marked processed"
         );
     }
 

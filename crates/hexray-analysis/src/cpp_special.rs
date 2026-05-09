@@ -190,7 +190,11 @@ impl CppSpecialDetector {
 
     /// Analyzes a symbol name for constructor/destructor patterns.
     pub fn analyze_symbol(&self, symbol: &str) -> Option<(SpecialMemberKind, String)> {
-        // Check for Itanium C++ ABI mangling
+        self.analyze_mangled_symbol(symbol)
+            .or_else(|| self.analyze_demangled_symbol(symbol))
+    }
+
+    fn analyze_mangled_symbol(&self, symbol: &str) -> Option<(SpecialMemberKind, String)> {
         if !symbol.starts_with("_ZN") {
             return None;
         }
@@ -246,6 +250,37 @@ impl CppSpecialDetector {
                 };
                 return Some((kind, class_name));
             }
+        }
+
+        None
+    }
+
+    fn analyze_demangled_symbol(&self, symbol: &str) -> Option<(SpecialMemberKind, String)> {
+        if !symbol.contains('(') {
+            return None;
+        }
+        let qualified = symbol.split('(').next().unwrap_or(symbol).trim();
+        let (class_name, member_name) = qualified.rsplit_once("::")?;
+        let simple_name = class_name.rsplit("::").next().unwrap_or(class_name);
+
+        if member_name == simple_name {
+            return Some((
+                SpecialMemberKind::Constructor {
+                    is_complete: true,
+                    is_allocating: false,
+                },
+                class_name.to_string(),
+            ));
+        }
+
+        if member_name == format!("~{}", simple_name) {
+            return Some((
+                SpecialMemberKind::Destructor {
+                    is_deleting: false,
+                    is_complete: true,
+                },
+                class_name.to_string(),
+            ));
         }
 
         None
@@ -1107,6 +1142,40 @@ mod tests {
 
         let result = detector.analyze_symbol("_ZN5ShapeC1EPKc"); // const char* param
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_analyze_demangled_constructor_symbol() {
+        let detector = CppSpecialDetector::new();
+        let (kind, class_name) = detector
+            .analyze_symbol("Circle::Circle(int)")
+            .expect("expected demangled constructor match");
+
+        assert_eq!(
+            kind,
+            SpecialMemberKind::Constructor {
+                is_complete: true,
+                is_allocating: false,
+            }
+        );
+        assert_eq!(class_name, "Circle");
+    }
+
+    #[test]
+    fn test_analyze_demangled_destructor_symbol() {
+        let detector = CppSpecialDetector::new();
+        let (kind, class_name) = detector
+            .analyze_symbol("ns::Circle::~Circle()")
+            .expect("expected demangled destructor match");
+
+        assert_eq!(
+            kind,
+            SpecialMemberKind::Destructor {
+                is_deleting: false,
+                is_complete: true,
+            }
+        );
+        assert_eq!(class_name, "ns::Circle");
     }
 
     #[test]

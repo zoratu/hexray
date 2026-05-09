@@ -7,6 +7,14 @@ use std::collections::HashSet;
 pub fn is_noreturn_function_name(name: &str) -> bool {
     // Mach-O, PLT, and thunk symbols often grow one or more leading underscores.
     let name = name.trim_start_matches('_');
+    let name = name
+        .split_once("@plt")
+        .map(|(base, _)| base)
+        .unwrap_or(name);
+    let name = name
+        .split_once("@@")
+        .map(|(base, _)| base)
+        .unwrap_or_else(|| name.split('@').next().unwrap_or(name));
 
     is_asan_report_function(name)
         || matches!(
@@ -66,6 +74,17 @@ mod tests {
     #[test]
     fn matches_macho_prefixed_names() {
         for name in ["_exit", "__assert_rtn", "_abort", "__stack_chk_fail"] {
+            assert!(is_noreturn_function_name(name), "{name} should be noreturn");
+        }
+    }
+
+    #[test]
+    fn matches_versioned_and_plt_noreturn_names() {
+        for name in [
+            "__stack_chk_fail@GLIBC_2.4",
+            "__stack_chk_fail@GLIBC_2.4@plt",
+            "__fortify_fail@plt",
+        ] {
             assert!(is_noreturn_function_name(name), "{name} should be noreturn");
         }
     }

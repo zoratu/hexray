@@ -67,10 +67,14 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     let mut return_value = None;
     let mut indices_to_remove = Vec::new();
     let mut saw_real_call_after = false;
+    let mut saw_stack_canary_after = false;
 
     // Search backwards for an assignment to a return register, collecting epilogue statements
     for i in (0..statements.len()).rev() {
         let stmt = &statements[i];
+        if expr_mentions_stack_canary_guard(stmt) {
+            saw_stack_canary_after = true;
+        }
 
         if statement_contains_real_call(stmt) {
             saw_real_call_after = true;
@@ -99,6 +103,11 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     );
                     indices_to_remove.push(i);
                     break;
+                }
+
+                if saw_stack_canary_after {
+                    indices_to_remove.push(i);
+                    continue;
                 }
 
                 // ARM64 epilogue: frame pointer (x29) and link register (x30) restoration
@@ -173,6 +182,48 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     }
 
     (statements, return_value)
+}
+
+fn expr_mentions_stack_canary_guard(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(v) => v.name.contains("stack_chk_guard"),
+        ExprKind::Unknown(name) => name.contains("stack_chk_guard"),
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_mentions_stack_canary_guard(left) || expr_mentions_stack_canary_guard(right),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_mentions_stack_canary_guard(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_mentions_stack_canary_guard(base) || expr_mentions_stack_canary_guard(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_mentions_stack_canary_guard(base),
+        ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+            args.iter().any(expr_mentions_stack_canary_guard)
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_mentions_stack_canary_guard(cond)
+                || expr_mentions_stack_canary_guard(then_expr)
+                || expr_mentions_stack_canary_guard(else_expr)
+        }
+        ExprKind::GotRef { display_expr, .. } => expr_mentions_stack_canary_guard(display_expr),
+        ExprKind::IntLit(_) => false,
+    }
 }
 
 /// Simplifies statements by performing copy propagation on temporary registers.
@@ -2456,21 +2507,34 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
     // Track argument register values and their statement indices
     let mut arg_values: HashMap<String, (usize, Expr)> = HashMap::new();
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
+    let mut call_target_values: HashMap<String, Expr> = HashMap::new();
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for (i, stmt) in statements.into_iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            let substituted_lhs = substitute_assignment_lhs(lhs, &reg_values);
             let tracked_rhs = substitute_vars(rhs, &reg_values);
 
             if let ExprKind::Var(v) = &lhs.kind {
+                let written_aliases: HashSet<String> =
+                    get_register_aliases(&v.name).into_iter().collect();
+                invalidate_dependent_register_values(&mut reg_values, &written_aliases);
+                invalidate_dependent_arg_values(&mut arg_values, &written_aliases);
+                invalidate_written_call_target_values(&mut call_target_values, &written_aliases);
+
                 if is_temp_register(&v.name) {
-                    for alias in get_register_aliases(&v.name) {
-                        reg_values.insert(alias, tracked_rhs.clone());
+                    for alias in &written_aliases {
+                        reg_values.insert(alias.clone(), tracked_rhs.clone());
+                        call_target_values.insert(alias.clone(), tracked_rhs.clone());
                     }
                 }
 
                 if get_arg_register_index(&v.name).is_some() {
+                    for alias in &written_aliases {
+                        reg_values.insert(alias.clone(), tracked_rhs.clone());
+                        call_target_values.insert(alias.clone(), tracked_rhs.clone());
+                    }
                     // If one ABI argument register is only staging a value into another
                     // argument register, keep the destination but drop the staged source.
                     if let ExprKind::Var(src_var) = &rhs.kind {
@@ -2484,43 +2548,62 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
                     }
 
                     // Track this argument value along with its statement index.
-                    arg_values.insert(v.name.clone(), (i, tracked_rhs.clone()));
+                    arg_values.insert(v.name.to_lowercase(), (i, tracked_rhs.clone()));
                     result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
                 }
             }
 
-            result.push(stmt);
+            forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
+            result.push(Expr::assign(substituted_lhs, tracked_rhs));
             continue;
         }
 
         if let ExprKind::CompoundAssign { op, lhs, rhs } = &stmt.kind {
+            let substituted_lhs = substitute_assignment_lhs(lhs, &reg_values);
             let tracked_rhs = substitute_vars(rhs, &reg_values);
 
             if let ExprKind::Var(v) = &lhs.kind {
+                let written_aliases: HashSet<String> =
+                    get_register_aliases(&v.name).into_iter().collect();
+                invalidate_dependent_register_values(&mut reg_values, &written_aliases);
+                invalidate_dependent_arg_values(&mut arg_values, &written_aliases);
+                invalidate_written_call_target_values(&mut call_target_values, &written_aliases);
+
                 if is_temp_register(&v.name) {
                     let current = reg_values
                         .get(&v.name)
                         .cloned()
                         .unwrap_or_else(|| (**lhs).clone());
-                    let new_val = Expr::binop(*op, current, tracked_rhs);
-                    for alias in get_register_aliases(&v.name) {
-                        reg_values.insert(alias, new_val.clone());
+                    let new_val = Expr::binop(*op, current, tracked_rhs.clone());
+                    for alias in &written_aliases {
+                        reg_values.insert(alias.clone(), new_val.clone());
+                        call_target_values.insert(alias.clone(), new_val.clone());
                     }
                 }
                 if get_arg_register_index(&v.name).is_some() {
-                    arg_values.remove(&v.name);
+                    for alias in &written_aliases {
+                        reg_values.remove(alias);
+                    }
+                    arg_values.remove(&v.name.to_lowercase());
                 }
             }
 
-            result.push(stmt);
+            forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
+            result.push(Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: *op,
+                    lhs: Box::new(substituted_lhs),
+                    rhs: Box::new(tracked_rhs),
+                },
+            });
             continue;
         }
 
         // Check if this is an assignment to an argument register
         // Check if this is a function call (not push/pop/syscall/etc.)
         if let ExprKind::Call { target, args } = &stmt.kind {
-            let substituted_target = substitute_call_target(target.clone(), &reg_values);
+            let substituted_target = substitute_call_target(target.clone(), &call_target_values);
             if is_real_function_call(target) {
                 let excluded_arg_regs = collect_target_argument_registers(target);
                 // Try to extract arguments from tracked registers
@@ -2536,6 +2619,7 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
                     // Clear argument tracking after the call
                     arg_values.clear();
                     reg_values.clear();
+                    call_target_values.clear();
                     continue;
                 }
 
@@ -2543,6 +2627,7 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
                 result.push(Expr::call(substituted_target, substituted_args.collect()));
                 arg_values.clear();
                 reg_values.clear();
+                call_target_values.clear();
                 continue;
             }
         }
@@ -2570,6 +2655,7 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
         }
 
         // Pass through other statements
+        forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
         result.push(stmt);
     }
 
@@ -2580,6 +2666,153 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
         .filter(|(idx, _)| !to_remove.contains(idx))
         .map(|(_, stmt)| stmt)
         .collect()
+}
+
+fn substitute_assignment_lhs(lhs: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
+    use super::super::expression::ExprKind;
+
+    match &lhs.kind {
+        ExprKind::Var(_) => lhs.clone(),
+        _ => substitute_vars(lhs, reg_values),
+    }
+}
+
+fn invalidate_written_call_target_values(
+    call_target_values: &mut HashMap<String, Expr>,
+    written_aliases: &HashSet<String>,
+) {
+    call_target_values.retain(|alias, _| !written_aliases.contains(alias));
+}
+
+fn invalidate_dependent_register_values(
+    reg_values: &mut HashMap<String, Expr>,
+    written_aliases: &HashSet<String>,
+) {
+    reg_values.retain(|alias, expr| {
+        !written_aliases.contains(alias) && !expr_uses_any_register_alias(expr, written_aliases)
+    });
+}
+
+fn invalidate_dependent_arg_values(
+    arg_values: &mut HashMap<String, (usize, Expr)>,
+    written_aliases: &HashSet<String>,
+) {
+    arg_values.retain(|alias, (_, expr)| {
+        !written_aliases.contains(alias) && !expr_uses_any_register_alias(expr, written_aliases)
+    });
+}
+
+fn expr_uses_any_register_alias(expr: &Expr, aliases: &HashSet<String>) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(v) => get_register_aliases(&v.name)
+            .into_iter()
+            .any(|alias| aliases.contains(&alias)),
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => {
+            expr_uses_any_register_alias(left, aliases)
+                || expr_uses_any_register_alias(right, aliases)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => {
+            expr_uses_any_register_alias(operand, aliases)
+        }
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_uses_any_register_alias(base, aliases)
+                || expr_uses_any_register_alias(index, aliases)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_uses_any_register_alias(base, aliases),
+        ExprKind::Call { args, .. } | ExprKind::Phi(args) => args
+            .iter()
+            .any(|arg| expr_uses_any_register_alias(arg, aliases)),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_uses_any_register_alias(cond, aliases)
+                || expr_uses_any_register_alias(then_expr, aliases)
+                || expr_uses_any_register_alias(else_expr, aliases)
+        }
+        ExprKind::GotRef { display_expr, .. } => {
+            expr_uses_any_register_alias(display_expr, aliases)
+        }
+        ExprKind::Unknown(_) | ExprKind::IntLit(_) => false,
+    }
+}
+
+fn forget_pending_arg_values_from_expr(
+    expr: &Expr,
+    arg_values: &mut HashMap<String, (usize, Expr)>,
+) {
+    use super::super::expression::ExprKind;
+
+    fn walk(expr: &Expr, consumed: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Var(v) => {
+                if get_arg_register_index(&v.name).is_some() {
+                    consumed.insert(v.name.to_lowercase());
+                }
+            }
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                walk(left, consumed);
+                walk(right, consumed);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => walk(operand, consumed),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                walk(base, consumed);
+                walk(index, consumed);
+            }
+            ExprKind::FieldAccess { base, .. } => walk(base, consumed),
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+                for arg in args {
+                    walk(arg, consumed);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                walk(cond, consumed);
+                walk(then_expr, consumed);
+                walk(else_expr, consumed);
+            }
+            ExprKind::GotRef { display_expr, .. } => walk(display_expr, consumed),
+            ExprKind::Unknown(_) | ExprKind::IntLit(_) => {}
+        }
+    }
+
+    let mut consumed = HashSet::new();
+    walk(expr, &mut consumed);
+    for reg in consumed {
+        arg_values.remove(&reg);
+    }
 }
 
 fn substitute_call_target(
@@ -4144,6 +4377,27 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_return_value_skips_stack_canary_compare_setup() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("ebx", 4)),
+            Expr::assign(reg("rdx", 8), Expr::unknown("local_18")),
+            Expr::assign(
+                reg("rdx", 8),
+                Expr::binop(
+                    BinOpKind::Sub,
+                    reg("rdx", 8),
+                    Expr::unknown("__stack_chk_guard"),
+                ),
+            ),
+        ];
+
+        let (filtered, return_value) = extract_return_value(statements);
+
+        assert!(filtered.is_empty(), "canary setup should be stripped");
+        assert_eq!(format!("{}", return_value.expect("return value")), "ebx");
+    }
+
+    #[test]
     fn test_simplify_statements_keeps_register_value_live_into_following_return() {
         let nodes = vec![
             block(0, vec![Expr::assign(reg("eax", 4), Expr::int(7))]),
@@ -4288,6 +4542,31 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rdi", "rsi", "0x40"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_drops_pending_arg_after_non_call_use() {
+        let statements = vec![
+            Expr::assign(reg("edx", 4), Expr::int(0x402070)),
+            Expr::assign(Expr::deref(reg("rax", 8), 8), reg("edx", 4)),
+            Expr::assign(reg("rdi", 8), reg("rax", 8)),
+            Expr::call(CallTarget::Named("Shape::~Shape()".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(format!("{}", propagated[1]), "*(uint64_t*)(rax) = 0x402070");
+
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rax"]
         );
     }
 

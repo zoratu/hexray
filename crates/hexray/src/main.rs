@@ -2136,6 +2136,73 @@ fn disassemble_for_cfg<D: Disassembler>(
     instructions
 }
 
+struct DecompileTargetInfo {
+    start_addr: u64,
+    name: String,
+    max_bytes: usize,
+    stop_after_first_return: bool,
+}
+
+fn decompile_target_info_for_address(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    addr: u64,
+) -> DecompileTargetInfo {
+    let exact_symbol = fmt.symbol_at(addr).filter(|symbol| symbol.is_function());
+    let name = project
+        .and_then(|p| p.get_function_name(addr))
+        .map(|n| n.to_string())
+        .or_else(|| exact_symbol.map(|symbol| demangle_or_original(&symbol.name)))
+        .unwrap_or_else(|| format!("sub_{:x}", addr));
+    let max_bytes = exact_symbol
+        .map(|symbol| {
+            if symbol.size > 0 {
+                symbol.size as usize
+            } else {
+                4096
+            }
+        })
+        .unwrap_or(4096);
+    let stop_after_first_return = exact_symbol.map_or(true, |symbol| symbol.size == 0);
+
+    DecompileTargetInfo {
+        start_addr: addr,
+        name,
+        max_bytes,
+        stop_after_first_return,
+    }
+}
+
+fn resolve_decompile_target_info(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    target: &str,
+    relocation_table: &RelocationTable,
+) -> Result<DecompileTargetInfo> {
+    match resolve_analysis_target_with_entry_main(fmt, project, target, relocation_table)? {
+        ResolvedAnalysisTarget::Address(addr) => {
+            Ok(decompile_target_info_for_address(fmt, project, addr))
+        }
+        ResolvedAnalysisTarget::Symbol(symbol) => {
+            let max_bytes = if symbol.size > 0 {
+                symbol.size as usize
+            } else {
+                4096usize
+            };
+            let name = project
+                .and_then(|p| p.get_function_name(symbol.address))
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| demangle_or_original(&symbol.name));
+            Ok(DecompileTargetInfo {
+                start_addr: symbol.address,
+                name,
+                max_bytes,
+                stop_after_first_return: symbol.size == 0,
+            })
+        }
+    }
+}
+
 fn decompile_function(
     binary: &Binary,
     target: &str,
@@ -2148,34 +2215,17 @@ fn decompile_function(
     let fmt = binary.as_format();
     let relocation_table = build_relocation_table(binary);
 
-    let (start_addr, name, max_bytes, stop_after_first_return) =
-        match resolve_analysis_target_with_entry_main(fmt, project, target, &relocation_table) {
-            Ok(ResolvedAnalysisTarget::Address(addr)) => {
-                let name = project
-                    .and_then(|p| p.get_function_name(addr))
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| format!("sub_{:x}", addr));
-                (addr, name, 4096usize, true)
-            }
-            Ok(ResolvedAnalysisTarget::Symbol(symbol)) => {
-                let max_bytes = if symbol.size > 0 {
-                    symbol.size as usize
-                } else {
-                    4096usize
-                };
-                let name = project
-                    .and_then(|p| p.get_function_name(symbol.address))
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| demangle_or_original(&symbol.name));
-                (symbol.address, name, max_bytes, symbol.size == 0)
-            }
-            Err(_) => {
-                bail!(
-                    "Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).",
-                    target
-                )
-            }
-        };
+    let DecompileTargetInfo {
+        start_addr,
+        name,
+        max_bytes,
+        stop_after_first_return,
+    } = resolve_decompile_target_info(fmt, project, target, &relocation_table).map_err(|_| {
+        anyhow::anyhow!(
+            "Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).",
+            target
+        )
+    })?;
 
     // Validate the address is reasonable
     if start_addr == 0 {
@@ -2280,6 +2330,7 @@ fn decompile_function(
         .with_constant_database(const_db)
         .with_struct_inference(true)
         .with_calling_convention(calling_convention);
+    decompiler = decompiler.analyze_cpp_special(&cfg, &instructions, Some(&name));
     if let Some(info) = binary.exception_info_for_function(start_addr, start_addr) {
         decompiler = decompiler.with_exception_info(info);
     }
@@ -4310,23 +4361,9 @@ fn decompile_with_follow(
     // Queue of (address, name, depth) to decompile
     let mut queue: Vec<(u64, String, usize)> = Vec::new();
 
-    let (start_addr, name) =
-        match resolve_analysis_target_with_entry_main(fmt, project, target, &relocation_table)? {
-            ResolvedAnalysisTarget::Address(addr) => {
-                let name = project
-                    .and_then(|p| p.get_function_name(addr))
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| format!("sub_{:x}", addr));
-                (addr, name)
-            }
-            ResolvedAnalysisTarget::Symbol(symbol) => {
-                let name = project
-                    .and_then(|p| p.get_function_name(symbol.address))
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| demangle_or_original(&symbol.name));
-                (symbol.address, name)
-            }
-        };
+    let DecompileTargetInfo {
+        start_addr, name, ..
+    } = resolve_decompile_target_info(fmt, project, target, &relocation_table)?;
 
     queue.push((start_addr, name, 0));
 
@@ -4383,7 +4420,13 @@ fn decompile_with_follow(
         );
 
         // Disassemble
-        let bytes = match fmt.bytes_at(func_addr, 4096) {
+        let DecompileTargetInfo {
+            max_bytes,
+            stop_after_first_return,
+            ..
+        } = decompile_target_info_for_address(fmt, project, func_addr);
+
+        let bytes = match fmt.bytes_at(func_addr, max_bytes) {
             Some(b) => b,
             None => continue,
         };
@@ -4391,19 +4434,19 @@ fn decompile_with_follow(
         let mut instructions = match arch {
             Architecture::X86_64 | Architecture::X86 => {
                 let disasm = X86_64Disassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
             }
             Architecture::Arm64 => {
                 let disasm = Arm64Disassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
             }
             Architecture::RiscV64 => {
                 let disasm = RiscVDisassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
             }
             Architecture::RiscV32 => {
                 let disasm = RiscVDisassembler::new_rv32();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, true)
+                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
             }
             _ => continue,
         };
@@ -4438,6 +4481,7 @@ fn decompile_with_follow(
             .with_constant_database(const_db.clone())
             .with_struct_inference(true)
             .with_calling_convention(calling_convention);
+        decompiler = decompiler.analyze_cpp_special(&cfg, &instructions, Some(&func_name));
         if let Some(info) = binary.exception_info_for_function(func_addr, func_addr) {
             decompiler = decompiler.with_exception_info(info);
         }
@@ -7928,6 +7972,35 @@ mod tests {
                 panic!("resolved {address:#x} instead of the normalized TLS symbol")
             }
         }
+    }
+
+    #[test]
+    fn decompile_address_queries_reuse_exact_function_symbol_bounds() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401000,
+                data: vec![0; 0x100],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![Symbol {
+                name: "_Z10total_areaPP5Shapei".to_string(),
+                address: 0x401040,
+                size: 0x49,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            }],
+            entry_point: None,
+        };
+
+        let info = super::decompile_target_info_for_address(&binary, None, 0x401040);
+
+        assert_eq!(info.start_addr, 0x401040);
+        assert_eq!(info.name, "total_area(Shape**, int)");
+        assert_eq!(info.max_bytes, 0x49);
+        assert!(!info.stop_after_first_return);
     }
 
     #[test]
