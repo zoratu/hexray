@@ -97,6 +97,20 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     sigaction.finalize();
     db.add_type("struct sigaction", CType::Struct(sigaction));
 
+    db.add_function(
+        FunctionPrototype::new("sigaction", CType::int())
+            .param("signum", CType::int())
+            .param(
+                "act",
+                CType::ptr(CType::Named("struct sigaction".to_string())),
+            )
+            .param(
+                "oldact",
+                CType::ptr(CType::Named("struct sigaction".to_string())),
+            )
+            .doc("Examine and change a signal action"),
+    );
+
     // epoll types
     let mut epoll_event = StructType::new(Some("epoll_event".to_string()));
     epoll_event.packed = true; // epoll_event is packed on x86_64
@@ -106,6 +120,13 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     db.add_type("struct epoll_event", CType::Struct(epoll_event));
 
     // Linux-specific syscall functions
+    db.add_function(
+        FunctionPrototype::new("syscall", CType::long())
+            .param("number", CType::long())
+            .variadic()
+            .doc("Invoke a Linux system call by number"),
+    );
+
     db.add_function(
         FunctionPrototype::new("stat", CType::int())
             .param("pathname", CType::ptr(CType::char()))
@@ -282,6 +303,8 @@ mod tests {
         assert!(db.has_type("struct dirent"));
         assert!(db.has_function("mmap"));
         assert!(db.has_function("socket"));
+        assert!(db.has_function("sigaction"));
+        assert!(db.has_function("syscall"));
     }
 
     #[test]
@@ -295,5 +318,20 @@ mod tests {
 
         let field = db.format_field_access("struct stat", 48);
         assert_eq!(field, Some(".st_size".to_string()));
+    }
+
+    #[test]
+    fn test_sigaction_and_syscall_signatures() {
+        let mut db = TypeDatabase::new();
+        load_posix_types(&mut db);
+        load_linux_types(&mut db);
+
+        let sigaction = db.get_function("sigaction").expect("sigaction prototype");
+        assert_eq!(sigaction.parameters.len(), 3);
+        assert!(!sigaction.variadic);
+
+        let syscall = db.get_function("syscall").expect("syscall prototype");
+        assert_eq!(syscall.parameters.len(), 1);
+        assert!(syscall.variadic);
     }
 }

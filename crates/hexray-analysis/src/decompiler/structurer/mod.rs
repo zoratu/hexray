@@ -6093,7 +6093,7 @@ mod tests {
         }
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
-            ["rsi"]
+            ["arg1"]
         );
     }
 

@@ -1198,6 +1198,28 @@ impl Expr {
         }
     }
 
+    fn known_segmented_memory_expr(mem: &MemoryRef) -> Option<Self> {
+        if let Some(symbol) = Self::known_segmented_memory_symbol(mem) {
+            return Some(Self::unknown(symbol));
+        }
+
+        let segment = mem.segment.as_ref()?;
+        if mem.base.is_some() || mem.index.is_some() {
+            return None;
+        }
+
+        match (segment.id, mem.displacement) {
+            // On x86 Linux, `fs:0` loads the thread-pointer base. Preserve it as
+            // a TLS-aware expression instead of collapsing it to an absolute null
+            // dereference.
+            (x86::FS, 0) | (x86::GS, 0) => Some(Self::call(
+                CallTarget::Named("__builtin_thread_pointer".to_string()),
+                vec![],
+            )),
+            _ => None,
+        }
+    }
+
     fn memory_address_expr_with_size(mem: &MemoryRef, forced_size_bytes: Option<u8>) -> Self {
         let mut addr_expr: Option<Expr> = None;
 
@@ -1233,8 +1255,8 @@ impl Expr {
 
     /// Converts a memory reference to an expression.
     fn from_memory_ref(mem: &MemoryRef) -> Self {
-        if let Some(symbol) = Self::known_segmented_memory_symbol(mem) {
-            return Self::unknown(symbol);
+        if let Some(expr) = Self::known_segmented_memory_expr(mem) {
+            return expr;
         }
         Self::deref(Self::memory_address_expr(mem), mem.size)
     }
@@ -1271,8 +1293,8 @@ impl Expr {
         if base_name == "rip" && mem.index.is_none() {
             let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
             Self::got_addr(abs_addr, inst.address, Self::int(abs_addr as i128))
-        } else if let Some(symbol) = Self::known_segmented_memory_symbol(mem) {
-            Self::unknown(symbol)
+        } else if let Some(expr) = Self::known_segmented_memory_expr(mem) {
+            expr
         } else {
             Self::memory_address_expr(mem)
         }
@@ -1822,12 +1844,21 @@ impl Expr {
             Operation::Syscall => {
                 if inst.mnemonic.eq_ignore_ascii_case("syscall") {
                     let rax = Self::var(Variable::reg("rax", 8));
+                    let args = vec![
+                        rax.clone(),
+                        Self::var(Variable::reg("rdi", 8)),
+                        Self::var(Variable::reg("rsi", 8)),
+                        Self::var(Variable::reg("rdx", 8)),
+                        Self::var(Variable::reg("r10", 8)),
+                        Self::var(Variable::reg("r8", 8)),
+                        Self::var(Variable::reg("r9", 8)),
+                    ];
                     Self::assign(
                         rax.clone(),
-                        Self::call(CallTarget::Named("syscall".to_string()), vec![rax]),
+                        Self::call(CallTarget::Named("__linux_syscall".to_string()), args),
                     )
                 } else {
-                    Self::call(CallTarget::Named("syscall".to_string()), vec![])
+                    Self::call(CallTarget::Named("__raw_syscall".to_string()), vec![])
                 }
             }
             Operation::Interrupt => {
@@ -5533,6 +5564,28 @@ mod tests {
     }
 
     #[test]
+    fn test_fs_zero_lifts_to_thread_pointer_builtin() {
+        use hexray_core::{Architecture, IndexMode, MemoryRef, Operand, Register, RegisterClass};
+
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+        let operand = Operand::Memory(MemoryRef {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0,
+            size: 8,
+            segment: Some(fs),
+            broadcast: false,
+            index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
+        });
+
+        let expr = Expr::from_operand(&operand);
+
+        assert_eq!(expr.to_string(), "__builtin_thread_pointer()");
+    }
+
+    #[test]
     fn test_x86_integer_simd_mnemonic_lifts_to_opaque_comment() {
         use hexray_core::{
             register::x86, Architecture, Operand, Operation, Register, RegisterClass,
@@ -5853,13 +5906,16 @@ mod tests {
     }
 
     #[test]
-    fn test_syscall_lifts_to_opaque_rax_assignment() {
+    fn test_syscall_lifts_to_linux_syscall_pseudo() {
         let inst = Instruction::new(0x401141, 2, vec![0x0f, 0x05], "syscall")
             .with_operation(Operation::Syscall);
 
         let rendered = Expr::from_instruction(&inst).to_string();
 
-        assert_eq!(rendered, "rax = syscall(rax)");
+        assert_eq!(
+            rendered,
+            "rax = __linux_syscall(rax, rdi, rsi, rdx, r10, r8, r9)"
+        );
     }
 
     #[test]

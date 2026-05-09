@@ -34,8 +34,13 @@
 //! functions stay private to this module.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use hexray_core::Architecture;
+use hexray_types::{
+    builtin::{load_libc_functions, load_linux_types, load_posix_types},
+    TypeDatabase,
+};
 
 use super::super::abi::{
     get_arg_register_index, is_argument_register, is_callee_saved_or_renamed, is_return_register,
@@ -2362,7 +2367,11 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         if let ExprKind::Call { .. } = &stmt.kind {
             let substituted = substitute_vars(&stmt, &reg_values);
             if let ExprKind::Call { target, .. } = &substituted.kind {
-                invalidate_pseudo_call_output_copies(&mut reg_values, target);
+                if is_real_function_call(target) {
+                    reg_values.clear();
+                } else {
+                    invalidate_pseudo_call_output_copies(&mut reg_values, target);
+                }
             }
             result.push(substituted);
             continue;
@@ -2785,8 +2794,12 @@ fn propagate_args_in_block_with_binary_data(
                         }
                     }
 
-                    // Track this argument value along with its statement index.
-                    arg_values.insert(v.name.to_lowercase(), (i, tracked_rhs.clone()));
+                    // Preserve copies of incoming ABI arguments even if the source
+                    // registers get reused later in the setup sequence.
+                    arg_values.insert(
+                        v.name.to_lowercase(),
+                        (i, stabilize_saved_arg_registers(tracked_rhs.clone())),
+                    );
                     result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
                 }
@@ -2823,15 +2836,20 @@ fn propagate_args_in_block_with_binary_data(
                             to_remove.insert(idx);
                         }
                         rewritten_args = recovered_args;
-                    } else if args.is_empty() {
-                        let recovered_args =
-                            extract_call_arguments_with_indices(&arg_values, &excluded_arg_regs);
-                        if !recovered_args.0.is_empty() {
+                    } else {
+                        let recovered_args = extract_call_arguments_with_indices(
+                            Some(target),
+                            args,
+                            &arg_values,
+                            &excluded_arg_regs,
+                            preferred_family,
+                        );
+                        if recovered_args.0.len() != args.len() || !recovered_args.1.is_empty() {
                             for idx in recovered_args.1 {
                                 to_remove.insert(idx);
                             }
                             rewritten_args = recovered_args.0;
-                        } else {
+                        } else if args.is_empty() {
                             rewritten_args =
                                 synthesize_leading_passthrough_args_from_target(&excluded_arg_regs);
                         }
@@ -2944,8 +2962,24 @@ fn propagate_args_in_block_with_binary_data(
                     continue;
                 }
                 // Try to extract arguments from tracked registers
-                let new_args = extract_call_arguments_with_indices(&arg_values, &excluded_arg_regs);
-                if args.is_empty() && !new_args.0.is_empty() {
+                let new_args = extract_call_arguments_with_indices(
+                    Some(target),
+                    args,
+                    &arg_values,
+                    &excluded_arg_regs,
+                    preferred_family,
+                );
+                if (new_args.0.len() != args.len() || !new_args.1.is_empty()) && !args.is_empty() {
+                    for idx in new_args.1 {
+                        to_remove.insert(idx);
+                    }
+                    result.push(Expr::call(substituted_target, new_args.0));
+                    arg_values.clear();
+                    reg_values.clear();
+                    call_target_values.clear();
+                    continue;
+                }
+                if args.is_empty() && (!new_args.0.is_empty() || !new_args.1.is_empty()) {
                     // Mark the used arg assignments for removal
                     for idx in new_args.1 {
                         to_remove.insert(idx);
@@ -3628,7 +3662,15 @@ fn is_real_function_call(target: &super::super::expression::CallTarget) -> bool 
         CallTarget::Named(name) => {
             !matches!(
                 name.as_str(),
-                "push" | "pop" | "syscall" | "int" | "halt" | "swap" | "rol" | "ror"
+                "push"
+                    | "pop"
+                    | "__linux_syscall"
+                    | "__raw_syscall"
+                    | "int"
+                    | "halt"
+                    | "swap"
+                    | "rol"
+                    | "ror"
             ) && !is_register_state_pseudo_call(name)
         }
         CallTarget::Direct { .. } | CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => {
@@ -3779,17 +3821,61 @@ fn call_has_output_use_before_clobber(
 
 /// Extracts call arguments and returns (arguments, statement_indices_used).
 /// The statement indices are used to track which arg assignments should be removed.
+#[derive(Debug, Clone, Copy)]
+struct KnownCallSignature {
+    fixed_arg_count: usize,
+    variadic: bool,
+}
+
+fn normalize_known_call_name(name: &str) -> &str {
+    let trimmed = name.trim_start_matches('_');
+    trimmed.split('@').next().unwrap_or(trimmed)
+}
+
+fn builtin_call_type_database() -> &'static TypeDatabase {
+    static DB: OnceLock<TypeDatabase> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = TypeDatabase::new();
+        load_posix_types(&mut db);
+        load_linux_types(&mut db);
+        load_libc_functions(&mut db);
+        db
+    })
+}
+
+fn known_call_signature(
+    target: &super::super::expression::CallTarget,
+) -> Option<KnownCallSignature> {
+    let super::super::expression::CallTarget::Named(name) = target else {
+        return None;
+    };
+    let proto = builtin_call_type_database().get_function(normalize_known_call_name(name))?;
+    Some(KnownCallSignature {
+        fixed_arg_count: proto.parameters.len(),
+        variadic: proto.variadic,
+    })
+}
+
 fn extract_call_arguments_with_indices(
+    target: Option<&super::super::expression::CallTarget>,
+    existing_args: &[Expr],
     arg_values: &HashMap<String, (usize, Expr)>,
     excluded_regs: &HashSet<String>,
+    preferred_family: Option<ArgumentAbiFamily>,
 ) -> (Vec<Expr>, Vec<usize>) {
+    let signature = target.and_then(known_call_signature);
     let mut args: Vec<(usize, usize, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
+    let mut removable_indices = Vec::new();
 
     for (reg_name, (stmt_idx, value)) in arg_values {
         if excluded_regs.contains(&reg_name.to_lowercase()) {
             continue;
         }
         if let Some(arg_idx) = get_arg_register_index(reg_name) {
+            if signature.is_some_and(|sig| !sig.variadic && arg_idx >= sig.fixed_arg_count) {
+                removable_indices.push(*stmt_idx);
+                continue;
+            }
             args.push((arg_idx, *stmt_idx, value.clone()));
         }
     }
@@ -3802,21 +3888,37 @@ fn extract_call_arguments_with_indices(
             .keys()
             .map(String::as_str)
             .chain(excluded_regs.iter().map(String::as_str)),
-    );
+    )
+    .or(preferred_family);
     let explicit_by_index: HashMap<usize, (usize, Expr)> = args
         .into_iter()
         .map(|(arg_idx, stmt_idx, value)| (arg_idx, (stmt_idx, value)))
         .collect();
     let Some(max_idx) = explicit_by_index.keys().copied().max() else {
-        return (Vec::new(), Vec::new());
+        return (existing_args.to_vec(), removable_indices);
+    };
+
+    if signature.is_some_and(|sig| !sig.variadic && sig.fixed_arg_count == 0) {
+        return (existing_args.to_vec(), removable_indices);
+    }
+
+    let max_idx = if let Some(sig) = signature {
+        if sig.variadic {
+            max_idx
+        } else {
+            max_idx.min(sig.fixed_arg_count.saturating_sub(1))
+        }
+    } else {
+        max_idx
     };
 
     // Include contiguous arguments starting from 0. If a thin wrapper only
     // materializes later ABI registers (e.g. edx = 64; jmp memcmp), synthesize
     // untouched leading entry registers as pass-through arguments.
-    let mut result = Vec::new();
-    let mut used_indices = Vec::new();
-    for expected_idx in 0..=max_idx {
+    let start_idx = existing_args.len();
+    let mut result = existing_args.to_vec();
+    let mut used_indices = removable_indices;
+    for expected_idx in start_idx..=max_idx {
         if let Some((stmt_idx, value)) = explicit_by_index.get(&expected_idx) {
             result.push(value.clone());
             used_indices.push(*stmt_idx);
@@ -6026,12 +6128,106 @@ mod tests {
         );
         let excluded = HashSet::from(["rdi".to_string()]);
 
-        let (args, used_indices) = extract_call_arguments_with_indices(&arg_values, &excluded);
+        let (args, used_indices) =
+            extract_call_arguments_with_indices(None, &[], &arg_values, &excluded, None);
 
         assert_eq!(used_indices, vec![0]);
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["&arg_local"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_drops_stale_copy_after_real_call() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::int(0)),
+            Expr::call(
+                CallTarget::Named("open".to_string()),
+                vec![Expr::unknown("path")],
+            ),
+            Expr::assign(reg("edi", 4), reg("eax", 4)),
+            Expr::call(CallTarget::Named("read".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing read call after propagation");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "read"),
+            other => panic!("expected named read target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["eax"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_variadic_syscall_suffix() {
+        let statements = vec![
+            Expr::assign(reg("rcx", 8), reg("rdx", 8)),
+            Expr::assign(reg("rdx", 8), reg("rsi", 8)),
+            Expr::assign(reg("esi", 4), reg("edi", 4)),
+            Expr::call(CallTarget::Named("syscall".to_string()), vec![Expr::int(1)]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing syscall call after propagation");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "syscall"),
+            other => panic!("expected named syscall target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["1", "arg0", "arg1", "arg2"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_caps_sigaction_to_known_prototype() {
+        let statements = vec![
+            Expr::assign(reg("r8d", 4), reg("edi", 4)),
+            Expr::assign(reg("ecx", 4), Expr::int(18)),
+            Expr::assign(reg("edx", 4), Expr::int(0)),
+            Expr::assign(reg("rsi", 8), reg("rsp", 8)),
+            Expr::assign(reg("edi", 4), reg("r8d", 4)),
+            Expr::call(CallTarget::Named("sigaction".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing sigaction call after propagation");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "sigaction"),
+            other => panic!("expected named sigaction target, got {other:?}"),
+        }
+        assert_eq!(args.len(), 3);
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["arg0", "rsp", "0"]
+        );
+        assert!(
+            !propagated
+                .iter()
+                .any(|expr| format!("{expr}") == "ecx = 18"),
+            "truncated fixed-arg setup should be removed: {propagated:#?}"
         );
     }
 
