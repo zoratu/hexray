@@ -2822,6 +2822,7 @@ impl PseudoCodeEmitter {
         arg: &Expr,
         func_name: &str,
         arg_index: usize,
+        args: &[Expr],
         table: &StringTable,
     ) -> String {
         // signal/signaction handler argument: resolve raw addresses to function names.
@@ -2862,7 +2863,11 @@ impl PseudoCodeEmitter {
             }
         }
         // Fall back to normal expression formatting
-        self.format_expr_with_strings(arg, table)
+        self.format_expr_with_explicit_string_len(
+            arg,
+            table,
+            self.explicit_string_arg_len(func_name, args, arg_index),
+        )
     }
 
     /// Resolve a function pointer-like argument to a symbol name, when possible.
@@ -2873,6 +2878,47 @@ impl PseudoCodeEmitter {
             ExprKind::GotRef { address, .. } => sym.get(*address).map(ToOwned::to_owned),
             _ => None,
         }
+    }
+
+    fn explicit_string_arg_len(
+        &self,
+        func_name: &str,
+        args: &[Expr],
+        arg_index: usize,
+    ) -> Option<usize> {
+        // Rust string slices are commonly lowered as adjacent `(ptr, len)` pairs in
+        // demangled `path::to::function` calls. Keep the heuristic narrow enough to
+        // avoid truncating classic C string arguments like `printf("...", 2)`.
+        if !(func_name.contains("::") || func_name.starts_with('<')) {
+            return None;
+        }
+
+        let len_expr = args.get(arg_index + 1)?;
+        let ExprKind::IntLit(len) = len_expr.kind else {
+            return None;
+        };
+        usize::try_from(len).ok()
+    }
+
+    fn truncate_resolved_string<'a>(&self, value: &'a str, max_len: Option<usize>) -> &'a str {
+        let Some(max_len) = max_len else {
+            return value;
+        };
+        if max_len >= value.len() {
+            return value;
+        }
+        value.get(..max_len).unwrap_or(value)
+    }
+
+    fn format_string_literal_at(
+        &self,
+        address: u64,
+        table: &StringTable,
+        max_len: Option<usize>,
+    ) -> Option<String> {
+        let value = table.get(address)?;
+        let truncated = self.truncate_resolved_string(value, max_len);
+        Some(format!("\"{}\"", escape_string(truncated)))
     }
 
     /// Formats comparison operands, converting integers to character literals when appropriate.
@@ -3002,6 +3048,30 @@ impl PseudoCodeEmitter {
     fn format_expr_no_string_resolve(&self, expr: &Expr) -> String {
         let empty = super::StringTable::new();
         self.format_lvalue(expr, &empty)
+    }
+
+    fn format_expr_with_explicit_string_len(
+        &self,
+        expr: &Expr,
+        table: &StringTable,
+        max_len: Option<usize>,
+    ) -> String {
+        match &expr.kind {
+            ExprKind::IntLit(n) if *n > 0 && *n < i128::from(u64::MAX) => {
+                let addr = *n as u64;
+                if let Some(rendered) = self.format_string_literal_at(addr, table, max_len) {
+                    return rendered;
+                }
+                format_integer(*n)
+            }
+            ExprKind::GotRef { address, .. } => {
+                if let Some(rendered) = self.format_string_literal_at(*address, table, max_len) {
+                    return rendered;
+                }
+                self.format_expr_with_strings(expr, table)
+            }
+            _ => self.format_expr_with_strings(expr, table),
+        }
     }
 
     /// Formats a binary operation's operand, adding parentheses if needed based on precedence.
@@ -4358,7 +4428,7 @@ impl PseudoCodeEmitter {
                             self.format_expr_preserving_register_names(a, table)
                         } else {
                             // Try to resolve argument as a magic constant
-                            self.format_call_arg(a, &target_str, idx, table)
+                            self.format_call_arg(a, &target_str, idx, args, table)
                         }
                     })
                     .collect();
@@ -7767,6 +7837,44 @@ mod tests {
         let output = emitter.emit(&cfg, "test");
 
         assert!(output.contains("((*(uint64_t*)(err))->vftable[0])(*(uint64_t*)(err))"));
+    }
+
+    #[test]
+    fn test_emit_rust_slice_string_arg_truncates_with_explicit_len() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Expr(Expr::call(
+                CallTarget::Named("main::parse".to_string()),
+                vec![Expr::unknown("dst"), Expr::int(0x4000), Expr::int(2)],
+            ))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut table = StringTable::new();
+        table.insert(0x4000, "42Error".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_string_table(Some(table));
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(output.contains("main::parse(dst, \"42\", 2);"), "{output}");
+    }
+
+    #[test]
+    fn test_emit_classic_c_string_arg_does_not_truncate_without_rust_slice_shape() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Expr(Expr::call(
+                CallTarget::Named("printf".to_string()),
+                vec![Expr::int(0x5000), Expr::int(2)],
+            ))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut table = StringTable::new();
+        table.insert(0x5000, "hello".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_string_table(Some(table));
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(output.contains("printf(\"hello\", 2);"), "{output}");
     }
 
     #[test]
