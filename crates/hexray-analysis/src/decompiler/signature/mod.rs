@@ -102,6 +102,8 @@ pub struct SignatureRecovery {
     return_confidence: u8,
     /// Parameter names assigned from stack slot analysis.
     param_names: HashMap<usize, String>,
+    /// Explicit parameter type overrides inferred from wrappers/patterns.
+    param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
     dwarf_param_names: Vec<String>,
     /// Usage hints for parameters (indexed by arg register index).
@@ -129,6 +131,14 @@ pub struct SignatureRecovery {
     summary_database: Option<Arc<super::interprocedural::SummaryDatabase>>,
     /// Function name being analyzed (for known function lookup).
     current_func_name: Option<String>,
+    /// SysV `va_list.gp_offset` field slots initialized in the body.
+    sysv_va_list_gp_offset_slots: HashSet<String>,
+    /// SysV `va_list.fp_offset` field slots initialized in the body.
+    sysv_va_list_fp_offset_slots: HashSet<String>,
+    /// SysV `va_list` pointer field slots initialized in the body.
+    sysv_va_list_pointer_slots: HashSet<String>,
+    /// Fixed non-variadic prefix inferred for the current function.
+    variadic_fixed_param_count: Option<usize>,
 }
 
 impl SignatureRecovery {
@@ -165,6 +175,7 @@ impl SignatureRecovery {
             return_provenance: Vec::new(),
             return_confidence: 0,
             param_names: HashMap::new(),
+            param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
             function_pointer_aliases: HashMap::new(),
@@ -177,6 +188,10 @@ impl SignatureRecovery {
             symbol_table: None,
             summary_database: None,
             current_func_name: None,
+            sysv_va_list_gp_offset_slots: HashSet::new(),
+            sysv_va_list_fp_offset_slots: HashSet::new(),
+            sysv_va_list_pointer_slots: HashSet::new(),
+            variadic_fixed_param_count: None,
         }
     }
 
@@ -236,12 +251,17 @@ impl SignatureRecovery {
         self.return_provenance.clear();
         self.return_confidence = 0;
         self.param_names.clear();
+        self.param_type_overrides.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
         self.function_pointer_alias_latest.clear();
         self.value_alias_latest.clear();
         self.assigned_value_names.clear();
         self.value_function_pointer_types.clear();
+        self.sysv_va_list_gp_offset_slots.clear();
+        self.sysv_va_list_fp_offset_slots.clear();
+        self.sysv_va_list_pointer_slots.clear();
+        self.variadic_fixed_param_count = None;
 
         // Analyze the function body
         self.analyze_nodes(&cfg.body, false);
@@ -611,6 +631,7 @@ impl SignatureRecovery {
     fn analyze_statement(&mut self, expr: &Expr, near_return: bool) {
         match &expr.kind {
             ExprKind::Assign { lhs, rhs } => {
+                self.observe_sysv_va_list_assignment(lhs, rhs);
                 // First, analyze the RHS for reads
                 self.analyze_expr_reads(rhs);
                 if let Some(lhs_name) = self.extract_var_name(lhs) {
@@ -1053,6 +1074,9 @@ impl SignatureRecovery {
 
                 // Check if calling a string function
                 let func_name = self.extract_call_name(target);
+                if let Some(fn_name) = &func_name {
+                    self.observe_variadic_forwarding_call(fn_name, args);
+                }
                 let is_string_fn = func_name
                     .as_ref()
                     .map(|n| {
@@ -2013,9 +2037,14 @@ impl SignatureRecovery {
     fn extract_stack_offset(&self, expr: &Expr) -> Option<i128> {
         match &expr.kind {
             ExprKind::Deref { addr, .. } => {
+                if let ExprKind::Var(base) = &addr.kind {
+                    if is_stack_base_register(&base.name) {
+                        return Some(0);
+                    }
+                }
                 if let ExprKind::BinOp { op, left, right } = &addr.kind {
                     if let ExprKind::Var(base) = &left.kind {
-                        if is_frame_pointer(&base.name) {
+                        if is_stack_base_register(&base.name) {
                             if let ExprKind::IntLit(offset) = &right.kind {
                                 let actual = match op {
                                     BinOpKind::Add => *offset,
@@ -2707,6 +2736,12 @@ impl SignatureRecovery {
         }
         used_args.sort_unstable();
 
+        let variadic_fixed_param_count = self.infer_variadic_fixed_param_count(&used_args);
+        if let Some(fixed_count) = variadic_fixed_param_count {
+            sig.is_variadic = true;
+            used_args.retain(|idx| *idx < fixed_count);
+        }
+
         // Create parameters only for registers that were actually used
         for &idx in &used_args {
             let reg64 = int_regs[idx].to_lowercase();
@@ -2765,6 +2800,8 @@ impl SignatureRecovery {
             // Use known type, or infer type from usage hints if available
             let param_type = if let Some(known_ty) = known_type {
                 known_ty
+            } else if let Some(override_ty) = self.param_type_overrides.get(&idx) {
+                override_ty.clone()
             } else if let Some(hints) = hints {
                 hints.infer_type(size)
             } else {
@@ -2851,6 +2888,9 @@ impl SignatureRecovery {
         let integer_simd_signature =
             self.integer_simd_ops_observed && self.return_from_integer_simd_lane;
         for (idx, reg) in float_regs.iter().enumerate() {
+            if variadic_fixed_param_count.is_some_and(|fixed_count| idx >= fixed_count) {
+                continue;
+            }
             let reg_lower = reg.to_lowercase();
             let seen_as_param = self.read_regs.contains(&reg_lower)
                 || self.observed_float_arg_regs.contains(&reg_lower)
@@ -2927,6 +2967,252 @@ impl SignatureRecovery {
         sig
     }
 
+    fn observe_sysv_va_list_assignment(&mut self, lhs: &Expr, rhs: &Expr) {
+        if !matches!(self.convention, CallingConvention::SystemV) {
+            return;
+        }
+
+        let Some(lhs_name) = self.extract_var_name(lhs) else {
+            return;
+        };
+
+        match &rhs.kind {
+            ExprKind::IntLit(8) => {
+                self.sysv_va_list_gp_offset_slots.insert(lhs_name.clone());
+            }
+            ExprKind::IntLit(48) => {
+                self.sysv_va_list_fp_offset_slots.insert(lhs_name.clone());
+            }
+            ExprKind::Var(var) => self.observe_sysv_va_list_alias(&lhs_name, &var.name),
+            ExprKind::Unknown(name) => self.observe_sysv_va_list_alias(&lhs_name, name),
+            ExprKind::Cast { expr: inner, .. } => {
+                if let Some(inner_name) = self.extract_var_name(inner) {
+                    self.observe_sysv_va_list_alias(&lhs_name, &inner_name);
+                }
+            }
+            _ => {}
+        }
+
+        if Self::expr_is_stack_base_with_const_offset(rhs) {
+            self.sysv_va_list_pointer_slots.insert(lhs_name);
+        }
+    }
+
+    fn observe_sysv_va_list_alias(&mut self, lhs_name: &str, rhs_name: &str) {
+        let rhs_name = rhs_name.to_lowercase();
+        if self.var_name_traces_to_sysv_slot_set(&rhs_name, &self.sysv_va_list_gp_offset_slots) {
+            self.sysv_va_list_gp_offset_slots
+                .insert(lhs_name.to_string());
+        }
+        if self.var_name_traces_to_sysv_slot_set(&rhs_name, &self.sysv_va_list_fp_offset_slots) {
+            self.sysv_va_list_fp_offset_slots
+                .insert(lhs_name.to_string());
+        }
+        if self.var_name_traces_to_sysv_slot_set(&rhs_name, &self.sysv_va_list_pointer_slots) {
+            self.sysv_va_list_pointer_slots.insert(lhs_name.to_string());
+        }
+    }
+
+    fn observe_variadic_forwarding_call(&mut self, function_name: &str, args: &[Expr]) {
+        if !self.has_sysv_va_list_materialization() {
+            return;
+        }
+
+        let Some(fixed_arg_count) = Self::known_va_list_forwarder_fixed_arg_count(function_name)
+        else {
+            return;
+        };
+        if args.len() <= fixed_arg_count {
+            return;
+        }
+        if !self.expr_looks_like_sysv_va_list_arg(&args[fixed_arg_count]) {
+            return;
+        }
+
+        self.variadic_fixed_param_count = Some(
+            self.variadic_fixed_param_count.unwrap_or(0).max(
+                (0..fixed_arg_count)
+                    .filter_map(|arg_index| {
+                        self.resolve_param_index_from_expr_precise(&args[arg_index])
+                            .map(|param_idx| {
+                                if let Some((param_name, param_type)) =
+                                    get_known_function_params(function_name)
+                                        .and_then(|params| params.get(arg_index))
+                                {
+                                    self.param_names
+                                        .entry(param_idx)
+                                        .or_insert_with(|| (*param_name).to_string());
+                                    self.param_type_overrides
+                                        .entry(param_idx)
+                                        .or_insert_with(|| param_type.clone());
+                                }
+                                param_idx + 1
+                            })
+                    })
+                    .max()
+                    .unwrap_or(1),
+            ),
+        );
+
+        // TODO(45.2): materialize a synthetic `va_list ap` local so forwarded wrappers
+        // decompile as `vprintf(fmt, ap)` instead of exposing the raw stack root.
+    }
+
+    fn infer_variadic_fixed_param_count(&self, used_args: &[usize]) -> Option<usize> {
+        if !self.has_sysv_va_list_materialization() {
+            return None;
+        }
+
+        // TODO(45.1): collapse the full SysV `va_arg` state machine into a dedicated
+        // `va_arg(ap, T)` IR node instead of only repairing the wrapper signature.
+        if let Some(fixed_count) = self.variadic_fixed_param_count {
+            return Some(fixed_count.max(1));
+        }
+
+        let mut fixed_prefix = 0usize;
+        for idx in 0..self.convention.max_int_args() {
+            if !used_args.contains(&idx) {
+                if fixed_prefix > 0 {
+                    break;
+                }
+                continue;
+            }
+            if self.variadic_fixed_param_has_signal(idx) {
+                fixed_prefix = idx + 1;
+            } else if fixed_prefix > 0 {
+                break;
+            }
+        }
+
+        if fixed_prefix > 0 {
+            Some(fixed_prefix)
+        } else {
+            (!used_args.is_empty()).then_some(1)
+        }
+    }
+
+    fn variadic_fixed_param_has_signal(&self, idx: usize) -> bool {
+        self.param_type_overrides.contains_key(&idx)
+            || self
+                .param_hints
+                .get(&idx)
+                .is_some_and(ParameterUsageHints::has_strong_signal)
+            || self
+                .dwarf_param_names
+                .get(idx)
+                .is_some_and(|name| !name.is_empty())
+            || self.param_names.get(&idx).is_some_and(|name| {
+                !name.is_empty()
+                    && name != &format!("arg{idx}")
+                    && !name.starts_with("var_")
+                    && !name.starts_with("local_")
+            })
+    }
+
+    fn has_sysv_va_list_materialization(&self) -> bool {
+        matches!(self.convention, CallingConvention::SystemV)
+            && !self.sysv_va_list_gp_offset_slots.is_empty()
+            && self.sysv_va_list_pointer_slots.len() >= 2
+            && (!self.sysv_va_list_fp_offset_slots.is_empty()
+                || self.has_observed_register_varargs_spills())
+    }
+
+    fn has_observed_register_varargs_spills(&self) -> bool {
+        self.convention
+            .integer_arg_registers()
+            .iter()
+            .zip(self.convention.integer_arg_registers_32().iter())
+            .enumerate()
+            .skip(1)
+            .any(|(idx, (reg64, reg32))| {
+                self.read_regs.contains(&format!("arg{}", idx))
+                    || self.read_regs.contains(&reg64.to_lowercase())
+                    || self.read_regs.contains(&reg32.to_lowercase())
+            })
+    }
+
+    fn known_va_list_forwarder_fixed_arg_count(function_name: &str) -> Option<usize> {
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
+        match clean {
+            "vprintf" => Some(1),
+            "vfprintf" | "vdprintf" | "vsyslog" => Some(2),
+            "vsprintf" | "vasprintf" => Some(2),
+            "vsnprintf" => Some(3),
+            "vprintf_chk" => Some(2),
+            "vfprintf_chk" | "vdprintf_chk" => Some(3),
+            "vsprintf_chk" | "vasprintf_chk" => Some(4),
+            "vsnprintf_chk" => Some(5),
+            _ => None,
+        }
+    }
+
+    fn expr_looks_like_sysv_va_list_arg(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                let lowered = var.name.to_lowercase();
+                matches!(lowered.as_str(), "rsp" | "esp" | "sp")
+                    || self.var_name_traces_to_sysv_slot_set(
+                        &lowered,
+                        &self.sysv_va_list_pointer_slots,
+                    )
+            }
+            ExprKind::Unknown(name) => {
+                let lowered = name.to_lowercase();
+                matches!(lowered.as_str(), "rsp" | "esp" | "sp")
+                    || self.var_name_traces_to_sysv_slot_set(
+                        &lowered,
+                        &self.sysv_va_list_pointer_slots,
+                    )
+            }
+            ExprKind::AddressOf(inner) | ExprKind::Cast { expr: inner, .. } => {
+                self.expr_looks_like_sysv_va_list_arg(inner)
+            }
+            ExprKind::Deref { .. } | ExprKind::ArrayAccess { .. } => {
+                self.extract_var_name(expr).is_some_and(|name| {
+                    self.var_name_traces_to_sysv_slot_set(&name, &self.sysv_va_list_pointer_slots)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn var_name_traces_to_sysv_slot_set(&self, var_name: &str, slots: &HashSet<String>) -> bool {
+        let mut queue = VecDeque::new();
+        queue.push_back(var_name.to_lowercase());
+        for alias in Self::lifted_alias_name_variants(var_name) {
+            queue.push_back(alias);
+        }
+        let mut visited = HashSet::new();
+        while let Some(name) = queue.pop_front() {
+            let lowered = name.to_lowercase();
+            if !visited.insert(lowered.clone()) {
+                continue;
+            }
+            if slots.contains(&lowered) {
+                return true;
+            }
+            if let Some(next) = self.resolve_latest_value_alias(&lowered) {
+                queue.push_back(next);
+            }
+        }
+        false
+    }
+
+    fn expr_is_stack_base_with_const_offset(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::BinOp {
+                op: BinOpKind::Add | BinOpKind::Sub,
+                left,
+                right,
+            } => {
+                matches!(&left.kind, ExprKind::Var(var) if is_stack_base_register(&var.name))
+                    && matches!(right.kind, ExprKind::IntLit(_))
+            }
+            ExprKind::Cast { expr: inner, .. } => Self::expr_is_stack_base_with_const_offset(inner),
+            _ => false,
+        }
+    }
+
     /// Detects common parameter pairs like (buffer, size) and improves naming.
     fn detect_param_pairs(&self, sig: &mut FunctionSignature) {
         if sig.parameters.len() < 2 {
@@ -2988,6 +3274,10 @@ fn is_frame_pointer(name: &str) -> bool {
         name.to_lowercase().as_str(),
         "rbp" | "ebp" | "x29" | "fp" | "s0"
     )
+}
+
+fn is_stack_base_register(name: &str) -> bool {
+    is_frame_pointer(name) || matches!(name.to_lowercase().as_str(), "rsp" | "esp" | "sp" | "x31")
 }
 
 #[cfg(test)]
@@ -3198,6 +3488,234 @@ mod tests {
         assert_eq!(sig.parameters.len(), 2);
         assert_eq!(sig.parameters[0].name, "arg0");
         assert_eq!(sig.parameters[1].name, "arg1");
+    }
+
+    #[test]
+    fn test_signature_recovery_marks_vfprintf_chk_forwarder_variadic() {
+        let rsp = Expr::var(Variable::reg("rsp", 8));
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let rsi = Expr::var(Variable::reg("rsi", 8));
+        let rdx = Expr::var(Variable::reg("rdx", 8));
+        let rcx = Expr::var(Variable::reg("rcx", 8));
+        let r8 = Expr::var(Variable::reg("r8", 8));
+        let r9 = Expr::var(Variable::reg("r9", 8));
+
+        let fmt_local = Expr::var(Variable::stack(-0x18, 8));
+        let spill_28 = Expr::var(Variable::stack(-0x28, 8));
+        let spill_30 = Expr::var(Variable::stack(-0x30, 8));
+        let spill_38 = Expr::var(Variable::stack(-0x38, 8));
+        let spill_40 = Expr::var(Variable::stack(-0x40, 8));
+        let spill_48 = Expr::var(Variable::stack(-0x48, 8));
+        let fp_offset = Expr::var(Variable::stack(-0x4, 4));
+        let reg_save = Expr::var(Variable::stack(-0x10, 8));
+        let overflow = Expr::var(Variable::stack(-0x8, 8));
+        let gp_offset = Expr::deref(rsp.clone(), 4);
+
+        let call = Expr::call(
+            CallTarget::Named("__vfprintf_chk@GLIBC_2.3.4".to_string()),
+            vec![
+                Expr::unknown("stdout@@GLIBC_2.2.5"),
+                Expr::int(2),
+                fmt_local.clone(),
+                rsp.clone(),
+            ],
+        );
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Block {
+                id: BasicBlockId::new(0),
+                statements: vec![
+                    Expr::assign(spill_28, rsi),
+                    Expr::assign(spill_30, rdx),
+                    Expr::assign(spill_38, rcx),
+                    Expr::assign(spill_40, r8),
+                    Expr::assign(spill_48, r9),
+                    Expr::assign(fmt_local, rdi),
+                    Expr::assign(
+                        overflow,
+                        Expr::binop(BinOpKind::Add, rsp.clone(), Expr::int(224)),
+                    ),
+                    Expr::assign(gp_offset, Expr::int(8)),
+                    Expr::assign(fp_offset, Expr::int(48)),
+                    Expr::assign(
+                        reg_save,
+                        Expr::binop(BinOpKind::Add, rsp.clone(), Expr::int(32)),
+                    ),
+                    call,
+                ],
+                address_range: (0x1000, 0x1040),
+            }],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.is_variadic);
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].name, "format");
+        assert!(matches!(sig.parameters[0].param_type, ParamType::Pointer));
+        assert!(sig.to_c_declaration("my_log").contains("..."));
+    }
+
+    #[test]
+    fn test_signature_recovery_marks_sysv_va_start_user_variadic() {
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let rsi = Expr::var(Variable::reg("rsi", 8));
+        let rdx = Expr::var(Variable::reg("rdx", 8));
+        let rcx = Expr::var(Variable::reg("rcx", 8));
+        let r8 = Expr::var(Variable::reg("r8", 8));
+        let r9 = Expr::var(Variable::reg("r9", 8));
+
+        let gp_offset = Expr::var(Variable::stack(-0x10, 4));
+        let fp_offset = Expr::var(Variable::stack(-0xc, 4));
+        let overflow = Expr::var(Variable::stack(-0x8, 8));
+        let reg_save = Expr::var(Variable::stack(-0x18, 8));
+        let counter = Expr::var(Variable::stack(-0x20, 4));
+        let spill_28 = Expr::var(Variable::stack(-0x28, 8));
+        let spill_30 = Expr::var(Variable::stack(-0x30, 8));
+        let spill_38 = Expr::var(Variable::stack(-0x38, 8));
+        let spill_40 = Expr::var(Variable::stack(-0x40, 8));
+        let spill_48 = Expr::var(Variable::stack(-0x48, 8));
+        let sum = Expr::var(Variable::stack(-0x58, 4));
+
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Block {
+                    id: BasicBlockId::new(0),
+                    statements: vec![
+                        Expr::assign(spill_28, rsi),
+                        Expr::assign(spill_30, rdx),
+                        Expr::assign(spill_38, rcx),
+                        Expr::assign(spill_40, r8),
+                        Expr::assign(spill_48, r9),
+                        Expr::assign(counter.clone(), Expr::int(0)),
+                        Expr::assign(sum.clone(), Expr::int(0)),
+                        Expr::assign(gp_offset.clone(), Expr::int(8)),
+                        Expr::assign(fp_offset, Expr::int(48)),
+                        Expr::assign(
+                            overflow,
+                            Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(16)),
+                        ),
+                        Expr::assign(
+                            reg_save.clone(),
+                            Expr::binop(BinOpKind::Sub, rbp.clone(), Expr::int(176)),
+                        ),
+                    ],
+                    address_range: (0x1000, 0x1030),
+                },
+                StructuredNode::While {
+                    condition: Expr::binop(BinOpKind::Lt, counter.clone(), rdi),
+                    body: vec![StructuredNode::Block {
+                        id: BasicBlockId::new(1),
+                        statements: vec![
+                            Expr::assign(
+                                sum.clone(),
+                                Expr::binop(
+                                    BinOpKind::Add,
+                                    sum.clone(),
+                                    Expr::deref(
+                                        Expr::binop(BinOpKind::Add, reg_save, gp_offset.clone()),
+                                        4,
+                                    ),
+                                ),
+                            ),
+                            Expr {
+                                kind: ExprKind::CompoundAssign {
+                                    op: BinOpKind::Add,
+                                    lhs: Box::new(gp_offset),
+                                    rhs: Box::new(Expr::int(8)),
+                                },
+                            },
+                            Expr {
+                                kind: ExprKind::CompoundAssign {
+                                    op: BinOpKind::Add,
+                                    lhs: Box::new(counter),
+                                    rhs: Box::new(Expr::int(1)),
+                                },
+                            },
+                        ],
+                        address_range: (0x1030, 0x1060),
+                    }],
+                    header: Some(BasicBlockId::new(1)),
+                    exit_block: Some(BasicBlockId::new(2)),
+                },
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.is_variadic);
+        assert_eq!(sig.parameters.len(), 1);
+        assert!(sig.to_c_declaration("my_sum").contains("..."));
+    }
+
+    #[test]
+    fn test_signature_recovery_marks_optimized_sysv_va_start_user_variadic() {
+        let rsp = Expr::var(Variable::reg("rsp", 8));
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let rsi = Expr::var(Variable::reg("rsi", 8));
+        let rdx = Expr::var(Variable::reg("rdx", 8));
+        let rcx = Expr::var(Variable::reg("rcx", 8));
+        let r8 = Expr::var(Variable::reg("r8", 8));
+        let r9 = Expr::var(Variable::reg("r9", 8));
+
+        let gp_offset = Expr::deref(rsp.clone(), 4);
+        let reg_save = Expr::var(Variable::stack(-0x10, 8));
+        let overflow = Expr::var(Variable::stack(-0x8, 8));
+        let spill_28 = Expr::var(Variable::stack(-0x28, 8));
+        let spill_30 = Expr::var(Variable::stack(-0x30, 8));
+        let spill_38 = Expr::var(Variable::stack(-0x38, 8));
+        let spill_40 = Expr::var(Variable::stack(-0x40, 8));
+        let spill_48 = Expr::var(Variable::stack(-0x48, 8));
+
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Block {
+                    id: BasicBlockId::new(0),
+                    statements: vec![
+                        Expr::assign(spill_28, rsi),
+                        Expr::assign(spill_30, rdx),
+                        Expr::assign(spill_38, rcx),
+                        Expr::assign(spill_40, r8),
+                        Expr::assign(spill_48, r9),
+                        Expr::assign(gp_offset, Expr::int(8)),
+                        Expr::assign(
+                            overflow,
+                            Expr::binop(BinOpKind::Add, rsp.clone(), Expr::int(96)),
+                        ),
+                        Expr::assign(
+                            reg_save,
+                            Expr::binop(BinOpKind::Add, rsp.clone(), Expr::int(32)),
+                        ),
+                    ],
+                    address_range: (0x1000, 0x1020),
+                },
+                StructuredNode::If {
+                    condition: Expr::binop(BinOpKind::Gt, rdi, Expr::int(0)),
+                    then_body: vec![StructuredNode::Block {
+                        id: BasicBlockId::new(1),
+                        statements: vec![Expr::assign(
+                            Expr::var(Variable::stack(-0x58, 4)),
+                            Expr::int(0),
+                        )],
+                        address_range: (0x1020, 0x1030),
+                    }],
+                    else_body: None,
+                },
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.is_variadic);
+        assert_eq!(sig.parameters.len(), 1);
+        assert!(sig.to_c_declaration("my_sum").contains("..."));
     }
 
     #[test]

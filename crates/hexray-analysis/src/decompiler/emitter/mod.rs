@@ -529,13 +529,23 @@ impl PseudoCodeEmitter {
         return_type: &super::signature::ParamType,
         func_name: &str,
         params: &[String],
+        is_variadic: bool,
     ) -> String {
         let (func_name, trailing_qualifiers) =
             Self::split_embedded_signature(func_name).unwrap_or((func_name, ""));
         let params_str = if params.is_empty() {
-            "void".to_string()
+            if is_variadic {
+                "...".to_string()
+            } else {
+                "void".to_string()
+            }
         } else {
-            params.join(", ")
+            let joined = params.join(", ");
+            if is_variadic {
+                format!("{joined}, ...")
+            } else {
+                joined
+            }
         };
 
         match return_type {
@@ -4679,7 +4689,12 @@ impl PseudoCodeEmitter {
                 writeln!(
                     output,
                     "{}",
-                    Self::format_function_header(&sig.return_type, func_name, &params)
+                    Self::format_function_header(
+                        &sig.return_type,
+                        func_name,
+                        &params,
+                        sig.is_variadic,
+                    )
                 )
                 .unwrap();
             } else {
@@ -4886,7 +4901,12 @@ impl PseudoCodeEmitter {
         writeln!(
             output,
             "{}",
-            Self::format_function_header(&signature.return_type, func_name, &params)
+            Self::format_function_header(
+                &signature.return_type,
+                func_name,
+                &params,
+                signature.is_variadic,
+            )
         )
         .unwrap();
         writeln!(output, "{{").unwrap();
@@ -7494,9 +7514,22 @@ mod tests {
             &super::super::signature::ParamType::SignedInt(32),
             "Square::area() const",
             &[String::from("int32_t* this")],
+            false,
         );
 
         assert_eq!(header, "int32_t Square::area(int32_t* this) const");
+    }
+
+    #[test]
+    fn test_format_function_header_appends_variadic_ellipsis() {
+        let header = PseudoCodeEmitter::format_function_header(
+            &super::super::signature::ParamType::SignedInt(32),
+            "my_log",
+            &[String::from("void* format")],
+            true,
+        );
+
+        assert_eq!(header, "int32_t my_log(void* format, ...)");
     }
 
     #[test]

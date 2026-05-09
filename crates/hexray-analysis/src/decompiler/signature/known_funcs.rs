@@ -17,8 +17,9 @@ use super::ParamType;
 pub(super) fn get_known_function_params(
     func_name: &str,
 ) -> Option<&'static [(&'static str, ParamType)]> {
-    // Normalize function name (strip leading underscores)
+    // Normalize function names from imports like __vfprintf_chk@GLIBC_2.3.4.
     let name = func_name.trim_start_matches('_');
+    let name = name.split('@').next().unwrap_or(name);
 
     match name {
         // main() function
@@ -297,11 +298,58 @@ pub(super) fn get_known_function_params(
 
         // printf/scanf family
         "printf" | "puts" => Some(&[("format", ParamType::Pointer)]),
+        "vprintf" => Some(&[("format", ParamType::Pointer), ("ap", ParamType::Pointer)]),
         "sprintf" => Some(&[("str", ParamType::Pointer), ("format", ParamType::Pointer)]),
+        "vsprintf" => Some(&[
+            ("str", ParamType::Pointer),
+            ("format", ParamType::Pointer),
+            ("ap", ParamType::Pointer),
+        ]),
         "snprintf" => Some(&[
             ("str", ParamType::Pointer),
             ("size", ParamType::UnsignedInt(64)),
             ("format", ParamType::Pointer),
+        ]),
+        "vsnprintf" => Some(&[
+            ("str", ParamType::Pointer),
+            ("size", ParamType::UnsignedInt(64)),
+            ("format", ParamType::Pointer),
+            ("ap", ParamType::Pointer),
+        ]),
+        "printf_chk" => Some(&[
+            ("flag", ParamType::SignedInt(32)),
+            ("format", ParamType::Pointer),
+        ]),
+        "vprintf_chk" => Some(&[
+            ("flag", ParamType::SignedInt(32)),
+            ("format", ParamType::Pointer),
+            ("ap", ParamType::Pointer),
+        ]),
+        "fprintf_chk" => Some(&[
+            ("stream", ParamType::Pointer),
+            ("flag", ParamType::SignedInt(32)),
+            ("format", ParamType::Pointer),
+        ]),
+        "vfprintf_chk" => Some(&[
+            ("stream", ParamType::Pointer),
+            ("flag", ParamType::SignedInt(32)),
+            ("format", ParamType::Pointer),
+            ("ap", ParamType::Pointer),
+        ]),
+        "vsprintf_chk" => Some(&[
+            ("str", ParamType::Pointer),
+            ("flag", ParamType::SignedInt(32)),
+            ("slen", ParamType::UnsignedInt(64)),
+            ("format", ParamType::Pointer),
+            ("ap", ParamType::Pointer),
+        ]),
+        "vsnprintf_chk" => Some(&[
+            ("str", ParamType::Pointer),
+            ("size", ParamType::UnsignedInt(64)),
+            ("flag", ParamType::SignedInt(32)),
+            ("slen", ParamType::UnsignedInt(64)),
+            ("format", ParamType::Pointer),
+            ("ap", ParamType::Pointer),
         ]),
         "scanf" => Some(&[("format", ParamType::Pointer)]),
         "sscanf" => Some(&[("str", ParamType::Pointer), ("format", ParamType::Pointer)]),
