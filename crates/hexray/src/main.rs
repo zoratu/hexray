@@ -2370,6 +2370,7 @@ fn decompile_function(
             }
         }
     }
+    let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
 
     // Build relocation table for kernel modules
     // Build binary data context for jump table reconstruction
@@ -2401,6 +2402,7 @@ fn decompile_function(
         .with_string_table(string_table)
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
+        .with_throw_thunks(throw_thunks)
         .with_binary_data(binary_data_ctx)
         .with_dwarf_names(dwarf_names.stack_names)
         .with_dwarf_param_names(dwarf_names.parameter_names)
@@ -2753,6 +2755,99 @@ fn build_symbol_table(binary: &Binary) -> SymbolTable {
     }
 
     table
+}
+
+fn collect_throw_thunks(
+    binary: &Binary,
+    symbol_table: &SymbolTable,
+    relocation_table: &RelocationTable,
+) -> std::collections::HashMap<u64, String> {
+    let fmt = binary.as_format();
+    let arch = fmt.architecture();
+    let mut throw_thunks = std::collections::HashMap::new();
+
+    for symbol in fmt.symbols() {
+        if !symbol.is_function() || symbol.address == 0 {
+            continue;
+        }
+
+        let display_name = symbol_table
+            .get(symbol.address)
+            .map(str::to_string)
+            .unwrap_or_else(|| demangle_or_original(&symbol.name));
+        if !looks_like_cold_split_symbol(&symbol.name, &display_name) {
+            continue;
+        }
+
+        let max_bytes = if symbol.size > 0 {
+            symbol.size as usize
+        } else {
+            256usize
+        };
+        let Some(bytes) = fmt.bytes_at(symbol.address, max_bytes) else {
+            continue;
+        };
+
+        let mut instructions = match arch {
+            Architecture::X86_64 | Architecture::X86 => {
+                let disasm = X86_64Disassembler::new();
+                disassemble_for_cfg(&disasm, fmt, bytes, symbol.address, symbol.size == 0)
+            }
+            Architecture::Arm64 => {
+                let disasm = Arm64Disassembler::new();
+                disassemble_for_cfg(&disasm, fmt, bytes, symbol.address, symbol.size == 0)
+            }
+            Architecture::RiscV64 => {
+                let disasm = RiscVDisassembler::new();
+                disassemble_for_cfg(&disasm, fmt, bytes, symbol.address, symbol.size == 0)
+            }
+            Architecture::RiscV32 => {
+                let disasm = RiscVDisassembler::new_rv32();
+                disassemble_for_cfg(&disasm, fmt, bytes, symbol.address, symbol.size == 0)
+            }
+            _ => Vec::new(),
+        };
+        apply_call_relocations(&mut instructions, relocation_table);
+
+        if instructions.iter().any(|instruction| {
+            instruction_calls_cxx_throw(instruction, fmt, symbol_table, relocation_table)
+        }) {
+            throw_thunks.insert(symbol.address, display_name);
+        }
+    }
+
+    throw_thunks
+}
+
+fn looks_like_cold_split_symbol(raw_name: &str, display_name: &str) -> bool {
+    raw_name.contains(".cold") || display_name.contains(".cold")
+}
+
+fn instruction_calls_cxx_throw(
+    instruction: &hexray_core::Instruction,
+    fmt: &dyn BinaryFormat,
+    symbol_table: &SymbolTable,
+    relocation_table: &RelocationTable,
+) -> bool {
+    let hexray_core::ControlFlow::Call { target, .. } = instruction.control_flow else {
+        return false;
+    };
+
+    if relocation_table
+        .get_call(instruction.address)
+        .is_some_and(|relocation| is_cxx_throw_symbol_name(&relocation.symbol))
+    {
+        return true;
+    }
+
+    symbol_table
+        .get(target)
+        .or_else(|| fmt.symbol_at(target).map(|symbol| symbol.name.as_str()))
+        .is_some_and(is_cxx_throw_symbol_name)
+}
+
+fn is_cxx_throw_symbol_name(name: &str) -> bool {
+    name.contains("__cxa_throw") || name.contains("__cxa_rethrow")
 }
 
 /// Builds a binary data context from read-only data sections for jump table reconstruction.
@@ -4455,6 +4550,7 @@ fn decompile_with_follow(
             }
         }
     }
+    let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
     let tls_tpoff_map = build_tls_tpoff_map(binary);
     let tls_slot_map = build_tls_slot_map(binary);
 
@@ -4553,6 +4649,7 @@ fn decompile_with_follow(
             .with_string_table(string_table.clone())
             .with_symbol_table(symbol_table.clone())
             .with_relocation_table(relocation_table.clone())
+            .with_throw_thunks(throw_thunks.clone())
             .with_dwarf_names(dwarf_names.stack_names)
             .with_dwarf_param_names(dwarf_names.parameter_names)
             .with_constant_database(const_db.clone())
@@ -6769,6 +6866,8 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     })
                     .unwrap_or_else(|| format!("sub_{:x}", addr));
 
+                let relocations = build_relocation_table(binary);
+                let throw_thunks = collect_throw_thunks(binary, &symbols, &relocations);
                 let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
                 let calling_convention = default_calling_convention(
                     match binary {
@@ -6781,6 +6880,8 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 let mut decompiler = Decompiler::new()
                     .with_addresses(false)
                     .with_symbol_table(symbols)
+                    .with_relocation_table(relocations)
+                    .with_throw_thunks(throw_thunks)
                     .with_constant_database(const_db)
                     .with_struct_inference(true)
                     .with_calling_convention(calling_convention);

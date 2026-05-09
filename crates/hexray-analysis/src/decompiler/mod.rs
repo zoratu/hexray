@@ -619,6 +619,8 @@ pub struct Decompiler {
     /// Binary data context for jump table reconstruction.
     /// When set, enables proper switch statement recovery by reading jump tables.
     pub binary_data: Option<BinaryDataContext>,
+    /// Split cold helper targets whose bodies end in C++ throw/rethrow machinery.
+    pub throw_thunks: HashMap<u64, String>,
 }
 
 impl Default for Decompiler {
@@ -644,6 +646,7 @@ impl Default for Decompiler {
             config: None,
             summary_database: None,
             binary_data: None,
+            throw_thunks: HashMap::new(),
         }
     }
 }
@@ -684,6 +687,12 @@ impl Decompiler {
     /// Sets the relocation table for resolving call targets.
     pub fn with_relocation_table(mut self, table: RelocationTable) -> Self {
         self.relocation_table = Some(table);
+        self
+    }
+
+    /// Sets known cold-split throw thunk targets.
+    pub fn with_throw_thunks(mut self, throw_thunks: HashMap<u64, String>) -> Self {
+        self.throw_thunks = throw_thunks;
         self
     }
 
@@ -1618,6 +1627,7 @@ impl Decompiler {
                 None,
                 &noreturn_targets,
                 &ubsan_targets,
+                &self.throw_thunks,
             );
         let mut recovery = SignatureRecovery::new(self.calling_convention)
             .with_relocation_table(self.relocation_table.clone())
@@ -1643,6 +1653,7 @@ impl Decompiler {
                 self.exception_info.as_ref(),
                 &noreturn_targets,
                 &ubsan_targets,
+                &self.throw_thunks,
             )
         } else {
             StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
@@ -1652,6 +1663,7 @@ impl Decompiler {
                 self.exception_info.as_ref(),
                 &noreturn_targets,
                 &ubsan_targets,
+                &self.throw_thunks,
             )
         }
     }

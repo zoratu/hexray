@@ -380,6 +380,7 @@ impl StructuredCfg {
             exception_info,
             &known_noreturn_targets,
             &known_ubsan_targets,
+            &HashMap::new(),
         )
     }
 
@@ -398,6 +399,7 @@ impl StructuredCfg {
             exception_info,
             known_noreturn_targets,
             &known_ubsan_targets,
+            &HashMap::new(),
         )
     }
 
@@ -408,6 +410,7 @@ impl StructuredCfg {
         exception_info: Option<&ExceptionInfo>,
         known_noreturn_targets: &HashMap<u64, String>,
         known_ubsan_targets: &HashMap<u64, String>,
+        known_throw_targets: &HashMap<u64, String>,
     ) -> Self {
         use super::config::OptimizationPass;
 
@@ -418,6 +421,7 @@ impl StructuredCfg {
             annotations,
             known_noreturn_targets.clone(),
             known_ubsan_targets.clone(),
+            known_throw_targets.clone(),
         );
         let mut body = structurer.structure();
         if !structurer.known_noreturn_targets.is_empty() {
@@ -606,6 +610,8 @@ struct Structurer<'a> {
     known_noreturn_targets: HashMap<u64, String>,
     /// Known recoverable UBSan helper targets resolved from the enclosing decompiler context.
     known_ubsan_targets: HashMap<u64, String>,
+    /// Known cold-split helpers that ultimately throw or rethrow a C++ exception.
+    known_throw_targets: HashMap<u64, String>,
 }
 
 impl<'a> Structurer<'a> {
@@ -614,6 +620,7 @@ impl<'a> Structurer<'a> {
             cfg,
             None,
             StructuringAnnotations::default(),
+            HashMap::new(),
             HashMap::new(),
         )
     }
@@ -626,6 +633,7 @@ impl<'a> Structurer<'a> {
             cfg,
             None,
             annotations,
+            HashMap::new(),
             HashMap::new(),
         )
     }
@@ -640,6 +648,7 @@ impl<'a> Structurer<'a> {
             binary_data,
             annotations,
             HashMap::new(),
+            HashMap::new(),
         )
     }
 
@@ -648,6 +657,7 @@ impl<'a> Structurer<'a> {
         binary_data: Option<&'a BinaryDataContext>,
         annotations: StructuringAnnotations,
         known_noreturn_targets: HashMap<u64, String>,
+        known_throw_targets: HashMap<u64, String>,
     ) -> Self {
         Self::new_with_binary_data_annotations_and_known_targets(
             cfg,
@@ -655,6 +665,7 @@ impl<'a> Structurer<'a> {
             annotations,
             known_noreturn_targets,
             HashMap::new(),
+            known_throw_targets,
         )
     }
 
@@ -664,6 +675,7 @@ impl<'a> Structurer<'a> {
         annotations: StructuringAnnotations,
         known_noreturn_targets: HashMap<u64, String>,
         known_ubsan_targets: HashMap<u64, String>,
+        known_throw_targets: HashMap<u64, String>,
     ) -> Self {
         let loops = cfg.find_loops();
         let mut loop_headers = HashSet::new();
@@ -743,6 +755,7 @@ impl<'a> Structurer<'a> {
             binary_data,
             known_noreturn_targets,
             known_ubsan_targets,
+            known_throw_targets,
         }
     }
 
@@ -1547,13 +1560,15 @@ impl<'a> Structurer<'a> {
                 }
 
                 BlockTerminator::ExternalJump { target } => {
-                    let call = Expr::call(
-                        ExprCallTarget::Direct {
+                    let throw_thunk_name = self.known_throw_targets.get(target).cloned();
+                    let call_target = throw_thunk_name
+                        .as_ref()
+                        .map(|name| ExprCallTarget::Named(name.clone()))
+                        .unwrap_or(ExprCallTarget::Direct {
                             target: *target,
                             call_site: block.start,
-                        },
-                        vec![],
-                    );
+                        });
+                    let call = Expr::call(call_target, vec![]);
                     if !statements.is_empty() {
                         statements = propagate_args_in_block(statements);
                         result.push(StructuredNode::Block {
@@ -1561,6 +1576,12 @@ impl<'a> Structurer<'a> {
                             statements,
                             address_range,
                         });
+                    }
+                    if let Some(name) = throw_thunk_name {
+                        result.push(StructuredNode::Expr(Expr::unknown(format!(
+                            "/* throw via {}() */",
+                            name
+                        ))));
                     }
                     result.push(StructuredNode::Return(Some(call)));
                     break;
@@ -3843,6 +3864,7 @@ fn is_noreturn_function(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompiler::{config::DecompilerConfig, PseudoCodeEmitter};
     use hexray_core::{
         Architecture, BasicBlock, BlockTerminator, Condition, ControlFlow, Operand, Operation,
         Register, RegisterClass,
@@ -5161,6 +5183,38 @@ mod tests {
     }
 
     #[test]
+    fn test_external_jump_to_throw_thunk_emits_comment() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ExternalJump { target: 0x2000 };
+        cfg.add_block(bb0);
+
+        let mut throw_targets = HashMap::new();
+        throw_targets.insert(0x2000, "may_throw(int) [clone .cold]".to_string());
+
+        let structured =
+            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
+                &cfg,
+                &DecompilerConfig::default(),
+                None,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+                &throw_targets,
+            );
+        let output = PseudoCodeEmitter::new("    ", false).emit(&structured, "may_throw");
+
+        assert!(
+            output.contains("/* throw via may_throw(int) [clone .cold]() */"),
+            "expected throw-thunk comment, got:\n{output}"
+        );
+        assert!(
+            output.contains("return may_throw(int) [clone .cold]();"),
+            "expected named cold thunk return, got:\n{output}"
+        );
+    }
+
+    #[test]
     fn test_structurer_diamond_if_else() {
         let cfg = make_diamond_cfg();
         let structured = StructuredCfg::from_cfg(&cfg);
@@ -6266,6 +6320,7 @@ mod tests {
             StructuringAnnotations::default(),
             HashMap::new(),
             HashMap::from([(0x5000, "__ubsan_handle_add_overflow@plt".to_string())]),
+            HashMap::new(),
         );
         let structured = structurer.structure();
 
@@ -6347,6 +6402,7 @@ mod tests {
             None,
             StructuringAnnotations::default(),
             HashMap::from([(0x5000, "__stack_chk_fail@plt".to_string())]),
+            HashMap::new(),
             HashMap::new(),
         );
         let structured = structurer.structure();
@@ -6497,6 +6553,7 @@ mod tests {
             StructuringAnnotations::default(),
             HashMap::new(),
             HashMap::from([(0x5000, "__ubsan_handle_add_overflow@plt".to_string())]),
+            HashMap::new(),
         );
         let statements = structurer.block_to_statements(BasicBlockId::new(0));
         let rendered: Vec<_> = statements.iter().map(|expr| format!("{expr}")).collect();
