@@ -628,6 +628,8 @@ pub struct Decompiler {
     pub dwarf_names: HashMap<i128, String>,
     /// DWARF parameter names in declaration order.
     pub dwarf_param_names: Vec<String>,
+    /// DWARF lexical-block ranges keyed by local variable name.
+    pub dwarf_scope_ranges: HashMap<String, (u64, u64)>,
     /// Whether to enable struct field inference.
     pub enable_struct_inference: bool,
     /// Calling convention for function signature recovery.
@@ -671,6 +673,7 @@ impl Default for Decompiler {
             type_info: HashMap::new(),
             dwarf_names: HashMap::new(),
             dwarf_param_names: Vec::new(),
+            dwarf_scope_ranges: HashMap::new(),
             enable_struct_inference: false,
             calling_convention: CallingConvention::default(),
             enable_signature_recovery: true,
@@ -751,6 +754,12 @@ impl Decompiler {
     /// Sets DWARF parameter names in declaration order.
     pub fn with_dwarf_param_names(mut self, names: Vec<String>) -> Self {
         self.dwarf_param_names = names;
+        self
+    }
+
+    /// Sets DWARF lexical-block ranges keyed by local variable name.
+    pub fn with_dwarf_scope_ranges(mut self, ranges: HashMap<String, (u64, u64)>) -> Self {
+        self.dwarf_scope_ranges = ranges;
         self
     }
 
@@ -1018,6 +1027,7 @@ impl Decompiler {
             .with_type_info(merged_types)
             .with_dwarf_names(self.dwarf_names.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone())
+            .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
         if let Some(ref db) = self.summary_database {
@@ -1799,6 +1809,7 @@ impl Decompiler {
             .with_type_info(self.type_info.clone())
             .with_dwarf_names(self.dwarf_names.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone())
+            .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery);
         if let Some(ref db) = self.summary_database {

@@ -3,8 +3,11 @@
 //! information organized into compilation units.
 
 use super::abbrev::AbbreviationTable;
+use super::addr_table::AddressTable;
 use super::die::{AttributeValue, Die, DieParser};
+use super::str_offsets::StringOffsetsTable;
 use super::types::DwLang;
+use super::DwAt;
 use crate::ParseError;
 
 // Bounds-checked little-endian readers used by the CU header parser.
@@ -191,6 +194,25 @@ impl CompilationUnit {
     pub fn variables<'a>(&'a self, die: &'a Die) -> impl Iterator<Item = &'a Die> {
         VariableIterator::new(die)
     }
+
+    /// Find a DIE by its offset from the start of the compilation unit.
+    pub fn find_die_by_offset(&self, offset: u64) -> Option<&Die> {
+        Self::find_die_by_offset_in(&self.root_die, offset)
+    }
+
+    fn find_die_by_offset_in(die: &Die, offset: u64) -> Option<&Die> {
+        if die.offset == offset {
+            return Some(die);
+        }
+
+        for child in &die.children {
+            if let Some(found) = Self::find_die_by_offset_in(child, offset) {
+                return Some(found);
+            }
+        }
+
+        None
+    }
 }
 
 /// Iterator over subprograms in a DIE tree.
@@ -265,15 +287,32 @@ pub struct DebugInfoParser<'a> {
     debug_abbrev: &'a [u8],
     /// The raw .debug_str data (for string references).
     debug_str: Option<&'a [u8]>,
+    /// Optional DWARF5 string-offsets section.
+    debug_str_offsets: Option<&'a [u8]>,
+    /// Optional DWARF5 address table section.
+    debug_addr: Option<&'a [u8]>,
 }
 
 impl<'a> DebugInfoParser<'a> {
     /// Create a new debug info parser.
     pub fn new(debug_info: &'a [u8], debug_abbrev: &'a [u8], debug_str: Option<&'a [u8]>) -> Self {
+        Self::with_tables(debug_info, debug_abbrev, debug_str, None, None)
+    }
+
+    /// Create a new debug info parser with optional DWARF5 tables.
+    pub fn with_tables(
+        debug_info: &'a [u8],
+        debug_abbrev: &'a [u8],
+        debug_str: Option<&'a [u8]>,
+        debug_str_offsets: Option<&'a [u8]>,
+        debug_addr: Option<&'a [u8]>,
+    ) -> Self {
         Self {
             debug_info,
             debug_abbrev,
             debug_str,
+            debug_str_offsets,
+            debug_addr,
         }
     }
 
@@ -368,6 +407,12 @@ impl<'a> DebugInfoParser<'a> {
             (0x01, address_size, abbrev_offset) // 0x01 = DW_UT_compile
         };
 
+        // DWARF5 skeleton and split-compile units carry an 8-byte
+        // DWO ID between the fixed header and the root DIE.
+        if version >= 5 && matches!(unit_type, 0x04 | 0x05) {
+            local_offset = local_offset.saturating_add(8);
+        }
+
         let header = CompilationUnitHeader {
             unit_length,
             version,
@@ -408,24 +453,80 @@ impl<'a> DebugInfoParser<'a> {
         let mut root_die = parser.parse_die()?.ok_or(ParseError::InvalidValue(
             "missing root DIE in compilation unit",
         ))?;
-        self.resolve_string_offsets(&mut root_die);
+        self.resolve_unit_references(&mut root_die);
 
         Ok((CompilationUnit { header, root_die }, cu_end))
     }
 
-    fn resolve_string_offsets(&self, die: &mut Die) {
+    fn resolve_unit_references(&self, die: &mut Die) {
+        let str_offsets = self.string_offsets_table(die);
+        let addr_table = self.address_table(die);
+        self.resolve_die_references(die, str_offsets.as_ref(), addr_table.as_ref());
+    }
+
+    fn string_offsets_table(&self, root: &Die) -> Option<StringOffsetsTable> {
+        let data = self.debug_str_offsets?;
+        let base = match root.attr(DwAt::StrOffsetsBase) {
+            Some(AttributeValue::SecOffset(offset)) | Some(AttributeValue::Unsigned(offset)) => {
+                *offset as usize
+            }
+            _ => 0,
+        };
+        StringOffsetsTable::parse(data, base).ok().or_else(|| {
+            (base != 0)
+                .then(|| StringOffsetsTable::parse(data, 0).ok())
+                .flatten()
+        })
+    }
+
+    fn address_table(&self, root: &Die) -> Option<AddressTable> {
+        let data = self.debug_addr?;
+        let base = match root.attr(DwAt::AddrBase) {
+            Some(AttributeValue::SecOffset(offset)) | Some(AttributeValue::Unsigned(offset)) => {
+                *offset as usize
+            }
+            _ => 0,
+        };
+        AddressTable::parse(data, base).ok().or_else(|| {
+            (base != 0)
+                .then(|| AddressTable::parse(data, 0).ok())
+                .flatten()
+        })
+    }
+
+    fn resolve_die_references(
+        &self,
+        die: &mut Die,
+        str_offsets: Option<&StringOffsetsTable>,
+        addr_table: Option<&AddressTable>,
+    ) {
         for attr in &mut die.attributes {
-            let offset = match &attr.value {
-                AttributeValue::StringOffset(offset) => *offset,
-                _ => continue,
-            };
-            if let Some(value) = self.get_string(offset) {
-                attr.value = AttributeValue::String(value.to_string());
+            match &attr.value {
+                AttributeValue::StringOffset(offset) => {
+                    if let Some(value) = self.get_string(*offset) {
+                        attr.value = AttributeValue::String(value.to_string());
+                    }
+                }
+                AttributeValue::StringIndex(index) => {
+                    if let (Some(table), Some(debug_str)) = (str_offsets, self.debug_str) {
+                        if let Some(value) = table.get_string(*index as usize, debug_str) {
+                            attr.value = AttributeValue::String(value.to_string());
+                        }
+                    }
+                }
+                AttributeValue::AddressIndex(index) => {
+                    if let Some(table) = addr_table {
+                        if let Some(address) = table.get_address(*index as usize) {
+                            attr.value = AttributeValue::Address(address);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
         for child in &mut die.children {
-            self.resolve_string_offsets(child);
+            self.resolve_die_references(child, str_offsets, addr_table);
         }
     }
 
@@ -470,7 +571,7 @@ mod tests {
             }],
         };
 
-        parser.resolve_string_offsets(&mut die);
+        parser.resolve_unit_references(&mut die);
 
         assert_eq!(die.name(), Some("outer"));
         assert_eq!(die.children[0].name(), Some("inner"));

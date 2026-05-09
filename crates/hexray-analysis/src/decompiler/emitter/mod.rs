@@ -386,6 +386,8 @@ pub struct PseudoCodeEmitter {
     dwarf_names: std::collections::HashMap<i128, String>,
     /// DWARF parameter names in declaration order.
     dwarf_param_names: Vec<String>,
+    /// DWARF lexical-block ranges keyed by local variable name.
+    dwarf_scope_ranges: std::collections::HashMap<String, (u64, u64)>,
     /// Naming context for pattern-based variable naming.
     /// Uses RefCell for interior mutability during emission.
     naming_ctx: RefCell<NamingContext>,
@@ -477,6 +479,12 @@ impl PseudoCodeEmitter {
             }
         }
         None
+    }
+
+    fn dwarf_scope_comment(&self, candidate: &str) -> Option<String> {
+        self.dwarf_scope_ranges
+            .get(candidate)
+            .map(|(start, end)| format!(" // DWARF scope [{start:#x}, {end:#x})"))
     }
 
     fn argument_type_aliases(&self, candidate: &str) -> Vec<&'static str> {
@@ -620,6 +628,7 @@ impl PseudoCodeEmitter {
             type_info: std::collections::HashMap::new(),
             dwarf_names: std::collections::HashMap::new(),
             dwarf_param_names: Vec::new(),
+            dwarf_scope_ranges: std::collections::HashMap::new(),
             naming_ctx: RefCell::new(NamingContext::new()),
             calling_convention: CallingConvention::default(),
             use_signature_recovery: true,
@@ -2519,6 +2528,15 @@ impl PseudoCodeEmitter {
     /// Sets DWARF parameter names in declaration order.
     pub fn with_dwarf_param_names(mut self, names: Vec<String>) -> Self {
         self.dwarf_param_names = names;
+        self
+    }
+
+    /// Sets DWARF lexical-block ranges keyed by local variable name.
+    pub fn with_dwarf_scope_ranges(
+        mut self,
+        ranges: std::collections::HashMap<String, (u64, u64)>,
+    ) -> Self {
+        self.dwarf_scope_ranges = ranges;
         self
     }
 
@@ -4920,10 +4938,16 @@ impl PseudoCodeEmitter {
                     } else {
                         self.get_type(var)
                     };
+                let scope_comment = self.dwarf_scope_comment(var).unwrap_or_default();
                 if loop_zero_init_vars.contains(var) {
-                    writeln!(output, "{}{} {} = 0;", indent, var_type, var).unwrap();
+                    writeln!(
+                        output,
+                        "{}{} {} = 0;{}",
+                        indent, var_type, var, scope_comment
+                    )
+                    .unwrap();
                 } else {
-                    writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
+                    writeln!(output, "{}{} {};{}", indent, var_type, var, scope_comment).unwrap();
                 }
             }
             writeln!(output).unwrap(); // Blank line after declarations
@@ -5087,10 +5111,16 @@ impl PseudoCodeEmitter {
                     } else {
                         self.get_type(var)
                     };
+                let scope_comment = self.dwarf_scope_comment(var).unwrap_or_default();
                 if loop_zero_init_vars.contains(var) {
-                    writeln!(output, "{}{} {} = 0;", indent, var_type, var).unwrap();
+                    writeln!(
+                        output,
+                        "{}{} {} = 0;{}",
+                        indent, var_type, var, scope_comment
+                    )
+                    .unwrap();
                 } else {
-                    writeln!(output, "{}{} {};", indent, var_type, var).unwrap();
+                    writeln!(output, "{}{} {};{}", indent, var_type, var, scope_comment).unwrap();
                 }
             }
             writeln!(output).unwrap();

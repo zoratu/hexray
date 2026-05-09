@@ -28,7 +28,9 @@ use hexray_analysis::{
 use hexray_core::{Architecture, Endianness};
 use hexray_demangle::demangle_or_original;
 use hexray_disasm::{Arm64Disassembler, Disassembler, RiscVDisassembler, X86_64Disassembler};
-use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
+use hexray_formats::dwarf::{
+    decode_uleb128, parse_debug_info, AttributeValue, DebugInfo, Die, DwAt, DwTag,
+};
 use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
 use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
 use hexray_types::TypeDatabase;
@@ -793,6 +795,7 @@ fn main() -> Result<()> {
 
             if follow {
                 decompile_with_follow(
+                    binary_path,
                     &binary,
                     &target,
                     show_addresses,
@@ -804,6 +807,7 @@ fn main() -> Result<()> {
                 )?;
             } else {
                 decompile_function(
+                    binary_path,
                     &binary,
                     &target,
                     show_addresses,
@@ -2586,7 +2590,9 @@ fn resolve_decompile_target_info(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decompile_function(
+    binary_path: &Path,
     binary: &Binary,
     target: &str,
     show_addresses: bool,
@@ -2683,8 +2689,8 @@ fn decompile_function(
     let binary_data_ctx = build_binary_data_context(fmt);
 
     // Try to load DWARF debug info for function-scoped variable and parameter names.
-    let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary) {
-        get_dwarf_function_names(&debug_info, start_addr)
+    let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary_path, binary) {
+        get_dwarf_function_names(&debug_info, start_addr, binary)
     } else {
         DwarfFunctionNames::default()
     };
@@ -2712,6 +2718,7 @@ fn decompile_function(
         .with_binary_data(binary_data_ctx)
         .with_dwarf_names(dwarf_names.stack_names)
         .with_dwarf_param_names(dwarf_names.parameter_names)
+        .with_dwarf_scope_ranges(dwarf_names.local_scope_ranges)
         .with_constant_database(const_db)
         .with_struct_inference(true)
         .with_calling_convention(calling_convention);
@@ -3717,7 +3724,7 @@ fn load_type_database(
 
 /// Attempts to load DWARF debug info from a binary.
 /// Returns None if DWARF sections are not present.
-fn load_dwarf_info(binary: &Binary) -> Option<DebugInfo> {
+fn load_dwarf_info(binary_path: &Path, binary: &Binary) -> Option<DebugInfo> {
     let fmt = binary.as_format();
 
     // Get DWARF sections
@@ -3737,6 +3744,22 @@ fn load_dwarf_info(binary: &Binary) -> Option<DebugInfo> {
         .sections()
         .find(|s| s.name() == ".debug_line" || s.name() == "__debug_line")
         .map(|s| s.data());
+    let debug_loc = fmt
+        .sections()
+        .find(|s| s.name() == ".debug_loc" || s.name() == "__debug_loc")
+        .map(|s| s.data());
+    let debug_loclists = fmt
+        .sections()
+        .find(|s| s.name() == ".debug_loclists" || s.name() == "__debug_loclists")
+        .map(|s| s.data());
+    let debug_str_offsets = fmt
+        .sections()
+        .find(|s| s.name() == ".debug_str_offsets" || s.name() == "__debug_str_offsets")
+        .map(|s| s.data());
+    let debug_addr = fmt
+        .sections()
+        .find(|s| s.name() == ".debug_addr" || s.name() == "__debug_addr")
+        .map(|s| s.data());
 
     // Determine address size based on architecture
     let address_size = match fmt.architecture() {
@@ -3745,35 +3768,248 @@ fn load_dwarf_info(binary: &Binary) -> Option<DebugInfo> {
     };
 
     // Parse DWARF info
-    parse_debug_info(
+    let parsed = parse_debug_info(
         debug_info,
         debug_abbrev,
         debug_str,
         debug_line,
+        debug_loc,
+        debug_loclists,
+        debug_str_offsets,
+        debug_addr,
         address_size,
     )
-    .ok()
+    .ok()?;
+
+    load_split_dwarf_info(binary_path, fmt, &parsed, address_size).or(Some(parsed))
 }
 
 #[derive(Default)]
 struct DwarfFunctionNames {
     stack_names: std::collections::HashMap<i128, String>,
     parameter_names: Vec<String>,
+    local_scope_ranges: std::collections::HashMap<String, (u64, u64)>,
 }
 
 /// Gets DWARF variable and parameter names for a function at the given address.
-fn get_dwarf_function_names(debug_info: &DebugInfo, func_addr: u64) -> DwarfFunctionNames {
+fn get_dwarf_function_names(
+    debug_info: &DebugInfo,
+    func_addr: u64,
+    binary: &Binary,
+) -> DwarfFunctionNames {
     if let Some(func) = debug_info.find_function(func_addr) {
+        let declared_names: Vec<String> = func
+            .parameters()
+            .map(|param| {
+                func.resolved_name(param)
+                    .map(str::to_string)
+                    .unwrap_or_default()
+            })
+            .collect();
+        let mut bound_names = std::collections::HashMap::new();
+        for param in func.parameters() {
+            let Some(name) = func.resolved_name(param).map(str::to_string) else {
+                continue;
+            };
+            let Some(expr) = func.entry_location_expression(param) else {
+                continue;
+            };
+            let Some(reg) = dwarf_entry_register(&expr) else {
+                continue;
+            };
+            let Some(arg_index) = dwarf_register_arg_index(binary, reg) else {
+                continue;
+            };
+            bound_names.entry(arg_index).or_insert(name);
+        }
+
+        let parameter_names = if bound_names.is_empty() {
+            declared_names
+        } else {
+            let mut names = vec![
+                String::new();
+                declared_names.len().max(
+                    bound_names
+                        .keys()
+                        .copied()
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1)
+                )
+            ];
+            for (idx, name) in bound_names {
+                if let Some(slot) = names.get_mut(idx) {
+                    *slot = name;
+                }
+            }
+            for name in declared_names {
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(slot) = names.iter_mut().find(|slot| slot.is_empty()) {
+                    *slot = name;
+                }
+            }
+            names
+        };
         DwarfFunctionNames {
             stack_names: func.variable_names(),
-            parameter_names: func
-                .parameters()
-                .map(|param| param.name().map(str::to_string).unwrap_or_default())
-                .collect(),
+            parameter_names,
+            local_scope_ranges: dwarf_lexical_scope_ranges(&func),
         }
     } else {
         DwarfFunctionNames::default()
     }
+}
+
+fn dwarf_lexical_scope_ranges(
+    func: &hexray_formats::dwarf::FunctionInfo<'_>,
+) -> std::collections::HashMap<String, (u64, u64)> {
+    fn collect(
+        func: &hexray_formats::dwarf::FunctionInfo<'_>,
+        die: &Die,
+        out: &mut std::collections::HashMap<String, (u64, u64)>,
+    ) {
+        if matches!(die.tag, DwTag::LexicalBlock) {
+            if let (Some(low_pc), Some(high_pc_attr)) = (die.low_pc(), die.attr(DwAt::HighPc)) {
+                let high_pc = match high_pc_attr {
+                    AttributeValue::Address(addr) => *addr,
+                    AttributeValue::Unsigned(size) => low_pc.saturating_add(*size),
+                    _ => low_pc,
+                };
+                for child in &die.children {
+                    if matches!(child.tag, DwTag::Variable) {
+                        if let Some(name) = func.resolved_name(child) {
+                            out.insert(name.to_string(), (low_pc, high_pc));
+                        }
+                    }
+                }
+            }
+        }
+
+        for child in &die.children {
+            collect(func, child, out);
+        }
+    }
+
+    let mut ranges = std::collections::HashMap::new();
+    collect(func, func.die, &mut ranges);
+    ranges
+}
+
+fn load_split_dwarf_info(
+    binary_path: &Path,
+    fmt: &dyn BinaryFormat,
+    main_debug_info: &DebugInfo,
+    address_size: u8,
+) -> Option<DebugInfo> {
+    let (dwo_name, comp_dir) = main_debug_info
+        .compilation_units
+        .iter()
+        .find_map(|cu| match cu.root_die.attr(DwAt::DwoName) {
+            Some(AttributeValue::String(name)) => {
+                Some((name.clone(), cu.comp_dir().map(str::to_string)))
+            }
+            _ => None,
+        })?;
+
+    let sidecar_path = resolve_dwo_path(binary_path, comp_dir.as_deref(), &dwo_name)?;
+    let bytes = fs::read(sidecar_path).ok()?;
+    if detect_format(&bytes) != BinaryType::Elf {
+        return None;
+    }
+    let elf = Elf::parse(&bytes).ok()?;
+
+    let debug_info = elf
+        .sections()
+        .find(|s| s.name() == ".debug_info.dwo")?
+        .data();
+    let debug_abbrev = elf
+        .sections()
+        .find(|s| s.name() == ".debug_abbrev.dwo")?
+        .data();
+    let debug_str = elf
+        .sections()
+        .find(|s| s.name() == ".debug_str.dwo")
+        .map(|s| s.data());
+    let debug_line = elf
+        .sections()
+        .find(|s| s.name() == ".debug_line.dwo")
+        .map(|s| s.data());
+    let debug_loclists = elf
+        .sections()
+        .find(|s| s.name() == ".debug_loclists.dwo")
+        .map(|s| s.data());
+    let debug_str_offsets = elf
+        .sections()
+        .find(|s| s.name() == ".debug_str_offsets.dwo")
+        .map(|s| s.data());
+    let debug_addr = fmt
+        .sections()
+        .find(|s| s.name() == ".debug_addr" || s.name() == "__debug_addr")
+        .map(|s| s.data());
+
+    parse_debug_info(
+        debug_info,
+        debug_abbrev,
+        debug_str,
+        debug_line,
+        None,
+        debug_loclists,
+        debug_str_offsets,
+        debug_addr,
+        address_size,
+    )
+    .ok()
+}
+
+fn resolve_dwo_path(binary_path: &Path, comp_dir: Option<&str>, dwo_name: &str) -> Option<PathBuf> {
+    let dwo_path = Path::new(dwo_name);
+    if dwo_path.is_absolute() && dwo_path.exists() {
+        return Some(dwo_path.to_path_buf());
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(parent) = binary_path.parent() {
+        candidates.push(parent.join(dwo_name));
+    }
+    if let Some(dir) = comp_dir {
+        candidates.push(Path::new(dir).join(dwo_name));
+    }
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
+fn dwarf_entry_register(expr: &[u8]) -> Option<u64> {
+    let op = *expr.first()?;
+    match op {
+        0x50..=0x6f => Some((op - 0x50) as u64),
+        0x90 => decode_uleb128(expr.get(1..)?).ok().map(|(reg, _)| reg),
+        0xa3 | 0xf3 => {
+            let (len, consumed) = decode_uleb128(expr.get(1..)?).ok()?;
+            let start = 1usize.checked_add(consumed)?;
+            let end = start.checked_add(len as usize)?;
+            dwarf_entry_register(expr.get(start..end)?)
+        }
+        _ => None,
+    }
+}
+
+fn dwarf_register_arg_index(binary: &Binary, reg: u64) -> Option<usize> {
+    const X86_64_SYSV: &[u64] = &[5, 4, 1, 2, 8, 9];
+    const X86_64_WIN64: &[u64] = &[2, 1, 8, 9];
+    const ARM64_AAPCS: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7];
+    const RISCV: &[u64] = &[10, 11, 12, 13, 14, 15, 16, 17];
+
+    let order = match (binary, binary.as_format().architecture()) {
+        (Binary::Pe(_), Architecture::X86_64) => X86_64_WIN64,
+        (_, Architecture::X86_64) => X86_64_SYSV,
+        (_, Architecture::Arm64) => ARM64_AAPCS,
+        (_, Architecture::RiscV64 | Architecture::RiscV32) => RISCV,
+        _ => &[],
+    };
+
+    order.iter().position(|candidate| *candidate == reg)
 }
 
 /// Disassemble bytes to extract call instructions (for function discovery).
@@ -4905,6 +5141,7 @@ fn extract_strings(
 /// Decompile a function and follow internal calls recursively.
 #[allow(clippy::too_many_arguments)]
 fn decompile_with_follow(
+    binary_path: &Path,
     binary: &Binary,
     target: &str,
     show_addresses: bool,
@@ -4951,7 +5188,7 @@ fn decompile_with_follow(
     let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
 
     // Try to load DWARF debug info once
-    let debug_info = load_dwarf_info(binary);
+    let debug_info = load_dwarf_info(binary_path, binary);
 
     while let Some((func_addr, func_name, depth)) = queue.pop() {
         if decompiled.contains(&func_addr) {
@@ -5023,7 +5260,7 @@ fn decompile_with_follow(
 
         // Get DWARF variable and parameter names for this function.
         let dwarf_names = if let Some(ref di) = debug_info {
-            get_dwarf_function_names(di, func_addr)
+            get_dwarf_function_names(di, func_addr, binary)
         } else {
             DwarfFunctionNames::default()
         };
@@ -5045,6 +5282,7 @@ fn decompile_with_follow(
             .with_throw_thunks(throw_thunks.clone())
             .with_dwarf_names(dwarf_names.stack_names)
             .with_dwarf_param_names(dwarf_names.parameter_names)
+            .with_dwarf_scope_ranges(dwarf_names.local_scope_ranges)
             .with_constant_database(const_db.clone())
             .with_struct_inference(true)
             .with_calling_convention(calling_convention);

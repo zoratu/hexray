@@ -52,6 +52,7 @@ pub mod eh_frame;
 mod info;
 mod leb128;
 mod line;
+pub mod loc;
 pub mod loclists;
 pub mod lsda;
 pub mod rnglists;
@@ -65,6 +66,7 @@ pub use eh_frame::{parse_eh_frame, CfiInstruction, Cie, EhFrame, EhFrameParser, 
 pub use info::{CompilationUnit, CompilationUnitHeader, DebugInfoParser};
 pub use leb128::{decode_sleb128, decode_uleb128};
 pub use line::{FileEntry, LineNumberProgram, LineNumberProgramHeader, LineRow};
+pub use loc::DebugLocParser;
 pub use loclists::{DwLle, LocationEntry, LocationListsParser};
 pub use lsda::{
     ActionRecord, CallSite, CatchHandler, CatchType, CleanupHandler, ExceptionHandlingInfo, Lsda,
@@ -88,6 +90,14 @@ pub struct DebugInfo {
     line_programs_by_offset: std::collections::HashMap<u64, usize>,
     /// CU address ranges sorted for binary search: (low_pc, high_pc, cu_index).
     cu_ranges: Vec<(u64, u64, usize)>,
+    /// Raw DWARF sections needed for on-demand location resolution.
+    sections: DebugSections,
+}
+
+#[derive(Debug, Default)]
+struct DebugSections {
+    debug_loc: Option<Vec<u8>>,
+    debug_loclists: Option<Vec<u8>>,
 }
 
 impl DebugInfo {
@@ -95,6 +105,14 @@ impl DebugInfo {
     pub fn new(
         compilation_units: Vec<CompilationUnit>,
         line_programs: Vec<(u64, LineNumberProgram)>,
+    ) -> Self {
+        Self::with_sections(compilation_units, line_programs, DebugSections::default())
+    }
+
+    fn with_sections(
+        compilation_units: Vec<CompilationUnit>,
+        line_programs: Vec<(u64, LineNumberProgram)>,
+        sections: DebugSections,
     ) -> Self {
         // Build line program index for O(1) lookup
         let line_programs_by_offset: std::collections::HashMap<u64, usize> = line_programs
@@ -126,6 +144,7 @@ impl DebugInfo {
             line_programs,
             line_programs_by_offset,
             cu_ranges,
+            sections,
         }
     }
 
@@ -146,6 +165,13 @@ impl DebugInfo {
         } else {
             None
         }
+    }
+
+    fn find_die_by_global_offset(&self, offset: u64) -> Option<&Die> {
+        self.compilation_units.iter().find_map(|cu| {
+            let local = offset.checked_sub(cu.header.offset)?;
+            cu.find_die_by_offset(local)
+        })
     }
 
     /// Find the source location for an address.
@@ -181,6 +207,7 @@ impl DebugInfo {
                 return Some(FunctionInfo {
                     die,
                     compilation_unit: cu,
+                    debug_info: self,
                 });
             }
         }
@@ -190,6 +217,7 @@ impl DebugInfo {
                 return Some(FunctionInfo {
                     die,
                     compilation_unit: cu,
+                    debug_info: self,
                 });
             }
         }
@@ -198,10 +226,11 @@ impl DebugInfo {
 
     /// Get all functions defined in the debug info.
     pub fn functions(&self) -> impl Iterator<Item = FunctionInfo<'_>> {
-        self.compilation_units.iter().flat_map(|cu| {
+        self.compilation_units.iter().flat_map(move |cu| {
             cu.subprograms().map(move |die| FunctionInfo {
                 die,
                 compilation_unit: cu,
+                debug_info: self,
             })
         })
     }
@@ -234,6 +263,8 @@ pub struct FunctionInfo<'a> {
     pub die: &'a Die,
     /// The compilation unit this function belongs to.
     pub compilation_unit: &'a CompilationUnit,
+    /// Parent debug container for auxiliary sections.
+    debug_info: &'a DebugInfo,
 }
 
 impl<'a> FunctionInfo<'a> {
@@ -276,6 +307,59 @@ impl<'a> FunctionInfo<'a> {
             .children
             .iter()
             .filter(|d| matches!(d.tag, DwTag::Variable))
+    }
+
+    /// Resolve a DIE's abstract origin within the current debug info.
+    pub fn abstract_origin(&self, die: &'a Die) -> Option<&'a Die> {
+        match die.attr(DwAt::AbstractOrigin) {
+            Some(AttributeValue::Reference(offset)) => {
+                self.compilation_unit.find_die_by_offset(*offset)
+            }
+            Some(AttributeValue::RefAddr(offset)) => {
+                self.debug_info.find_die_by_global_offset(*offset)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve a DIE name, following `DW_AT_abstract_origin` when needed.
+    pub fn resolved_name(&self, die: &'a Die) -> Option<&'a str> {
+        die.name()
+            .or_else(|| self.abstract_origin(die).and_then(Die::name))
+    }
+
+    /// Get the location expression that is valid at function entry.
+    pub fn entry_location_expression(&self, die: &Die) -> Option<Vec<u8>> {
+        let low_pc = self.low_pc()?;
+        match die.attr(DwAt::Location)? {
+            AttributeValue::ExprLoc(bytes) | AttributeValue::Block(bytes) => Some(bytes.clone()),
+            AttributeValue::SecOffset(offset) => {
+                let offset = *offset as usize;
+                if self.compilation_unit.header.version >= 5 {
+                    let data = self.debug_info.sections.debug_loclists.as_deref()?;
+                    let parser =
+                        LocationListsParser::new(data, self.compilation_unit.header.address_size);
+                    let locations = parser.parse_location_list(offset, low_pc, None).ok()?;
+                    Self::location_at_entry(&locations, low_pc)
+                } else {
+                    let data = self.debug_info.sections.debug_loc.as_deref()?;
+                    let parser =
+                        DebugLocParser::new(data, self.compilation_unit.header.address_size);
+                    let locations = parser.parse_location_list(offset).ok()?;
+                    Self::location_at_entry(&locations, low_pc)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn location_at_entry(locations: &[LocationEntry], low_pc: u64) -> Option<Vec<u8>> {
+        locations
+            .iter()
+            .find(|entry| entry.is_valid_at(low_pc))
+            .or_else(|| locations.iter().find(|entry| entry.is_default()))
+            .or_else(|| locations.first())
+            .map(|entry| entry.expression.clone())
     }
 
     /// Frame-base correction in bytes from CFA to the architecture's
@@ -335,7 +419,9 @@ impl<'a> FunctionInfo<'a> {
 
         // Collect parameters
         for param in self.parameters() {
-            if let (Some(name), Some(offset)) = (param.name(), param.frame_base_offset()) {
+            if let (Some(name), Some(offset)) =
+                (self.resolved_name(param), param.frame_base_offset())
+            {
                 names.insert(
                     (offset as i128).saturating_add(cfa_correction),
                     name.to_string(),
@@ -347,7 +433,7 @@ impl<'a> FunctionInfo<'a> {
         let mut locals = Vec::new();
         collect_local_variables(self.die, &mut locals);
         for var in locals {
-            if let (Some(name), Some(offset)) = (var.name(), var.frame_base_offset()) {
+            if let (Some(name), Some(offset)) = (self.resolved_name(var), var.frame_base_offset()) {
                 names.insert(
                     (offset as i128).saturating_add(cfa_correction),
                     name.to_string(),
@@ -362,7 +448,7 @@ impl<'a> FunctionInfo<'a> {
     pub fn parameter_info(&self) -> Vec<(String, Option<i64>)> {
         self.parameters()
             .filter_map(|p| {
-                p.name()
+                self.resolved_name(p)
                     .map(|name| (name.to_string(), p.frame_base_offset()))
             })
             .collect()
@@ -372,7 +458,7 @@ impl<'a> FunctionInfo<'a> {
     pub fn local_variable_info(&self) -> Vec<(String, Option<i64>)> {
         self.local_variables()
             .filter_map(|v| {
-                v.name()
+                self.resolved_name(v)
                     .map(|name| (name.to_string(), v.frame_base_offset()))
             })
             .collect()
@@ -387,15 +473,26 @@ impl<'a> FunctionInfo<'a> {
 /// * `debug_str` - Optional .debug_str section data.
 /// * `debug_line` - Optional .debug_line section data.
 /// * `address_size` - The address size (4 or 8 bytes).
+#[allow(clippy::too_many_arguments)]
 pub fn parse_debug_info(
     debug_info: &[u8],
     debug_abbrev: &[u8],
     debug_str: Option<&[u8]>,
     debug_line: Option<&[u8]>,
+    debug_loc: Option<&[u8]>,
+    debug_loclists: Option<&[u8]>,
+    debug_str_offsets: Option<&[u8]>,
+    debug_addr: Option<&[u8]>,
     address_size: u8,
 ) -> Result<DebugInfo, crate::ParseError> {
     // Parse compilation units
-    let parser = DebugInfoParser::new(debug_info, debug_abbrev, debug_str);
+    let parser = DebugInfoParser::with_tables(
+        debug_info,
+        debug_abbrev,
+        debug_str,
+        debug_str_offsets,
+        debug_addr,
+    );
     let compilation_units = parser.parse_all()?;
 
     // Parse line number programs
@@ -418,7 +515,16 @@ pub fn parse_debug_info(
         }
     }
 
-    Ok(DebugInfo::new(compilation_units, line_programs))
+    let sections = DebugSections {
+        debug_loc: debug_loc.map(<[u8]>::to_vec),
+        debug_loclists: debug_loclists.map(<[u8]>::to_vec),
+    };
+
+    Ok(DebugInfo::with_sections(
+        compilation_units,
+        line_programs,
+        sections,
+    ))
 }
 
 #[cfg(test)]
