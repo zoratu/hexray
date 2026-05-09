@@ -1424,16 +1424,9 @@ impl ExpressionTypePropagation {
                 })
             }
             ExprKind::IntLit(value) => {
-                // Infer type from value
-                if is_likely_char_constant(*value) {
-                    Some(ExprType::Char { signed: true })
-                } else if *value >= 0 && *value <= 255 {
-                    Some(ExprType::uint(1))
-                } else if *value >= i8::MIN as i128 && *value <= i8::MAX as i128 {
-                    Some(ExprType::sint(1))
-                } else if *value >= i16::MIN as i128 && *value <= i16::MAX as i128 {
-                    Some(ExprType::sint(2))
-                } else if *value >= i32::MIN as i128 && *value <= i32::MAX as i128 {
+                // Plain integer literals in C/C++ are `int`-sized unless an
+                // explicit narrower cast or stronger context says otherwise.
+                if *value >= i32::MIN as i128 && *value <= i32::MAX as i128 {
                     Some(ExprType::sint(4))
                 } else {
                     Some(ExprType::sint(8))
@@ -1731,13 +1724,12 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_expr_type_for_char_constant() {
+    fn test_infer_expr_type_for_small_integer_literal_defaults_to_int() {
         let engine = ExpressionTypePropagation::new();
 
-        // Character constant
         let char_lit = Expr::int('a' as i128);
         let ty = engine.infer_expr_type(&char_lit);
-        assert!(matches!(ty, Some(ExprType::Char { .. })));
+        assert_eq!(ty, Some(ExprType::sint(4)));
     }
 
     #[test]
@@ -1907,6 +1899,35 @@ mod tests {
             engine.variable_types.get("str"),
             Some(ExprType::CString)
         ));
+    }
+
+    #[test]
+    fn test_zero_initialized_accumulator_stays_int32() {
+        let acc = Expr::var(Variable {
+            kind: VarKind::Temp(0),
+            name: "acc".to_string(),
+            size: 1,
+        });
+        let ptr = make_var("rdi", 8);
+        let nodes = vec![StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(acc.clone(), Expr::int(0)),
+                Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Add,
+                        lhs: Box::new(acc.clone()),
+                        rhs: Box::new(Expr::deref(ptr, 4)),
+                    },
+                },
+            ],
+            address_range: (0x1000, 0x1010),
+        }];
+
+        let mut engine = ExpressionTypePropagation::new();
+        engine.analyze(&nodes);
+
+        assert_eq!(engine.get_variable_type("acc"), Some(&ExprType::sint(4)));
     }
 
     #[test]

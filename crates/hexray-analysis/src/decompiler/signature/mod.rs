@@ -2631,11 +2631,8 @@ impl SignatureRecovery {
                 }
             }
             ExprKind::IntLit(n) => {
-                if *n >= i8::MIN as i128 && *n <= i8::MAX as i128 {
-                    Some(1)
-                } else if *n >= i16::MIN as i128 && *n <= i16::MAX as i128 {
-                    Some(2)
-                } else if *n >= i32::MIN as i128 && *n <= i32::MAX as i128 {
+                // Plain integer literals default to at least `int` width in C/C++.
+                if *n >= i32::MIN as i128 && *n <= i32::MAX as i128 {
                     Some(4)
                 } else {
                     Some(8)
@@ -3868,6 +3865,43 @@ mod tests {
             "provenance: {:?}",
             sig.return_provenance
         );
+    }
+
+    #[test]
+    fn test_accumulator_initialized_from_zero_stays_int32_on_return() {
+        use hexray_core::BasicBlockId;
+
+        let acc = Expr::var(Variable {
+            kind: crate::decompiler::expression::VarKind::Temp(0),
+            name: "acc".to_string(),
+            size: 1,
+        });
+        let ptr = Expr::var(Variable::reg("rdi", 8));
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(acc.clone(), Expr::int(0)),
+                Expr::assign(
+                    acc.clone(),
+                    Expr::call(
+                        CallTarget::Named("max".to_string()),
+                        vec![acc.clone(), Expr::deref(ptr, 4)],
+                    ),
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let ret = StructuredNode::Return(Some(acc));
+        let cfg = StructuredCfg {
+            body: vec![block, ret],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(matches!(sig.return_type, ParamType::SignedInt(32)));
     }
 
     #[test]
