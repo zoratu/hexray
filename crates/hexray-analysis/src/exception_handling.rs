@@ -294,6 +294,29 @@ impl ExceptionExtractor {
             .count()
     }
 
+    /// Returns the total number of FDEs present in `.eh_frame`.
+    pub fn fde_count(&self) -> usize {
+        self.eh_frame.fdes.len()
+    }
+
+    /// Returns the unique personality functions referenced by parsed CIEs.
+    pub fn personality_functions(&self) -> Vec<u64> {
+        let mut personalities: Vec<u64> = self
+            .eh_frame
+            .cies
+            .iter()
+            .filter_map(|cie| cie.personality)
+            .collect();
+        personalities.sort_unstable();
+        personalities.dedup();
+        personalities
+    }
+
+    /// Returns true when an LSDA section such as `.gcc_except_table` was found.
+    pub fn has_lsda_section(&self) -> bool {
+        self.lsda_data.is_some()
+    }
+
     /// Returns all function boundaries from eh_frame.
     pub fn function_boundaries(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.eh_frame.function_boundaries()

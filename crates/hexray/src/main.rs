@@ -17,12 +17,13 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hexray_analysis::{
-    is_noreturn_function_name, is_ubsan_handler_function_name, AnalysisProject, BinaryDataContext,
-    BinaryDiff, CallGraph, CallGraphBuilder, CallGraphDotExporter, CallGraphHtmlExporter,
-    CallGraphJsonExporter, CallSite, CallType, CfgBuilder, CfgDotExporter, CfgHtmlExporter,
-    CfgJsonExporter, Decompiler, DecompilerConfig, ExceptionExtractor, ExceptionInfo, FunctionInfo,
-    OptimizationLevel, OptimizationPass, ParallelCallGraphBuilder, Patch, PatchType,
-    RelocationTable, StringConfig, StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
+    add_exception_section_xrefs, is_noreturn_function_name, is_ubsan_handler_function_name,
+    AnalysisProject, BinaryDataContext, BinaryDiff, CallGraph, CallGraphBuilder,
+    CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CallSite, CallType,
+    CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter, Decompiler, DecompilerConfig,
+    ExceptionExtractor, ExceptionInfo, FunctionInfo, OptimizationLevel, OptimizationPass,
+    ParallelCallGraphBuilder, Patch, PatchType, RelocationTable, StringConfig, StringDetector,
+    StringTable, SymbolTable, XrefBuilder, XrefType,
 };
 use hexray_core::Architecture;
 use hexray_demangle::demangle_or_original;
@@ -377,6 +378,77 @@ impl<'a> Binary<'a> {
         };
         extractor.get_exception_info(func_start, func_end)
     }
+
+    fn exception_metadata_summary(&self) -> Option<ExceptionMetadataSummary> {
+        let extractor = match self {
+            Self::Elf(elf) => ExceptionExtractor::from_elf(elf).ok()?,
+            Self::MachO(macho) => ExceptionExtractor::from_elf(macho).ok()?,
+            Self::Pe(pe) => ExceptionExtractor::from_elf(pe).ok()?,
+        };
+
+        Some(ExceptionMetadataSummary {
+            fde_count: extractor.fde_count(),
+            personalities: extractor.personality_functions(),
+            lsda_section_name: exception_lsda_section_name(self.as_format()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExceptionMetadataSummary {
+    fde_count: usize,
+    personalities: Vec<u64>,
+    lsda_section_name: Option<String>,
+}
+
+fn exception_lsda_section_name(fmt: &dyn BinaryFormat) -> Option<String> {
+    fmt.sections().find_map(|section| {
+        let name = section.name();
+        if matches!(name, ".gcc_except_table" | "__gcc_except_tab")
+            || name.ends_with(".gcc_except_table")
+            || name.ends_with("__gcc_except_tab")
+        {
+            Some(section.name().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn format_exception_personality(binary: &Binary<'_>, addr: u64) -> String {
+    match binary.as_format().symbol_at(addr) {
+        Some(symbol) if !symbol.name.is_empty() => {
+            format!("{} ({:#x})", demangle_or_original(&symbol.name), addr)
+        }
+        _ => format!("{:#x}", addr),
+    }
+}
+
+fn append_exception_metadata(output: &mut String, binary: &Binary<'_>) {
+    let Some(summary) = binary.exception_metadata_summary() else {
+        return;
+    };
+
+    let personality = if summary.personalities.is_empty() {
+        "none".to_string()
+    } else {
+        summary
+            .personalities
+            .iter()
+            .map(|addr| format_exception_personality(binary, *addr))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let lsda = match summary.lsda_section_name {
+        Some(name) => format!("{} (present)", name),
+        None => "absent".to_string(),
+    };
+
+    output.push_str("\nException Handling\n");
+    output.push_str("------------------\n");
+    output.push_str(&format!(".eh_frame FDEs: {}\n", summary.fde_count));
+    output.push_str(&format!("Personality:   {}\n", personality));
+    output.push_str(&format!("LSDA Section:  {}\n", lsda));
 }
 
 fn default_calling_convention(
@@ -888,6 +960,11 @@ fn print_info(binary: &Binary) {
 
     let sym_count: usize = fmt.symbols().count();
     println!("\nSymbols:       {}", sym_count);
+    let mut exception_output = String::new();
+    append_exception_metadata(&mut exception_output, binary);
+    if !exception_output.is_empty() {
+        print!("{}", exception_output);
+    }
 }
 
 fn print_sections(binary: &Binary) {
@@ -4938,6 +5015,7 @@ fn build_xrefs(
     }
 
     let mut db = xref_builder.build();
+    add_exception_section_xrefs(fmt, &mut db);
     for (slot_addr, target) in discover_lifecycle_array_entries(fmt) {
         db.add_xref(slot_addr, target, XrefType::DataRead);
     }
@@ -5983,6 +6061,12 @@ struct JsonBinaryInfo {
     endianness: String,
     entry_point: Option<String>,
     symbol_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eh_frame_fde_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    personality_function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lsda_section: Option<String>,
 }
 
 /// Symbol information for JSON output
@@ -6081,12 +6165,29 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
             let sym_count: usize = fmt.symbols().count();
 
             if is_json_mode(&parts) {
+                let exception_summary = binary.exception_metadata_summary();
                 let info = JsonBinaryInfo {
                     format: binary.format_name().to_string(),
                     architecture: format!("{:?}", fmt.architecture()),
                     endianness: format!("{:?}", fmt.endianness()),
                     entry_point: fmt.entry_point().map(|e| format!("{:#x}", e)),
                     symbol_count: sym_count,
+                    eh_frame_fde_count: exception_summary.as_ref().map(|summary| summary.fde_count),
+                    personality_function: exception_summary.as_ref().and_then(|summary| {
+                        if summary.personalities.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                summary
+                                    .personalities
+                                    .iter()
+                                    .map(|addr| format_exception_personality(binary, *addr))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            )
+                        }
+                    }),
+                    lsda_section: exception_summary.and_then(|summary| summary.lsda_section_name),
                 };
                 Ok(serde_json::to_string_pretty(&info)?)
             } else {
@@ -6100,6 +6201,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     output.push_str(&format!("Entry Point:   {:#x}\n", entry));
                 }
                 output.push_str(&format!("Symbols:       {}\n", sym_count));
+                append_exception_metadata(&mut output, binary);
                 Ok(output)
             }
         }
@@ -6742,7 +6844,8 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                 }
             }
 
-            let xref_db = builder.build();
+            let mut xref_db = builder.build();
+            add_exception_section_xrefs(fmt, &mut xref_db);
             let refs = xref_db.refs_to(addr);
 
             if refs.is_empty() {

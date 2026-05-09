@@ -58,7 +58,7 @@ pub use indirect_calls::{
 pub use strings::{
     DetectedString, DetectedStringTable, StringConfig, StringDetector, StringEncoding,
 };
-pub use xrefs::{Xref, XrefBuilder, XrefDatabase, XrefType};
+pub use xrefs::{add_exception_section_xrefs, Xref, XrefBuilder, XrefDatabase, XrefType};
 
 pub use analysis_cache::{
     create_shared_cache, AnalysisCache, BinaryCacheKey, CacheConfig, CacheError, CacheResult,

@@ -9,8 +9,10 @@
 use std::collections::{HashMap, HashSet};
 
 use hexray_core::{
-    Architecture, ControlFlow, Instruction, Operand, Operation, Register, RegisterClass,
+    Architecture, Bitness, ControlFlow, Endianness, Instruction, Operand, Operation, Register,
+    RegisterClass,
 };
+use hexray_formats::{BinaryFormat, Section};
 
 /// Type of cross-reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -177,6 +179,118 @@ impl XrefDatabase {
 
     fn same_xref(left: &Xref, right: &Xref) -> bool {
         left.from == right.from && left.to == right.to && left.xref_type == right.xref_type
+    }
+}
+
+const EXCEPTION_POINTER_SECTION_NAMES: &[&str] = &[
+    ".eh_frame",
+    "__eh_frame",
+    ".gcc_except_table",
+    "__gcc_except_tab",
+];
+
+/// Scans exception metadata sections for absolute pointers into allocated code/data sections.
+///
+/// GCC and Clang commonly encode C++ personality pointers and LSDA references as absolute
+/// 32-bit values inside 64-bit `.eh_frame` records, so this scans both 4-byte and native-width
+/// values on 64-bit binaries.
+pub fn add_exception_section_xrefs<B: BinaryFormat + ?Sized>(binary: &B, db: &mut XrefDatabase) {
+    let target_ranges = binary
+        .sections()
+        .filter(|section| is_addressable_target_section(*section))
+        .map(|section| {
+            (
+                section.virtual_address(),
+                section.virtual_address().saturating_add(section.size()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if target_ranges.is_empty() {
+        return;
+    }
+
+    let scan_widths: &[usize] = match binary.bitness() {
+        Bitness::Bits32 => &[4],
+        Bitness::Bits64 => &[4, 8],
+    };
+
+    for section in binary.sections() {
+        if !matches_exception_pointer_section(section) || !section.is_allocated() {
+            continue;
+        }
+
+        scan_absolute_pointer_section(
+            section,
+            binary.endianness(),
+            scan_widths,
+            &target_ranges,
+            db,
+        );
+    }
+}
+
+fn matches_exception_pointer_section(section: &dyn Section) -> bool {
+    let name = section.name();
+    EXCEPTION_POINTER_SECTION_NAMES
+        .iter()
+        .any(|candidate| name == *candidate || name.ends_with(candidate))
+}
+
+fn is_addressable_target_section(section: &dyn Section) -> bool {
+    if !section.is_allocated() || section.size() == 0 {
+        return false;
+    }
+
+    let name = section.name().to_ascii_lowercase();
+    !name.starts_with(".debug")
+        && !name.starts_with("__debug")
+        && !matches!(
+            name.as_str(),
+            ".symtab" | ".strtab" | ".shstrtab" | ".comment"
+        )
+}
+
+fn scan_absolute_pointer_section(
+    section: &dyn Section,
+    endianness: Endianness,
+    scan_widths: &[usize],
+    target_ranges: &[(u64, u64)],
+    db: &mut XrefDatabase,
+) {
+    let data = section.data();
+
+    for &width in scan_widths {
+        let Some(last_offset) = data.len().checked_sub(width) else {
+            continue;
+        };
+
+        for offset in 0..=last_offset {
+            let Some(candidate) =
+                decode_absolute_pointer(&data[offset..offset + width], endianness)
+            else {
+                continue;
+            };
+            if candidate == 0
+                || !target_ranges
+                    .iter()
+                    .any(|(start, end)| candidate >= *start && candidate < *end)
+            {
+                continue;
+            }
+
+            let from = section.virtual_address().saturating_add(offset as u64);
+            db.add_xref(from, candidate, XrefType::DataAddress);
+        }
+    }
+}
+
+fn decode_absolute_pointer(bytes: &[u8], endianness: Endianness) -> Option<u64> {
+    match (endianness, bytes.len()) {
+        (Endianness::Little, 4) => Some(u32::from_le_bytes(bytes.try_into().ok()?) as u64),
+        (Endianness::Big, 4) => Some(u32::from_be_bytes(bytes.try_into().ok()?) as u64),
+        (Endianness::Little, 8) => Some(u64::from_le_bytes(bytes.try_into().ok()?)),
+        (Endianness::Big, 8) => Some(u64::from_be_bytes(bytes.try_into().ok()?)),
+        _ => None,
     }
 }
 
@@ -475,7 +589,111 @@ impl XrefBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{Architecture, ControlFlow, Instruction, MemoryRef, Register};
+    use hexray_core::{Architecture, ControlFlow, Instruction, MemoryRef, Register, Symbol};
+
+    #[derive(Clone)]
+    struct TestSection {
+        name: &'static str,
+        virtual_address: u64,
+        data: Vec<u8>,
+        executable: bool,
+        writable: bool,
+        allocated: bool,
+    }
+
+    impl Section for TestSection {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn virtual_address(&self) -> u64 {
+            self.virtual_address
+        }
+
+        fn size(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+
+        fn is_executable(&self) -> bool {
+            self.executable
+        }
+
+        fn is_writable(&self) -> bool {
+            self.writable
+        }
+
+        fn is_allocated(&self) -> bool {
+            self.allocated
+        }
+    }
+
+    struct TestBinary {
+        bitness: Bitness,
+        endianness: Endianness,
+        sections: Vec<TestSection>,
+        symbols: Vec<Symbol>,
+    }
+
+    impl BinaryFormat for TestBinary {
+        fn architecture(&self) -> Architecture {
+            Architecture::X86_64
+        }
+
+        fn endianness(&self) -> Endianness {
+            self.endianness
+        }
+
+        fn bitness(&self) -> Bitness {
+            self.bitness
+        }
+
+        fn entry_point(&self) -> Option<u64> {
+            None
+        }
+
+        fn executable_sections(&self) -> Box<dyn Iterator<Item = &dyn Section> + '_> {
+            Box::new(
+                self.sections
+                    .iter()
+                    .filter(|section| section.executable)
+                    .map(|section| section as &dyn Section),
+            )
+        }
+
+        fn sections(&self) -> Box<dyn Iterator<Item = &dyn Section> + '_> {
+            Box::new(self.sections.iter().map(|section| section as &dyn Section))
+        }
+
+        fn symbols(&self) -> Box<dyn Iterator<Item = &Symbol> + '_> {
+            Box::new(self.symbols.iter())
+        }
+
+        fn symbol_at(&self, addr: u64) -> Option<&Symbol> {
+            self.symbols.iter().find(|symbol| symbol.address == addr)
+        }
+
+        fn bytes_at(&self, addr: u64, len: usize) -> Option<&[u8]> {
+            let section = self.section_containing(addr)?;
+            let start = addr.checked_sub(section.virtual_address())? as usize;
+            let end = start.checked_add(len)?;
+            section.data().get(start..end)
+        }
+
+        fn section_containing(&self, addr: u64) -> Option<&dyn Section> {
+            self.sections
+                .iter()
+                .find(|section| {
+                    let start = section.virtual_address;
+                    let end = start.saturating_add(section.data.len() as u64);
+                    addr >= start && addr < end
+                })
+                .map(|section| section as &dyn Section)
+        }
+    }
 
     #[test]
     fn test_xref_database_basic() {
@@ -596,6 +814,65 @@ mod tests {
         assert_eq!(db1.count_refs_to(0x2000), 2);
         assert_eq!(db1.count_refs_to(0x3000), 1);
         assert_eq!(db1.total_xrefs(), 3);
+    }
+
+    #[test]
+    fn test_add_exception_section_xrefs_scans_32bit_values_in_64bit_eh_frame() {
+        let binary = TestBinary {
+            bitness: Bitness::Bits64,
+            endianness: Endianness::Little,
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    virtual_address: 0x401000,
+                    data: vec![0x90; 0x400],
+                    executable: true,
+                    writable: false,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".gcc_except_table",
+                    virtual_address: 0x4023c0,
+                    data: vec![0; 0x40],
+                    executable: false,
+                    writable: false,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".eh_frame",
+                    virtual_address: 0x402160,
+                    data: vec![
+                        0x00, 0x03, 0xd0, 0x11, 0x40, 0x00, // absolute 32-bit personality ptr
+                        0x7f, 0x00, 0xc0, 0x23, 0x40, 0x00, // absolute 32-bit LSDA ptr
+                    ],
+                    executable: false,
+                    writable: false,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".debug_info",
+                    virtual_address: 0x500000,
+                    data: vec![0; 0x20],
+                    executable: false,
+                    writable: false,
+                    allocated: false,
+                },
+            ],
+            symbols: Vec::new(),
+        };
+
+        let mut db = XrefDatabase::new();
+        add_exception_section_xrefs(&binary, &mut db);
+
+        let personality_refs = db.refs_to(0x4011d0);
+        assert_eq!(personality_refs.len(), 1);
+        assert_eq!(personality_refs[0].from, 0x402162);
+        assert_eq!(personality_refs[0].xref_type, XrefType::DataAddress);
+
+        let lsda_refs = db.refs_to(0x4023c0);
+        assert_eq!(lsda_refs.len(), 1);
+        assert_eq!(lsda_refs[0].from, 0x402168);
+        assert_eq!(lsda_refs[0].xref_type, XrefType::DataAddress);
     }
 
     #[test]
