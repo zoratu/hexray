@@ -198,6 +198,42 @@ impl Disassembler for X86_64Disassembler {
                 }
             }
 
+            // Fence instructions encoded via 0F AE /{5,6,7} with mod=11, rm=0.
+            if opcode == 0xAE {
+                let remaining = bytes.get(offset..).unwrap_or(&[]);
+                if let Some(&modrm_byte) = remaining.first() {
+                    let modrm = ModRM::parse(modrm_byte, prefixes.rex);
+                    if modrm.is_register() && modrm.rm == 0 {
+                        let mnemonic = match modrm.reg & 0x7 {
+                            5 => Some("lfence"),
+                            6 => Some("mfence"),
+                            7 => Some("sfence"),
+                            _ => None,
+                        };
+                        if let Some(mnemonic) = mnemonic {
+                            offset = offset.saturating_add(1);
+                            let instruction = Instruction {
+                                address,
+                                size: offset,
+                                bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+                                operation: Operation::Other(0x0FAE),
+                                mnemonic: mnemonic.to_string(),
+                                operands: vec![],
+                                control_flow: ControlFlow::Sequential,
+                                reads: vec![],
+                                writes: vec![],
+
+                                guard: None,
+                            };
+                            return Ok(DecodedInstruction {
+                                instruction,
+                                size: offset,
+                            });
+                        }
+                    }
+                }
+            }
+
             // Handle 0F 38 three-byte escape (SSSE3, SSE4.1, SSE4.2)
             if opcode == 0x38 {
                 if offset >= bytes.len() {
@@ -3349,6 +3385,41 @@ mod tests {
             .decode_instruction(&[0x48, 0x89, 0xe5], 0x1000)
             .unwrap();
         assert_eq!(result.instruction.mnemonic, "mov");
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_decode_xchg_rip_relative_memory() {
+        let disasm = X86_64Disassembler::new();
+        // xchg DWORD PTR [rip+0x2dbc], eax
+        let result = disasm
+            .decode_instruction(&[0x87, 0x05, 0xbc, 0x2d, 0x00, 0x00], 0x401266)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xchg");
+        assert_eq!(result.instruction.operation, Operation::Exchange);
+        assert_eq!(result.size, 6);
+        assert_eq!(result.instruction.operands.len(), 2);
+        match &result.instruction.operands[0] {
+            Operand::Memory(mem) => {
+                assert_eq!(mem.displacement, 0x2dbc);
+                assert_eq!(mem.size, 4);
+                assert!(mem.base.as_ref().is_some_and(|reg| reg.name() == "rip"));
+            }
+            other => panic!("expected memory operand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_mfence() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0xae, 0xf0], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "mfence");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FAE));
+        assert!(result.instruction.operands.is_empty());
         assert_eq!(result.size, 3);
     }
 

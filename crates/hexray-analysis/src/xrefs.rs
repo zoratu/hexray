@@ -493,6 +493,9 @@ impl XrefBuilder {
                 Operation::LoadEffectiveAddress if !Self::is_arm64_adrp(instr) => {
                     &[OperandAccess::Address]
                 }
+                Operation::Exchange if instr.mnemonic.eq_ignore_ascii_case("xchg") => {
+                    &[OperandAccess::Read, OperandAccess::Write]
+                }
                 Operation::Move => {
                     if index == 0 {
                         &[OperandAccess::Write]
@@ -1009,6 +1012,38 @@ mod tests {
         builder.analyze_instruction(&instr);
         let db = builder.build();
         let refs = db.refs_to(0x302b);
+
+        assert_eq!(refs.len(), 2);
+        assert!(refs.iter().any(|xref| xref.xref_type == XrefType::DataRead));
+        assert!(refs
+            .iter()
+            .any(|xref| xref.xref_type == XrefType::DataWrite));
+    }
+
+    #[test]
+    fn test_xref_builder_tracks_xchg_memory_as_read_and_write() {
+        let mut builder = XrefBuilder::new();
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let instr = Instruction {
+            address: 0x401266,
+            size: 6,
+            bytes: vec![0x87, 0x05, 0xbc, 0x2d, 0x00, 0x00],
+            operation: Operation::Exchange,
+            mnemonic: "xchg".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x2dbc, 4)),
+                Operand::Register(eax),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![rip, eax],
+            writes: vec![eax],
+            guard: None,
+        };
+
+        builder.analyze_instruction(&instr);
+        let db = builder.build();
+        let refs = db.refs_to(0x404028);
 
         assert_eq!(refs.len(), 2);
         assert!(refs.iter().any(|xref| xref.xref_type == XrefType::DataRead));

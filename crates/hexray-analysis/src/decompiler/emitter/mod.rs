@@ -2095,6 +2095,12 @@ impl PseudoCodeEmitter {
             };
 
             let call_expr = statements.get(call_stmt_index).cloned();
+            if call_expr
+                .as_ref()
+                .is_some_and(|expr| !Self::call_can_be_folded_into_return(expr))
+            {
+                return;
+            }
             statements.truncate(call_stmt_index);
             call_expr
         }) else {
@@ -2120,6 +2126,28 @@ impl PseudoCodeEmitter {
         } else {
             nodes.push(StructuredNode::Return(Some(call_expr)));
         }
+    }
+
+    fn call_can_be_folded_into_return(expr: &Expr) -> bool {
+        let ExprKind::Call { target, .. } = &expr.kind else {
+            return false;
+        };
+        let CallTarget::Named(name) = target else {
+            return true;
+        };
+
+        !matches!(
+            name.as_str(),
+            "__atomic_thread_fence"
+                | "atomic_store"
+                | "atomic_exchange"
+                | "atomic_fetch_add"
+                | "atomic_fetch_sub"
+                | "atomic_fetch_and"
+                | "atomic_fetch_or"
+                | "atomic_fetch_xor"
+                | "atomic_compare_exchange_strong"
+        )
     }
 
     fn emit_return_line(&self, output: &mut String, indent: &str, expr: Option<&Expr>) {
@@ -9051,6 +9079,46 @@ mod tests {
         assert!(
             !output.contains("\n    helper(argc);\n"),
             "tail call should not remain a standalone statement:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_does_not_fold_atomic_store_or_fence_into_return() {
+        let store_block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::call(
+                    CallTarget::Named("atomic_store".to_string()),
+                    vec![Expr::unknown("&g_counter"), Expr::unknown("arg0")],
+                ),
+                Expr::call(
+                    CallTarget::Named("__atomic_thread_fence".to_string()),
+                    vec![Expr::unknown("memory_order_seq_cst")],
+                ),
+            ],
+            address_range: (0x1300, 0x1310),
+        };
+        let cfg = StructuredCfg {
+            body: vec![store_block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_signature_recovery(true);
+        let output = emitter.emit(&cfg, "store_counter");
+        assert!(
+            output.contains("atomic_store(&g_counter, arg0);"),
+            "pseudo atomic store should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            output.contains("__atomic_thread_fence(memory_order_seq_cst);"),
+            "pseudo fence should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            output.contains("\n    return;\n"),
+            "expected bare return after pseudo atomic statements:\n{}",
             output
         );
     }

@@ -1114,6 +1114,179 @@ impl Expr {
         }
     }
 
+    fn from_memory_address_with_context(mem: &MemoryRef, inst: &Instruction) -> Self {
+        let base_name = mem.base.as_ref().map(|r| r.name()).unwrap_or("");
+        if base_name == "rip" && mem.index.is_none() {
+            let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
+            Self::got_addr(abs_addr, inst.address, Self::int(abs_addr as i128))
+        } else if let Some(symbol) = Self::known_segmented_memory_symbol(mem) {
+            Self::unknown(symbol)
+        } else {
+            Self::memory_address_expr(mem)
+        }
+    }
+
+    fn is_lock_prefixed(inst: &Instruction) -> bool {
+        inst.bytes.first() == Some(&0xF0)
+    }
+
+    fn is_mfence(inst: &Instruction) -> bool {
+        inst.mnemonic.eq_ignore_ascii_case("mfence") || inst.bytes.as_slice() == [0x0f, 0xae, 0xf0]
+    }
+
+    fn is_zero_immediate(operand: &Operand) -> bool {
+        matches!(operand, Operand::Immediate(imm) if imm.value == 0)
+    }
+
+    fn is_stack_fence_memory(mem: &MemoryRef) -> bool {
+        mem.index.is_none()
+            && mem.displacement == 0
+            && mem
+                .base
+                .as_ref()
+                .is_some_and(|base| matches!(base.name(), "rsp" | "esp"))
+    }
+
+    fn is_seq_cst_fence_pattern(inst: &Instruction) -> bool {
+        if !Self::is_lock_prefixed(inst) || inst.operands.len() != 2 {
+            return false;
+        }
+
+        let Some(Operand::Memory(mem)) = inst.operands.first() else {
+            return false;
+        };
+
+        Self::is_stack_fence_memory(mem)
+            && Self::is_zero_immediate(&inst.operands[1])
+            && matches!(inst.mnemonic.as_str(), "or" | "add")
+    }
+
+    fn x86_atomic_pair(ops: &[Operand]) -> Option<(&MemoryRef, usize)> {
+        let mem_index = ops
+            .iter()
+            .position(|operand| matches!(operand, Operand::Memory(_)))?;
+        let reg_index = ops.iter().enumerate().find_map(|(index, operand)| {
+            (index != mem_index && matches!(operand, Operand::Register(_))).then_some(index)
+        })?;
+        let Operand::Memory(mem) = &ops[mem_index] else {
+            return None;
+        };
+        Some((mem, reg_index))
+    }
+
+    fn x86_seq_cst_fence_expr() -> Self {
+        Self::call(
+            CallTarget::Named("__atomic_thread_fence".to_string()),
+            vec![Self::unknown("memory_order_seq_cst")],
+        )
+    }
+
+    fn x86_locked_rmw_expr(inst: &Instruction) -> Option<Self> {
+        if !Self::is_lock_prefixed(inst) {
+            return None;
+        }
+        if Self::is_seq_cst_fence_pattern(inst) {
+            return Some(Self::x86_seq_cst_fence_expr());
+        }
+
+        let Operand::Memory(mem) = inst.operands.first()? else {
+            return None;
+        };
+        let ptr = Self::from_memory_address_with_context(mem, inst);
+
+        let (func_name, value) = match inst.operation {
+            Operation::Add if inst.operands.len() >= 2 => (
+                "atomic_fetch_add",
+                Self::from_operand_with_inst(&inst.operands[1], inst),
+            ),
+            Operation::Sub if inst.operands.len() >= 2 => (
+                "atomic_fetch_sub",
+                Self::from_operand_with_inst(&inst.operands[1], inst),
+            ),
+            Operation::And if inst.operands.len() >= 2 => (
+                "atomic_fetch_and",
+                Self::from_operand_with_inst(&inst.operands[1], inst),
+            ),
+            Operation::Or if inst.operands.len() >= 2 => (
+                "atomic_fetch_or",
+                Self::from_operand_with_inst(&inst.operands[1], inst),
+            ),
+            Operation::Xor if inst.operands.len() >= 2 => (
+                "atomic_fetch_xor",
+                Self::from_operand_with_inst(&inst.operands[1], inst),
+            ),
+            Operation::Inc => ("atomic_fetch_add", Self::int(1)),
+            Operation::Dec => ("atomic_fetch_sub", Self::int(1)),
+            _ => return None,
+        };
+
+        Some(Self::call(
+            CallTarget::Named(func_name.to_string()),
+            vec![ptr, value],
+        ))
+    }
+
+    fn x86_atomic_xchg_expr(inst: &Instruction) -> Option<Self> {
+        if !inst.mnemonic.eq_ignore_ascii_case("xchg") {
+            return None;
+        }
+        let (mem, reg_index) = Self::x86_atomic_pair(&inst.operands)?;
+        let ptr = Self::from_memory_address_with_context(mem, inst);
+        let reg = Self::from_operand_with_inst(&inst.operands[reg_index], inst);
+        let prior = reg.clone();
+        Some(Self::assign(
+            reg,
+            Self::call(
+                CallTarget::Named("atomic_exchange".to_string()),
+                vec![ptr, prior],
+            ),
+        ))
+    }
+
+    fn x86_atomic_xadd_expr(inst: &Instruction) -> Option<Self> {
+        if !inst.mnemonic.eq_ignore_ascii_case("xadd") {
+            return None;
+        }
+        let (mem, reg_index) = Self::x86_atomic_pair(&inst.operands)?;
+        let ptr = Self::from_memory_address_with_context(mem, inst);
+        let reg = Self::from_operand_with_inst(&inst.operands[reg_index], inst);
+        let delta = reg.clone();
+        Some(Self::assign(
+            reg,
+            Self::call(
+                CallTarget::Named("atomic_fetch_add".to_string()),
+                vec![ptr, delta],
+            ),
+        ))
+    }
+
+    fn x86_atomic_cmpxchg_expr(inst: &Instruction) -> Option<Self> {
+        if !inst.mnemonic.eq_ignore_ascii_case("cmpxchg") {
+            return None;
+        }
+        let (mem, reg_index) = Self::x86_atomic_pair(&inst.operands)?;
+        let ptr = Self::from_memory_address_with_context(mem, inst);
+        let desired = Self::from_operand_with_inst(&inst.operands[reg_index], inst);
+        let expected_size = mem.size.max(1);
+        let expected = Self::address_of(Self::var(Variable::reg("rax", expected_size)));
+
+        Some(Self::call(
+            CallTarget::Named("atomic_compare_exchange_strong".to_string()),
+            vec![ptr, expected, desired],
+        ))
+    }
+
+    fn lift_special_x86_atomic(inst: &Instruction) -> Option<Self> {
+        if Self::is_mfence(inst) || Self::is_seq_cst_fence_pattern(inst) {
+            return Some(Self::x86_seq_cst_fence_expr());
+        }
+
+        Self::x86_atomic_xchg_expr(inst)
+            .or_else(|| Self::x86_atomic_xadd_expr(inst))
+            .or_else(|| Self::x86_atomic_cmpxchg_expr(inst))
+            .or_else(|| Self::x86_locked_rmw_expr(inst))
+    }
+
     fn opaque_x86_integer_simd_comment(mnemonic: &str) -> Self {
         Self::unknown(format!("/* SSE: {} */", mnemonic.to_ascii_lowercase()))
     }
@@ -1141,6 +1314,10 @@ impl Expr {
     pub fn from_instruction(inst: &Instruction) -> Self {
         if Self::should_lift_as_opaque_x86_integer_simd(inst) {
             return Self::opaque_x86_integer_simd_comment(&inst.mnemonic);
+        }
+
+        if let Some(expr) = Self::lift_special_x86_atomic(inst) {
+            return expr;
         }
 
         let ops = &inst.operands;
@@ -4938,6 +5115,134 @@ mod tests {
         let rendered = Expr::from_instruction(&inst).to_string();
 
         assert_eq!(rendered, "/* SSE: paddq */");
+    }
+
+    #[test]
+    fn test_x86_xchg_memory_lifts_to_atomic_exchange() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let inst = Instruction::new(
+            0x401100,
+            6,
+            vec![0x87, 0x05, 0x24, 0x00, 0x00, 0x00],
+            "xchg",
+        )
+        .with_operation(Operation::Exchange)
+        .with_operands(vec![
+            Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x24, 4)),
+            Operand::Register(eax),
+        ]);
+
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { lhs, rhs } = &expr.kind else {
+            panic!("expected assignment, got {:?}", expr.kind);
+        };
+        assert!(matches!(lhs.kind, ExprKind::Var(ref v) if v.name == "rax"));
+
+        let ExprKind::Call { target, args } = &rhs.kind else {
+            panic!("expected call rhs, got {:?}", rhs.kind);
+        };
+        assert!(matches!(target, CallTarget::Named(name) if name == "atomic_exchange"));
+        assert_eq!(args.len(), 2);
+        assert!(matches!(
+            args[0].kind,
+            ExprKind::GotRef {
+                address: 0x40112a,
+                is_deref: false,
+                ..
+            }
+        ));
+        assert!(matches!(args[1].kind, ExprKind::Var(ref v) if v.name == "rax"));
+    }
+
+    #[test]
+    fn test_x86_lock_xadd_lifts_to_atomic_fetch_add() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let inst = Instruction::new(
+            0x4011d6,
+            8,
+            vec![0xf0, 0x0f, 0xc1, 0x05, 0x4a, 0x2e, 0x00, 0x00],
+            "xadd",
+        )
+        .with_operation(Operation::Add)
+        .with_operands(vec![
+            Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x2e4a, 4)),
+            Operand::Register(eax),
+        ]);
+
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { rhs, .. } = &expr.kind else {
+            panic!("expected assignment, got {:?}", expr.kind);
+        };
+        let ExprKind::Call { target, args } = &rhs.kind else {
+            panic!("expected call rhs, got {:?}", rhs.kind);
+        };
+        assert!(matches!(target, CallTarget::Named(name) if name == "atomic_fetch_add"));
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn test_x86_cmpxchg_lifts_to_atomic_compare_exchange_strong() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+        let inst = Instruction::new(
+            0x401276,
+            8,
+            vec![0xf0, 0x0f, 0xb1, 0x35, 0xaa, 0x2d, 0x00, 0x00],
+            "cmpxchg",
+        )
+        .with_operation(Operation::Exchange)
+        .with_operands(vec![
+            Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x2daa, 4)),
+            Operand::Register(esi),
+        ]);
+
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Call { target, args } = &expr.kind else {
+            panic!("expected call, got {:?}", expr.kind);
+        };
+        assert!(matches!(
+            target,
+            CallTarget::Named(name) if name == "atomic_compare_exchange_strong"
+        ));
+        assert_eq!(args.len(), 3);
+        assert!(matches!(args[1].kind, ExprKind::AddressOf(_)));
+    }
+
+    #[test]
+    fn test_x86_seq_cst_fence_patterns_lift_to_thread_fence() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+        let lock_or = Instruction::new(0x4012e4, 6, vec![0xf0, 0x48, 0x83, 0x0c, 0x24, 0x00], "or")
+            .with_operation(Operation::Or)
+            .with_operands(vec![
+                Operand::Memory(MemoryRef::base_disp(rsp, 0, 8)),
+                Operand::imm_unsigned(0, 8),
+            ]);
+        let mfence = Instruction::new(0x401300, 3, vec![0x0f, 0xae, 0xf0], "mfence")
+            .with_operation(Operation::Other(0x0FAE));
+
+        for inst in [lock_or, mfence] {
+            let expr = Expr::from_instruction(&inst);
+            let ExprKind::Call { target, args } = &expr.kind else {
+                panic!("expected call, got {:?}", expr.kind);
+            };
+            assert!(matches!(
+                target,
+                CallTarget::Named(name) if name == "__atomic_thread_fence"
+            ));
+            assert!(
+                matches!(args.as_slice(), [Expr { kind: ExprKind::Unknown(name) }] if name == "memory_order_seq_cst")
+            );
+        }
     }
 
     #[test]

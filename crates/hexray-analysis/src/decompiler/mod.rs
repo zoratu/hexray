@@ -2256,6 +2256,116 @@ mod tests {
     }
 
     #[test]
+    fn test_decompile_x86_atomic_store_from_xchg_is_preserved() {
+        use crate::SymbolTable;
+        use hexray_core::{Architecture, MemoryRef, Operand, Register, RegisterClass};
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(Instruction {
+            address: 0x1000,
+            size: 6,
+            bytes: vec![0x87],
+            operation: Operation::Exchange,
+            mnemonic: "xchg".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef::absolute(0x404028, 4)),
+                Operand::Register(edi),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        });
+        block.instructions.push(
+            Instruction::new(0x1006, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        block.terminator = BlockTerminator::Return;
+        cfg.add_block(block);
+
+        let mut symbols = SymbolTable::new();
+        symbols.insert_with_metadata(0x404028, "g_counter".to_string(), 4, true, true);
+
+        let structured = StructuredCfg::from_cfg(&cfg);
+        assert!(
+            structured.body.iter().any(|node| {
+                matches!(
+                    node,
+                    StructuredNode::Block { statements, .. }
+                        if statements.iter().any(|stmt| matches!(
+                            &stmt.kind,
+                            super::expression::ExprKind::Call {
+                                target: super::expression::CallTarget::Named(name),
+                                ..
+                            } if name == "atomic_store"
+                        ))
+                )
+            }),
+            "expected structured body to retain atomic_store call, got:\n{:#?}",
+            structured.body
+        );
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_symbol_table(symbols)
+            .decompile(&cfg, "store_counter");
+
+        assert!(
+            output.contains("atomic_store(") && output.contains("arg0"),
+            "expected atomic store pseudo-call, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_decompile_x86_seq_cst_fence_uses_enum_constant_without_declaring_local() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Register, RegisterClass};
+
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(Instruction {
+            address: 0x1000,
+            size: 6,
+            bytes: vec![0xf0, 0x48, 0x83, 0x0c, 0x24, 0x00],
+            operation: Operation::Or,
+            mnemonic: "or".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef::base_disp(rsp, 0, 8)),
+                Operand::imm(0, 1),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        });
+        block.instructions.push(
+            Instruction::new(0x1006, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        block.terminator = BlockTerminator::Return;
+        cfg.add_block(block);
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .decompile(&cfg, "mem_fence");
+
+        assert!(
+            output.contains("__atomic_thread_fence(memory_order_seq_cst);"),
+            "expected seq-cst fence pseudo-call, got:\n{output}"
+        );
+        assert!(
+            !output.contains("int memory_order_seq_cst;"),
+            "did not expect memory_order_seq_cst to be declared as a local:\n{output}"
+        );
+    }
+
+    #[test]
     fn test_apply_exception_handling_wraps_cleanup_only_landing_pad_in_catch_all() {
         let body = vec![
             StructuredNode::Block {

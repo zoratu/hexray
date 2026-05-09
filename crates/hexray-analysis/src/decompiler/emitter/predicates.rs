@@ -645,6 +645,10 @@ pub(super) fn is_declarable_variable(name: &str) -> bool {
 }
 
 pub(super) fn is_assignable_unknown_name(name: &str) -> bool {
+    if is_atomic_memory_order_identifier(name) {
+        return false;
+    }
+
     if is_declarable_variable(name) {
         return true;
     }
@@ -663,6 +667,19 @@ pub(super) fn is_likely_global_identifier(name: &str) -> bool {
         || name.starts_with("data_")
         || name.starts_with("__")
         || matches!(name, "stdin" | "stdout" | "stderr" | "errno")
+        || is_atomic_memory_order_identifier(name)
+}
+
+fn is_atomic_memory_order_identifier(name: &str) -> bool {
+    matches!(
+        name,
+        "memory_order_relaxed"
+            | "memory_order_consume"
+            | "memory_order_acquire"
+            | "memory_order_release"
+            | "memory_order_acq_rel"
+            | "memory_order_seq_cst"
+    )
 }
 
 pub(super) fn contains_identifier_token(text: &str, ident: &str) -> bool {

@@ -1468,8 +1468,11 @@ impl SignatureRecovery {
     }
 
     fn infer_tail_call_return_type(&self, expr: &Expr) -> Option<ParamType> {
-        if let ExprKind::Call { target, .. } = &expr.kind {
+        if let ExprKind::Call { target, args } = &expr.kind {
             if let Some(name) = self.extract_call_name(target) {
+                if let Some(ty) = self.infer_atomic_pseudo_call_return_type(&name, args) {
+                    return Some(ty);
+                }
                 if Self::is_x87_mnemonic(&name) {
                     return Some(ParamType::Float(80));
                 }
@@ -1483,6 +1486,60 @@ impl SignatureRecovery {
             return Some(ParamType::SignedInt(32));
         }
         None
+    }
+
+    fn infer_atomic_pseudo_call_return_type(&self, name: &str, args: &[Expr]) -> Option<ParamType> {
+        match name {
+            "__atomic_thread_fence" | "atomic_store" => Some(ParamType::Void),
+            "atomic_compare_exchange_strong" => Some(ParamType::Bool),
+            "atomic_exchange" | "atomic_fetch_add" | "atomic_fetch_sub" | "atomic_fetch_and"
+            | "atomic_fetch_or" | "atomic_fetch_xor" => self
+                .infer_atomic_pseudo_call_result_size(args)
+                .map(Self::signed_int_param_type_for_size)
+                .or(Some(ParamType::SignedInt(32))),
+            _ => None,
+        }
+    }
+
+    fn infer_atomic_pseudo_call_result_size(&self, args: &[Expr]) -> Option<u8> {
+        let ptr = args.first()?;
+        Self::infer_pointee_size_from_expr(ptr)
+    }
+
+    fn infer_pointee_size_from_expr(expr: &Expr) -> Option<u8> {
+        match &expr.kind {
+            ExprKind::AddressOf(inner) => Self::infer_pointee_size_from_expr(inner)
+                .or_else(|| Self::infer_terminal_expr_size(inner)),
+            ExprKind::Deref { size, .. } => Some(*size),
+            ExprKind::Var(var) => Some(var.size).filter(|size| *size > 0),
+            ExprKind::FieldAccess { base, .. } | ExprKind::Cast { expr: base, .. } => {
+                Self::infer_pointee_size_from_expr(base)
+            }
+            ExprKind::ArrayAccess { element_size, .. } => Some(*element_size as u8),
+            _ => None,
+        }
+    }
+
+    fn infer_terminal_expr_size(expr: &Expr) -> Option<u8> {
+        match &expr.kind {
+            ExprKind::Var(var) => Some(var.size).filter(|size| *size > 0),
+            ExprKind::Deref { size, .. } => Some(*size),
+            ExprKind::ArrayAccess { element_size, .. } => Some(*element_size as u8),
+            ExprKind::FieldAccess { base, .. } | ExprKind::Cast { expr: base, .. } => {
+                Self::infer_terminal_expr_size(base)
+            }
+            _ => None,
+        }
+    }
+
+    fn signed_int_param_type_for_size(size: u8) -> ParamType {
+        match size {
+            1 => ParamType::SignedInt(8),
+            2 => ParamType::SignedInt(16),
+            4 => ParamType::SignedInt(32),
+            8 => ParamType::SignedInt(64),
+            _ => ParamType::SignedInt(64),
+        }
     }
 
     /// Infers a type for an argument passed into an indirect function call.
@@ -2580,7 +2637,27 @@ impl SignatureRecovery {
             ExprKind::Deref { size, .. } => Some(*size),
             ExprKind::ArrayAccess { element_size, .. } => Some(*element_size as u8),
             ExprKind::Cast { to_size, .. } => Some(*to_size),
-            ExprKind::Call { target, .. } => {
+            ExprKind::Call { target, args } => {
+                if let Some(name) = self.extract_call_name(target) {
+                    if let Some(size) =
+                        self.infer_atomic_pseudo_call_result_size(args).filter(|_| {
+                            matches!(
+                                name.as_str(),
+                                "atomic_exchange"
+                                    | "atomic_fetch_add"
+                                    | "atomic_fetch_sub"
+                                    | "atomic_fetch_and"
+                                    | "atomic_fetch_or"
+                                    | "atomic_fetch_xor"
+                            )
+                        })
+                    {
+                        return Some(size);
+                    }
+                    if name == "atomic_compare_exchange_strong" {
+                        return Some(1);
+                    }
+                }
                 matches!(target, super::expression::CallTarget::Named(name) if Self::is_x87_mnemonic(name))
                     .then_some(10)
             }
@@ -6125,5 +6202,25 @@ mod tests {
 
         assert_eq!(sig.parameters.len(), 1);
         assert_eq!(sig.parameters[0].name, "size");
+    }
+
+    #[test]
+    fn test_signature_recovery_infers_atomic_exchange_return_width_from_pointee() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::call(
+                CallTarget::Named("atomic_exchange".to_string()),
+                vec![
+                    Expr::address_of(Expr::var(Variable::global(0x404028, 4))),
+                    Expr::var(Variable::reg("rdi", 4)),
+                ],
+            )))],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
     }
 }

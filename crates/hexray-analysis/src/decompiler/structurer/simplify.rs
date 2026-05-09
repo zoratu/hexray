@@ -42,7 +42,7 @@ use super::super::abi::{
     is_temp_register,
 };
 use super::super::dead_store::collect_all_uses;
-use super::super::expression::{BinOpKind, Expr, Variable};
+use super::super::expression::{BinOpKind, CallTarget, Expr, ExprKind, Variable};
 use super::super::BinaryDataContext;
 use super::{CatchHandler, StructuredNode};
 
@@ -58,7 +58,10 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     for stmt in &statements {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             if let ExprKind::Var(v) = &lhs.kind {
-                if is_temp_register(&v.name) {
+                if is_temp_register(&v.name)
+                    || is_return_register(&v.name)
+                    || is_argument_register(&v.name)
+                {
                     // Substitute known values in RHS before storing
                     let substituted_rhs = substitute_vars(rhs, &reg_values);
                     reg_values.insert(v.name.clone(), substituted_rhs);
@@ -77,11 +80,6 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
         let stmt = &statements[i];
         if expr_mentions_stack_canary_guard(stmt) {
             saw_stack_canary_after = true;
-        }
-
-        if statement_contains_real_call(stmt) {
-            saw_real_call_after = true;
-            continue;
         }
 
         // Check for return register assignment
@@ -138,10 +136,13 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     continue;
                 }
 
-                // Skip other temp register assignments (they'll be removed by propagate_copies later)
+                // Skip other temp register assignments only when they're plain data shuffles.
+                // Side-effecting RHS expressions (e.g. lifted atomic ops) must survive.
                 if is_temp_register(&v.name) {
-                    indices_to_remove.push(i);
-                    continue;
+                    if !expr_has_side_effects_from_assignment(stmt) {
+                        indices_to_remove.push(i);
+                        continue;
+                    }
                 }
             }
         }
@@ -160,6 +161,11 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     break;
                 }
             }
+        }
+
+        if statement_contains_real_call(stmt) {
+            saw_real_call_after = true;
+            continue;
         }
 
         // x86 epilogue: push/pop calls
@@ -544,10 +550,15 @@ fn prune_dead_register_artifacts_in_block(
         }
 
         if let Some(defined_aliases) = ephemeral_statement_def_aliases(&stmt) {
-            if defined_aliases.iter().all(|alias| !live.contains(alias))
-                && !expr_has_side_effects_from_assignment(&stmt)
-            {
-                continue;
+            if defined_aliases.iter().all(|alias| !live.contains(alias)) {
+                if let Some(rewritten) = rewrite_dead_atomic_result_capture(&stmt) {
+                    collect_live_uses_in_expr(&rewritten, &mut live);
+                    pruned.push(rewritten);
+                    continue;
+                }
+                if !expr_has_side_effects_from_assignment(&stmt) {
+                    continue;
+                }
             }
         }
 
@@ -599,8 +610,6 @@ fn ephemeral_statement_def_aliases(stmt: &Expr) -> Option<Vec<String>> {
 }
 
 fn register_state_pseudo_call_aliases(stmt: &Expr) -> Option<Vec<String>> {
-    use super::super::expression::{CallTarget, ExprKind};
-
     let ExprKind::Call { target, .. } = &stmt.kind else {
         return None;
     };
@@ -621,9 +630,32 @@ fn register_state_pseudo_call_aliases(stmt: &Expr) -> Option<Vec<String>> {
     Some(aliases.into_iter().map(str::to_string).collect())
 }
 
-fn collect_live_uses_in_expr(expr: &Expr, live: &mut HashSet<String>) {
-    use super::super::expression::ExprKind;
+fn rewrite_dead_atomic_result_capture(stmt: &Expr) -> Option<Expr> {
+    let ExprKind::Assign { rhs, .. } = &stmt.kind else {
+        return None;
+    };
+    let ExprKind::Call { target, args } = &rhs.kind else {
+        return None;
+    };
+    let CallTarget::Named(name) = target else {
+        return None;
+    };
 
+    let target = match name.as_str() {
+        "atomic_exchange" => CallTarget::Named("atomic_store".to_string()),
+        "atomic_fetch_add"
+        | "atomic_fetch_sub"
+        | "atomic_fetch_and"
+        | "atomic_fetch_or"
+        | "atomic_fetch_xor"
+        | "atomic_compare_exchange_strong" => CallTarget::Named(name.clone()),
+        _ => return None,
+    };
+
+    Some(Expr::call(target, args.clone()))
+}
+
+fn collect_live_uses_in_expr(expr: &Expr, live: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::Var(v) => {
             live.insert(v.name.to_lowercase());
@@ -2401,10 +2433,102 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
             substitute_vars(rhs, reg_values),
         ),
         ExprKind::Deref { addr, size } => Expr::deref(substitute_vars(addr, reg_values), *size),
+        ExprKind::AddressOf(inner) => Expr::address_of(substitute_vars(inner, reg_values)),
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => Expr::array_access(
+            substitute_vars(base, reg_values),
+            substitute_vars(index, reg_values),
+            *element_size,
+        ),
+        ExprKind::FieldAccess {
+            base,
+            field_name,
+            offset,
+        } => Expr::field_access(
+            substitute_vars(base, reg_values),
+            field_name.clone(),
+            *offset,
+        ),
+        ExprKind::Call { target, args } => Expr::call(
+            substitute_call_target_vars(target, reg_values),
+            args.iter()
+                .map(|arg| substitute_vars(arg, reg_values))
+                .collect(),
+        ),
+        ExprKind::Cast {
+            expr: inner,
+            to_size,
+            signed,
+        } => Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(substitute_vars(inner, reg_values)),
+                to_size: *to_size,
+                signed: *signed,
+            },
+        },
+        ExprKind::BitField {
+            expr: inner,
+            start,
+            width,
+        } => Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(substitute_vars(inner, reg_values)),
+                start: *start,
+                width: *width,
+            },
+        },
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr {
+            kind: ExprKind::Conditional {
+                cond: Box::new(substitute_vars(cond, reg_values)),
+                then_expr: Box::new(substitute_vars(then_expr, reg_values)),
+                else_expr: Box::new(substitute_vars(else_expr, reg_values)),
+            },
+        },
+        ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
+            kind: ExprKind::CompoundAssign {
+                op: *op,
+                lhs: Box::new(substitute_vars(lhs, reg_values)),
+                rhs: Box::new(substitute_vars(rhs, reg_values)),
+            },
+        },
+        ExprKind::Phi(args) => Expr {
+            kind: ExprKind::Phi(
+                args.iter()
+                    .map(|arg| substitute_vars(arg, reg_values))
+                    .collect(),
+            ),
+        },
         _ => expr.clone(),
     };
     // Simplify after substitution to handle boolean patterns like (x == 1) != 1 → x != 1
     result.simplify()
+}
+
+fn substitute_call_target_vars(
+    target: &CallTarget,
+    reg_values: &HashMap<String, Expr>,
+) -> CallTarget {
+    match target {
+        CallTarget::Direct { target, call_site } => CallTarget::Direct {
+            target: *target,
+            call_site: *call_site,
+        },
+        CallTarget::Named(name) => CallTarget::Named(name.clone()),
+        CallTarget::Indirect(expr) => {
+            CallTarget::Indirect(Box::new(substitute_vars(expr, reg_values)))
+        }
+        CallTarget::IndirectGot { got_address, expr } => CallTarget::IndirectGot {
+            got_address: *got_address,
+            expr: Box::new(substitute_vars(expr, reg_values)),
+        },
+    }
 }
 
 /// Recursively propagates function call arguments through structured nodes.
@@ -4958,6 +5082,47 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_return_value_substitutes_prior_return_reg_value_in_atomic_exchange() {
+        let statements = vec![
+            Expr::assign(reg("rax", 8), Expr::unknown("arg0")),
+            Expr::assign(
+                reg("rax", 8),
+                Expr::call(
+                    CallTarget::Named("atomic_exchange".to_string()),
+                    vec![Expr::unknown("&g_counter"), reg("rax", 8)],
+                ),
+            ),
+        ];
+
+        let (_, return_value) = extract_return_value(statements);
+
+        assert_eq!(
+            format!("{}", return_value.expect("return value")),
+            "atomic_exchange(&g_counter, arg0)"
+        );
+    }
+
+    #[test]
+    fn test_extract_return_value_keeps_side_effecting_temp_assignment() {
+        let statements = vec![Expr::assign(
+            reg("rdi", 8),
+            Expr::call(
+                CallTarget::Named("atomic_exchange".to_string()),
+                vec![Expr::unknown("&g_counter"), reg("rdi", 8)],
+            ),
+        )];
+
+        let (filtered, return_value) = extract_return_value(statements);
+
+        assert!(return_value.is_none(), "did not expect a return value");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            format!("{}", filtered[0]),
+            "rdi = atomic_exchange(&g_counter, rdi)"
+        );
+    }
+
+    #[test]
     fn test_simplify_statements_keeps_register_value_live_into_following_return() {
         let nodes = vec![
             block(0, vec![Expr::assign(reg("eax", 4), Expr::int(7))]),
@@ -4971,6 +5136,31 @@ mod tests {
 
         assert_eq!(statements.len(), 1);
         assert_eq!(format!("{}", statements[0]), "eax = 7");
+    }
+
+    #[test]
+    fn test_simplify_statements_rewrites_dead_atomic_exchange_capture_to_store() {
+        let nodes = vec![block(
+            0,
+            vec![Expr::assign(
+                reg("edi", 4),
+                Expr::call(
+                    CallTarget::Named("atomic_exchange".to_string()),
+                    vec![Expr::unknown("&g_counter"), reg("edi", 4)],
+                ),
+            )],
+        )];
+
+        let simplified = simplify_statements(nodes);
+        let StructuredNode::Block { statements, .. } = &simplified[0] else {
+            panic!("expected block");
+        };
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            format!("{}", statements[0]),
+            "atomic_store(&g_counter, edi)"
+        );
     }
 
     #[test]

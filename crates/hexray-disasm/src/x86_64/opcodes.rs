@@ -534,6 +534,16 @@ pub static OPCODE_TABLE: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::ModRmRm_Reg,
     ));
 
+    // XCHG r/m, r
+    table[0x86] = Some(
+        OpcodeEntry::new("xchg", Operation::Exchange, OperandEncoding::ModRmRm_Reg).with_size(8),
+    );
+    table[0x87] = Some(OpcodeEntry::new(
+        "xchg",
+        Operation::Exchange,
+        OperandEncoding::ModRmRm_Reg,
+    ));
+
     // TEST AL/AX/EAX/RAX, imm
     table[0xA8] =
         Some(OpcodeEntry::new("test", Operation::Test, OperandEncoding::Acc_Imm).with_size(8));
