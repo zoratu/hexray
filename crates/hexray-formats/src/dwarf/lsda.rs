@@ -67,13 +67,16 @@ impl Lsda {
     /// Gets exception types caught at a landing pad.
     pub fn get_catch_types(&self, action_index: usize) -> Vec<CatchType> {
         let mut types = Vec::new();
-        let mut current = action_index;
+        if action_index == 0 {
+            return types;
+        }
+        let mut current_offset = action_index.saturating_sub(1);
 
-        while current > 0 && current <= self.actions.len() {
-            let Some(action) = self.actions.get(current.saturating_sub(1)) else {
-                break;
-            };
-
+        while let Some(action) = self
+            .actions
+            .iter()
+            .find(|action| action.offset == current_offset)
+        {
             if action.type_filter > 0 {
                 // Positive filter: catch specific type
                 let type_idx = action.type_filter as usize;
@@ -85,7 +88,13 @@ impl Lsda {
                 } else {
                     None
                 };
-                types.push(CatchType::Specific { type_info });
+                if let Some(type_info) = type_info {
+                    types.push(CatchType::Specific {
+                        type_info: Some(type_info),
+                    });
+                } else {
+                    types.push(CatchType::CatchAll);
+                }
             } else if action.type_filter == 0 {
                 // Zero filter: cleanup (finally)
                 types.push(CatchType::Cleanup);
@@ -100,12 +109,23 @@ impl Lsda {
             if action.next_action == 0 {
                 break;
             }
-            // next_action is a byte offset, but we indexed actions sequentially
-            // This is a simplification - proper handling needs byte offset tracking
-            current = (current as i64).wrapping_add(action.next_action) as usize;
-            if current == 0 || current > self.actions.len() {
-                break;
-            }
+            current_offset = if action.next_action > 0 {
+                let Ok(delta) = usize::try_from(action.next_action) else {
+                    break;
+                };
+                let Some(next) = action.offset.checked_add(delta) else {
+                    break;
+                };
+                next
+            } else {
+                let Ok(delta) = usize::try_from(action.next_action.wrapping_neg()) else {
+                    break;
+                };
+                let Some(next) = action.offset.checked_sub(delta) else {
+                    break;
+                };
+                next
+            };
         }
 
         types
@@ -145,6 +165,8 @@ impl CallSite {
 /// An action record in the action table.
 #[derive(Debug, Clone)]
 pub struct ActionRecord {
+    /// Byte offset of this record from the start of the action table.
+    pub offset: usize,
     /// Type filter:
     /// - Positive: index into type table (1-based)
     /// - Zero: cleanup (finally)
@@ -312,6 +334,7 @@ impl<'a> LsdaParser<'a> {
         let action_table_end = type_table_offset.unwrap_or(self.data.len());
 
         while offset < action_table_end && offset < self.data.len() {
+            let record_offset = offset.saturating_sub(action_table_start);
             let type_filter = self.read_sleb(&mut offset)?;
 
             if offset >= action_table_end || offset >= self.data.len() {
@@ -321,6 +344,7 @@ impl<'a> LsdaParser<'a> {
             let next_action = self.read_sleb(&mut offset)?;
 
             actions.push(ActionRecord {
+                offset: record_offset,
                 type_filter,
                 next_action,
             });
@@ -708,6 +732,7 @@ mod tests {
                 },
             ],
             actions: vec![ActionRecord {
+                offset: 0,
                 type_filter: 1,
                 next_action: 0,
             }],
@@ -718,5 +743,56 @@ mod tests {
         assert!(info.has_exception_handling);
         assert_eq!(info.cleanup_handlers.len(), 1);
         assert_eq!(info.try_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_get_catch_types_follows_action_byte_offsets() {
+        let lsda = Lsda {
+            landing_pad_base: 0x1000,
+            type_table_encoding: 0,
+            call_sites: Vec::new(),
+            actions: vec![
+                ActionRecord {
+                    offset: 0,
+                    type_filter: 1,
+                    next_action: 2,
+                },
+                ActionRecord {
+                    offset: 2,
+                    type_filter: 0,
+                    next_action: 0,
+                },
+            ],
+            type_table: vec![Some(0x5000)],
+        };
+
+        let catch_types = lsda.get_catch_types(1);
+        assert_eq!(catch_types.len(), 2);
+        assert!(matches!(
+            catch_types[0],
+            CatchType::Specific {
+                type_info: Some(0x5000)
+            }
+        ));
+        assert!(matches!(catch_types[1], CatchType::Cleanup));
+    }
+
+    #[test]
+    fn test_get_catch_types_treats_null_type_entry_as_catch_all() {
+        let lsda = Lsda {
+            landing_pad_base: 0x1000,
+            type_table_encoding: 0,
+            call_sites: Vec::new(),
+            actions: vec![ActionRecord {
+                offset: 0,
+                type_filter: 1,
+                next_action: 0,
+            }],
+            type_table: vec![None],
+        };
+
+        let catch_types = lsda.get_catch_types(1);
+        assert_eq!(catch_types.len(), 1);
+        assert!(matches!(catch_types[0], CatchType::CatchAll));
     }
 }

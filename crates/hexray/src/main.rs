@@ -22,10 +22,10 @@ use hexray_analysis::{
     CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CallSite, CallType,
     CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter, Decompiler, DecompilerConfig,
     ExceptionExtractor, ExceptionInfo, FunctionInfo, OptimizationLevel, OptimizationPass,
-    ParallelCallGraphBuilder, Patch, PatchType, RelocationTable, StringConfig, StringDetector,
-    StringTable, SymbolTable, XrefBuilder, XrefType,
+    ParallelCallGraphBuilder, Patch, PatchType, RelocationTable, RttiParser, StringConfig,
+    StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
-use hexray_core::Architecture;
+use hexray_core::{Architecture, Endianness};
 use hexray_demangle::demangle_or_original;
 use hexray_disasm::{Arm64Disassembler, Disassembler, RiscVDisassembler, X86_64Disassembler};
 use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
@@ -376,7 +376,9 @@ impl<'a> Binary<'a> {
             Self::MachO(macho) => ExceptionExtractor::from_elf(macho).ok()?,
             Self::Pe(pe) => ExceptionExtractor::from_elf(pe).ok()?,
         };
-        extractor.get_exception_info(func_start, func_end)
+        let mut info = extractor.get_exception_info(func_start, func_end)?;
+        resolve_exception_type_names(self.as_format(), &mut info);
+        Some(info)
     }
 
     fn exception_metadata_summary(&self) -> Option<ExceptionMetadataSummary> {
@@ -392,6 +394,52 @@ impl<'a> Binary<'a> {
             lsda_section_name: exception_lsda_section_name(self.as_format()),
         })
     }
+}
+
+fn resolve_exception_type_names(fmt: &dyn BinaryFormat, info: &mut ExceptionInfo) {
+    for try_block in &mut info.try_blocks {
+        for handler in &mut try_block.handlers {
+            let Some(typeinfo_addr) =
+                parse_exception_type_placeholder(handler.catch_type.as_deref())
+            else {
+                continue;
+            };
+
+            if let Some(name) = resolve_exception_type_name(fmt, typeinfo_addr) {
+                handler.catch_type = Some(name);
+            }
+        }
+    }
+}
+
+fn parse_exception_type_placeholder(value: Option<&str>) -> Option<u64> {
+    let raw = value?.strip_prefix("type@0x")?;
+    u64::from_str_radix(raw, 16).ok()
+}
+
+fn resolve_exception_type_name(fmt: &dyn BinaryFormat, addr: u64) -> Option<String> {
+    let symbol = fmt.symbol_at(addr)?;
+    demangle_exception_typeinfo_symbol_name(&symbol.name).or_else(|| {
+        demangle_or_original(&symbol.name)
+            .strip_prefix("typeinfo for ")
+            .map(str::to_string)
+    })
+}
+
+fn demangle_exception_typeinfo_symbol_name(raw_name: &str) -> Option<String> {
+    let unversioned = hexray_core::unversioned_symbol_name(raw_name);
+    let mangled = &unversioned[unversioned.find("_ZTI")? + 4..];
+    if mangled.is_empty() {
+        return None;
+    }
+
+    let parser = RttiParser::new(8, Endianness::Little);
+    let demangled = parser.demangle_type_name(mangled);
+    if demangled != mangled {
+        return Some(demangled);
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7512,14 +7560,15 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_calling_convention, discover_function_starts,
-        discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
-        ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
-        infer_main_symbol_from_entry, parse_address_str, patch_affects_function,
-        resolve_analysis_target, resolve_analysis_target_with_entry_main,
-        resolve_materialized_callback_targets, resolve_xref_source_label,
-        resolve_xref_target_addresses, string_tags, truncate_for_display, DiffPatchAddressSpace,
-        FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
+        default_calling_convention, demangle_exception_typeinfo_symbol_name,
+        discover_function_starts, discover_materialized_internal_targets,
+        discover_stripped_x86_function_seeds, ensure_distinct_export_paths,
+        find_symbol_in_candidates, format_callgraph_text, infer_main_symbol_from_entry,
+        parse_address_str, patch_affects_function, resolve_analysis_target,
+        resolve_analysis_target_with_entry_main, resolve_materialized_callback_targets,
+        resolve_xref_source_label, resolve_xref_target_addresses, string_tags,
+        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
+        SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{
         CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
@@ -9040,5 +9089,21 @@ mod tests {
             0x4011f0,
             0x401260
         ));
+    }
+
+    #[test]
+    fn demangle_exception_typeinfo_symbol_name_handles_direct_typeinfo() {
+        assert_eq!(
+            demangle_exception_typeinfo_symbol_name("_ZTI7MyError"),
+            Some("MyError".to_string())
+        );
+    }
+
+    #[test]
+    fn demangle_exception_typeinfo_symbol_name_handles_dw_ref_aliases() {
+        assert_eq!(
+            demangle_exception_typeinfo_symbol_name("DW.ref._ZTI7MyError"),
+            Some("MyError".to_string())
+        );
     }
 }

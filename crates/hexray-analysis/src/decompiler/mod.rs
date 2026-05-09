@@ -1813,7 +1813,11 @@ fn apply_exception_handling(
     }
 
     if exception_info.try_blocks.is_empty() {
-        return remaining_body;
+        return wrap_cleanup_regions(
+            remaining_body,
+            &exception_info.cleanup_handlers,
+            &landing_pad_nodes,
+        );
     }
 
     let mut result = Vec::new();
@@ -1823,20 +1827,21 @@ fn apply_exception_handling(
         let node = &remaining_body[i];
 
         // Get the address range of this node
-        if let Some((node_start, _node_end)) = get_node_address_range(node) {
+        if let Some((node_start, node_end)) = get_node_address_range(node) {
             // Check if this node starts a try block
             if let Some(try_block) = exception_info
                 .try_blocks
                 .iter()
-                .find(|tb| node_start >= tb.start && node_start < tb.end)
+                .find(|tb| node_end > tb.start && node_start < tb.end)
             {
                 // Collect all nodes that fall within this try block
                 let mut try_body = vec![remaining_body[i].clone()];
                 i += 1;
 
                 while i < remaining_body.len() {
-                    if let Some((next_start, _)) = get_node_address_range(&remaining_body[i]) {
-                        if next_start >= try_block.start && next_start < try_block.end {
+                    if let Some((next_start, next_end)) = get_node_address_range(&remaining_body[i])
+                    {
+                        if next_end > try_block.start && next_start < try_block.end {
                             try_body.push(remaining_body[i].clone());
                             i += 1;
                         } else {
@@ -1886,6 +1891,97 @@ fn apply_exception_handling(
     }
 
     result
+}
+
+fn wrap_cleanup_regions(
+    body: Vec<StructuredNode>,
+    cleanup_handlers: &[CleanupInfo],
+    landing_pad_nodes: &std::collections::HashMap<u64, Vec<StructuredNode>>,
+) -> Vec<StructuredNode> {
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < body.len() {
+        let node = &body[i];
+
+        if let Some((node_start, node_end)) = get_node_address_range(node) {
+            if let Some(cleanup) = cleanup_handlers
+                .iter()
+                .find(|cleanup| node_end > cleanup.start && node_start < cleanup.end)
+            {
+                let mut try_body = vec![body[i].clone()];
+                i += 1;
+
+                while i < body.len() {
+                    if let Some((next_start, next_end)) = get_node_address_range(&body[i]) {
+                        if next_end > cleanup.start && next_start < cleanup.end {
+                            try_body.push(body[i].clone());
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                result.push(StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers: vec![structurer::CatchHandler {
+                        exception_type: None,
+                        variable_name: None,
+                        body: landing_pad_nodes
+                            .get(&cleanup.landing_pad)
+                            .cloned()
+                            .unwrap_or_default(),
+                        landing_pad: cleanup.landing_pad,
+                    }],
+                });
+                continue;
+            }
+        }
+
+        result.push(body[i].clone());
+        i += 1;
+    }
+
+    if result
+        .iter()
+        .any(|node| matches!(node, StructuredNode::TryCatch { .. }))
+        || cleanup_handlers.len() != 1
+        || body.is_empty()
+    {
+        return result;
+    }
+
+    let cleanup = &cleanup_handlers[0];
+    vec![StructuredNode::TryCatch {
+        try_body: body,
+        catch_handlers: vec![structurer::CatchHandler {
+            exception_type: None,
+            variable_name: None,
+            body: landing_pad_nodes
+                .get(&cleanup.landing_pad)
+                .cloned()
+                .unwrap_or_default(),
+            landing_pad: cleanup.landing_pad,
+        }],
+    }]
+}
+
+#[cfg(test)]
+fn catch_handler_body_len(catch_handlers: &[structurer::CatchHandler]) -> usize {
+    catch_handlers
+        .first()
+        .map(|handler| handler.body.len())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn is_catch_all_handler(catch_handlers: &[structurer::CatchHandler]) -> bool {
+    catch_handlers
+        .first()
+        .is_some_and(|handler| handler.exception_type.is_none())
 }
 
 /// Gets the address range of a structured node.
@@ -2052,7 +2148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_exception_handling_drops_cleanup_only_landing_pad() {
+    fn test_apply_exception_handling_wraps_cleanup_only_landing_pad_in_catch_all() {
         let body = vec![
             StructuredNode::Block {
                 id: BasicBlockId::new(0),
@@ -2078,11 +2174,87 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         match &filtered[0] {
-            StructuredNode::Block { statements, .. } => {
-                assert_eq!(statements.len(), 1);
-                assert_eq!(format!("{}", statements[0]), "live_stmt");
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                assert_eq!(try_body.len(), 1);
+                assert_eq!(catch_handlers.len(), 1);
+                assert_eq!(catch_handler_body_len(catch_handlers), 1);
+                assert!(is_catch_all_handler(catch_handlers));
             }
-            other => panic!("expected surviving live block, got {other:?}"),
+            other => panic!("expected synthetic try/catch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_exception_handling_wraps_cleanup_only_expr_body_with_single_handler() {
+        let body = vec![StructuredNode::Expr(Expr::unknown("live_stmt"))];
+        let info = ExceptionInfo {
+            try_blocks: Vec::new(),
+            cleanup_handlers: vec![CleanupInfo {
+                start: 0x1000,
+                end: 0x1010,
+                landing_pad: 0x1200,
+            }],
+        };
+
+        let wrapped = apply_exception_handling(body, &info);
+
+        assert_eq!(wrapped.len(), 1);
+        match &wrapped[0] {
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                assert_eq!(try_body.len(), 1);
+                assert_eq!(catch_handlers.len(), 1);
+                assert!(is_catch_all_handler(catch_handlers));
+            }
+            other => panic!("expected synthetic try/catch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_exception_handling_wraps_blocks_that_overlap_try_range() {
+        let body = vec![
+            StructuredNode::Block {
+                id: BasicBlockId::new(0),
+                statements: vec![Expr::unknown("call_stmt")],
+                address_range: (0x1000, 0x1018),
+            },
+            StructuredNode::Block {
+                id: BasicBlockId::new(1),
+                statements: vec![Expr::unknown("handler_stmt")],
+                address_range: (0x1200, 0x1208),
+            },
+        ];
+        let info = ExceptionInfo {
+            try_blocks: vec![TryBlockInfo {
+                start: 0x1008,
+                end: 0x1010,
+                handlers: vec![CatchInfo {
+                    landing_pad: 0x1200,
+                    catch_type: Some("MyError".to_string()),
+                    is_catch_all: false,
+                }],
+            }],
+            cleanup_handlers: Vec::new(),
+        };
+
+        let wrapped = apply_exception_handling(body, &info);
+
+        assert_eq!(wrapped.len(), 1);
+        match &wrapped[0] {
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                assert_eq!(try_body.len(), 1);
+                assert_eq!(catch_handlers.len(), 1);
+                assert_eq!(catch_handlers[0].body.len(), 1);
+            }
+            other => panic!("expected try/catch wrapper, got {other:?}"),
         }
     }
 
