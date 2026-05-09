@@ -28,7 +28,7 @@ use std::fmt::Write;
 pub fn demangle(name: &str) -> Option<String> {
     let (core_name, suffix) = split_symbol_suffix(name);
 
-    let demangled = demangle_inner(core_name)?;
+    let demangled = postprocess_demangled(core_name, demangle_inner(core_name)?);
     if suffix.is_empty() {
         Some(demangled)
     } else {
@@ -68,6 +68,79 @@ fn split_symbol_suffix(name: &str) -> (&str, &str) {
     (&name[..suffix_start], &name[suffix_start..])
 }
 
+fn postprocess_demangled(mangled: &str, demangled: String) -> String {
+    recover_make_shared_signature(mangled, &demangled).unwrap_or(demangled)
+}
+
+fn recover_make_shared_signature(mangled: &str, demangled: &str) -> Option<String> {
+    if !mangled.starts_with("_ZSt11make_sharedI") {
+        return None;
+    }
+
+    let prefix = "std::make_shared<";
+    let rest = demangled.strip_prefix(prefix)?;
+    let template_end = find_matching_angle(rest)?;
+    let template_args = &rest[..template_end];
+    let params = rest.get(template_end + 1..)?;
+    if params != "()" {
+        return None;
+    }
+
+    let args = split_top_level_template_args(template_args);
+    let pointee = args.first()?;
+    let ctor_args = if args.len() > 1 {
+        args[1..].join(", ")
+    } else {
+        String::new()
+    };
+
+    Some(format!(
+        "std::shared_ptr<{}> std::make_shared<{}>({})",
+        pointee, template_args, ctor_args
+    ))
+}
+
+fn find_matching_angle(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                if depth == 0 {
+                    return Some(idx);
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_template_args(input: &str) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut args = Vec::new();
+
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(input[start..idx].trim().to_string());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+
+    args.push(input[start..].trim().to_string());
+    args
+}
+
 /// Returns the demangled name or the original if demangling fails.
 pub fn demangle_or_original(name: &str) -> String {
     demangle(name).unwrap_or_else(|| name.to_string())
@@ -87,7 +160,25 @@ fn demangle_cpp(name: &str) -> Option<String> {
     let normalized = normalize_prefixed_name(name, "_Z")?;
     let symbol = CppSymbol::new(normalized).ok()?;
     let options = CppDemangleOptions::new().no_return_type();
-    symbol.demangle_with_options(&options).ok()
+    let without_return = symbol.demangle_with_options(&options).ok();
+    if let Some(demangled) = without_return.as_ref() {
+        if !is_low_fidelity_cpp_demangle(demangled) {
+            return without_return;
+        }
+    }
+
+    let with_return = symbol.demangle().ok();
+    if let Some(demangled) = with_return.as_ref() {
+        if !is_low_fidelity_cpp_demangle(demangled) {
+            return with_return;
+        }
+    }
+
+    None
+}
+
+fn is_low_fidelity_cpp_demangle(name: &str) -> bool {
+    matches!(name, "std" | "std()") || name.ends_with("::()")
 }
 
 fn normalize_prefixed_name<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
@@ -513,6 +604,15 @@ impl<'a> ItaniumDemangler<'a> {
 
     /// Parse a name.
     fn parse_name(&mut self) -> Option<String> {
+        if self.peek_n(2) == "St" {
+            self.consume(2);
+            if self.remaining().is_empty() {
+                return Some("std".to_string());
+            }
+            let member = self.parse_name()?;
+            return Some(format!("std::{}", member));
+        }
+
         // Nested name
         if self.peek() == Some('N') {
             return self.parse_nested_name();
@@ -565,6 +665,18 @@ impl<'a> ItaniumDemangler<'a> {
         while !self.expect("E") {
             if self.remaining().is_empty() {
                 return None;
+            }
+
+            if self.expect("J") {
+                while !self.expect("E") {
+                    if self.remaining().is_empty() {
+                        return None;
+                    }
+                    let arg = self.parse_template_arg()?;
+                    self.template_args.push(arg.clone());
+                    args.push(arg);
+                }
+                continue;
             }
 
             let arg = self.parse_template_arg()?;
@@ -816,6 +928,16 @@ impl<'a> ItaniumDemangler<'a> {
         }
 
         // Substitution
+        if self.peek_n(2) == "St" {
+            self.consume(2);
+            if self.remaining().is_empty() {
+                return Some("std".to_string());
+            }
+            let member = self.parse_name()?;
+            let qualified = format!("std::{}", member);
+            self.substitutions.push(qualified.clone());
+            return Some(qualified);
+        }
         if self.peek() == Some('S') {
             return self.parse_substitution();
         }
@@ -1200,6 +1322,14 @@ mod tests {
     #[test]
     fn test_cpp_demangle_handles_macho_leading_underscore() {
         assert_eq!(demangle("__ZN3foo3barEv"), Some("foo::bar()".to_string()));
+    }
+
+    #[test]
+    fn test_cpp_demangle_handles_make_shared_with_template_pack() {
+        assert_eq!(
+            demangle("_ZSt11make_sharedI5ThingJRiEESt10shared_ptrINSt9enable_ifIXntsrSt8is_arrayIT_E5valueES5_E4typeEEDpOT0_"),
+            Some("std::shared_ptr<Thing> std::make_shared<Thing, int&>(int&)".to_string())
+        );
     }
 
     #[test]
