@@ -32,10 +32,13 @@ pub use cleanup::{
     remove_orphan_gotos, remove_orphan_labels, structure_shared_exits,
 };
 #[cfg(test)]
+use condition::condition_to_expr_with_block;
+#[cfg(test)]
 use condition::try_extract_arm64_branch_condition;
 use condition::{
-    condition_to_expr_with_block, condition_to_expr_with_block_no_alu_updates,
-    generate_writeback_expr, lift_cmovcc_with_context, lift_setcc_with_context, negate_condition,
+    condition_to_expr_with_block_and_fallback,
+    condition_to_expr_with_block_no_alu_updates_and_fallback, generate_writeback_expr,
+    lift_cmovcc_with_context, lift_setcc_with_context, negate_condition,
 };
 #[cfg(test)]
 use gotos::LoopContext;
@@ -2240,6 +2243,22 @@ impl<'a> Structurer<'a> {
         result
     }
 
+    fn condition_fallback_block(&self, block_id: BasicBlockId) -> Option<&BasicBlock> {
+        let [pred_id] = self.cfg.predecessors(block_id) else {
+            return None;
+        };
+
+        let pred = self.cfg.block(*pred_id)?;
+        match pred.terminator {
+            BlockTerminator::ConditionalBranch {
+                true_target,
+                false_target,
+                ..
+            } if true_target == block_id || false_target == block_id => Some(pred),
+            _ => None,
+        }
+    }
+
     fn external_loop_guard(
         &self,
         header: BasicBlockId,
@@ -2263,7 +2282,11 @@ impl<'a> Structurer<'a> {
 
         let lifted = self.rewrite_condition_call_return_alias(
             header,
-            condition_to_expr_with_block(*condition, block),
+            condition_to_expr_with_block_and_fallback(
+                *condition,
+                block,
+                self.condition_fallback_block(header),
+            ),
         );
 
         let (loop_target, external_target, external_condition) = if true_in_loop {
@@ -2306,7 +2329,11 @@ impl<'a> Structurer<'a> {
 
             let cond_expr = self.rewrite_condition_call_return_alias(
                 header,
-                condition_to_expr_with_block(*condition, block),
+                condition_to_expr_with_block_and_fallback(
+                    *condition,
+                    block,
+                    self.condition_fallback_block(header),
+                ),
             );
 
             if true_in_loop && !false_in_loop {
@@ -2334,7 +2361,11 @@ impl<'a> Structurer<'a> {
 
                 let cond_expr = self.rewrite_condition_call_return_alias(
                     cond_block_id,
-                    condition_to_expr_with_block(*condition, cond_block),
+                    condition_to_expr_with_block_and_fallback(
+                        *condition,
+                        cond_block,
+                        self.condition_fallback_block(cond_block_id),
+                    ),
                 );
 
                 if true_in_loop && !false_in_loop {
@@ -2367,9 +2398,17 @@ impl<'a> Structurer<'a> {
             } = &block.terminator
             {
                 let lifted = if back_edge == info.header {
-                    condition_to_expr_with_block_no_alu_updates(*condition, block)
+                    condition_to_expr_with_block_no_alu_updates_and_fallback(
+                        *condition,
+                        block,
+                        self.condition_fallback_block(back_edge),
+                    )
                 } else {
-                    condition_to_expr_with_block(*condition, block)
+                    condition_to_expr_with_block_and_fallback(
+                        *condition,
+                        block,
+                        self.condition_fallback_block(back_edge),
+                    )
                 };
                 let cond_expr = self.rewrite_condition_call_return_alias(back_edge, lifted);
                 if *true_target == info.header {
@@ -2394,7 +2433,11 @@ impl<'a> Structurer<'a> {
     ) -> (StructuredNode, bool) {
         let cond_expr = self.rewrite_condition_call_return_alias(
             block_id,
-            condition_to_expr_with_block(condition, block),
+            condition_to_expr_with_block_and_fallback(
+                condition,
+                block,
+                self.condition_fallback_block(block_id),
+            ),
         );
 
         let shared_return = join.and_then(|join_id| self.get_return_expr_if_pure_return(join_id));

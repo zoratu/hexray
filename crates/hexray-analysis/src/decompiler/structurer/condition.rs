@@ -128,6 +128,16 @@ pub(super) fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) 
     condition_to_expr_before_address_with_options(cond, block, None, true)
 }
 
+/// Converts a Condition to an Expr, falling back to a predecessor block when the current
+/// block only contains the consuming branch and the flags were set earlier.
+pub(super) fn condition_to_expr_with_block_and_fallback(
+    cond: Condition,
+    block: &BasicBlock,
+    fallback_block: Option<&BasicBlock>,
+) -> Expr {
+    condition_to_expr_before_address_with_fallback(cond, block, None, true, fallback_block)
+}
+
 /// Converts a condition to an Expr without folding same-block ALU updates into register values.
 /// This is useful for bottom-tested self-loops where the arithmetic update is already emitted
 /// in the loop body and should not be duplicated in the condition.
@@ -136,6 +146,16 @@ pub(super) fn condition_to_expr_with_block_no_alu_updates(
     block: &BasicBlock,
 ) -> Expr {
     condition_to_expr_before_address_with_options(cond, block, None, false)
+}
+
+/// Like `condition_to_expr_with_block_no_alu_updates`, but allows a predecessor fallback when
+/// the condition consumes flags set in a different block.
+pub(super) fn condition_to_expr_with_block_no_alu_updates_and_fallback(
+    cond: Condition,
+    block: &BasicBlock,
+    fallback_block: Option<&BasicBlock>,
+) -> Expr {
+    condition_to_expr_before_address_with_fallback(cond, block, None, false, fallback_block)
 }
 
 /// Converts a Condition to an Expr, finding the compare instruction before the given address.
@@ -154,6 +174,22 @@ fn condition_to_expr_before_address_with_options(
     before_addr: Option<u64>,
     track_alu_updates: bool,
 ) -> Expr {
+    condition_to_expr_before_address_with_fallback(
+        cond,
+        block,
+        before_addr,
+        track_alu_updates,
+        None,
+    )
+}
+
+fn condition_to_expr_before_address_with_fallback(
+    cond: Condition,
+    block: &BasicBlock,
+    before_addr: Option<u64>,
+    track_alu_updates: bool,
+    fallback_block: Option<&BasicBlock>,
+) -> Expr {
     let op = match cond {
         Condition::Equal => BinOpKind::Eq,
         Condition::NotEqual => BinOpKind::Ne,
@@ -165,57 +201,35 @@ fn condition_to_expr_before_address_with_options(
         Condition::BelowOrEqual => BinOpKind::ULe,
         Condition::Above => BinOpKind::UGt,
         Condition::AboveOrEqual => BinOpKind::UGe,
-        // Sign/NotSign: after CMP x, y, MI is set when x - y < 0 (signed)
         Condition::Sign => BinOpKind::Lt,
         Condition::NotSign => BinOpKind::Ge,
-        _ => BinOpKind::Ne, // Default for flag-based conditions
+        _ => BinOpKind::Ne,
     };
 
-    // Build a map of register values from MOV instructions before the compare
-    let reg_values = build_register_value_map_with_options(block, track_alu_updates);
+    let reg_values = build_register_value_map_with_options(block, before_addr, track_alu_updates);
 
-    // Check for ARM64 CBZ/CBNZ/TBZ/TBNZ instructions first
-    // These have the comparison built into the branch instruction itself
     if let Some(cond_expr) = try_extract_arm64_branch_condition(block, op, &reg_values) {
         return cond_expr;
     }
 
-    // Find the last flag-setting instruction in the block (before the given address if specified)
-    // This includes CMP, TEST, SUB, NEG, ADD, INC, DEC, AND, OR, XOR, and shift operations
-    let compare_inst = block
-        .instructions
-        .iter()
-        .rev()
-        .filter(|inst| {
-            // If before_addr is specified, only consider instructions before that address
-            before_addr.map_or(true, |addr| inst.address < addr)
-        })
-        .find(|inst| is_flag_setting_instruction(inst));
-
-    if let Some(inst) = compare_inst {
-        // For NEG instructions, flags reflect the negated result
-        // neg eax: SF set if (-eax) < 0, i.e., eax > 0
-        // For Sign condition after NEG, we need "operand > 0" (or < 0 for inverted)
+    let lift_condition_from_inst = |inst: &Instruction, reg_values: &HashMap<String, Expr>| {
         if matches!(inst.operation, Operation::Neg) && !inst.operands.is_empty() {
             let operand = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
-                &reg_values,
+                reg_values,
             );
-            // NEG sets SF if result is negative, meaning original was positive
-            // So Sign (SF) after NEG means original > 0
             let neg_op = match cond {
-                Condition::Sign => BinOpKind::Gt,    // SF set means orig > 0
-                Condition::NotSign => BinOpKind::Le, // SF clear means orig <= 0
-                _ => op,                             // Use default mapping for other conditions
+                Condition::Sign => BinOpKind::Gt,
+                Condition::NotSign => BinOpKind::Le,
+                _ => op,
             };
-            return Expr::binop(neg_op, operand, Expr::int(0));
+            return Some(Expr::binop(neg_op, operand, Expr::int(0)));
         }
 
-        // INC/DEC: compare result against 0
         if matches!(inst.operation, Operation::Inc | Operation::Dec) && !inst.operands.is_empty() {
             let operand = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
-                &reg_values,
+                reg_values,
             );
             let adjustment = if matches!(inst.operation, Operation::Inc) {
                 1
@@ -223,63 +237,58 @@ fn condition_to_expr_before_address_with_options(
                 -1
             };
             let result = Expr::binop(BinOpKind::Add, operand, Expr::int(adjustment));
-            return Expr::binop(op, result, Expr::int(0));
+            return Some(Expr::binop(op, result, Expr::int(0)));
         }
 
-        // ADD (3 operands): ARM64 ADDS
         if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Add) {
             let src1 = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[1], inst),
-                &reg_values,
+                reg_values,
             );
             let src2 = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[2], inst),
-                &reg_values,
+                reg_values,
             );
             let result = Expr::binop(BinOpKind::Add, src1, src2);
-            return Expr::binop(op, result, Expr::int(0));
+            return Some(Expr::binop(op, result, Expr::int(0)));
         }
 
-        // ADD (2 operands): x86 ADD
         if inst.operands.len() == 2 && matches!(inst.operation, Operation::Add) {
             let dst = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
-                &reg_values,
+                reg_values,
             );
             let src = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[1], inst),
-                &reg_values,
+                reg_values,
             );
             let result = Expr::binop(BinOpKind::Add, dst, src);
-            return Expr::binop(op, result, Expr::int(0));
+            return Some(Expr::binop(op, result, Expr::int(0)));
         }
 
-        // For SUB/SUBS instructions (ARM64), operands are [dst, src1, src2]
-        // The comparison is between src1 and src2
         if inst.operands.len() >= 3 && matches!(inst.operation, Operation::Sub) {
             let left = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[1], inst),
-                &reg_values,
+                reg_values,
             );
             let right = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[2], inst),
-                &reg_values,
+                reg_values,
             );
-            return Expr::binop(op, left, right);
+            return Some(Expr::binop(op, left, right));
         } else if inst.operands.len() >= 3
             && matches!(
                 inst.operation,
                 Operation::And | Operation::Or | Operation::Xor
             )
         {
-            // ARM64: ANDS/ORRS/EORS dst, src1, src2
             let src1 = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[1], inst),
-                &reg_values,
+                reg_values,
             );
             let src2 = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[2], inst),
-                &reg_values,
+                reg_values,
             );
             let binop_kind = match inst.operation {
                 Operation::And => BinOpKind::And,
@@ -288,26 +297,24 @@ fn condition_to_expr_before_address_with_options(
                 _ => unreachable!(),
             };
             let result = Expr::binop(binop_kind, src1, src2);
-            return Expr::binop(op, result, Expr::int(0));
+            return Some(Expr::binop(op, result, Expr::int(0)));
         } else if inst.operands.len() == 2
             && matches!(
                 inst.operation,
                 Operation::And | Operation::Or | Operation::Xor
             )
         {
-            // x86: AND/OR/XOR dst, src
             let dst = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
-                &reg_values,
+                reg_values,
             );
             let src = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[1], inst),
-                &reg_values,
+                reg_values,
             );
 
-            // Special case: XOR reg, reg clears to 0
             if matches!(inst.operation, Operation::Xor) && inst.operands[0] == inst.operands[1] {
-                return Expr::binop(op, Expr::int(0), Expr::int(0));
+                return Some(Expr::binop(op, Expr::int(0), Expr::int(0)));
             }
 
             let binop_kind = match inst.operation {
@@ -317,38 +324,47 @@ fn condition_to_expr_before_address_with_options(
                 _ => unreachable!(),
             };
             let result = Expr::binop(binop_kind, dst, src);
-            return Expr::binop(op, result, Expr::int(0));
+            return Some(Expr::binop(op, result, Expr::int(0)));
         } else if inst.operands.len() >= 2 {
-            // For CMP/TEST instructions, operands are [src1, src2]
             let left = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
-                &reg_values,
+                reg_values,
             );
             let right = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[1], inst),
-                &reg_values,
+                reg_values,
             );
 
-            // Special case: TEST reg, reg (same register) is a zero check
-            // test eax, eax; je → jump if eax == 0
-            // test eax, eax; jne → jump if eax != 0
             if matches!(inst.operation, Operation::Test) && inst.operands[0] == inst.operands[1] {
-                return Expr::binop(op, left, Expr::int(0));
+                return Some(Expr::binop(op, left, Expr::int(0)));
             }
 
-            return Expr::binop(op, left, right);
+            return Some(Expr::binop(op, left, right));
         } else if inst.operands.len() == 1 {
-            // Compare against zero (common for test/cmp with single operand)
             let left = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
-                &reg_values,
+                reg_values,
             );
-            return Expr::binop(op, left, Expr::int(0));
+            return Some(Expr::binop(op, left, Expr::int(0)));
+        }
+
+        None
+    };
+
+    if let Some(inst) = find_flag_setting_instruction(block, before_addr) {
+        if let Some(expr) = lift_condition_from_inst(inst, &reg_values) {
+            return expr;
+        }
+    } else if let Some(fallback_block) = fallback_block {
+        let fallback_reg_values =
+            build_register_value_map_with_options(fallback_block, None, track_alu_updates);
+        if let Some(inst) = find_flag_setting_instruction(fallback_block, None) {
+            if let Some(expr) = lift_condition_from_inst(inst, &fallback_reg_values) {
+                return expr;
+            }
         }
     }
 
-    // Fallback: show a descriptive condition name when compare not found
-    // Use readable condition names instead of raw flag expressions
     let cond_name = match cond {
         Condition::Equal => "/* equal */",
         Condition::NotEqual => "/* not_equal */",
@@ -368,8 +384,6 @@ fn condition_to_expr_before_address_with_options(
         Condition::NotParity => "/* parity_odd */",
         _ => "/* condition */",
     };
-    // Return just the condition name as an unknown expression
-    // The operator and 0 comparison are implicit
     Expr::unknown(cond_name)
 }
 
@@ -381,11 +395,12 @@ fn condition_to_expr_before_address_with_options(
 /// that conditions like `test eax, eax` display as `if (ebx == 0)` when we've merged
 /// the call into `ebx = func()`.
 pub(super) fn build_register_value_map(block: &BasicBlock) -> HashMap<String, Expr> {
-    build_register_value_map_with_options(block, true)
+    build_register_value_map_with_options(block, None, true)
 }
 
 fn build_register_value_map_with_options(
     block: &BasicBlock,
+    before_addr: Option<u64>,
     track_alu_updates: bool,
 ) -> HashMap<String, Expr> {
     use super::super::expression::{VarKind, Variable};
@@ -397,6 +412,10 @@ fn build_register_value_map_with_options(
     let mut ret_capture_counter: u32 = 0;
 
     for inst in &block.instructions {
+        if before_addr.is_some_and(|addr| inst.address >= addr) {
+            break;
+        }
+
         // Track if we've seen a call instruction
         if inst.is_call() {
             saw_call = true;
@@ -524,6 +543,18 @@ fn build_register_value_map_with_options(
     }
 
     reg_values
+}
+
+fn find_flag_setting_instruction(
+    block: &BasicBlock,
+    before_addr: Option<u64>,
+) -> Option<&Instruction> {
+    block
+        .instructions
+        .iter()
+        .rev()
+        .filter(|inst| before_addr.map_or(true, |addr| inst.address < addr))
+        .find(|inst| is_flag_setting_instruction(inst))
 }
 
 fn binop_for_register_update(operation: Operation) -> Option<BinOpKind> {
@@ -924,8 +955,8 @@ pub(super) fn lift_setcc_with_context(inst: &hexray_core::Instruction, block: &B
 
     // Try to parse condition from mnemonic (for CSET, SETcc, etc.)
     if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
-        // Get the comparison expression using the block context
-        let cond_expr = condition_to_expr_with_block(cond, block);
+        // SETcc reads the flags as they existed at this instruction, not after later ALU ops.
+        let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
         // Assign the boolean result to the destination
         Expr::assign(dest, cond_expr)
     } else {
@@ -956,8 +987,7 @@ pub(super) fn lift_cmovcc_with_context(
 
     // Try to parse condition from mnemonic
     if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
-        // Get the comparison expression
-        let cond_expr = condition_to_expr_with_block(cond, block);
+        let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
         // Emit as conditional: dest = (cond) ? src : dest
         Expr::assign(
             dest.clone(),
@@ -1099,6 +1129,70 @@ mod tests {
         assert!(
             rendered.contains("ret_0"),
             "expected TEST on al to resolve through call return temp, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_can_fall_back_to_predecessor_compare() {
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+
+        let mut pred = BasicBlock::new(BasicBlockId::new(0), 0x4000);
+        pred.instructions.push(
+            Instruction::new(0x4000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(edi), Operand::imm_unsigned(100, 32)]),
+        );
+
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x4003);
+        block.instructions.push(
+            Instruction::new(0x4003, 2, vec![], "jg")
+                .with_operation(Operation::ConditionalJump)
+                .with_operands(vec![Operand::pc_rel(0x4005, 0x4010)]),
+        );
+
+        let expr =
+            condition_to_expr_with_block_and_fallback(Condition::Greater, &block, Some(&pred));
+        let rendered = format!("{expr}");
+        assert!(
+            rendered.contains("rdi >") || rendered.contains("edi >"),
+            "expected predecessor compare operands to be recovered, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("signed_gt"),
+            "expected real comparison instead of placeholder, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_lift_setcc_uses_flags_before_later_alu_updates() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x5000);
+        block.instructions.push(
+            Instruction::new(0x5000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(esi), Operand::imm_unsigned(1, 32)]),
+        );
+        let setne = Instruction::new(0x5003, 3, vec![], "setne")
+            .with_operation(Operation::SetConditional)
+            .with_operands(vec![Operand::Register(al)]);
+        block.instructions.push(setne.clone());
+        block.instructions.push(
+            Instruction::new(0x5006, 3, vec![], "add")
+                .with_operation(Operation::Add)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(2, 32)]),
+        );
+
+        let rendered = format!("{}", lift_setcc_with_context(&setne, &block));
+        assert!(
+            rendered.contains("!= 1"),
+            "expected SETcc to use the preceding CMP operands, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("+ 2"),
+            "expected SETcc lowering to ignore later flag clobbers, got {rendered}"
         );
     }
 }
