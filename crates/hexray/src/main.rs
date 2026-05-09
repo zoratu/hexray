@@ -16,6 +16,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use hexray_analysis::cfg_builder::resolve_computed_dispatch_targets;
 use hexray_analysis::{
     add_exception_section_xrefs, is_noreturn_function_name, is_ubsan_handler_function_name,
     AnalysisProject, BinaryDataContext, BinaryDiff, CallGraph, CallGraphBuilder,
@@ -2427,7 +2428,8 @@ fn disassemble_cfg(
         }
     };
     // Build CFG
-    let cfg = CfgBuilder::build(&instructions, start_addr);
+    let binary_data_ctx = build_binary_data_context(fmt);
+    let cfg = CfgBuilder::build_with_binary_context(&instructions, start_addr, &binary_data_ctx);
 
     if html {
         // Output in interactive HTML format
@@ -2475,8 +2477,11 @@ fn disassemble_for_cfg<D: Disassembler>(
     start_addr: u64,
     stop_after_first_return: bool,
 ) -> Vec<hexray_core::Instruction> {
+    let binary_data_ctx = build_binary_data_context(fmt);
+    let scan_limit = start_addr.saturating_add(bytes.len() as u64);
     let mut instructions = Vec::new();
     let mut offset = 0;
+    let mut min_scan_end = start_addr;
 
     while offset < bytes.len() && instructions.len() < 500 {
         let remaining = &bytes[offset..];
@@ -2507,9 +2512,33 @@ fn disassemble_for_cfg<D: Disassembler>(
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
+                let branch_index = instructions.len() - 1;
+                if !binary_data_ctx.is_empty() {
+                    let targets = resolve_computed_dispatch_targets(
+                        &instructions,
+                        branch_index,
+                        &binary_data_ctx,
+                        start_addr,
+                        scan_limit,
+                    );
+                    if !targets.is_empty() {
+                        if let hexray_core::ControlFlow::IndirectBranch { possible_targets } =
+                            &mut instructions[branch_index].control_flow
+                        {
+                            *possible_targets = targets.clone();
+                        }
+                        if let Some(max_target) = targets.into_iter().max() {
+                            min_scan_end = min_scan_end.max(max_target);
+                        }
+                    }
+                }
+
                 // If we only have a fallback byte window (unknown function size),
                 // stop at the first return/noreturn call to avoid spilling into neighbors.
-                if stop_after_first_return && (is_ret || is_noreturn_call || is_heuristic_tail_jump)
+                let must_keep_scanning = next_addr < min_scan_end;
+                if stop_after_first_return
+                    && !must_keep_scanning
+                    && (is_ret || is_noreturn_call || is_heuristic_tail_jump)
                 {
                     break;
                 }
@@ -2668,7 +2697,8 @@ fn decompile_function(
     rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
     // Build CFG
-    let cfg = CfgBuilder::build(&instructions, start_addr);
+    let binary_data_ctx = build_binary_data_context(fmt);
+    let cfg = CfgBuilder::build_with_binary_context(&instructions, start_addr, &binary_data_ctx);
 
     // Build string table from data sections
     let string_table = build_string_table(fmt);
@@ -2683,10 +2713,10 @@ fn decompile_function(
         }
     }
     let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
+    let binary_data_ctx = build_binary_data_context(fmt);
 
     // Build relocation table for kernel modules
-    // Build binary data context for jump table reconstruction
-    let binary_data_ctx = build_binary_data_context(fmt);
+    // Reuse the binary data context for jump table reconstruction.
 
     // Try to load DWARF debug info for function-scoped variable and parameter names.
     let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary_path, binary) {
@@ -5181,6 +5211,7 @@ fn decompile_with_follow(
         }
     }
     let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
+    let binary_data_ctx = build_binary_data_context(fmt);
     let tls_access_targets = build_tls_access_targets(binary);
     let tls_slot_map = build_tls_slot_map(binary);
 
@@ -5256,7 +5287,7 @@ fn decompile_with_follow(
         crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
         // Build CFG
-        let cfg = CfgBuilder::build(&instructions, func_addr);
+        let cfg = CfgBuilder::build_with_binary_context(&instructions, func_addr, &binary_data_ctx);
 
         // Get DWARF variable and parameter names for this function.
         let dwarf_names = if let Some(ref di) = debug_info {
@@ -7216,7 +7247,9 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     return Ok("No instructions decoded".to_string());
                 }
 
-                let cfg = CfgBuilder::build(&instructions, addr);
+                let binary_data_ctx = build_binary_data_context(fmt);
+                let cfg =
+                    CfgBuilder::build_with_binary_context(&instructions, addr, &binary_data_ctx);
 
                 let mut block_ids: Vec<_> = cfg.block_ids().collect();
                 block_ids.sort_by_key(|id| id.0);
@@ -7483,7 +7516,9 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     return Ok("No instructions decoded".to_string());
                 }
 
-                let cfg = CfgBuilder::build(&instructions, addr);
+                let binary_data_ctx = build_binary_data_context(fmt);
+                let cfg =
+                    CfgBuilder::build_with_binary_context(&instructions, addr, &binary_data_ctx);
 
                 // Build symbol table from session renames
                 let mut symbols = SymbolTable::new();
@@ -9558,6 +9593,106 @@ mod tests {
             instructions[2].control_flow,
             ControlFlow::IndirectBranch { .. }
         ));
+    }
+
+    #[test]
+    fn heuristic_cfg_disassembly_keeps_scanning_through_local_dispatch_table() {
+        let mut table = vec![0u8; 0x30];
+        for (index, value) in [0x4011f0u64, 0x401270, 0x401260, 0x401230, 0x401220]
+            .into_iter()
+            .enumerate()
+        {
+            let start = index * 8;
+            table[start..start + 8].copy_from_slice(&value.to_le_bytes());
+        }
+
+        let binary = TestBinary {
+            sections: vec![
+                TestSection {
+                    name: ".text",
+                    address: 0x4011d0,
+                    data: vec![
+                        0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                        0x48, 0x89, 0xf9, // mov rcx, rdi
+                        0x31, 0xd2, // xor edx, edx
+                        0x85, 0xf6, // test esi, esi
+                        0x74, 0x47, // je 0x401224
+                        0x48, 0x8d, 0x47, 0x04, // lea rax, [rdi + 4]
+                        0x48, 0x63, 0x3f, // movsxd rdi, [rdi]
+                        0xff, 0x24, 0xfd, 0x20, 0x20, 0x40, 0x00, // jmp [rdi*8 + 0x402020]
+                        0x0f, 0x1f, 0x44, 0x00, 0x00, // nopl [rax + rax]
+                        0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                        0x03, 0x10, // add edx, [rax]
+                        0x48, 0x8d, 0x78, 0x04, // lea rdi, [rax + 4]
+                        0x4c, 0x63, 0xc6, // movsxd r8, esi
+                        0x48, 0x29, 0xcf, // sub rdi, rcx
+                        0x48, 0xc1, 0xff, 0x02, // sar rdi, 2
+                        0x4c, 0x39, 0xc7, // cmp rdi, r8
+                        0x7d, 0x1b, // jge 0x401224
+                        0x48, 0x63, 0x78, 0x04, // movsxd rdi, [rax + 4]
+                        0x48, 0x83, 0xc0, 0x08, // add rax, 8
+                        0x48, 0x8b, 0x3c, 0xfd, 0x20, 0x20, 0x40,
+                        0x00, // mov rdi, [rdi*8 + 0x402020]
+                        0xff, 0xe7, // jmp rdi
+                        0x0f, 0x1f, 0x44, 0x00, 0x00, // nopl [rax + rax]
+                        0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                        0x89, 0xd0, // mov eax, edx
+                        0xc3, // ret
+                        0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00,
+                        0x00, // nopw [rax + rax]
+                        0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                        0x48, 0x89, 0xc7, // mov rdi, rax
+                        0x4c, 0x63, 0xc6, // movsxd r8, esi
+                        0xf7, 0xda, // neg edx
+                        0x48, 0x29, 0xcf, // sub rdi, rcx
+                        0x48, 0xc1, 0xff, 0x02, // sar rdi, 2
+                        0x4c, 0x39, 0xc7, // cmp rdi, r8
+                        0x7d, 0xdc, // jge 0x401224
+                        0x48, 0x63, 0x38, // movsxd rdi, [rax]
+                        0x48, 0x83, 0xc0, 0x04, // add rax, 4
+                        0x48, 0x8b, 0x3c, 0xfd, 0x20, 0x20, 0x40,
+                        0x00, // mov rdi, [rdi*8 + 0x402020]
+                        0xff, 0xe7, // jmp rdi
+                        0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, // nopl [rax]
+                        0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                        0x0f, 0xaf, 0x10, // imul edx, [rax]
+                        0xeb, 0x8d, // jmp 0x4011f6
+                        0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, // nopl [rax]
+                        0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                        0x2b, 0x10, // sub edx, [rax]
+                        0xe9, 0x7b, 0xff, 0xff, 0xff, // jmp 0x4011f6
+                    ],
+                    executable: true,
+                    allocated: true,
+                },
+                TestSection {
+                    name: ".rodata",
+                    address: 0x402020,
+                    data: table,
+                    executable: false,
+                    allocated: true,
+                },
+            ],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x4011d0, 0xab).unwrap();
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x4011d0, true);
+
+        assert!(instructions.iter().any(|inst| inst.address == 0x401270));
+        assert!(instructions.iter().any(|inst| inst.address == 0x401276));
+        let first_dispatch = instructions
+            .iter()
+            .find(|inst| inst.address == 0x4011e4)
+            .expect("dispatch branch");
+        match &first_dispatch.control_flow {
+            ControlFlow::IndirectBranch { possible_targets } => {
+                assert_eq!(possible_targets.len(), 5);
+            }
+            other => panic!("expected indirect branch, got {other:?}"),
+        }
     }
 
     #[test]
