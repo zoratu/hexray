@@ -2807,6 +2807,9 @@ fn propagate_args_in_block_with_binary_data(
                                 to_remove.insert(idx);
                             }
                             rewritten_args = recovered_args.0;
+                        } else {
+                            rewritten_args =
+                                synthesize_leading_passthrough_args_from_target(&excluded_arg_regs);
                         }
                     }
                     let rewritten_call = Expr::call(substituted_target, rewritten_args);
@@ -2931,6 +2934,17 @@ fn propagate_args_in_block_with_binary_data(
                     reg_values.clear();
                     call_target_values.clear();
                     continue;
+                }
+                if args.is_empty() {
+                    let passthrough_args =
+                        synthesize_leading_passthrough_args_from_target(&excluded_arg_regs);
+                    if !passthrough_args.is_empty() {
+                        result.push(Expr::call(substituted_target, passthrough_args));
+                        arg_values.clear();
+                        reg_values.clear();
+                        call_target_values.clear();
+                        continue;
+                    }
                 }
 
                 let substituted_args = args.iter().map(|arg| substitute_vars(arg, &reg_values));
@@ -3798,6 +3812,31 @@ fn extract_call_arguments_with_indices(
     }
 
     (result, used_indices)
+}
+
+fn synthesize_leading_passthrough_args_from_target(excluded_regs: &HashSet<String>) -> Vec<Expr> {
+    let Some(family) = infer_argument_abi_family(excluded_regs.iter().map(String::as_str)) else {
+        return Vec::new();
+    };
+    let Some(highest_target_idx) = excluded_regs
+        .iter()
+        .filter_map(|reg| get_arg_register_index(reg))
+        .max()
+    else {
+        return Vec::new();
+    };
+
+    let mut args = Vec::new();
+    for idx in 0..highest_target_idx {
+        let Some(reg_name) = pass_through_arg_register_name(family, idx) else {
+            break;
+        };
+        if excluded_regs.contains(reg_name) {
+            continue;
+        }
+        args.push(pass_through_arg_expr(reg_name));
+    }
+    args
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5872,6 +5911,31 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rdi", "rsi", "0x40"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_synthesizes_passthrough_args_for_indirect_target_reg() {
+        let statements = vec![Expr::call(
+            CallTarget::Indirect(Box::new(Expr::array_access(reg("rdx", 8), Expr::int(3), 8))),
+            vec![],
+        )];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing indirect call after propagation");
+        };
+
+        match target {
+            CallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "rdx[3]"),
+            other => panic!("expected indirect target to stay in rdx, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rdi", "rsi"]
         );
     }
 
