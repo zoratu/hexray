@@ -1149,8 +1149,13 @@ impl<'a> Structurer<'a> {
         }
 
         let live_in_regs = self.block_live_in_registers(normal_target)?;
+        // Architectures whose disassemblers don't populate inst.reads /
+        // inst.writes (notably x86_64) leave live_in_regs empty even when
+        // there is a real continuation user value. Falling back to keeping
+        // every prior instruction is safer than dropping the user
+        // computation along with the helper-arg setup.
         if live_in_regs.is_empty() {
-            return None;
+            return block.instructions.len().checked_sub(1);
         }
 
         block
@@ -1164,6 +1169,7 @@ impl<'a> Structurer<'a> {
                     .any(|reg| live_in_regs.contains(&reg))
             })
             .map(|(idx, _)| idx)
+            .or_else(|| block.instructions.len().checked_sub(1))
     }
 
     fn block_live_in_registers(&self, block_id: BasicBlockId) -> Option<HashSet<String>> {
@@ -5884,6 +5890,60 @@ mod tests {
         assert_eq!(
             structurer.asan_probe_setup_end_index(&probe, BasicBlockId::new(1)),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn test_recoverable_ubsan_setup_end_index_falls_back_when_no_arch_liveness() {
+        // x86_64 disassembler doesn't populate inst.reads/inst.writes, so
+        // block_live_in_registers returns an empty set even when the
+        // continuation has live values. Falling back to keeping every
+        // pre-terminator instruction is required so user computation
+        // (e.g. ebx = a + b) survives UBSan trimming.
+        use hexray_core::{Architecture, Operand, Register, RegisterClass};
+
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+        let ebx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut probe = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        // sub rsp, 0x18 sets the explicit guard predicate but the disasm
+        // here intentionally omits inst.reads/writes to mimic the x86_64
+        // case.
+        probe.instructions.push(
+            Instruction::new(0x1000, 4, vec![], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![Operand::Register(rsp), Operand::imm(0x18, 8)]),
+        );
+        probe.instructions.push(
+            Instruction::new(0x1004, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(ebx), Operand::Register(edi)]),
+        );
+        probe.instructions.push(
+            Instruction::new(0x1007, 2, vec![], "add")
+                .with_operation(Operation::Add)
+                .with_operands(vec![Operand::Register(ebx), Operand::Register(esi)]),
+        );
+        cfg.add_block(probe.clone());
+
+        let mut normal = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        normal.instructions.push(
+            Instruction::new(0x1010, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(ebx)]),
+        );
+        cfg.add_block(normal);
+
+        let structurer = Structurer::new(&cfg);
+        // Without the fallback this would return None and block_to_statements
+        // would drop every prior instruction, including ebx = ebx + esi.
+        assert_eq!(
+            structurer.recoverable_ubsan_setup_end_index(&probe, BasicBlockId::new(1)),
+            Some(2)
         );
     }
 
