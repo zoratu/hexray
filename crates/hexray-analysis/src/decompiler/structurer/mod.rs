@@ -10,6 +10,8 @@ use hexray_core::{
 };
 use std::collections::{HashMap, HashSet};
 
+use crate::dataflow::infer_cfg_arch;
+
 use super::abi;
 use super::expression::{
     resolve_adrp_patterns, BinOpKind, CallTarget as ExprCallTarget, Expr, ExprKind, UnaryOpKind,
@@ -45,8 +47,8 @@ use gotos::{
 use simplify::capture_return_register_uses_in_block;
 use simplify::{
     extract_return_value, merge_return_value_captures, propagate_args_in_block,
-    propagate_call_args, simplify_statements, statement_contains_real_call,
-    substitute_return_register_uses,
+    propagate_call_args_with_binary_data_and_arch, simplify_statements,
+    statement_contains_real_call, substitute_return_register_uses,
 };
 use switch::{detect_switch_statements, simplify_strcmp_switch_patterns};
 #[cfg(test)]
@@ -421,7 +423,11 @@ impl StructuredCfg {
 
         // Post-process to propagate arguments into function calls (before copy propagation)
         if config.is_pass_enabled(OptimizationPass::CallArgPropagation) {
-            body = propagate_call_args(body);
+            body = propagate_call_args_with_binary_data_and_arch(
+                body,
+                structurer.binary_data,
+                infer_cfg_arch(cfg),
+            );
         }
 
         // Post-process to merge return value captures across block boundaries

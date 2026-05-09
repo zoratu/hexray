@@ -2368,7 +2368,7 @@ impl PseudoCodeEmitter {
 
     fn arg_register_display_name(&self, name: &str) -> Option<String> {
         let lower = name.to_lowercase();
-        let idx = self
+        if let Some(idx) = self
             .calling_convention
             .integer_arg_registers()
             .iter()
@@ -2379,17 +2379,19 @@ impl PseudoCodeEmitter {
                     .iter()
                     .position(|reg| reg.eq_ignore_ascii_case(&lower))
             })
-            .or_else(|| {
-                self.calling_convention
-                    .float_arg_registers()
-                    .iter()
-                    .position(|reg| reg.eq_ignore_ascii_case(&lower))
-            })?;
+        {
+            return Some(match self.calling_convention {
+                CallingConvention::RiscV => format!("a{}", idx),
+                _ => format!("arg{}", idx),
+            });
+        }
 
-        Some(match self.calling_convention {
-            CallingConvention::RiscV => format!("a{}", idx),
-            _ => format!("arg{}", idx),
-        })
+        let idx = self
+            .calling_convention
+            .float_arg_registers()
+            .iter()
+            .position(|reg| reg.eq_ignore_ascii_case(&lower))?;
+        Some(format!("farg{}", idx))
     }
 
     fn resolve_display_identifier_name(&self, name: &str) -> String {
@@ -10155,5 +10157,16 @@ mod tests {
             !output.contains("err") && !output.contains("result") && !output.contains("ret ="),
             "did not expect semantic pseudo-locals in snapshot helper, got:\n{output}"
         );
+    }
+
+    #[test]
+    fn test_format_expr_uses_float_argument_names_for_xmm_registers() {
+        use super::super::expression::Variable;
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_calling_convention(CallingConvention::SystemV);
+        let expr = Expr::var(Variable::reg("xmm0", 16));
+
+        assert_eq!(emitter.format_expr(&expr), "farg0");
     }
 }

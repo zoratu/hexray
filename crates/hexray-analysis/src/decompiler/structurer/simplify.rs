@@ -35,12 +35,15 @@
 
 use std::collections::{HashMap, HashSet};
 
+use hexray_core::Architecture;
+
 use super::super::abi::{
     get_arg_register_index, is_argument_register, is_callee_saved_or_renamed, is_return_register,
     is_temp_register,
 };
 use super::super::dead_store::collect_all_uses;
 use super::super::expression::{BinOpKind, Expr, Variable};
+use super::super::BinaryDataContext;
 use super::{CatchHandler, StructuredNode};
 
 /// Extracts the return value from a return register assignment near the end of the block.
@@ -2406,17 +2409,45 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
 
 /// Recursively propagates function call arguments through structured nodes.
 pub(super) fn propagate_call_args(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
-    nodes.into_iter().map(propagate_call_args_node).collect()
+    propagate_call_args_with_binary_data_and_arch(nodes, None, None)
+}
+
+pub(super) fn propagate_call_args_with_binary_data(
+    nodes: Vec<StructuredNode>,
+    binary_data: Option<&BinaryDataContext>,
+) -> Vec<StructuredNode> {
+    propagate_call_args_with_binary_data_and_arch(nodes, binary_data, None)
+}
+
+pub(super) fn propagate_call_args_with_binary_data_and_arch(
+    nodes: Vec<StructuredNode>,
+    binary_data: Option<&BinaryDataContext>,
+    arch: Option<Architecture>,
+) -> Vec<StructuredNode> {
+    let preferred_family = arch.and_then(argument_abi_family_from_arch);
+    nodes
+        .into_iter()
+        .map(|node| propagate_call_args_node_with_binary_data(node, binary_data, preferred_family))
+        .collect()
 }
 
 pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
+    propagate_call_args_node_with_binary_data(node, None, None)
+}
+
+fn propagate_call_args_node_with_binary_data(
+    node: StructuredNode,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> StructuredNode {
     match node {
         StructuredNode::Block {
             id,
             statements,
             address_range,
         } => {
-            let statements = propagate_args_in_block(statements);
+            let statements =
+                propagate_args_in_block_with_binary_data(statements, binary_data, preferred_family);
             StructuredNode::Block {
                 id,
                 statements,
@@ -2429,8 +2460,9 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             else_body,
         } => StructuredNode::If {
             condition,
-            then_body: propagate_call_args(then_body),
-            else_body: else_body.map(propagate_call_args),
+            then_body: propagate_call_args_node_sequence(then_body, binary_data, preferred_family),
+            else_body: else_body
+                .map(|body| propagate_call_args_node_sequence(body, binary_data, preferred_family)),
         },
         StructuredNode::While {
             condition,
@@ -2439,7 +2471,7 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             exit_block,
         } => StructuredNode::While {
             condition,
-            body: propagate_call_args(body),
+            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
             header,
             exit_block,
         },
@@ -2449,7 +2481,7 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::DoWhile {
-            body: propagate_call_args(body),
+            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
             condition,
             header,
             exit_block,
@@ -2465,7 +2497,7 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             init,
             condition,
             update,
-            body: propagate_call_args(body),
+            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
             header,
             exit_block,
         },
@@ -2474,7 +2506,7 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::Loop {
-            body: propagate_call_args(body),
+            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
             header,
             exit_block,
         },
@@ -2486,13 +2518,32 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
             value,
             cases: cases
                 .into_iter()
-                .map(|(vals, body)| (vals, propagate_call_args(body)))
+                .map(|(vals, body)| {
+                    (
+                        vals,
+                        propagate_call_args_node_sequence(body, binary_data, preferred_family),
+                    )
+                })
                 .collect(),
-            default: default.map(propagate_call_args),
+            default: default
+                .map(|body| propagate_call_args_node_sequence(body, binary_data, preferred_family)),
         },
-        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(propagate_call_args(nodes)),
+        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
+            propagate_call_args_node_sequence(nodes, binary_data, preferred_family),
+        ),
         other => other,
     }
+}
+
+fn propagate_call_args_node_sequence(
+    nodes: Vec<StructuredNode>,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .map(|node| propagate_call_args_node_with_binary_data(node, binary_data, preferred_family))
+        .collect()
 }
 
 /// Propagates arguments into function calls within a block.
@@ -2502,6 +2553,14 @@ pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
 /// Into:
 ///   func(5);
 pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
+    propagate_args_in_block_with_binary_data(statements, None, None)
+}
+
+fn propagate_args_in_block_with_binary_data(
+    statements: Vec<Expr>,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> Vec<Expr> {
     use super::super::expression::ExprKind;
 
     // Track argument register values and their statement indices
@@ -2530,7 +2589,7 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
                     }
                 }
 
-                if get_arg_register_index(&v.name).is_some() {
+                if is_tracked_call_arg_register(&v.name) {
                     for alias in &written_aliases {
                         reg_values.insert(alias.clone(), tracked_rhs.clone());
                         call_target_values.insert(alias.clone(), tracked_rhs.clone());
@@ -2551,6 +2610,36 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
                     arg_values.insert(v.name.to_lowercase(), (i, tracked_rhs.clone()));
                     result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
+                }
+            }
+
+            if let ExprKind::Call { target, args } = &rhs.kind {
+                let substituted_target =
+                    substitute_call_target(target.clone(), &call_target_values);
+                if is_real_function_call(target) {
+                    let excluded_arg_regs = collect_target_argument_registers(target);
+                    if let Some((recovered_args, used_stmt_indices)) =
+                        try_recover_format_call_arguments(
+                            target,
+                            args,
+                            &arg_values,
+                            &excluded_arg_regs,
+                            binary_data,
+                            preferred_family,
+                        )
+                    {
+                        for idx in used_stmt_indices {
+                            to_remove.insert(idx);
+                        }
+                        result.push(Expr::assign(
+                            substituted_lhs,
+                            Expr::call(substituted_target, recovered_args),
+                        ));
+                        arg_values.clear();
+                        reg_values.clear();
+                        call_target_values.clear();
+                        continue;
+                    }
                 }
             }
 
@@ -2581,7 +2670,7 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
                         call_target_values.insert(alias.clone(), new_val.clone());
                     }
                 }
-                if get_arg_register_index(&v.name).is_some() {
+                if is_tracked_call_arg_register(&v.name) {
                     for alias in &written_aliases {
                         reg_values.remove(alias);
                     }
@@ -2606,6 +2695,23 @@ pub(super) fn propagate_args_in_block(statements: Vec<Expr>) -> Vec<Expr> {
             let substituted_target = substitute_call_target(target.clone(), &call_target_values);
             if is_real_function_call(target) {
                 let excluded_arg_regs = collect_target_argument_registers(target);
+                if let Some((recovered_args, used_stmt_indices)) = try_recover_format_call_arguments(
+                    target,
+                    args,
+                    &arg_values,
+                    &excluded_arg_regs,
+                    binary_data,
+                    preferred_family,
+                ) {
+                    for idx in used_stmt_indices {
+                        to_remove.insert(idx);
+                    }
+                    result.push(Expr::call(substituted_target, recovered_args));
+                    arg_values.clear();
+                    reg_values.clear();
+                    call_target_values.clear();
+                    continue;
+                }
                 // Try to extract arguments from tracked registers
                 let new_args = extract_call_arguments_with_indices(&arg_values, &excluded_arg_regs);
                 if args.is_empty() && !new_args.0.is_empty() {
@@ -2762,7 +2868,7 @@ fn forget_pending_arg_values_from_expr(
     fn walk(expr: &Expr, consumed: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Var(v) => {
-                if get_arg_register_index(&v.name).is_some() {
+                if is_tracked_call_arg_register(&v.name) {
                     consumed.insert(v.name.to_lowercase());
                 }
             }
@@ -2841,7 +2947,7 @@ fn collect_target_argument_registers(
 
         match &expr.kind {
             ExprKind::Var(v) => {
-                if get_arg_register_index(&v.name).is_some() {
+                if is_tracked_call_arg_register(&v.name) {
                     out.insert(v.name.to_lowercase());
                 }
             }
@@ -3033,6 +3139,12 @@ fn extract_call_arguments_with_indices(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatArgClass {
+    Integer,
+    Float,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArgumentAbiFamily {
     X86_64SysV,
     Aarch64,
@@ -3044,7 +3156,9 @@ fn infer_argument_abi_family<'a>(
 ) -> Option<ArgumentAbiFamily> {
     for name in names {
         let lower = name.to_lowercase();
-        if get_arg_register_index(&lower).is_none() {
+        if get_arg_register_index(&lower).is_none()
+            && get_float_arg_register_index(&lower).is_none()
+        {
             continue;
         }
         if matches!(
@@ -3061,10 +3175,24 @@ fn infer_argument_abi_family<'a>(
                 | "r8d"
                 | "r9"
                 | "r9d"
+                | "xmm0"
+                | "xmm1"
+                | "xmm2"
+                | "xmm3"
+                | "xmm4"
+                | "xmm5"
+                | "xmm6"
+                | "xmm7"
         ) {
             return Some(ArgumentAbiFamily::X86_64SysV);
         }
-        if lower.starts_with('x') || lower.starts_with('w') {
+        if lower.starts_with('x')
+            || lower.starts_with('w')
+            || matches!(
+                lower.as_str(),
+                "d0" | "d1" | "d2" | "d3" | "d4" | "d5" | "d6" | "d7"
+            )
+        {
             return Some(ArgumentAbiFamily::Aarch64);
         }
         if lower.starts_with('a') {
@@ -3073,6 +3201,15 @@ fn infer_argument_abi_family<'a>(
     }
 
     None
+}
+
+fn argument_abi_family_from_arch(arch: Architecture) -> Option<ArgumentAbiFamily> {
+    match arch {
+        Architecture::X86_64 => Some(ArgumentAbiFamily::X86_64SysV),
+        Architecture::Arm64 => Some(ArgumentAbiFamily::Aarch64),
+        Architecture::RiscV64 => Some(ArgumentAbiFamily::RiscV),
+        _ => None,
+    }
 }
 
 fn pass_through_arg_register_name(family: ArgumentAbiFamily, index: usize) -> Option<&'static str> {
@@ -3091,6 +3228,420 @@ fn pass_through_arg_register_name(family: ArgumentAbiFamily, index: usize) -> Op
 
 fn pass_through_arg_expr(reg_name: &str) -> Expr {
     Expr::var(super::super::expression::Variable::reg(reg_name, 8))
+}
+
+fn pass_through_float_arg_register_name(
+    family: ArgumentAbiFamily,
+    index: usize,
+) -> Option<&'static str> {
+    match family {
+        ArgumentAbiFamily::X86_64SysV => [
+            "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+        ]
+        .get(index)
+        .copied(),
+        ArgumentAbiFamily::Aarch64 => ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"]
+            .get(index)
+            .copied(),
+        ArgumentAbiFamily::RiscV => None,
+    }
+}
+
+fn pass_through_float_arg_expr(reg_name: &str) -> Expr {
+    let size = if reg_name.starts_with("xmm") { 16 } else { 8 };
+    Expr::var(super::super::expression::Variable::reg(reg_name, size))
+}
+
+fn is_tracked_call_arg_register(name: &str) -> bool {
+    get_arg_register_index(name).is_some() || get_float_arg_register_index(name).is_some()
+}
+
+fn get_float_arg_register_index(name: &str) -> Option<usize> {
+    match name.to_lowercase().as_str() {
+        "xmm0" | "d0" => Some(0),
+        "xmm1" | "d1" => Some(1),
+        "xmm2" | "d2" => Some(2),
+        "xmm3" | "d3" => Some(3),
+        "xmm4" | "d4" => Some(4),
+        "xmm5" | "d5" => Some(5),
+        "xmm6" | "d6" => Some(6),
+        "xmm7" | "d7" => Some(7),
+        _ => None,
+    }
+}
+
+fn try_recover_format_call_arguments(
+    target: &super::super::expression::CallTarget,
+    args: &[Expr],
+    arg_values: &HashMap<String, (usize, Expr)>,
+    excluded_regs: &HashSet<String>,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> Option<(Vec<Expr>, Vec<usize>)> {
+    let target_name = match target {
+        super::super::expression::CallTarget::Named(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let spec = detect_format_call(target_name, args, binary_data)?;
+    if args.len() < spec.fixed_arg_count
+        || args.len() > spec.fixed_arg_count + spec.arg_classes.len()
+    {
+        return None;
+    }
+
+    let family =
+        infer_argument_abi_family(arg_values.keys().map(String::as_str)).or(preferred_family)?;
+    let mut recovered_args = args[..spec.fixed_arg_count].to_vec();
+    let existing_variadic_args = &args[spec.fixed_arg_count..];
+    let mut existing_variadic_index = 0usize;
+    let mut used_stmt_indices = Vec::new();
+    let mut int_slot = spec.fixed_arg_count;
+    let mut float_slot = 0usize;
+
+    for class in spec.arg_classes {
+        match class {
+            FormatArgClass::Integer => {
+                if let Some((stmt_idx, value)) = lookup_slot_value_or_passthrough(
+                    arg_values,
+                    existing_variadic_args,
+                    &mut existing_variadic_index,
+                    family,
+                    int_slot,
+                    excluded_regs,
+                ) {
+                    used_stmt_indices.push(stmt_idx);
+                    recovered_args.push(value);
+                } else if let Some(value) = reuse_existing_integer_variadic_arg(
+                    existing_variadic_args,
+                    &mut existing_variadic_index,
+                ) {
+                    recovered_args.push(value);
+                } else {
+                    let reg_name = pass_through_arg_register_name(family, int_slot)?;
+                    if excluded_regs.contains(reg_name) {
+                        return None;
+                    }
+                    recovered_args.push(pass_through_arg_expr(reg_name));
+                }
+                int_slot += 1;
+            }
+            FormatArgClass::Float => {
+                if let Some((stmt_idx, value)) = lookup_float_slot_value_or_passthrough(
+                    arg_values,
+                    existing_variadic_args,
+                    &mut existing_variadic_index,
+                    family,
+                    float_slot,
+                    excluded_regs,
+                ) {
+                    used_stmt_indices.push(stmt_idx);
+                    recovered_args.push(value);
+                } else if let Some(value) = reuse_existing_float_variadic_arg(
+                    existing_variadic_args,
+                    &mut existing_variadic_index,
+                ) {
+                    recovered_args.push(value);
+                } else {
+                    let reg_name = pass_through_float_arg_register_name(family, float_slot)?;
+                    if excluded_regs.contains(reg_name) {
+                        return None;
+                    }
+                    recovered_args.push(pass_through_float_arg_expr(reg_name));
+                }
+                float_slot += 1;
+            }
+        }
+    }
+
+    Some((recovered_args, used_stmt_indices))
+}
+
+fn lookup_slot_value_or_passthrough(
+    arg_values: &HashMap<String, (usize, Expr)>,
+    existing_variadic_args: &[Expr],
+    existing_variadic_index: &mut usize,
+    family: ArgumentAbiFamily,
+    int_slot: usize,
+    excluded_regs: &HashSet<String>,
+) -> Option<(usize, Expr)> {
+    let reg_name = pass_through_arg_register_name(family, int_slot)?;
+    if excluded_regs.contains(reg_name) {
+        return None;
+    }
+    if let Some((stmt_idx, value)) = lookup_tracked_register_value(arg_values, reg_name) {
+        return Some((stmt_idx, value));
+    }
+
+    if existing_variadic_args
+        .get(*existing_variadic_index)
+        .is_some_and(expr_looks_float_like)
+    {
+        return None;
+    }
+
+    None
+}
+
+fn lookup_float_slot_value_or_passthrough(
+    arg_values: &HashMap<String, (usize, Expr)>,
+    existing_variadic_args: &[Expr],
+    existing_variadic_index: &mut usize,
+    family: ArgumentAbiFamily,
+    float_slot: usize,
+    excluded_regs: &HashSet<String>,
+) -> Option<(usize, Expr)> {
+    let reg_name = pass_through_float_arg_register_name(family, float_slot)?;
+    if excluded_regs.contains(reg_name) {
+        return None;
+    }
+    if let Some((stmt_idx, value)) = lookup_tracked_register_value(arg_values, reg_name) {
+        return Some((stmt_idx, value));
+    }
+
+    if existing_variadic_args
+        .get(*existing_variadic_index)
+        .is_some_and(expr_looks_float_like)
+    {
+        return None;
+    }
+
+    None
+}
+
+fn reuse_existing_integer_variadic_arg(
+    existing_variadic_args: &[Expr],
+    existing_variadic_index: &mut usize,
+) -> Option<Expr> {
+    let candidate = existing_variadic_args.get(*existing_variadic_index)?;
+    if expr_looks_float_like(candidate) {
+        return None;
+    }
+    *existing_variadic_index += 1;
+    Some(candidate.clone())
+}
+
+fn reuse_existing_float_variadic_arg(
+    existing_variadic_args: &[Expr],
+    existing_variadic_index: &mut usize,
+) -> Option<Expr> {
+    let candidate = existing_variadic_args.get(*existing_variadic_index)?;
+    if !expr_looks_float_like(candidate) {
+        return None;
+    }
+    *existing_variadic_index += 1;
+    Some(candidate.clone())
+}
+
+fn expr_looks_float_like(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(var) => {
+            let lower = var.name.to_lowercase();
+            lower.starts_with("xmm") || lower.starts_with('d') || lower.starts_with("farg")
+        }
+        ExprKind::Unknown(name) => {
+            let lower = name.to_lowercase();
+            lower.starts_with("farg") || lower.starts_with("xmm")
+        }
+        ExprKind::Cast { expr, .. } => expr_looks_float_like(expr),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FormatCallRecovery {
+    fixed_arg_count: usize,
+    arg_classes: Vec<FormatArgClass>,
+}
+
+fn detect_format_call(
+    target_name: Option<&str>,
+    args: &[Expr],
+    binary_data: Option<&BinaryDataContext>,
+) -> Option<FormatCallRecovery> {
+    let named_fixed_arg_count = target_name.and_then(|name| {
+        let normalized = name
+            .split_once('@')
+            .map_or(name, |(base, _)| base)
+            .trim_start_matches('_');
+        match normalized {
+            "printf" => Some(1),
+            "fprintf" | "dprintf" | "syslog" => Some(2),
+            "sprintf" | "asprintf" => Some(2),
+            "snprintf" => Some(3),
+            "printf_chk" => Some(2),
+            "fprintf_chk" | "dprintf_chk" => Some(3),
+            "sprintf_chk" | "asprintf_chk" => Some(4),
+            "snprintf_chk" => Some(5),
+            _ => None,
+        }
+    });
+
+    let candidate_counts: Vec<usize> = if let Some(count) = named_fixed_arg_count {
+        vec![count]
+    } else {
+        (1..=args.len().min(5)).collect()
+    };
+
+    for fixed_arg_count in candidate_counts {
+        if !is_plausible_format_call_prefix(args, fixed_arg_count) {
+            continue;
+        }
+        let Some(format_arg) = args.get(fixed_arg_count.saturating_sub(1)) else {
+            continue;
+        };
+        let Some(format) = resolve_string_literal(format_arg, binary_data) else {
+            continue;
+        };
+        let arg_classes = parse_printf_format_arg_classes(&format);
+        if arg_classes.is_empty() {
+            continue;
+        }
+
+        return Some(FormatCallRecovery {
+            fixed_arg_count,
+            arg_classes,
+        });
+    }
+
+    None
+}
+
+fn is_plausible_format_call_prefix(args: &[Expr], fixed_arg_count: usize) -> bool {
+    use super::super::expression::ExprKind;
+
+    if args.len() < fixed_arg_count {
+        return false;
+    }
+
+    match fixed_arg_count {
+        1 => true,
+        2 => matches!(
+            args.first().map(|expr| &expr.kind),
+            Some(ExprKind::IntLit(_))
+        ),
+        3 | 4 => matches!(
+            args.get(1).map(|expr| &expr.kind),
+            Some(ExprKind::IntLit(_))
+        ),
+        5 => matches!(
+            args.get(2).map(|expr| &expr.kind),
+            Some(ExprKind::IntLit(_))
+        ),
+        _ => false,
+    }
+}
+
+fn lookup_tracked_register_value(
+    arg_values: &HashMap<String, (usize, Expr)>,
+    reg_name: &str,
+) -> Option<(usize, Expr)> {
+    for alias in get_register_aliases(reg_name) {
+        if let Some((stmt_idx, value)) = arg_values.get(&alias) {
+            return Some((*stmt_idx, value.clone()));
+        }
+    }
+    None
+}
+
+fn resolve_string_literal(expr: &Expr, binary_data: Option<&BinaryDataContext>) -> Option<String> {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::IntLit(value) if *value >= 0 && *value <= i128::from(u64::MAX) => {
+            read_c_string(binary_data?, *value as u64)
+        }
+        ExprKind::GotRef { address, .. } => read_c_string(binary_data?, *address),
+        ExprKind::Unknown(text)
+            if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 =>
+        {
+            Some(text[1..text.len() - 1].to_string())
+        }
+        _ => None,
+    }
+}
+
+fn read_c_string(binary_data: &BinaryDataContext, address: u64) -> Option<String> {
+    let (section, base) = binary_data.section_containing(address)?;
+    let start = usize::try_from(address.checked_sub(base)?).ok()?;
+    let suffix = section.get(start..)?;
+    let end = suffix.iter().position(|byte| *byte == 0)?;
+    std::str::from_utf8(&suffix[..end]).ok().map(str::to_string)
+}
+
+fn parse_printf_format_arg_classes(format: &str) -> Vec<FormatArgClass> {
+    let bytes = format.as_bytes();
+    let mut i = 0usize;
+    let mut classes = Vec::new();
+
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'%' {
+            i += 1;
+            continue;
+        }
+
+        while i < bytes.len() && matches!(bytes[i], b'#' | b'0' | b'-' | b' ' | b'+' | b'\'') {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'*' {
+            classes.push(FormatArgClass::Integer);
+            i += 1;
+        } else {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'*' {
+                classes.push(FormatArgClass::Integer);
+                i += 1;
+            } else {
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+        }
+
+        let mut long_double = false;
+        if i + 1 < bytes.len() && (&bytes[i..i + 2] == b"hh" || &bytes[i..i + 2] == b"ll") {
+            i += 2;
+        } else if i < bytes.len() {
+            match bytes[i] {
+                b'h' | b'l' | b'j' | b'z' | b't' => i += 1,
+                b'L' => {
+                    long_double = true;
+                    i += 1;
+                }
+                _ => {}
+            }
+        }
+
+        if i >= bytes.len() {
+            break;
+        }
+        match bytes[i] as char {
+            'd' | 'i' | 'u' | 'o' | 'x' | 'X' | 'c' | 's' | 'p' | 'n' => {
+                classes.push(FormatArgClass::Integer);
+            }
+            'a' | 'A' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' if !long_double => {
+                classes.push(FormatArgClass::Float);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    classes
 }
 
 /// Merges return value captures across basic block boundaries.
@@ -4297,6 +4848,7 @@ pub(super) fn substitute_return_register_uses(
 mod tests {
     use super::*;
     use crate::decompiler::expression::{BinOpKind, CallTarget, ExprKind, Variable};
+    use crate::decompiler::BinaryDataContext;
     use hexray_core::BasicBlockId;
 
     fn reg(name: &str, size: u8) -> Expr {
@@ -4317,6 +4869,14 @@ mod tests {
             name: "ret".to_string(),
             size,
         })
+    }
+
+    fn binary_data_with_string(address: u64, text: &str) -> BinaryDataContext {
+        let mut ctx = BinaryDataContext::new();
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        ctx.add_section(address, bytes);
+        ctx
     }
 
     #[test]
@@ -4567,6 +5127,207 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rax"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_missing_printf_chk_variadic_float_and_trailing_gpr() {
+        let format_addr = 0x5000;
+        let binary_data = binary_data_with_string(format_addr, "x=%d y=%.2f s=%s\n");
+        let statements = vec![
+            Expr::assign(reg("edx", 4), Expr::unknown("x")),
+            Expr::assign(reg("rcx", 8), Expr::unknown("s")),
+            Expr::call(
+                CallTarget::Named("__printf_chk".to_string()),
+                vec![Expr::int(1), Expr::int(format_addr as i128)],
+            ),
+        ];
+
+        let propagated =
+            propagate_args_in_block_with_binary_data(statements, Some(&binary_data), None);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["1", "0x5000", "x", "xmm0", "s"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_rebuilds_partial_printf_chk_variadic_suffix() {
+        let format_addr = 0x5100;
+        let binary_data = binary_data_with_string(format_addr, "x=%d y=%.2f s=%s\n");
+        let statements = vec![
+            Expr::assign(reg("ecx", 4), Expr::unknown("s")),
+            Expr::assign(reg("edx", 4), Expr::unknown("x")),
+            Expr::call(
+                CallTarget::Named("__printf_chk".to_string()),
+                vec![
+                    Expr::int(1),
+                    Expr::int(format_addr as i128),
+                    Expr::unknown("stale_x"),
+                    Expr::unknown("stale_s"),
+                ],
+            ),
+        ];
+
+        let propagated =
+            propagate_args_in_block_with_binary_data(statements, Some(&binary_data), None);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["1", "0x5100", "x", "xmm0", "s"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_rebuilds_partial_printf_chk_suffix_for_direct_imports() {
+        let format_addr = 0x5200;
+        let binary_data = binary_data_with_string(format_addr, "x=%d y=%.2f s=%s\n");
+        let statements = vec![
+            Expr::assign(reg("ecx", 4), Expr::unknown("s")),
+            Expr::assign(reg("edx", 4), Expr::unknown("x")),
+            Expr::call(
+                CallTarget::Direct {
+                    target: 0x4010a0,
+                    call_site: 0x401108,
+                },
+                vec![
+                    Expr::int(1),
+                    Expr::int(format_addr as i128),
+                    Expr::unknown("stale_x"),
+                    Expr::unknown("stale_s"),
+                ],
+            ),
+        ];
+
+        let propagated =
+            propagate_args_in_block_with_binary_data(statements, Some(&binary_data), None);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["1", "0x5200", "x", "xmm0", "s"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_inserts_missing_float_for_direct_import_without_tracked_gprs() {
+        let format_addr = 0x5300;
+        let binary_data = binary_data_with_string(format_addr, "x=%d y=%.2f s=%s\n");
+        let statements = vec![Expr::call(
+            CallTarget::Direct {
+                target: 0x4010a0,
+                call_site: 0x401108,
+            },
+            vec![
+                Expr::int(1),
+                Expr::int(format_addr as i128),
+                Expr::int(42),
+                Expr::unknown("world"),
+            ],
+        )];
+
+        let propagated = propagate_args_in_block_with_binary_data(
+            statements,
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["1", "0x5300", "0x2a", "xmm0", "world"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_inserts_missing_float_for_assignment_rhs_call() {
+        let format_addr = 0x5310;
+        let binary_data = binary_data_with_string(format_addr, "x=%d y=%.2f s=%s\n");
+        let statements = vec![Expr::assign(
+            Expr::unknown("ret_2"),
+            Expr::call(
+                CallTarget::Direct {
+                    target: 0x4010a0,
+                    call_site: 0x401108,
+                },
+                vec![
+                    Expr::int(1),
+                    Expr::int(format_addr as i128),
+                    Expr::int(42),
+                    Expr::unknown("world"),
+                ],
+            ),
+        )];
+
+        let propagated = propagate_args_in_block_with_binary_data(
+            statements,
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+        let Some(Expr {
+            kind: ExprKind::Assign { rhs, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected assignment with recovered call");
+        };
+        let ExprKind::Call { args, .. } = &rhs.kind else {
+            panic!("expected call on assignment rhs");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["1", "0x5310", "0x2a", "xmm0", "world"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_user_variadic_format_call_from_first_arg() {
+        let format_addr = 0x6000;
+        let binary_data = binary_data_with_string(format_addr, "sum=%d, pi=%g\n");
+        let statements = vec![
+            Expr::assign(reg("esi", 4), Expr::int(5)),
+            Expr::assign(reg("xmm0", 16), Expr::unknown("pi")),
+            Expr::call(
+                CallTarget::Named("my_log".to_string()),
+                vec![Expr::int(format_addr as i128)],
+            ),
+        ];
+
+        let propagated =
+            propagate_args_in_block_with_binary_data(statements, Some(&binary_data), None);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["0x6000", "5", "pi"]
         );
     }
 
