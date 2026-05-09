@@ -282,6 +282,25 @@ fn prune_dead_register_artifacts(nodes: Vec<StructuredNode>) -> Vec<StructuredNo
     prune_dead_register_artifacts_in_list(nodes, HashSet::new()).0
 }
 
+fn prune_dead_register_artifacts_in_loop_body(
+    body: Vec<StructuredNode>,
+    loop_live_after: HashSet<String>,
+) -> (Vec<StructuredNode>, HashSet<String>) {
+    let original_body = body;
+    let mut seed = loop_live_after;
+
+    loop {
+        let (pruned_body, body_live_in) =
+            prune_dead_register_artifacts_in_list(original_body.clone(), seed.clone());
+        let mut next_seed = seed.clone();
+        next_seed.extend(body_live_in.iter().cloned());
+        if next_seed == seed {
+            return (pruned_body, body_live_in);
+        }
+        seed = next_seed;
+    }
+}
+
 fn prune_dead_register_artifacts_in_list(
     nodes: Vec<StructuredNode>,
     live_after: HashSet<String>,
@@ -365,7 +384,7 @@ fn prune_dead_register_artifacts_in_node(
             let mut loop_live_after = live_after.clone();
             collect_live_uses_in_expr(&condition, &mut loop_live_after);
             let (body, body_live_in) =
-                prune_dead_register_artifacts_in_list(body, loop_live_after.clone());
+                prune_dead_register_artifacts_in_loop_body(body, loop_live_after.clone());
 
             let mut live_before = loop_live_after;
             live_before.extend(body_live_in);
@@ -389,7 +408,7 @@ fn prune_dead_register_artifacts_in_node(
             let mut loop_live_after = live_after.clone();
             collect_live_uses_in_expr(&condition, &mut loop_live_after);
             let (body, body_live_in) =
-                prune_dead_register_artifacts_in_list(body, loop_live_after.clone());
+                prune_dead_register_artifacts_in_loop_body(body, loop_live_after.clone());
 
             let mut live_before = loop_live_after;
             live_before.extend(body_live_in);
@@ -418,7 +437,7 @@ fn prune_dead_register_artifacts_in_node(
                 collect_live_uses_in_expr(update, &mut loop_live_after);
             }
             let (body, body_live_in) =
-                prune_dead_register_artifacts_in_list(body, loop_live_after.clone());
+                prune_dead_register_artifacts_in_loop_body(body, loop_live_after.clone());
 
             let mut live_before = loop_live_after;
             live_before.extend(body_live_in);
@@ -444,7 +463,7 @@ fn prune_dead_register_artifacts_in_node(
             exit_block,
         } => {
             let (body, body_live_in) =
-                prune_dead_register_artifacts_in_list(body, live_after.clone());
+                prune_dead_register_artifacts_in_loop_body(body, live_after.clone());
             let mut live_before = live_after.clone();
             live_before.extend(body_live_in);
             (
@@ -5755,6 +5774,60 @@ mod tests {
 
         assert_eq!(statements.len(), 1);
         assert_eq!(format!("{}", statements[0]), "eax = 7");
+    }
+
+    #[test]
+    fn test_simplify_statements_keeps_loop_carried_register_update_live() {
+        let update = Expr::assign(
+            reg("rbp", 4),
+            Expr::binop(
+                BinOpKind::Add,
+                reg("rbp", 4),
+                Expr::deref(
+                    Expr::binop(BinOpKind::Add, reg("rbx", 8), Expr::int(0x10)),
+                    4,
+                ),
+            ),
+        );
+        let nodes = vec![StructuredNode::While {
+            condition: Expr::binop(BinOpKind::Ne, Expr::deref(reg("rbx", 8), 8), Expr::int(0)),
+            body: vec![
+                block(
+                    0,
+                    vec![Expr::call(
+                        CallTarget::Indirect(Box::new(Expr::deref(reg("rbx", 8), 8))),
+                        vec![reg("rbx", 8)],
+                    )],
+                ),
+                StructuredNode::If {
+                    condition: Expr::binop(
+                        BinOpKind::Eq,
+                        Expr::deref(reg("rbx", 8), 8),
+                        Expr::int(0),
+                    ),
+                    then_body: vec![StructuredNode::Return(Some(reg("rbp", 4)))],
+                    else_body: None,
+                },
+                block(1, vec![update]),
+            ],
+            header: None,
+            exit_block: None,
+        }];
+
+        let simplified = simplify_statements(nodes);
+        let StructuredNode::While { body, .. } = &simplified[0] else {
+            panic!("expected while loop");
+        };
+        let StructuredNode::Block { statements, .. } = &body[2] else {
+            panic!("expected trailing loop block");
+        };
+
+        assert_eq!(statements.len(), 1);
+        assert!(
+            format!("{}", statements[0]).contains("rbp = rbp + rbx[4]"),
+            "expected loop-carried update to remain present, got {}",
+            statements[0]
+        );
     }
 
     #[test]
