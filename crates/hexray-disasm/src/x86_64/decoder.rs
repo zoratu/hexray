@@ -290,6 +290,11 @@ impl Disassembler for X86_64Disassembler {
                 return self.decode_group8(bytes, address, &prefixes, offset);
             }
 
+            // Handle 0F 18 prefetch hint / long NOP encodings via ModR/M.reg dispatch.
+            if opcode == 0x18 {
+                return self.decode_0f18_prefetch_group(bytes, address, &prefixes, offset);
+            }
+
             OPCODE_TABLE_0F
                 .get(opcode as usize)
                 .and_then(|e| e.as_ref())
@@ -1492,6 +1497,60 @@ impl X86_64Disassembler {
             operation,
             mnemonic: mnemonic.to_string(),
             operands: vec![rm_operand, Operand::imm_unsigned(imm as u64, 8)],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+
+            guard: None,
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    fn decode_0f18_prefetch_group(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
+        }
+
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), prefixes.rex);
+        offset = offset.saturating_add(1);
+
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
+        let (rm_operand, rm_consumed) =
+            decode_modrm_rm(rm_bytes, modrm, prefixes, 8).ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
+
+        let (mnemonic, operation, operands) = match modrm.reg & 0x7 {
+            0 => ("prefetchnta", Operation::Other(0x0F18), vec![rm_operand]),
+            1 => ("prefetcht0", Operation::Other(0x0F18), vec![rm_operand]),
+            2 => ("prefetcht1", Operation::Other(0x0F18), vec![rm_operand]),
+            3 => ("prefetcht2", Operation::Other(0x0F18), vec![rm_operand]),
+            _ => ("nop", Operation::Nop, Vec::new()),
+        };
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands,
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
@@ -3744,6 +3803,42 @@ mod tests {
         assert_eq!(result.instruction.operation, Operation::ReadTscP);
         assert_eq!(result.size, 3);
         assert!(result.instruction.operands.is_empty());
+    }
+
+    #[test]
+    fn test_decode_bsr_and_bsf() {
+        let disasm = X86_64Disassembler::new();
+
+        let bsf = disasm
+            .decode_instruction(&[0x0f, 0xbc, 0xc1], 0x1000)
+            .unwrap();
+        assert_eq!(bsf.instruction.mnemonic, "bsf");
+        assert_eq!(bsf.instruction.operands.len(), 2);
+
+        let bsr = disasm
+            .decode_instruction(&[0x0f, 0xbd, 0xc1], 0x1003)
+            .unwrap();
+        assert_eq!(bsr.instruction.mnemonic, "bsr");
+        assert_eq!(bsr.instruction.operands.len(), 2);
+    }
+
+    #[test]
+    fn test_decode_prefetch_and_0f18_nop_variants() {
+        let disasm = X86_64Disassembler::new();
+
+        let prefetch = disasm
+            .decode_instruction(&[0x0f, 0x18, 0x08], 0x2000)
+            .unwrap();
+        assert_eq!(prefetch.instruction.mnemonic, "prefetcht0");
+        assert_eq!(prefetch.instruction.operation, Operation::Other(0x0F18));
+        assert_eq!(prefetch.instruction.operands.len(), 1);
+
+        let nop = disasm
+            .decode_instruction(&[0x0f, 0x18, 0x20], 0x2003)
+            .unwrap();
+        assert_eq!(nop.instruction.mnemonic, "nop");
+        assert_eq!(nop.instruction.operation, Operation::Nop);
+        assert!(nop.instruction.operands.is_empty());
     }
 
     #[test]

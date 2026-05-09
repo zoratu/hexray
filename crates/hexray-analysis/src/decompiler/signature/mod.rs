@@ -1448,6 +1448,8 @@ impl SignatureRecovery {
     fn known_call_return_type(function_name: &str) -> Option<ParamType> {
         let clean = ParameterUsageHints::normalize_callback_name(function_name);
         match clean {
+            "builtin_prefetch" | "builtin_trap" | "builtin_unreachable" => Some(ParamType::Void),
+            "builtin_return_address" => Some(ParamType::Pointer),
             "qsort" | "qsort_r" | "qsort_s" | "bsd_qsort_r" => Some(ParamType::Void),
             "hexray_qsort_r"
             | "hexray_bsd_qsort_r"
@@ -5589,6 +5591,36 @@ mod tests {
             id: BasicBlockId::new(0),
             statements: vec![call],
             address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(!sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Void);
+    }
+
+    #[test]
+    fn test_signature_recovery_does_not_infer_tail_return_for_builtin_prefetch() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("__builtin_prefetch".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::int(0),
+                Expr::int(3),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1100, 0x1110),
         };
         let cfg = StructuredCfg {
             body: vec![block],

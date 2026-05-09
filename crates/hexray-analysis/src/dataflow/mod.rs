@@ -219,6 +219,25 @@ impl InstructionEffects {
                 }
             }
 
+            Operation::Exchange if inst.mnemonic.eq_ignore_ascii_case("bswap") => {
+                if let Some(operand) = inst.operands.first() {
+                    effects.add_def(operand);
+                    effects.add_use(operand);
+                }
+            }
+
+            Operation::Nop => {
+                for operand in &inst.operands {
+                    effects.add_address_uses(operand);
+                }
+            }
+
+            Operation::Other(_) if inst.mnemonic.to_ascii_lowercase().starts_with("prefetch") => {
+                for operand in &inst.operands {
+                    effects.add_address_uses(operand);
+                }
+            }
+
             // Default: analyze operands heuristically
             _ => {
                 // First operand is often destination
@@ -836,6 +855,31 @@ mod tests {
     fn test_instruction_effects_default() {
         assert!(InstructionEffects::default().defs.is_empty());
         assert!(InstructionEffects::default().uses.is_empty());
+    }
+
+    #[test]
+    fn test_instruction_effects_bswap_reads_and_writes_same_register() {
+        let mut inst = Instruction::new(0x1000, 2, vec![0x0f, 0xc8], "bswap");
+        inst.operation = Operation::Exchange;
+        inst.operands = vec![Operand::Register(make_register(0))];
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.defs.contains(&Location::Register(0)));
+        assert!(effects.uses.contains(&Location::Register(0)));
+    }
+
+    #[test]
+    fn test_instruction_effects_prefetch_has_only_address_uses() {
+        let mut inst = Instruction::new(0x1000, 3, vec![0x0f, 0x18, 0x08], "prefetcht0");
+        inst.operation = Operation::Other(0x0F18);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, x86::RDI, 64);
+        inst.operands = vec![Operand::Memory(MemoryRef::base_disp(rdi, 0, 8))];
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.defs.is_empty());
+        assert_eq!(effects.uses, vec![Location::Register(x86::RDI)]);
     }
 
     #[test]

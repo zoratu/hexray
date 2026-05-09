@@ -1098,6 +1098,13 @@ impl Expr {
     /// Returns a GotRef for RIP-relative addresses with computed absolute address,
     /// or a regular Deref for other memory accesses.
     fn from_memory_with_context(mem: &MemoryRef, inst: &Instruction, is_dest: bool) -> Self {
+        if !is_dest && Self::is_saved_return_address_slot(mem) {
+            return Self::call(
+                CallTarget::Named("__builtin_return_address".to_string()),
+                vec![Self::int(0)],
+            );
+        }
+
         let base_name = mem.base.as_ref().map(|r| r.name()).unwrap_or("");
         if base_name == "rip" && mem.index.is_none() {
             // Compute absolute address: inst.address + inst.size + displacement
@@ -1124,6 +1131,16 @@ impl Expr {
         } else {
             Self::memory_address_expr(mem)
         }
+    }
+
+    fn is_saved_return_address_slot(mem: &MemoryRef) -> bool {
+        mem.index.is_none()
+            && mem.displacement == 8
+            && mem.size == 8
+            && mem
+                .base
+                .as_ref()
+                .is_some_and(|base| matches!(base.name(), "rbp" | "ebp" | "bp"))
     }
 
     fn is_lock_prefixed(inst: &Instruction) -> bool {
@@ -1287,6 +1304,79 @@ impl Expr {
             .or_else(|| Self::x86_locked_rmw_expr(inst))
     }
 
+    fn x86_bswap_expr(inst: &Instruction) -> Option<Self> {
+        if !inst.mnemonic.eq_ignore_ascii_case("bswap") || inst.operands.len() != 1 {
+            return None;
+        }
+
+        let builtin = match inst.operands.first() {
+            Some(Operand::Register(reg)) if reg.size == 32 => "__builtin_bswap32",
+            Some(Operand::Register(reg)) if reg.size == 64 => "__builtin_bswap64",
+            _ => return None,
+        };
+        let operand = Self::from_operand_with_inst(inst.operands.first()?, inst);
+
+        Some(Self::assign(
+            operand.clone(),
+            Self::call(CallTarget::Named(builtin.to_string()), vec![operand]),
+        ))
+    }
+
+    fn x86_bit_scan_expr(inst: &Instruction) -> Option<Self> {
+        if inst.operands.len() < 2 {
+            return None;
+        }
+
+        let builtin = if inst.mnemonic.eq_ignore_ascii_case("bsf") {
+            "__builtin_bsf"
+        } else if inst.mnemonic.eq_ignore_ascii_case("bsr") {
+            "__builtin_bsr"
+        } else {
+            return None;
+        };
+
+        Some(Self::assign(
+            Self::from_operand_with_inst(&inst.operands[0], inst),
+            Self::call(
+                CallTarget::Named(builtin.to_string()),
+                vec![Self::from_operand_with_inst(&inst.operands[1], inst)],
+            ),
+        ))
+    }
+
+    fn x86_prefetch_expr(inst: &Instruction) -> Option<Self> {
+        let locality = match inst.mnemonic.to_ascii_lowercase().as_str() {
+            "prefetchnta" => Some(0),
+            "prefetcht2" => Some(1),
+            "prefetcht1" => Some(2),
+            "prefetcht0" => Some(3),
+            _ => None,
+        }?;
+
+        let address = match inst.operands.first()? {
+            Operand::Memory(mem) => Self::from_memory_address_with_context(mem, inst),
+            operand => Self::from_operand_with_inst(operand, inst),
+        };
+
+        Some(Self::call(
+            CallTarget::Named("__builtin_prefetch".to_string()),
+            vec![address, Self::int(0), Self::int(locality)],
+        ))
+    }
+
+    fn x86_ud2_expr(inst: &Instruction) -> Option<Self> {
+        inst.mnemonic
+            .eq_ignore_ascii_case("ud2")
+            .then(|| Self::call(CallTarget::Named("__builtin_trap".to_string()), vec![]))
+    }
+
+    fn lift_special_x86_intrinsic(inst: &Instruction) -> Option<Self> {
+        Self::x86_bswap_expr(inst)
+            .or_else(|| Self::x86_bit_scan_expr(inst))
+            .or_else(|| Self::x86_prefetch_expr(inst))
+            .or_else(|| Self::x86_ud2_expr(inst))
+    }
+
     fn opaque_x86_integer_simd_comment(mnemonic: &str) -> Self {
         Self::unknown(format!("/* SSE: {} */", mnemonic.to_ascii_lowercase()))
     }
@@ -1317,6 +1407,10 @@ impl Expr {
         }
 
         if let Some(expr) = Self::lift_special_x86_atomic(inst) {
+            return expr;
+        }
+
+        if let Some(expr) = Self::lift_special_x86_intrinsic(inst) {
             return expr;
         }
 
@@ -5214,6 +5308,77 @@ mod tests {
         ));
         assert_eq!(args.len(), 3);
         assert!(matches!(args[1].kind, ExprKind::AddressOf(_)));
+    }
+
+    #[test]
+    fn test_bswap_lifts_to_builtin() {
+        use hexray_core::{Architecture, Operand, Operation, Register, RegisterClass};
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let inst = Instruction::new(0x401320, 2, vec![0x0f, 0xc8], "bswap")
+            .with_operation(Operation::Exchange)
+            .with_operands(vec![Operand::Register(eax)]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "rax = __builtin_bswap32(rax)");
+    }
+
+    #[test]
+    fn test_bsr_lifts_to_builtin() {
+        use hexray_core::{Architecture, Operand, Operation, Register, RegisterClass};
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let inst = Instruction::new(0x401330, 3, vec![0x0f, 0xbd, 0xc1], "bsr")
+            .with_operation(Operation::Other(0x0FBD))
+            .with_operands(vec![Operand::Register(eax), Operand::Register(ecx)]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "rax = __builtin_bsr(rcx)");
+    }
+
+    #[test]
+    fn test_prefetch_lifts_to_builtin_without_deref_side_effect() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let inst = Instruction::new(0x401340, 3, vec![0x0f, 0x18, 0x0f], "prefetcht0")
+            .with_operation(Operation::Other(0x0F18))
+            .with_operands(vec![Operand::Memory(MemoryRef::base_disp(rdi, 0, 8))]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "__builtin_prefetch(rdi, 0, 3)");
+    }
+
+    #[test]
+    fn test_ud2_lifts_to_builtin_trap() {
+        let inst = Instruction::new(0x401350, 2, vec![0x0f, 0x0b], "ud2")
+            .with_operation(Operation::Interrupt);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "__builtin_trap()");
+    }
+
+    #[test]
+    fn test_saved_return_address_slot_lifts_to_builtin() {
+        use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
+
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let inst = Instruction::new(0x401360, 4, vec![0x48, 0x8b, 0x45, 0x08], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Register(rax),
+                Operand::Memory(MemoryRef::base_disp(rbp, 8, 8)),
+            ]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "rax = __builtin_return_address(0)");
     }
 
     #[test]

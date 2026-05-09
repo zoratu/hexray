@@ -2490,6 +2490,10 @@ fn disassemble_for_cfg<D: Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_halt = matches!(
+                    decoded.instruction.control_flow,
+                    hexray_core::ControlFlow::Halt
+                );
                 let next_offset = offset + decoded.size;
                 let next_addr = addr + decoded.size as u64;
                 let is_heuristic_tail_jump = stop_after_first_return
@@ -2505,9 +2509,7 @@ fn disassemble_for_cfg<D: Disassembler>(
                 let is_noreturn_call = matches!(
                     decoded.instruction.control_flow,
                     hexray_core::ControlFlow::Call { target, .. }
-                        if fmt
-                            .symbol_at(target)
-                            .is_some_and(|symbol| is_noreturn_function_name(&symbol.name))
+                        if is_known_noreturn_call_target(fmt, target)
                 );
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
@@ -2538,7 +2540,7 @@ fn disassemble_for_cfg<D: Disassembler>(
                 let must_keep_scanning = next_addr < min_scan_end;
                 if stop_after_first_return
                     && !must_keep_scanning
-                    && (is_ret || is_noreturn_call || is_heuristic_tail_jump)
+                    && (is_ret || is_halt || is_noreturn_call || is_heuristic_tail_jump)
                 {
                     break;
                 }
@@ -2550,6 +2552,31 @@ fn disassemble_for_cfg<D: Disassembler>(
     }
 
     instructions
+}
+
+fn is_known_noreturn_call_target(fmt: &dyn BinaryFormat, target: u64) -> bool {
+    fmt.symbol_at(target)
+        .is_some_and(|symbol| is_noreturn_function_name(&symbol.name))
+        || looks_like_x86_ud2_trap_stub(fmt, target)
+}
+
+fn looks_like_x86_ud2_trap_stub(fmt: &dyn BinaryFormat, target: u64) -> bool {
+    if !matches!(fmt.architecture(), Architecture::X86_64 | Architecture::X86) {
+        return false;
+    }
+
+    let Some(bytes) = fmt.bytes_at(target, 6) else {
+        return false;
+    };
+    let bytes = if bytes.starts_with(&[0xf3, 0x0f, 0x1e, 0xfa])
+        || bytes.starts_with(&[0xf3, 0x0f, 0x1e, 0xfb])
+    {
+        &bytes[4..]
+    } else {
+        bytes
+    };
+
+    bytes.starts_with(&[0x0f, 0x0b])
 }
 
 struct DecompileTargetInfo {
@@ -4061,6 +4088,10 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_halt = matches!(
+                    decoded.instruction.control_flow,
+                    hexray_core::ControlFlow::Halt
+                );
                 let next_offset = offset + decoded.size;
                 let next_addr = addr + decoded.size as u64;
                 let is_heuristic_tail_jump = heuristic_bounds
@@ -4081,7 +4112,7 @@ fn disassemble_for_calls<D: hexray_disasm::Disassembler>(
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
-                if is_noreturn_call || is_heuristic_tail_jump {
+                if is_halt || is_noreturn_call || is_heuristic_tail_jump {
                     break;
                 }
                 // With exact symbol bounds we can keep scanning across early returns
@@ -9558,6 +9589,65 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].mnemonic, "endbr64");
         assert_eq!(instructions[1].mnemonic, "jmp");
+    }
+
+    #[test]
+    fn heuristic_cfg_disassembly_stops_at_ud2_leaf() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401520,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0x0f, 0x0b, // ud2
+                    0xf3, 0x0f, 0x1e, 0xfa, // adjacent function
+                    0xc3, // ret
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x401520, 11).unwrap();
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x401520, true);
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "ud2");
+    }
+
+    #[test]
+    fn heuristic_cfg_disassembly_treats_symbolless_ud2_leaf_call_as_noreturn() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401550,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0xe8, 0x03, 0x00, 0x00, 0x00, // call 0x40155c
+                    0x0f, 0x1f, 0x00, // nopl [rax]
+                    0x0f, 0x0b, // ud2 trap stub
+                    0x66, 0x90, // padding
+                    0xf3, 0x0f, 0x1e, 0xfa, // adjacent function
+                    0xc3, // ret
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x401550, 21).unwrap();
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x401550, true);
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].mnemonic, "endbr64");
+        assert_eq!(instructions[1].mnemonic, "call");
     }
 
     #[test]

@@ -903,6 +903,19 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::ModRmRm_Reg,
     ));
 
+    // BSF/BSR - Bit Scan Forward/Reverse
+    // F3 0F BC/BD are TZCNT/LZCNT and are handled in the prefix tables.
+    table[0xBC] = Some(OpcodeEntry::new(
+        "bsf",
+        Operation::Other(0x0FBC),
+        OperandEncoding::ModRmReg_Rm,
+    ));
+    table[0xBD] = Some(OpcodeEntry::new(
+        "bsr",
+        Operation::Other(0x0FBD),
+        OperandEncoding::ModRmReg_Rm,
+    ));
+
     // XADD - Exchange and Add (often used with LOCK prefix)
     // 0F C0 /r = XADD r/m8, r8
     table[0xC0] = Some(OpcodeEntry::new(

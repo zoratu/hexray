@@ -95,6 +95,10 @@ fn disassemble_function<D: Disassembler>(
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
                 let is_ret = decoded.instruction.is_return();
+                let is_halt = matches!(
+                    decoded.instruction.control_flow,
+                    hexray_core::ControlFlow::Halt
+                );
                 let is_heuristic_tail_jump = heuristic_bounds
                     && matches!(
                         decoded.instruction.control_flow,
@@ -109,7 +113,7 @@ fn disassemble_function<D: Disassembler>(
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
 
-                if is_noreturn_call || is_heuristic_tail_jump {
+                if is_halt || is_noreturn_call || is_heuristic_tail_jump {
                     break;
                 }
 

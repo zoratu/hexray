@@ -26,6 +26,7 @@ pub fn is_noreturn_function_name(name: &str) -> bool {
                 | "assert_fail"
                 | "assert_rtn"
                 | "panic"
+                | "builtin_trap"
                 | "cxa_throw"
                 | "cxa_rethrow"
                 | "cxa_bad_cast"
@@ -114,6 +115,7 @@ mod tests {
             "__asan_report_store1",
             "__asan_report_store16",
             "__asan_report_store_n",
+            "__builtin_trap",
         ] {
             assert!(is_noreturn_function_name(name), "{name} should be noreturn");
         }

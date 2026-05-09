@@ -2148,6 +2148,8 @@ impl PseudoCodeEmitter {
         !matches!(
             name.as_str(),
             "__atomic_thread_fence"
+                | "__builtin_prefetch"
+                | "__builtin_trap"
                 | "atomic_store"
                 | "atomic_exchange"
                 | "atomic_fetch_add"
@@ -9148,6 +9150,36 @@ mod tests {
         assert!(
             output.contains("\n    return;\n"),
             "expected bare return after pseudo atomic statements:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_does_not_fold_builtin_prefetch_into_return() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::call(
+                CallTarget::Named("__builtin_prefetch".to_string()),
+                vec![Expr::unknown("arg0"), Expr::int(0), Expr::int(3)],
+            )],
+            address_range: (0x1310, 0x1320),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_signature_recovery(true);
+        let output = emitter.emit(&cfg, "prefetch_addr");
+
+        assert!(
+            output.contains("__builtin_prefetch(arg0, 0, 3);"),
+            "builtin prefetch should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return __builtin_prefetch"),
+            "builtin prefetch should not be folded into a return:\n{}",
             output
         );
     }

@@ -2797,7 +2797,11 @@ impl<'a> Structurer<'a> {
                     }
                 }
                 // Skip branch instructions, but keep calls
-                if inst.is_branch() && !inst.is_call() && inst.operation != Operation::Syscall {
+                if inst.is_branch()
+                    && !inst.is_call()
+                    && inst.operation != Operation::Syscall
+                    && !matches!(inst.control_flow, ControlFlow::Halt)
+                {
                     return false;
                 }
                 // Skip the compare/subs instruction if it's used for a conditional branch
@@ -7202,5 +7206,25 @@ mod tests {
             !body_terminates(else_body),
             "else branch should continue into the join block, got {else_body:?}"
         );
+    }
+
+    #[test]
+    fn test_block_to_statements_keeps_ud2_halt_as_trap() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 2, vec![0x0f, 0x0b], "ud2")
+                .with_operation(Operation::Other(0x0f0b))
+                .with_control_flow(ControlFlow::Halt),
+        );
+        bb0.terminator = BlockTerminator::Unreachable;
+        cfg.add_block(bb0);
+
+        let structurer = Structurer::new(&cfg);
+        let statements = structurer.block_to_statements(BasicBlockId::new(0));
+        let rendered: Vec<_> = statements.iter().map(|expr| format!("{expr}")).collect();
+
+        assert_eq!(rendered, vec!["__builtin_trap()"]);
     }
 }
