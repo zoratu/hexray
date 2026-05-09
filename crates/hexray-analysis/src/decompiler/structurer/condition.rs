@@ -457,8 +457,8 @@ fn build_register_value_map_with_options(
                 let substituted_src = substitute_register_in_expr(
                     Expr::from_operand_with_inst(&inst.operands[1], inst),
                     &reg_values,
-                )
-                .simplify();
+                );
+                let simplified_src = substituted_src.clone().simplify();
 
                 // Check if source is a memory operand (stack variable or global)
                 if let Operand::Memory { .. } = &inst.operands[1] {
@@ -498,11 +498,11 @@ fn build_register_value_map_with_options(
                         }
                     }
                     if !handled_return_capture {
-                        insert_register_value_aliases(&mut reg_values, &dst_name, substituted_src);
+                        insert_register_value_aliases(&mut reg_values, &dst_name, simplified_src);
                         at_block_start = false;
                     }
                 } else {
-                    insert_register_value_aliases(&mut reg_values, &dst_name, substituted_src);
+                    insert_register_value_aliases(&mut reg_values, &dst_name, simplified_src);
                     at_block_start = false;
                 }
             }
