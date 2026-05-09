@@ -3249,8 +3249,16 @@ impl PseudoCodeEmitter {
         }
     }
 
+    fn strip_plt_suffix(name: &str) -> &str {
+        name.split_once("@plt").map_or(name, |(base, _)| base)
+    }
+
+    fn format_indirect_got_call_target(name: &str) -> String {
+        format!("(*{}@got)", Self::strip_plt_suffix(name))
+    }
+
     fn is_tls_get_addr_name(name: &str) -> bool {
-        let stripped = name.split_once("@plt").map_or(name, |(base, _)| base);
+        let stripped = Self::strip_plt_suffix(name);
         let unversioned = hexray_core::unversioned_symbol_name(stripped);
         unversioned == "__tls_get_addr"
     }
@@ -4245,15 +4253,6 @@ impl PseudoCodeEmitter {
                         return self.format_expr_with_strings(&expr, table);
                     }
                 }
-                // Strip the `@plt` suffix on lookup-by-address — the
-                // synthesised PLT-stub symbol carries it as a marker
-                // (so downstream tooling can tell it's a thunk), but
-                // emitted code wants the bare symbol name. matches
-                // llvm-objdump and `c++filt` conventions.
-                fn strip_plt(name: &str) -> String {
-                    name.split_once("@plt")
-                        .map_or_else(|| name.to_string(), |(b, _)| b.to_string())
-                }
                 let target_str = match target {
                     super::expression::CallTarget::Direct {
                         target: addr,
@@ -4263,11 +4262,11 @@ impl PseudoCodeEmitter {
                         // This uses the call instruction address to find the target symbol
                         if let Some(ref reloc_table) = self.relocation_table {
                             if let Some(name) = reloc_table.get(*call_site) {
-                                strip_plt(name)
+                                Self::strip_plt_suffix(name).to_string()
                             } else if let Some(ref sym_table) = self.symbol_table {
                                 // Fall back to symbol table by target address
                                 if let Some(name) = sym_table.get(*addr) {
-                                    strip_plt(name)
+                                    Self::strip_plt_suffix(name).to_string()
                                 } else {
                                     format!("sub_{:x}", addr)
                                 }
@@ -4277,7 +4276,7 @@ impl PseudoCodeEmitter {
                         } else if let Some(ref sym_table) = self.symbol_table {
                             // Check symbol table by target address
                             if let Some(name) = sym_table.get(*addr) {
-                                strip_plt(name)
+                                Self::strip_plt_suffix(name).to_string()
                             } else if let Some(s) = table.get(*addr) {
                                 // Check if this is a string address (for lea/adr patterns)
                                 return format!("\"{}\"", escape_string(s));
@@ -4305,7 +4304,7 @@ impl PseudoCodeEmitter {
                         // Try to resolve the GOT entry to a symbol name
                         if let Some(ref reloc_table) = self.relocation_table {
                             if let Some(name) = reloc_table.get_got(*got_address) {
-                                name.to_string()
+                                Self::format_indirect_got_call_target(name)
                             } else {
                                 // Fall back to showing the expression
                                 format!("({})", self.format_expr_with_strings(expr, table))
@@ -4313,7 +4312,7 @@ impl PseudoCodeEmitter {
                         } else if let Some(ref sym_table) = self.symbol_table {
                             // Try symbol table by GOT address (rare, but possible)
                             if let Some(name) = sym_table.get(*got_address) {
-                                name.to_string()
+                                Self::format_indirect_got_call_target(name)
                             } else {
                                 format!("({})", self.format_expr_with_strings(expr, table))
                             }
@@ -6411,7 +6410,7 @@ impl PseudoCodeEmitter {
             super::expression::CallTarget::IndirectGot { got_address, expr } => {
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get_got(*got_address) {
-                        name.to_string()
+                        Self::format_indirect_got_call_target(name)
                     } else {
                         format!("({})", self.format_expr(expr))
                     }
@@ -10493,6 +10492,36 @@ mod tests {
         assert!(
             !output.contains("err") && !output.contains("result") && !output.contains("ret ="),
             "did not expect semantic pseudo-locals in snapshot helper, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_emit_plt_stub_as_got_trampoline() {
+        let mut relocations = RelocationTable::new();
+        relocations.insert_got(0x404000, "public_add".to_string());
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::call(
+                CallTarget::IndirectGot {
+                    got_address: 0x404000,
+                    expr: Box::new(Expr::unknown("jmp *[rip+0x2f76]")),
+                },
+                vec![],
+            )))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let output = PseudoCodeEmitter::new("    ", false)
+            .with_relocation_table(Some(relocations))
+            .emit(&cfg, "public_add@plt");
+
+        assert!(
+            output.contains("return (*public_add@got)();"),
+            "expected GOT trampoline rendering, got:\n{output}"
+        );
+        assert!(
+            !output.contains("return public_add();"),
+            "PLT trampoline should not collapse into a recursive self-call:\n{output}"
         );
     }
 
