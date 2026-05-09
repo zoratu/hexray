@@ -172,6 +172,10 @@ impl Arm64Disassembler {
             // Fall through to standard decode if SVE decoder can't handle it
         }
 
+        if let Some(decoded) = Self::decode_arm64e_alias(insn, address, raw_bytes.clone()) {
+            return Ok(decoded);
+        }
+
         // Extract op0 (bits 25-28) for major classification
         let op0 = (insn >> 25) & 0xF;
 
@@ -1014,6 +1018,31 @@ impl Arm64Disassembler {
             .with_operation(Operation::Move)
             .with_operand(Operand::reg(Self::xreg(rt)));
         Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
+    }
+
+    fn decode_arm64e_alias(insn: u32, address: u64, bytes: Vec<u8>) -> Option<DecodedInstruction> {
+        let (mnemonic, operation, control_flow) = match insn {
+            0xd503_233f => ("paciasp", Operation::Nop, ControlFlow::Sequential),
+            0xd503_23bf => ("autiasp", Operation::Nop, ControlFlow::Sequential),
+            0xd503_237f => ("pacibsp", Operation::Nop, ControlFlow::Sequential),
+            0xd503_23ff => ("autibsp", Operation::Nop, ControlFlow::Sequential),
+            0xd503_241f => ("bti", Operation::Nop, ControlFlow::Sequential),
+            0xd503_245f => ("bti c", Operation::Nop, ControlFlow::Sequential),
+            0xd503_249f => ("bti j", Operation::Nop, ControlFlow::Sequential),
+            0xd503_24df => ("bti jc", Operation::Nop, ControlFlow::Sequential),
+            0xd65f_0bff => ("retaa", Operation::Return, ControlFlow::Return),
+            0xd65f_0fff => ("retab", Operation::Return, ControlFlow::Return),
+            _ => return None,
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_control_flow(control_flow);
+
+        Some(DecodedInstruction {
             instruction: inst,
             size: 4,
         })
@@ -3471,6 +3500,39 @@ mod tests {
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "ret");
         assert!(result.instruction.is_return());
+    }
+
+    #[test]
+    fn test_paciasp_alias() {
+        let disasm = Arm64Disassembler::new();
+        let bytes = [0x3F, 0x23, 0x03, 0xD5];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "paciasp");
+        assert_eq!(result.instruction.operation, Operation::Nop);
+    }
+
+    #[test]
+    fn test_retab_alias() {
+        let disasm = Arm64Disassembler::new();
+        let bytes = [0xFF, 0x0F, 0x5F, 0xD6];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "retab");
+        assert!(result.instruction.is_return());
+    }
+
+    #[test]
+    fn test_bti_aliases() {
+        let disasm = Arm64Disassembler::new();
+        for (bytes, mnemonic) in [
+            ([0x1F, 0x24, 0x03, 0xD5], "bti"),
+            ([0x5F, 0x24, 0x03, 0xD5], "bti c"),
+            ([0x9F, 0x24, 0x03, 0xD5], "bti j"),
+            ([0xDF, 0x24, 0x03, 0xD5], "bti jc"),
+        ] {
+            let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+            assert_eq!(result.instruction.mnemonic, mnemonic);
+            assert_eq!(result.instruction.operation, Operation::Nop);
+        }
     }
 
     #[test]
