@@ -54,6 +54,22 @@ fn add_string_functions(db: &mut SignatureDatabase) {
         );
     }
 
+    // strlen IFUNC resolver used by recent glibc static builds
+    if let Ok(sig) = FunctionSignature::from_hex(
+        "strlen_ifunc",
+        "F3 0F 1E FA 8B 15 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 89 D1 F7 D1 81 E1 28 01 00 00 74 03 C3",
+    ) {
+        db.add(
+            sig.with_alias("strlen")
+                .with_convention(CallingConvention::SystemV)
+                .with_return_type(ParameterType::Size)
+                .with_param(Parameter::string("s"))
+                .with_library("glibc")
+                .with_doc("glibc IFUNC resolver for strlen")
+                .with_confidence(0.92),
+        );
+    }
+
     // strcpy
     if let Ok(sig) = FunctionSignature::from_hex("strcpy", "55 48 89 E5 48 89 7D E8 48 89 75 E0") {
         db.add(
@@ -97,6 +113,26 @@ fn add_string_functions(db: &mut SignatureDatabase) {
                 .with_library("libc")
                 .with_doc("Compare two strings")
                 .with_confidence(0.7),
+        );
+    }
+
+    // strcmp IFUNC resolver used by recent glibc static builds
+    if let Ok(sig) = FunctionSignature::from_hex(
+        "strcmp_ifunc",
+        "F3 0F 1E FA 8B 0D ?? ?? ?? ?? 8B 15 ?? ?? ?? ?? 89 C8 F7 D0 A9 20 01 00 00 74 ?? F6 05 ?? ?? ?? ?? 10",
+    ) {
+        db.add(
+            sig.with_alias("strcmp")
+                .with_convention(CallingConvention::SystemV)
+                .with_return_type(ParameterType::Int {
+                    size: 4,
+                    signed: true,
+                })
+                .with_param(Parameter::string("s1"))
+                .with_param(Parameter::string("s2"))
+                .with_library("glibc")
+                .with_doc("glibc IFUNC resolver for strcmp")
+                .with_confidence(0.92),
         );
     }
 
@@ -211,6 +247,24 @@ fn add_memory_functions(db: &mut SignatureDatabase) {
         );
     }
 
+    // memcpy IFUNC resolver used by recent glibc static builds
+    if let Ok(sig) = FunctionSignature::from_hex(
+        "memcpy_ifunc",
+        "F3 0F 1E FA 8B 15 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? F6 C6 90 75 ?? 8B 0D ?? ?? ?? ?? F7 C1 00 00 01 00",
+    ) {
+        db.add(
+            sig.with_alias("memcpy")
+                .with_convention(CallingConvention::SystemV)
+                .with_return_type(ParameterType::OpaquePtr)
+                .with_param(Parameter::ptr("dest"))
+                .with_param(Parameter::ptr("src"))
+                .with_param(Parameter::size("n"))
+                .with_library("glibc")
+                .with_doc("glibc IFUNC resolver for memcpy")
+                .with_confidence(0.93),
+        );
+    }
+
     // memmove
     if let Ok(sig) = FunctionSignature::from_hex(
         "memmove",
@@ -261,6 +315,24 @@ fn add_memory_functions(db: &mut SignatureDatabase) {
         );
     }
 
+    // memset IFUNC resolver used by recent glibc static builds
+    if let Ok(sig) = FunctionSignature::from_hex(
+        "memset_ifunc",
+        "F3 0F 1E FA 8B 0D ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? F6 C5 10 75 ?? 8B 15 ?? ?? ?? ?? F7 C2 00 00 01 00",
+    ) {
+        db.add(
+            sig.with_alias("memset")
+                .with_convention(CallingConvention::SystemV)
+                .with_return_type(ParameterType::OpaquePtr)
+                .with_param(Parameter::ptr("s"))
+                .with_param(Parameter::int("c"))
+                .with_param(Parameter::size("n"))
+                .with_library("glibc")
+                .with_doc("glibc IFUNC resolver for memset")
+                .with_confidence(0.93),
+        );
+    }
+
     // memcmp
     if let Ok(sig) =
         FunctionSignature::from_hex("memcmp", "55 48 89 E5 48 89 7D E8 48 89 75 E0 48 89 55 D8")
@@ -292,6 +364,22 @@ fn add_memory_functions(db: &mut SignatureDatabase) {
         );
     }
 
+    // __libc_malloc body used by recent glibc static builds
+    if let Ok(sig) = FunctionSignature::from_hex(
+        "__libc_malloc",
+        "F3 0F 1E FA 55 48 89 E5 41 54 53 48 89 FB 48 83 EC 10 80 3D ?? ?? ?? ?? 00",
+    ) {
+        db.add(
+            sig.with_alias("malloc")
+                .with_convention(CallingConvention::SystemV)
+                .with_return_type(ParameterType::OpaquePtr)
+                .with_param(Parameter::size("size"))
+                .with_library("glibc")
+                .with_doc("glibc malloc implementation")
+                .with_confidence(0.9),
+        );
+    }
+
     // free
     if let Ok(sig) = FunctionSignature::from_hex("free", "55 48 89 E5 53 48 83 EC 08 48 85 FF 74") {
         db.add(
@@ -301,6 +389,22 @@ fn add_memory_functions(db: &mut SignatureDatabase) {
                 .with_library("libc")
                 .with_doc("Free allocated memory")
                 .with_confidence(0.6),
+        );
+    }
+
+    // __free body used by recent glibc static builds
+    if let Ok(sig) = FunctionSignature::from_hex(
+        "__free",
+        "F3 0F 1E FA 48 85 FF 0F 84 ?? ?? ?? ?? 55 48 89 E5 41 55 4C 8D 6F F0 41 54 53 48 83 EC 18",
+    ) {
+        db.add(
+            sig.with_alias("free")
+                .with_convention(CallingConvention::SystemV)
+                .with_return_type(ParameterType::Void)
+                .with_param(Parameter::ptr("ptr"))
+                .with_library("glibc")
+                .with_doc("glibc free implementation")
+                .with_confidence(0.9),
         );
     }
 
@@ -471,6 +575,26 @@ fn add_io_functions(db: &mut SignatureDatabase) {
 }
 
 fn add_process_functions(db: &mut SignatureDatabase) {
+    // __libc_start_main as found in stripped static glibc executables
+    if let Ok(sig) = FunctionSignature::from_hex(
+        "__libc_start_main",
+        "F3 0F 1E FA 55 48 63 C6 48 89 E5 41 57 41 56 41 55 41 54 49 89 D4 53 48 89 C3 48 83 EC 18",
+    ) {
+        db.add(
+            sig.with_convention(CallingConvention::SystemV)
+                .with_return_type(ParameterType::Int {
+                    size: 4,
+                    signed: true,
+                })
+                .with_param(Parameter::ptr("main"))
+                .with_param(Parameter::int("argc"))
+                .with_param(Parameter::ptr("argv"))
+                .with_library("glibc")
+                .with_doc("glibc process startup entrypoint")
+                .with_confidence(0.92),
+        );
+    }
+
     // exit
     if let Ok(sig) = FunctionSignature::from_hex("exit", "55 48 89 E5 89 7D FC E8") {
         db.add(

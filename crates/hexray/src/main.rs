@@ -30,6 +30,7 @@ use hexray_demangle::demangle_or_original;
 use hexray_disasm::{Arm64Disassembler, Disassembler, RiscVDisassembler, X86_64Disassembler};
 use hexray_formats::dwarf::{parse_debug_info, DebugInfo};
 use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
+use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
 use hexray_types::TypeDatabase;
 use serde::Serialize;
 use std::fs;
@@ -1077,17 +1078,14 @@ fn print_sections(binary: &Binary) {
 
 fn print_symbols(binary: &Binary, functions_only: bool, project: Option<&AnalysisProject>) {
     let fmt = binary.as_format();
+    let relocation_table = build_relocation_table(binary);
     println!(
         "{:<16} {:<8} {:<8} {:<8} Name",
         "Address", "Size", "Type", "Bind"
     );
     println!("{}", "-".repeat(70));
 
-    let mut symbols: Vec<_> = fmt.symbols().cloned().collect();
-    if functions_only {
-        let relocation_table = build_relocation_table(binary);
-        synthesize_startup_function_symbols(fmt, &relocation_table, &mut symbols);
-    }
+    let mut symbols = collect_analysis_symbols(binary, &relocation_table);
     symbols.sort_by(|left, right| {
         left.address
             .cmp(&right.address)
@@ -1975,6 +1973,81 @@ fn synthesize_startup_function_symbols(
                 });
             }
         }
+    }
+}
+
+fn signature_architecture_name(arch: Architecture) -> Option<&'static str> {
+    match arch {
+        Architecture::X86_64 | Architecture::X86 => Some("x86_64"),
+        Architecture::Arm64 => Some("aarch64"),
+        _ => None,
+    }
+}
+
+fn function_start_bytes(
+    fmt: &dyn BinaryFormat,
+    address: u64,
+    size: u64,
+    heuristic_bounds: bool,
+) -> Option<&[u8]> {
+    let requested = if heuristic_bounds {
+        size.clamp(64, 4096)
+    } else {
+        size.clamp(1, 4096)
+    };
+    let len = usize::try_from(requested).ok()?;
+    fmt.bytes_at(address, len)
+}
+
+fn synthesize_signature_function_symbols(
+    fmt: &dyn BinaryFormat,
+    symbols: &mut Vec<hexray_core::Symbol>,
+) {
+    use hexray_core::{SymbolBinding, SymbolKind};
+
+    let Some(arch_name) = signature_architecture_name(fmt.architecture()) else {
+        return;
+    };
+    let db = sig_builtin::load_for_architecture(arch_name);
+    if db.is_empty() {
+        return;
+    }
+    let matcher = SignatureMatcher::new(&db).with_min_confidence(0.75);
+
+    let mut seen: std::collections::HashSet<(u64, String)> = symbols
+        .iter()
+        .map(|symbol| (symbol.address, symbol.name.clone()))
+        .collect();
+    let has_named_symbol_at = |addr: u64, symbols: &[hexray_core::Symbol]| {
+        symbols
+            .iter()
+            .any(|symbol| symbol.address == addr && !symbol.name.is_empty())
+    };
+
+    for (address, size, heuristic_bounds) in
+        discover_function_starts(fmt, fmt.architecture(), symbols)
+    {
+        if has_named_symbol_at(address, symbols) {
+            continue;
+        }
+        let Some(bytes) = function_start_bytes(fmt, address, size, heuristic_bounds) else {
+            continue;
+        };
+        let Some(matched) = matcher.match_bytes(bytes) else {
+            continue;
+        };
+        let name = matched.signature.preferred_name().to_string();
+        if !seen.insert((address, name.clone())) {
+            continue;
+        }
+        symbols.push(hexray_core::Symbol {
+            name,
+            address,
+            size: if heuristic_bounds { 0 } else { size },
+            kind: SymbolKind::Function,
+            binding: SymbolBinding::Local,
+            section_index: fmt.section_containing(address).map(|_| 0),
+        });
     }
 }
 
@@ -3452,6 +3525,9 @@ fn collect_analysis_symbols(
             section_index: None,
         });
     }
+
+    synthesize_startup_function_symbols(fmt, relocations, &mut symbols);
+    synthesize_signature_function_symbols(fmt, &mut symbols);
 
     symbols
 }

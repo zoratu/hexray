@@ -285,6 +285,14 @@ impl FunctionSignature {
         self.pattern.matches(bytes)
     }
 
+    /// Preferred display name for this signature.
+    pub fn preferred_name(&self) -> &str {
+        self.aliases
+            .first()
+            .map(String::as_str)
+            .unwrap_or(&self.name)
+    }
+
     /// Get the C function prototype string.
     pub fn to_c_prototype(&self) -> String {
         let ret = self.return_type.to_c_string();
@@ -337,6 +345,15 @@ mod tests {
         assert!(sig.matches(&[0x55, 0x48, 0x00, 0xE5]));
         assert!(sig.matches(&[0x55, 0x48, 0xFF, 0xE5]));
         assert!(!sig.matches(&[0x55, 0x48, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn test_preferred_name_uses_alias_when_present() {
+        let sig = FunctionSignature::from_hex("internal_strlen", "F3 0F 1E FA")
+            .unwrap()
+            .with_alias("strlen");
+
+        assert_eq!(sig.preferred_name(), "strlen");
     }
 
     #[test]

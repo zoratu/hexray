@@ -5,9 +5,12 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
-use hexray_core::{Architecture, Symbol};
+use hexray_core::Architecture;
 use hexray_formats::BinaryFormat;
 use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
+
+#[cfg(test)]
+use hexray_core::Symbol;
 
 /// Signature management actions.
 #[derive(Subcommand)]
@@ -203,17 +206,21 @@ fn scan_function_symbols<'a>(
     matcher: &SignatureMatcher<'a>,
 ) -> Vec<hexray_signatures::MatchResult<'a>> {
     let mut matches = Vec::new();
+    let symbols: Vec<_> = fmt.symbols().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
 
-    for symbol in fmt
-        .symbols()
-        .filter(|symbol| symbol.is_function() && symbol.is_defined() && symbol.address != 0)
+    for (address, size, heuristic_bounds) in
+        crate::discover_function_starts(fmt, fmt.architecture(), &symbols)
     {
-        let Some(bytes) = function_symbol_bytes(fmt, symbol) else {
+        if !seen.insert(address) {
+            continue;
+        }
+        let Some(bytes) = crate::function_start_bytes(fmt, address, size, heuristic_bounds) else {
             continue;
         };
 
-        for mut m in matcher.match_bytes_all(bytes) {
-            m.offset += symbol.address as usize;
+        if let Some(mut m) = matcher.match_bytes(bytes) {
+            m.offset += address as usize;
             matches.push(m);
         }
     }
@@ -245,24 +252,6 @@ fn parse_confidence(input: &str) -> std::result::Result<f32, String> {
     Ok(confidence)
 }
 
-fn function_symbol_bytes<'a>(fmt: &'a dyn BinaryFormat, symbol: &Symbol) -> Option<&'a [u8]> {
-    let section = fmt.section_containing(symbol.address)?;
-    if !section.is_executable() {
-        return None;
-    }
-
-    let section_start = section.virtual_address();
-    let start = usize::try_from(symbol.address.checked_sub(section_start)?).ok()?;
-    let available = section.data().get(start..)?;
-
-    if symbol.size == 0 {
-        return Some(available);
-    }
-
-    let len = usize::try_from(symbol.size).ok().unwrap_or(available.len());
-    Some(&available[..available.len().min(len)])
-}
-
 fn print_scan_result_json(
     arch_str: &str,
     confidence: f32,
@@ -276,7 +265,7 @@ fn print_scan_result_json(
         let comma = if i < matches.len() - 1 { "," } else { "" };
         println!("    {{");
         println!("      \"address\": \"{:#x}\",", m.offset);
-        println!("      \"name\": \"{}\",", m.signature.name);
+        println!("      \"name\": \"{}\",", m.signature.preferred_name());
         println!("      \"library\": \"{}\",", m.signature.library);
         println!("      \"confidence\": {:.3},", m.confidence);
         if let Some(doc) = &m.signature.doc {
@@ -312,7 +301,10 @@ fn print_scan_result(arch_str: &str, confidence: f32, matches: &[hexray_signatur
         for m in matches {
             println!(
                 "{:#016x} {:<24} {:<12} {:.2}",
-                m.offset, &m.signature.name, &m.signature.library, m.confidence
+                m.offset,
+                m.signature.preferred_name(),
+                &m.signature.library,
+                m.confidence
             );
         }
 
@@ -478,6 +470,31 @@ mod tests {
         assert!(matches
             .iter()
             .any(|m| m.offset == 0x2000 && m.signature.name == "free"));
+    }
+
+    #[test]
+    fn scan_recovers_matches_from_stripped_endbr_starts() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x2000,
+                data: vec![
+                    0xF3, 0x0F, 0x1E, 0xFA, 0x8B, 0x15, 0x10, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x05,
+                    0x20, 0x00, 0x00, 0x00, 0x89, 0xD1, 0xF7, 0xD1, 0x81, 0xE1, 0x28, 0x01, 0x00,
+                    0x00, 0x74, 0x03, 0xC3, 0x90, 0x90,
+                ],
+                executable: true,
+            }],
+            symbols: vec![],
+        };
+
+        let db = sig_builtin::load_x86_64();
+        let matcher = SignatureMatcher::new(&db).with_min_confidence(0.5);
+        let matches = scan_function_symbols(&binary, &matcher);
+
+        assert!(matches
+            .iter()
+            .any(|m| m.offset == 0x2000 && m.signature.preferred_name() == "strlen"));
     }
 
     #[test]
