@@ -107,6 +107,10 @@ pub enum RelocationType {
     Pc64,
     /// TLS offset from thread pointer
     Tpoff64,
+    /// TLS module ID for Global Dynamic descriptors
+    DtpMod64,
+    /// TLS offset within the module for Global Dynamic descriptors
+    DtpOff64,
     /// 64-bit GOT offset
     GotOff64,
     /// 32-bit signed PC-relative offset to GOT
@@ -139,6 +143,8 @@ impl RelocationType {
             13 => Self::Pc16,
             14 => Self::R8,
             15 => Self::Pc8,
+            16 => Self::DtpMod64,
+            17 => Self::DtpOff64,
             18 => Self::Tpoff64,
             24 => Self::Pc64,
             25 => Self::GotOff64,

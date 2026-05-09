@@ -19,7 +19,7 @@
 //! - If a field is passed to functions with known signatures, we can infer its type
 //! - Access size determines the base field size (1/2/4/8 bytes)
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use super::expression::{BinOpKind, Expr, ExprKind, VarKind, Variable};
@@ -216,6 +216,8 @@ pub struct StructInference {
     base_to_struct: HashMap<String, String>,
     /// Minimum number of field accesses to consider it a struct.
     min_field_count: usize,
+    /// Resolved global identifiers that should not be treated as pointer bases.
+    global_identifiers: HashSet<String>,
 }
 
 impl StructInference {
@@ -227,12 +229,19 @@ impl StructInference {
             struct_counter: 0,
             base_to_struct: HashMap::new(),
             min_field_count: 2, // At least 2 fields to be considered a struct
+            global_identifiers: HashSet::new(),
         }
     }
 
     /// Sets the minimum number of fields required to infer a struct.
     pub fn with_min_field_count(mut self, count: usize) -> Self {
         self.min_field_count = count;
+        self
+    }
+
+    /// Excludes resolved globals from generic struct-base inference.
+    pub fn with_global_identifiers(mut self, names: HashSet<String>) -> Self {
+        self.global_identifiers = names;
         self
     }
 
@@ -471,6 +480,10 @@ impl StructInference {
 
     /// Checks if a register is a valid base for struct access.
     fn is_valid_base_register(&self, name: &str) -> bool {
+        if self.global_identifiers.contains(name) {
+            return false;
+        }
+
         // Exclude stack/frame pointers as they are stack slots, not struct pointers
         // Also exclude temporary/scratch registers that are unlikely to hold struct pointers
         !matches!(
@@ -1311,6 +1324,7 @@ mod tests {
             struct_counter: 1,
             base_to_struct: HashMap::new(),
             min_field_count: 2,
+            global_identifiers: HashSet::new(),
         };
 
         let output = inference.generate_struct_definitions();
@@ -1460,6 +1474,7 @@ mod tests {
             struct_counter: 1,
             base_to_struct: HashMap::new(),
             min_field_count: 2,
+            global_identifiers: HashSet::new(),
         };
 
         let output = inference.generate_struct_definitions();

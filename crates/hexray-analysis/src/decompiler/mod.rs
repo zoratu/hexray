@@ -448,6 +448,11 @@ impl SymbolTable {
             idx -= 1;
         }
     }
+
+    /// Returns true if any symbol record uses the given display name.
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.symbols.values().any(|symbol| symbol.name == name)
+    }
 }
 
 /// A resolved call-site relocation.
@@ -474,6 +479,8 @@ pub struct RelocationTable {
     data_relocations: HashMap<u64, String>,
     /// Maps GOT/PLT entry addresses to symbol names (for indirect calls).
     got_symbols: HashMap<u64, String>,
+    /// Maps TLS GD descriptor addresses to the underlying TLS symbol names.
+    tls_descriptors: HashMap<u64, String>,
 }
 
 impl RelocationTable {
@@ -551,6 +558,7 @@ impl RelocationTable {
         self.call_relocations.is_empty()
             && self.data_relocations.is_empty()
             && self.got_symbols.is_empty()
+            && self.tls_descriptors.is_empty()
     }
 
     /// Returns the number of data relocations.
@@ -566,6 +574,35 @@ impl RelocationTable {
     /// Looks up a symbol by GOT entry address.
     pub fn get_got(&self, got_addr: u64) -> Option<&str> {
         self.got_symbols.get(&got_addr).map(|s| s.as_str())
+    }
+
+    /// Adds a TLS Global Dynamic descriptor mapping.
+    pub fn insert_tls_descriptor(&mut self, descriptor_addr: u64, symbol: String) {
+        self.tls_descriptors.insert(descriptor_addr, symbol);
+    }
+
+    /// Looks up the underlying TLS symbol for a GD descriptor address.
+    pub fn get_tls_descriptor(&self, descriptor_addr: u64) -> Option<&str> {
+        self.tls_descriptors
+            .get(&descriptor_addr)
+            .map(|s| s.as_str())
+    }
+
+    /// Returns descriptor addresses that resolve to the given TLS symbol.
+    pub fn tls_descriptor_addresses(&self, symbol: &str) -> Vec<u64> {
+        self.tls_descriptors
+            .iter()
+            .filter_map(|(addr, name)| {
+                if name == symbol
+                    || hexray_core::unversioned_symbol_name(name) == symbol
+                    || hexray_core::unversioned_symbol_name(symbol) == name.as_str()
+                {
+                    Some(*addr)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -896,7 +933,7 @@ impl Decompiler {
 
         // Step 2: Apply struct inference if enabled
         let structured = if self.enable_struct_inference {
-            let mut inference = StructInference::new();
+            let mut inference = self.make_struct_inference();
             inference.analyze(&structured.body);
             let transformed_body: Vec<_> = structured
                 .body
@@ -1668,6 +1705,22 @@ impl Decompiler {
         }
     }
 
+    fn make_struct_inference(&self) -> StructInference {
+        let global_identifiers = self
+            .symbol_table
+            .as_ref()
+            .map(|table| {
+                table
+                    .symbols
+                    .values()
+                    .map(|symbol| symbol.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        StructInference::new().with_global_identifiers(global_identifiers)
+    }
+
     /// Analyzes a CFG for struct patterns and returns inferred struct definitions.
     ///
     /// This can be used to generate struct type definitions to prepend to the
@@ -1675,7 +1728,7 @@ impl Decompiler {
     /// from memory access patterns.
     pub fn infer_structs(&self, cfg: &ControlFlowGraph) -> Vec<InferredStruct> {
         let structured = self.structure(cfg);
-        let mut inference = StructInference::new();
+        let mut inference = self.make_struct_inference();
         inference.analyze(&structured.body);
         inference.structs().to_vec()
     }
@@ -1721,7 +1774,7 @@ impl Decompiler {
         let structured = self.structure(cfg);
 
         // Run struct inference
-        let mut inference = StructInference::new();
+        let mut inference = self.make_struct_inference();
         inference.analyze(&structured.body);
 
         // Get struct definitions
@@ -2145,6 +2198,61 @@ mod tests {
         // Should contain if/else structure
         assert!(output.contains("if"));
         assert!(output.contains("else"));
+    }
+
+    #[test]
+    fn test_decompile_absolute_global_increment_emits_compound_assignment() {
+        use hexray_core::{Immediate, MemoryRef, Operand};
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(Instruction {
+            address: 0x1000,
+            size: 7,
+            bytes: vec![],
+            operation: Operation::Add,
+            mnemonic: "add".to_string(),
+            operands: vec![
+                Operand::Memory(MemoryRef::absolute(0x403df0, 4)),
+                Operand::Immediate(Immediate {
+                    value: 1,
+                    size: 4,
+                    signed: false,
+                }),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        });
+        block.instructions.push(Instruction {
+            address: 0x1007,
+            size: 1,
+            bytes: vec![],
+            operation: Operation::Return,
+            mnemonic: "ret".to_string(),
+            operands: vec![],
+            control_flow: ControlFlow::Return,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        });
+        block.terminator = BlockTerminator::Return;
+        cfg.add_block(block);
+
+        let mut symbols = SymbolTable::new();
+        symbols.insert_with_metadata(0x403de0, "g_tls_struct".to_string(), 16, true, true);
+        symbols.insert_with_metadata(0x403df0, "s_thread_local".to_string(), 4, true, true);
+
+        let output = Decompiler::new()
+            .with_addresses(false)
+            .with_symbol_table(symbols)
+            .decompile(&cfg, "incr_static");
+
+        assert!(
+            output.contains("s_thread_local += 1;"),
+            "expected direct global increment, got:\n{output}"
+        );
     }
 
     #[test]

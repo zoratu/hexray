@@ -3133,7 +3133,32 @@ impl PseudoCodeEmitter {
         }
     }
 
+    fn format_exact_global_address(&self, address: u64) -> Option<String> {
+        match self.resolve_global_symbol(address)? {
+            GlobalSymbolResolution::Exact(name) => Some(format!("&{}", name)),
+            GlobalSymbolResolution::Interior { .. } => None,
+        }
+    }
+
     fn format_global_value(&self, address: u64, size: u8) -> Option<String> {
+        let table = self.symbol_table.as_ref()?;
+
+        if let Some(symbol) = table.get_match(address) {
+            if symbol.is_defined && symbol.is_data_symbol {
+                let name = self.simplify_symbol_name(symbol.name);
+                if symbol.size > u64::from(size) {
+                    return Some(self.format_global_field_access(&name, 0));
+                }
+                return Some(name);
+            }
+        }
+
+        if let Some(symbol) = table.get_containing_match(address) {
+            let offset = address.saturating_sub(symbol.address);
+            let base_name = self.simplify_symbol_name(symbol.name);
+            return Some(self.format_global_field_access(&base_name, offset));
+        }
+
         match self.resolve_global_symbol(address)? {
             GlobalSymbolResolution::Exact(name) => Some(name),
             GlobalSymbolResolution::Interior { base_name, offset } => Some(format!(
@@ -3153,10 +3178,61 @@ impl PseudoCodeEmitter {
                 ..
             } => self.format_global_address(*address),
             ExprKind::IntLit(value) if *value > 0 && *value < i128::from(u64::MAX) => {
-                self.format_global_address(*value as u64)
+                self.format_exact_global_address(*value as u64)
             }
             _ => None,
         }
+    }
+
+    fn format_global_field_access(&self, base_name: &str, offset: u64) -> String {
+        if let Some(field_access) = self.try_format_named_global_field(base_name, offset) {
+            return field_access;
+        }
+
+        if offset == 0 {
+            format!("{base_name}.field_0")
+        } else {
+            format!("{base_name}.field_{offset:x}")
+        }
+    }
+
+    fn try_format_named_global_field(&self, base_name: &str, offset: u64) -> Option<String> {
+        let type_db = self.type_database.as_ref()?;
+        let type_str = self.type_info.get(base_name)?;
+        let rest = type_str.strip_prefix("struct ")?;
+        let name_end = rest.find(['*', ' ']).unwrap_or(rest.len());
+        let struct_name = format!("struct {}", rest[..name_end].trim());
+        let field_access =
+            type_db.format_field_access(&struct_name, usize::try_from(offset).ok()?)?;
+        Some(format!("{base_name}{field_access}"))
+    }
+
+    fn try_extract_materialized_address(expr: &Expr) -> Option<u64> {
+        match &expr.kind {
+            ExprKind::GotRef {
+                address,
+                is_deref: false,
+                ..
+            } => Some(*address),
+            ExprKind::IntLit(value) if *value > 0 && *value < i128::from(u64::MAX) => {
+                Some(*value as u64)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_tls_get_addr_name(name: &str) -> bool {
+        let stripped = name.split_once("@plt").map_or(name, |(base, _)| base);
+        let unversioned = hexray_core::unversioned_symbol_name(stripped);
+        unversioned == "__tls_get_addr"
+    }
+
+    fn try_format_tls_descriptor_arg(&self, expr: &Expr) -> Option<String> {
+        let descriptor_addr = Self::try_extract_materialized_address(expr)?;
+        let relocations = self.relocation_table.as_ref()?;
+        let symbol = relocations.get_tls_descriptor(descriptor_addr)?;
+        let simplified = self.simplify_symbol_name(symbol);
+        Some(format!("&_TLS_{simplified}_"))
     }
 
     fn try_format_global_array_base(&self, expr: &Expr) -> Option<String> {
@@ -4223,6 +4299,11 @@ impl PseudoCodeEmitter {
                     .iter()
                     .enumerate()
                     .map(|(idx, a)| {
+                        if Self::is_tls_get_addr_name(&target_str) {
+                            if let Some(arg) = self.try_format_tls_descriptor_arg(a) {
+                                return arg;
+                            }
+                        }
                         if self.register_snapshot_mode.get()
                             && target_str == "rdsspq"
                             && Self::expr_contains_snapshot_register_source(a)
@@ -4785,7 +4866,9 @@ impl PseudoCodeEmitter {
             .filter(|var| contains_identifier_token(&body_output, var))
             .collect();
         for inferred in collect_decl_identifiers_from_emitted_body(&body_output) {
-            if !param_exclusion_list.contains(&inferred) {
+            if !param_exclusion_list.contains(&inferred)
+                && !self.is_known_global_identifier(&inferred)
+            {
                 all_vars_set.insert(inferred);
             }
         }
@@ -4950,7 +5033,9 @@ impl PseudoCodeEmitter {
             .filter(|var| contains_identifier_token(&body_output, var))
             .collect();
         for inferred in collect_decl_identifiers_from_emitted_body(&body_output) {
-            if !param_exclusion_list.contains(&inferred) {
+            if !param_exclusion_list.contains(&inferred)
+                && !self.is_known_global_identifier(&inferred)
+            {
                 all_vars_set.insert(inferred);
             }
         }
@@ -5028,6 +5113,7 @@ impl PseudoCodeEmitter {
             .into_iter()
             .filter_map(|name| canonical_decl_var_name(&name))
             .filter(|name| !is_likely_global_identifier(name))
+            .filter(|name| !self.is_known_global_identifier(name))
             .collect();
 
         // Remove parameters
@@ -5416,8 +5502,15 @@ impl PseudoCodeEmitter {
             ExprKind::BitField { expr: inner, .. } => {
                 self.collect_assigned_vars_from_expr(inner, assigned);
             }
-            ExprKind::GotRef { display_expr, .. } => {
-                self.collect_assigned_vars_from_expr(display_expr, assigned);
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                display_expr,
+                ..
+            } => {
+                if self.should_recurse_into_gotref_display_expr(*address, *instruction_address) {
+                    self.collect_assigned_vars_from_expr(display_expr, assigned);
+                }
             }
             _ => {}
         }
@@ -5574,11 +5667,45 @@ impl PseudoCodeEmitter {
             ExprKind::BitField { expr: inner, .. } => {
                 self.collect_display_assigned_names_from_expr(inner, vars);
             }
-            ExprKind::GotRef { display_expr, .. } => {
-                self.collect_display_assigned_names_from_expr(display_expr, vars);
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                display_expr,
+                ..
+            } => {
+                if self.should_recurse_into_gotref_display_expr(*address, *instruction_address) {
+                    self.collect_display_assigned_names_from_expr(display_expr, vars);
+                }
             }
             ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => {}
         }
+    }
+
+    fn should_recurse_into_gotref_display_expr(
+        &self,
+        address: u64,
+        instruction_address: u64,
+    ) -> bool {
+        if self.resolve_global_symbol(address).is_some() {
+            return false;
+        }
+
+        if let Some(relocations) = &self.relocation_table {
+            if relocations.get_got(address).is_some()
+                || relocations.get_got(instruction_address).is_some()
+                || relocations.get_tls_descriptor(address).is_some()
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn is_known_global_identifier(&self, name: &str) -> bool {
+        self.symbol_table
+            .as_ref()
+            .is_some_and(|table| table.contains_name(name))
     }
 
     fn extract_display_assigned_identifier(&self, lhs: &Expr) -> Option<String> {
@@ -5685,8 +5812,15 @@ impl PseudoCodeEmitter {
                     self.collect_vars_from_expr(e, vars);
                 }
             }
-            ExprKind::GotRef { display_expr, .. } => {
-                self.collect_vars_from_expr(display_expr, vars);
+            ExprKind::GotRef {
+                address,
+                instruction_address,
+                display_expr,
+                ..
+            } => {
+                if self.should_recurse_into_gotref_display_expr(*address, *instruction_address) {
+                    self.collect_vars_from_expr(display_expr, vars);
+                }
             }
             // Literals don't contain variables.
             ExprKind::IntLit(_) => {}
@@ -9459,6 +9593,17 @@ mod tests {
     }
 
     #[test]
+    fn test_absolute_deref_smaller_than_global_uses_field_access() {
+        let mut sym = SymbolTable::new();
+        sym.insert_with_metadata(0x403de0, "g_tls_struct".to_string(), 16, true, true);
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::deref(Expr::int(0x403de0), 4);
+
+        assert_eq!(emitter.format_expr(&expr), "g_tls_struct.field_0");
+    }
+
+    #[test]
     fn test_global_address_materialization_uses_address_of_symbol() {
         let mut sym = SymbolTable::new();
         sym.insert(0x4040e4, "g_counter".to_string());
@@ -9511,7 +9656,98 @@ mod tests {
         let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
         let expr = Expr::got_ref(0x5008, 0, 4, Expr::unknown("rip_ref"));
 
-        assert_eq!(emitter.format_expr(&expr), "*(uint32_t*)(g_struct + 8)");
+        assert_eq!(emitter.format_expr(&expr), "g_struct.field_8");
+    }
+
+    #[test]
+    fn test_emit_does_not_declare_resolved_gotref_global() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(Expr::got_ref(
+                        0x403df0,
+                        0,
+                        4,
+                        Expr::unknown("s_thread_local"),
+                    )),
+                    rhs: Box::new(Expr::int(1)),
+                },
+            }],
+            address_range: (0x1000, 0x1004),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sym = SymbolTable::new();
+        sym.insert(0x403df0, "s_thread_local".to_string());
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let output = emitter.emit(&cfg, "incr_static");
+
+        assert!(
+            !output.contains("int s_thread_local;"),
+            "did not expect a local declaration for resolved TLS global:\n{output}"
+        );
+        assert!(
+            output.contains("s_thread_local += 1;"),
+            "expected compound assignment to use the TLS global name:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_emit_tls_compound_assign_keeps_unit_literal_rhs() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(Expr::deref(Expr::int(0x10), 4)),
+                    rhs: Box::new(Expr::int(1)),
+                },
+            }],
+            address_range: (0x1000, 0x1004),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sym = SymbolTable::new();
+        sym.insert_with_metadata(0x0, "g_tls_struct".to_string(), 16, true, true);
+        sym.insert_with_metadata(0x10, "s_thread_local".to_string(), 4, true, true);
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let output = emitter.emit(&cfg, "incr_static");
+
+        assert!(
+            output.contains("s_thread_local += 1;"),
+            "expected TLS unit increment to keep literal rhs:\n{output}"
+        );
+        assert!(
+            !output.contains("g_tls_struct + 1"),
+            "did not expect TLS canonical offset to be reinterpreted as a global address:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_tls_get_addr_descriptor_argument_is_named() {
+        let mut relocations = RelocationTable::new();
+        relocations.insert_tls_descriptor(0x3fb8, "lib_counter".to_string());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_relocation_table(Some(relocations));
+        let call = Expr::call(
+            super::super::expression::CallTarget::Named("__tls_get_addr@GLIBC_2.3".to_string()),
+            vec![Expr::got_addr(0x3fb8, 0, Expr::int(0x3fb8))],
+        );
+
+        assert_eq!(
+            emitter.format_expr(&call),
+            "__tls_get_addr@GLIBC_2.3(&_TLS_lib_counter_)"
+        );
     }
 
     #[test]

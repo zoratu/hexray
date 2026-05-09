@@ -1130,7 +1130,8 @@ fn compare_symbol_display_priority(
         .then_with(|| left.name.len().cmp(&right.name.len()))
 }
 
-fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u8, u64) {
+fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u8, u8, u64) {
+    let defined_rank = u8::from(symbol.is_defined());
     let kind_rank = match symbol.kind {
         hexray_core::SymbolKind::Function => 3u8,
         hexray_core::SymbolKind::Tls => 2u8,
@@ -1151,6 +1152,7 @@ fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u8, u64
     let name_rank = u8::from(!symbol.name.is_empty());
 
     (
+        defined_rank,
         kind_rank,
         version_rank,
         binding_rank,
@@ -1359,6 +1361,56 @@ fn display_function_name(
         .unwrap_or_else(|| format!("sub_{:x}", address))
 }
 
+fn tls_image_base(fmt: &dyn BinaryFormat) -> Option<u64> {
+    fmt.sections()
+        .filter(|section| section.is_allocated() && matches!(section.name(), ".tdata" | ".tbss"))
+        .map(|section| section.virtual_address())
+        .min()
+}
+
+fn find_tls_symbol_by_image_address<'a>(
+    fmt: &dyn BinaryFormat,
+    symbols: &'a [hexray_core::Symbol],
+    address: u64,
+) -> Option<(&'a hexray_core::Symbol, u64)> {
+    let base = tls_image_base(fmt)?;
+
+    for symbol in symbols {
+        if symbol.kind != hexray_core::SymbolKind::Tls {
+            continue;
+        }
+        let start = base.checked_add(symbol.address)?;
+        let span = symbol.size.max(1);
+        let end = start.checked_add(span)?;
+        if address >= start && address < end {
+            return Some((symbol, address - start));
+        }
+    }
+
+    None
+}
+
+fn tls_symbol_query_address(
+    fmt: &dyn BinaryFormat,
+    symbols: &[hexray_core::Symbol],
+    address: u64,
+) -> Option<u64> {
+    let base = tls_image_base(fmt)?;
+
+    for symbol in symbols {
+        if symbol.kind != hexray_core::SymbolKind::Tls {
+            continue;
+        }
+        let span = symbol.size.max(1);
+        let end = symbol.address.checked_add(span)?;
+        if address >= symbol.address && address < end {
+            return base.checked_add(address);
+        }
+    }
+
+    None
+}
+
 fn display_symbol_or_label_name_with_symbols(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
@@ -1377,6 +1429,18 @@ fn display_symbol_or_label_name_with_symbols(
                 .or_else(|| {
                     fmt.symbol_at(address)
                         .map(|symbol| demangle_or_original(&symbol.name))
+                })
+                .or_else(|| {
+                    find_tls_symbol_by_image_address(fmt, symbols, address).map(
+                        |(symbol, offset)| {
+                            let name = demangle_or_original(&symbol.name);
+                            if offset == 0 {
+                                name
+                            } else {
+                                format!("{name} + 0x{offset:x}")
+                            }
+                        },
+                    )
                 })
         })
         .unwrap_or_else(|| format!("sub_{:x}", address))
@@ -1911,6 +1975,7 @@ fn resolve_xref_target_addresses(
     project: Option<&AnalysisProject>,
     target: &str,
     symbols: &[hexray_core::Symbol],
+    relocation_table: &RelocationTable,
     db: &hexray_analysis::XrefDatabase,
     calls_only: bool,
 ) -> Result<Vec<u64>> {
@@ -1919,7 +1984,7 @@ fn resolve_xref_target_addresses(
     }
 
     let has_refs = |addr: u64| {
-        xref_query_target_addresses(fmt, symbols, addr)
+        xref_query_target_addresses(fmt, symbols, relocation_table, addr)
             .into_iter()
             .any(|query_addr| {
                 if calls_only {
@@ -1934,7 +1999,10 @@ fn resolve_xref_target_addresses(
     let mut referenced_targets = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for symbol in &matching_symbols {
-        if symbol.address == 0 || !has_refs(symbol.address) || !seen.insert(symbol.address) {
+        if (symbol.address == 0 && symbol.kind != hexray_core::SymbolKind::Tls)
+            || !has_refs(symbol.address)
+            || !seen.insert(symbol.address)
+        {
             continue;
         }
         referenced_targets.push(symbol.address);
@@ -1946,7 +2014,9 @@ fn resolve_xref_target_addresses(
 
     let mut resolved_matches = Vec::new();
     for symbol in matching_symbols {
-        if symbol.address == 0 || !seen.insert(symbol.address) {
+        if (symbol.address == 0 && symbol.kind != hexray_core::SymbolKind::Tls)
+            || !seen.insert(symbol.address)
+        {
             continue;
         }
         resolved_matches.push(symbol.address);
@@ -1966,12 +2036,34 @@ fn resolve_xref_target_addresses(
 fn xref_query_target_addresses(
     fmt: &dyn BinaryFormat,
     symbols: &[hexray_core::Symbol],
+    relocation_table: &RelocationTable,
     addr: u64,
 ) -> Vec<u64> {
     let mut addresses = vec![addr];
     if let Some(address_point) = maybe_itanium_vtable_address_point(fmt, symbols, addr) {
         if !addresses.contains(&address_point) {
             addresses.push(address_point);
+        }
+    }
+    if let Some(tls_image_addr) = tls_symbol_query_address(fmt, symbols, addr) {
+        if !addresses.contains(&tls_image_addr) {
+            addresses.push(tls_image_addr);
+        }
+    }
+    if let Some((symbol, _)) = find_tls_symbol_by_image_address(fmt, symbols, addr) {
+        for descriptor_addr in relocation_table.tls_descriptor_addresses(&symbol.name) {
+            if !addresses.contains(&descriptor_addr) {
+                addresses.push(descriptor_addr);
+            }
+        }
+    } else if let Some(symbol) = symbols
+        .iter()
+        .find(|symbol| symbol.address == addr && symbol.kind == hexray_core::SymbolKind::Tls)
+    {
+        for descriptor_addr in relocation_table.tls_descriptor_addresses(&symbol.name) {
+            if !addresses.contains(&descriptor_addr) {
+                addresses.push(descriptor_addr);
+            }
         }
     }
     addresses
@@ -2399,9 +2491,9 @@ fn decompile_function(
             bail!("Unsupported architecture: {:?}", arch);
         }
     };
-    let tls_tpoff_map = build_tls_tpoff_map(binary);
+    let tls_access_targets = build_tls_access_targets(binary);
     let tls_slot_map = build_tls_slot_map(binary);
-    rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
+    rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
     // Build CFG
     let cfg = CfgBuilder::build(&instructions, start_addr);
@@ -2589,7 +2681,21 @@ fn build_string_table(fmt: &dyn BinaryFormat) -> StringTable {
     table
 }
 
-fn elf_tls_layout(binary: &Binary) -> Option<(u64, u64)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ElfTlsLayout {
+    vaddr: u64,
+    memsz: u64,
+    align: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TlsAccessTarget {
+    tpoff: i64,
+    address: u64,
+    size: u64,
+}
+
+fn elf_tls_layout(binary: &Binary) -> Option<ElfTlsLayout> {
     const PT_TLS: u32 = 7;
 
     match binary {
@@ -2597,27 +2703,52 @@ fn elf_tls_layout(binary: &Binary) -> Option<(u64, u64)> {
             .segments
             .iter()
             .find(|segment| segment.p_type == PT_TLS && segment.p_memsz > 0)
-            .map(|segment| (segment.p_vaddr, segment.p_memsz)),
+            .map(|segment| ElfTlsLayout {
+                vaddr: segment.p_vaddr,
+                memsz: segment.p_memsz,
+                align: segment.p_align,
+            }),
         _ => None,
     }
 }
 
-fn normalize_symbol_address(symbol: &hexray_core::Symbol, tls_layout: Option<(u64, u64)>) -> u64 {
+fn normalize_symbol_address(symbol: &hexray_core::Symbol, tls_layout: Option<ElfTlsLayout>) -> u64 {
     if symbol.kind == hexray_core::SymbolKind::Tls {
-        if let Some((tls_vaddr, _)) = tls_layout {
-            return tls_vaddr.saturating_add(symbol.address);
+        if let Some(layout) = tls_layout {
+            return layout.vaddr.saturating_add(symbol.address);
         }
     }
 
     symbol.address
 }
 
-fn build_tls_tpoff_map(binary: &Binary) -> std::collections::HashMap<i64, u64> {
-    let Some((tls_vaddr, tls_memsz)) = elf_tls_layout(binary) else {
-        return std::collections::HashMap::new();
+fn align_up_u64(value: u64, align: u64) -> Option<u64> {
+    if align <= 1 {
+        return Some(value);
+    }
+
+    let rem = value % align;
+    if rem == 0 {
+        Some(value)
+    } else {
+        value.checked_add(align - rem)
+    }
+}
+
+fn tls_static_block_size(layout: ElfTlsLayout) -> Option<i64> {
+    let aligned = align_up_u64(layout.memsz, layout.align.max(1))?;
+    i64::try_from(aligned).ok()
+}
+
+fn build_tls_access_targets(binary: &Binary) -> Vec<TlsAccessTarget> {
+    let Some(layout) = elf_tls_layout(binary) else {
+        return Vec::new();
+    };
+    let Some(static_block_size) = tls_static_block_size(layout) else {
+        return Vec::new();
     };
 
-    let mut map = std::collections::HashMap::new();
+    let mut targets = Vec::new();
     for symbol in binary.as_format().symbols() {
         if symbol.kind != hexray_core::SymbolKind::Tls || !symbol.is_defined() {
             continue;
@@ -2625,13 +2756,15 @@ fn build_tls_tpoff_map(binary: &Binary) -> std::collections::HashMap<i64, u64> {
         let Ok(raw_offset) = i64::try_from(symbol.address) else {
             continue;
         };
-        let Ok(memsz) = i64::try_from(tls_memsz) else {
-            continue;
-        };
-        map.insert(raw_offset - memsz, tls_vaddr.saturating_add(symbol.address));
+        targets.push(TlsAccessTarget {
+            tpoff: raw_offset - static_block_size,
+            address: layout.vaddr.saturating_add(symbol.address),
+            size: symbol.size,
+        });
     }
 
-    map
+    targets.sort_by_key(|target| target.tpoff);
+    targets
 }
 
 fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
@@ -2639,7 +2772,7 @@ fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
         return std::collections::HashMap::new();
     };
 
-    let Some((tls_vaddr, _)) = elf_tls_layout(binary) else {
+    let Some(layout) = elf_tls_layout(binary) else {
         return std::collections::HashMap::new();
     };
 
@@ -2651,7 +2784,7 @@ fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
         let Ok(raw_offset) = u64::try_from(reloc.addend) else {
             continue;
         };
-        map.insert(reloc.offset, tls_vaddr.saturating_add(raw_offset));
+        map.insert(reloc.offset, layout.vaddr.saturating_add(raw_offset));
     }
 
     map
@@ -2676,12 +2809,54 @@ fn add_signed_offset(base: u64, displacement: i64) -> Option<i64> {
     i64::try_from(target).ok()
 }
 
+fn resolve_tls_access_target(
+    targets: &[TlsAccessTarget],
+    displacement: i64,
+    access_size: u8,
+) -> Option<i64> {
+    for target in targets {
+        if displacement == target.tpoff {
+            if let Ok(address) = i64::try_from(target.address) {
+                return Some(address);
+            }
+        }
+    }
+
+    let access_size = i64::from(access_size);
+    for target in targets {
+        let Ok(size) = i64::try_from(target.size) else {
+            continue;
+        };
+        if size <= 0 {
+            continue;
+        }
+        let Some(offset) = displacement.checked_sub(target.tpoff) else {
+            continue;
+        };
+        if offset < 0 {
+            continue;
+        }
+        let Some(end) = offset.checked_add(access_size) else {
+            continue;
+        };
+        if end > size {
+            continue;
+        }
+        let absolute = i128::from(target.address) + i128::from(offset);
+        if let Ok(address) = i64::try_from(absolute) {
+            return Some(address);
+        }
+    }
+
+    None
+}
+
 fn rewrite_tls_memory_operands(
     instructions: &mut [hexray_core::Instruction],
-    tls_tpoff_map: &std::collections::HashMap<i64, u64>,
+    tls_access_targets: &[TlsAccessTarget],
     tls_slot_map: &std::collections::HashMap<u64, u64>,
 ) {
-    if tls_tpoff_map.is_empty() && tls_slot_map.is_empty() {
+    if tls_access_targets.is_empty() && tls_slot_map.is_empty() {
         return;
     }
 
@@ -2730,10 +2905,9 @@ fn rewrite_tls_memory_operands(
             if mem.base.is_some() || mem.index.is_some() {
                 continue;
             }
-            let Some(&target) = tls_tpoff_map.get(&mem.displacement) else {
-                continue;
-            };
-            let Ok(target_addr) = i64::try_from(target) else {
+            let Some(target_addr) =
+                resolve_tls_access_target(tls_access_targets, mem.displacement, mem.size)
+            else {
                 continue;
             };
             *mem = hexray_core::MemoryRef::absolute(target_addr, mem.size);
@@ -2760,31 +2934,34 @@ fn build_symbol_table(binary: &Binary) -> SymbolTable {
     let mut table = SymbolTable::new();
     let mut best_symbols: std::collections::HashMap<u64, hexray_core::Symbol> =
         std::collections::HashMap::new();
-    let mut symbols: Vec<_> = fmt
-        .symbols()
-        .cloned()
-        .map(|mut symbol| {
-            symbol.address = normalize_symbol_address(&symbol, tls_layout);
-            symbol
-        })
-        .collect();
+    let mut symbols: Vec<_> = fmt.symbols().cloned().collect();
     add_ifunc_plt_aliases(binary, &mut symbols);
 
     // Add all symbols (both functions and data) for proper resolution.
-    // TLS symbols are normalized to their TLS image address so rewritten
-    // fs:/gs: references can resolve to names instead of raw offsets.
+    // TLS symbols are inserted both at their canonical TLS offset and at a
+    // synthetic image address so rewritten fs:/gs: references can still
+    // resolve to names while symbol queries keep the canonical offset.
     for symbol in &symbols {
         if symbol.name.is_empty() {
             continue;
         }
 
-        let address = symbol.address;
-        if address == 0 {
+        if symbol.address == 0 && symbol.kind != hexray_core::SymbolKind::Tls {
             continue;
         }
 
-        let candidate = symbol.clone();
-        match best_symbols.entry(address) {
+        table.insert_symbol(symbol, demangle_or_original(&symbol.name));
+
+        let mut candidate = symbol.clone();
+        candidate.address = normalize_symbol_address(symbol, tls_layout);
+        if candidate.address != symbol.address {
+            table.insert_symbol(&candidate, demangle_or_original(&symbol.name));
+        }
+        if candidate.address == 0 {
+            continue;
+        }
+
+        match best_symbols.entry(candidate.address) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(candidate);
             }
@@ -3159,15 +3336,7 @@ fn collect_analysis_symbols(
     relocations: &RelocationTable,
 ) -> Vec<hexray_core::Symbol> {
     let fmt = binary.as_format();
-    let tls_layout = elf_tls_layout(binary);
-    let mut symbols: Vec<_> = fmt
-        .symbols()
-        .cloned()
-        .map(|mut symbol| {
-            symbol.address = normalize_symbol_address(&symbol, tls_layout);
-            symbol
-        })
-        .collect();
+    let mut symbols: Vec<_> = fmt.symbols().cloned().collect();
     add_ifunc_plt_aliases(binary, &mut symbols);
     let mut seen = std::collections::HashSet::new();
     for symbol in &symbols {
@@ -3228,6 +3397,13 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                 RelocationType::GlobDat | RelocationType::JumpSlot => {
                     // The relocation offset is the virtual address of the GOT entry
                     table.insert_got(reloc.offset, symbol.name.clone());
+                }
+                RelocationType::DtpMod64 => {
+                    table.insert_tls_descriptor(reloc.offset, symbol.name.clone());
+                }
+                RelocationType::DtpOff64 => {
+                    table
+                        .insert_tls_descriptor(reloc.offset.saturating_sub(8), symbol.name.clone());
                 }
                 // PC-relative relocations (for calls/jumps in relocatable objects)
                 RelocationType::Pc32 | RelocationType::Plt32 => {
@@ -4599,7 +4775,7 @@ fn decompile_with_follow(
         }
     }
     let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
-    let tls_tpoff_map = build_tls_tpoff_map(binary);
+    let tls_access_targets = build_tls_access_targets(binary);
     let tls_slot_map = build_tls_slot_map(binary);
 
     // Create constant database for magic number recognition
@@ -4671,7 +4847,7 @@ fn decompile_with_follow(
             }
             _ => continue,
         };
-        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
         // Build CFG
         let cfg = CfgBuilder::build(&instructions, func_addr);
@@ -5063,7 +5239,7 @@ fn build_xrefs(
         .filter(|s| is_noreturn_function_name(&s.name))
         .map(|s| s.address)
         .collect();
-    let tls_tpoff_map = build_tls_tpoff_map(binary);
+    let tls_access_targets = build_tls_access_targets(binary);
     let tls_slot_map = build_tls_slot_map(binary);
 
     // Build xref database by disassembling all functions
@@ -5139,7 +5315,7 @@ fn build_xrefs(
                     _ => Vec::new(),
                 };
                 apply_call_relocations(&mut instructions, &relocation_table);
-                rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
+                rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
                 xref_builder.analyze_instructions(&instructions);
 
                 for instr in instructions {
@@ -5167,8 +5343,15 @@ fn build_xrefs(
 
     // If a target is specified, show refs to that target
     if let Some(target_str) = target {
-        let target_addrs =
-            resolve_xref_target_addresses(fmt, project, target_str, &symbols, &db, calls_only)?;
+        let target_addrs = resolve_xref_target_addresses(
+            fmt,
+            project,
+            target_str,
+            &symbols,
+            &relocation_table,
+            &db,
+            calls_only,
+        )?;
         let resolved_targets: Vec<_> = target_addrs
             .iter()
             .map(|addr| {
@@ -5186,7 +5369,9 @@ fn build_xrefs(
         let mut refs = Vec::new();
         let mut seen_refs = std::collections::HashSet::new();
         for target_addr in &target_addrs {
-            for query_addr in xref_query_target_addresses(fmt, &symbols, *target_addr) {
+            for query_addr in
+                xref_query_target_addresses(fmt, &symbols, &relocation_table, *target_addr)
+            {
                 let target_refs: Vec<_> = if calls_only {
                     db.call_refs_to(query_addr).into_iter().cloned().collect()
                 } else {
@@ -7873,9 +8058,18 @@ mod tests {
         let mut db = hexray_analysis::XrefDatabase::new();
         db.add_xref(0x117b, 0x1060, XrefType::Call);
         db.add_xref(0x1187, 0x1070, XrefType::Call);
+        let relocation_table = RelocationTable::new();
 
-        let resolved = resolve_xref_target_addresses(&binary, None, "foo", &symbols, &db, true)
-            .expect("versioned PLT targets should resolve");
+        let resolved = resolve_xref_target_addresses(
+            &binary,
+            None,
+            "foo",
+            &symbols,
+            &relocation_table,
+            &db,
+            true,
+        )
+        .expect("versioned PLT targets should resolve");
 
         assert_eq!(resolved, vec![0x1060, 0x1070]);
     }
@@ -7907,10 +8101,18 @@ mod tests {
         ];
         let mut db = hexray_analysis::XrefDatabase::new();
         db.add_xref(0x117b, 0x1060, XrefType::Call);
+        let relocation_table = RelocationTable::new();
 
-        let resolved =
-            resolve_xref_target_addresses(&binary, None, "foo@VER_1", &symbols, &db, true)
-                .expect("versioned PLT target should resolve");
+        let resolved = resolve_xref_target_addresses(
+            &binary,
+            None,
+            "foo@VER_1",
+            &symbols,
+            &relocation_table,
+            &db,
+            true,
+        )
+        .expect("versioned PLT target should resolve");
 
         assert_eq!(resolved, vec![0x1060]);
     }
@@ -7967,6 +8169,7 @@ mod tests {
             None,
             "_ZTV6Circle",
             &binary.symbols,
+            &RelocationTable::new(),
             &db,
             false,
         )
@@ -7974,7 +8177,12 @@ mod tests {
 
         assert_eq!(resolved, vec![0x402060]);
         assert_eq!(
-            super::xref_query_target_addresses(&binary, &binary.symbols, resolved[0]),
+            super::xref_query_target_addresses(
+                &binary,
+                &binary.symbols,
+                &RelocationTable::new(),
+                resolved[0],
+            ),
             vec![0x402060, 0x402070]
         );
     }
@@ -7995,8 +8203,98 @@ mod tests {
         };
 
         assert_eq!(
-            super::xref_query_target_addresses(&binary, &binary.symbols, 0x402060),
+            super::xref_query_target_addresses(
+                &binary,
+                &binary.symbols,
+                &RelocationTable::new(),
+                0x402060,
+            ),
             vec![0x402060, 0x402070]
+        );
+    }
+
+    #[test]
+    fn xrefs_query_tls_symbols_by_canonical_offset() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".tdata",
+                address: 0x403de0,
+                data: vec![0; 0x20],
+                executable: false,
+                allocated: true,
+            }],
+            symbols: vec![Symbol {
+                name: "g_thread_counter".to_string(),
+                address: 0x14,
+                size: 4,
+                kind: SymbolKind::Tls,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            }],
+            entry_point: None,
+        };
+        let mut db = hexray_analysis::XrefDatabase::new();
+        db.add_xref(0x401274, 0x403df4, XrefType::DataRead);
+        let relocation_table = RelocationTable::new();
+
+        let resolved = resolve_xref_target_addresses(
+            &binary,
+            None,
+            "g_thread_counter",
+            &binary.symbols,
+            &relocation_table,
+            &db,
+            false,
+        )
+        .expect("TLS query should resolve by canonical offset");
+
+        assert_eq!(resolved, vec![0x14]);
+        assert_eq!(
+            super::xref_query_target_addresses(&binary, &binary.symbols, &relocation_table, 0x14,),
+            vec![0x14, 0x403df4]
+        );
+    }
+
+    #[test]
+    fn xrefs_query_tls_symbols_through_gd_descriptors() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".tdata",
+                address: 0x3de8,
+                data: vec![0; 4],
+                executable: false,
+                allocated: true,
+            }],
+            symbols: vec![Symbol {
+                name: "lib_counter".to_string(),
+                address: 0,
+                size: 4,
+                kind: SymbolKind::Tls,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            }],
+            entry_point: None,
+        };
+        let mut db = hexray_analysis::XrefDatabase::new();
+        db.add_xref(0x1128, 0x3fb8, XrefType::DataAddress);
+        let mut relocation_table = RelocationTable::new();
+        relocation_table.insert_tls_descriptor(0x3fb8, "lib_counter".to_string());
+
+        let resolved = resolve_xref_target_addresses(
+            &binary,
+            None,
+            "lib_counter",
+            &binary.symbols,
+            &relocation_table,
+            &db,
+            false,
+        )
+        .expect("GD TLS descriptor should resolve to the TLS symbol");
+
+        assert_eq!(resolved, vec![0]);
+        assert_eq!(
+            super::xref_query_target_addresses(&binary, &binary.symbols, &relocation_table, 0,),
+            vec![0, 0x3de8, 0x3fb8]
         );
     }
 
@@ -8183,7 +8481,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_analysis_target_with_symbols_prefers_normalized_tls_exact_match() {
+    fn resolve_analysis_target_with_symbols_prefers_canonical_tls_exact_match() {
         let binary = TestBinary {
             sections: vec![TestSection {
                 name: ".tdata",
@@ -8202,29 +8500,61 @@ mod tests {
             }],
             entry_point: None,
         };
-        let normalized_symbols = vec![Symbol {
+        let symbols = vec![Symbol {
             name: "seeded".to_string(),
-            address: 0x403de4,
+            address: 0,
             size: 4,
             kind: SymbolKind::Tls,
             binding: SymbolBinding::Global,
             section_index: Some(1),
         }];
 
-        let resolved = crate::resolve_analysis_target_with_symbols(
-            &binary,
-            None,
-            "seeded",
-            &normalized_symbols,
-        )
-        .unwrap();
+        let resolved =
+            crate::resolve_analysis_target_with_symbols(&binary, None, "seeded", &symbols).unwrap();
 
         match resolved {
-            ResolvedAnalysisTarget::Symbol(symbol) => assert_eq!(symbol.address, 0x403de4),
+            ResolvedAnalysisTarget::Symbol(symbol) => assert_eq!(symbol.address, 0),
             ResolvedAnalysisTarget::Address(address) => {
-                panic!("resolved {address:#x} instead of the normalized TLS symbol")
+                panic!("resolved {address:#x} instead of the canonical TLS symbol")
             }
         }
+    }
+
+    #[test]
+    fn display_symbol_name_prefers_defined_tls_over_undefined_import_at_zero() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".tdata",
+                address: 0x403de4,
+                data: vec![0; 4],
+                executable: false,
+                allocated: true,
+            }],
+            symbols: vec![
+                Symbol {
+                    name: "__tls_get_addr@GLIBC_2.3".to_string(),
+                    address: 0,
+                    size: 0,
+                    kind: SymbolKind::Function,
+                    binding: SymbolBinding::Global,
+                    section_index: None,
+                },
+                Symbol {
+                    name: "lib_counter".to_string(),
+                    address: 0,
+                    size: 4,
+                    kind: SymbolKind::Tls,
+                    binding: SymbolBinding::Global,
+                    section_index: Some(1),
+                },
+            ],
+            entry_point: None,
+        };
+
+        let display =
+            crate::display_symbol_or_label_name_with_symbols(&binary, None, &binary.symbols, 0);
+
+        assert_eq!(display, "lib_counter");
     }
 
     #[test]
@@ -8805,15 +9135,60 @@ mod tests {
             writes: vec![],
             guard: None,
         }];
-        let tls_tpoff_map = std::collections::HashMap::from([(-0x50, 0x403de0)]);
-
+        let tls_access_targets = vec![crate::TlsAccessTarget {
+            tpoff: -0x50,
+            address: 0x403de0,
+            size: 4,
+        }];
         let tls_slot_map = std::collections::HashMap::new();
-        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
         let Operand::Memory(mem) = &instructions[0].operands[1] else {
             panic!("expected rewritten TLS memory operand");
         };
         assert_eq!(mem.displacement, 0x403de0);
+        assert!(mem.segment.is_none());
+    }
+
+    #[test]
+    fn tls_memory_operands_rewrite_interior_tls_offsets() {
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+        let mut instructions = vec![Instruction {
+            address: 0x4012c4,
+            size: 9,
+            bytes: vec![],
+            operation: Operation::Move,
+            mnemonic: "mov".to_string(),
+            operands: vec![
+                Operand::Register(Register::new(
+                    Architecture::X86_64,
+                    RegisterClass::General,
+                    x86::RAX,
+                    64,
+                )),
+                Operand::Memory(MemoryRef::absolute(-0x10, 8).with_segment(fs)),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        }];
+        let tls_access_targets = vec![crate::TlsAccessTarget {
+            tpoff: -0x18,
+            address: 0x403de0,
+            size: 16,
+        }];
+
+        crate::rewrite_tls_memory_operands(
+            &mut instructions,
+            &tls_access_targets,
+            &std::collections::HashMap::new(),
+        );
+
+        let Operand::Memory(mem) = &instructions[0].operands[1] else {
+            panic!("expected rewritten interior TLS memory operand");
+        };
+        assert_eq!(mem.displacement, 0x403de8);
         assert!(mem.segment.is_none());
     }
 
@@ -8858,10 +9233,10 @@ mod tests {
                 guard: None,
             },
         ];
-        let tls_tpoff_map = std::collections::HashMap::new();
+        let tls_access_targets = Vec::new();
         let tls_slot_map = std::collections::HashMap::from([(0x1107, 0x403de0)]);
 
-        crate::rewrite_tls_memory_operands(&mut instructions, &tls_tpoff_map, &tls_slot_map);
+        crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
         let Operand::Memory(mem) = &instructions[1].operands[0] else {
             panic!("expected rewritten TLS store operand");
