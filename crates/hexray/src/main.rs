@@ -762,7 +762,7 @@ fn main() -> Result<()> {
         }) => {
             let project =
                 load_requested_project(None, global_project_path.as_deref(), binary_path)?;
-            disassemble_cfg(fmt, &target, dot, json, html, project.as_ref())?;
+            disassemble_cfg(&binary, &target, dot, json, html, project.as_ref())?;
         }
         Some(Commands::Decompile {
             target,
@@ -887,12 +887,12 @@ fn main() -> Result<()> {
             // cli.count is instruction count, convert to bytes (max 15 bytes per x86 instruction)
             let max_bytes = cli.count * 15;
             if let Some(symbol_name) = cli.symbol {
-                disassemble_symbol(fmt, &symbol_name, cli.count)?;
+                disassemble_symbol(&binary, &symbol_name, cli.count)?;
             } else if let Some(addr) = cli.address {
-                disassemble_at(fmt, addr, max_bytes)?;
+                disassemble_at(&binary, addr, max_bytes)?;
             } else if let Some(entry) = fmt.entry_point() {
                 println!("Disassembling entry point at {:#x}\n", entry);
-                disassemble_at(fmt, entry, max_bytes)?;
+                disassemble_at(&binary, entry, max_bytes)?;
             } else {
                 println!("No entry point found. Use -s <symbol> or -a <address>");
             }
@@ -1091,6 +1091,42 @@ fn print_symbols(binary: &Binary, functions_only: bool, project: Option<&Analysi
     println!("{}", "-".repeat(70));
 
     let mut symbols = collect_analysis_symbols(binary, &relocation_table);
+    if matches!(binary, Binary::Elf(elf) if elf.is_relocatable()) {
+        let undefined_names: std::collections::HashSet<_> = fmt
+            .symbols()
+            .filter(|symbol| !symbol.is_defined() && symbol.address == 0)
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        for symbol in &mut symbols {
+            if symbol.address != 0
+                && symbol.section_index.is_none()
+                && undefined_names.contains(symbol.name.as_str())
+            {
+                symbol.address = 0;
+            }
+        }
+
+        let mut deduped = std::collections::HashMap::new();
+        for symbol in symbols {
+            let key = (symbol.address, symbol.name.clone());
+            match deduped.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let current = entry.get();
+                    let replace = symbol_display_priority(&symbol)
+                        .cmp(&symbol_display_priority(current))
+                        .then_with(|| current.name.len().cmp(&symbol.name.len()))
+                        .is_gt();
+                    if replace {
+                        entry.insert(symbol);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(symbol);
+                }
+            }
+        }
+        symbols = deduped.into_values().collect();
+    }
     symbols.sort_by(|left, right| {
         left.address
             .cmp(&right.address)
@@ -2262,7 +2298,78 @@ fn maybe_itanium_vtable_address_point(
     addr.checked_add(address_point_offset)
 }
 
-fn disassemble_symbol(fmt: &dyn BinaryFormat, name: &str, max_count: usize) -> Result<()> {
+fn format_disassembly_operand(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    symbols: &[hexray_core::Symbol],
+    relocations: &RelocationTable,
+    instruction: &hexray_core::Instruction,
+    operand: &hexray_core::Operand,
+) -> String {
+    match operand {
+        hexray_core::Operand::PcRelative { target, .. } => {
+            if let Some(relocation) = relocations.get_call(instruction.address) {
+                demangle_or_original(&relocation.symbol)
+            } else if let Some(symbol) = find_preferred_symbol_at(symbols, *target) {
+                display_symbol_name(fmt, project, symbol)
+            } else {
+                format!("{:#x}", target)
+            }
+        }
+        hexray_core::Operand::Immediate(_)
+            if relocations.get_data(instruction.address).is_some() =>
+        {
+            relocations
+                .get_data(instruction.address)
+                .map(demangle_or_original)
+                .unwrap_or_else(|| format!("{}", operand))
+        }
+        hexray_core::Operand::Memory(mem)
+            if mem.base.as_ref().is_some_and(|reg| reg.name() == "rip")
+                && mem.index.is_none()
+                && relocations.data_is_pc_relative(instruction.address) =>
+        {
+            relocations
+                .get_data(instruction.address)
+                .map(|name| format!("[{}]", demangle_or_original(name)))
+                .unwrap_or_else(|| format!("{}", operand))
+        }
+        _ => format!("{}", operand),
+    }
+}
+
+fn format_instruction_for_output(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    symbols: &[hexray_core::Symbol],
+    relocations: &RelocationTable,
+    instruction: &hexray_core::Instruction,
+) -> String {
+    let mut rendered = format!("{:#010x}:  ", instruction.address);
+    for byte in &instruction.bytes {
+        rendered.push_str(&format!("{:02x} ", byte));
+    }
+    for _ in instruction.bytes.len()..8 {
+        rendered.push_str("   ");
+    }
+    rendered.push(' ');
+    rendered.push_str(&instruction.mnemonic);
+    if !instruction.operands.is_empty() {
+        rendered.push(' ');
+        let operands: Vec<_> = instruction
+            .operands
+            .iter()
+            .map(|operand| {
+                format_disassembly_operand(fmt, project, symbols, relocations, instruction, operand)
+            })
+            .collect();
+        rendered.push_str(&operands.join(", "));
+    }
+    rendered
+}
+
+fn disassemble_symbol(binary: &Binary, name: &str, max_count: usize) -> Result<()> {
+    let fmt = binary.as_format();
     // Find the symbol - prefer exact or alias matches, then prefix matches.
     let symbol = find_symbol(fmt, name).with_context(|| format!("Symbol '{}' not found", name))?;
 
@@ -2279,13 +2386,16 @@ fn disassemble_symbol(fmt: &dyn BinaryFormat, name: &str, max_count: usize) -> R
         max_count * 15 // Estimate: max x86 instruction is 15 bytes
     };
 
-    disassemble_at(fmt, symbol.address, size.min(max_count * 15))
+    disassemble_at(binary, symbol.address, size.min(max_count * 15))
 }
 
-fn disassemble_at(fmt: &dyn BinaryFormat, address: u64, max_bytes: usize) -> Result<()> {
+fn disassemble_at(binary: &Binary, address: u64, max_bytes: usize) -> Result<()> {
+    let fmt = binary.as_format();
     let bytes = fmt
         .bytes_at(address, max_bytes)
         .with_context(|| format!("Cannot read bytes at {:#x}", address))?;
+    let relocation_table = build_relocation_table(binary);
+    let symbols = collect_analysis_symbols(binary, &relocation_table);
 
     let arch = fmt.architecture();
     let mut offset = 0;
@@ -2295,27 +2405,87 @@ fn disassemble_at(fmt: &dyn BinaryFormat, address: u64, max_bytes: usize) -> Res
     match arch {
         Architecture::X86_64 | Architecture::X86 => {
             let disasm = X86_64Disassembler::new();
-            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+            disassemble_with(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                &mut offset,
+                &mut count,
+                None,
+                &symbols,
+                &relocation_table,
+            )?;
         }
         Architecture::Arm64 => {
             let disasm = Arm64Disassembler::new();
-            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+            disassemble_with(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                &mut offset,
+                &mut count,
+                None,
+                &symbols,
+                &relocation_table,
+            )?;
         }
         Architecture::RiscV64 => {
             let disasm = RiscVDisassembler::new();
-            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+            disassemble_with(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                &mut offset,
+                &mut count,
+                None,
+                &symbols,
+                &relocation_table,
+            )?;
         }
         Architecture::RiscV32 => {
             let disasm = RiscVDisassembler::new_rv32();
-            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+            disassemble_with(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                &mut offset,
+                &mut count,
+                None,
+                &symbols,
+                &relocation_table,
+            )?;
         }
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
             let disasm = hexray_disasm::cuda::SassDisassembler::for_sm(sm);
-            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+            disassemble_with(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                &mut offset,
+                &mut count,
+                None,
+                &symbols,
+                &relocation_table,
+            )?;
         }
         Architecture::Amdgpu(target) => {
             let disasm = hexray_disasm::amdgpu::AmdgpuDisassembler::for_target(target);
-            disassemble_with(&disasm, fmt, bytes, address, &mut offset, &mut count)?;
+            disassemble_with(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                &mut offset,
+                &mut count,
+                None,
+                &symbols,
+                &relocation_table,
+            )?;
         }
         _ => {
             bail!("Unsupported architecture: {:?}", arch);
@@ -2325,6 +2495,7 @@ fn disassemble_at(fmt: &dyn BinaryFormat, address: u64, max_bytes: usize) -> Res
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn disassemble_with<D: Disassembler>(
     disasm: &D,
     fmt: &dyn BinaryFormat,
@@ -2332,6 +2503,9 @@ fn disassemble_with<D: Disassembler>(
     address: u64,
     offset: &mut usize,
     count: &mut usize,
+    project: Option<&AnalysisProject>,
+    symbols: &[hexray_core::Symbol],
+    relocations: &RelocationTable,
 ) -> Result<()> {
     while *offset < bytes.len() && *count < 100 {
         let remaining = &bytes[*offset..];
@@ -2339,6 +2513,9 @@ fn disassemble_with<D: Disassembler>(
 
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
+                let mut instruction = decoded.instruction;
+                apply_instruction_relocations(std::slice::from_mut(&mut instruction), relocations);
+
                 // Check for symbol at this address
                 if let Some(sym) = fmt.symbol_at(addr) {
                     if !sym.name.is_empty() {
@@ -2346,12 +2523,15 @@ fn disassemble_with<D: Disassembler>(
                     }
                 }
 
-                println!("{}", decoded.instruction);
+                println!(
+                    "{}",
+                    format_instruction_for_output(fmt, project, symbols, relocations, &instruction)
+                );
                 *offset += decoded.size;
                 *count += 1;
 
                 // Stop at return
-                if decoded.instruction.is_return() {
+                if instruction.is_return() {
                     break;
                 }
             }
@@ -2369,13 +2549,14 @@ fn disassemble_with<D: Disassembler>(
 }
 
 fn disassemble_cfg(
-    fmt: &dyn BinaryFormat,
+    binary: &Binary,
     target: &str,
     dot: bool,
     json: bool,
     html: bool,
     project: Option<&AnalysisProject>,
 ) -> Result<()> {
+    let fmt = binary.as_format();
     let (start_addr, name, max_bytes, stop_after_first_return) =
         match resolve_analysis_target(fmt, project, target)? {
             ResolvedAnalysisTarget::Address(addr) => {
@@ -2404,9 +2585,11 @@ fn disassemble_cfg(
     let bytes = fmt
         .bytes_at(start_addr, max_bytes)
         .context("Cannot read bytes")?;
+    let relocation_table = build_relocation_table(binary);
+    let symbols = collect_analysis_symbols(binary, &relocation_table);
 
     let arch = fmt.architecture();
-    let instructions = match arch {
+    let mut instructions = match arch {
         Architecture::X86_64 | Architecture::X86 => {
             let disasm = X86_64Disassembler::new();
             disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
@@ -2427,6 +2610,7 @@ fn disassemble_cfg(
             bail!("Unsupported architecture: {:?}", arch);
         }
     };
+    apply_instruction_relocations(&mut instructions, &relocation_table);
     // Build CFG
     let binary_data_ctx = build_binary_data_context(fmt);
     let cfg = CfgBuilder::build_with_binary_context(&instructions, start_addr, &binary_data_ctx);
@@ -2454,7 +2638,10 @@ fn disassemble_cfg(
             println!("{}:  ; [{:#x} - {:#x})", block_id, block.start, block.end);
 
             for inst in &block.instructions {
-                println!("    {}", inst);
+                println!(
+                    "    {}",
+                    format_instruction_for_output(fmt, project, &symbols, &relocation_table, inst)
+                );
             }
 
             // Print successors
@@ -2719,6 +2906,7 @@ fn decompile_function(
             bail!("Unsupported architecture: {:?}", arch);
         }
     };
+    apply_instruction_relocations(&mut instructions, &relocation_table);
     let tls_access_targets = build_tls_access_targets(binary);
     let tls_slot_map = build_tls_slot_map(binary);
     rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
@@ -3373,12 +3561,194 @@ fn synthetic_external_symbol_address(name: &str) -> u64 {
     0xff00_0000_0000_0000 | (hash & 0x00ff_ffff_ffff_ffff)
 }
 
-fn resolve_relocation_symbol(symbol: &hexray_core::Symbol) -> (u64, bool) {
-    if symbol.section_index.is_some() {
-        (symbol.address, false)
-    } else {
-        (synthetic_external_symbol_address(&symbol.name), true)
+fn relocation_defined_target_addr(
+    symbol: &hexray_core::Symbol,
+    reloc_type: hexray_formats::RelocationType,
+    addend: i64,
+) -> u64 {
+    match reloc_type {
+        hexray_formats::RelocationType::Pc32 | hexray_formats::RelocationType::Plt32 => symbol
+            .address
+            .checked_add_signed(addend.saturating_add(4))
+            .unwrap_or(symbol.address),
+        hexray_formats::RelocationType::R32S => symbol
+            .address
+            .checked_add_signed(addend)
+            .unwrap_or(symbol.address),
+        _ => symbol.address,
     }
+}
+
+fn relocation_display_name(
+    symbols: &[hexray_core::Symbol],
+    symbol: &hexray_core::Symbol,
+    target_addr: u64,
+) -> String {
+    if let Some(preferred) = find_preferred_symbol_at(symbols, target_addr) {
+        let symbol_is_sectionish =
+            matches!(symbol.kind, hexray_core::SymbolKind::Section) || symbol.name.starts_with('.');
+        let preferred_is_concrete = !matches!(preferred.kind, hexray_core::SymbolKind::Section)
+            && !preferred.name.starts_with('.');
+        if symbol_is_sectionish && preferred_is_concrete {
+            return preferred.name.clone();
+        }
+    }
+
+    if target_addr != symbol.address {
+        if let Some(offset) = target_addr.checked_sub(symbol.address) {
+            if offset > 0 {
+                return format!("{}+{:#x}", symbol.name, offset);
+            }
+        }
+    }
+
+    symbol.name.clone()
+}
+
+fn resolve_relocation_symbol(
+    symbols: &[hexray_core::Symbol],
+    symbol: &hexray_core::Symbol,
+    reloc_type: hexray_formats::RelocationType,
+    addend: i64,
+) -> (String, u64, bool) {
+    if symbol.section_index.is_some() {
+        let target_addr = relocation_defined_target_addr(symbol, reloc_type, addend);
+        (
+            relocation_display_name(symbols, symbol, target_addr),
+            target_addr,
+            false,
+        )
+    } else {
+        (
+            symbol.name.clone(),
+            synthetic_external_symbol_address(&symbol.name),
+            true,
+        )
+    }
+}
+
+fn instruction_can_host_x86_64_relocation(instruction: &hexray_core::Instruction) -> bool {
+    matches!(
+        instruction.control_flow,
+        hexray_core::ControlFlow::Call { .. }
+            | hexray_core::ControlFlow::UnconditionalBranch { .. }
+            | hexray_core::ControlFlow::ConditionalBranch { .. }
+    ) || instruction.operands.iter().any(|operand| match operand {
+        hexray_core::Operand::Immediate(_) => true,
+        hexray_core::Operand::Memory(mem) => {
+            mem.base.as_ref().is_some_and(|reg| reg.name() == "rip") && mem.index.is_none()
+        }
+        hexray_core::Operand::PcRelative { .. } => true,
+        _ => false,
+    })
+}
+
+fn x86_64_relocation_candidate_rank(
+    instruction: &hexray_core::Instruction,
+    reloc_type: hexray_formats::RelocationType,
+) -> u8 {
+    let is_control_flow = matches!(
+        instruction.control_flow,
+        hexray_core::ControlFlow::Call { .. }
+            | hexray_core::ControlFlow::UnconditionalBranch { .. }
+            | hexray_core::ControlFlow::ConditionalBranch { .. }
+    );
+    let has_pc_relative_operand = instruction
+        .operands
+        .iter()
+        .any(|operand| matches!(operand, hexray_core::Operand::PcRelative { .. }));
+    let has_rip_relative_memory = instruction.operands.iter().any(|operand| {
+        matches!(
+            operand,
+            hexray_core::Operand::Memory(mem)
+                if mem.base.as_ref().is_some_and(|reg| reg.name() == "rip")
+                    && mem.index.is_none()
+        )
+    });
+    let has_immediate = instruction
+        .operands
+        .iter()
+        .any(|operand| matches!(operand, hexray_core::Operand::Immediate(_)));
+
+    match reloc_type {
+        hexray_formats::RelocationType::Pc32 | hexray_formats::RelocationType::Plt32 => {
+            if is_control_flow && has_pc_relative_operand {
+                3
+            } else if has_rip_relative_memory {
+                2
+            } else if has_immediate {
+                1
+            } else {
+                0
+            }
+        }
+        hexray_formats::RelocationType::R32S | hexray_formats::RelocationType::R64 => {
+            if has_immediate {
+                3
+            } else if has_rip_relative_memory {
+                2
+            } else if is_control_flow && has_pc_relative_operand {
+                1
+            } else {
+                0
+            }
+        }
+        _ => {
+            if is_control_flow {
+                2
+            } else if has_rip_relative_memory || has_immediate {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn find_x86_64_relocation_instruction(
+    section: &hexray_formats::elf::SectionHeader,
+    section_data: &[u8],
+    reloc_type: hexray_formats::RelocationType,
+    reloc_offset: u64,
+) -> Option<hexray_core::Instruction> {
+    let field_start = usize::try_from(reloc_offset).ok()?;
+    let field_end = field_start.checked_add(4)?;
+    if field_end > section_data.len() {
+        return None;
+    }
+
+    let disasm = X86_64Disassembler::new();
+    let scan_start = field_start.saturating_sub(15);
+    let mut best: Option<(u8, usize, hexray_core::Instruction)> = None;
+
+    for candidate in scan_start..=field_start {
+        let remaining = section_data.get(candidate..)?;
+        let addr = section.sh_offset.saturating_add(candidate as u64);
+        let Ok(decoded) = disasm.decode_instruction(remaining, addr) else {
+            continue;
+        };
+        if candidate.saturating_add(decoded.size) != field_end {
+            continue;
+        }
+        if !instruction_can_host_x86_64_relocation(&decoded.instruction) {
+            continue;
+        }
+        let rank = x86_64_relocation_candidate_rank(&decoded.instruction, reloc_type);
+        if rank == 0 {
+            continue;
+        }
+        let should_replace = best
+            .as_ref()
+            .map(|(best_rank, best_size, _)| {
+                rank > *best_rank || (rank == *best_rank && decoded.size > *best_size)
+            })
+            .unwrap_or(true);
+        if should_replace {
+            best = Some((rank, decoded.size, decoded.instruction));
+        }
+    }
+
+    best.map(|(_, _, instruction)| instruction)
 }
 
 const R_X86_64_IRELATIVE: u32 = 37;
@@ -3614,99 +3984,129 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
         _ => return table,
     };
 
-    // Collect symbols for lookup by index
-    let symbols: Vec<_> = elf.symbols().collect();
+    // Collect symbols for lookup by index and section-relative target resolution.
+    let symbols: Vec<_> = elf.symbols().cloned().collect();
 
     // Process relocations - each relocation has a section_index telling us which section it applies to
     for reloc in &elf.relocations {
-        if let Some(symbol) = symbols.get(reloc.symbol_index as usize) {
-            if symbol.name.is_empty() {
-                continue;
-            }
+        let Some(symbol) = symbols.get(reloc.symbol_index as usize) else {
+            continue;
+        };
+        if symbol.name.is_empty() {
+            continue;
+        }
 
-            match reloc.r_type {
-                // GOT entry relocations - map GOT address to symbol name
-                // These are used for indirect calls: call [rip + offset] -> call through GOT
-                RelocationType::GlobDat | RelocationType::JumpSlot => {
-                    // The relocation offset is the virtual address of the GOT entry
-                    table.insert_got(reloc.offset, symbol.name.clone());
+        match reloc.r_type {
+            // GOT entry relocations - map GOT address to symbol name
+            // These are used for indirect calls: call [rip + offset] -> call through GOT
+            RelocationType::GlobDat | RelocationType::JumpSlot => {
+                // The relocation offset is the virtual address of the GOT entry
+                table.insert_got(reloc.offset, symbol.name.clone());
+            }
+            RelocationType::DtpMod64 => {
+                table.insert_tls_descriptor(reloc.offset, symbol.name.clone());
+            }
+            RelocationType::DtpOff64 => {
+                table.insert_tls_descriptor(reloc.offset.saturating_sub(8), symbol.name.clone());
+            }
+            // PC-relative relocations (for calls/jumps in relocatable objects)
+            RelocationType::Pc32 | RelocationType::Plt32 => {
+                let Some(section) = elf.sections.get(reloc.section_index) else {
+                    continue;
+                };
+                let (resolved_name, target_addr, is_external) =
+                    resolve_relocation_symbol(&symbols, symbol, reloc.r_type, reloc.addend);
+                let instruction = elf.section_data(section).and_then(|section_data| {
+                    find_x86_64_relocation_instruction(
+                        section,
+                        section_data,
+                        reloc.r_type,
+                        reloc.offset,
+                    )
+                });
+                if let Some(instruction) = instruction {
+                    match instruction.control_flow {
+                        hexray_core::ControlFlow::Call { .. }
+                        | hexray_core::ControlFlow::UnconditionalBranch { .. }
+                        | hexray_core::ControlFlow::ConditionalBranch { .. } => {
+                            table.insert_call(
+                                instruction.address,
+                                resolved_name,
+                                target_addr,
+                                is_external,
+                            );
+                        }
+                        _ => {
+                            table.insert_data(
+                                instruction.address,
+                                resolved_name,
+                                target_addr,
+                                true,
+                            );
+                        }
+                    }
+                } else {
+                    let call_addr = section
+                        .sh_offset
+                        .saturating_add(reloc.offset)
+                        .saturating_sub(1);
+                    table.insert_call(call_addr, resolved_name, target_addr, is_external);
                 }
-                RelocationType::DtpMod64 => {
-                    table.insert_tls_descriptor(reloc.offset, symbol.name.clone());
-                }
-                RelocationType::DtpOff64 => {
-                    table
-                        .insert_tls_descriptor(reloc.offset.saturating_sub(8), symbol.name.clone());
-                }
-                // PC-relative relocations (for calls/jumps in relocatable objects)
-                RelocationType::Pc32 | RelocationType::Plt32 => {
-                    if let Some(section) = elf.sections.get(reloc.section_index) {
-                        let (target_addr, is_external) = resolve_relocation_symbol(symbol);
-                        // For x86_64 call E8 xx xx xx xx, the relocation points to the displacement
-                        // The call opcode (E8) is at offset-1 from the relocation
-                        let call_addr = section
+            }
+            // 32-bit signed immediate relocations (for mov reg, imm32)
+            RelocationType::R32S => {
+                let Some(section) = elf.sections.get(reloc.section_index) else {
+                    continue;
+                };
+                let (resolved_name, target_addr, _) =
+                    resolve_relocation_symbol(&symbols, symbol, reloc.r_type, reloc.addend);
+                let sym_name = if symbol.name.starts_with(".rodata.str") {
+                    usize::try_from(target_addr)
+                        .ok()
+                        .and_then(|offset| read_cstring_from_elf(elf.data(), offset))
+                        .unwrap_or(resolved_name)
+                } else {
+                    resolved_name
+                };
+                let inst_addr = elf
+                    .section_data(section)
+                    .and_then(|section_data| {
+                        find_x86_64_relocation_instruction(
+                            section,
+                            section_data,
+                            reloc.r_type,
+                            reloc.offset,
+                        )
+                    })
+                    .map(|instruction| instruction.address)
+                    .unwrap_or_else(|| {
+                        section
                             .sh_offset
                             .saturating_add(reloc.offset)
-                            .saturating_sub(1);
-                        table.insert_call(call_addr, symbol.name.clone(), target_addr, is_external);
-                    }
-                }
-                // 32-bit signed immediate relocations (for mov reg, imm32)
-                // mov rdi, 0x0 = 48 C7 C7 xx xx xx xx (7 bytes)
-                // relocation points to offset+3 (the immediate)
-                RelocationType::R32S => {
-                    if let Some(section) = elf.sections.get(reloc.section_index) {
-                        // Instruction starts 3 bytes before the relocation offset
-                        // for "mov reg, imm32" with REX prefix
-                        let inst_addr = section.sh_offset + reloc.offset - 3;
-
-                        // Try to read actual string content from .rodata.str* sections
-                        // These sections (e.g., .rodata.str1.1, .rodata.str1.8) contain string literals
-                        let sym_name = if symbol.name.starts_with(".rodata.str") {
-                            // Find the target section and read the string
-                            if let Some(rodata_section) = elf.sections.iter().find(|s| {
-                                elf.section_name(s)
-                                    .map(|n| n == symbol.name)
-                                    .unwrap_or(false)
-                            }) {
-                                let string_offset =
-                                    rodata_section.sh_offset as usize + reloc.addend as usize;
-                                read_cstring_from_elf(elf.data(), string_offset).unwrap_or_else(
-                                    || format!("{}+{:#x}", symbol.name, reloc.addend),
-                                )
-                            } else {
-                                format!("{}+{:#x}", symbol.name, reloc.addend)
-                            }
-                        } else if reloc.addend != 0 {
-                            format!("{}+{:#x}", symbol.name, reloc.addend)
-                        } else {
-                            symbol.name.clone()
-                        };
-                        table.insert_data(inst_addr, sym_name);
-                    }
-                }
-                // 64-bit absolute relocations
-                RelocationType::R64 => {
-                    if let Some(section) = elf.sections.get(reloc.section_index) {
-                        // For movabs, the relocation points to the immediate
-                        let inst_addr = section.sh_offset + reloc.offset - 2;
-                        table.insert_data(inst_addr, symbol.name.clone());
-                    }
-                }
-                // GOT-relative relocations (for mov reg, [rip+X] accessing global variables)
-                // The relocation points to the displacement (4 bytes), instruction starts 3 bytes before
-                // Format: REX.W MOV ModRM disp32 = 48 8b XX 00 00 00 00
-                RelocationType::GotPcRel
-                | RelocationType::GotPcRelX
-                | RelocationType::RexGotPcRelX => {
-                    if let Some(section) = elf.sections.get(reloc.section_index) {
-                        // Instruction starts 3 bytes before the displacement
-                        let inst_addr = section.sh_offset + reloc.offset - 3;
-                        table.insert_got(inst_addr, symbol.name.clone());
-                    }
-                }
-                _ => {}
+                            .saturating_sub(3)
+                    });
+                table.insert_data(inst_addr, sym_name, target_addr, false);
             }
+            // 64-bit absolute relocations
+            RelocationType::R64 => {
+                if let Some(section) = elf.sections.get(reloc.section_index) {
+                    let (resolved_name, target_addr, _) =
+                        resolve_relocation_symbol(&symbols, symbol, reloc.r_type, reloc.addend);
+                    let inst_addr = section.sh_offset + reloc.offset - 2;
+                    table.insert_data(inst_addr, resolved_name, target_addr, false);
+                }
+            }
+            // GOT-relative relocations (for mov reg, [rip+X] accessing global variables)
+            // The relocation points to the displacement (4 bytes), instruction starts 3 bytes before
+            // Format: REX.W MOV ModRM disp32 = 48 8b XX 00 00 00 00
+            RelocationType::GotPcRel | RelocationType::GotPcRelX | RelocationType::RexGotPcRelX => {
+                if let Some(section) = elf.sections.get(reloc.section_index) {
+                    // Instruction starts 3 bytes before the displacement
+                    let inst_addr = section.sh_offset + reloc.offset - 3;
+                    table.insert_got(inst_addr, symbol.name.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4172,12 +4572,85 @@ fn apply_call_relocations(
     relocations: &RelocationTable,
 ) {
     for instruction in instructions {
-        if let hexray_core::ControlFlow::Call { target, .. } = &mut instruction.control_flow {
-            if let Some(relocation) = relocations.get_call(instruction.address) {
+        let Some(relocation) = relocations.get_call(instruction.address) else {
+            continue;
+        };
+        let is_return_thunk = relocation.symbol == "__x86_return_thunk";
+
+        match &mut instruction.control_flow {
+            hexray_core::ControlFlow::Call { target, .. } => {
                 *target = relocation.target_addr;
+            }
+            hexray_core::ControlFlow::UnconditionalBranch { target } => {
+                if is_return_thunk {
+                    instruction.control_flow = hexray_core::ControlFlow::Return;
+                } else {
+                    *target = relocation.target_addr;
+                }
+            }
+            hexray_core::ControlFlow::ConditionalBranch { target, .. } => {
+                *target = relocation.target_addr;
+            }
+            _ => {}
+        }
+
+        if !is_return_thunk {
+            for operand in &mut instruction.operands {
+                if let hexray_core::Operand::PcRelative { target, .. } = operand {
+                    *target = relocation.target_addr;
+                }
             }
         }
     }
+}
+
+fn apply_data_relocations(
+    instructions: &mut [hexray_core::Instruction],
+    relocations: &RelocationTable,
+) {
+    for instruction in instructions {
+        let Some(target_addr) = relocations.get_data_target(instruction.address) else {
+            continue;
+        };
+        if !relocations.data_is_pc_relative(instruction.address) {
+            for operand in &mut instruction.operands {
+                if let hexray_core::Operand::Immediate(imm) = operand {
+                    imm.value = i128::from(target_addr);
+                    break;
+                }
+            }
+            continue;
+        }
+        let Some(inst_end) = instruction.address.checked_add(instruction.size as u64) else {
+            continue;
+        };
+        let Ok(inst_end_i64) = i64::try_from(inst_end) else {
+            continue;
+        };
+        let Ok(target_i64) = i64::try_from(target_addr) else {
+            continue;
+        };
+        let Some(displacement) = target_i64.checked_sub(inst_end_i64) else {
+            continue;
+        };
+
+        for operand in &mut instruction.operands {
+            if let hexray_core::Operand::Memory(mem) = operand {
+                if mem.base.as_ref().is_some_and(|reg| reg.name() == "rip") && mem.index.is_none() {
+                    mem.displacement = displacement;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn apply_instruction_relocations(
+    instructions: &mut [hexray_core::Instruction],
+    relocations: &RelocationTable,
+) {
+    apply_call_relocations(instructions, relocations);
+    apply_data_relocations(instructions, relocations);
 }
 
 // Shared function-start recovery for analyses that need whole-function
@@ -5414,6 +5887,7 @@ fn decompile_with_follow(
             }
             _ => continue,
         };
+        apply_instruction_relocations(&mut instructions, &relocation_table);
         crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
         // Build CFG
@@ -8317,15 +8791,15 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_calling_convention, demangle_exception_typeinfo_symbol_name,
-        discover_function_starts, discover_materialized_internal_targets,
-        discover_stripped_x86_function_seeds, ensure_distinct_export_paths,
-        find_symbol_in_candidates, format_callgraph_text, infer_main_symbol_from_entry,
-        parse_address_str, patch_affects_function, resolve_analysis_target,
-        resolve_analysis_target_with_entry_main, resolve_materialized_callback_targets,
-        resolve_xref_source_label, resolve_xref_target_addresses, string_tags,
-        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
-        SessionExportFormat, SymbolLookupMode,
+        apply_instruction_relocations, default_calling_convention,
+        demangle_exception_typeinfo_symbol_name, discover_function_starts,
+        discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
+        ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
+        infer_main_symbol_from_entry, parse_address_str, patch_affects_function,
+        resolve_analysis_target, resolve_analysis_target_with_entry_main,
+        resolve_materialized_callback_targets, resolve_xref_source_label,
+        resolve_xref_target_addresses, string_tags, truncate_for_display, DiffPatchAddressSpace,
+        FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{
         CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
@@ -10308,5 +10782,56 @@ mod tests {
             demangle_exception_typeinfo_symbol_name("DW.ref._ZTI7MyError"),
             Some("MyError".to_string())
         );
+    }
+
+    #[test]
+    fn apply_instruction_relocations_rewrites_rip_relative_data_targets() {
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        let rdx = Register::new(Architecture::X86_64, RegisterClass::General, x86::RDX, 32);
+        let mut instructions =
+            vec![
+                Instruction::new(0x4d, 6, vec![0x8b, 0x15, 0x00, 0x00, 0x00, 0x00], "mov")
+                    .with_operation(Operation::Move)
+                    .with_operand(Operand::reg(rdx))
+                    .with_operand(Operand::Memory(MemoryRef::base_disp(rip, 0, 4))),
+            ];
+
+        let mut relocations = RelocationTable::new();
+        relocations.insert_data(0x4d, "counter".to_string(), 0x2000, true);
+
+        apply_instruction_relocations(&mut instructions, &relocations);
+
+        let Operand::Memory(mem) = &instructions[0].operands[1] else {
+            panic!("expected RIP-relative memory operand");
+        };
+        assert_eq!(mem.displacement, 0x2000_i64 - 0x53_i64);
+    }
+
+    #[test]
+    fn apply_instruction_relocations_rewrites_absolute_immediates() {
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, x86::RDI, 64);
+        let mut instructions = vec![Instruction::new(
+            0x1a66,
+            7,
+            vec![0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00],
+            "mov",
+        )
+        .with_operation(Operation::Move)
+        .with_operand(Operand::reg(rdi))
+        .with_operand(Operand::Immediate(Immediate {
+            value: 0,
+            size: 4,
+            signed: true,
+        }))];
+
+        let mut relocations = RelocationTable::new();
+        relocations.insert_data(0x1a66, "msdos_fs_type".to_string(), 0x3020, false);
+
+        apply_instruction_relocations(&mut instructions, &relocations);
+
+        let Operand::Immediate(imm) = &instructions[0].operands[1] else {
+            panic!("expected immediate operand");
+        };
+        assert_eq!(imm.value, 0x3020);
     }
 }

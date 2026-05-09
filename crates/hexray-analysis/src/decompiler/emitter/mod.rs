@@ -2863,6 +2863,9 @@ impl PseudoCodeEmitter {
             }
         }
         // Fall back to normal expression formatting
+        if let Some(address_str) = self.try_format_global_address_materialization(arg) {
+            return address_str;
+        }
         self.format_expr_with_explicit_string_len(
             arg,
             table,

@@ -466,6 +466,17 @@ pub struct CallRelocation {
     pub is_external: bool,
 }
 
+/// A resolved data relocation.
+#[derive(Debug, Clone)]
+struct DataRelocation {
+    /// The target symbol name.
+    symbol: String,
+    /// The resolved address used by analysis.
+    target_addr: u64,
+    /// Whether the relocation was PC-relative (e.g. RIP-relative x86_64 loads).
+    is_pc_relative: bool,
+}
+
 /// Relocation table for resolving symbols in relocatable files.
 ///
 /// In kernel modules and other relocatable files, call instructions
@@ -476,7 +487,7 @@ pub struct RelocationTable {
     /// Maps instruction addresses to target symbol names (for calls).
     call_relocations: HashMap<u64, CallRelocation>,
     /// Maps instruction addresses to data symbol names (for mov/lea with immediates).
-    data_relocations: HashMap<u64, String>,
+    data_relocations: HashMap<u64, DataRelocation>,
     /// Maps GOT/PLT entry addresses to symbol names (for indirect calls).
     got_symbols: HashMap<u64, String>,
     /// Maps TLS GD descriptor addresses to the underlying TLS symbol names.
@@ -513,8 +524,21 @@ impl RelocationTable {
     }
 
     /// Adds a data relocation entry.
-    pub fn insert_data(&mut self, inst_addr: u64, symbol: String) {
-        self.data_relocations.insert(inst_addr, symbol);
+    pub fn insert_data(
+        &mut self,
+        inst_addr: u64,
+        symbol: String,
+        target_addr: u64,
+        is_pc_relative: bool,
+    ) {
+        self.data_relocations.insert(
+            inst_addr,
+            DataRelocation {
+                symbol,
+                target_addr,
+                is_pc_relative,
+            },
+        );
     }
 
     /// Looks up a call target by call instruction address.
@@ -538,7 +562,23 @@ impl RelocationTable {
 
     /// Looks up a data symbol by instruction address.
     pub fn get_data(&self, inst_addr: u64) -> Option<&str> {
-        self.data_relocations.get(&inst_addr).map(|s| s.as_str())
+        self.data_relocations
+            .get(&inst_addr)
+            .map(|reloc| reloc.symbol.as_str())
+    }
+
+    /// Looks up a data relocation target address by instruction address.
+    pub fn get_data_target(&self, inst_addr: u64) -> Option<u64> {
+        self.data_relocations
+            .get(&inst_addr)
+            .map(|reloc| reloc.target_addr)
+    }
+
+    /// Returns whether the data relocation at an instruction was PC-relative.
+    pub fn data_is_pc_relative(&self, inst_addr: u64) -> bool {
+        self.data_relocations
+            .get(&inst_addr)
+            .is_some_and(|reloc| reloc.is_pc_relative)
     }
 
     /// Gets all data relocations within an address range, sorted by address.
@@ -547,7 +587,7 @@ impl RelocationTable {
             .data_relocations
             .iter()
             .filter(|(addr, _)| **addr >= start && **addr < end)
-            .map(|(addr, name)| (*addr, name.as_str()))
+            .map(|(addr, reloc)| (*addr, reloc.symbol.as_str()))
             .collect();
         results.sort_by_key(|(addr, _)| *addr);
         results

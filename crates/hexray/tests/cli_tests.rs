@@ -1378,6 +1378,52 @@ fn test_callgraph_relocatable_uses_relocation_target_name() {
     );
 }
 
+#[test]
+fn test_disassemble_relocatable_uses_relocation_target_name() {
+    let fixture = workspace_fixture_path("test_relocatable.o");
+    let output = run_hexray(&[&fixture, "-s", "my_function"]);
+    assert!(
+        output.status.success(),
+        "disassembly on relocatable object should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("call external_func"),
+        "disassembly should name the relocated callee: {stdout}"
+    );
+    assert!(
+        !stdout.contains("call 0x53"),
+        "disassembly should not keep the raw fallthrough target: {stdout}"
+    );
+}
+
+#[test]
+fn test_symbols_relocatable_undefined_import_stays_zero() {
+    let fixture = workspace_fixture_path("test_relocatable.o");
+    let output = run_hexray(&[&fixture, "symbols"]);
+    assert!(
+        output.status.success(),
+        "symbols on relocatable object should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let external_line = stdout
+        .lines()
+        .find(|line| line.contains("external_func"))
+        .expect("symbols output should contain external_func");
+    assert!(
+        external_line.contains("0x00000000000000"),
+        "undefined relocatable imports should stay at zero: {external_line}"
+    );
+    assert!(
+        !external_line.contains("0xff"),
+        "undefined relocatable imports should not use synthetic addresses: {external_line}"
+    );
+}
+
 // =============================================================================
 // Xrefs Command Tests
 // =============================================================================
