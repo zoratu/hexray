@@ -94,8 +94,8 @@ impl Vex {
         // C5 RvvvvLpp
         Self {
             r: (byte1 & 0x80) == 0, // Inverted
-            x: true,                // Not encoded in 2-byte, default to 1 (no extension)
-            b: true,                // Not encoded in 2-byte, default to 1 (no extension)
+            x: false,               // Not encoded in 2-byte, so no extension is available
+            b: false,               // Not encoded in 2-byte, so no extension is available
             w: false,               // Not encoded in 2-byte, default to 0
             vvvv: (!byte1 >> 3) & 0x0F,
             l: (byte1 & 0x04) != 0,

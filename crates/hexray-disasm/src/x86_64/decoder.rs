@@ -3742,6 +3742,16 @@ mod tests {
         assert_eq!(result.instruction.mnemonic, "vaddps");
         assert_eq!(result.size, 4);
         assert_eq!(result.instruction.operands.len(), 3);
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(operand_names, vec!["xmm0", "xmm1", "xmm2"]);
     }
 
     // ==========================================================================

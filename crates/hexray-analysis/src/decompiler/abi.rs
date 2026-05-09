@@ -345,13 +345,13 @@ pub fn get_arg_register_index(name: &str) -> Option<usize> {
 /// Checks if a register is a return value register.
 ///
 /// Supports:
-/// - x86-64: eax/rax and xmm0 for scalar FP/vector returns
+/// - x86-64: eax/rax and xmm0/ymm0/zmm0 for FP/vector returns
 /// - ARM64: x0/w0
 /// - RISC-V: a0
 pub fn is_return_register(name: &str) -> bool {
     matches!(
         name,
-        "al" | "ax" | "eax" | "rax" | "xmm0" | "x0" | "w0" | "a0"
+        "al" | "ax" | "eax" | "rax" | "xmm0" | "ymm0" | "zmm0" | "x0" | "w0" | "a0"
     )
 }
 
@@ -660,6 +660,8 @@ mod tests {
         assert!(is_return_register("rax"));
         assert!(is_return_register("eax"));
         assert!(is_return_register("xmm0"));
+        assert!(is_return_register("ymm0"));
+        assert!(is_return_register("zmm0"));
         assert!(is_return_register("x0"));
         assert!(is_return_register("w0"));
         assert!(is_return_register("a0"));

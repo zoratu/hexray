@@ -89,7 +89,10 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                 // x86: eax (32-bit), rax (64-bit)
                 // ARM64: w0 (32-bit), x0 (64-bit)
                 // RISC-V: a0
-                let is_return_reg = matches!(v.name.as_str(), "eax" | "rax" | "w0" | "x0" | "a0");
+                let is_return_reg = matches!(
+                    v.name.as_str(),
+                    "eax" | "rax" | "w0" | "x0" | "a0" | "xmm0" | "ymm0" | "zmm0"
+                );
                 if is_return_reg {
                     if saw_real_call_after {
                         continue;
@@ -151,8 +154,10 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
         // live in-place, so keep the statement and return the updated register.
         if let ExprKind::CompoundAssign { lhs, .. } = &stmt.kind {
             if let ExprKind::Var(v) = &lhs.kind {
-                let is_return_reg =
-                    matches!(v.name.as_str(), "eax" | "rax" | "w0" | "x0" | "a0" | "xmm0");
+                let is_return_reg = matches!(
+                    v.name.as_str(),
+                    "eax" | "rax" | "w0" | "x0" | "a0" | "xmm0" | "ymm0" | "zmm0"
+                );
                 if is_return_reg {
                     if saw_real_call_after {
                         continue;

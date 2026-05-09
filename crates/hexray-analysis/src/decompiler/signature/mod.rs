@@ -286,6 +286,23 @@ impl SignatureRecovery {
             }
         }
 
+        if self.float_return
+            && self.return_size == 8
+            && !self.return_from_integer_simd_lane
+            && !self
+                .return_provenance
+                .iter()
+                .any(|reason| reason.contains("width inferred as"))
+        {
+            if let Some(size) = self.consistent_observed_float_arg_size() {
+                self.return_size = size;
+                self.return_provenance.push(format!(
+                    "float return width matched observed float argument width of {} byte(s)",
+                    size
+                ));
+            }
+        }
+
         // Build the signature
         self.build_signature()
     }
@@ -537,10 +554,9 @@ impl SignatureRecovery {
                         .push("explicit return expression".to_string());
                 }
                 self.return_confidence = self.return_confidence.max(200);
-                if self.expr_is_float_abi_value(expr) {
+                if self.expr_uses_float_abi_value(expr) {
                     if !self.return_from_integer_simd_lane {
                         self.float_return = true;
-                        self.return_size = self.return_size.max(8);
                         if !self
                             .return_provenance
                             .iter()
@@ -573,7 +589,7 @@ impl SignatureRecovery {
                     } else if self.float_return && self.return_size >= 10 {
                         self.return_size
                     } else if self.float_return {
-                        8
+                        size
                     } else if matches!(expr.kind, ExprKind::IntLit(_)) {
                         size.max(4)
                     } else {
@@ -901,7 +917,15 @@ impl SignatureRecovery {
             ExprKind::Var(var) => {
                 let name = var.name.to_lowercase();
                 if self.is_float_arg_register(&name) {
-                    self.observed_float_arg_regs.insert(name.clone());
+                    let observed_name = self
+                        .canonical_float_arg_register_name(&name)
+                        .unwrap_or_else(|| name.clone());
+                    self.observed_float_arg_regs.insert(observed_name.clone());
+                    let size = self.observed_float_expr_size(var);
+                    if size > 0 {
+                        self.record_value_size_hint(&name, size);
+                        self.record_value_size_hint(&observed_name, size);
+                    }
                 }
                 // If this register is an argument register and hasn't been written yet,
                 // it's being used as an argument
@@ -923,7 +947,10 @@ impl SignatureRecovery {
                     self.integer_simd_ops_observed = true;
                 }
                 if self.is_float_arg_register(&lowered) {
-                    self.observed_float_arg_regs.insert(lowered.clone());
+                    let observed_name = self
+                        .canonical_float_arg_register_name(&lowered)
+                        .unwrap_or_else(|| lowered.clone());
+                    self.observed_float_arg_regs.insert(observed_name);
                 }
                 // Lifted IR often represents argument aliases as unknown identifiers
                 // (e.g., arg0/arg_8); treat them as reads for use-before-def.
@@ -1566,7 +1593,13 @@ impl SignatureRecovery {
             }
             ExprKind::Var(var) => {
                 let name = var.name.to_lowercase();
-                if name.starts_with("xmm") || name.starts_with("d") {
+                if name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm") {
+                    match var.size {
+                        0..=4 => ParamType::Float(32),
+                        5..=8 => ParamType::Float(64),
+                        size => ParamType::SimdFloat(size),
+                    }
+                } else if name.starts_with("d") {
                     ParamType::Float(64)
                 } else if name.starts_with("s") {
                     ParamType::Float(32)
@@ -1605,6 +1638,9 @@ impl SignatureRecovery {
             (ParamType::Pointer, _) | (_, ParamType::Pointer) => ParamType::Pointer,
             (ParamType::Float(sa), ParamType::Float(sb)) => ParamType::Float((*sa).max(*sb)),
             (ParamType::SimdInt128, ParamType::SimdInt128) => ParamType::SimdInt128,
+            (ParamType::SimdFloat(sa), ParamType::SimdFloat(sb)) => {
+                ParamType::SimdFloat((*sa).max(*sb))
+            }
             (ParamType::UnsignedInt(sa), ParamType::UnsignedInt(sb)) => {
                 ParamType::UnsignedInt((*sa).max(*sb))
             }
@@ -1620,6 +1656,42 @@ impl SignatureRecovery {
             }
             _ => ParamType::Unknown,
         }
+    }
+
+    fn float_param_type_for_size(size: u8) -> ParamType {
+        match size {
+            0..=4 => ParamType::Float(32),
+            5..=8 => ParamType::Float(64),
+            10 => ParamType::Float(80),
+            size => ParamType::SimdFloat(size),
+        }
+    }
+
+    fn observed_float_register_size(&self, idx: usize, reg_name: &str) -> Option<u8> {
+        let reg_lower = reg_name.to_lowercase();
+        let mut candidates = vec![reg_lower, format!("farg{}", idx)];
+        for prefix in ["xmm", "ymm", "zmm"] {
+            candidates.push(format!("{prefix}{idx}"));
+        }
+
+        candidates
+            .into_iter()
+            .filter_map(|name| self.value_sizes.get(&name).copied())
+            .max()
+    }
+
+    fn consistent_observed_float_arg_size(&self) -> Option<u8> {
+        let mut observed_sizes = self
+            .convention
+            .float_arg_registers()
+            .iter()
+            .enumerate()
+            .filter(|(_, reg)| self.observed_float_arg_regs.contains(&reg.to_lowercase()))
+            .filter_map(|(idx, reg)| self.observed_float_register_size(idx, reg))
+            .filter(|size| *size > 0);
+
+        let first = observed_sizes.next()?;
+        observed_sizes.all(|size| size == first).then_some(first)
     }
 
     fn is_ambiguous_indirect_arg_type(ty: &ParamType) -> bool {
@@ -2090,10 +2162,10 @@ impl SignatureRecovery {
 
     /// Extracts a register name from an expression if it's a simple register reference.
     fn extract_register_name(&self, expr: &Expr) -> Option<String> {
-        if let ExprKind::Var(var) = &expr.kind {
-            Some(var.name.clone())
-        } else {
-            None
+        match &expr.kind {
+            ExprKind::Var(var) => Some(var.name.clone()),
+            ExprKind::Unknown(name) if self.reg_size_from_name(name) > 0 => Some(name.clone()),
+            _ => None,
         }
     }
 
@@ -2248,6 +2320,7 @@ impl SignatureRecovery {
         name_lower == self.convention.integer_return_register()
             || name_lower == self.convention.integer_return_register_32()
             || name_lower == self.convention.float_return_register()
+            || Self::x86_simd_register_index(&name_lower) == Some(0)
     }
 
     fn is_float_arg_register(&self, name: &str) -> bool {
@@ -2256,6 +2329,8 @@ impl SignatureRecovery {
             .float_arg_registers()
             .iter()
             .any(|reg| reg.eq_ignore_ascii_case(&name_lower))
+            || Self::x86_simd_register_index(&name_lower)
+                .is_some_and(|idx| idx < self.convention.float_arg_registers().len())
             || name_lower
                 .strip_prefix("farg")
                 .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
@@ -2265,9 +2340,52 @@ impl SignatureRecovery {
     fn is_float_return_register(&self, name: &str) -> bool {
         let name_lower = name.to_lowercase();
         name_lower == self.convention.float_return_register()
+            || Self::x86_simd_register_index(&name_lower) == Some(0)
             || name_lower
                 .strip_prefix("farg")
                 .is_some_and(|suffix| suffix.parse::<usize>().ok() == Some(0))
+    }
+
+    fn x86_simd_register_index(name: &str) -> Option<usize> {
+        for prefix in ["xmm", "ymm", "zmm"] {
+            if let Some(suffix) = name.strip_prefix(prefix) {
+                return suffix.parse::<usize>().ok();
+            }
+        }
+        None
+    }
+
+    fn canonical_float_arg_register_name(&self, name: &str) -> Option<String> {
+        let name_lower = name.to_lowercase();
+        if let Some(idx) = Self::x86_simd_register_index(&name_lower) {
+            return self
+                .convention
+                .float_arg_registers()
+                .get(idx)
+                .map(|reg| reg.to_lowercase());
+        }
+        self.convention
+            .float_arg_registers()
+            .iter()
+            .find(|reg| reg.eq_ignore_ascii_case(&name_lower))
+            .map(|reg| reg.to_lowercase())
+    }
+
+    fn observed_float_expr_size(&self, var: &Variable) -> u8 {
+        let name_lower = var.name.to_lowercase();
+        if name_lower.starts_with("xmm") {
+            return match var.size {
+                1..=8 => var.size,
+                _ => 8,
+            };
+        }
+        if name_lower.starts_with("ymm") {
+            return if var.size > 0 { var.size } else { 32 };
+        }
+        if name_lower.starts_with("zmm") {
+            return if var.size > 0 { var.size } else { 64 };
+        }
+        self.effective_var_size(var)
     }
 
     fn is_x87_stack_register(name: &str) -> bool {
@@ -2490,6 +2608,15 @@ impl SignatureRecovery {
         let name_lower = name.to_lowercase();
 
         // x86-64 register naming
+        if name_lower.starts_with("zmm") {
+            return 64;
+        }
+        if name_lower.starts_with("ymm") {
+            return 32;
+        }
+        if name_lower.starts_with("xmm") {
+            return 16;
+        }
         if name_lower.starts_with('r') && !name_lower.ends_with('d') {
             return 8; // 64-bit (rax, rdi, etc.)
         }
@@ -2569,6 +2696,21 @@ impl SignatureRecovery {
     }
 
     fn value_size_alias_names(name_lower: &str) -> Vec<String> {
+        if let Some(suffix) = name_lower.strip_prefix("xmm") {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return vec![format!("ymm{}", suffix), format!("zmm{}", suffix)];
+            }
+        }
+        if let Some(suffix) = name_lower.strip_prefix("ymm") {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return vec![format!("xmm{}", suffix), format!("zmm{}", suffix)];
+            }
+        }
+        if let Some(suffix) = name_lower.strip_prefix("zmm") {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return vec![format!("xmm{}", suffix), format!("ymm{}", suffix)];
+            }
+        }
         if let Some(suffix) = name_lower.strip_prefix('w') {
             if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
                 return vec![format!("x{}", suffix)];
@@ -2583,15 +2725,34 @@ impl SignatureRecovery {
     }
 
     fn record_value_size_hint(&mut self, name_lower: &str, size: u8) {
-        let merged = self
-            .value_sizes
-            .get(name_lower)
-            .copied()
-            .unwrap_or(0)
-            .max(size);
+        let current = self.value_sizes.get(name_lower).copied().unwrap_or(0);
+        let merged = if current == 0 {
+            size
+        } else if (self.is_float_arg_register(name_lower)
+            || self.is_float_return_register(name_lower)
+            || Self::x86_simd_register_index(name_lower).is_some())
+            && current <= 8
+            && size <= 8
+        {
+            current.min(size)
+        } else {
+            current.max(size)
+        };
         self.value_sizes.insert(name_lower.to_string(), merged);
         for alias in Self::value_size_alias_names(name_lower) {
-            let alias_merged = self.value_sizes.get(&alias).copied().unwrap_or(0).max(size);
+            let alias_current = self.value_sizes.get(&alias).copied().unwrap_or(0);
+            let alias_merged = if alias_current == 0 {
+                size
+            } else if (self.is_float_arg_register(&alias)
+                || self.is_float_return_register(&alias)
+                || Self::x86_simd_register_index(&alias).is_some())
+                && alias_current <= 8
+                && size <= 8
+            {
+                alias_current.min(size)
+            } else {
+                alias_current.max(size)
+            };
             self.value_sizes.insert(alias, alias_merged);
         }
     }
@@ -2607,6 +2768,13 @@ impl SignatureRecovery {
                 if self.is_float_return_register(&var_name_lower)
                     || self.is_float_arg_register(&var_name_lower)
                 {
+                    if let Some(size) = self.value_sizes.get(&var_name_lower) {
+                        return Some(*size);
+                    }
+                    let size = self.observed_float_expr_size(var);
+                    if size > 0 {
+                        return Some(size);
+                    }
                     return Some(8);
                 }
                 if let Some(size) = self.value_sizes.get(&var_name_lower) {
@@ -2630,6 +2798,43 @@ impl SignatureRecovery {
                     None
                 }
             }
+            ExprKind::Unknown(name) => {
+                let name_lower = name.to_lowercase();
+                if Self::is_x87_stack_register(&name_lower) {
+                    return Some(10);
+                }
+                if self.is_float_return_register(&name_lower)
+                    || self.is_float_arg_register(&name_lower)
+                {
+                    if let Some(size) = self.value_sizes.get(&name_lower) {
+                        return Some(*size);
+                    }
+                    if let Some(idx) = name_lower
+                        .strip_prefix("farg")
+                        .and_then(|suffix| suffix.parse::<usize>().ok())
+                    {
+                        if let Some(reg_name) = self.convention.float_arg_registers().get(idx) {
+                            if let Some(size) = self.observed_float_register_size(idx, reg_name) {
+                                return Some(size);
+                            }
+                        }
+                    }
+                    let reg_size = self.reg_size_from_name(&name_lower);
+                    if reg_size > 0 {
+                        return Some(reg_size);
+                    }
+                    return Some(8);
+                }
+                if let Some(size) = self.value_sizes.get(&name_lower) {
+                    return Some(*size);
+                }
+                let reg_size = self.reg_size_from_name(&name_lower);
+                if reg_size > 0 {
+                    Some(reg_size)
+                } else {
+                    None
+                }
+            }
             ExprKind::IntLit(n) => {
                 // Plain integer literals default to at least `int` width in C/C++.
                 if *n >= i32::MIN as i128 && *n <= i32::MAX as i128 {
@@ -2643,6 +2848,19 @@ impl SignatureRecovery {
             ExprKind::Cast { to_size, .. } => Some(*to_size),
             ExprKind::Call { target, args } => {
                 if let Some(name) = self.extract_call_name(target) {
+                    if matches!(name.as_str(), "fminf" | "fmaxf") {
+                        return Some(4);
+                    }
+                    if matches!(name.as_str(), "fmin" | "fmax") {
+                        return Some(8);
+                    }
+                    if let Some(size) = name
+                        .strip_prefix("__m")
+                        .and_then(|suffix| suffix.split('_').next())
+                        .and_then(|digits| digits.parse::<u8>().ok())
+                    {
+                        return Some(size / 8);
+                    }
                     if let Some(size) =
                         self.infer_atomic_pseudo_call_result_size(args).filter(|_| {
                             matches!(
@@ -2987,8 +3205,15 @@ impl SignatureRecovery {
                         },
                     ));
                 } else {
-                    sig.parameters
-                        .push(Parameter::from_float_register(idx, reg));
+                    let size = self.observed_float_register_size(idx, reg).unwrap_or(8);
+                    sig.parameters.push(Parameter::new(
+                        format!("farg{}", idx),
+                        Self::float_param_type_for_size(size),
+                        ParameterLocation::FloatRegister {
+                            name: reg.to_string(),
+                            index: idx,
+                        },
+                    ));
                 }
             }
         }
@@ -3009,11 +3234,7 @@ impl SignatureRecovery {
                     _ => ParamType::SignedInt(32),
                 };
             } else if self.float_return {
-                sig.return_type = match self.return_size {
-                    0..=4 => ParamType::Float(32),
-                    5..=8 => ParamType::Float(64),
-                    size => ParamType::Float(size * 8),
-                };
+                sig.return_type = Self::float_param_type_for_size(self.return_size);
             } else if self.return_is_pointer && self.return_size == 8 {
                 // Return value is a pointer
                 sig.return_type = ParamType::Pointer;
@@ -3393,6 +3614,7 @@ mod tests {
         assert_eq!(ParamType::Float(32).to_c_string(), "float");
         assert_eq!(ParamType::Float(64).to_c_string(), "double");
         assert_eq!(ParamType::Float(80).to_c_string(), "long double");
+        assert_eq!(ParamType::SimdFloat(32).to_c_string(), "__m256");
         assert_eq!(ParamType::Pointer.to_c_string(), "void*");
         let fp = ParamType::FunctionPointer {
             return_type: Box::new(ParamType::SignedInt(32)),
@@ -4267,6 +4489,7 @@ mod tests {
         assert_eq!(ParamType::Float(32).size(), 4);
         assert_eq!(ParamType::Float(64).size(), 8);
         assert_eq!(ParamType::Float(80).size(), 10);
+        assert_eq!(ParamType::SimdFloat(32).size(), 32);
         assert_eq!(ParamType::Pointer.size(), 8);
         assert_eq!(
             ParamType::FunctionPointer {
@@ -5871,6 +6094,162 @@ mod tests {
         let fparam = Parameter::from_float_register(0, "xmm0");
         assert_eq!(fparam.name, "farg0");
         assert_eq!(fparam.param_type, ParamType::Float(64));
+    }
+
+    #[test]
+    fn test_signature_recovery_infers_float32_for_addss() {
+        use crate::decompiler::expression::Expr;
+        use hexray_core::{
+            register::x86, Architecture, BasicBlockId, Instruction, Operand, Operation, Register,
+            RegisterClass,
+        };
+
+        let xmm0 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM0,
+            128,
+        );
+        let xmm1 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM1,
+            128,
+        );
+        let addss = Instruction::new(0x1000, 4, vec![0xf3, 0x0f, 0x58, 0xc1], "addss")
+            .with_operation(Operation::Add)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Register(xmm1)]);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::from_instruction(&addss)],
+            address_range: (0x1000, 0x1004),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.return_type, ParamType::Float(32));
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(sig.parameters[0].param_type, ParamType::Float(32));
+        assert_eq!(sig.parameters[1].param_type, ParamType::Float(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_treats_explicit_float_binop_return_as_float() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: Vec::new(),
+            address_range: (0x1000, 0x1000),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::binop(
+                    BinOpKind::Add,
+                    Expr::var(Variable::reg("farg0", 4)),
+                    Expr::var(Variable::reg("farg1", 4)),
+                ))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.return_type, ParamType::Float(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_treats_unknown_scalar_return_register_as_float() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::assign(
+                Expr::var(Variable::reg("xmm0", 4)),
+                Expr::binop(
+                    BinOpKind::Add,
+                    Expr::var(Variable::reg("xmm2", 4)),
+                    Expr::binop(
+                        BinOpKind::Mul,
+                        Expr::var(Variable::reg("xmm0", 4)),
+                        Expr::var(Variable::reg("xmm1", 4)),
+                    ),
+                ),
+            )],
+            address_range: (0x1000, 0x1000),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(Some(Expr::unknown("xmm0")))],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.return_type, ParamType::Float(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_treats_unknown_ymm_return_as_m256() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: Vec::new(),
+            address_range: (0x1000, 0x1000),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(Some(Expr::unknown("ymm0")))],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.return_type, ParamType::SimdFloat(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_matches_unresolved_float_return_to_observed_arg_width() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("tmp0"), Expr::var(Variable::reg("xmm0", 4))),
+                Expr::assign(Expr::unknown("tmp1"), Expr::var(Variable::reg("xmm1", 4))),
+                Expr::assign(Expr::unknown("tmp2"), Expr::var(Variable::reg("xmm2", 4))),
+            ],
+            address_range: (0x1000, 0x1000),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::binop(
+                    BinOpKind::Add,
+                    Expr::unknown("farg2"),
+                    Expr::binop(
+                        BinOpKind::Mul,
+                        Expr::unknown("farg0"),
+                        Expr::unknown("farg1"),
+                    ),
+                ))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.return_type, ParamType::Float(32));
     }
 
     #[test]

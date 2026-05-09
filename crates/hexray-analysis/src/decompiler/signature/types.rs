@@ -402,6 +402,8 @@ pub enum ParamType {
     Float(u8),
     /// x86 integer SIMD value passed in an XMM register.
     SimdInt128,
+    /// Floating SIMD value passed in an XMM/YMM/ZMM register.
+    SimdFloat(u8),
     /// Function pointer type.
     FunctionPointer {
         /// Return type of the callback.
@@ -435,6 +437,10 @@ impl ParamType {
             ParamType::Float(80) => "long double".to_string(),
             ParamType::Float(_) => "double".to_string(),
             ParamType::SimdInt128 => "__m128i".to_string(),
+            ParamType::SimdFloat(16) => "__m128".to_string(),
+            ParamType::SimdFloat(32) => "__m256".to_string(),
+            ParamType::SimdFloat(64) => "__m512".to_string(),
+            ParamType::SimdFloat(_) => "__m128".to_string(),
             ParamType::FunctionPointer {
                 return_type,
                 params,
@@ -486,6 +492,7 @@ impl ParamType {
             ParamType::SignedInt(64) | ParamType::UnsignedInt(64) | ParamType::Float(64) => 8,
             ParamType::SignedInt(n) | ParamType::UnsignedInt(n) | ParamType::Float(n) => *n / 8,
             ParamType::SimdInt128 => 16,
+            ParamType::SimdFloat(size) => *size,
             ParamType::FunctionPointer { .. } => 8,
         }
     }

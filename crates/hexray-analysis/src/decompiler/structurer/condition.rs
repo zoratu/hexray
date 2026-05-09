@@ -121,6 +121,37 @@ fn is_flag_setting_instruction(inst: &Instruction) -> bool {
     }
 }
 
+fn x86_float_compare_binop(cond: Condition, inst: &Instruction) -> Option<BinOpKind> {
+    let mnemonic = inst.mnemonic.to_ascii_lowercase();
+    if !matches!(
+        mnemonic.as_str(),
+        "comiss"
+            | "ucomiss"
+            | "comisd"
+            | "ucomisd"
+            | "vcomiss"
+            | "vucomiss"
+            | "vcomisd"
+            | "vucomisd"
+    ) {
+        return None;
+    }
+
+    Some(match cond {
+        Condition::Equal => BinOpKind::Eq,
+        Condition::NotEqual => BinOpKind::Ne,
+        Condition::Above => BinOpKind::Gt,
+        Condition::AboveOrEqual => BinOpKind::Ge,
+        Condition::Below => BinOpKind::Lt,
+        Condition::BelowOrEqual => BinOpKind::Le,
+        Condition::Greater => BinOpKind::Gt,
+        Condition::GreaterOrEqual => BinOpKind::Ge,
+        Condition::Less => BinOpKind::Lt,
+        Condition::LessOrEqual => BinOpKind::Le,
+        _ => return None,
+    })
+}
+
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
 /// Also substitutes register names with their values from preceding MOV instructions.
 pub(super) fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
@@ -213,6 +244,8 @@ fn condition_to_expr_before_address_with_fallback(
     }
 
     let lift_condition_from_inst = |inst: &Instruction, reg_values: &HashMap<String, Expr>| {
+        let cmp_op = x86_float_compare_binop(cond, inst).unwrap_or(op);
+
         if matches!(inst.operation, Operation::Neg) && !inst.operands.is_empty() {
             let operand = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
@@ -336,16 +369,16 @@ fn condition_to_expr_before_address_with_fallback(
             );
 
             if matches!(inst.operation, Operation::Test) && inst.operands[0] == inst.operands[1] {
-                return Some(Expr::binop(op, left, Expr::int(0)));
+                return Some(Expr::binop(cmp_op, left, Expr::int(0)));
             }
 
-            return Some(Expr::binop(op, left, right));
+            return Some(Expr::binop(cmp_op, left, right));
         } else if inst.operands.len() == 1 {
             let left = substitute_register_in_expr(
                 Expr::from_operand_with_inst(&inst.operands[0], inst),
                 reg_values,
             );
-            return Some(Expr::binop(op, left, Expr::int(0)));
+            return Some(Expr::binop(cmp_op, left, Expr::int(0)));
         }
 
         None
@@ -1305,5 +1338,33 @@ mod tests {
             !rendered.contains("+ 2"),
             "expected SETcc lowering to ignore later flag clobbers, got {rendered}"
         );
+    }
+
+    #[test]
+    fn test_float_compare_maps_ja_to_gt_after_vcomiss() {
+        use hexray_core::register::x86;
+
+        let xmm0 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM0,
+            128,
+        );
+        let xmm1 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM1,
+            128,
+        );
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x6000);
+        block.instructions.push(
+            Instruction::new(0x6000, 4, vec![], "vcomiss")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(xmm1), Operand::Register(xmm0)]),
+        );
+
+        let rendered = format!("{}", condition_to_expr_with_block(Condition::Above, &block));
+        assert_eq!(rendered, "xmm1 > xmm0");
     }
 }

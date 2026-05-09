@@ -1017,15 +1017,152 @@ impl Expr {
         }
     }
 
+    fn x86_scalar_float_lane_size(inst: &Instruction) -> Option<u8> {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        if mnemonic.ends_with("ss") {
+            Some(4)
+        } else if mnemonic.ends_with("sd") {
+            Some(8)
+        } else {
+            None
+        }
+    }
+
+    fn scalar_x86_simd_register_expr(reg: &Register, inst: &Instruction) -> Option<Self> {
+        let size_bytes = Self::x86_scalar_float_lane_size(inst)?;
+
+        let name = reg.name().to_ascii_lowercase();
+        if !(name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm")) {
+            return None;
+        }
+
+        Some(Self::var(Variable::reg(reg.name(), size_bytes)))
+    }
+
     /// Converts an operand to an expression with instruction context.
     /// This properly handles RIP-relative memory accesses by computing the absolute address.
     pub fn from_operand_with_inst(op: &Operand, inst: &Instruction) -> Self {
         match op {
-            Operand::Register(reg) => Self::var(Variable::from_register(reg)),
+            Operand::Register(reg) => Self::scalar_x86_simd_register_expr(reg, inst)
+                .unwrap_or_else(|| Self::var(Variable::from_register(reg))),
             Operand::Immediate(imm) => Self::int(imm.value),
             Operand::Memory(mem) => Self::from_memory_with_context(mem, inst, false),
             Operand::PcRelative { target, .. } => Self::int(*target as i128),
         }
+    }
+
+    fn x86_vector_float_call_name(inst: &Instruction, base: &str, dst: &Operand) -> Option<String> {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        let suffix = if mnemonic.ends_with("ps") {
+            "ps"
+        } else if mnemonic.ends_with("pd") {
+            "pd"
+        } else {
+            return None;
+        };
+
+        let Operand::Register(reg) = dst else {
+            return None;
+        };
+        let width_bytes = (reg.size / 8) as u8;
+        if width_bytes <= 8 {
+            return None;
+        }
+
+        let ty = match width_bytes {
+            16 => "__m128",
+            32 => "__m256",
+            64 => "__m512",
+            _ => return None,
+        };
+        Some(format!("{ty}_{base}_{suffix}"))
+    }
+
+    fn x86_vector_float_binop(inst: &Instruction, ops: &[Operand], base: &str) -> Option<Self> {
+        let call_name = Self::x86_vector_float_call_name(inst, base, ops.first()?)?;
+        let dst = Self::from_operand_with_inst(ops.first()?, inst);
+        let args = if ops.len() >= 3 {
+            vec![
+                Self::from_operand_with_inst(&ops[1], inst),
+                Self::from_operand_with_inst(&ops[2], inst),
+            ]
+        } else if ops.len() == 2 {
+            vec![dst.clone(), Self::from_operand_with_inst(&ops[1], inst)]
+        } else {
+            return None;
+        };
+
+        Some(Self::assign(
+            dst,
+            Self::call(CallTarget::Named(call_name), args),
+        ))
+    }
+
+    fn x86_scalar_minmax_expr(inst: &Instruction) -> Option<Self> {
+        let call_name = match inst.mnemonic.to_ascii_lowercase().as_str() {
+            "minss" | "vminss" => "fminf",
+            "minsd" | "vminsd" => "fmin",
+            "maxss" | "vmaxss" => "fmaxf",
+            "maxsd" | "vmaxsd" => "fmax",
+            _ => return None,
+        };
+        let ops = &inst.operands;
+        let dst = Self::from_operand_with_inst(ops.first()?, inst);
+        let args = if ops.len() >= 3 {
+            vec![
+                Self::from_operand_with_inst(&ops[1], inst),
+                Self::from_operand_with_inst(&ops[2], inst),
+            ]
+        } else if ops.len() == 2 {
+            vec![dst.clone(), Self::from_operand_with_inst(&ops[1], inst)]
+        } else {
+            return None;
+        };
+
+        Some(Self::assign(
+            dst,
+            Self::call(CallTarget::Named(call_name.to_string()), args),
+        ))
+    }
+
+    fn x86_vector_minmax_expr(inst: &Instruction) -> Option<Self> {
+        let base = match inst.mnemonic.to_ascii_lowercase().as_str() {
+            "minps" | "vminps" | "minpd" | "vminpd" => "min",
+            "maxps" | "vmaxps" | "maxpd" | "vmaxpd" => "max",
+            _ => return None,
+        };
+        Self::x86_vector_float_binop(inst, &inst.operands, base)
+    }
+
+    fn x86_fma_expr(inst: &Instruction) -> Option<Self> {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        if !mnemonic.starts_with("vfmadd") || inst.operands.len() < 3 {
+            return None;
+        }
+
+        let dst = Self::from_operand_with_inst(&inst.operands[0], inst);
+        let src0 = dst.clone();
+        let src1 = Self::from_operand_with_inst(&inst.operands[1], inst);
+        let src2 = Self::from_operand_with_inst(&inst.operands[2], inst);
+
+        let (mul_lhs, mul_rhs, addend) = if mnemonic.contains("132") {
+            (src0, src2, src1)
+        } else if mnemonic.contains("213") {
+            (src0, src1, src2)
+        } else if mnemonic.contains("231") {
+            (src1, src2, src0)
+        } else {
+            return None;
+        };
+
+        Some(Self::assign(
+            dst,
+            Self::binop(
+                BinOpKind::Add,
+                Self::binop(BinOpKind::Mul, mul_lhs, mul_rhs),
+                addend,
+            ),
+        ))
     }
 
     fn address_register_expr(reg: &Register, forced_size_bytes: Option<u8>) -> Self {
@@ -1431,16 +1568,16 @@ impl Expr {
                     let lhs = if let Operand::Memory(mem) = &ops[0] {
                         Self::from_memory_with_context(mem, inst, true)
                     } else {
-                        Self::from_operand(&ops[0])
+                        Self::from_operand_with_inst(&ops[0], inst)
                     };
                     let rhs = if let Operand::Memory(mem) = &ops[1] {
                         Self::from_memory_with_context(mem, inst, false)
                     } else {
-                        Self::from_operand(&ops[1])
+                        Self::from_operand_with_inst(&ops[1], inst)
                     };
                     Self::assign(lhs, rhs)
                 } else if ops.len() == 1 {
-                    Self::from_operand(&ops[0])
+                    Self::from_operand_with_inst(&ops[0], inst)
                 } else {
                     Self::unknown(&inst.mnemonic)
                 }
@@ -1450,16 +1587,25 @@ impl Expr {
                     // ARM64 ldp: load pair [reg1, reg2, mem]
                     // Just load into first register (second is typically x30/link register)
                     // This is used in epilogue (ldp x29, x30, [sp + X])
-                    Self::assign(Self::from_operand(&ops[0]), Self::from_operand(&ops[2]))
+                    Self::assign(
+                        Self::from_operand_with_inst(&ops[0], inst),
+                        Self::from_operand_with_inst(&ops[2], inst),
+                    )
                 } else if ops.len() >= 2 {
-                    Self::assign(Self::from_operand(&ops[0]), Self::from_operand(&ops[1]))
+                    Self::assign(
+                        Self::from_operand_with_inst(&ops[0], inst),
+                        Self::from_operand_with_inst(&ops[1], inst),
+                    )
                 } else {
                     Self::unknown(&inst.mnemonic)
                 }
             }
             Operation::Store => {
                 if ops.len() >= 2 {
-                    Self::assign(Self::from_operand(&ops[1]), Self::from_operand(&ops[0]))
+                    Self::assign(
+                        Self::from_operand_with_inst(&ops[1], inst),
+                        Self::from_operand_with_inst(&ops[0], inst),
+                    )
                 } else {
                     Self::unknown(&inst.mnemonic)
                 }
@@ -1734,6 +1880,13 @@ impl Expr {
                 }
             }
             Operation::Other(_) => {
+                if let Some(expr) = Self::x86_fma_expr(inst)
+                    .or_else(|| Self::x86_scalar_minmax_expr(inst))
+                    .or_else(|| Self::x86_vector_minmax_expr(inst))
+                {
+                    return expr;
+                }
+
                 let mnem_lower = inst.mnemonic.to_lowercase();
 
                 // Handle ARM64 bitfield operations
@@ -2306,6 +2459,16 @@ impl Expr {
     }
 
     fn make_binop(inst: &Instruction, ops: &[Operand], op: BinOpKind, mnemonic: &str) -> Self {
+        if let Some(expr) = match op {
+            BinOpKind::Add => Self::x86_vector_float_binop(inst, ops, "add"),
+            BinOpKind::Sub => Self::x86_vector_float_binop(inst, ops, "sub"),
+            BinOpKind::Mul => Self::x86_vector_float_binop(inst, ops, "mul"),
+            BinOpKind::Div => Self::x86_vector_float_binop(inst, ops, "div"),
+            _ => None,
+        } {
+            return expr;
+        }
+
         if ops.len() >= 3 {
             // dest = src1 op src2
             Self::assign(
@@ -5401,6 +5564,93 @@ mod tests {
         let rendered = Expr::from_instruction(&inst).to_string();
 
         assert_eq!(rendered, "/* SSE: paddq */");
+    }
+
+    #[test]
+    fn test_addss_lifts_scalar_xmm_operands_as_32bit_values() {
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM0,
+            128,
+        );
+        let xmm1 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM1,
+            128,
+        );
+        let inst = Instruction::new(0x401020, 4, vec![0xf3, 0x0f, 0x58, 0xc1], "addss")
+            .with_operation(Operation::Add)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Register(xmm1)]);
+
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { lhs, rhs } = expr.kind else {
+            panic!("expected assignment");
+        };
+        let ExprKind::Var(lhs_var) = lhs.kind else {
+            panic!("expected scalar xmm destination");
+        };
+        assert_eq!(lhs_var.size, 4);
+
+        let ExprKind::BinOp { left, right, .. } = rhs.kind else {
+            panic!("expected binary rhs");
+        };
+        let ExprKind::Var(left_var) = left.kind else {
+            panic!("expected lhs operand var");
+        };
+        let ExprKind::Var(right_var) = right.kind else {
+            panic!("expected rhs operand var");
+        };
+        assert_eq!(left_var.size, 4);
+        assert_eq!(right_var.size, 4);
+    }
+
+    #[test]
+    fn test_vfmadd132ss_lifts_to_mul_add_expression() {
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM0,
+            128,
+        );
+        let xmm1 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM1,
+            128,
+        );
+        let xmm2 = Register::new(
+            Architecture::X86_64,
+            RegisterClass::FloatingPoint,
+            x86::XMM2,
+            128,
+        );
+        let inst = Instruction::new(
+            0x401030,
+            5,
+            vec![0xc4, 0xe2, 0x69, 0x99, 0xc1],
+            "vfmadd132ss",
+        )
+        .with_operation(Operation::Other(0x99))
+        .with_operands(vec![
+            Operand::Register(xmm0),
+            Operand::Register(xmm2),
+            Operand::Register(xmm1),
+        ]);
+
+        assert_eq!(
+            Expr::from_instruction(&inst).to_string(),
+            "xmm0 = xmm0 * xmm1 + xmm2"
+        );
     }
 
     #[test]
