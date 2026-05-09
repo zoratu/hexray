@@ -403,7 +403,7 @@ fn build_register_value_map_with_options(
     before_addr: Option<u64>,
     track_alu_updates: bool,
 ) -> HashMap<String, Expr> {
-    use super::super::expression::{VarKind, Variable};
+    use super::super::expression::{ExprKind, VarKind, Variable};
     use hexray_core::Operand;
 
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
@@ -454,11 +454,15 @@ fn build_register_value_map_with_options(
             // First operand is destination (register), second is source
             if let Operand::Register(dst_reg) = &inst.operands[0] {
                 let dst_name = dst_reg.name().to_lowercase();
+                let substituted_src = substitute_register_in_expr(
+                    Expr::from_operand_with_inst(&inst.operands[1], inst),
+                    &reg_values,
+                )
+                .simplify();
 
                 // Check if source is a memory operand (stack variable or global)
                 if let Operand::Memory { .. } = &inst.operands[1] {
-                    let value = Expr::from_operand_with_inst(&inst.operands[1], inst);
-                    insert_register_value_aliases(&mut reg_values, &dst_name, value);
+                    insert_register_value_aliases(&mut reg_values, &dst_name, substituted_src);
                     at_block_start = false;
                 }
                 // Check for return value capture: mov dest, ret_reg at block start or after call
@@ -466,6 +470,7 @@ fn build_register_value_map_with_options(
                 // Only substitute if destination is a callee-saved register (indicating
                 // the value is being preserved across calls, not just temporarily stored)
                 else if at_block_start || saw_call {
+                    let mut handled_return_capture = false;
                     if let Operand::Register(src_reg) = &inst.operands[1] {
                         let src_name = src_reg.name().to_lowercase();
                         // Return registers: eax/rax (x86-64), x0/w0 (ARM64)
@@ -476,9 +481,9 @@ fn build_register_value_map_with_options(
                             if is_callee_saved_register(&dst_name) {
                                 // Map the return register to the destination variable
                                 // So `eax` in conditions becomes `ebx` when we have `mov ebx, eax`
-                                let dest_var = super::super::expression::Variable {
+                                let dest_var = Variable {
                                     name: dst_name.clone(),
-                                    kind: super::super::expression::VarKind::Register(dst_reg.id),
+                                    kind: VarKind::Register(dst_reg.id),
                                     size: (dst_reg.size / 8) as u8,
                                 };
                                 insert_register_value_aliases(
@@ -489,10 +494,49 @@ fn build_register_value_map_with_options(
                             }
                             at_block_start = false;
                             saw_call = false;
+                            handled_return_capture = true;
                         }
                     }
+                    if !handled_return_capture {
+                        insert_register_value_aliases(&mut reg_values, &dst_name, substituted_src);
+                        at_block_start = false;
+                    }
+                } else {
+                    insert_register_value_aliases(&mut reg_values, &dst_name, substituted_src);
+                    at_block_start = false;
                 }
             }
+        }
+
+        if matches!(inst.operation, Operation::ConditionalMove) && inst.operands.len() >= 2 {
+            if let Operand::Register(dst_reg) = &inst.operands[0] {
+                let dst_name = dst_reg.name().to_lowercase();
+                let current = reg_values
+                    .get(&dst_name)
+                    .cloned()
+                    .unwrap_or_else(|| Expr::from_operand_with_inst(&inst.operands[0], inst));
+                let src = substitute_register_in_expr(
+                    Expr::from_operand_with_inst(&inst.operands[1], inst),
+                    &reg_values,
+                )
+                .simplify();
+
+                if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
+                    let cond_expr =
+                        condition_to_expr_before_address(cond, block, Some(inst.address));
+                    let value = Expr {
+                        kind: ExprKind::Conditional {
+                            cond: Box::new(cond_expr),
+                            then_expr: Box::new(src),
+                            else_expr: Box::new(current),
+                        },
+                    }
+                    .simplify();
+                    insert_register_value_aliases(&mut reg_values, &dst_name, value);
+                }
+            }
+            at_block_start = false;
+            saw_call = false;
         }
 
         // Look for LDR instructions (ARM64): ldr reg, [sp, #offset]
@@ -526,7 +570,7 @@ fn build_register_value_map_with_options(
                     insert_register_value_aliases(
                         &mut reg_values,
                         &dst_name,
-                        Expr::binop(binop, current, rhs),
+                        Expr::binop(binop, current, rhs).simplify(),
                     );
                 }
             }
@@ -1160,6 +1204,73 @@ mod tests {
         assert!(
             !rendered.contains("signed_gt"),
             "expected real comparison instead of placeholder, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_tracks_cmove_boolean_wrapper_through_test() {
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 64);
+        let rdx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 64);
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x5000);
+        block.instructions.push(
+            Instruction::new(0x5000, 10, vec![], "movabs")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rdx),
+                    Operand::imm(i64::MIN as i128, 64),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x500a, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rax), Operand::imm_unsigned(1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x500f, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(rcx), Operand::Register(rcx)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x5011, 7, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rsp, 0x100, 8)),
+                    Operand::Register(rdx),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x5018, 4, vec![], "cmove")
+                .with_operation(Operation::ConditionalMove)
+                .with_operands(vec![Operand::Register(rax), Operand::Register(rcx)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x501c, 4, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(rax), Operand::imm_unsigned(1, 32)]),
+        );
+
+        let reg_values = build_register_value_map_with_options(&block, Some(0x501c), true);
+        let Some(rax_value) = reg_values.get("rax") else {
+            panic!("expected rax value to be tracked through cmove");
+        };
+        assert_eq!(
+            format!("{rax_value}"),
+            "rsp[0x20] == -0x8000000000000000 ? 0 : 1"
+        );
+
+        let expr = condition_to_expr_with_block(Condition::NotEqual, &block).simplify();
+        let rendered = format!("{expr}");
+        assert!(
+            rendered.contains("== -0x8000000000000000")
+                || rendered.contains("!= -0x8000000000000000"),
+            "expected cmove/test wrapper to collapse back to a direct compare, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("== 1"),
+            "expected no boolean-compare chain after cmove/test lowering, got {rendered}"
         );
     }
 

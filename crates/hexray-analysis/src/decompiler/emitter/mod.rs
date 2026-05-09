@@ -4130,11 +4130,19 @@ impl PseudoCodeEmitter {
                 }
             }
             ExprKind::UnaryOp { op, operand } => {
-                format!(
-                    "{}{}",
-                    op.as_str(),
-                    self.format_expr_with_strings(operand, table)
-                )
+                let operand_text = self.format_expr_with_strings(operand, table);
+                let needs_parens = matches!(
+                    operand.kind,
+                    ExprKind::BinOp { .. }
+                        | ExprKind::Assign { .. }
+                        | ExprKind::CompoundAssign { .. }
+                        | ExprKind::Conditional { .. }
+                );
+                if needs_parens {
+                    format!("{}({})", op.as_str(), operand_text)
+                } else {
+                    format!("{}{}", op.as_str(), operand_text)
+                }
             }
             ExprKind::Deref { addr, size } => {
                 // Special case: nested dereferences rooted at libc globals.

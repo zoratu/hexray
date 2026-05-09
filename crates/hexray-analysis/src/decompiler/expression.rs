@@ -702,6 +702,14 @@ impl Expr {
                     return cast;
                 }
 
+                let (left, right) = normalize_small_cast_comparison_operands(op, left, right);
+
+                if let Some(simplified) =
+                    try_simplify_conditional_boolean_comparison(&left, op, &right)
+                {
+                    return simplified;
+                }
+
                 // Bit field extraction pattern: (x >> start) & mask
                 // becomes BITS(x, start, width) where width = popcount(mask)
                 if let Some(bitfield) = try_match_bitfield_extraction(&left, op, &right) {
@@ -3141,6 +3149,16 @@ fn try_simplify_boolean_comparison(left: &Expr, op: BinOpKind, right: &Expr) -> 
         return None;
     };
 
+    let (cmp_expr, cmp_already_negated) = if let ExprKind::UnaryOp {
+        op: UnaryOpKind::LogicalNot,
+        operand,
+    } = &cmp_expr.kind
+    {
+        (operand.as_ref(), true)
+    } else {
+        (cmp_expr, false)
+    };
+
     // The comparison expression must be a comparison operator
     if let ExprKind::BinOp {
         op: inner_op,
@@ -3157,8 +3175,9 @@ fn try_simplify_boolean_comparison(left: &Expr, op: BinOpKind, right: &Expr) -> 
         // - (cmp) != 1 → negate
         // - (cmp) == 0 → negate
         // - (cmp) != 0 → identity (don't negate)
-        let should_negate =
-            (op == BinOpKind::Eq && const_val == 0) || (op == BinOpKind::Ne && const_val == 1);
+        let should_negate = ((op == BinOpKind::Eq && const_val == 0)
+            || (op == BinOpKind::Ne && const_val == 1))
+            ^ cmp_already_negated;
 
         if should_negate {
             // Negate the comparison
@@ -3179,6 +3198,109 @@ fn try_simplify_boolean_comparison(left: &Expr, op: BinOpKind, right: &Expr) -> 
     } else {
         None
     }
+}
+
+fn try_simplify_conditional_boolean_comparison(
+    left: &Expr,
+    op: BinOpKind,
+    right: &Expr,
+) -> Option<Expr> {
+    if op != BinOpKind::Eq && op != BinOpKind::Ne {
+        return None;
+    }
+
+    let (conditional, cmp_value) = match (&left.kind, &right.kind) {
+        (ExprKind::Conditional { .. }, ExprKind::IntLit(n)) if *n == 0 || *n == 1 => (left, *n),
+        (ExprKind::IntLit(n), ExprKind::Conditional { .. }) if *n == 0 || *n == 1 => (right, *n),
+        _ => return None,
+    };
+
+    let ExprKind::Conditional {
+        cond,
+        then_expr,
+        else_expr,
+    } = &conditional.kind
+    else {
+        return None;
+    };
+    let ExprKind::IntLit(then_val) = then_expr.kind else {
+        return None;
+    };
+    let ExprKind::IntLit(else_val) = else_expr.kind else {
+        return None;
+    };
+    if !matches!(then_val, 0 | 1) || !matches!(else_val, 0 | 1) {
+        return None;
+    }
+
+    let true_result = match op {
+        BinOpKind::Eq => then_val == cmp_value,
+        BinOpKind::Ne => then_val != cmp_value,
+        _ => unreachable!(),
+    };
+    let false_result = match op {
+        BinOpKind::Eq => else_val == cmp_value,
+        BinOpKind::Ne => else_val != cmp_value,
+        _ => unreachable!(),
+    };
+
+    match (true_result, false_result) {
+        (true, true) => Some(Expr::int(1)),
+        (false, false) => Some(Expr::int(0)),
+        (true, false) => Some((**cond).clone()),
+        (false, true) => Some((**cond).clone().negate().simplify()),
+    }
+}
+
+fn normalize_small_cast_comparison_operands(
+    op: BinOpKind,
+    left: Expr,
+    right: Expr,
+) -> (Expr, Expr) {
+    if !op.is_comparison() {
+        return (left, right);
+    }
+
+    if let Some(normalized) = normalize_small_cast_literal(&left, &right) {
+        return (left, Expr::int(normalized));
+    }
+    if let Some(normalized) = normalize_small_cast_literal(&right, &left) {
+        return (Expr::int(normalized), right);
+    }
+
+    (left, right)
+}
+
+fn normalize_small_cast_literal(cast_expr: &Expr, literal_expr: &Expr) -> Option<i128> {
+    let ExprKind::Cast {
+        to_size, signed, ..
+    } = &cast_expr.kind
+    else {
+        return None;
+    };
+    if *to_size >= 8 {
+        return None;
+    }
+
+    let ExprKind::IntLit(n) = literal_expr.kind else {
+        return None;
+    };
+
+    let bits = u32::from(*to_size) * 8;
+    let mask = (1_i128 << bits) - 1;
+    let masked = n & mask;
+    let normalized = if *signed {
+        let sign_bit = 1_i128 << (bits - 1);
+        if (masked & sign_bit) != 0 {
+            masked | !mask
+        } else {
+            masked
+        }
+    } else {
+        masked
+    };
+
+    (normalized != n).then_some(normalized)
 }
 
 /// Attempts to detect compound assignment patterns.
@@ -3774,6 +3896,66 @@ mod tests {
                 assert!(matches!(right.kind, ExprKind::IntLit(1)));
             }
             _ => panic!("Expected BinOp, got {:?}", simplified.kind),
+        }
+
+        // !((uint8_t)tag == INT64_MIN) == 1 → (uint8_t)tag != 0
+        let cast = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(Expr::unknown("tag")),
+                to_size: 1,
+                signed: false,
+            },
+        };
+        let weird_cmp = Expr::binop(BinOpKind::Eq, cast, Expr::int(i64::MIN as i128));
+        let expr = Expr::binop(
+            BinOpKind::Eq,
+            Expr::unary(UnaryOpKind::LogicalNot, weird_cmp),
+            Expr::int(1),
+        );
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BinOp { op, left, right } => {
+                assert_eq!(*op, BinOpKind::Ne);
+                assert!(matches!(
+                    left.kind,
+                    ExprKind::Cast {
+                        to_size: 1,
+                        signed: false,
+                        ..
+                    }
+                ));
+                assert!(matches!(right.kind, ExprKind::IntLit(0)));
+            }
+            _ => panic!("Expected normalized BinOp, got {:?}", simplified.kind),
+        }
+
+        // (cmp ? 0 : 1) != 0 → !cmp
+        let expr = Expr::binop(
+            BinOpKind::Ne,
+            Expr {
+                kind: ExprKind::Conditional {
+                    cond: Box::new(Expr::binop(
+                        BinOpKind::Eq,
+                        Expr::unknown("tag"),
+                        Expr::int(0),
+                    )),
+                    then_expr: Box::new(Expr::int(0)),
+                    else_expr: Box::new(Expr::int(1)),
+                },
+            },
+            Expr::int(0),
+        );
+        let simplified = expr.simplify();
+        match &simplified.kind {
+            ExprKind::BinOp { op, left, right } => {
+                assert_eq!(*op, BinOpKind::Ne);
+                assert!(matches!(left.kind, ExprKind::Unknown(ref s) if s == "tag"));
+                assert!(matches!(right.kind, ExprKind::IntLit(0)));
+            }
+            _ => panic!(
+                "Expected conditional boolean wrapper to collapse to a comparison, got {:?}",
+                simplified.kind
+            ),
         }
     }
 
