@@ -1794,11 +1794,15 @@ fn resolve_xref_target_addresses(
     }
 
     let has_refs = |addr: u64| {
-        if calls_only {
-            !db.call_refs_to(addr).is_empty()
-        } else {
-            !db.refs_to(addr).is_empty()
-        }
+        xref_query_target_addresses(fmt, symbols, addr)
+            .into_iter()
+            .any(|query_addr| {
+                if calls_only {
+                    !db.call_refs_to(query_addr).is_empty()
+                } else {
+                    !db.refs_to(query_addr).is_empty()
+                }
+            })
     };
     let matching_symbols = collect_xref_symbol_matches(symbols, target);
 
@@ -1832,6 +1836,42 @@ fn resolve_xref_target_addresses(
         ResolvedAnalysisTarget::Address(address) => address,
         ResolvedAnalysisTarget::Symbol(symbol) => symbol.address,
     }])
+}
+
+fn xref_query_target_addresses(
+    fmt: &dyn BinaryFormat,
+    symbols: &[hexray_core::Symbol],
+    addr: u64,
+) -> Vec<u64> {
+    let mut addresses = vec![addr];
+    if let Some(address_point) = maybe_itanium_vtable_address_point(fmt, symbols, addr) {
+        if !addresses.contains(&address_point) {
+            addresses.push(address_point);
+        }
+    }
+    addresses
+}
+
+fn maybe_itanium_vtable_address_point(
+    fmt: &dyn BinaryFormat,
+    symbols: &[hexray_core::Symbol],
+    addr: u64,
+) -> Option<u64> {
+    let is_vtable_base = fmt
+        .symbol_at(addr)
+        .into_iter()
+        .chain(symbols.iter().filter(|symbol| symbol.address == addr))
+        .any(|symbol| symbol.name.starts_with("_ZTV"));
+    if !is_vtable_base {
+        return None;
+    }
+
+    let address_point_offset = match fmt.architecture() {
+        Architecture::X86 | Architecture::RiscV32 => 8,
+        Architecture::X86_64 | Architecture::Arm64 | Architecture::RiscV64 => 16,
+        _ => return None,
+    };
+    addr.checked_add(address_point_offset)
 }
 
 fn disassemble_symbol(fmt: &dyn BinaryFormat, name: &str, max_count: usize) -> Result<()> {
@@ -4879,14 +4919,16 @@ fn build_xrefs(
         let mut refs = Vec::new();
         let mut seen_refs = std::collections::HashSet::new();
         for target_addr in &target_addrs {
-            let target_refs: Vec<_> = if calls_only {
-                db.call_refs_to(*target_addr).into_iter().cloned().collect()
-            } else {
-                db.refs_to(*target_addr).to_vec()
-            };
-            for xref in target_refs {
-                if seen_refs.insert((xref.from, xref.to, xref.xref_type)) {
-                    refs.push(xref);
+            for query_addr in xref_query_target_addresses(fmt, &symbols, *target_addr) {
+                let target_refs: Vec<_> = if calls_only {
+                    db.call_refs_to(query_addr).into_iter().cloned().collect()
+                } else {
+                    db.refs_to(query_addr).to_vec()
+                };
+                for xref in target_refs {
+                    if seen_refs.insert((xref.from, xref.to, xref.xref_type)) {
+                        refs.push(xref);
+                    }
                 }
             }
         }
@@ -7604,6 +7646,61 @@ mod tests {
 
         assert_eq!(name, "sub_1060");
         assert_eq!(offset, Some(0xc));
+    }
+
+    #[test]
+    fn xrefs_consider_itanium_vtable_address_point_for_symbol_queries() {
+        let binary = TestBinary {
+            sections: Vec::new(),
+            symbols: vec![Symbol {
+                name: "_ZTV6Circle".to_string(),
+                address: 0x402060,
+                size: 0x30,
+                kind: SymbolKind::Object,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            }],
+            entry_point: None,
+        };
+        let mut db = hexray_analysis::XrefDatabase::new();
+        db.add_xref(0x401500, 0x402070, XrefType::DataWrite);
+
+        let resolved = resolve_xref_target_addresses(
+            &binary,
+            None,
+            "_ZTV6Circle",
+            &binary.symbols,
+            &db,
+            false,
+        )
+        .expect("vtable base query should resolve");
+
+        assert_eq!(resolved, vec![0x402060]);
+        assert_eq!(
+            super::xref_query_target_addresses(&binary, &binary.symbols, resolved[0]),
+            vec![0x402060, 0x402070]
+        );
+    }
+
+    #[test]
+    fn xrefs_consider_itanium_vtable_address_point_for_address_queries() {
+        let binary = TestBinary {
+            sections: Vec::new(),
+            symbols: vec![Symbol {
+                name: "_ZTV6Circle".to_string(),
+                address: 0x402060,
+                size: 0x30,
+                kind: SymbolKind::Object,
+                binding: SymbolBinding::Global,
+                section_index: Some(1),
+            }],
+            entry_point: None,
+        };
+
+        assert_eq!(
+            super::xref_query_target_addresses(&binary, &binary.symbols, 0x402060),
+            vec![0x402060, 0x402070]
+        );
     }
 
     #[test]
