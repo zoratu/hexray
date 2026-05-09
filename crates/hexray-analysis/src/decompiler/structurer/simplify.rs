@@ -2691,13 +2691,15 @@ fn propagate_args_in_block_with_binary_data(
     let mut arg_values: HashMap<String, (usize, Expr)> = HashMap::new();
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
     let mut call_target_values: HashMap<String, Expr> = HashMap::new();
+    let mut stack_slot_values: HashMap<String, Expr> = HashMap::new();
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for (i, stmt) in statements.into_iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             let substituted_lhs = substitute_assignment_lhs(lhs, &reg_values);
-            let tracked_rhs = substitute_vars(rhs, &reg_values);
+            let tracked_rhs =
+                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
 
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
@@ -2705,6 +2707,10 @@ fn propagate_args_in_block_with_binary_data(
                 invalidate_dependent_register_values(&mut reg_values, &written_aliases);
                 invalidate_dependent_arg_values(&mut arg_values, &written_aliases);
                 invalidate_written_call_target_values(&mut call_target_values, &written_aliases);
+                invalidate_dependent_stack_slot_values(&mut stack_slot_values, &written_aliases);
+                if aliases_include_stack_base(&written_aliases) {
+                    stack_slot_values.clear();
+                }
 
                 if is_temp_register(&v.name) {
                     for alias in &written_aliases {
@@ -2735,6 +2741,14 @@ fn propagate_args_in_block_with_binary_data(
                     result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
                 }
+            }
+
+            if let Some(slot_key) = stack_slot_key(&substituted_lhs) {
+                let stabilized_rhs = stabilize_saved_arg_registers(tracked_rhs);
+                stack_slot_values.insert(slot_key, stabilized_rhs.clone());
+                forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
+                result.push(Expr::assign(substituted_lhs, stabilized_rhs));
+                continue;
             }
 
             if let ExprKind::Call { target, args } = &rhs.kind {
@@ -2793,7 +2807,8 @@ fn propagate_args_in_block_with_binary_data(
 
         if let ExprKind::CompoundAssign { op, lhs, rhs } = &stmt.kind {
             let substituted_lhs = substitute_assignment_lhs(lhs, &reg_values);
-            let tracked_rhs = substitute_vars(rhs, &reg_values);
+            let tracked_rhs =
+                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
 
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
@@ -2801,6 +2816,10 @@ fn propagate_args_in_block_with_binary_data(
                 invalidate_dependent_register_values(&mut reg_values, &written_aliases);
                 invalidate_dependent_arg_values(&mut arg_values, &written_aliases);
                 invalidate_written_call_target_values(&mut call_target_values, &written_aliases);
+                invalidate_dependent_stack_slot_values(&mut stack_slot_values, &written_aliases);
+                if aliases_include_stack_base(&written_aliases) {
+                    stack_slot_values.clear();
+                }
 
                 if is_temp_register(&v.name) {
                     let current = reg_values
@@ -2933,6 +2952,22 @@ fn invalidate_written_call_target_values(
     call_target_values.retain(|alias, _| !written_aliases.contains(alias));
 }
 
+fn invalidate_dependent_stack_slot_values(
+    stack_slot_values: &mut HashMap<String, Expr>,
+    written_aliases: &HashSet<String>,
+) {
+    stack_slot_values.retain(|_, expr| !expr_uses_any_register_alias(expr, written_aliases));
+}
+
+fn aliases_include_stack_base(written_aliases: &HashSet<String>) -> bool {
+    written_aliases.iter().any(|alias| {
+        matches!(
+            alias.as_str(),
+            "sp" | "rsp" | "esp" | "rbp" | "ebp" | "bp" | "x29" | "fp"
+        )
+    })
+}
+
 fn track_call_result_aliases(
     result_expr: &Expr,
     reg_values: &mut HashMap<String, Expr>,
@@ -2960,6 +2995,307 @@ fn invalidate_dependent_arg_values(
     arg_values.retain(|alias, (_, expr)| {
         !written_aliases.contains(alias) && !expr_uses_any_register_alias(expr, written_aliases)
     });
+}
+
+fn substitute_stack_slot_values(expr: Expr, stack_slot_values: &HashMap<String, Expr>) -> Expr {
+    use super::super::expression::ExprKind;
+
+    match expr.kind {
+        ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => expr,
+        ExprKind::Deref { addr, size } => {
+            let deref = Expr::deref(substitute_stack_slot_values(*addr, stack_slot_values), size);
+            if let Some(key) = stack_slot_key(&deref) {
+                if let Some(value) = stack_slot_values.get(&key) {
+                    return value.clone();
+                }
+            }
+            deref
+        }
+        ExprKind::BinOp { op, left, right } => Expr::binop(
+            op,
+            substitute_stack_slot_values(*left, stack_slot_values),
+            substitute_stack_slot_values(*right, stack_slot_values),
+        ),
+        ExprKind::UnaryOp { op, operand } => Expr::unary(
+            op,
+            substitute_stack_slot_values(*operand, stack_slot_values),
+        ),
+        ExprKind::Assign { lhs, rhs } => Expr::assign(
+            substitute_stack_slot_values(*lhs, stack_slot_values),
+            substitute_stack_slot_values(*rhs, stack_slot_values),
+        ),
+        ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
+            kind: ExprKind::CompoundAssign {
+                op,
+                lhs: Box::new(substitute_stack_slot_values(*lhs, stack_slot_values)),
+                rhs: Box::new(substitute_stack_slot_values(*rhs, stack_slot_values)),
+            },
+        },
+        ExprKind::AddressOf(inner) => {
+            Expr::address_of(substitute_stack_slot_values(*inner, stack_slot_values))
+        }
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => Expr::array_access(
+            substitute_stack_slot_values(*base, stack_slot_values),
+            substitute_stack_slot_values(*index, stack_slot_values),
+            element_size,
+        ),
+        ExprKind::FieldAccess {
+            base,
+            field_name,
+            offset,
+        } => Expr::field_access(
+            substitute_stack_slot_values(*base, stack_slot_values),
+            field_name,
+            offset,
+        ),
+        ExprKind::Call { target, args } => Expr::call(
+            substitute_call_target_stack_slots(target, stack_slot_values),
+            args.into_iter()
+                .map(|arg| substitute_stack_slot_values(arg, stack_slot_values))
+                .collect(),
+        ),
+        ExprKind::Cast {
+            expr: inner,
+            to_size,
+            signed,
+        } => Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(substitute_stack_slot_values(*inner, stack_slot_values)),
+                to_size,
+                signed,
+            },
+        },
+        ExprKind::BitField {
+            expr: inner,
+            start,
+            width,
+        } => Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(substitute_stack_slot_values(*inner, stack_slot_values)),
+                start,
+                width,
+            },
+        },
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr {
+            kind: ExprKind::Conditional {
+                cond: Box::new(substitute_stack_slot_values(*cond, stack_slot_values)),
+                then_expr: Box::new(substitute_stack_slot_values(*then_expr, stack_slot_values)),
+                else_expr: Box::new(substitute_stack_slot_values(*else_expr, stack_slot_values)),
+            },
+        },
+        ExprKind::Phi(args) => Expr {
+            kind: ExprKind::Phi(
+                args.into_iter()
+                    .map(|arg| substitute_stack_slot_values(arg, stack_slot_values))
+                    .collect(),
+            ),
+        },
+        ExprKind::GotRef {
+            address,
+            instruction_address,
+            size,
+            display_expr,
+            is_deref,
+        } => Expr {
+            kind: ExprKind::GotRef {
+                address,
+                instruction_address,
+                size,
+                display_expr: Box::new(substitute_stack_slot_values(
+                    *display_expr,
+                    stack_slot_values,
+                )),
+                is_deref,
+            },
+        },
+    }
+}
+
+fn substitute_call_target_stack_slots(
+    target: CallTarget,
+    stack_slot_values: &HashMap<String, Expr>,
+) -> CallTarget {
+    match target {
+        CallTarget::Indirect(expr) => CallTarget::Indirect(Box::new(substitute_stack_slot_values(
+            *expr,
+            stack_slot_values,
+        ))),
+        CallTarget::IndirectGot { got_address, expr } => CallTarget::IndirectGot {
+            got_address,
+            expr: Box::new(substitute_stack_slot_values(*expr, stack_slot_values)),
+        },
+        other => other,
+    }
+}
+
+fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
+    use super::super::expression::ExprKind;
+
+    match expr.kind {
+        ExprKind::Var(v) => get_arg_register_index(&v.name)
+            .map(|index| Expr::unknown(format!("arg{}", index)))
+            .unwrap_or_else(|| Expr::var(v)),
+        ExprKind::Unknown(_) | ExprKind::IntLit(_) => expr,
+        ExprKind::Deref { addr, size } => Expr::deref(stabilize_saved_arg_registers(*addr), size),
+        ExprKind::BinOp { op, left, right } => Expr::binop(
+            op,
+            stabilize_saved_arg_registers(*left),
+            stabilize_saved_arg_registers(*right),
+        ),
+        ExprKind::UnaryOp { op, operand } => {
+            Expr::unary(op, stabilize_saved_arg_registers(*operand))
+        }
+        ExprKind::Assign { lhs, rhs } => Expr::assign(
+            stabilize_saved_arg_registers(*lhs),
+            stabilize_saved_arg_registers(*rhs),
+        ),
+        ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
+            kind: ExprKind::CompoundAssign {
+                op,
+                lhs: Box::new(stabilize_saved_arg_registers(*lhs)),
+                rhs: Box::new(stabilize_saved_arg_registers(*rhs)),
+            },
+        },
+        ExprKind::AddressOf(inner) => Expr::address_of(stabilize_saved_arg_registers(*inner)),
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => Expr::array_access(
+            stabilize_saved_arg_registers(*base),
+            stabilize_saved_arg_registers(*index),
+            element_size,
+        ),
+        ExprKind::FieldAccess {
+            base,
+            field_name,
+            offset,
+        } => Expr::field_access(stabilize_saved_arg_registers(*base), field_name, offset),
+        ExprKind::Call { target, args } => Expr::call(
+            stabilize_saved_arg_call_target(target),
+            args.into_iter()
+                .map(stabilize_saved_arg_registers)
+                .collect(),
+        ),
+        ExprKind::Cast {
+            expr: inner,
+            to_size,
+            signed,
+        } => Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(stabilize_saved_arg_registers(*inner)),
+                to_size,
+                signed,
+            },
+        },
+        ExprKind::BitField {
+            expr: inner,
+            start,
+            width,
+        } => Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(stabilize_saved_arg_registers(*inner)),
+                start,
+                width,
+            },
+        },
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => Expr {
+            kind: ExprKind::Conditional {
+                cond: Box::new(stabilize_saved_arg_registers(*cond)),
+                then_expr: Box::new(stabilize_saved_arg_registers(*then_expr)),
+                else_expr: Box::new(stabilize_saved_arg_registers(*else_expr)),
+            },
+        },
+        ExprKind::Phi(args) => Expr {
+            kind: ExprKind::Phi(
+                args.into_iter()
+                    .map(stabilize_saved_arg_registers)
+                    .collect(),
+            ),
+        },
+        ExprKind::GotRef {
+            address,
+            instruction_address,
+            size,
+            display_expr,
+            is_deref,
+        } => Expr {
+            kind: ExprKind::GotRef {
+                address,
+                instruction_address,
+                size,
+                display_expr: Box::new(stabilize_saved_arg_registers(*display_expr)),
+                is_deref,
+            },
+        },
+    }
+}
+
+fn stabilize_saved_arg_call_target(target: CallTarget) -> CallTarget {
+    match target {
+        CallTarget::Indirect(expr) => {
+            CallTarget::Indirect(Box::new(stabilize_saved_arg_registers(*expr)))
+        }
+        CallTarget::IndirectGot { got_address, expr } => CallTarget::IndirectGot {
+            got_address,
+            expr: Box::new(stabilize_saved_arg_registers(*expr)),
+        },
+        other => other,
+    }
+}
+
+fn stack_slot_key(expr: &Expr) -> Option<String> {
+    let super::super::expression::ExprKind::Deref { addr, .. } = &expr.kind else {
+        return None;
+    };
+    stack_slot_address_key(addr)
+}
+
+fn stack_slot_address_key(addr: &Expr) -> Option<String> {
+    use super::super::expression::ExprKind;
+
+    match &addr.kind {
+        ExprKind::Var(var) if is_stack_slot_base_register(&var.name) => {
+            Some(format!("{}:{:+}", var.name.to_lowercase(), 0))
+        }
+        ExprKind::BinOp { op, left, right } => {
+            let ExprKind::Var(base) = &left.kind else {
+                return None;
+            };
+            if !is_stack_slot_base_register(&base.name) {
+                return None;
+            }
+            let ExprKind::IntLit(offset) = &right.kind else {
+                return None;
+            };
+            let actual_offset = match op {
+                BinOpKind::Add => *offset,
+                BinOpKind::Sub => -*offset,
+                _ => return None,
+            };
+            Some(format!("{}:{:+}", base.name.to_lowercase(), actual_offset))
+        }
+        _ => None,
+    }
+}
+
+fn is_stack_slot_base_register(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sp" | "rsp" | "esp" | "rbp" | "ebp" | "bp" | "x29" | "fp"
+    )
 }
 
 fn expr_uses_any_register_alias(expr: &Expr, aliases: &HashSet<String>) -> bool {
@@ -6073,6 +6409,44 @@ mod tests {
         let propagated = propagate_args_in_block(statements);
         assert_eq!(format!("{}", propagated[2]), "rdx = edi * 4");
         assert_eq!(format!("{}", propagated[4]), "rcx = edi * 4 + rsi");
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_saved_arm64_param_from_stack_slot() {
+        let sp_slot = Expr::deref(reg("sp", 8), 8);
+        let statements = vec![
+            Expr::assign(sp_slot.clone(), reg("x0", 8)),
+            Expr::assign(reg("x0", 8), Expr::int(0x1b8)),
+            Expr::call(CallTarget::Named("helper".to_string()), vec![]),
+            Expr::assign(reg("x8", 8), sp_slot),
+            Expr::assign(
+                reg("w8", 4),
+                Expr::deref(
+                    Expr::binop(BinOpKind::Add, reg("x8", 8), Expr::int(0x1f0)),
+                    1,
+                ),
+            ),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let final_read = format!(
+            "{}",
+            propagated
+                .last()
+                .expect("expected propagated stack-slot reload to remain present")
+        );
+        assert!(
+            final_read.contains("arg0"),
+            "expected saved parameter to flow into reload, got {final_read}"
+        );
+        assert!(
+            !final_read.contains("*(uint64_t*)(sp)"),
+            "expected stack slot reload to be substituted, got {final_read}"
+        );
+        assert!(
+            final_read.contains("[0x1f0]"),
+            "expected the original page offset to survive propagation, got {final_read}"
+        );
     }
 
     #[test]
