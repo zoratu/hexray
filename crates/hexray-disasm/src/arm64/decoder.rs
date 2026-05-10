@@ -2133,6 +2133,11 @@ impl Arm64Disassembler {
             return self.decode_add_sub_extended_reg(insn, address, bytes);
         }
 
+        // Conditional compare
+        if op1 == 1 && op2 == 0b0010 {
+            return self.decode_cond_compare(insn, address, bytes);
+        }
+
         // Data processing (2 source)
         if op1 == 1 && op2 == 0b0110 {
             return self.decode_dp_2source(insn, address, bytes);
@@ -2373,6 +2378,56 @@ impl Arm64Disassembler {
             } else {
                 Operation::Add
             })
+            .with_operands(operands);
+
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
+    }
+
+    /// Decode conditional compare (CCMN, CCMP).
+    fn decode_cond_compare(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let sf = (insn >> 31) & 1 == 1;
+        let op = (insn >> 30) & 1;
+        let s = (insn >> 29) & 1;
+        let rm_or_imm5 = ((insn >> 16) & 0x1F) as u16;
+        let cond = ((insn >> 12) & 0xF) as u8;
+        let compare_mode = ((insn >> 10) & 0x3) as u8;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let op0 = (insn >> 4) & 1;
+        let nzcv = (insn & 0xF) as u64;
+
+        if s != 1 || op0 != 0 {
+            return self.decode_unknown(insn, address, bytes);
+        }
+
+        let mnemonic = if op == 0 { "ccmn" } else { "ccmp" };
+        let (cond_str, _) = decode_condition(cond);
+        let src1 = if sf { Self::xreg(rn) } else { Self::wreg(rn) };
+
+        let mut operands = vec![Operand::reg(src1)];
+        match compare_mode {
+            0b00 => {
+                let src2 = if sf {
+                    Self::xreg(rm_or_imm5)
+                } else {
+                    Self::wreg(rm_or_imm5)
+                };
+                operands.push(Operand::reg(src2));
+            }
+            0b10 => operands.push(Operand::imm_unsigned(rm_or_imm5 as u64, 5)),
+            _ => return self.decode_unknown(insn, address, bytes),
+        }
+        operands.push(Operand::imm_unsigned(nzcv, 4));
+
+        let inst = Instruction::new(address, 4, bytes, format!("{}.{}", mnemonic, cond_str))
+            .with_operation(Operation::Compare)
             .with_operands(operands);
 
         Ok(DecodedInstruction {
@@ -4027,6 +4082,62 @@ mod tests {
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "ldaddh");
         assert_eq!(result.instruction.operation, Operation::AtomicAdd);
+    }
+
+    #[test]
+    fn test_ccmp_register_decode() {
+        let disasm = Arm64Disassembler::new();
+        // CCMP X27, X24, #0, LS: 0xFA589360
+        let bytes = [0x60, 0x93, 0x58, 0xFA];
+        let result = disasm.decode_instruction(&bytes, 0x2184).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ccmp.ls");
+        assert_eq!(result.instruction.operation, Operation::Compare);
+        assert_eq!(result.instruction.operands.len(), 3);
+        assert_eq!(format!("{}", result.instruction.operands[0]), "x27");
+        assert_eq!(format!("{}", result.instruction.operands[1]), "x24");
+        assert_eq!(format!("{}", result.instruction.operands[2]), "0x0");
+    }
+
+    #[test]
+    fn test_ccmp_immediate_decode() {
+        let disasm = Arm64Disassembler::new();
+        // CCMP X27, #24, #0, LS: 0xFA589B60
+        let bytes = [0x60, 0x9B, 0x58, 0xFA];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ccmp.ls");
+        assert_eq!(result.instruction.operation, Operation::Compare);
+        assert_eq!(result.instruction.operands.len(), 3);
+        assert_eq!(format!("{}", result.instruction.operands[0]), "x27");
+        assert_eq!(format!("{}", result.instruction.operands[1]), "0x18");
+        assert_eq!(format!("{}", result.instruction.operands[2]), "0x0");
+    }
+
+    #[test]
+    fn test_ccmn_immediate_decode() {
+        let disasm = Arm64Disassembler::new();
+        // CCMN W1, #7, #3, NE: 0x3A471823
+        let bytes = [0x23, 0x18, 0x47, 0x3A];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ccmn.ne");
+        assert_eq!(result.instruction.operation, Operation::Compare);
+        assert_eq!(result.instruction.operands.len(), 3);
+        assert_eq!(format!("{}", result.instruction.operands[0]), "w1");
+        assert_eq!(format!("{}", result.instruction.operands[1]), "0x7");
+        assert_eq!(format!("{}", result.instruction.operands[2]), "0x3");
+    }
+
+    #[test]
+    fn test_ccmn_register_decode() {
+        let disasm = Arm64Disassembler::new();
+        // CCMN X2, X9, #8, HI: 0xBA498048
+        let bytes = [0x48, 0x80, 0x49, 0xBA];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ccmn.hi");
+        assert_eq!(result.instruction.operation, Operation::Compare);
+        assert_eq!(result.instruction.operands.len(), 3);
+        assert_eq!(format!("{}", result.instruction.operands[0]), "x2");
+        assert_eq!(format!("{}", result.instruction.operands[1]), "x9");
+        assert_eq!(format!("{}", result.instruction.operands[2]), "0x8");
     }
 
     // SVE (Scalable Vector Extension) tests
