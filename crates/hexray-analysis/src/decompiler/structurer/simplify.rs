@@ -60,7 +60,8 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
 
     // First pass: build a map of temp register values for substitution
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
-    for stmt in &statements {
+    let mut substituted_assignments: HashMap<usize, Expr> = HashMap::new();
+    for (stmt_idx, stmt) in statements.iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             if let ExprKind::Var(v) = &lhs.kind {
                 if is_temp_register(&v.name)
@@ -69,7 +70,11 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                 {
                     // Substitute known values in RHS before storing
                     let substituted_rhs = substitute_vars(rhs, &reg_values);
-                    if expr_requires_single_evaluation(&substituted_rhs) {
+                    substituted_assignments.insert(stmt_idx, substituted_rhs.clone());
+                    invalidate_clobbered_register_mappings(&mut reg_values, &v.name);
+                    if expr_requires_single_evaluation(&substituted_rhs)
+                        && !expr_is_pure_stack_slot_expression(&substituted_rhs)
+                    {
                         reg_values.remove(&v.name);
                     } else {
                         reg_values.insert(v.name.clone(), substituted_rhs);
@@ -109,9 +114,10 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     // Use the fully substituted value from reg_values if available,
                     // otherwise substitute the RHS directly
                     return_value = Some(
-                        reg_values
-                            .get(&v.name)
+                        substituted_assignments
+                            .get(&i)
                             .cloned()
+                            .or_else(|| reg_values.get(&v.name).cloned())
                             .unwrap_or_else(|| substitute_vars(rhs, &reg_values)),
                     );
                     indices_to_remove.push(i);
@@ -3185,6 +3191,29 @@ fn propagate_args_in_block_with_state(
 
     for (i, stmt) in statements.into_iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let ExprKind::Var(rhs_var) = &rhs.kind {
+                if is_return_register(&rhs_var.name) {
+                    if let Some(Expr {
+                        kind: ExprKind::Call { target, args },
+                    }) = result.last().cloned()
+                    {
+                        if is_real_function_call(&target) {
+                            let merged_assign =
+                                Expr::assign((**lhs).clone(), Expr::call(target, args));
+                            result.pop();
+                            let merged = propagate_args_in_block_with_state(
+                                vec![merged_assign],
+                                state,
+                                binary_data,
+                                preferred_family,
+                            );
+                            result.extend(merged);
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let substituted_lhs = substitute_assignment_lhs(lhs, &state.reg_values);
             let tracked_rhs = substitute_stack_slot_values(
                 substitute_vars(rhs, &state.reg_values),
@@ -3245,10 +3274,18 @@ fn propagate_args_in_block_with_state(
 
                     // Preserve copies of incoming ABI arguments even if the source
                     // registers get reused later in the setup sequence.
-                    state.arg_values.insert(
-                        v.name.to_lowercase(),
-                        (Some(i), stabilize_saved_arg_registers(tracked_rhs.clone())),
-                    );
+                    let tracked_arg_value = match &tracked_rhs.kind {
+                        ExprKind::Call { target, .. } if is_real_function_call(target) => {
+                            call_result_placeholder_expr(preferred_family, &v.name, v.size)
+                                .unwrap_or_else(|| {
+                                    stabilize_saved_arg_registers(tracked_rhs.clone())
+                                })
+                        }
+                        _ => stabilize_saved_arg_registers(tracked_rhs.clone()),
+                    };
+                    state
+                        .arg_values
+                        .insert(v.name.to_lowercase(), (Some(i), tracked_arg_value));
                     result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
                 }
@@ -3294,6 +3331,7 @@ fn propagate_args_in_block_with_state(
                             args,
                             &state.arg_values,
                             &excluded_arg_regs,
+                            binary_data,
                             preferred_family,
                         );
                         if recovered_args.0.len() != args.len() || !recovered_args.1.is_empty() {
@@ -3434,6 +3472,7 @@ fn propagate_args_in_block_with_state(
                     args,
                     &state.arg_values,
                     &excluded_arg_regs,
+                    binary_data,
                     preferred_family,
                 );
                 if (new_args.0.len() != args.len() || !new_args.1.is_empty()) && !args.is_empty() {
@@ -3912,6 +3951,44 @@ fn is_stack_slot_base_register(name: &str) -> bool {
     )
 }
 
+fn expr_is_pure_stack_slot_expression(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Deref { .. } => stack_slot_key(expr).is_some(),
+        ExprKind::IntLit(_) | ExprKind::Var(_) | ExprKind::Unknown(_) => true,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_is_pure_stack_slot_expression(left) && expr_is_pure_stack_slot_expression(right),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_is_pure_stack_slot_expression(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_is_pure_stack_slot_expression(base) && expr_is_pure_stack_slot_expression(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_is_pure_stack_slot_expression(base),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_is_pure_stack_slot_expression(cond)
+                && expr_is_pure_stack_slot_expression(then_expr)
+                && expr_is_pure_stack_slot_expression(else_expr)
+        }
+        ExprKind::Phi(values) => values.iter().all(expr_is_pure_stack_slot_expression),
+        ExprKind::Call { .. } | ExprKind::GotRef { .. } => false,
+    }
+}
+
 fn expr_uses_any_register_alias(expr: &Expr, aliases: &HashSet<String>) -> bool {
     use super::super::expression::ExprKind;
 
@@ -4304,14 +4381,31 @@ fn builtin_call_type_database() -> &'static TypeDatabase {
 
 fn known_call_signature(
     target: &super::super::expression::CallTarget,
+    binary_data: Option<&BinaryDataContext>,
 ) -> Option<KnownCallSignature> {
-    let super::super::expression::CallTarget::Named(name) = target else {
-        return None;
-    };
-    let proto = builtin_call_type_database().get_function(normalize_known_call_name(name))?;
+    if let super::super::expression::CallTarget::Named(name) = target {
+        if let Some(proto) =
+            builtin_call_type_database().get_function(normalize_known_call_name(name))
+        {
+            return Some(KnownCallSignature {
+                fixed_arg_count: proto.parameters.len(),
+                variadic: proto.variadic,
+            });
+        }
+    }
+
+    let hinted_arg_count = match target {
+        super::super::expression::CallTarget::Named(name) => {
+            binary_data?.call_signature_hint_by_name(name)
+        }
+        super::super::expression::CallTarget::Direct { target, .. } => {
+            binary_data?.call_signature_hint_by_address(*target)
+        }
+        _ => None,
+    }?;
     Some(KnownCallSignature {
-        fixed_arg_count: proto.parameters.len(),
-        variadic: proto.variadic,
+        fixed_arg_count: hinted_arg_count,
+        variadic: false,
     })
 }
 
@@ -4320,9 +4414,10 @@ fn extract_call_arguments_with_indices(
     existing_args: &[Expr],
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
     excluded_regs: &HashSet<String>,
+    binary_data: Option<&BinaryDataContext>,
     preferred_family: Option<ArgumentAbiFamily>,
 ) -> (Vec<Expr>, Vec<usize>) {
-    let signature = target.and_then(known_call_signature);
+    let signature = target.and_then(|target| known_call_signature(target, binary_data));
     let mut args: Vec<(usize, Option<usize>, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
     let mut removable_indices = Vec::new();
 
@@ -4356,6 +4451,33 @@ fn extract_call_arguments_with_indices(
         .map(|(arg_idx, stmt_idx, value)| (arg_idx, (stmt_idx, value)))
         .collect();
     let Some(max_idx) = explicit_by_index.keys().copied().max() else {
+        if let Some(sig) = signature {
+            if sig.fixed_arg_count == 0 {
+                return (existing_args.to_vec(), removable_indices);
+            }
+            let Some(family) = infer_argument_abi_family(
+                excluded_regs
+                    .iter()
+                    .map(String::as_str)
+                    .chain(arg_values.keys().map(String::as_str)),
+            )
+            .or(preferred_family) else {
+                return (existing_args.to_vec(), removable_indices);
+            };
+            let start_idx = existing_args.len();
+            let end_idx = sig.fixed_arg_count.saturating_sub(1);
+            let mut result = existing_args.to_vec();
+            for expected_idx in start_idx..=end_idx {
+                let Some(reg_name) = pass_through_arg_register_name(family, expected_idx) else {
+                    break;
+                };
+                if excluded_regs.contains(reg_name) {
+                    continue;
+                }
+                result.push(pass_through_arg_expr(reg_name));
+            }
+            return (result, removable_indices);
+        }
         return (existing_args.to_vec(), removable_indices);
     };
 
@@ -4531,6 +4653,39 @@ fn pass_through_arg_register_name(family: ArgumentAbiFamily, index: usize) -> Op
 
 fn pass_through_arg_expr(reg_name: &str) -> Expr {
     Expr::var(super::super::expression::Variable::reg(reg_name, 8))
+}
+
+fn call_result_placeholder_expr(
+    preferred_family: Option<ArgumentAbiFamily>,
+    dest_reg_name: &str,
+    dest_reg_size: u8,
+) -> Option<Expr> {
+    let family = preferred_family.or_else(|| infer_argument_abi_family([dest_reg_name]))?;
+    let reg_name = match family {
+        ArgumentAbiFamily::X86_64SysV => {
+            if dest_reg_size <= 4 {
+                "eax"
+            } else {
+                "rax"
+            }
+        }
+        ArgumentAbiFamily::Aarch64 => {
+            if dest_reg_size <= 4 {
+                "w0"
+            } else {
+                "x0"
+            }
+        }
+        ArgumentAbiFamily::RiscV => "a0",
+    };
+    let reg_size = if matches!(reg_name, "eax" | "w0") {
+        4
+    } else {
+        8
+    };
+    Some(Expr::var(super::super::expression::Variable::reg(
+        reg_name, reg_size,
+    )))
 }
 
 fn pass_through_float_arg_register_name(
@@ -6576,6 +6731,32 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_return_value_keeps_secondary_snapshot_when_return_reg_is_overwritten() {
+        let statements = vec![
+            Expr::assign(reg("rdx", 4), reg("rax", 4)),
+            Expr::assign(reg("rax", 4), reg("rbx", 4)),
+            Expr::assign(
+                reg("rax", 4),
+                Expr::binop(BinOpKind::Sub, reg("rax", 4), reg("rdx", 4)),
+            ),
+        ];
+
+        let (filtered, return_value) = extract_return_value(statements);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|stmt| format!("{stmt}"))
+                .collect::<Vec<_>>(),
+            vec!["rdx = rax".to_string(), "rax = rbx".to_string()]
+        );
+        assert_eq!(
+            format!("{}", return_value.expect("return value")),
+            "rbx - rdx"
+        );
+    }
+
+    #[test]
     fn test_simplify_statements_keeps_register_value_live_into_following_return() {
         let nodes = vec![
             block(0, vec![Expr::assign(reg("eax", 4), Expr::int(7))]),
@@ -6837,12 +7018,33 @@ mod tests {
         let excluded = HashSet::from(["rdi".to_string()]);
 
         let (args, used_indices) =
-            extract_call_arguments_with_indices(None, &[], &arg_values, &excluded, None);
+            extract_call_arguments_with_indices(None, &[], &arg_values, &excluded, None, None);
 
         assert_eq!(used_indices, vec![0]);
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["&arg_local"]
+        );
+    }
+
+    #[test]
+    fn test_extract_call_arguments_uses_direct_callee_signature_hint_for_passthrough_arg() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_signature_hint_by_name("helper", 1);
+
+        let (args, used_indices) = extract_call_arguments_with_indices(
+            Some(&CallTarget::Named("helper".to_string())),
+            &[],
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+
+        assert!(used_indices.is_empty());
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rdi"]
         );
     }
 

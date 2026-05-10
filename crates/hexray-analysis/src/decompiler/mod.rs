@@ -117,6 +117,10 @@ pub struct CleanupInfo {
 pub struct BinaryDataContext {
     /// Pairs of (base_address, data) for each data section.
     sections: Vec<(u64, Vec<u8>)>,
+    /// Best-effort fixed-arity hints for direct/internal call targets keyed by name.
+    call_signature_hints_by_name: HashMap<String, usize>,
+    /// Best-effort fixed-arity hints for direct/internal call targets keyed by address.
+    call_signature_hints_by_address: HashMap<u64, usize>,
 }
 
 impl BinaryDataContext {
@@ -124,6 +128,8 @@ impl BinaryDataContext {
     pub fn new() -> Self {
         Self {
             sections: Vec::new(),
+            call_signature_hints_by_name: HashMap::new(),
+            call_signature_hints_by_address: HashMap::new(),
         }
     }
 
@@ -145,6 +151,32 @@ impl BinaryDataContext {
     /// Returns an iterator over all sections.
     pub fn sections(&self) -> impl Iterator<Item = &(u64, Vec<u8>)> {
         self.sections.iter()
+    }
+
+    /// Adds a fixed-arity hint for a call target name.
+    pub fn add_call_signature_hint_by_name(
+        &mut self,
+        name: impl Into<String>,
+        fixed_arg_count: usize,
+    ) {
+        self.call_signature_hints_by_name
+            .insert(name.into(), fixed_arg_count);
+    }
+
+    /// Adds a fixed-arity hint for a call target address.
+    pub fn add_call_signature_hint_by_address(&mut self, address: u64, fixed_arg_count: usize) {
+        self.call_signature_hints_by_address
+            .insert(address, fixed_arg_count);
+    }
+
+    /// Looks up a fixed-arity hint by call target name.
+    pub fn call_signature_hint_by_name(&self, name: &str) -> Option<usize> {
+        self.call_signature_hints_by_name.get(name).copied()
+    }
+
+    /// Looks up a fixed-arity hint by call target address.
+    pub fn call_signature_hint_by_address(&self, address: u64) -> Option<usize> {
+        self.call_signature_hints_by_address.get(&address).copied()
     }
 
     /// Returns true if the context contains no sections.

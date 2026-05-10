@@ -2906,6 +2906,107 @@ fn resolve_decompile_target_info(
     }
 }
 
+fn disassemble_function_for_cfg(
+    fmt: &dyn BinaryFormat,
+    address: u64,
+    max_bytes: usize,
+    stop_after_first_return: bool,
+) -> Result<Vec<hexray_core::Instruction>> {
+    let bytes = fmt
+        .bytes_at(address, max_bytes)
+        .context("Cannot read bytes")?;
+    match fmt.architecture() {
+        Architecture::X86_64 | Architecture::X86 => {
+            let disasm = X86_64Disassembler::new();
+            Ok(disassemble_for_cfg(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+            ))
+        }
+        Architecture::Arm64 => {
+            let disasm = Arm64Disassembler::new();
+            Ok(disassemble_for_cfg(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+            ))
+        }
+        Architecture::RiscV64 => {
+            let disasm = RiscVDisassembler::new();
+            Ok(disassemble_for_cfg(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+            ))
+        }
+        Architecture::RiscV32 => {
+            let disasm = RiscVDisassembler::new_rv32();
+            Ok(disassemble_for_cfg(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+            ))
+        }
+        arch => bail!("Unsupported architecture: {:?}", arch),
+    }
+}
+
+struct DirectCalleeSignatureSeedContext<'a> {
+    relocation_table: &'a RelocationTable,
+    symbol_table: &'a SymbolTable,
+    calling_convention: hexray_analysis::CallingConvention,
+    tls_access_targets: &'a [TlsAccessTarget],
+    tls_slot_map: &'a std::collections::HashMap<u64, u64>,
+}
+
+fn seed_direct_callee_signature_hints(
+    binary: &Binary,
+    instructions: &[hexray_core::Instruction],
+    binary_data_ctx: &mut BinaryDataContext,
+    seed_ctx: &DirectCalleeSignatureSeedContext<'_>,
+) {
+    let fmt = binary.as_format();
+    for (callee_addr, callee_name) in extract_internal_call_targets(instructions, fmt) {
+        let DecompileTargetInfo {
+            max_bytes,
+            stop_after_first_return,
+            ..
+        } = decompile_target_info_for_address(fmt, None, callee_addr);
+        let Ok(mut callee_instructions) =
+            disassemble_function_for_cfg(fmt, callee_addr, max_bytes, stop_after_first_return)
+        else {
+            continue;
+        };
+        apply_instruction_relocations(&mut callee_instructions, seed_ctx.relocation_table);
+        rewrite_tls_memory_operands(
+            &mut callee_instructions,
+            seed_ctx.tls_access_targets,
+            seed_ctx.tls_slot_map,
+        );
+        let callee_cfg = CfgBuilder::build_with_binary_context(
+            &callee_instructions,
+            callee_addr,
+            binary_data_ctx,
+        );
+        let signature = Decompiler::new()
+            .with_symbol_table(seed_ctx.symbol_table.clone())
+            .with_relocation_table(seed_ctx.relocation_table.clone())
+            .with_calling_convention(seed_ctx.calling_convention)
+            .recover_signature(&callee_cfg);
+        binary_data_ctx.add_call_signature_hint_by_address(callee_addr, signature.parameters.len());
+        binary_data_ctx.add_call_signature_hint_by_name(callee_name, signature.parameters.len());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decompile_function(
     binary_path: &Path,
@@ -2952,44 +3053,13 @@ fn decompile_function(
 
     println!("Decompiling {} at {:#x}\n", name, start_addr);
 
-    // Disassemble instructions
-    let bytes = fmt
-        .bytes_at(start_addr, max_bytes)
-        .context("Cannot read bytes")?;
-
     let arch = fmt.architecture();
-    let mut instructions = match arch {
-        Architecture::X86_64 | Architecture::X86 => {
-            let disasm = X86_64Disassembler::new();
-            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
-        }
-        Architecture::Arm64 => {
-            let disasm = Arm64Disassembler::new();
-            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
-        }
-        Architecture::RiscV64 => {
-            let disasm = RiscVDisassembler::new();
-            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
-        }
-        Architecture::RiscV32 => {
-            let disasm = RiscVDisassembler::new_rv32();
-            disassemble_for_cfg(&disasm, fmt, bytes, start_addr, stop_after_first_return)
-        }
-        _ => {
-            bail!("Unsupported architecture: {:?}", arch);
-        }
-    };
+    let mut instructions =
+        disassemble_function_for_cfg(fmt, start_addr, max_bytes, stop_after_first_return)?;
     apply_instruction_relocations(&mut instructions, &relocation_table);
     let tls_access_targets = build_tls_access_targets(binary);
     let tls_slot_map = build_tls_slot_map(binary);
     rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
-
-    // Build CFG
-    let binary_data_ctx = build_binary_data_context(fmt);
-    let cfg = CfgBuilder::build_with_binary_context(&instructions, start_addr, &binary_data_ctx);
-
-    // Build string table from data sections
-    let string_table = build_string_table(fmt);
 
     // Build symbol table for function names, merging with project overrides
     let mut symbol_table = build_symbol_table(binary);
@@ -3001,10 +3071,6 @@ fn decompile_function(
         }
     }
     let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
-    let binary_data_ctx = build_binary_data_context(fmt);
-
-    // Build relocation table for kernel modules
-    // Reuse the binary data context for jump table reconstruction.
 
     // Try to load DWARF debug info for function-scoped variable and parameter names.
     let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary_path, binary) {
@@ -3026,6 +3092,22 @@ fn decompile_function(
         },
         arch,
     );
+
+    let mut binary_data_ctx = build_binary_data_context(fmt);
+    let seed_ctx = DirectCalleeSignatureSeedContext {
+        relocation_table: &relocation_table,
+        symbol_table: &symbol_table,
+        calling_convention,
+        tls_access_targets: &tls_access_targets,
+        tls_slot_map: &tls_slot_map,
+    };
+    seed_direct_callee_signature_hints(binary, &instructions, &mut binary_data_ctx, &seed_ctx);
+
+    // Build CFG using both read-only section bytes and direct-callee signature hints.
+    let cfg = CfgBuilder::build_with_binary_context(&instructions, start_addr, &binary_data_ctx);
+
+    // Build string table from data sections
+    let string_table = build_string_table(fmt);
 
     let mut decompiler = Decompiler::new()
         .with_addresses(show_addresses)
