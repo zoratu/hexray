@@ -276,6 +276,13 @@ impl ConstantPropagator {
 
     fn propagate_expr(&mut self, expr: Expr) -> Expr {
         let folded = self.fold_expr(expr);
+        let has_call = expr_contains_call(&folded);
+
+        if has_call {
+            // Calls clobber caller-saved registers and may mutate memory, so
+            // any constants tracked before the call are stale afterward.
+            self.constants.clear();
+        }
 
         // Track constant assignments only for register and temp variables.
         // Stack, global, and argument variables are memory-backed and should
@@ -706,6 +713,43 @@ fn collect_modified_vars_in_expr(expr: &Expr, modified: &mut std::collections::H
     }
 }
 
+fn expr_contains_call(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Call { .. } => true,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_contains_call(left) || expr_contains_call(right),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_contains_call(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_contains_call(base) || expr_contains_call(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_contains_call(base),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_contains_call(cond)
+                || expr_contains_call(then_expr)
+                || expr_contains_call(else_expr)
+        }
+        ExprKind::Phi(values) => values.iter().any(expr_contains_call),
+        ExprKind::GotRef { display_expr, .. } => expr_contains_call(display_expr),
+        ExprKind::Var(_) | ExprKind::IntLit(_) | ExprKind::Unknown(_) => false,
+    }
+}
+
 /// Evaluates a binary operation on constants.
 fn eval_binop(op: BinOpKind, left: i128, right: i128) -> Option<i128> {
     match op {
@@ -933,6 +977,36 @@ mod tests {
         // Using the register variable should substitute
         let folded = prop.fold_expr(reg_var);
         assert!(matches!(folded.kind, ExprKind::IntLit(42)));
+    }
+
+    #[test]
+    fn test_call_invalidates_stale_register_constant() {
+        let mut prop = ConstantPropagator::new();
+        let ret = Expr::var(Variable {
+            name: "ret".to_string(),
+            kind: VarKind::Register(0),
+            size: 4,
+        });
+
+        prop.propagate_expr(Expr::assign(ret.clone(), Expr::int(0)));
+        prop.propagate_expr(Expr::call(
+            super::super::expression::CallTarget::Named("strtol".to_string()),
+            vec![Expr::unknown("err"), Expr::int(0), Expr::int(10)],
+        ));
+
+        let folded = prop.propagate_expr(Expr::call(
+            super::super::expression::CallTarget::Named("format_msg".to_string()),
+            vec![Expr::unknown("rsp"), ret.clone()],
+        ));
+        let ExprKind::Call { args, .. } = folded.kind else {
+            panic!("expected propagated call expression");
+        };
+
+        assert!(
+            matches!(args[1].kind, ExprKind::Var(ref v) if v.name == "ret"),
+            "post-call return alias should stay symbolic, got {:?}",
+            args[1]
+        );
     }
 
     #[test]
