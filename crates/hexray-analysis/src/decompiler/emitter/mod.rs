@@ -1841,6 +1841,11 @@ impl PseudoCodeEmitter {
         }
     }
 
+    fn is_guarded_stack_canary_branch(&self, condition: &Expr, body: &[StructuredNode]) -> bool {
+        Self::expr_mentions_stack_canary_guard(condition)
+            && is_stack_canary_check_body(body, self.symbol_table.as_ref())
+    }
+
     fn rewrite_small_aggregate_slots_for_emission(
         &self,
         nodes: &[StructuredNode],
@@ -7307,11 +7312,11 @@ impl PseudoCodeEmitter {
             } => {
                 // Skip stack canary check: if (check) { __stack_chk_fail(); }
                 // Check both then and else bodies since compiler may invert the condition
-                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                if self.is_guarded_stack_canary_branch(condition, then_body) {
                     return;
                 }
                 if let Some(else_nodes) = else_body {
-                    if is_stack_canary_check_body(else_nodes, self.symbol_table.as_ref()) {
+                    if self.is_guarded_stack_canary_branch(condition, else_nodes) {
                         return;
                     }
                 }
@@ -7478,11 +7483,11 @@ impl PseudoCodeEmitter {
             } => {
                 // Skip stack canary check: if (check) { __stack_chk_fail(); }
                 // Check both then and else bodies since compiler may invert the condition
-                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                if self.is_guarded_stack_canary_branch(condition, then_body) {
                     return;
                 }
                 if let Some(else_nodes) = else_body {
-                    if is_stack_canary_check_body(else_nodes, self.symbol_table.as_ref()) {
+                    if self.is_guarded_stack_canary_branch(condition, else_nodes) {
                         return;
                     }
                 }
@@ -7775,7 +7780,7 @@ impl PseudoCodeEmitter {
             } = &else_nodes[0]
             {
                 // Skip stack canary checks in else-if
-                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                if self.is_guarded_stack_canary_branch(condition, then_body) {
                     return;
                 }
 
@@ -7826,7 +7831,7 @@ impl PseudoCodeEmitter {
             } = &else_nodes[0]
             {
                 // Skip stack canary checks in else-if
-                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                if self.is_guarded_stack_canary_branch(condition, then_body) {
                     return;
                 }
 
@@ -8145,11 +8150,11 @@ impl PseudoCodeEmitter {
             } => {
                 // Skip stack canary check: if (check) { __stack_chk_fail(); }
                 // Check both then and else bodies since compiler may invert the condition
-                if is_stack_canary_check_body(then_body, self.symbol_table.as_ref()) {
+                if self.is_guarded_stack_canary_branch(condition, then_body) {
                     return;
                 }
                 if let Some(else_nodes) = else_body {
-                    if is_stack_canary_check_body(else_nodes, self.symbol_table.as_ref()) {
+                    if self.is_guarded_stack_canary_branch(condition, else_nodes) {
                         return;
                     }
                 }
@@ -8870,6 +8875,38 @@ mod tests {
         assert!(output.contains("y = 1"));
         assert!(output.contains("else"));
         assert!(output.contains("y = 2"));
+    }
+
+    #[test]
+    fn test_emit_user_authored_stack_chk_fail_branch_without_guard() {
+        let call = Expr::call(
+            CallTarget::Named("__stack_chk_fail".to_string()),
+            Vec::new(),
+        );
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::If {
+                condition: Expr::binop(BinOpKind::Ne, Expr::unknown("ret"), Expr::unknown("arg0")),
+                then_body: vec![StructuredNode::Block {
+                    id: hexray_core::BasicBlockId::new(1),
+                    statements: vec![call],
+                    address_range: (0x1000, 0x1005),
+                }],
+                else_body: Some(vec![StructuredNode::Return(Some(Expr::int(1)))]),
+            }],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "manual_sub_fail");
+
+        assert!(
+            output.contains("if (ret != arg0)"),
+            "user-authored fail branch should remain visible:\n{output}"
+        );
+        assert!(
+            output.contains("__stack_chk_fail"),
+            "user-authored fail call should not be elided:\n{output}"
+        );
     }
 
     #[test]
