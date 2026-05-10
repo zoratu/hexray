@@ -427,6 +427,15 @@ impl StructuredCfg {
             body = rewrite_known_noreturn_calls(body, &structurer.known_noreturn_targets);
         }
 
+        // Materialize folded condition call results early so later call-argument
+        // propagation can still see the producer when a branch body reuses the
+        // return register (for example, open() in an if-condition feeding read()).
+        if config.is_pass_enabled(OptimizationPass::ReturnValueMerge)
+            && body_contains_condition_call(&body)
+        {
+            body = merge_return_value_captures(body);
+        }
+
         // Post-process to propagate arguments into function calls (before copy propagation)
         if config.is_pass_enabled(OptimizationPass::CallArgPropagation) {
             body = propagate_call_args_with_binary_data_and_arch(
@@ -985,6 +994,16 @@ impl<'a> Structurer<'a> {
                     }
                 }
             }
+
+            if let ExprKind::Assign { lhs, rhs } = Expr::from_instruction(inst).kind {
+                if let ExprKind::Var(var) = lhs.kind {
+                    if abi::is_return_register(&var.name.to_lowercase()) {
+                        return_value = Some(*rhs);
+                        continue;
+                    }
+                }
+            }
+
             // Skip epilogue instructions and jump/ret
             if matches!(
                 inst.operation,
@@ -1005,6 +1024,23 @@ impl<'a> Structurer<'a> {
                     }
                 }
             }
+            if matches!(
+                inst.mnemonic.to_ascii_lowercase().as_str(),
+                "cbw"
+                    | "cwde"
+                    | "cdqe"
+                    | "cbtw"
+                    | "cwtl"
+                    | "cltq"
+                    | "cwd"
+                    | "cdq"
+                    | "cqo"
+                    | "cwtd"
+                    | "cltd"
+                    | "cqto"
+            ) {
+                continue;
+            }
             // Skip ARM64 ldp for callee-saved registers (x29, x30, etc.)
             if inst.mnemonic.to_lowercase() == "ldp" {
                 continue;
@@ -1013,8 +1049,13 @@ impl<'a> Structurer<'a> {
             return None;
         }
 
-        // Only return an expression when we saw an explicit return-register assignment.
-        return_value.or_else(|| self.implicit_return_register_expr_for_block(block.id))
+        let substituted_return_value = extract_return_value(self.block_to_statements(block.id)).1;
+
+        // Prefer the statement-level extraction when it can substitute earlier
+        // register copies into the final return expression (e.g. x86 idiv setup).
+        substituted_return_value
+            .or(return_value)
+            .or_else(|| self.implicit_return_register_expr_for_block(block.id))
     }
 
     /// Checks if a block is a cleanup block (just a call, no other logic).
@@ -4100,6 +4141,104 @@ fn attach_shared_return_to_branch(
     body
 }
 
+fn body_contains_condition_call(nodes: &[StructuredNode]) -> bool {
+    nodes.iter().any(node_contains_condition_call)
+}
+
+fn node_contains_condition_call(node: &StructuredNode) -> bool {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            expr_contains_real_call(condition)
+                || body_contains_condition_call(then_body)
+                || else_body
+                    .as_ref()
+                    .is_some_and(|body| body_contains_condition_call(body))
+        }
+        StructuredNode::While {
+            condition, body, ..
+        }
+        | StructuredNode::DoWhile {
+            condition, body, ..
+        } => expr_contains_real_call(condition) || body_contains_condition_call(body),
+        StructuredNode::For {
+            condition, body, ..
+        } => expr_contains_real_call(condition) || body_contains_condition_call(body),
+        StructuredNode::Loop { body, .. } | StructuredNode::Sequence(body) => {
+            body_contains_condition_call(body)
+        }
+        StructuredNode::Switch { cases, default, .. } => {
+            cases
+                .iter()
+                .any(|(_, body)| body_contains_condition_call(body))
+                || default
+                    .as_ref()
+                    .is_some_and(|body| body_contains_condition_call(body))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            body_contains_condition_call(try_body)
+                || catch_handlers
+                    .iter()
+                    .any(|handler| body_contains_condition_call(&handler.body))
+        }
+        StructuredNode::Block { .. }
+        | StructuredNode::Break
+        | StructuredNode::Continue
+        | StructuredNode::Return(_)
+        | StructuredNode::Goto(_)
+        | StructuredNode::Label(_)
+        | StructuredNode::Expr(_) => false,
+    }
+}
+
+fn expr_contains_real_call(expr: &Expr) -> bool {
+    if statement_contains_real_call(expr) {
+        return true;
+    }
+
+    match &expr.kind {
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_contains_real_call(left) || expr_contains_real_call(right),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::FieldAccess { base: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_contains_real_call(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_contains_real_call(base) || expr_contains_real_call(index)
+        }
+        ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+            args.iter().any(expr_contains_real_call)
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_contains_real_call(cond)
+                || expr_contains_real_call(then_expr)
+                || expr_contains_real_call(else_expr)
+        }
+        ExprKind::GotRef { display_expr, .. } => expr_contains_real_call(display_expr),
+        ExprKind::Var(_) | ExprKind::IntLit(_) | ExprKind::Unknown(_) => false,
+    }
+}
+
 /// Checks if a body of statements terminates (ends with return/break/continue/goto/noreturn call).
 pub(super) fn body_terminates(body: &[StructuredNode]) -> bool {
     if body.is_empty() {
@@ -6282,6 +6421,38 @@ mod tests {
     }
 
     #[test]
+    fn test_body_contains_condition_call_only_for_branch_conditions() {
+        use crate::decompiler::expression::CallTarget;
+
+        let linear = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::call(CallTarget::Named("foo".to_string()), vec![])],
+            address_range: (0, 0),
+        }];
+        assert!(
+            !body_contains_condition_call(&linear),
+            "straight-line calls should not trigger early condition-call materialization"
+        );
+
+        let conditional = vec![StructuredNode::If {
+            condition: Expr::binop(
+                BinOpKind::Lt,
+                Expr::call(
+                    CallTarget::Named("open".to_string()),
+                    vec![Expr::unknown("path")],
+                ),
+                Expr::int(0),
+            ),
+            then_body: vec![StructuredNode::Return(None)],
+            else_body: Some(vec![]),
+        }];
+        assert!(
+            body_contains_condition_call(&conditional),
+            "branch conditions containing a call should trigger early materialization"
+        );
+    }
+
+    #[test]
     fn test_structure_unknown_direct_tail_jump_as_call() {
         use hexray_core::{Architecture, Register, RegisterClass};
 
@@ -7352,6 +7523,47 @@ mod tests {
                 .is_none(),
             "mid-function call chain should not be treated as a pure return"
         );
+    }
+
+    #[test]
+    fn test_get_return_expr_if_pure_return_keeps_cdq_idiv_block() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+
+        let mut sign_extend =
+            Instruction::new(0x1000, 1, vec![], "cdq").with_operation(Operation::SignExtend);
+        sign_extend.reads = vec![eax];
+        sign_extend.writes = vec![edx];
+        bb0.instructions.push(sign_extend);
+
+        let mut divide = Instruction::new(0x1001, 2, vec![], "idiv")
+            .with_operation(Operation::Div)
+            .with_operands(vec![Operand::Register(ecx)]);
+        divide.reads = vec![edx, eax, ecx];
+        divide.writes = vec![eax, edx];
+        bb0.instructions.push(divide);
+
+        bb0.instructions.push(
+            Instruction::new(0x1003, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb0.terminator = BlockTerminator::Return;
+        cfg.add_block(bb0);
+
+        let structurer = Structurer::new(&cfg);
+        let Some(Some(expr)) = structurer.get_return_expr_if_pure_return(BasicBlockId::new(0))
+        else {
+            panic!("expected pure return block to keep idiv quotient");
+        };
+
+        assert_eq!(format!("{expr}"), "eax / rcx");
     }
 
     #[test]

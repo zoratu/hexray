@@ -2511,6 +2511,12 @@ impl Expr {
             return expr;
         }
 
+        if op == BinOpKind::Div && ops.len() == 1 {
+            if let Some(expr) = Self::x86_single_operand_div(inst, ops) {
+                return expr;
+            }
+        }
+
         if ops.len() >= 3 {
             // dest = src1 op src2
             Self::assign(
@@ -2534,6 +2540,30 @@ impl Expr {
         } else {
             Self::unknown(mnemonic)
         }
+    }
+
+    fn x86_single_operand_div(inst: &Instruction, ops: &[Operand]) -> Option<Self> {
+        let operand_size = match &ops[0] {
+            Operand::Register(reg) => (reg.size / 8) as u8,
+            Operand::Immediate(imm) => imm.size / 8,
+            Operand::Memory(mem) => mem.size,
+            Operand::PcRelative { .. } => return None,
+        };
+        let quotient_name = match operand_size {
+            1 => "al",
+            2 => "ax",
+            4 => "eax",
+            8 => "rax",
+            _ => return None,
+        };
+        let quotient_size = operand_size;
+        let quotient = Self::var(Variable::reg(quotient_name, quotient_size));
+        let divisor = Self::from_operand_with_inst(&ops[0], inst);
+
+        Some(Self::assign(
+            quotient.clone(),
+            Self::binop(BinOpKind::Div, quotient, divisor),
+        ))
     }
 }
 
@@ -3517,16 +3547,21 @@ fn try_simplify_boolean_comparison(left: &Expr, op: BinOpKind, right: &Expr) -> 
         (cmp_expr, false)
     };
 
-    // The comparison expression must be a comparison operator
+    // The wrapped expression must be a boolean-producing operator.
     if let ExprKind::BinOp {
         op: inner_op,
         left: inner_left,
         right: inner_right,
     } = &cmp_expr.kind
     {
-        if !inner_op.is_comparison() {
+        if !inner_op.is_comparison()
+            && *inner_op != BinOpKind::LogicalAnd
+            && *inner_op != BinOpKind::LogicalOr
+        {
             return None;
         }
+
+        let base_expr = Expr::binop(*inner_op, (**inner_left).clone(), (**inner_right).clone());
 
         // Determine if we should negate:
         // - (cmp) == 1 → identity (don't negate)
@@ -3538,20 +3573,9 @@ fn try_simplify_boolean_comparison(left: &Expr, op: BinOpKind, right: &Expr) -> 
             ^ cmp_already_negated;
 
         if should_negate {
-            // Negate the comparison
-            let negated_op = inner_op.negate()?;
-            Some(Expr::binop(
-                negated_op,
-                (**inner_left).clone(),
-                (**inner_right).clone(),
-            ))
+            Some(base_expr.negate().simplify())
         } else {
-            // Return the comparison unchanged
-            Some(Expr::binop(
-                *inner_op,
-                (**inner_left).clone(),
-                (**inner_right).clone(),
-            ))
+            Some(base_expr)
         }
     } else {
         None
@@ -4067,7 +4091,7 @@ fn extract_scaled_index_from_expr(expr: &Expr) -> Option<(Expr, i128)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hexray_core::{Architecture, Register, RegisterClass};
+    use hexray_core::{Architecture, Instruction, Operand, Operation, Register, RegisterClass};
 
     #[test]
     fn test_constant_folding_arithmetic() {
@@ -4090,6 +4114,23 @@ mod tests {
         let expr = Expr::binop(BinOpKind::Div, Expr::int(20), Expr::int(4));
         let simplified = expr.simplify();
         assert!(matches!(simplified.kind, ExprKind::IntLit(5)));
+    }
+
+    #[test]
+    fn test_x86_single_operand_idiv_assigns_quotient_register() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let mut inst = Instruction::new(0x1000, 2, vec![], "idiv")
+            .with_operation(Operation::Div)
+            .with_operands(vec![Operand::Register(ecx)]);
+        inst.reads = vec![edx, eax, ecx];
+        inst.writes = vec![eax, edx];
+
+        assert_eq!(
+            format!("{}", Expr::from_instruction(&inst)),
+            "eax = eax / rcx"
+        );
     }
 
     #[test]
@@ -4315,6 +4356,21 @@ mod tests {
                 simplified.kind
             ),
         }
+
+        let expr = Expr::binop(
+            BinOpKind::Eq,
+            Expr::binop(
+                BinOpKind::LogicalAnd,
+                Expr::binop(BinOpKind::Eq, Expr::unknown("a"), Expr::int(1)),
+                Expr::binop(BinOpKind::Eq, Expr::unknown("b"), Expr::int(2)),
+            ),
+            Expr::int(0),
+        );
+        let rendered = format!("{}", expr.simplify());
+        assert!(
+            rendered.starts_with("!"),
+            "expected boolean && compared to zero to simplify via negation, got {rendered}"
+        );
     }
 
     #[test]

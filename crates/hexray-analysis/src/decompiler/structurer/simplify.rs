@@ -3565,7 +3565,11 @@ fn propagate_args_in_block_with_state(
                             binary_data,
                             preferred_family,
                         );
-                        if recovered_args.0.len() != args.len() || !recovered_args.1.is_empty() {
+                        if should_replace_existing_call_args(
+                            args,
+                            &recovered_args.0,
+                            &recovered_args.1,
+                        ) {
                             for idx in recovered_args.1 {
                                 to_remove.insert(idx);
                             }
@@ -3718,7 +3722,7 @@ fn propagate_args_in_block_with_state(
                     binary_data,
                     preferred_family,
                 );
-                if (new_args.0.len() != args.len() || !new_args.1.is_empty()) && !args.is_empty() {
+                if should_replace_existing_call_args(args, &new_args.0, &new_args.1) {
                     for idx in new_args.1 {
                         to_remove.insert(idx);
                     }
@@ -3875,9 +3879,10 @@ fn track_bare_call_result_aliases(
     call_target_values: &mut HashMap<String, Expr>,
     preferred_family: Option<ArgumentAbiFamily>,
 ) {
-    let Some((primary_reg, primary_expr)) = primary_call_result_alias_expr(preferred_family) else {
+    let Some((primary_reg, _)) = primary_call_result_alias_expr(preferred_family) else {
         return;
     };
+    let primary_expr = Expr::unknown("ret");
 
     for alias in get_register_aliases(primary_reg)
         .into_iter()
@@ -5090,6 +5095,16 @@ fn tracked_arg_candidate_priority(
     )
 }
 
+fn should_replace_existing_call_args(
+    existing_args: &[Expr],
+    recovered_args: &[Expr],
+    used_indices: &[usize],
+) -> bool {
+    !used_indices.is_empty()
+        || (existing_args.is_empty() && !recovered_args.is_empty())
+        || recovered_args.len() > existing_args.len()
+}
+
 fn tracked_arg_register_priority(reg_name: &str) -> usize {
     match reg_name.to_lowercase().as_str() {
         "rdi" | "rsi" | "rdx" | "rcx" | "r8" | "r9" | "xmm0" | "xmm1" | "xmm2" | "xmm3"
@@ -5462,32 +5477,10 @@ fn call_result_placeholder_expr(
     dest_reg_name: &str,
     dest_reg_size: u8,
 ) -> Option<Expr> {
-    let family = preferred_family.or_else(|| infer_argument_abi_family([dest_reg_name]))?;
-    let reg_name = match family {
-        ArgumentAbiFamily::X86_64SysV => {
-            if dest_reg_size <= 4 {
-                "eax"
-            } else {
-                "rax"
-            }
-        }
-        ArgumentAbiFamily::Aarch64 => {
-            if dest_reg_size <= 4 {
-                "w0"
-            } else {
-                "x0"
-            }
-        }
-        ArgumentAbiFamily::RiscV => "a0",
-    };
-    let reg_size = if matches!(reg_name, "eax" | "w0") {
-        4
-    } else {
-        8
-    };
-    Some(Expr::var(super::super::expression::Variable::reg(
-        reg_name, reg_size,
-    )))
+    let _ = dest_reg_size;
+    preferred_family
+        .or_else(|| infer_argument_abi_family([dest_reg_name]))
+        .map(|_| Expr::unknown("ret"))
 }
 
 fn pass_through_float_arg_register_name(
@@ -5925,20 +5918,60 @@ fn parse_printf_format_arg_classes(format: &str) -> Vec<FormatArgClass> {
     classes
 }
 
-fn extract_materializable_condition_call(expr: &Expr) -> Option<(Expr, bool)> {
+enum MaterializableConditionCall {
+    Direct {
+        call_expr: Expr,
+        negated: bool,
+    },
+    Compare {
+        call_expr: Expr,
+        op: BinOpKind,
+        other: Expr,
+        call_on_left: bool,
+    },
+}
+
+fn extract_materializable_condition_call(expr: &Expr) -> Option<MaterializableConditionCall> {
     match &expr.kind {
         ExprKind::Call { target, .. } if is_real_function_call(target) => {
-            Some((expr.clone(), false))
+            Some(MaterializableConditionCall::Direct {
+                call_expr: expr.clone(),
+                negated: false,
+            })
         }
         ExprKind::UnaryOp {
             op: super::super::expression::UnaryOpKind::LogicalNot,
             operand,
         } => match &operand.kind {
             ExprKind::Call { target, .. } if is_real_function_call(target) => {
-                Some(((**operand).clone(), true))
+                Some(MaterializableConditionCall::Direct {
+                    call_expr: (**operand).clone(),
+                    negated: true,
+                })
             }
             _ => None,
         },
+        ExprKind::BinOp { op, left, right } if op.is_comparison() => {
+            match (&left.kind, &right.kind) {
+                (ExprKind::Call { target, .. }, _) if is_real_function_call(target) => {
+                    Some(MaterializableConditionCall::Compare {
+                        call_expr: (**left).clone(),
+                        op: *op,
+                        other: (**right).clone(),
+                        call_on_left: true,
+                    })
+                }
+                (_, ExprKind::Call { target, .. }) if is_real_function_call(target) => {
+                    Some(MaterializableConditionCall::Compare {
+                        call_expr: (**right).clone(),
+                        op: *op,
+                        other: (**left).clone(),
+                        call_on_left: false,
+                    })
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -6068,12 +6101,16 @@ fn materialize_folded_condition_call_result(
         other => return other,
     };
 
-    let Some((call_expr, negated)) = extract_materializable_condition_call(&condition) else {
+    let Some(materialized_call) = extract_materializable_condition_call(&condition) else {
         return StructuredNode::If {
             condition,
             then_body,
             else_body,
         };
+    };
+    let call_expr = match &materialized_call {
+        MaterializableConditionCall::Direct { call_expr, .. }
+        | MaterializableConditionCall::Compare { call_expr, .. } => call_expr.clone(),
     };
 
     let primary_alias = first_return_value_alias_use_in_nodes(&then_body).or_else(|| {
@@ -6116,14 +6153,30 @@ fn materialize_folded_condition_call_result(
             &temp_expr,
         )
     });
-    let condition = if negated {
-        Expr::unary(
-            super::super::expression::UnaryOpKind::LogicalNot,
-            temp_expr.clone(),
-        )
-        .simplify()
-    } else {
-        temp_expr.clone()
+    let condition = match materialized_call {
+        MaterializableConditionCall::Direct { negated, .. } => {
+            if negated {
+                Expr::unary(
+                    super::super::expression::UnaryOpKind::LogicalNot,
+                    temp_expr.clone(),
+                )
+                .simplify()
+            } else {
+                temp_expr.clone()
+            }
+        }
+        MaterializableConditionCall::Compare {
+            op,
+            other,
+            call_on_left,
+            ..
+        } => {
+            if call_on_left {
+                Expr::binop(op, temp_expr.clone(), other).simplify()
+            } else {
+                Expr::binop(op, other, temp_expr.clone()).simplify()
+            }
+        }
     };
 
     StructuredNode::Sequence(vec![
@@ -8398,7 +8451,7 @@ mod tests {
         }
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
-            ["eax"]
+            ["ret"]
         );
     }
 
@@ -8434,7 +8487,7 @@ mod tests {
         }
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
-            ["rsp", "eax"]
+            ["rsp", "ret"]
         );
     }
 
@@ -8469,8 +8522,80 @@ mod tests {
         }
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
-            ["rsp", "eax"]
+            ["rsp", "ret"]
         );
+    }
+
+    #[test]
+    fn test_propagate_call_args_preserves_fd_from_bare_call_after_return_reg_clobber() {
+        let statements = vec![
+            Expr::call(
+                CallTarget::Named("open".to_string()),
+                vec![Expr::unknown("path")],
+            ),
+            Expr::assign(Expr::unknown("marker"), Expr::int(1)),
+            Expr::assign(reg("ebp", 4), reg("eax", 4)),
+            Expr::assign(reg("edi", 4), reg("ebp", 4)),
+            Expr::assign(reg("eax", 4), Expr::int(0)),
+            Expr::assign(reg("rsi", 8), Expr::unknown("buf")),
+            Expr::assign(reg("edx", 4), Expr::unknown("len")),
+            Expr::call(CallTarget::Named("read".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing read call after propagation, got {rendered:?}");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "read"),
+            other => panic!("expected named read target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["ebp", "buf", "len"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_keeps_explicit_args_on_captured_calls() {
+        let statements = vec![
+            Expr::assign(
+                Expr::unknown("ret_0"),
+                Expr::call(
+                    CallTarget::Named("_factorial".to_string()),
+                    vec![Expr::int(5)],
+                ),
+            ),
+            Expr::assign(Expr::unknown("var_8"), Expr::unknown("ret_0")),
+            Expr::assign(
+                Expr::unknown("ret_1"),
+                Expr::call(
+                    CallTarget::Named("_sum_while".to_string()),
+                    vec![Expr::int(10)],
+                ),
+            ),
+            Expr::assign(Expr::unknown("local_4"), Expr::unknown("ret_1")),
+            Expr::assign(
+                Expr::unknown("ret_2"),
+                Expr::call(
+                    CallTarget::Named("_conditional".to_string()),
+                    vec![Expr::int(7)],
+                ),
+            ),
+            Expr::assign(Expr::unknown("var_0"), Expr::unknown("ret_2")),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(rendered[0], "ret_0 = _factorial(5)");
+        assert_eq!(rendered[2], "ret_1 = _sum_while(0xa)");
+        assert_eq!(rendered[4], "ret_2 = _conditional(7)");
     }
 
     #[test]
@@ -9182,6 +9307,52 @@ mod tests {
             else_body.last(),
             Some(StructuredNode::Return(Some(expr))) if format!("{expr}") == "ret_0"
         ));
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_materializes_compared_condition_call_result() {
+        let nodes = vec![StructuredNode::If {
+            condition: Expr::binop(
+                BinOpKind::Lt,
+                Expr::call(
+                    CallTarget::Named("open".to_string()),
+                    vec![Expr::unknown("path"), Expr::int(0)],
+                ),
+                Expr::int(0),
+            ),
+            then_body: vec![StructuredNode::Return(Some(Expr::unknown("cold")))],
+            else_body: Some(vec![block(
+                0,
+                vec![Expr::assign(reg("edi", 4), reg("eax", 4))],
+            )]),
+        }];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Sequence(seq) = &merged[0] else {
+            panic!("expected compared condition call to materialize into a sequence");
+        };
+        let StructuredNode::Expr(assign) = &seq[0] else {
+            panic!("expected leading call-result assignment");
+        };
+        assert_eq!(format!("{assign}"), "ret_0 = open(path, 0)");
+
+        let StructuredNode::If {
+            condition,
+            else_body: Some(else_body),
+            ..
+        } = &seq[1]
+        else {
+            panic!("expected rewritten if after call-result assignment");
+        };
+        assert!(
+            format!("{condition}").starts_with("ret_0 <"),
+            "expected rewritten condition to compare the materialized call result, got {condition}"
+        );
+
+        let StructuredNode::Block { statements, .. } = &else_body[0] else {
+            panic!("expected else block with rewritten register copy");
+        };
+        assert_eq!(format!("{}", statements[0]), "edi = ret_0");
     }
 
     #[test]

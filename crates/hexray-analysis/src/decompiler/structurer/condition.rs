@@ -634,6 +634,18 @@ fn build_register_value_map_with_options(
             saw_call = false;
         }
 
+        if matches!(inst.operation, Operation::SetConditional) && !inst.operands.is_empty() {
+            if let Operand::Register(dst_reg) = &inst.operands[0] {
+                let dst_name = dst_reg.name().to_lowercase();
+                let lowered = lift_setcc_with_context(inst, block);
+                if let super::super::expression::ExprKind::Assign { rhs, .. } = lowered.kind {
+                    insert_register_value_aliases(&mut reg_values, &dst_name, *rhs);
+                }
+            }
+            at_block_start = false;
+            continue;
+        }
+
         // Look for LDR instructions (ARM64): ldr reg, [sp, #offset]
         if matches!(inst.operation, Operation::Load) && inst.operands.len() >= 2 {
             // First operand is destination (register), second is source (memory)
@@ -1430,6 +1442,42 @@ mod tests {
         assert!(
             !rendered.contains("+ 2"),
             "expected SETcc lowering to ignore later flag clobbers, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_lifts_setcc_test_chain_as_negated_predicate() {
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x7000);
+        block.instructions.push(
+            Instruction::new(0x7000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(edi), Operand::imm(-1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x7003, 3, vec![], "sete")
+                .with_operation(Operation::SetConditional)
+                .with_operands(vec![Operand::Register(al)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x7006, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(al), Operand::Register(al)]),
+        );
+
+        let rendered = format!(
+            "{}",
+            condition_to_expr_with_block(Condition::Equal, &block).simplify()
+        );
+        assert!(
+            rendered.contains("!="),
+            "expected setcc/test/je chain to render as a negated compare, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("== 0"),
+            "expected no trailing boolean compare wrapper, got {rendered}"
         );
     }
 
