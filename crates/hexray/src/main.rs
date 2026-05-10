@@ -2998,12 +2998,13 @@ fn seed_direct_callee_signature_hints(
             binary_data_ctx,
         );
         let signature = Decompiler::new()
+            .with_binary_data(binary_data_ctx.clone())
             .with_symbol_table(seed_ctx.symbol_table.clone())
             .with_relocation_table(seed_ctx.relocation_table.clone())
             .with_calling_convention(seed_ctx.calling_convention)
             .recover_signature(&callee_cfg);
-        binary_data_ctx.add_call_signature_hint_by_address(callee_addr, signature.parameters.len());
-        binary_data_ctx.add_call_signature_hint_by_name(callee_name, signature.parameters.len());
+        binary_data_ctx.add_call_signature_by_address(callee_addr, signature.clone());
+        binary_data_ctx.add_call_signature_by_name(callee_name, signature);
     }
 }
 

@@ -394,6 +394,12 @@ pub enum ParamType {
     SignedInt(u8),
     /// Unsigned integer of specified size in bits.
     UnsignedInt(u8),
+    /// C `unsigned long long`.
+    UnsignedLongLong,
+    /// C `size_t`.
+    SizeT,
+    /// C `ptrdiff_t`.
+    PtrDiffT,
     /// Pointer type.
     Pointer,
     /// Typed pointer (e.g., int32_t*, uint8_t*).
@@ -430,6 +436,9 @@ impl ParamType {
             ParamType::UnsignedInt(32) => "uint32_t".to_string(),
             ParamType::UnsignedInt(64) => "uint64_t".to_string(),
             ParamType::UnsignedInt(_) => "unsigned int".to_string(),
+            ParamType::UnsignedLongLong => "unsigned long long".to_string(),
+            ParamType::SizeT => "size_t".to_string(),
+            ParamType::PtrDiffT => "ptrdiff_t".to_string(),
             ParamType::Pointer => "void*".to_string(),
             ParamType::TypedPointer(inner) => format!("{}*", inner.to_c_string()),
             ParamType::Float(32) => "float".to_string(),
@@ -490,6 +499,7 @@ impl ParamType {
             ParamType::SignedInt(16) | ParamType::UnsignedInt(16) => 2,
             ParamType::SignedInt(32) | ParamType::UnsignedInt(32) | ParamType::Float(32) => 4,
             ParamType::SignedInt(64) | ParamType::UnsignedInt(64) | ParamType::Float(64) => 8,
+            ParamType::UnsignedLongLong | ParamType::SizeT | ParamType::PtrDiffT => 8,
             ParamType::SignedInt(n) | ParamType::UnsignedInt(n) | ParamType::Float(n) => *n / 8,
             ParamType::SimdInt128 => 16,
             ParamType::SimdFloat(size) => *size,

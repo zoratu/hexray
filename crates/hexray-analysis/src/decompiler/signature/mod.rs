@@ -39,7 +39,7 @@
 
 use super::expression::{BinOpKind, Expr, ExprKind, Variable};
 use super::structurer::{StructuredCfg, StructuredNode};
-use super::{RelocationTable, SymbolTable};
+use super::{BinaryDataContext, RelocationTable, SymbolTable};
 use hexray_types::{
     builtin::{load_libc_functions, load_linux_types, load_posix_types},
     CType, TypeDatabase,
@@ -56,6 +56,18 @@ pub use types::{
     CallingConvention, FunctionSignature, ParamType, Parameter, ParameterLocation,
     ParameterUsageHints,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrintfLengthModifier {
+    None,
+    CharChar,
+    Short,
+    Long,
+    LongLong,
+    IntMax,
+    Size,
+    PtrDiff,
+}
 
 /// Signature recovery engine.
 ///
@@ -139,6 +151,8 @@ pub struct SignatureRecovery {
     symbol_table: Option<SymbolTable>,
     /// Optional inter-procedural summary database for signature hints.
     summary_database: Option<Arc<super::interprocedural::SummaryDatabase>>,
+    /// Optional read-only binary data for resolving string-literal arguments.
+    binary_data: Option<Arc<BinaryDataContext>>,
     /// Function name being analyzed (for known function lookup).
     current_func_name: Option<String>,
     /// SysV `va_list.gp_offset` field slots initialized in the body.
@@ -199,6 +213,7 @@ impl SignatureRecovery {
             relocation_table: None,
             symbol_table: None,
             summary_database: None,
+            binary_data: None,
             current_func_name: None,
             sysv_va_list_gp_offset_slots: HashSet::new(),
             sysv_va_list_fp_offset_slots: HashSet::new(),
@@ -237,6 +252,12 @@ impl SignatureRecovery {
         summary_database: Option<Arc<super::interprocedural::SummaryDatabase>>,
     ) -> Self {
         self.summary_database = summary_database;
+        self
+    }
+
+    /// Provides read-only binary data for resolving string-literal arguments.
+    pub fn with_binary_data(mut self, binary_data: Option<&BinaryDataContext>) -> Self {
+        self.binary_data = binary_data.cloned().map(Arc::new);
         self
     }
 
@@ -601,6 +622,9 @@ impl SignatureRecovery {
                         ParamType::Float(bits) => {
                             self.float_return = true;
                             self.return_size = self.return_size.max((bits / 8).max(1));
+                        }
+                        ParamType::UnsignedLongLong | ParamType::SizeT | ParamType::PtrDiffT => {
+                            self.return_size = self.return_size.max(8);
                         }
                         ParamType::SignedInt(bits) | ParamType::UnsignedInt(bits) => {
                             self.return_size = self.return_size.max((bits / 8).max(1));
@@ -1241,6 +1265,7 @@ impl SignatureRecovery {
                 let func_name = self.extract_call_name(target);
                 if let Some(fn_name) = &func_name {
                     self.observe_variadic_forwarding_call(fn_name, args);
+                    self.observe_printf_format_forwarding_call(fn_name, args);
                 }
                 let is_string_fn = func_name
                     .as_ref()
@@ -1823,12 +1848,25 @@ impl SignatureRecovery {
             (ParamType::SimdFloat(sa), ParamType::SimdFloat(sb)) => {
                 ParamType::SimdFloat((*sa).max(*sb))
             }
+            (ParamType::UnsignedLongLong, ParamType::UnsignedLongLong) => {
+                ParamType::UnsignedLongLong
+            }
+            (ParamType::SizeT, ParamType::SizeT) => ParamType::SizeT,
+            (ParamType::PtrDiffT, ParamType::PtrDiffT) => ParamType::PtrDiffT,
             (ParamType::UnsignedInt(sa), ParamType::UnsignedInt(sb)) => {
                 ParamType::UnsignedInt((*sa).max(*sb))
             }
             (ParamType::SignedInt(sa), ParamType::SignedInt(sb)) => {
                 ParamType::SignedInt((*sa).max(*sb))
             }
+            (ParamType::UnsignedLongLong, ParamType::UnsignedInt(64))
+            | (ParamType::UnsignedInt(64), ParamType::UnsignedLongLong) => {
+                ParamType::UnsignedLongLong
+            }
+            (ParamType::SizeT, ParamType::UnsignedInt(64))
+            | (ParamType::UnsignedInt(64), ParamType::SizeT) => ParamType::SizeT,
+            (ParamType::PtrDiffT, ParamType::SignedInt(64))
+            | (ParamType::SignedInt(64), ParamType::PtrDiffT) => ParamType::PtrDiffT,
             (ParamType::SignedInt(sa), ParamType::UnsignedInt(sb))
             | (ParamType::UnsignedInt(sa), ParamType::SignedInt(sb)) => {
                 ParamType::SignedInt((*sa).max(*sb))
@@ -3575,6 +3613,214 @@ impl SignatureRecovery {
         // decompile as `vprintf(fmt, ap)` instead of exposing the raw stack root.
     }
 
+    fn observe_printf_format_forwarding_call(&mut self, function_name: &str, args: &[Expr]) {
+        let Some(format_index) = Self::known_printf_format_arg_index(function_name) else {
+            return;
+        };
+        let Some(format) = args
+            .get(format_index)
+            .and_then(|expr| self.extract_string_literal(expr))
+        else {
+            return;
+        };
+
+        for (offset, param_type) in Self::parse_printf_format_param_types(&format)
+            .into_iter()
+            .enumerate()
+        {
+            let Some(arg) = args.get(format_index + 1 + offset) else {
+                break;
+            };
+            let Some(param_idx) = self.resolve_param_index_from_expr_precise(arg) else {
+                continue;
+            };
+
+            self.param_type_overrides
+                .entry(param_idx)
+                .or_insert_with(|| param_type.clone());
+            if matches!(param_type, ParamType::SizeT) {
+                self.record_usage_hint(&format!("arg{}", param_idx), |h| h.is_size_param = true);
+            }
+        }
+    }
+
+    fn known_printf_format_arg_index(function_name: &str) -> Option<usize> {
+        match ParameterUsageHints::normalize_callback_name(function_name) {
+            "printf" => Some(0),
+            "fprintf" | "dprintf" | "syslog" => Some(1),
+            "sprintf" | "asprintf" => Some(1),
+            "snprintf" => Some(2),
+            "printf_chk" => Some(1),
+            "fprintf_chk" | "dprintf_chk" => Some(2),
+            "sprintf_chk" | "asprintf_chk" => Some(3),
+            "snprintf_chk" => Some(4),
+            _ => None,
+        }
+    }
+
+    fn extract_string_literal(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Unknown(text)
+                if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 =>
+            {
+                Some(text[1..text.len() - 1].to_string())
+            }
+            ExprKind::IntLit(value) if *value >= 0 && *value <= i128::from(u64::MAX) => {
+                self.read_string_from_binary_data(*value as u64)
+            }
+            ExprKind::GotRef { address, .. } => self.read_string_from_binary_data(*address),
+            ExprKind::Cast { expr: inner, .. } => self.extract_string_literal(inner),
+            _ => None,
+        }
+    }
+
+    fn read_string_from_binary_data(&self, address: u64) -> Option<String> {
+        let binary_data = self.binary_data.as_deref()?;
+        let (section, base) = binary_data.section_containing(address)?;
+        let start = usize::try_from(address.checked_sub(base)?).ok()?;
+        let suffix = section.get(start..)?;
+        let end = suffix.iter().position(|byte| *byte == 0)?;
+        std::str::from_utf8(&suffix[..end]).ok().map(str::to_string)
+    }
+
+    fn parse_printf_format_param_types(format: &str) -> Vec<ParamType> {
+        let bytes = format.as_bytes();
+        let mut i = 0usize;
+        let mut types = Vec::new();
+
+        while i < bytes.len() {
+            if bytes[i] != b'%' {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            if bytes[i] == b'%' {
+                i += 1;
+                continue;
+            }
+
+            while i < bytes.len() && matches!(bytes[i], b'#' | b'0' | b'-' | b' ' | b'+' | b'\'') {
+                i += 1;
+            }
+
+            if i < bytes.len() && bytes[i] == b'*' {
+                types.push(ParamType::SignedInt(32));
+                i += 1;
+            } else {
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'*' {
+                    types.push(ParamType::SignedInt(32));
+                    i += 1;
+                } else {
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
+
+            let mut long_double = false;
+            let mut length = PrintfLengthModifier::None;
+            if i + 1 < bytes.len() {
+                match &bytes[i..i + 2] {
+                    b"hh" => {
+                        length = PrintfLengthModifier::CharChar;
+                        i += 2;
+                    }
+                    b"ll" => {
+                        length = PrintfLengthModifier::LongLong;
+                        i += 2;
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(length, PrintfLengthModifier::None) && i < bytes.len() {
+                match bytes[i] {
+                    b'h' => {
+                        length = PrintfLengthModifier::Short;
+                        i += 1;
+                    }
+                    b'l' => {
+                        length = PrintfLengthModifier::Long;
+                        i += 1;
+                    }
+                    b'j' => {
+                        length = PrintfLengthModifier::IntMax;
+                        i += 1;
+                    }
+                    b'z' => {
+                        length = PrintfLengthModifier::Size;
+                        i += 1;
+                    }
+                    b't' => {
+                        length = PrintfLengthModifier::PtrDiff;
+                        i += 1;
+                    }
+                    b'L' => {
+                        long_double = true;
+                        i += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            if i >= bytes.len() {
+                break;
+            }
+
+            if let Some(param_type) =
+                Self::printf_conversion_param_type(bytes[i] as char, length, long_double)
+            {
+                types.push(param_type);
+            }
+            i += 1;
+        }
+
+        types
+    }
+
+    fn printf_conversion_param_type(
+        specifier: char,
+        length: PrintfLengthModifier,
+        long_double: bool,
+    ) -> Option<ParamType> {
+        match specifier {
+            'd' | 'i' => Some(match length {
+                PrintfLengthModifier::PtrDiff => ParamType::PtrDiffT,
+                PrintfLengthModifier::LongLong | PrintfLengthModifier::IntMax => {
+                    ParamType::SignedInt(64)
+                }
+                _ => ParamType::SignedInt(32),
+            }),
+            'u' | 'o' | 'x' | 'X' => Some(match length {
+                PrintfLengthModifier::LongLong => ParamType::UnsignedLongLong,
+                PrintfLengthModifier::Size => ParamType::SizeT,
+                PrintfLengthModifier::PtrDiff | PrintfLengthModifier::IntMax => {
+                    ParamType::UnsignedInt(64)
+                }
+                _ => ParamType::UnsignedInt(32),
+            }),
+            'c' => Some(ParamType::SignedInt(32)),
+            's' => Some(ParamType::Pointer),
+            'p' => Some(ParamType::Pointer),
+            'n' => Some(ParamType::TypedPointer(Box::new(ParamType::SignedInt(32)))),
+            'a' | 'A' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' => Some(if long_double {
+                ParamType::Float(80)
+            } else {
+                ParamType::Float(64)
+            }),
+            _ => None,
+        }
+    }
+
     fn infer_variadic_fixed_param_count(&self, used_args: &[usize]) -> Option<usize> {
         if !self.has_sysv_va_list_materialization() {
             return None;
@@ -3742,7 +3988,11 @@ impl SignatureRecovery {
             let is_ptr = matches!(sig.parameters[i].param_type, ParamType::Pointer);
             let is_size = matches!(
                 sig.parameters[i + 1].param_type,
-                ParamType::UnsignedInt(_) | ParamType::SignedInt(32 | 64)
+                ParamType::UnsignedInt(_)
+                    | ParamType::SignedInt(32 | 64)
+                    | ParamType::UnsignedLongLong
+                    | ParamType::SizeT
+                    | ParamType::PtrDiffT
             );
 
             if is_ptr && is_size {
@@ -6022,6 +6272,58 @@ mod tests {
         assert_eq!(sig.parameters.len(), 2);
         assert_eq!(sig.parameters[0].name, "dst");
         assert_eq!(sig.parameters[1].name, "arg1");
+    }
+
+    #[test]
+    fn test_parse_printf_format_param_types_honors_size_modifiers_and_pointers() {
+        let inferred = SignatureRecovery::parse_printf_format_param_types(
+            "ull=%llu sz=%zu pd=%td ptr=%p n=%n\n",
+        );
+
+        assert_eq!(
+            inferred,
+            vec![
+                ParamType::UnsignedLongLong,
+                ParamType::SizeT,
+                ParamType::PtrDiffT,
+                ParamType::Pointer,
+                ParamType::TypedPointer(Box::new(ParamType::SignedInt(32))),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_infers_printf_chk_wrapper_variadic_types_from_format() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("__printf_chk@GLIBC_2.3.4".to_string()),
+            vec![
+                Expr::int(2),
+                Expr::unknown("\"ull=%llu sz=%zu pd=%td\\n\""),
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+                Expr::var(Variable::reg("rdx", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 3);
+        assert_eq!(sig.parameters[0].param_type, ParamType::UnsignedLongLong);
+        assert_eq!(sig.parameters[1].param_type, ParamType::SizeT);
+        assert_eq!(sig.parameters[2].param_type, ParamType::PtrDiffT);
     }
 
     #[test]

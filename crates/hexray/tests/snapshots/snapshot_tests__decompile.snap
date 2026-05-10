@@ -1,6 +1,6 @@
 ---
 source: crates/hexray/tests/snapshot_tests.rs
-assertion_line: 318
+assertion_line: 663
 expression: normalized
 ---
 (auto-selected 'main' at [ADDR])
@@ -10,13 +10,17 @@ Decompiling _main at [ADDR]
 int32_t _main(void)
 {
     int local_4;
-    int ret;
     int ret_0;
+    int ret_1;
+    int ret_2;
     int var_0;
+    int var_8;
 
-    ret = _factorial(5);
-    local_4 = _sum_while(10);
-    ret_0 = _conditional(7);
-    var_0 = ret_0;
-    return ret + local_4 + var_0;
+    ret_0 = _factorial(5);
+    var_8 = ret_0;
+    ret_1 = _sum_while(10);
+    local_4 = ret_1;
+    ret_2 = _conditional(7);
+    var_0 = ret_2;
+    return var_8 + local_4 + var_0;
 }

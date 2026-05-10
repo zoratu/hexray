@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 use hexray_core::Architecture;
 use hexray_types::{
     builtin::{load_libc_functions, load_linux_types, load_posix_types},
-    TypeDatabase,
+    CType, TypeDatabase,
 };
 
 use super::super::abi::{
@@ -2299,11 +2299,38 @@ pub(super) fn simplify_node_copies(node: StructuredNode) -> StructuredNode {
             default: default.map(|nodes| nodes.into_iter().map(simplify_node_copies).collect()),
         },
         StructuredNode::Sequence(nodes) => {
-            StructuredNode::Sequence(nodes.into_iter().map(simplify_node_copies).collect())
+            StructuredNode::Sequence(simplify_sequence_node_copies(nodes))
         }
         // Pass through other nodes unchanged
         other => other,
     }
+}
+
+fn simplify_sequence_node_copies(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    fn flush_expr_run(run: &mut Vec<Expr>, out: &mut Vec<StructuredNode>) {
+        if run.is_empty() {
+            return;
+        }
+        for expr in propagate_copies(std::mem::take(run)) {
+            out.push(StructuredNode::Expr(expr));
+        }
+    }
+
+    let mut simplified = Vec::with_capacity(nodes.len());
+    let mut expr_run = Vec::new();
+
+    for node in nodes {
+        match node {
+            StructuredNode::Expr(expr) => expr_run.push(expr),
+            other => {
+                flush_expr_run(&mut expr_run, &mut simplified);
+                simplified.push(simplify_node_copies(other));
+            }
+        }
+    }
+
+    flush_expr_run(&mut expr_run, &mut simplified);
+    simplified
 }
 
 /// Normalize register names for aliasing (ARM64 w->x, x86 32->64 bit).
@@ -2424,16 +2451,24 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
 
     // Track the last value assigned to each temp register
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
+    let mut stack_slot_values: HashMap<String, Expr> = HashMap::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for stmt in statements.into_iter() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             // Always substitute known register values in the RHS
             let new_lhs = substitute_assignment_lhs(lhs, &reg_values);
-            let new_rhs = substitute_vars(rhs, &reg_values);
+            let new_rhs =
+                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
 
             if let ExprKind::Var(lhs_var) = &lhs.kind {
+                let written_aliases: HashSet<String> =
+                    get_register_aliases(&lhs_var.name).into_iter().collect();
                 invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
+                invalidate_dependent_stack_slot_values(&mut stack_slot_values, &written_aliases);
+                if aliases_include_stack_base(&written_aliases) {
+                    stack_slot_values.clear();
+                }
 
                 // Check if LHS is a temp register
                 if is_temp_register(&lhs_var.name) {
@@ -2450,13 +2485,24 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                 }
             }
 
+            if let Some(slot_key) = stack_slot_key(&new_lhs) {
+                let stabilized_rhs = stabilize_saved_arg_registers(new_rhs);
+                stack_slot_values.remove(&slot_key);
+                if !expr_requires_single_evaluation(&stabilized_rhs) {
+                    stack_slot_values.insert(slot_key, stabilized_rhs.clone());
+                }
+                result.push(Expr::assign(new_lhs, stabilized_rhs));
+                continue;
+            }
+
             // Non-temp LHS (memory location or non-temp register): emit with substitution
             result.push(Expr::assign(new_lhs, new_rhs));
             continue;
         }
 
         if let ExprKind::CompoundAssign { op, lhs, rhs } = &stmt.kind {
-            let new_rhs = substitute_vars(rhs, &reg_values);
+            let new_rhs =
+                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 let aliases = get_register_aliases(&lhs_var.name);
                 let prior_value = if is_temp_register(&lhs_var.name) {
@@ -2493,12 +2539,29 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         }
 
         if let ExprKind::Call { .. } = &stmt.kind {
-            let substituted = substitute_vars(&stmt, &reg_values);
+            let substituted = substitute_stack_slot_values(
+                substitute_vars(&stmt, &reg_values),
+                &stack_slot_values,
+            );
             if let ExprKind::Call { target, .. } = &substituted.kind {
                 if is_real_function_call(target) {
                     reg_values.clear();
+                    stack_slot_values.clear();
                 } else {
                     invalidate_pseudo_call_output_copies(&mut reg_values, target);
+                    let written_aliases: HashSet<String> = call_output_alias_groups(target)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    if !written_aliases.is_empty() {
+                        invalidate_dependent_stack_slot_values(
+                            &mut stack_slot_values,
+                            &written_aliases,
+                        );
+                        if aliases_include_stack_base(&written_aliases) {
+                            stack_slot_values.clear();
+                        }
+                    }
                 }
             }
             result.push(substituted);
@@ -2508,7 +2571,141 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         result.push(stmt);
     }
 
-    result
+    collapse_single_use_call_result_copies(result)
+}
+
+fn expr_simple_identifier(expr: &Expr) -> Option<&str> {
+    match &expr.kind {
+        ExprKind::Var(var) => Some(var.name.as_str()),
+        ExprKind::Unknown(name) => Some(name.as_str()),
+        ExprKind::Cast { expr, .. } => expr_simple_identifier(expr),
+        _ => None,
+    }
+}
+
+fn expr_mentions_identifier(expr: &Expr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Var(var) => var.name == name,
+        ExprKind::Unknown(candidate) => candidate == name,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_mentions_identifier(left, name) || expr_mentions_identifier(right, name),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_mentions_identifier(operand, name),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_mentions_identifier(base, name) || expr_mentions_identifier(index, name)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_mentions_identifier(base, name),
+        ExprKind::Call { target, args } => {
+            let target_mentions = match target {
+                CallTarget::Indirect(expr) | CallTarget::IndirectGot { expr, .. } => {
+                    expr_mentions_identifier(expr, name)
+                }
+                CallTarget::Direct { .. } | CallTarget::Named(_) => false,
+            };
+            target_mentions || args.iter().any(|arg| expr_mentions_identifier(arg, name))
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_mentions_identifier(cond, name)
+                || expr_mentions_identifier(then_expr, name)
+                || expr_mentions_identifier(else_expr, name)
+        }
+        ExprKind::Phi(values) => values
+            .iter()
+            .any(|value| expr_mentions_identifier(value, name)),
+        ExprKind::GotRef { display_expr, .. } => expr_mentions_identifier(display_expr, name),
+        ExprKind::IntLit(_) => false,
+    }
+}
+
+fn stmt_writes_identifier(expr: &Expr, name: &str) -> bool {
+    match &expr.kind {
+        ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => {
+            expr_simple_identifier(lhs).is_some_and(|lhs_name| lhs_name == name)
+        }
+        _ => false,
+    }
+}
+
+fn collapse_single_use_call_result_copies(mut statements: Vec<Expr>) -> Vec<Expr> {
+    use super::super::expression::ExprKind;
+
+    let mut i = 0usize;
+    while i + 1 < statements.len() {
+        let (temp_name, target, args) = match &statements[i].kind {
+            ExprKind::Assign { lhs, rhs } => {
+                let Some(temp_name) = expr_simple_identifier(lhs) else {
+                    i += 1;
+                    continue;
+                };
+                let ExprKind::Call { target, args } = &rhs.kind else {
+                    i += 1;
+                    continue;
+                };
+                if !temp_name.starts_with("ret_") || !is_real_function_call(target) {
+                    i += 1;
+                    continue;
+                }
+                (temp_name.to_string(), target.clone(), args.clone())
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let (copy_lhs_name, copy_lhs) = match &statements[i + 1].kind {
+            ExprKind::Assign { lhs, rhs } => {
+                let Some(rhs_name) = expr_simple_identifier(rhs) else {
+                    i += 1;
+                    continue;
+                };
+                let Some(lhs_name) = expr_simple_identifier(lhs) else {
+                    i += 1;
+                    continue;
+                };
+                if rhs_name != temp_name || lhs_name == temp_name || lhs_name.starts_with("ret_") {
+                    i += 1;
+                    continue;
+                }
+                (lhs_name.to_string(), (**lhs).clone())
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if statements[i + 2..].iter().any(|stmt| {
+            stmt_writes_identifier(stmt, &temp_name) || stmt_writes_identifier(stmt, &copy_lhs_name)
+        }) {
+            i += 1;
+            continue;
+        }
+
+        let substitutions = HashMap::from([(temp_name.clone(), copy_lhs.clone())]);
+        for stmt in &mut statements[i + 2..] {
+            *stmt = substitute_vars(stmt, &substitutions);
+        }
+        statements[i] = Expr::assign(copy_lhs, Expr::call(target, args));
+        statements.remove(i + 1);
+    }
+
+    statements
 }
 
 fn invalidate_clobbered_register_mappings(reg_values: &mut HashMap<String, Expr>, written: &str) {
@@ -2887,6 +3084,7 @@ fn propagate_call_args_node_with_binary_data(
 struct CallArgPropagationState {
     arg_values: HashMap<String, (Option<usize>, Expr)>,
     reg_values: HashMap<String, Expr>,
+    saved_temp_values: HashMap<String, Expr>,
     call_target_values: HashMap<String, Expr>,
     stack_slot_values: HashMap<String, Expr>,
 }
@@ -2895,6 +3093,7 @@ impl CallArgPropagationState {
     fn clear_after_real_call(&mut self) {
         self.arg_values.clear();
         self.reg_values.clear();
+        self.saved_temp_values.clear();
         self.call_target_values.clear();
     }
 
@@ -3236,6 +3435,10 @@ fn propagate_args_in_block_with_state(
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
                 invalidate_dependent_register_values(&mut state.reg_values, &written_aliases);
+                invalidate_dependent_register_values(
+                    &mut state.saved_temp_values,
+                    &written_aliases,
+                );
                 invalidate_dependent_arg_values(&mut state.arg_values, &written_aliases);
                 invalidate_written_call_target_values(
                     &mut state.call_target_values,
@@ -3258,6 +3461,13 @@ fn propagate_args_in_block_with_state(
                                 .insert(alias.clone(), stabilized_temp_rhs.clone());
                             state
                                 .call_target_values
+                                .insert(alias.clone(), stabilized_temp_rhs.clone());
+                        }
+                    }
+                    if expr_is_saved_temp_arg_source(&stabilized_temp_rhs) {
+                        for alias in &written_aliases {
+                            state
+                                .saved_temp_values
                                 .insert(alias.clone(), stabilized_temp_rhs.clone());
                         }
                     }
@@ -3350,6 +3560,7 @@ fn propagate_args_in_block_with_state(
                             Some(target),
                             args,
                             &state.arg_values,
+                            Some(&state.saved_temp_values),
                             &excluded_arg_regs,
                             binary_data,
                             preferred_family,
@@ -3383,6 +3594,7 @@ fn propagate_args_in_block_with_state(
                     if invalidate_pseudo_call_outputs(
                         target,
                         &mut state.reg_values,
+                        &mut state.saved_temp_values,
                         &mut state.arg_values,
                         &mut state.call_target_values,
                         &mut state.stack_slot_values,
@@ -3417,6 +3629,10 @@ fn propagate_args_in_block_with_state(
                     None
                 };
                 invalidate_dependent_register_values(&mut state.reg_values, &written_aliases);
+                invalidate_dependent_register_values(
+                    &mut state.saved_temp_values,
+                    &written_aliases,
+                );
                 invalidate_dependent_arg_values(&mut state.arg_values, &written_aliases);
                 invalidate_written_call_target_values(
                     &mut state.call_target_values,
@@ -3448,6 +3664,7 @@ fn propagate_args_in_block_with_state(
                 if is_tracked_call_arg_register(&v.name) {
                     for alias in &written_aliases {
                         state.reg_values.remove(alias);
+                        state.saved_temp_values.remove(alias);
                     }
                     state.arg_values.remove(&v.name.to_lowercase());
                 }
@@ -3496,6 +3713,7 @@ fn propagate_args_in_block_with_state(
                     Some(target),
                     args,
                     &state.arg_values,
+                    Some(&state.saved_temp_values),
                     &excluded_arg_regs,
                     binary_data,
                     preferred_family,
@@ -3562,6 +3780,7 @@ fn propagate_args_in_block_with_state(
                 if invalidate_pseudo_call_outputs(
                     target,
                     &mut state.reg_values,
+                    &mut state.saved_temp_values,
                     &mut state.arg_values,
                     &mut state.call_target_values,
                     &mut state.stack_slot_values,
@@ -3682,6 +3901,7 @@ fn primary_call_result_alias_expr(
 fn invalidate_pseudo_call_outputs(
     target: &super::super::expression::CallTarget,
     reg_values: &mut HashMap<String, Expr>,
+    saved_temp_values: &mut HashMap<String, Expr>,
     arg_values: &mut HashMap<String, (Option<usize>, Expr)>,
     call_target_values: &mut HashMap<String, Expr>,
     stack_slot_values: &mut HashMap<String, Expr>,
@@ -3695,6 +3915,7 @@ fn invalidate_pseudo_call_outputs(
     }
 
     invalidate_dependent_register_values(reg_values, &written_aliases);
+    invalidate_dependent_register_values(saved_temp_values, &written_aliases);
     invalidate_dependent_arg_values(arg_values, &written_aliases);
     invalidate_written_call_target_values(call_target_values, &written_aliases);
     invalidate_dependent_stack_slot_values(stack_slot_values, &written_aliases);
@@ -3727,7 +3948,25 @@ fn substitute_stack_slot_values(expr: Expr, stack_slot_values: &HashMap<String, 
     use super::super::expression::ExprKind;
 
     match expr.kind {
-        ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => expr,
+        ExprKind::Var(var) => {
+            let expr = Expr::var(var);
+            if let Some(key) = stack_slot_key(&expr) {
+                if let Some(value) = stack_slot_values.get(&key) {
+                    return value.clone();
+                }
+            }
+            expr
+        }
+        ExprKind::Unknown(name) => {
+            let expr = Expr::unknown(name);
+            if let Some(key) = stack_slot_key(&expr) {
+                if let Some(value) = stack_slot_values.get(&key) {
+                    return value.clone();
+                }
+            }
+            expr
+        }
+        ExprKind::IntLit(_) => expr,
         ExprKind::Deref { addr, size } => {
             let deref = Expr::deref(substitute_stack_slot_values(*addr, stack_slot_values), size);
             if let Some(key) = stack_slot_key(&deref) {
@@ -3764,11 +4003,19 @@ fn substitute_stack_slot_values(expr: Expr, stack_slot_values: &HashMap<String, 
             base,
             index,
             element_size,
-        } => Expr::array_access(
-            substitute_stack_slot_values(*base, stack_slot_values),
-            substitute_stack_slot_values(*index, stack_slot_values),
-            element_size,
-        ),
+        } => {
+            let array = Expr::array_access(
+                substitute_stack_slot_values(*base, stack_slot_values),
+                substitute_stack_slot_values(*index, stack_slot_values),
+                element_size,
+            );
+            if let Some(key) = stack_slot_key(&array) {
+                if let Some(value) = stack_slot_values.get(&key) {
+                    return value.clone();
+                }
+            }
+            array
+        }
         ExprKind::FieldAccess {
             base,
             field_name,
@@ -3866,10 +4113,25 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
     use super::super::expression::ExprKind;
 
     match expr.kind {
-        ExprKind::Var(v) => get_arg_register_index(&v.name)
-            .map(|index| Expr::unknown(format!("arg{}", index)))
-            .unwrap_or_else(|| Expr::var(v)),
-        ExprKind::Unknown(_) | ExprKind::IntLit(_) => expr,
+        ExprKind::Var(v) => {
+            if let Some(index) = get_arg_register_index(&v.name) {
+                Expr::unknown(format!("arg{}", index))
+            } else if let Some(index) = get_float_arg_register_index(&v.name) {
+                Expr::unknown(format!("farg{}", index))
+            } else {
+                Expr::var(v)
+            }
+        }
+        ExprKind::Unknown(name) => {
+            if let Some(index) = get_arg_register_index(&name) {
+                Expr::unknown(format!("arg{}", index))
+            } else if let Some(index) = get_float_arg_register_index(&name) {
+                Expr::unknown(format!("farg{}", index))
+            } else {
+                Expr::unknown(name)
+            }
+        }
+        ExprKind::IntLit(_) => expr,
         ExprKind::Deref { addr, size } => Expr::deref(stabilize_saved_arg_registers(*addr), size),
         ExprKind::BinOp { op, left, right } => Expr::binop(
             op,
@@ -3983,10 +4245,44 @@ fn stabilize_saved_arg_call_target(target: CallTarget) -> CallTarget {
 }
 
 fn stack_slot_key(expr: &Expr) -> Option<String> {
-    let super::super::expression::ExprKind::Deref { addr, .. } = &expr.kind else {
-        return None;
-    };
-    stack_slot_address_key(addr)
+    use super::super::expression::{ExprKind, VarKind};
+
+    match &expr.kind {
+        ExprKind::Deref { addr, .. } => stack_slot_address_key(addr),
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => stack_slot_array_key(base, index, *element_size),
+        ExprKind::Var(var) => match var.kind {
+            VarKind::Stack(offset) => Some(format!("stack:{:+}", offset)),
+            _ => stack_slot_name_key(&var.name),
+        },
+        ExprKind::Unknown(name) => stack_slot_name_key(name),
+        _ => None,
+    }
+}
+
+fn stack_slot_name_key(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+
+    if let Some(hex) = lower
+        .strip_prefix("var_")
+        .or_else(|| lower.strip_prefix("local_"))
+    {
+        let offset = i64::from_str_radix(hex.trim_start_matches("0x"), 16).ok()?;
+        return Some(format!("stack:{:+}", -offset));
+    }
+    if let Some(hex) = lower.strip_prefix("arg_") {
+        let offset = i64::from_str_radix(hex.trim_start_matches("0x"), 16).ok()?;
+        return Some(format!("stack:{:+}", offset));
+    }
+    if let Some(offset) = lower.strip_prefix("stack_") {
+        let offset = offset.parse::<i64>().ok()?;
+        return Some(format!("stack:{:+}", offset));
+    }
+
+    None
 }
 
 fn stack_slot_address_key(addr: &Expr) -> Option<String> {
@@ -4015,6 +4311,27 @@ fn stack_slot_address_key(addr: &Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn stack_slot_array_key(base: &Expr, index: &Expr, element_size: usize) -> Option<String> {
+    use super::super::expression::ExprKind;
+
+    let ExprKind::Var(base_var) = &base.kind else {
+        return None;
+    };
+    if !is_stack_slot_base_register(&base_var.name) {
+        return None;
+    }
+    let ExprKind::IntLit(slot_index) = &index.kind else {
+        return None;
+    };
+    let actual_offset = slot_index.checked_mul(element_size as i128)?;
+    let actual_offset = i64::try_from(actual_offset).ok()?;
+    Some(format!(
+        "{}:{:+}",
+        base_var.name.to_lowercase(),
+        actual_offset
+    ))
 }
 
 fn is_stack_slot_base_register(name: &str) -> bool {
@@ -4060,6 +4377,22 @@ fn expr_is_pure_stack_slot_expression(expr: &Expr) -> bool {
         ExprKind::Phi(values) => values.iter().all(expr_is_pure_stack_slot_expression),
         ExprKind::Call { .. } | ExprKind::GotRef { .. } => false,
     }
+}
+
+fn expr_is_pure_data_load_expression(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::GotRef { is_deref, .. } => *is_deref,
+        ExprKind::Cast { expr: inner, .. } | ExprKind::BitField { expr: inner, .. } => {
+            expr_is_pure_data_load_expression(inner)
+        }
+        _ => false,
+    }
+}
+
+fn expr_is_saved_temp_arg_source(expr: &Expr) -> bool {
+    expr_is_pure_stack_slot_expression(expr) || expr_is_pure_data_load_expression(expr)
 }
 
 fn expr_uses_any_register_alias(expr: &Expr, aliases: &HashSet<String>) -> bool {
@@ -4433,10 +4766,25 @@ fn call_has_output_use_before_clobber(
 
 /// Extracts call arguments and returns (arguments, statement_indices_used).
 /// The statement indices are used to track which arg assignments should be removed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct KnownCallSignature {
     fixed_arg_count: usize,
     variadic: bool,
+    param_classes: Option<Vec<CallParamClass>>,
+    source: KnownCallSignatureSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallParamClass {
+    Integer,
+    Float,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownCallSignatureSource {
+    Builtin,
+    Recovered,
+    Hint,
 }
 
 fn normalize_known_call_name(name: &str) -> &str {
@@ -4483,6 +4831,31 @@ fn known_call_signature(
             return Some(KnownCallSignature {
                 fixed_arg_count: proto.parameters.len(),
                 variadic: proto.variadic,
+                param_classes: Some(
+                    proto
+                        .parameters
+                        .iter()
+                        .map(|(_, ty)| call_param_class_from_ctype(ty))
+                        .collect(),
+                ),
+                source: KnownCallSignatureSource::Builtin,
+            });
+        }
+        if let Some(signature) = binary_data.and_then(|ctx| {
+            ctx.call_signature_by_name(&name)
+                .or_else(|| ctx.call_signature_by_name(normalize_known_call_name(&name)))
+        }) {
+            return Some(KnownCallSignature {
+                fixed_arg_count: signature.parameters.len(),
+                variadic: signature.is_variadic,
+                param_classes: Some(
+                    signature
+                        .parameters
+                        .iter()
+                        .map(call_param_class_from_signature_parameter)
+                        .collect(),
+                ),
+                source: KnownCallSignatureSource::Recovered,
             });
         }
         if let Some(hinted_arg_count) = binary_data.and_then(|ctx| {
@@ -4492,33 +4865,88 @@ fn known_call_signature(
             return Some(KnownCallSignature {
                 fixed_arg_count: hinted_arg_count,
                 variadic: false,
+                param_classes: None,
+                source: KnownCallSignatureSource::Hint,
             });
         }
     }
 
-    let hinted_arg_count = match target {
+    match target {
         super::super::expression::CallTarget::Direct { target, .. } => {
-            binary_data?.call_signature_hint_by_address(*target)
+            if let Some(signature) = binary_data?.call_signature_by_address(*target) {
+                return Some(KnownCallSignature {
+                    fixed_arg_count: signature.parameters.len(),
+                    variadic: signature.is_variadic,
+                    param_classes: Some(
+                        signature
+                            .parameters
+                            .iter()
+                            .map(call_param_class_from_signature_parameter)
+                            .collect(),
+                    ),
+                    source: KnownCallSignatureSource::Recovered,
+                });
+            }
+            let hinted_arg_count = binary_data?.call_signature_hint_by_address(*target)?;
+            Some(KnownCallSignature {
+                fixed_arg_count: hinted_arg_count,
+                variadic: false,
+                param_classes: None,
+                source: KnownCallSignatureSource::Hint,
+            })
         }
         super::super::expression::CallTarget::Named(_)
         | super::super::expression::CallTarget::Indirect(_)
         | super::super::expression::CallTarget::IndirectGot { .. } => None,
-    }?;
-    Some(KnownCallSignature {
-        fixed_arg_count: hinted_arg_count,
-        variadic: false,
-    })
+    }
+}
+
+fn call_param_class_from_ctype(ty: &CType) -> CallParamClass {
+    if ty.is_float() {
+        CallParamClass::Float
+    } else {
+        CallParamClass::Integer
+    }
+}
+
+fn call_param_class_from_signature_parameter(
+    parameter: &super::super::signature::Parameter,
+) -> CallParamClass {
+    match (&parameter.location, &parameter.param_type) {
+        (super::super::signature::ParameterLocation::FloatRegister { .. }, _)
+        | (_, super::super::signature::ParamType::Float(_))
+        | (_, super::super::signature::ParamType::SimdFloat(_)) => CallParamClass::Float,
+        _ => CallParamClass::Integer,
+    }
 }
 
 fn extract_call_arguments_with_indices(
     target: Option<&super::super::expression::CallTarget>,
     existing_args: &[Expr],
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
     excluded_regs: &HashSet<String>,
     binary_data: Option<&BinaryDataContext>,
     preferred_family: Option<ArgumentAbiFamily>,
 ) -> (Vec<Expr>, Vec<usize>) {
     let signature = target.and_then(|target| known_call_signature(target, binary_data));
+    if let Some(signature) = signature.as_ref() {
+        if !signature.variadic
+            && signature.param_classes.is_some()
+            && existing_args.len() <= signature.fixed_arg_count
+        {
+            if let Some(recovered) = recover_typed_call_arguments(
+                signature,
+                existing_args,
+                arg_values,
+                saved_temp_values,
+                excluded_regs,
+                preferred_family,
+            ) {
+                return recovered;
+            }
+        }
+    }
     let mut args: Vec<(usize, Option<usize>, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
     let mut removable_indices = Vec::new();
 
@@ -4527,7 +4955,10 @@ fn extract_call_arguments_with_indices(
             continue;
         }
         if let Some(arg_idx) = get_arg_register_index(reg_name) {
-            if signature.is_some_and(|sig| !sig.variadic && arg_idx >= sig.fixed_arg_count) {
+            if signature
+                .as_ref()
+                .is_some_and(|sig| !sig.variadic && arg_idx >= sig.fixed_arg_count)
+            {
                 if let Some(stmt_idx) = stmt_idx {
                     removable_indices.push(*stmt_idx);
                 }
@@ -4552,7 +4983,7 @@ fn extract_call_arguments_with_indices(
         .map(|(arg_idx, stmt_idx, value)| (arg_idx, (stmt_idx, value)))
         .collect();
     let Some(max_idx) = explicit_by_index.keys().copied().max() else {
-        if let Some(sig) = signature {
+        if let Some(sig) = signature.as_ref() {
             if sig.fixed_arg_count == 0 {
                 return (existing_args.to_vec(), removable_indices);
             }
@@ -4595,11 +5026,14 @@ fn extract_call_arguments_with_indices(
         }
     }
 
-    if signature.is_some_and(|sig| !sig.variadic && sig.fixed_arg_count == 0) {
+    if signature
+        .as_ref()
+        .is_some_and(|sig| !sig.variadic && sig.fixed_arg_count == 0)
+    {
         return (existing_args.to_vec(), removable_indices);
     }
 
-    let max_idx = if let Some(sig) = signature {
+    let max_idx = if let Some(sig) = signature.as_ref() {
         if sig.variadic {
             max_idx
         } else {
@@ -4637,6 +5071,228 @@ fn extract_call_arguments_with_indices(
     }
 
     (result, used_indices)
+}
+
+fn recover_typed_call_arguments(
+    signature: &KnownCallSignature,
+    existing_args: &[Expr],
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
+    excluded_regs: &HashSet<String>,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> Option<(Vec<Expr>, Vec<usize>)> {
+    let param_classes = signature.param_classes.as_ref()?;
+    if existing_args.len() > param_classes.len() {
+        return None;
+    }
+
+    let family = infer_argument_abi_family(
+        arg_values
+            .keys()
+            .map(String::as_str)
+            .chain(excluded_regs.iter().map(String::as_str)),
+    )
+    .or(preferred_family);
+    let mut recovered_args = Vec::with_capacity(param_classes.len());
+    let mut existing_arg_index = 0usize;
+    let mut used_stmt_indices = Vec::new();
+    let mut int_slot = 0usize;
+    let mut float_slot = 0usize;
+    let saved_temp_values = (signature.source == KnownCallSignatureSource::Recovered)
+        .then_some(saved_temp_values)
+        .flatten();
+
+    for (param_index, class) in param_classes.iter().enumerate() {
+        match class {
+            CallParamClass::Integer => {
+                if let Some(family) = family {
+                    if let Some((stmt_idx, value)) = lookup_slot_value_or_passthrough(
+                        arg_values,
+                        saved_temp_values,
+                        existing_args,
+                        &mut existing_arg_index,
+                        family,
+                        int_slot,
+                        excluded_regs,
+                    ) {
+                        if let Some(stmt_idx) = stmt_idx {
+                            used_stmt_indices.push(stmt_idx);
+                        }
+                        recovered_args.push(value);
+                    } else if let Some(value) =
+                        reuse_existing_integer_variadic_arg(existing_args, &mut existing_arg_index)
+                    {
+                        recovered_args.push(value);
+                    } else if signature.source != KnownCallSignatureSource::Recovered {
+                        if !recovered_args.is_empty()
+                            && !has_remaining_typed_materialized_arg(
+                                param_classes,
+                                param_index + 1,
+                                arg_values,
+                                saved_temp_values,
+                                existing_args,
+                                existing_arg_index,
+                                Some(family),
+                                int_slot + 1,
+                                float_slot,
+                                excluded_regs,
+                            )
+                        {
+                            break;
+                        }
+                        let reg_name = pass_through_arg_register_name(family, int_slot)?;
+                        if excluded_regs.contains(reg_name) {
+                            return None;
+                        }
+                        recovered_args.push(pass_through_arg_expr(reg_name));
+                    } else {
+                        let reg_name = pass_through_arg_register_name(family, int_slot)?;
+                        if excluded_regs.contains(reg_name) {
+                            return None;
+                        }
+                        recovered_args.push(pass_through_arg_expr(reg_name));
+                    }
+                } else if let Some(value) =
+                    reuse_existing_integer_variadic_arg(existing_args, &mut existing_arg_index)
+                {
+                    recovered_args.push(value);
+                } else {
+                    return None;
+                }
+                int_slot += 1;
+            }
+            CallParamClass::Float => {
+                if let Some(family) = family {
+                    if let Some((stmt_idx, value)) = lookup_float_slot_value_or_passthrough(
+                        arg_values,
+                        saved_temp_values,
+                        existing_args,
+                        &mut existing_arg_index,
+                        family,
+                        float_slot,
+                        excluded_regs,
+                    ) {
+                        if let Some(stmt_idx) = stmt_idx {
+                            used_stmt_indices.push(stmt_idx);
+                        }
+                        recovered_args.push(value);
+                    } else if let Some(value) =
+                        reuse_existing_float_variadic_arg(existing_args, &mut existing_arg_index)
+                    {
+                        recovered_args.push(value);
+                    } else if signature.source != KnownCallSignatureSource::Recovered {
+                        if !recovered_args.is_empty()
+                            && !has_remaining_typed_materialized_arg(
+                                param_classes,
+                                param_index + 1,
+                                arg_values,
+                                saved_temp_values,
+                                existing_args,
+                                existing_arg_index,
+                                Some(family),
+                                int_slot,
+                                float_slot + 1,
+                                excluded_regs,
+                            )
+                        {
+                            break;
+                        }
+                        let reg_name = pass_through_float_arg_register_name(family, float_slot)?;
+                        if excluded_regs.contains(reg_name) {
+                            return None;
+                        }
+                        recovered_args.push(pass_through_float_arg_expr(reg_name));
+                    } else {
+                        let reg_name = pass_through_float_arg_register_name(family, float_slot)?;
+                        if excluded_regs.contains(reg_name) {
+                            return None;
+                        }
+                        recovered_args.push(pass_through_float_arg_expr(reg_name));
+                    }
+                } else if let Some(value) =
+                    reuse_existing_float_variadic_arg(existing_args, &mut existing_arg_index)
+                {
+                    recovered_args.push(value);
+                } else {
+                    return None;
+                }
+                float_slot += 1;
+            }
+        }
+    }
+
+    Some((recovered_args, used_stmt_indices))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn has_remaining_typed_materialized_arg(
+    param_classes: &[CallParamClass],
+    start_index: usize,
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
+    existing_args: &[Expr],
+    existing_arg_index: usize,
+    family: Option<ArgumentAbiFamily>,
+    int_slot: usize,
+    float_slot: usize,
+    excluded_regs: &HashSet<String>,
+) -> bool {
+    let mut existing_arg_index = existing_arg_index;
+    let mut int_slot = int_slot;
+    let mut float_slot = float_slot;
+
+    for class in &param_classes[start_index..] {
+        match class {
+            CallParamClass::Integer => {
+                if let Some(family) = family {
+                    if lookup_slot_value_or_passthrough(
+                        arg_values,
+                        saved_temp_values,
+                        existing_args,
+                        &mut existing_arg_index,
+                        family,
+                        int_slot,
+                        excluded_regs,
+                    )
+                    .is_some()
+                    {
+                        return true;
+                    }
+                }
+                if reuse_existing_integer_variadic_arg(existing_args, &mut existing_arg_index)
+                    .is_some()
+                {
+                    return true;
+                }
+                int_slot += 1;
+            }
+            CallParamClass::Float => {
+                if let Some(family) = family {
+                    if lookup_float_slot_value_or_passthrough(
+                        arg_values,
+                        saved_temp_values,
+                        existing_args,
+                        &mut existing_arg_index,
+                        family,
+                        float_slot,
+                        excluded_regs,
+                    )
+                    .is_some()
+                    {
+                        return true;
+                    }
+                }
+                if reuse_existing_float_variadic_arg(existing_args, &mut existing_arg_index)
+                    .is_some()
+                {
+                    return true;
+                }
+                float_slot += 1;
+            }
+        }
+    }
+
+    false
 }
 
 fn synthesize_leading_passthrough_args_from_target(excluded_regs: &HashSet<String>) -> Vec<Expr> {
@@ -4879,6 +5535,7 @@ fn try_recover_format_call_arguments(
             FormatArgClass::Integer => {
                 if let Some((stmt_idx, value)) = lookup_slot_value_or_passthrough(
                     arg_values,
+                    None,
                     existing_variadic_args,
                     &mut existing_variadic_index,
                     family,
@@ -4906,6 +5563,7 @@ fn try_recover_format_call_arguments(
             FormatArgClass::Float => {
                 if let Some((stmt_idx, value)) = lookup_float_slot_value_or_passthrough(
                     arg_values,
+                    None,
                     existing_variadic_args,
                     &mut existing_variadic_index,
                     family,
@@ -4938,6 +5596,7 @@ fn try_recover_format_call_arguments(
 
 fn lookup_slot_value_or_passthrough(
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
     existing_variadic_args: &[Expr],
     existing_variadic_index: &mut usize,
     family: ArgumentAbiFamily,
@@ -4948,7 +5607,9 @@ fn lookup_slot_value_or_passthrough(
     if excluded_regs.contains(reg_name) {
         return None;
     }
-    if let Some((stmt_idx, value)) = lookup_tracked_register_value(arg_values, reg_name) {
+    if let Some((stmt_idx, value)) =
+        lookup_tracked_register_value(arg_values, reg_name, saved_temp_values)
+    {
         return Some((stmt_idx, value));
     }
 
@@ -4964,6 +5625,7 @@ fn lookup_slot_value_or_passthrough(
 
 fn lookup_float_slot_value_or_passthrough(
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
     existing_variadic_args: &[Expr],
     existing_variadic_index: &mut usize,
     family: ArgumentAbiFamily,
@@ -4974,7 +5636,9 @@ fn lookup_float_slot_value_or_passthrough(
     if excluded_regs.contains(reg_name) {
         return None;
     }
-    if let Some((stmt_idx, value)) = lookup_tracked_register_value(arg_values, reg_name) {
+    if let Some((stmt_idx, value)) =
+        lookup_tracked_register_value(arg_values, reg_name, saved_temp_values)
+    {
         return Some((stmt_idx, value));
     }
 
@@ -5116,13 +5780,19 @@ fn is_plausible_format_call_prefix(args: &[Expr], fixed_arg_count: usize) -> boo
 fn lookup_tracked_register_value(
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
     reg_name: &str,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
 ) -> Option<(Option<usize>, Expr)> {
+    let resolve = |expr: &Expr| {
+        saved_temp_values
+            .map(|saved| substitute_vars(expr, saved))
+            .unwrap_or_else(|| expr.clone())
+    };
     if let Some((stmt_idx, value)) = arg_values.get(&reg_name.to_lowercase()) {
-        return Some((*stmt_idx, value.clone()));
+        return Some((*stmt_idx, resolve(value)));
     }
     for alias in get_register_aliases(reg_name) {
         if let Some((stmt_idx, value)) = arg_values.get(&alias) {
-            return Some((*stmt_idx, value.clone()));
+            return Some((*stmt_idx, resolve(value)));
         }
     }
     None
@@ -5454,8 +6124,6 @@ pub(super) fn merge_return_value_captures_with_counter(
     nodes: Vec<StructuredNode>,
     capture_counter: &mut u32,
 ) -> Vec<StructuredNode> {
-    use super::super::expression::ExprKind;
-
     let mut result: Vec<StructuredNode> = Vec::with_capacity(nodes.len());
 
     for node in nodes {
@@ -5482,74 +6150,8 @@ pub(super) fn merge_return_value_captures_with_counter(
                 mut statements,
                 address_range,
             } => {
-                // Check if first statement is `var = eax` (return value capture)
                 if !statements.is_empty() {
-                    let should_merge = if let ExprKind::Assign { lhs: _, rhs } = &statements[0].kind
-                    {
-                        if let ExprKind::Var(v) = &rhs.kind {
-                            if is_return_register(&v.name) {
-                                // Check if previous node is a block ending with a call
-                                if let Some(StructuredNode::Block {
-                                    statements: prev_stmts,
-                                    ..
-                                }) = result.last()
-                                {
-                                    if let Some(last_stmt) = prev_stmts.last() {
-                                        if let ExprKind::Call { target, .. } = &last_stmt.kind {
-                                            is_real_function_call(target)
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    if should_merge {
-                        // Pop the previous block
-                        if let Some(StructuredNode::Block {
-                            id: prev_id,
-                            statements: mut prev_stmts,
-                            address_range: prev_range,
-                        }) = result.pop()
-                        {
-                            // Extract the call from the previous block
-                            if let Some(last_stmt) = prev_stmts.pop() {
-                                if let ExprKind::Call { target, args } = &last_stmt.kind {
-                                    // Get the LHS from current block's first statement
-                                    if let ExprKind::Assign { lhs, .. } = &statements[0].kind {
-                                        // Create the merged assignment
-                                        let call_expr = Expr::call(target.clone(), args.clone());
-                                        let assign = Expr::assign((**lhs).clone(), call_expr);
-
-                                        // Put the modified previous block back (if not empty)
-                                        if !prev_stmts.is_empty() {
-                                            result.push(StructuredNode::Block {
-                                                id: prev_id,
-                                                statements: prev_stmts,
-                                                address_range: prev_range,
-                                            });
-                                        }
-
-                                        // Replace first statement with the merged assignment
-                                        statements[0] = assign;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
+                    merge_previous_block_call_capture(&mut result, &mut statements);
                     capture_return_register_uses_from_previous_block(
                         &mut result,
                         &mut statements,
@@ -5572,6 +6174,79 @@ pub(super) fn merge_return_value_captures_with_counter(
     }
 
     result
+}
+
+fn merge_previous_block_call_capture(result: &mut Vec<StructuredNode>, statements: &mut [Expr]) {
+    use super::super::expression::ExprKind;
+
+    let Some(ExprKind::Assign { lhs, rhs }) = statements.first().map(|stmt| &stmt.kind) else {
+        return;
+    };
+
+    let merge_kind = match &rhs.kind {
+        ExprKind::Var(var) if is_return_register(&var.name) => Some(None),
+        _ => expr_simple_identifier(rhs)
+            .filter(|name| name.starts_with("ret_"))
+            .map(|name| Some(name.to_string())),
+    };
+    let Some(expected_capture_name) = merge_kind else {
+        return;
+    };
+
+    let Some(StructuredNode::Block {
+        id: prev_id,
+        statements: prev_stmts,
+        address_range: prev_range,
+    }) = result.pop()
+    else {
+        return;
+    };
+
+    let Some(last_stmt) = prev_stmts.last().cloned() else {
+        result.push(StructuredNode::Block {
+            id: prev_id,
+            statements: prev_stmts,
+            address_range: prev_range,
+        });
+        return;
+    };
+
+    let call = match (&expected_capture_name, &last_stmt.kind) {
+        (None, ExprKind::Call { target, args }) if is_real_function_call(target) => {
+            Some(Expr::call(target.clone(), args.clone()))
+        }
+        (Some(expected_name), ExprKind::Assign { lhs, rhs }) => match &rhs.kind {
+            ExprKind::Call { target, args } if is_real_function_call(target) => {
+                if let Some(actual_name) = expr_simple_identifier(lhs) {
+                    (actual_name == expected_name).then(|| Expr::call(target.clone(), args.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(call) = call else {
+        result.push(StructuredNode::Block {
+            id: prev_id,
+            statements: prev_stmts,
+            address_range: prev_range,
+        });
+        return;
+    };
+
+    let mut prev_stmts = prev_stmts;
+    prev_stmts.pop();
+    if !prev_stmts.is_empty() {
+        result.push(StructuredNode::Block {
+            id: prev_id,
+            statements: prev_stmts,
+            address_range: prev_range,
+        });
+    }
+
+    statements[0] = Expr::assign((**lhs).clone(), call);
 }
 
 /// Recursively applies return value capture merging to nested structures.
@@ -6979,6 +7654,9 @@ mod tests {
         BinOpKind, CallTarget, ExprKind, UnaryOpKind, VarKind, Variable,
     };
     use crate::decompiler::BinaryDataContext;
+    use crate::decompiler::{
+        CallingConvention, FunctionSignature, ParamType, Parameter, ParameterLocation,
+    };
     use hexray_core::BasicBlockId;
 
     fn reg(name: &str, size: u8) -> Expr {
@@ -7431,8 +8109,15 @@ mod tests {
         );
         let excluded = HashSet::from(["rdi".to_string()]);
 
-        let (args, used_indices) =
-            extract_call_arguments_with_indices(None, &[], &arg_values, &excluded, None, None);
+        let (args, used_indices) = extract_call_arguments_with_indices(
+            None,
+            &[],
+            &arg_values,
+            None,
+            &excluded,
+            None,
+            None,
+        );
 
         assert_eq!(used_indices, vec![0]);
         assert_eq!(
@@ -7450,6 +8135,7 @@ mod tests {
             Some(&CallTarget::Named("helper".to_string())),
             &[],
             &HashMap::new(),
+            None,
             &HashSet::new(),
             Some(&binary_data),
             Some(ArgumentAbiFamily::X86_64SysV),
@@ -8012,6 +8698,127 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["1", "0x5310", "0x2a", "xmm0", "world"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_saved_x86_float_param_from_stack_slot_reload() {
+        let spill_slot = Expr::deref(Expr::binop(BinOpKind::Add, reg("rbp", 8), Expr::int(-8)), 8);
+        let statements = vec![
+            Expr::assign(spill_slot.clone(), reg("xmm0", 16)),
+            Expr::assign(reg("rax", 8), spill_slot),
+            Expr::assign(reg("rcx", 8), reg("rax", 8)),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(format!("{}", propagated[1]), "rax = farg0");
+        assert_eq!(format!("{}", propagated[2]), "rcx = farg0");
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_saved_x86_float_param_from_named_stack_slot() {
+        let spill_slot = Expr::var(Variable::stack(-8, 8));
+        let statements = vec![
+            Expr::assign(spill_slot.clone(), reg("xmm0", 16)),
+            Expr::assign(reg("rax", 8), spill_slot),
+            Expr::assign(reg("rcx", 8), reg("rax", 8)),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(format!("{}", propagated[1]), "rax = farg0");
+        assert_eq!(format!("{}", propagated[2]), "rcx = farg0");
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_mixed_float_arg_from_recovered_signature() {
+        let mut binary_data = BinaryDataContext::new();
+        let mut signature = FunctionSignature::new(CallingConvention::SystemV);
+        signature.parameters.push(Parameter::new(
+            "arg0",
+            ParamType::SignedInt(32),
+            ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+        signature.parameters.push(Parameter::new(
+            "farg0",
+            ParamType::Float(64),
+            ParameterLocation::FloatRegister {
+                name: "xmm0".to_string(),
+                index: 0,
+            },
+        ));
+        signature.parameters.push(Parameter::new(
+            "arg1",
+            ParamType::Pointer,
+            ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
+        ));
+        binary_data.add_call_signature_by_name("mixed", signature);
+
+        let statements = vec![
+            Expr::assign(reg("edi", 4), Expr::int(7)),
+            Expr::assign(reg("xmm0", 16), Expr::unknown("pi")),
+            Expr::assign(reg("rsi", 8), Expr::unknown("label")),
+            Expr::call(
+                CallTarget::Named("mixed".to_string()),
+                vec![Expr::int(7), Expr::unknown("label")],
+            ),
+        ];
+
+        let propagated =
+            propagate_args_in_block_with_binary_data(statements, Some(&binary_data), None);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing mixed call");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["7", "pi", "label"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_loaded_x86_float_arg_for_user_wrapper() {
+        let mut binary_data = BinaryDataContext::new();
+        let mut signature = FunctionSignature::new(CallingConvention::SystemV);
+        signature.parameters.push(Parameter::new(
+            "farg0",
+            ParamType::Float(64),
+            ParameterLocation::FloatRegister {
+                name: "xmm0".to_string(),
+                index: 0,
+            },
+        ));
+        binary_data.add_call_signature_by_name("hex_float", signature);
+
+        let statements = vec![
+            Expr::assign(
+                reg("rax", 8),
+                Expr::got_ref(0x5000, 0x4000, 8, Expr::int(0x5000)),
+            ),
+            Expr::assign(reg("xmm0", 16), reg("rax", 8)),
+            Expr::call(CallTarget::Named("hex_float".to_string()), vec![]),
+        ];
+
+        let propagated =
+            propagate_args_in_block_with_binary_data(statements, Some(&binary_data), None);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing hex_float call");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["*(uint64_t*)(&data_5000)"]
         );
     }
 
@@ -8801,6 +9608,28 @@ mod tests {
         let propagated = propagate_copies(statements);
         assert_eq!(format!("{}", propagated[1]), "edx = eax");
         assert_eq!(format!("{}", propagated[2]), "ecx = eax");
+    }
+
+    #[test]
+    fn test_propagate_copies_collapses_single_use_call_result_copy() {
+        let statements = vec![
+            Expr::assign(
+                local("ret_0", 4),
+                Expr::call(CallTarget::Named("foo".to_string()), vec![]),
+            ),
+            Expr::assign(local("var_8", 4), local("ret_0", 4)),
+            Expr::assign(
+                local("sum", 4),
+                Expr::binop(BinOpKind::Add, local("var_8", 4), Expr::int(1)),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(propagated.len(), 2, "{rendered:?}");
+        assert_eq!(rendered[0], "var_8 = foo()", "{rendered:?}");
+        assert_eq!(rendered[1], "sum = var_8 + 1", "{rendered:?}");
     }
 
     #[test]

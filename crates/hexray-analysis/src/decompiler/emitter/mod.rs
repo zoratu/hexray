@@ -664,7 +664,19 @@ impl PseudoCodeEmitter {
 
     fn repair_packed_small_aggregate_output(output: String) -> String {
         fn is_simple_identifier(name: &str) -> bool {
-            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            let mut chars = name.chars();
+            let Some(first) = chars.next() else {
+                return false;
+            };
+            (first == '_' || first.is_ascii_alphabetic())
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+
+        fn looks_like_restore_temp(name: &str) -> bool {
+            name == "ret"
+                || name.starts_with("ret_")
+                || name.starts_with("local_")
+                || name.starts_with("var_")
         }
 
         fn line_mentions_identifier(line: &str, name: &str) -> bool {
@@ -694,6 +706,28 @@ impl PseudoCodeEmitter {
             } else {
                 None
             }
+        }
+
+        fn parse_simple_decl(line: &str) -> Option<String> {
+            let trimmed = line.trim().strip_suffix(';')?;
+            if trimmed.contains('=') || trimmed.contains('(') || trimmed.contains(')') {
+                return None;
+            }
+            let mut parts = trimmed.split_whitespace();
+            let ty = parts.next()?;
+            let name = parts.next()?;
+            let starts_like_ident = name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic());
+            if ty == "return"
+                || parts.next().is_some()
+                || !starts_like_ident
+                || !is_simple_identifier(name)
+            {
+                return None;
+            }
+            Some(name.to_string())
         }
 
         fn split_top_level_csv(input: &str) -> Option<Vec<String>> {
@@ -977,6 +1011,51 @@ impl PseudoCodeEmitter {
                 .retain(|line| line.trim() != "int local_4;" && line.trim() != "uint32_t local_4;");
         }
 
+        loop {
+            let mut changed = false;
+            for idx in 0..lines.len() {
+                let Some((lhs, _rhs)) = parse_simple_copy_assign(&lines[idx]) else {
+                    continue;
+                };
+                if !looks_like_restore_temp(&lhs) {
+                    continue;
+                }
+                if lines[idx + 1..]
+                    .iter()
+                    .all(|line| !line_mentions_identifier(line, &lhs))
+                {
+                    lines.remove(idx);
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for idx in 0..lines.len() {
+                let Some(name) = parse_simple_decl(&lines[idx]) else {
+                    continue;
+                };
+                if !looks_like_restore_temp(&name) {
+                    continue;
+                }
+                if lines.iter().enumerate().all(|(other_idx, line)| {
+                    other_idx == idx || !line_mentions_identifier(line, &name)
+                }) {
+                    lines.remove(idx);
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
         lines.join("\n")
     }
 
@@ -1017,6 +1096,477 @@ impl PseudoCodeEmitter {
             ExprKind::Cast { expr, .. } => Self::expr_simple_name(expr),
             _ => None,
         }
+    }
+
+    fn collect_expr_name_uses(expr: &Expr, counts: &mut HashMap<String, usize>) {
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                *counts.entry(var.name.clone()).or_default() += 1;
+            }
+            ExprKind::Unknown(name) => {
+                *counts.entry(name.clone()).or_default() += 1;
+            }
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                Self::collect_expr_name_uses(left, counts);
+                Self::collect_expr_name_uses(right, counts);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                Self::collect_expr_name_uses(operand, counts);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                Self::collect_expr_name_uses(base, counts);
+                Self::collect_expr_name_uses(index, counts);
+            }
+            ExprKind::FieldAccess { base, .. } => Self::collect_expr_name_uses(base, counts),
+            ExprKind::Call { target, args } => {
+                match target {
+                    CallTarget::Indirect(expr) => Self::collect_expr_name_uses(expr, counts),
+                    CallTarget::IndirectGot { expr, .. } => {
+                        Self::collect_expr_name_uses(expr, counts)
+                    }
+                    CallTarget::Named(_) | CallTarget::Direct { .. } => {}
+                }
+                for arg in args {
+                    Self::collect_expr_name_uses(arg, counts);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_expr_name_uses(cond, counts);
+                Self::collect_expr_name_uses(then_expr, counts);
+                Self::collect_expr_name_uses(else_expr, counts);
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    Self::collect_expr_name_uses(value, counts);
+                }
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                Self::collect_expr_name_uses(display_expr, counts);
+            }
+            ExprKind::IntLit(_) => {}
+        }
+    }
+
+    fn prune_param_restore_statements(
+        statements: &[Expr],
+        param_names: &HashSet<String>,
+    ) -> Vec<Expr> {
+        let mut param_assign_counts: HashMap<String, usize> = HashMap::new();
+        let mut name_uses: HashMap<String, usize> = HashMap::new();
+        let mut assign_index_by_name: HashMap<String, usize> = HashMap::new();
+
+        for (idx, stmt) in statements.iter().enumerate() {
+            if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+                if let Some(lhs_name) = Self::expr_simple_name(lhs) {
+                    assign_index_by_name.insert(lhs_name.to_string(), idx);
+                    if param_names.contains(lhs_name) {
+                        *param_assign_counts.entry(lhs_name.to_string()).or_default() += 1;
+                    }
+                }
+                Self::collect_expr_name_uses(rhs, &mut name_uses);
+            } else {
+                Self::collect_expr_name_uses(stmt, &mut name_uses);
+            }
+        }
+
+        let mut remove = HashSet::new();
+        for (idx, stmt) in statements.iter().enumerate() {
+            let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+                continue;
+            };
+            let Some(lhs_name) = Self::expr_simple_name(lhs) else {
+                continue;
+            };
+            if !param_names.contains(lhs_name) {
+                continue;
+            }
+            if param_assign_counts
+                .get(lhs_name)
+                .copied()
+                .unwrap_or_default()
+                != 1
+            {
+                continue;
+            }
+            let Some(mut current_name) = Self::expr_simple_name(rhs).map(str::to_string) else {
+                continue;
+            };
+
+            remove.insert(idx);
+
+            loop {
+                if name_uses.get(&current_name).copied().unwrap_or_default() != 1 {
+                    break;
+                }
+                let Some(prev_idx) = assign_index_by_name.get(&current_name).copied() else {
+                    break;
+                };
+                let ExprKind::Assign {
+                    lhs: prev_lhs,
+                    rhs: prev_rhs,
+                } = &statements[prev_idx].kind
+                else {
+                    break;
+                };
+                let Some(prev_lhs_name) = Self::expr_simple_name(prev_lhs) else {
+                    break;
+                };
+                if prev_lhs_name != current_name {
+                    break;
+                }
+                let Some(next_name) = Self::expr_simple_name(prev_rhs).map(str::to_string) else {
+                    break;
+                };
+                remove.insert(prev_idx);
+                current_name = next_name;
+            }
+        }
+
+        let mut filtered: Vec<Expr> = statements
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !remove.contains(idx))
+            .map(|(_, stmt)| stmt.clone())
+            .collect();
+
+        if remove.is_empty() {
+            return filtered;
+        }
+
+        loop {
+            let mut current_uses: HashMap<String, usize> = HashMap::new();
+            for stmt in &filtered {
+                if let ExprKind::Assign { rhs, .. } = &stmt.kind {
+                    Self::collect_expr_name_uses(rhs, &mut current_uses);
+                } else {
+                    Self::collect_expr_name_uses(stmt, &mut current_uses);
+                }
+            }
+
+            let prior_len = filtered.len();
+            let next: Vec<Expr> = filtered
+                .into_iter()
+                .filter(|stmt| {
+                    let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+                        return true;
+                    };
+                    let Some(lhs_name) = Self::expr_simple_name(lhs) else {
+                        return true;
+                    };
+                    if param_names.contains(lhs_name) {
+                        return true;
+                    }
+                    Self::expr_simple_name(rhs).is_none()
+                        || current_uses.get(lhs_name).copied().unwrap_or_default() != 0
+                })
+                .collect();
+
+            if next.len() == prior_len {
+                return next;
+            }
+            filtered = next;
+        }
+    }
+
+    fn prune_param_restore_nodes(
+        nodes: &[StructuredNode],
+        param_names: &HashSet<String>,
+    ) -> Vec<StructuredNode> {
+        let mut param_assign_counts: HashMap<String, usize> = HashMap::new();
+        let mut name_uses: HashMap<String, usize> = HashMap::new();
+        let mut assign_index_by_name: HashMap<String, usize> = HashMap::new();
+
+        for (idx, node) in nodes.iter().enumerate() {
+            match node {
+                StructuredNode::Expr(expr) => {
+                    if let ExprKind::Assign { lhs, rhs } = &expr.kind {
+                        if let Some(lhs_name) = Self::expr_simple_name(lhs) {
+                            assign_index_by_name.insert(lhs_name.to_string(), idx);
+                            if param_names.contains(lhs_name) {
+                                *param_assign_counts.entry(lhs_name.to_string()).or_default() += 1;
+                            }
+                        }
+                        Self::collect_expr_name_uses(rhs, &mut name_uses);
+                    } else {
+                        Self::collect_expr_name_uses(expr, &mut name_uses);
+                    }
+                }
+                StructuredNode::Return(Some(expr)) => {
+                    Self::collect_expr_name_uses(expr, &mut name_uses);
+                }
+                _ => {}
+            }
+        }
+
+        let mut remove = HashSet::new();
+        for (idx, node) in nodes.iter().enumerate() {
+            let StructuredNode::Expr(expr) = node else {
+                continue;
+            };
+            let ExprKind::Assign { lhs, rhs } = &expr.kind else {
+                continue;
+            };
+            let Some(lhs_name) = Self::expr_simple_name(lhs) else {
+                continue;
+            };
+            if !param_names.contains(lhs_name) {
+                continue;
+            }
+            if param_assign_counts
+                .get(lhs_name)
+                .copied()
+                .unwrap_or_default()
+                != 1
+            {
+                continue;
+            }
+            let Some(mut current_name) = Self::expr_simple_name(rhs).map(str::to_string) else {
+                continue;
+            };
+
+            remove.insert(idx);
+
+            loop {
+                if name_uses.get(&current_name).copied().unwrap_or_default() != 1 {
+                    break;
+                }
+                let Some(prev_idx) = assign_index_by_name.get(&current_name).copied() else {
+                    break;
+                };
+                let StructuredNode::Expr(prev_expr) = &nodes[prev_idx] else {
+                    break;
+                };
+                let ExprKind::Assign {
+                    lhs: prev_lhs,
+                    rhs: prev_rhs,
+                } = &prev_expr.kind
+                else {
+                    break;
+                };
+                let Some(prev_lhs_name) = Self::expr_simple_name(prev_lhs) else {
+                    break;
+                };
+                if prev_lhs_name != current_name {
+                    break;
+                }
+                let Some(next_name) = Self::expr_simple_name(prev_rhs).map(str::to_string) else {
+                    break;
+                };
+                remove.insert(prev_idx);
+                current_name = next_name;
+            }
+        }
+
+        let mut filtered: Vec<StructuredNode> = nodes
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !remove.contains(idx))
+            .map(|(_, node)| node.clone())
+            .collect();
+
+        if remove.is_empty() {
+            return filtered;
+        }
+
+        loop {
+            let mut current_uses: HashMap<String, usize> = HashMap::new();
+            for node in &filtered {
+                match node {
+                    StructuredNode::Expr(expr) => {
+                        if let ExprKind::Assign { rhs, .. } = &expr.kind {
+                            Self::collect_expr_name_uses(rhs, &mut current_uses);
+                        } else {
+                            Self::collect_expr_name_uses(expr, &mut current_uses);
+                        }
+                    }
+                    StructuredNode::Return(Some(expr)) => {
+                        Self::collect_expr_name_uses(expr, &mut current_uses);
+                    }
+                    _ => {}
+                }
+            }
+
+            let prior_len = filtered.len();
+            let next: Vec<StructuredNode> = filtered
+                .into_iter()
+                .filter(|node| match node {
+                    StructuredNode::Expr(expr) => {
+                        let ExprKind::Assign { lhs, rhs } = &expr.kind else {
+                            return true;
+                        };
+                        let Some(lhs_name) = Self::expr_simple_name(lhs) else {
+                            return true;
+                        };
+                        if param_names.contains(lhs_name) {
+                            return true;
+                        }
+                        Self::expr_simple_name(rhs).is_none()
+                            || current_uses.get(lhs_name).copied().unwrap_or_default() != 0
+                    }
+                    _ => true,
+                })
+                .collect();
+
+            if next.len() == prior_len {
+                return next;
+            }
+            filtered = next;
+        }
+    }
+
+    fn rewrite_param_restore_artifacts_for_emission(
+        nodes: &[StructuredNode],
+        signature: &FunctionSignature,
+    ) -> Vec<StructuredNode> {
+        let mut param_names: HashSet<String> = HashSet::new();
+        for (idx, param) in signature.parameters.iter().enumerate() {
+            param_names.insert(param.name.clone());
+            param_names.insert(format!("arg{}", idx));
+            match &param.location {
+                super::signature::ParameterLocation::IntegerRegister { name, .. } => {
+                    param_names.insert(name.clone());
+                }
+                super::signature::ParameterLocation::FloatRegister { name, index } => {
+                    param_names.insert(name.clone());
+                    param_names.insert(format!("farg{}", index));
+                }
+                super::signature::ParameterLocation::Stack { .. } => {}
+            }
+        }
+
+        fn rewrite_list(
+            nodes: &[StructuredNode],
+            param_names: &HashSet<String>,
+        ) -> Vec<StructuredNode> {
+            let rewritten: Vec<_> = nodes
+                .iter()
+                .map(|node| match node {
+                    StructuredNode::Block {
+                        id,
+                        statements,
+                        address_range,
+                    } => StructuredNode::Block {
+                        id: *id,
+                        statements: PseudoCodeEmitter::prune_param_restore_statements(
+                            statements,
+                            param_names,
+                        ),
+                        address_range: *address_range,
+                    },
+                    StructuredNode::If {
+                        condition,
+                        then_body,
+                        else_body,
+                    } => StructuredNode::If {
+                        condition: condition.clone(),
+                        then_body: rewrite_list(then_body, param_names),
+                        else_body: else_body
+                            .as_ref()
+                            .map(|nodes| rewrite_list(nodes, param_names)),
+                    },
+                    StructuredNode::While {
+                        condition,
+                        body,
+                        header,
+                        exit_block,
+                    } => StructuredNode::While {
+                        condition: condition.clone(),
+                        body: rewrite_list(body, param_names),
+                        header: *header,
+                        exit_block: *exit_block,
+                    },
+                    StructuredNode::DoWhile {
+                        body,
+                        condition,
+                        header,
+                        exit_block,
+                    } => StructuredNode::DoWhile {
+                        body: rewrite_list(body, param_names),
+                        condition: condition.clone(),
+                        header: *header,
+                        exit_block: *exit_block,
+                    },
+                    StructuredNode::For {
+                        init,
+                        condition,
+                        update,
+                        body,
+                        header,
+                        exit_block,
+                    } => StructuredNode::For {
+                        init: init.clone(),
+                        condition: condition.clone(),
+                        update: update.clone(),
+                        body: rewrite_list(body, param_names),
+                        header: *header,
+                        exit_block: *exit_block,
+                    },
+                    StructuredNode::Loop {
+                        body,
+                        header,
+                        exit_block,
+                    } => StructuredNode::Loop {
+                        body: rewrite_list(body, param_names),
+                        header: *header,
+                        exit_block: *exit_block,
+                    },
+                    StructuredNode::Switch {
+                        value,
+                        cases,
+                        default,
+                    } => StructuredNode::Switch {
+                        value: value.clone(),
+                        cases: cases
+                            .iter()
+                            .map(|(vals, body)| (vals.clone(), rewrite_list(body, param_names)))
+                            .collect(),
+                        default: default
+                            .as_ref()
+                            .map(|nodes| rewrite_list(nodes, param_names)),
+                    },
+                    StructuredNode::Sequence(nodes) => {
+                        StructuredNode::Sequence(rewrite_list(nodes, param_names))
+                    }
+                    StructuredNode::TryCatch {
+                        try_body,
+                        catch_handlers,
+                    } => StructuredNode::TryCatch {
+                        try_body: rewrite_list(try_body, param_names),
+                        catch_handlers: catch_handlers
+                            .iter()
+                            .map(|handler| super::structurer::CatchHandler {
+                                exception_type: handler.exception_type.clone(),
+                                variable_name: handler.variable_name.clone(),
+                                body: rewrite_list(&handler.body, param_names),
+                                landing_pad: handler.landing_pad,
+                            })
+                            .collect(),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+
+            PseudoCodeEmitter::prune_param_restore_nodes(&rewritten, param_names)
+        }
+
+        rewrite_list(nodes, &param_names)
     }
 
     fn rewrite_destructor_cleanup_returns_for_emission(
@@ -5215,6 +5765,8 @@ impl PseudoCodeEmitter {
             &Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return),
         );
         let display_body = self.rewrite_destructor_cleanup_returns_for_emission(&display_body);
+        let display_body =
+            Self::rewrite_param_restore_artifacts_for_emission(&display_body, signature);
         let previous_snapshot_mode = self
             .register_snapshot_mode
             .replace(Self::should_enable_register_snapshot_mode(&display_body));
@@ -9303,6 +9855,50 @@ mod tests {
         assert!(
             !repaired.contains("arg1 = SET_BITS("),
             "Expected redundant alias assignment to be removed, got:\n{}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn test_repair_packed_small_aggregate_output_drops_dead_param_restore_artifacts() {
+        let input = r#"int32_t hex_float(double farg0)
+{
+    int local_8;
+    int ret;
+
+    ret = local_8;
+    return printf("%a\n", farg0);
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            !repaired.contains("int local_8;") && !repaired.contains("int ret;"),
+            "Expected dead restore locals to be dropped, got:\n{}",
+            repaired
+        );
+        assert!(
+            !repaired.contains("ret = local_8;"),
+            "Expected dead restore copy to be dropped, got:\n{}",
+            repaired
+        );
+        assert!(
+            repaired.contains("return printf(\"%a\\n\", farg0);"),
+            "Expected forwarding call to remain, got:\n{}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn test_repair_packed_small_aggregate_output_preserves_return_statement() {
+        let input = r#"int32_t main(void)
+{
+    return 0;
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            repaired.contains("return 0;"),
+            "Expected return statement to remain, got:\n{}",
             repaired
         );
     }

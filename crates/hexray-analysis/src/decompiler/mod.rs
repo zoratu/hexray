@@ -121,6 +121,10 @@ pub struct BinaryDataContext {
     call_signature_hints_by_name: HashMap<String, usize>,
     /// Best-effort fixed-arity hints for direct/internal call targets keyed by address.
     call_signature_hints_by_address: HashMap<u64, usize>,
+    /// Best-effort recovered signatures for direct/internal call targets keyed by name.
+    call_signatures_by_name: HashMap<String, FunctionSignature>,
+    /// Best-effort recovered signatures for direct/internal call targets keyed by address.
+    call_signatures_by_address: HashMap<u64, FunctionSignature>,
     /// Resolved direct-call target names keyed by target address.
     call_target_names_by_address: HashMap<u64, String>,
     /// Resolved direct-call target names keyed by call-site address.
@@ -134,6 +138,8 @@ impl BinaryDataContext {
             sections: Vec::new(),
             call_signature_hints_by_name: HashMap::new(),
             call_signature_hints_by_address: HashMap::new(),
+            call_signatures_by_name: HashMap::new(),
+            call_signatures_by_address: HashMap::new(),
             call_target_names_by_address: HashMap::new(),
             call_target_names_by_call_site: HashMap::new(),
         }
@@ -175,6 +181,25 @@ impl BinaryDataContext {
             .insert(address, fixed_arg_count);
     }
 
+    /// Adds a recovered signature for a call target name.
+    pub fn add_call_signature_by_name(
+        &mut self,
+        name: impl Into<String>,
+        signature: FunctionSignature,
+    ) {
+        let name = name.into();
+        self.call_signature_hints_by_name
+            .insert(name.clone(), signature.parameters.len());
+        self.call_signatures_by_name.insert(name, signature);
+    }
+
+    /// Adds a recovered signature for a call target address.
+    pub fn add_call_signature_by_address(&mut self, address: u64, signature: FunctionSignature) {
+        self.call_signature_hints_by_address
+            .insert(address, signature.parameters.len());
+        self.call_signatures_by_address.insert(address, signature);
+    }
+
     /// Looks up a fixed-arity hint by call target name.
     pub fn call_signature_hint_by_name(&self, name: &str) -> Option<usize> {
         self.call_signature_hints_by_name.get(name).copied()
@@ -183,6 +208,16 @@ impl BinaryDataContext {
     /// Looks up a fixed-arity hint by call target address.
     pub fn call_signature_hint_by_address(&self, address: u64) -> Option<usize> {
         self.call_signature_hints_by_address.get(&address).copied()
+    }
+
+    /// Looks up a recovered signature by call target name.
+    pub fn call_signature_by_name(&self, name: &str) -> Option<&FunctionSignature> {
+        self.call_signatures_by_name.get(name)
+    }
+
+    /// Looks up a recovered signature by call target address.
+    pub fn call_signature_by_address(&self, address: u64) -> Option<&FunctionSignature> {
+        self.call_signatures_by_address.get(&address)
     }
 
     /// Adds a resolved direct-call target name by target address.
@@ -1173,6 +1208,16 @@ impl Decompiler {
 
         let code = if let Some(signature) = self.adjusted_cpp_special_signature(cfg, func_name) {
             emitter.emit_with_signature(&structured, &display_name, &signature)
+        } else if self.enable_signature_recovery {
+            let signature = SignatureRecovery::new(self.calling_convention)
+                .with_binary_data(self.binary_data.as_ref())
+                .with_relocation_table(self.relocation_table.clone())
+                .with_symbol_table(self.symbol_table.clone())
+                .with_summary_database(self.summary_database.clone())
+                .with_dwarf_param_names(self.dwarf_param_names.clone())
+                .with_function_name(func_name)
+                .analyze(&structured);
+            emitter.emit_with_signature(&structured, &display_name, &signature)
         } else {
             emitter.emit(&structured, &display_name)
         };
@@ -2038,23 +2083,9 @@ impl Decompiler {
     /// This performs signature recovery without generating decompiled code,
     /// useful for building symbol tables or function prototypes.
     pub fn recover_signature(&self, cfg: &ControlFlowGraph) -> FunctionSignature {
-        let noreturn_targets = collect_known_noreturn_targets(
-            self.symbol_table.as_ref(),
-            self.relocation_table.as_ref(),
-        );
-        let ubsan_targets =
-            collect_known_ubsan_targets(self.symbol_table.as_ref(), self.relocation_table.as_ref());
-        let structured =
-            StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
-                cfg,
-                &config::DecompilerConfig::default(),
-                None,
-                None,
-                &noreturn_targets,
-                &ubsan_targets,
-                &self.throw_thunks,
-            );
+        let structured = self.structure(cfg);
         let mut recovery = SignatureRecovery::new(self.calling_convention)
+            .with_binary_data(self.binary_data.as_ref())
             .with_relocation_table(self.relocation_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone())
