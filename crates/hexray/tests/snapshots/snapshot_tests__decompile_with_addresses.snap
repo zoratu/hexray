@@ -7,16 +7,17 @@ expression: normalized
 
 Decompiling _main at [ADDR]
 
-int32_t _main(int32_t argc)
+int32_t _main(void)
 {
     int local_4;
     int ret;
+    int ret_0;
     int var_0;
 
     // bb0 [[ADDR]..[ADDR]]
     ret = _factorial(5);
     local_4 = _sum_while(10);
-    _conditional(7);
-    var_0 = argc;
+    ret_0 = _conditional(7);
+    var_0 = ret_0;
     return ret + local_4 + var_0;
 }
