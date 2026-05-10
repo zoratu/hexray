@@ -2680,6 +2680,21 @@ impl<'a> Structurer<'a> {
         false_target: BasicBlockId,
         region_end: Option<BasicBlockId>,
     ) -> Option<BasicBlockId> {
+        if region_end.is_some_and(|end| end == true_target || end == false_target) {
+            return region_end;
+        }
+
+        if let Some(end) = region_end {
+            let true_is_pure_return = self.get_return_expr_if_pure_return(true_target).is_some();
+            let false_is_pure_return = self.get_return_expr_if_pure_return(false_target).is_some();
+            if true_is_pure_return && self.block_can_reach(false_target, end) {
+                return Some(end);
+            }
+            if false_is_pure_return && self.block_can_reach(true_target, end) {
+                return Some(end);
+            }
+        }
+
         // Use dominator information to find where paths converge
         let _dominators = self.cfg.compute_dominators();
 
@@ -2689,6 +2704,17 @@ impl<'a> Structurer<'a> {
 
         self.collect_reachable(true_target, &mut true_reachable, region_end);
         self.collect_reachable(false_target, &mut false_reachable, region_end);
+
+        if true_reachable.contains(&false_target)
+            && self.get_return_expr_if_pure_return(false_target).is_none()
+        {
+            return Some(false_target);
+        }
+        if false_reachable.contains(&true_target)
+            && self.get_return_expr_if_pure_return(true_target).is_none()
+        {
+            return Some(true_target);
+        }
 
         // Find common reachable blocks
         let common: Vec<_> = true_reachable
@@ -2705,6 +2731,12 @@ impl<'a> Structurer<'a> {
         }
 
         region_end
+    }
+
+    fn block_can_reach(&self, start: BasicBlockId, target: BasicBlockId) -> bool {
+        let mut reachable = HashSet::new();
+        self.collect_reachable(start, &mut reachable, None);
+        reachable.contains(&target)
     }
 
     fn collect_reachable(
@@ -2776,7 +2808,7 @@ impl<'a> Structurer<'a> {
             _ => None,
         };
 
-        let exprs: Vec<Expr> = block
+        let filtered_instructions: Vec<_> = block
             .instructions
             .iter()
             .enumerate()
@@ -2812,24 +2844,38 @@ impl<'a> Structurer<'a> {
                 }
                 true
             })
-            .flat_map(|(_, inst)| {
-                // Special handling for SETcc and CMOVcc to use block context
-                let main_expr = match inst.operation {
-                    Operation::SetConditional => lift_setcc_with_context(inst, block),
-                    Operation::ConditionalMove => lift_cmovcc_with_context(inst, block),
-                    _ => Expr::from_instruction(inst),
-                };
-
-                // Generate writeback expressions for post-indexed loads/stores
-                let writeback = generate_writeback_expr(inst);
-
-                let mut exprs = vec![main_expr];
-                if let Some(wb) = writeback {
-                    exprs.push(wb);
-                }
-                exprs
-            })
             .collect();
+
+        let mut exprs = Vec::new();
+        let mut idx = 0usize;
+        while idx < filtered_instructions.len() {
+            if let Some((expr, consumed)) =
+                lift_branchless_strcmp_mask_pattern(&filtered_instructions[idx..])
+            {
+                exprs.push(expr);
+                idx += consumed;
+                continue;
+            }
+
+            let inst = filtered_instructions[idx].1;
+
+            // Special handling for SETcc and CMOVcc to use block context
+            let main_expr = match inst.operation {
+                Operation::SetConditional => lift_setcc_with_context(inst, block),
+                Operation::ConditionalMove => lift_cmovcc_with_context(inst, block),
+                _ => Expr::from_instruction(inst),
+            };
+
+            // Generate writeback expressions for post-indexed loads/stores
+            let writeback = generate_writeback_expr(inst);
+
+            exprs.push(main_expr);
+            if let Some(wb) = writeback {
+                exprs.push(wb);
+            }
+
+            idx += 1;
+        }
 
         // Resolve ADRP + ADD patterns (ARM64 PC-relative addressing)
         let exprs = resolve_adrp_patterns(exprs);
@@ -2849,6 +2895,60 @@ impl<'a> Structurer<'a> {
             exprs
         }
     }
+}
+
+fn lift_branchless_strcmp_mask_pattern(
+    instructions: &[(usize, &Instruction)],
+) -> Option<(Expr, usize)> {
+    if instructions.len() < 3 {
+        return None;
+    }
+
+    let cmp = instructions[0].1;
+    let sbb = instructions[1].1;
+    let and = instructions[2].1;
+
+    if cmp.operation != Operation::Compare
+        || !cmp.mnemonic.eq_ignore_ascii_case("cmp")
+        || !sbb.mnemonic.eq_ignore_ascii_case("sbb")
+        || and.operation != Operation::And
+    {
+        return None;
+    }
+
+    let (cmp_reg, cmp_imm) = match cmp.operands.as_slice() {
+        [Operand::Register(reg), Operand::Immediate(imm)] => (reg, imm.value),
+        [Operand::Immediate(imm), Operand::Register(reg)] => (reg, imm.value),
+        _ => return None,
+    };
+    if cmp_imm != 1 {
+        return None;
+    }
+
+    let [Operand::Register(sbb_dst), Operand::Register(sbb_src)] = sbb.operands.as_slice() else {
+        return None;
+    };
+    if sbb_dst != sbb_src || sbb_dst != cmp_reg {
+        return None;
+    }
+
+    let [Operand::Register(and_dst_reg), Operand::Immediate(mask)] = and.operands.as_slice() else {
+        return None;
+    };
+    if and_dst_reg != sbb_dst || mask.value < 0 {
+        return None;
+    }
+
+    let value = Expr::from_operand(&Operand::Register(*and_dst_reg));
+    let conditional = Expr {
+        kind: ExprKind::Conditional {
+            cond: Box::new(Expr::binop(BinOpKind::Eq, value.clone(), Expr::int(0))),
+            then_expr: Box::new(Expr::int(mask.value)),
+            else_expr: Box::new(Expr::int(0)),
+        },
+    };
+
+    Some((Expr::assign(value, conditional.simplify()), 3))
 }
 
 fn instruction_transfers_from_any_reg(inst: &Instruction, regs: &HashSet<u16>) -> bool {
@@ -7209,6 +7309,132 @@ mod tests {
     }
 
     #[test]
+    fn test_find_join_point_prefers_branch_target_reached_from_other_branch() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(5),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(6),
+            false_target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb3);
+
+        let mut bb4 = BasicBlock::new(BasicBlockId::new(4), 0x1040);
+        bb4.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(7),
+        };
+        cfg.add_block(bb4);
+
+        let mut bb5 = BasicBlock::new(BasicBlockId::new(5), 0x1050);
+        bb5.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(7),
+        };
+        cfg.add_block(bb5);
+
+        let mut bb6 = BasicBlock::new(BasicBlockId::new(6), 0x1060);
+        bb6.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(7),
+        };
+        cfg.add_block(bb6);
+
+        let mut bb7 = BasicBlock::new(BasicBlockId::new(7), 0x1070);
+        bb7.terminator = BlockTerminator::Return;
+        cfg.add_block(bb7);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(5));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(6));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(4), BasicBlockId::new(7));
+        cfg.add_edge(BasicBlockId::new(5), BasicBlockId::new(7));
+        cfg.add_edge(BasicBlockId::new(6), BasicBlockId::new(7));
+
+        let structurer = Structurer::new(&cfg);
+        let join = structurer.find_join_point(BasicBlockId::new(1), BasicBlockId::new(4), None);
+
+        assert_eq!(join, Some(BasicBlockId::new(4)));
+    }
+
+    #[test]
+    fn test_find_join_point_prefers_region_end_over_later_shared_return() {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(4),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(4),
+        };
+        cfg.add_block(bb3);
+
+        let mut bb4 = BasicBlock::new(BasicBlockId::new(4), 0x1040);
+        bb4.terminator = BlockTerminator::Return;
+        cfg.add_block(bb4);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(4));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(4));
+
+        let structurer = Structurer::new(&cfg);
+        let join = structurer.find_join_point(
+            BasicBlockId::new(1),
+            BasicBlockId::new(2),
+            Some(BasicBlockId::new(3)),
+        );
+
+        assert_eq!(join, Some(BasicBlockId::new(3)));
+    }
+
+    #[test]
     fn test_block_to_statements_keeps_ud2_halt_as_trap() {
         let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
 
@@ -7226,5 +7452,42 @@ mod tests {
         let rendered: Vec<_> = statements.iter().map(|expr| format!("{expr}")).collect();
 
         assert_eq!(rendered, vec!["__builtin_trap()"]);
+    }
+
+    #[test]
+    fn test_block_to_statements_lifts_cmp_sbb_and_mask_to_conditional() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(eax), Operand::imm(1, 4)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1003, 2, vec![], "sbb")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1005, 3, vec![], "and")
+                .with_operation(Operation::And)
+                .with_operands(vec![Operand::Register(eax), Operand::imm(5, 4)]),
+        );
+        bb0.terminator = BlockTerminator::Return;
+        cfg.add_block(bb0);
+
+        let structurer = Structurer::new(&cfg);
+        let statements = structurer.block_to_statements(BasicBlockId::new(0));
+
+        assert_eq!(statements.len(), 1);
+        let rendered = format!("{}", statements[0]);
+        assert!(
+            rendered.contains("? 5 : 0"),
+            "expected masked branchless idiom to lift into a conditional, got {rendered}"
+        );
     }
 }
