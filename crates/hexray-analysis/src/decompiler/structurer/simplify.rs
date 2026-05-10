@@ -6178,23 +6178,18 @@ fn broad_return_value_aliases(name: &str) -> Vec<String> {
 
 fn first_return_value_alias_use_in_node(node: &StructuredNode) -> Option<(Vec<String>, String)> {
     match node {
-        StructuredNode::Block { statements, .. } => {
-            let stop_aliases = broad_return_value_aliases("ret");
-            for stmt in statements {
-                if let Some(name) = collect_return_register_uses(stmt).into_iter().next() {
-                    return Some((broad_return_value_aliases(&name), name));
-                }
-                if let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind {
-                    if is_call_capture_boundary(target) {
-                        break;
-                    }
-                }
-                if statement_clobbers_return_register(stmt, &stop_aliases) {
-                    break;
-                }
+        StructuredNode::Block { statements, .. } => statements.first().and_then(|stmt| {
+            let super::super::expression::ExprKind::Call { target, .. } = &stmt.kind else {
+                return None;
+            };
+            if !is_call_capture_boundary(target) {
+                return None;
             }
-            None
-        }
+            collect_return_register_uses(stmt)
+                .into_iter()
+                .next()
+                .map(|name| (broad_return_value_aliases(&name), name))
+        }),
         StructuredNode::If { condition, .. }
         | StructuredNode::While { condition, .. }
         | StructuredNode::DoWhile { condition, .. } => {
