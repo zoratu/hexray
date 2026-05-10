@@ -841,26 +841,14 @@ impl SignatureRecovery {
                     if let ExprKind::Call { target, args } = &expr.kind {
                         if let Some(name) = self.extract_call_name(target) {
                             if let Some(params) = get_known_function_params(&name) {
+                                let mut resolved_args = Vec::with_capacity(args.len());
                                 let mut is_pure_prefix_wrapper =
-                                    !args.is_empty() && args.len() < params.len();
+                                    !args.is_empty() && args.len() <= params.len();
                                 for (arg_index, arg) in args.iter().enumerate() {
                                     let resolved_param_idx =
                                         self.resolve_param_index_from_expr_precise(arg);
-                                    if let Some(param_idx) = resolved_param_idx {
-                                        if let Some((param_name, param_type)) =
-                                            params.get(arg_index)
-                                        {
-                                            self.param_names
-                                                .entry(param_idx)
-                                                .or_insert_with(|| (*param_name).to_string());
-                                            self.param_type_overrides
-                                                .entry(param_idx)
-                                                .or_insert_with(|| param_type.clone());
-                                        }
-                                        is_pure_prefix_wrapper &= param_idx == arg_index;
-                                    } else {
-                                        is_pure_prefix_wrapper = false;
-                                    }
+                                    resolved_args.push(resolved_param_idx);
+                                    is_pure_prefix_wrapper &= resolved_param_idx == Some(arg_index);
                                 }
 
                                 if is_pure_prefix_wrapper {
@@ -870,12 +858,31 @@ impl SignatureRecovery {
                                     for (param_idx, (param_name, param_type)) in
                                         params.iter().enumerate()
                                     {
+                                        let wrapper_param_type =
+                                            ParameterUsageHints::callback_signature(
+                                                &name, param_idx,
+                                            )
+                                            .unwrap_or_else(|| param_type.clone());
                                         self.param_names
                                             .entry(param_idx)
                                             .or_insert_with(|| (*param_name).to_string());
                                         self.param_type_overrides
                                             .entry(param_idx)
-                                            .or_insert_with(|| param_type.clone());
+                                            .or_insert(wrapper_param_type);
+                                    }
+                                } else {
+                                    for (arg_index, resolved_param_idx) in
+                                        resolved_args.into_iter().enumerate()
+                                    {
+                                        let Some(param_idx) = resolved_param_idx else {
+                                            continue;
+                                        };
+                                        let Some((param_name, _)) = params.get(arg_index) else {
+                                            continue;
+                                        };
+                                        self.param_names
+                                            .entry(param_idx)
+                                            .or_insert_with(|| (*param_name).to_string());
                                     }
                                 }
                             }
