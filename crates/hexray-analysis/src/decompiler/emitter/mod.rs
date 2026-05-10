@@ -1218,8 +1218,12 @@ impl PseudoCodeEmitter {
             };
 
             remove.insert(idx);
+            let mut seen_names = HashSet::new();
 
             loop {
+                if !seen_names.insert(current_name.clone()) {
+                    break;
+                }
                 if name_uses.get(&current_name).copied().unwrap_or_default() != 1 {
                     break;
                 }
@@ -1350,8 +1354,12 @@ impl PseudoCodeEmitter {
             };
 
             remove.insert(idx);
+            let mut seen_names = HashSet::new();
 
             loop {
+                if !seen_names.insert(current_name.clone()) {
+                    break;
+                }
                 if name_uses.get(&current_name).copied().unwrap_or_default() != 1 {
                     break;
                 }
@@ -12024,5 +12032,78 @@ mod tests {
         let expr = Expr::var(Variable::reg("xmm0", 16));
 
         assert_eq!(emitter.format_expr(&expr), "farg0");
+    }
+
+    #[test]
+    fn test_emit_with_signature_breaks_block_param_restore_cycles() {
+        use super::super::expression::Variable;
+
+        let tmp = Expr::var(Variable::reg("tmp", 8));
+        let arg0 = Expr::var(Variable::reg("arg0", 8));
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Block {
+                    id: hexray_core::BasicBlockId::new(0),
+                    statements: vec![
+                        Expr::assign(tmp.clone(), arg0.clone()),
+                        Expr::assign(arg0.clone(), tmp),
+                    ],
+                    address_range: (0x1000, 0x1008),
+                },
+                StructuredNode::Return(Some(arg0)),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::default();
+        sig.parameters
+            .push(super::super::signature::Parameter::from_int_register(
+                0,
+                "rdi",
+                super::super::signature::ParamType::SignedInt(64),
+            ));
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(64);
+
+        let output = PseudoCodeEmitter::new("    ", false).emit_with_signature(&cfg, "cycle", &sig);
+
+        assert!(
+            output.contains("return arg0;"),
+            "expected emitter to finish block-cycle restoration cleanup, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_breaks_node_param_restore_cycles() {
+        use super::super::expression::Variable;
+
+        let tmp = Expr::var(Variable::reg("tmp", 8));
+        let arg0 = Expr::var(Variable::reg("arg0", 8));
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Expr(Expr::assign(tmp.clone(), arg0.clone())),
+                StructuredNode::Expr(Expr::assign(arg0.clone(), tmp)),
+                StructuredNode::Return(Some(arg0)),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sig = super::super::signature::FunctionSignature::default();
+        sig.parameters
+            .push(super::super::signature::Parameter::from_int_register(
+                0,
+                "rdi",
+                super::super::signature::ParamType::SignedInt(64),
+            ));
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(64);
+
+        let output =
+            PseudoCodeEmitter::new("    ", false).emit_with_signature(&cfg, "cycle_nodes", &sig);
+
+        assert!(
+            output.contains("return arg0;"),
+            "expected emitter to finish node-cycle restoration cleanup, got:\n{output}"
+        );
     }
 }
