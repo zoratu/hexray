@@ -200,6 +200,37 @@ fn expr_is_boolean_wrapper(expr: &Expr) -> bool {
     }
 }
 
+fn expr_known_bit_width(expr: &Expr) -> Option<u16> {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(var) => {
+            Some(u16::from(var.size).saturating_mul(8)).filter(|width| *width > 0)
+        }
+        ExprKind::Deref { size, .. } => {
+            Some(u16::from(*size).saturating_mul(8)).filter(|width| *width > 0)
+        }
+        ExprKind::ArrayAccess { element_size, .. } => u16::try_from(*element_size)
+            .ok()
+            .map(|size| size.saturating_mul(8)),
+        ExprKind::Cast { to_size, .. } => {
+            Some(u16::from(*to_size).saturating_mul(8)).filter(|width| *width > 0)
+        }
+        ExprKind::BitField { width, .. } => Some(u16::from(*width)).filter(|width| *width > 0),
+        _ => None,
+    }
+}
+
+fn should_preserve_subregister_test_alias(raw_operand: &Operand, substituted: &Expr) -> bool {
+    let Operand::Register(reg) = raw_operand else {
+        return false;
+    };
+    let Some(expr_bits) = expr_known_bit_width(substituted) else {
+        return false;
+    };
+    reg.size < expr_bits
+}
+
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
 /// Also substitutes register names with their values from preceding MOV instructions.
 pub(super) fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
@@ -414,15 +445,21 @@ fn condition_to_expr_before_address_with_fallback(
             let mut right = substitute_register_in_expr(raw_right.clone(), reg_values);
 
             if matches!(inst.operation, Operation::Test) {
+                let preserve_left_alias =
+                    should_preserve_subregister_test_alias(&inst.operands[0], &left);
+                let preserve_right_alias =
+                    should_preserve_subregister_test_alias(&inst.operands[1], &right);
                 if matches!(inst.operands[0], Operand::Register(_))
                     && expr_requires_single_evaluation(&left)
                     && !expr_is_boolean_wrapper(&left)
+                    && !preserve_left_alias
                 {
                     left = raw_left;
                 }
                 if matches!(inst.operands[1], Operand::Register(_))
                     && expr_requires_single_evaluation(&right)
                     && !expr_is_boolean_wrapper(&right)
+                    && !preserve_right_alias
                 {
                     right = raw_right;
                 }
@@ -1272,6 +1309,77 @@ mod tests {
             not_equal.contains('&')
                 && (not_equal.contains("!= 0") || not_equal.contains("!= '\\0'")),
             "expected TEST/JNE to lower as an AND-against-zero predicate, got {not_equal}"
+        );
+    }
+
+    #[test]
+    fn test_condition_preserves_movzx_source_for_low_byte_test_mask() {
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x2300);
+        block.instructions.push(
+            Instruction::new(0x2300, 4, vec![], "movzx")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rdi, 0x28, 2)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x2304, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(al), Operand::imm_unsigned(1, 8)]),
+        );
+
+        let rendered = format!(
+            "{}",
+            condition_to_expr_with_block(Condition::Equal, &block).simplify()
+        );
+        assert!(
+            rendered.contains("rdi") || rendered.contains("["),
+            "expected low-byte TEST to stay tied to the movzx source, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("al"),
+            "expected no detached low-byte temporary in TEST predicate, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_preserves_movzx_source_for_word_compare_alias() {
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 16);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x2340);
+        block.instructions.push(
+            Instruction::new(0x2340, 4, vec![], "movzx")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rdi, 0x28, 2)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0x2344, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(ax), Operand::imm_unsigned(4, 16)]),
+        );
+
+        let rendered = format!("{}", condition_to_expr_with_block(Condition::Equal, &block));
+        assert!(
+            rendered.contains("== 4"),
+            "expected compare to preserve the immediate case value, got {rendered}"
+        );
+        assert!(
+            rendered.contains("rdi") || rendered.contains("["),
+            "expected word compare alias to stay tied to the movzx source, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("ax"),
+            "expected no detached word-register alias in CMP predicate, got {rendered}"
         );
     }
 
