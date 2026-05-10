@@ -69,7 +69,11 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                 {
                     // Substitute known values in RHS before storing
                     let substituted_rhs = substitute_vars(rhs, &reg_values);
-                    reg_values.insert(v.name.clone(), substituted_rhs);
+                    if expr_requires_single_evaluation(&substituted_rhs) {
+                        reg_values.remove(&v.name);
+                    } else {
+                        reg_values.insert(v.name.clone(), substituted_rhs);
+                    }
                 }
             }
         }
@@ -791,6 +795,38 @@ fn expr_has_side_effects(expr: &Expr) -> bool {
     }
 }
 
+fn expr_requires_single_evaluation(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Call { target, .. } => is_real_function_call(target),
+        ExprKind::Assign { .. } | ExprKind::CompoundAssign { .. } => true,
+        ExprKind::Deref { .. } | ExprKind::ArrayAccess { .. } | ExprKind::FieldAccess { .. } => {
+            true
+        }
+        ExprKind::GotRef { is_deref, .. } => *is_deref,
+        ExprKind::BinOp { left, right, .. } => {
+            expr_requires_single_evaluation(left) || expr_requires_single_evaluation(right)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_requires_single_evaluation(operand),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_requires_single_evaluation(cond)
+                || expr_requires_single_evaluation(then_expr)
+                || expr_requires_single_evaluation(else_expr)
+        }
+        ExprKind::Phi(args) => args.iter().any(expr_requires_single_evaluation),
+        ExprKind::AddressOf(_) | ExprKind::IntLit(_) | ExprKind::Unknown(_) | ExprKind::Var(_) => {
+            false
+        }
+    }
+}
+
 fn merge_adjacent_blocks(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     let mut merged = Vec::new();
 
@@ -1419,8 +1455,14 @@ fn collect_temps_from_node(node: &StructuredNode, temps: &mut HashMap<String, Ex
                         if is_temp_register(&v.name) {
                             // Substitute existing temps in the RHS
                             let rhs_substituted = substitute_vars(rhs, temps);
-                            for alias in get_register_aliases(&v.name) {
-                                temps.insert(alias, rhs_substituted.clone());
+                            let aliases = get_register_aliases(&v.name);
+                            for alias in &aliases {
+                                temps.remove(alias);
+                            }
+                            if !expr_requires_single_evaluation(&rhs_substituted) {
+                                for alias in aliases {
+                                    temps.insert(alias, rhs_substituted.clone());
+                                }
                             }
                         }
                     }
@@ -1442,8 +1484,14 @@ fn collect_temps_from_node(node: &StructuredNode, temps: &mut HashMap<String, Ex
                                 }
                                 // Build the compound expression from the stabilized pre-update value.
                                 let new_val = Expr::binop(*op, lhs_val, rhs_substituted).simplify();
-                                for alias in aliases {
-                                    temps.insert(alias, new_val.clone());
+                                if expr_requires_single_evaluation(&new_val) {
+                                    for alias in aliases {
+                                        temps.remove(&alias);
+                                    }
+                                } else {
+                                    for alias in aliases {
+                                        temps.insert(alias, new_val.clone());
+                                    }
                                 }
                             } else {
                                 for alias in aliases {
@@ -2385,8 +2433,10 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                 if is_temp_register(&lhs_var.name) {
                     // Track this assignment for all aliased register names
                     // (e.g., w9 and x9 on ARM64, eax and rax on x86)
-                    for alias in get_register_aliases(&lhs_var.name) {
-                        reg_values.insert(alias, new_rhs.clone());
+                    if !expr_requires_single_evaluation(&new_rhs) {
+                        for alias in get_register_aliases(&lhs_var.name) {
+                            reg_values.insert(alias, new_rhs.clone());
+                        }
                     }
                     // Emit with substituted RHS (keep the assignment for now)
                     result.push(Expr::assign((**lhs).clone(), new_rhs));
@@ -2417,8 +2467,10 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                     if let Some(current) = prior_value {
                         if !expr_uses_any_alias(&current, &aliases) {
                             let new_val = Expr::binop(*op, current, new_rhs.clone()).simplify();
-                            for alias in aliases {
-                                reg_values.insert(alias, new_val.clone());
+                            if !expr_requires_single_evaluation(&new_val) {
+                                for alias in aliases {
+                                    reg_values.insert(alias, new_val.clone());
+                                }
                             }
                         }
                     }
@@ -3158,22 +3210,26 @@ fn propagate_args_in_block_with_state(
 
                 if is_temp_register(&v.name) {
                     let stabilized_temp_rhs = stabilize_saved_arg_registers(tracked_rhs.clone());
-                    for alias in &written_aliases {
-                        state
-                            .reg_values
-                            .insert(alias.clone(), stabilized_temp_rhs.clone());
-                        state
-                            .call_target_values
-                            .insert(alias.clone(), stabilized_temp_rhs.clone());
+                    if !expr_requires_single_evaluation(&stabilized_temp_rhs) {
+                        for alias in &written_aliases {
+                            state
+                                .reg_values
+                                .insert(alias.clone(), stabilized_temp_rhs.clone());
+                            state
+                                .call_target_values
+                                .insert(alias.clone(), stabilized_temp_rhs.clone());
+                        }
                     }
                 }
 
                 if is_tracked_call_arg_register(&v.name) {
-                    for alias in &written_aliases {
-                        state.reg_values.insert(alias.clone(), tracked_rhs.clone());
-                        state
-                            .call_target_values
-                            .insert(alias.clone(), tracked_rhs.clone());
+                    if !expr_requires_single_evaluation(&tracked_rhs) {
+                        for alias in &written_aliases {
+                            state.reg_values.insert(alias.clone(), tracked_rhs.clone());
+                            state
+                                .call_target_values
+                                .insert(alias.clone(), tracked_rhs.clone());
+                        }
                     }
                     // If one ABI argument register is only staging a value into another
                     // argument register, keep the destination but drop the staged source.
@@ -3200,9 +3256,12 @@ fn propagate_args_in_block_with_state(
 
             if let Some(slot_key) = stack_slot_key(&substituted_lhs) {
                 let stabilized_rhs = stabilize_saved_arg_registers(tracked_rhs);
-                state
-                    .stack_slot_values
-                    .insert(slot_key, stabilized_rhs.clone());
+                state.stack_slot_values.remove(&slot_key);
+                if !expr_requires_single_evaluation(&stabilized_rhs) {
+                    state
+                        .stack_slot_values
+                        .insert(slot_key, stabilized_rhs.clone());
+                }
                 forget_pending_arg_values_from_expr(&stmt, &mut state.arg_values);
                 result.push(Expr::assign(substituted_lhs, stabilized_rhs));
                 continue;
@@ -3317,11 +3376,13 @@ fn propagate_args_in_block_with_state(
                     if let Some(current) = prior_value {
                         if !expr_uses_any_register_alias(&current, &written_aliases) {
                             let new_val = Expr::binop(*op, current, tracked_rhs.clone()).simplify();
-                            for alias in &written_aliases {
-                                state.reg_values.insert(alias.clone(), new_val.clone());
-                                state
-                                    .call_target_values
-                                    .insert(alias.clone(), new_val.clone());
+                            if !expr_requires_single_evaluation(&new_val) {
+                                for alias in &written_aliases {
+                                    state.reg_values.insert(alias.clone(), new_val.clone());
+                                    state
+                                        .call_target_values
+                                        .insert(alias.clone(), new_val.clone());
+                                }
                             }
                         }
                     }
@@ -7822,6 +7883,19 @@ mod tests {
     }
 
     #[test]
+    fn test_propagate_copies_does_not_clone_load_rhs_across_temp_copies() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::deref(reg("rdi", 8), 4)),
+            Expr::assign(reg("edx", 4), reg("eax", 4)),
+            Expr::assign(reg("ecx", 4), reg("eax", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+        assert_eq!(format!("{}", propagated[1]), "edx = eax");
+        assert_eq!(format!("{}", propagated[2]), "ecx = eax");
+    }
+
+    #[test]
     fn test_propagate_copies_normalizes_set_bits_value_arg_after_shift_update() {
         let statements = vec![
             Expr::assign(reg("eax", 4), reg("edi", 4)),
@@ -8025,6 +8099,19 @@ mod tests {
     }
 
     #[test]
+    fn test_propagate_call_args_does_not_clone_load_rhs_across_temp_copies() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::deref(reg("rdi", 8), 4)),
+            Expr::assign(reg("edx", 4), reg("eax", 4)),
+            Expr::assign(reg("ecx", 4), reg("eax", 4)),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(format!("{}", propagated[1]), "edx = eax");
+        assert_eq!(format!("{}", propagated[2]), "ecx = eax");
+    }
+
+    #[test]
     fn test_propagate_call_args_recovers_saved_arm64_param_from_stack_slot() {
         let sp_slot = Expr::deref(reg("sp", 8), 8);
         let statements = vec![
@@ -8096,6 +8183,34 @@ mod tests {
         };
 
         assert_eq!(format!("{}", condition), "edi != 1");
+    }
+
+    #[test]
+    fn test_propagate_temps_to_conditions_keeps_single_load_temp_in_dowhile_condition() {
+        let nodes = vec![StructuredNode::DoWhile {
+            body: vec![block(
+                0,
+                vec![Expr::assign(reg("eax", 4), Expr::deref(reg("rdi", 8), 4))],
+            )],
+            condition: Expr::binop(
+                BinOpKind::Eq,
+                Expr::binop(BinOpKind::And, reg("eax", 4), Expr::unknown("mask")),
+                Expr::int(0),
+            ),
+            header: Some(BasicBlockId::new(0)),
+            exit_block: Some(BasicBlockId::new(1)),
+        }];
+
+        let propagated = propagate_temps_to_conditions(nodes);
+        let StructuredNode::DoWhile { condition, .. } = &propagated[0] else {
+            panic!("expected do-while node");
+        };
+        let rendered = format!("{condition}");
+
+        assert!(
+            rendered.contains("eax") && !rendered.contains("*(uint32_t*)(rdi)"),
+            "expected the captured load temp to stay single-evaluation, got {rendered}"
+        );
     }
 
     #[test]
