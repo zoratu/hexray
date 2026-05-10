@@ -3251,8 +3251,9 @@ fn propagate_args_in_block_with_state(
                     }
                 }
 
-                if is_tracked_call_arg_register(&v.name) {
-                    if !expr_requires_single_evaluation(&tracked_rhs) {
+                if let Some(tracked_arg_key) = tracked_call_arg_key(v, preferred_family) {
+                    let tracks_register_aliases = is_tracked_call_arg_register(&v.name);
+                    if tracks_register_aliases && !expr_requires_single_evaluation(&tracked_rhs) {
                         for alias in &written_aliases {
                             state.reg_values.insert(alias.clone(), tracked_rhs.clone());
                             state
@@ -3264,7 +3265,7 @@ fn propagate_args_in_block_with_state(
                     // argument register, keep the destination but drop the staged source.
                     if let ExprKind::Var(src_var) = &rhs.kind {
                         if let Some(src_idx) = get_arg_register_index(&src_var.name) {
-                            if get_arg_register_index(&v.name) != Some(src_idx) {
+                            if get_arg_register_index(&tracked_arg_key) != Some(src_idx) {
                                 for alias in get_register_aliases(&src_var.name) {
                                     state.arg_values.remove(&alias);
                                 }
@@ -3274,18 +3275,25 @@ fn propagate_args_in_block_with_state(
 
                     // Preserve copies of incoming ABI arguments even if the source
                     // registers get reused later in the setup sequence.
-                    let tracked_arg_value = match &tracked_rhs.kind {
-                        ExprKind::Call { target, .. } if is_real_function_call(target) => {
-                            call_result_placeholder_expr(preferred_family, &v.name, v.size)
-                                .unwrap_or_else(|| {
-                                    stabilize_saved_arg_registers(tracked_rhs.clone())
-                                })
-                        }
-                        _ => stabilize_saved_arg_registers(tracked_rhs.clone()),
+                    let tracked_arg_value = match v.kind {
+                        super::super::expression::VarKind::Arg(_) => Expr::var(v.clone()),
+                        _ => match &tracked_rhs.kind {
+                            ExprKind::Call { target, .. } if is_real_function_call(target) => {
+                                call_result_placeholder_expr(preferred_family, &v.name, v.size)
+                                    .unwrap_or_else(|| {
+                                        stabilize_saved_arg_registers(tracked_rhs.clone())
+                                    })
+                            }
+                            _ => stabilize_saved_arg_registers(tracked_rhs.clone()),
+                        },
+                    };
+                    let stmt_idx = match v.kind {
+                        super::super::expression::VarKind::Arg(_) => None,
+                        _ => Some(i),
                     };
                     state
                         .arg_values
-                        .insert(v.name.to_lowercase(), (Some(i), tracked_arg_value));
+                        .insert(tracked_arg_key, (stmt_idx, tracked_arg_value));
                     result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
                 }
@@ -4368,6 +4376,23 @@ fn normalize_known_call_name(name: &str) -> &str {
     trimmed.split('@').next().unwrap_or(trimmed)
 }
 
+fn resolved_known_call_name(
+    target: &super::super::expression::CallTarget,
+    binary_data: Option<&BinaryDataContext>,
+) -> Option<String> {
+    match target {
+        super::super::expression::CallTarget::Named(name) => Some(name.clone()),
+        super::super::expression::CallTarget::Direct { target, call_site } => binary_data
+            .and_then(|ctx| {
+                ctx.call_target_name_by_call_site(*call_site)
+                    .or_else(|| ctx.call_target_name_by_address(*target))
+            })
+            .map(str::to_string),
+        super::super::expression::CallTarget::Indirect(_)
+        | super::super::expression::CallTarget::IndirectGot { .. } => None,
+    }
+}
+
 fn builtin_call_type_database() -> &'static TypeDatabase {
     static DB: OnceLock<TypeDatabase> = OnceLock::new();
     DB.get_or_init(|| {
@@ -4383,25 +4408,33 @@ fn known_call_signature(
     target: &super::super::expression::CallTarget,
     binary_data: Option<&BinaryDataContext>,
 ) -> Option<KnownCallSignature> {
-    if let super::super::expression::CallTarget::Named(name) = target {
+    if let Some(name) = resolved_known_call_name(target, binary_data) {
         if let Some(proto) =
-            builtin_call_type_database().get_function(normalize_known_call_name(name))
+            builtin_call_type_database().get_function(normalize_known_call_name(&name))
         {
             return Some(KnownCallSignature {
                 fixed_arg_count: proto.parameters.len(),
                 variadic: proto.variadic,
             });
         }
+        if let Some(hinted_arg_count) = binary_data.and_then(|ctx| {
+            ctx.call_signature_hint_by_name(&name)
+                .or_else(|| ctx.call_signature_hint_by_name(normalize_known_call_name(&name)))
+        }) {
+            return Some(KnownCallSignature {
+                fixed_arg_count: hinted_arg_count,
+                variadic: false,
+            });
+        }
     }
 
     let hinted_arg_count = match target {
-        super::super::expression::CallTarget::Named(name) => {
-            binary_data?.call_signature_hint_by_name(name)
-        }
         super::super::expression::CallTarget::Direct { target, .. } => {
             binary_data?.call_signature_hint_by_address(*target)
         }
-        _ => None,
+        super::super::expression::CallTarget::Named(_)
+        | super::super::expression::CallTarget::Indirect(_)
+        | super::super::expression::CallTarget::IndirectGot { .. } => None,
     }?;
     Some(KnownCallSignature {
         fixed_arg_count: hinted_arg_count,
@@ -4653,6 +4686,23 @@ fn pass_through_arg_register_name(family: ArgumentAbiFamily, index: usize) -> Op
 
 fn pass_through_arg_expr(reg_name: &str) -> Expr {
     Expr::var(super::super::expression::Variable::reg(reg_name, 8))
+}
+
+fn tracked_call_arg_key(
+    var: &Variable,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> Option<String> {
+    if is_tracked_call_arg_register(&var.name) {
+        return Some(var.name.to_lowercase());
+    }
+
+    match var.kind {
+        super::super::expression::VarKind::Arg(index) => preferred_family
+            .and_then(|family| pass_through_arg_register_name(family, index as usize))
+            .map(str::to_string)
+            .or_else(|| Some(format!("arg{}", index))),
+        _ => None,
+    }
 }
 
 fn call_result_placeholder_expr(
@@ -4999,6 +5049,9 @@ fn lookup_tracked_register_value(
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
     reg_name: &str,
 ) -> Option<(Option<usize>, Expr)> {
+    if let Some((stmt_idx, value)) = arg_values.get(&reg_name.to_lowercase()) {
+        return Some((*stmt_idx, value.clone()));
+    }
     for alias in get_register_aliases(reg_name) {
         if let Some((stmt_idx, value)) = arg_values.get(&alias) {
             return Some((*stmt_idx, value.clone()));
@@ -5106,6 +5159,217 @@ fn parse_printf_format_arg_classes(format: &str) -> Vec<FormatArgClass> {
     classes
 }
 
+fn extract_materializable_condition_call(expr: &Expr) -> Option<(Expr, bool)> {
+    match &expr.kind {
+        ExprKind::Call { target, .. } if is_real_function_call(target) => {
+            Some((expr.clone(), false))
+        }
+        ExprKind::UnaryOp {
+            op: super::super::expression::UnaryOpKind::LogicalNot,
+            operand,
+        } => match &operand.kind {
+            ExprKind::Call { target, .. } if is_real_function_call(target) => {
+                Some(((**operand).clone(), true))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn first_return_value_alias_use_in_nodes(nodes: &[StructuredNode]) -> Option<String> {
+    nodes
+        .iter()
+        .find_map(first_return_value_alias_use_in_body_node)
+}
+
+fn first_return_value_alias_use_in_body_node(node: &StructuredNode) -> Option<String> {
+    match node {
+        StructuredNode::Block { statements, .. } => statements
+            .iter()
+            .find_map(first_return_value_alias_use_in_expr),
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => first_return_value_alias_use_in_expr(condition)
+            .or_else(|| first_return_value_alias_use_in_nodes(then_body))
+            .or_else(|| {
+                else_body
+                    .as_ref()
+                    .and_then(|body| first_return_value_alias_use_in_nodes(body))
+            }),
+        StructuredNode::While {
+            condition, body, ..
+        }
+        | StructuredNode::DoWhile {
+            condition, body, ..
+        } => first_return_value_alias_use_in_expr(condition)
+            .or_else(|| first_return_value_alias_use_in_nodes(body)),
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            ..
+        } => init
+            .as_ref()
+            .and_then(first_return_value_alias_use_in_expr)
+            .or_else(|| first_return_value_alias_use_in_expr(condition))
+            .or_else(|| {
+                update
+                    .as_ref()
+                    .and_then(first_return_value_alias_use_in_expr)
+            })
+            .or_else(|| first_return_value_alias_use_in_nodes(body)),
+        StructuredNode::Loop { body, .. } | StructuredNode::Sequence(body) => {
+            first_return_value_alias_use_in_nodes(body)
+        }
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => first_return_value_alias_use_in_expr(value)
+            .or_else(|| {
+                cases
+                    .iter()
+                    .find_map(|(_, body)| first_return_value_alias_use_in_nodes(body))
+            })
+            .or_else(|| {
+                default
+                    .as_ref()
+                    .and_then(|body| first_return_value_alias_use_in_nodes(body))
+            }),
+        StructuredNode::Return(Some(expr)) | StructuredNode::Expr(expr) => {
+            first_return_value_alias_use_in_expr(expr)
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => first_return_value_alias_use_in_nodes(try_body).or_else(|| {
+            catch_handlers
+                .iter()
+                .find_map(|handler| first_return_value_alias_use_in_nodes(&handler.body))
+        }),
+        StructuredNode::Return(None)
+        | StructuredNode::Break
+        | StructuredNode::Continue
+        | StructuredNode::Goto(_)
+        | StructuredNode::Label(_) => None,
+    }
+}
+
+fn rewrite_terminal_bare_returns(
+    mut body: Vec<StructuredNode>,
+    value: &Expr,
+) -> Vec<StructuredNode> {
+    let Some(last) = body.pop() else {
+        return body;
+    };
+    body.push(rewrite_terminal_bare_return_node(last, value));
+    body
+}
+
+fn rewrite_terminal_bare_return_node(node: StructuredNode, value: &Expr) -> StructuredNode {
+    match node {
+        StructuredNode::Return(None) => StructuredNode::Return(Some(value.clone())),
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(rewrite_terminal_bare_returns(nodes, value))
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: rewrite_terminal_bare_returns(then_body, value),
+            else_body: else_body.map(|body| rewrite_terminal_bare_returns(body, value)),
+        },
+        other => other,
+    }
+}
+
+fn materialize_folded_condition_call_result(
+    node: StructuredNode,
+    capture_counter: &mut u32,
+) -> StructuredNode {
+    let (condition, then_body, else_body) = match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => (condition, then_body, else_body),
+        other => return other,
+    };
+
+    let Some((call_expr, negated)) = extract_materializable_condition_call(&condition) else {
+        return StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        };
+    };
+
+    let primary_alias = first_return_value_alias_use_in_nodes(&then_body).or_else(|| {
+        else_body
+            .as_ref()
+            .and_then(|body| first_return_value_alias_use_in_nodes(body))
+    });
+    let Some(primary_alias) = primary_alias else {
+        return StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        };
+    };
+
+    let temp_name = format!("ret_{}", *capture_counter);
+    *capture_counter += 1;
+    let temp_expr = Expr::var(Variable {
+        kind: super::super::expression::VarKind::Temp(*capture_counter),
+        name: temp_name,
+        size: 8,
+    });
+    let aliases = broad_return_value_aliases(&primary_alias);
+    let then_body = rewrite_terminal_bare_returns(
+        then_body
+            .into_iter()
+            .map(|body_node| {
+                substitute_return_value_aliases_in_node(body_node, &aliases, &temp_expr)
+            })
+            .collect(),
+        &temp_expr,
+    );
+    let else_body = else_body.map(|body| {
+        rewrite_terminal_bare_returns(
+            body.into_iter()
+                .map(|body_node| {
+                    substitute_return_value_aliases_in_node(body_node, &aliases, &temp_expr)
+                })
+                .collect(),
+            &temp_expr,
+        )
+    });
+    let condition = if negated {
+        Expr::unary(
+            super::super::expression::UnaryOpKind::LogicalNot,
+            temp_expr.clone(),
+        )
+        .simplify()
+    } else {
+        temp_expr.clone()
+    };
+
+    StructuredNode::Sequence(vec![
+        StructuredNode::Expr(Expr::assign(temp_expr.clone(), call_expr)),
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        },
+    ])
+}
+
 /// Merges return value captures across basic block boundaries.
 /// Transforms patterns where:
 ///   Block1: ...; func();
@@ -5129,6 +5393,7 @@ pub(super) fn merge_return_value_captures_with_counter(
     for node in nodes {
         // First, recursively process nested structures
         let mut node = merge_return_value_captures_node(node, capture_counter);
+        node = materialize_folded_condition_call_result(node, capture_counter);
 
         if let Some((aliases, primary_alias)) = first_return_value_alias_use_in_node(&node) {
             if let Some(block_index) = find_previous_call_capture_block(&result, &aliases) {
@@ -6571,7 +6836,9 @@ pub(super) fn substitute_return_register_uses(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decompiler::expression::{BinOpKind, CallTarget, ExprKind, VarKind, Variable};
+    use crate::decompiler::expression::{
+        BinOpKind, CallTarget, ExprKind, UnaryOpKind, VarKind, Variable,
+    };
     use crate::decompiler::BinaryDataContext;
     use hexray_core::BasicBlockId;
 
@@ -6582,6 +6849,14 @@ mod tests {
     fn local(name: &str, size: u8) -> Expr {
         Expr::var(Variable {
             kind: VarKind::Temp(0),
+            name: name.to_string(),
+            size,
+        })
+    }
+
+    fn arg(name: &str, index: u8, size: u8) -> Expr {
+        Expr::var(Variable {
+            kind: VarKind::Arg(index),
             name: name.to_string(),
             size,
         })
@@ -7045,6 +7320,76 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rdi"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_uses_resolved_direct_import_name_for_known_prototype() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "strlen@GLIBC_2.2.5");
+
+        let statements = vec![Expr::call(
+            CallTarget::Direct {
+                target: 0x4010c0,
+                call_site: 0x5000,
+            },
+            vec![],
+        )];
+
+        let propagated = propagate_args_in_block_with_binary_data(
+            statements,
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected direct import call");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rdi"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_preserves_lifted_arg_slot_before_source_update() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010a0, "free@GLIBC_2.2.5");
+
+        let head = arg("head", 0, 8);
+        let node = local("node", 8);
+        let next = local("next", 8);
+        let statements = vec![
+            Expr::assign(head.clone(), node.clone()),
+            Expr::assign(node.clone(), next),
+            Expr::call(
+                CallTarget::Direct {
+                    target: 0x4010a0,
+                    call_site: 0x5008,
+                },
+                vec![],
+            ),
+        ];
+
+        let propagated = propagate_args_in_block_with_binary_data(
+            statements,
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+
+        assert_eq!(format!("{}", propagated[0]), "head = node");
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected recovered free call");
+        };
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["head"]
         );
     }
 
@@ -7688,6 +8033,66 @@ mod tests {
             panic!("expected deeper if");
         };
         assert_eq!(format!("{deeper_cond}"), "ret_0 == 'v'");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_materializes_folded_condition_call_result() {
+        let nodes = vec![StructuredNode::If {
+            condition: Expr::unary(
+                UnaryOpKind::LogicalNot,
+                Expr::call(CallTarget::Named("malloc".to_string()), vec![Expr::int(16)]),
+            ),
+            then_body: vec![StructuredNode::Return(None)],
+            else_body: Some(vec![
+                block(
+                    0,
+                    vec![
+                        Expr::assign(Expr::deref(reg("rax", 8), 4), Expr::unknown("value")),
+                        Expr::assign(
+                            Expr::deref(
+                                Expr::binop(BinOpKind::Add, reg("rax", 8), Expr::int(8)),
+                                8,
+                            ),
+                            Expr::int(0),
+                        ),
+                    ],
+                ),
+                StructuredNode::Return(None),
+            ]),
+        }];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Sequence(seq) = &merged[0] else {
+            panic!("expected folded condition call to materialize into a sequence");
+        };
+        let StructuredNode::Expr(assign) = &seq[0] else {
+            panic!("expected leading call-result assignment");
+        };
+        assert_eq!(format!("{assign}"), "ret_0 = malloc(0x10)");
+
+        let StructuredNode::If {
+            condition,
+            then_body,
+            else_body: Some(else_body),
+        } = &seq[1]
+        else {
+            panic!("expected rewritten if after call-result assignment");
+        };
+        assert_eq!(format!("{condition}"), "!ret_0");
+        assert!(matches!(
+            then_body.last(),
+            Some(StructuredNode::Return(Some(expr))) if format!("{expr}") == "ret_0"
+        ));
+
+        let StructuredNode::Block { statements, .. } = &else_body[0] else {
+            panic!("expected else block with rewritten stores");
+        };
+        assert_eq!(format!("{}", statements[0]), "*(uint32_t*)(ret_0) = value");
+        assert_eq!(format!("{}", statements[1]), "*(uint64_t*)(ret_0 + 8) = 0");
+        assert!(matches!(
+            else_body.last(),
+            Some(StructuredNode::Return(Some(expr))) if format!("{expr}") == "ret_0"
+        ));
     }
 
     #[test]

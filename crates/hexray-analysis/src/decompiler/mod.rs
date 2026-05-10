@@ -121,6 +121,10 @@ pub struct BinaryDataContext {
     call_signature_hints_by_name: HashMap<String, usize>,
     /// Best-effort fixed-arity hints for direct/internal call targets keyed by address.
     call_signature_hints_by_address: HashMap<u64, usize>,
+    /// Resolved direct-call target names keyed by target address.
+    call_target_names_by_address: HashMap<u64, String>,
+    /// Resolved direct-call target names keyed by call-site address.
+    call_target_names_by_call_site: HashMap<u64, String>,
 }
 
 impl BinaryDataContext {
@@ -130,6 +134,8 @@ impl BinaryDataContext {
             sections: Vec::new(),
             call_signature_hints_by_name: HashMap::new(),
             call_signature_hints_by_address: HashMap::new(),
+            call_target_names_by_address: HashMap::new(),
+            call_target_names_by_call_site: HashMap::new(),
         }
     }
 
@@ -177,6 +183,48 @@ impl BinaryDataContext {
     /// Looks up a fixed-arity hint by call target address.
     pub fn call_signature_hint_by_address(&self, address: u64) -> Option<usize> {
         self.call_signature_hints_by_address.get(&address).copied()
+    }
+
+    /// Adds a resolved direct-call target name by target address.
+    pub fn add_call_target_name_by_address(&mut self, address: u64, name: impl Into<String>) {
+        self.call_target_names_by_address
+            .insert(address, name.into());
+    }
+
+    /// Adds a resolved direct-call target name by call-site address.
+    pub fn add_call_target_name_by_call_site(&mut self, call_site: u64, name: impl Into<String>) {
+        self.call_target_names_by_call_site
+            .insert(call_site, name.into());
+    }
+
+    /// Looks up a resolved direct-call target name by target address.
+    pub fn call_target_name_by_address(&self, address: u64) -> Option<&str> {
+        self.call_target_names_by_address
+            .get(&address)
+            .map(|name| name.as_str())
+    }
+
+    /// Looks up a resolved direct-call target name by call-site address.
+    pub fn call_target_name_by_call_site(&self, call_site: u64) -> Option<&str> {
+        self.call_target_names_by_call_site
+            .get(&call_site)
+            .map(|name| name.as_str())
+    }
+
+    /// Returns an iterator over resolved direct-call target names keyed by address.
+    pub fn call_target_names_by_address(&self) -> impl ExactSizeIterator<Item = (u64, &str)> + '_ {
+        self.call_target_names_by_address
+            .iter()
+            .map(|(address, name)| (*address, name.as_str()))
+    }
+
+    /// Returns an iterator over resolved direct-call target names keyed by call site.
+    pub fn call_target_names_by_call_site(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (u64, &str)> + '_ {
+        self.call_target_names_by_call_site
+            .iter()
+            .map(|(call_site, name)| (*call_site, name.as_str()))
     }
 
     /// Returns true if the context contains no sections.
@@ -429,6 +477,15 @@ impl SymbolTable {
     /// Looks up a symbol at a given address.
     pub fn get(&self, address: u64) -> Option<&str> {
         self.symbols.get(&address).map(|s| s.name.as_str())
+    }
+
+    /// Iterates over exact symbol-address mappings.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &str)> + '_ {
+        self.ordered_addresses.iter().filter_map(|address| {
+            self.symbols
+                .get(address)
+                .map(|symbol| (*address, symbol.name.as_str()))
+        })
     }
 
     /// Looks up the exact symbol record at an address.
@@ -1030,7 +1087,8 @@ impl Decompiler {
         };
 
         // Step 2b: Run expression-level type propagation
-        let mut expr_type_propagation = type_propagation::ExpressionTypePropagation::with_libc();
+        let mut expr_type_propagation = type_propagation::ExpressionTypePropagation::with_libc()
+            .with_binary_data(self.binary_data.as_ref());
         expr_type_propagation.analyze(&structured.body);
         let expr_types = expr_type_propagation.export_for_decompiler();
 

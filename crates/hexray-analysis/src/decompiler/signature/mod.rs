@@ -40,8 +40,13 @@
 use super::expression::{BinOpKind, Expr, ExprKind, Variable};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, SymbolTable};
+use hexray_types::{
+    builtin::{load_libc_functions, load_linux_types, load_posix_types},
+    CType, TypeDatabase,
+};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 mod known_funcs;
 mod types;
@@ -119,6 +124,8 @@ pub struct SignatureRecovery {
     value_alias_latest: HashMap<String, String>,
     /// Names assigned within the recovered body (for local alias affinity checks).
     assigned_value_names: HashSet<String>,
+    /// Pointer-typed locals derived from allocator and alias tracking.
+    value_pointer_hints: HashSet<String>,
     /// Function-pointer typed locals derived from assignments/returns.
     value_function_pointer_types: HashMap<String, ParamType>,
     /// String functions for detection.
@@ -182,6 +189,7 @@ impl SignatureRecovery {
             function_pointer_alias_latest: HashMap::new(),
             value_alias_latest: HashMap::new(),
             assigned_value_names: HashSet::new(),
+            value_pointer_hints: HashSet::new(),
             value_function_pointer_types: HashMap::new(),
             string_functions,
             relocation_table: None,
@@ -257,6 +265,7 @@ impl SignatureRecovery {
         self.function_pointer_alias_latest.clear();
         self.value_alias_latest.clear();
         self.assigned_value_names.clear();
+        self.value_pointer_hints.clear();
         self.value_function_pointer_types.clear();
         self.sysv_va_list_gp_offset_slots.clear();
         self.sysv_va_list_fp_offset_slots.clear();
@@ -554,6 +563,52 @@ impl SignatureRecovery {
                         .push("explicit return expression".to_string());
                 }
                 self.return_confidence = self.return_confidence.max(200);
+                if let Some(candidate) = self.infer_tail_call_return_type(expr) {
+                    match candidate {
+                        ParamType::Pointer | ParamType::TypedPointer(_) => {
+                            self.return_is_pointer = true;
+                            self.return_size = self.return_size.max(8);
+                            if !self
+                                .return_provenance
+                                .iter()
+                                .any(|r| r == "return expression uses known pointer-valued call")
+                            {
+                                self.return_provenance.push(
+                                    "return expression uses known pointer-valued call".to_string(),
+                                );
+                            }
+                            self.return_confidence = self.return_confidence.max(215);
+                        }
+                        ParamType::FunctionPointer { .. } => {
+                            self.return_function_pointer = Some(candidate);
+                            self.return_is_pointer = true;
+                            self.return_size = self.return_size.max(8);
+                            if !self.return_provenance.iter().any(|r| {
+                                r == "return expression uses known function-pointer-valued call"
+                            }) {
+                                self.return_provenance.push(
+                                    "return expression uses known function-pointer-valued call"
+                                        .to_string(),
+                                );
+                            }
+                            self.return_confidence = self.return_confidence.max(230);
+                        }
+                        ParamType::Float(bits) => {
+                            self.float_return = true;
+                            self.return_size = self.return_size.max((bits / 8).max(1));
+                        }
+                        ParamType::SignedInt(bits) | ParamType::UnsignedInt(bits) => {
+                            self.return_size = self.return_size.max((bits / 8).max(1));
+                        }
+                        ParamType::Bool => {
+                            self.return_size = self.return_size.max(1);
+                        }
+                        ParamType::Void
+                        | ParamType::Unknown
+                        | ParamType::SimdInt128
+                        | ParamType::SimdFloat(_) => {}
+                    }
+                }
                 if self.expr_uses_float_abi_value(expr) {
                     if !self.return_from_integer_simd_lane {
                         self.float_return = true;
@@ -607,6 +662,7 @@ impl SignatureRecovery {
                 // Check if return value is a pointer
                 if self.is_expr_likely_pointer(expr) {
                     self.return_is_pointer = true;
+                    self.return_size = self.return_size.max(8);
                     if !self
                         .return_provenance
                         .iter()
@@ -737,6 +793,21 @@ impl SignatureRecovery {
                     self.assigned_value_names.insert(lhs_name.clone());
                     if let Some(rhs_name) = self.extract_var_name(rhs) {
                         self.insert_value_alias(&lhs_name, &rhs_name);
+                    }
+                    let rhs_is_pointer_like = self.is_expr_likely_pointer(rhs)
+                        || matches!(
+                            self.infer_tail_call_return_type(rhs),
+                            Some(
+                                ParamType::Pointer
+                                    | ParamType::TypedPointer(_)
+                                    | ParamType::FunctionPointer { .. }
+                            )
+                        )
+                        || self
+                            .extract_var_name(rhs)
+                            .is_some_and(|rhs_name| self.value_pointer_hints.contains(&rhs_name));
+                    if rhs_is_pointer_like {
+                        self.value_pointer_hints.insert(lhs_name.clone());
                     }
                     if let Some(idx) = self.resolve_param_index_from_expr_precise(rhs) {
                         self.insert_function_pointer_alias(&lhs_name, idx);
@@ -1484,6 +1555,52 @@ impl SignatureRecovery {
             .map(Self::param_type_from_summary)
     }
 
+    fn builtin_call_return_type(function_name: &str) -> Option<ParamType> {
+        static DB: OnceLock<TypeDatabase> = OnceLock::new();
+        let db = DB.get_or_init(|| {
+            let mut db = TypeDatabase::new();
+            load_posix_types(&mut db);
+            load_linux_types(&mut db);
+            load_libc_functions(&mut db);
+            db
+        });
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
+        let proto = db.get_function(clean)?;
+        Self::param_type_from_ctype(&proto.return_type)
+    }
+
+    fn param_type_from_ctype(ty: &CType) -> Option<ParamType> {
+        match ty {
+            CType::Void => Some(ParamType::Void),
+            CType::Int(int_ty) => Some(if int_ty.signed {
+                ParamType::SignedInt((int_ty.size as u8).saturating_mul(8))
+            } else {
+                ParamType::UnsignedInt((int_ty.size as u8).saturating_mul(8))
+            }),
+            CType::Float(float_ty) => {
+                Some(ParamType::Float((float_ty.size as u8).saturating_mul(8)))
+            }
+            CType::Pointer(_) | CType::Array(_) | CType::Struct(_) | CType::Union(_) => {
+                Some(ParamType::Pointer)
+            }
+            CType::Enum(enum_ty) => Some(ParamType::UnsignedInt(
+                (enum_ty.underlying_size as u8).saturating_mul(8),
+            )),
+            CType::Function(func_ty) => Some(ParamType::FunctionPointer {
+                return_type: Box::new(
+                    Self::param_type_from_ctype(&func_ty.return_type).unwrap_or(ParamType::Unknown),
+                ),
+                params: func_ty
+                    .parameters
+                    .iter()
+                    .filter_map(|param| Self::param_type_from_ctype(&param.param_type))
+                    .collect(),
+            }),
+            CType::Typedef(typedef_ty) => Self::param_type_from_ctype(&typedef_ty.target),
+            CType::Named(_) => None,
+        }
+    }
+
     fn known_call_return_type(function_name: &str) -> Option<ParamType> {
         let clean = ParameterUsageHints::normalize_callback_name(function_name);
         match clean {
@@ -1504,11 +1621,14 @@ impl SignatureRecovery {
                     params: vec![ParamType::SignedInt(32)],
                 })
             }
-            _ => None,
+            _ => Self::builtin_call_return_type(clean),
         }
     }
 
     fn infer_tail_call_return_type(&self, expr: &Expr) -> Option<ParamType> {
+        if let ExprKind::Cast { expr: inner, .. } = &expr.kind {
+            return self.infer_tail_call_return_type(inner);
+        }
         if let ExprKind::Call { target, args } = &expr.kind {
             if let Some(name) = self.extract_call_name(target) {
                 if let Some(ty) = self.infer_atomic_pseudo_call_return_type(&name, args) {
@@ -2931,9 +3051,27 @@ impl SignatureRecovery {
             ExprKind::Var(var) => {
                 // Check if this is a parameter that's been used as a pointer
                 let var_name_lower = var.name.to_lowercase();
+                if self.value_pointer_hints.contains(&var_name_lower) {
+                    return true;
+                }
                 if let Some(idx) = self.arg_register_index(&var_name_lower) {
                     if let Some(hints) = self.param_hints.get(&idx) {
                         // If parameter was dereferenced, used in pointer arithmetic, or null-checked, it's a pointer
+                        return hints.is_dereferenced
+                            || hints.is_pointer_arithmetic
+                            || hints.is_null_checked
+                            || hints.is_string_arg;
+                    }
+                }
+                false
+            }
+            ExprKind::Unknown(name) => {
+                let lowered = name.to_lowercase();
+                if self.value_pointer_hints.contains(&lowered) {
+                    return true;
+                }
+                if let Some(idx) = self.arg_register_index(&lowered) {
+                    if let Some(hints) = self.param_hints.get(&idx) {
                         return hints.is_dereferenced
                             || hints.is_pointer_arithmetic
                             || hints.is_null_checked
@@ -6738,6 +6876,52 @@ mod tests {
 
         assert_eq!(sig.parameters.len(), 1);
         assert_eq!(sig.parameters[0].name, "size");
+    }
+
+    #[test]
+    fn test_signature_recovery_uses_builtin_return_type_for_versioned_malloc_call() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::call(
+                CallTarget::Named("malloc@GLIBC_2.2.5".to_string()),
+                vec![Expr::var(Variable::reg("rdi", 8))],
+            )))],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Pointer);
+    }
+
+    #[test]
+    fn test_signature_recovery_tracks_pointer_alias_return_from_versioned_malloc_call() {
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::Expr(Expr::assign(
+                    Expr::unknown("local_8"),
+                    Expr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(Expr::call(
+                                CallTarget::Named("malloc@GLIBC_2.2.5".to_string()),
+                                vec![Expr::var(Variable::reg("rdi", 8))],
+                            )),
+                            to_size: 4,
+                            signed: true,
+                        },
+                    },
+                )),
+                StructuredNode::Return(Some(Expr::unknown("local_8"))),
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Pointer);
     }
 
     #[test]

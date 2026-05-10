@@ -3094,6 +3094,7 @@ fn decompile_function(
     );
 
     let mut binary_data_ctx = build_binary_data_context(fmt);
+    seed_resolved_call_target_names(&mut binary_data_ctx, &symbol_table, &relocation_table);
     let seed_ctx = DirectCalleeSignatureSeedContext {
         relocation_table: &relocation_table,
         symbol_table: &symbol_table,
@@ -3673,6 +3674,24 @@ fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
     }
 
     ctx
+}
+
+fn seed_resolved_call_target_names(
+    binary_data_ctx: &mut BinaryDataContext,
+    symbol_table: &SymbolTable,
+    relocation_table: &RelocationTable,
+) {
+    for (address, name) in symbol_table.iter() {
+        binary_data_ctx.add_call_target_name_by_address(address, name);
+    }
+
+    for (call_site, relocation) in relocation_table.call_relocations() {
+        binary_data_ctx.add_call_target_name_by_call_site(call_site, relocation.symbol.clone());
+        if relocation.target_addr != 0 {
+            binary_data_ctx
+                .add_call_target_name_by_address(relocation.target_addr, relocation.symbol.clone());
+        }
+    }
 }
 
 /// Builds a relocation table from ELF relocations.

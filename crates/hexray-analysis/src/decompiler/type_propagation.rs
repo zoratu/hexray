@@ -14,6 +14,7 @@
 
 use super::expression::{BinOpKind, CallTarget, Expr, ExprKind, UnaryOpKind};
 use super::structurer::StructuredNode;
+use super::BinaryDataContext;
 use std::collections::HashMap;
 
 /// Inferred type for an expression.
@@ -250,6 +251,10 @@ pub struct ExpressionTypePropagation {
     variable_types: HashMap<String, ExprType>,
     /// Type hints from context (e.g., comparison with char constant).
     context_hints: HashMap<String, ExprType>,
+    /// Resolved direct-call target names keyed by target address.
+    direct_call_names_by_address: HashMap<u64, String>,
+    /// Resolved direct-call target names keyed by call-site address.
+    direct_call_names_by_call_site: HashMap<u64, String>,
 }
 
 impl ExpressionTypePropagation {
@@ -259,6 +264,8 @@ impl ExpressionTypePropagation {
             signatures: HashMap::new(),
             variable_types: HashMap::new(),
             context_hints: HashMap::new(),
+            direct_call_names_by_address: HashMap::new(),
+            direct_call_names_by_call_site: HashMap::new(),
         }
     }
 
@@ -267,6 +274,21 @@ impl ExpressionTypePropagation {
         let mut engine = Self::new();
         engine.add_libc_signatures();
         engine
+    }
+
+    /// Seeds resolved names for direct call targets from binary context.
+    pub fn with_binary_data(mut self, binary_data: Option<&BinaryDataContext>) -> Self {
+        if let Some(binary_data) = binary_data {
+            self.direct_call_names_by_address = binary_data
+                .call_target_names_by_address()
+                .map(|(address, name)| (address, name.to_string()))
+                .collect();
+            self.direct_call_names_by_call_site = binary_data
+                .call_target_names_by_call_site()
+                .map(|(call_site, name)| (call_site, name.to_string()))
+                .collect();
+        }
+        self
     }
 
     /// Adds a known function signature.
@@ -902,9 +924,9 @@ impl ExpressionTypePropagation {
                 self.collect_type_hints_from_expr(rhs);
 
                 // Type propagation: if RHS has a known type, propagate to LHS
-                if let ExprKind::Var(var) = &lhs.kind {
+                if let Some(lhs_name) = self.extract_var_name(lhs) {
                     if let Some(rhs_type) = self.infer_expr_type(rhs) {
-                        self.set_variable_type(&var.name, rhs_type);
+                        self.set_variable_type(&lhs_name, rhs_type);
                     }
                 }
             }
@@ -912,7 +934,7 @@ impl ExpressionTypePropagation {
                 self.collect_type_hints_from_expr(lhs);
                 self.collect_type_hints_from_expr(rhs);
 
-                if let ExprKind::Var(var) = &lhs.kind {
+                if let Some(lhs_name) = self.extract_var_name(lhs) {
                     let lhs_type = self.infer_expr_type(lhs);
                     let rhs_type = self.infer_expr_type(rhs);
                     if let Some(merged) = match (lhs_type, rhs_type) {
@@ -920,7 +942,7 @@ impl ExpressionTypePropagation {
                         (Some(t), None) | (None, Some(t)) => Some(t),
                         (None, None) => None,
                     } {
-                        self.set_variable_type(&var.name, merged);
+                        self.set_variable_type(&lhs_name, merged);
                     }
                 }
             }
@@ -1376,6 +1398,9 @@ impl ExpressionTypePropagation {
             ExprKind::Var(var) => {
                 self.set_variable_type(&var.name, target_type.clone());
             }
+            ExprKind::Unknown(name) => {
+                self.set_variable_type(name, target_type.clone());
+            }
             ExprKind::Deref { addr, .. } => {
                 // If dereferencing, the address is a pointer to the target type
                 if let Some(var_name) = self.extract_var_name(addr) {
@@ -1422,6 +1447,18 @@ impl ExpressionTypePropagation {
                     size: var.size,
                     signed: true,
                 })
+            }
+            ExprKind::Unknown(name) => {
+                if let Some(hint) = self.context_hints.get(name) {
+                    return Some(hint.clone());
+                }
+                if let Some(ty) = self.variable_types.get(name) {
+                    return Some(ty.clone());
+                }
+                if Self::looks_like_float_abi_name(name) {
+                    return Some(ExprType::Float { size: 8 });
+                }
+                None
             }
             ExprKind::IntLit(value) => {
                 // Plain integer literals in C/C++ are `int`-sized unless an
@@ -1486,11 +1523,20 @@ impl ExpressionTypePropagation {
                     .map(|array_type| array_type.deref())
             }
             ExprKind::Cast {
-                to_size, signed, ..
-            } => Some(ExprType::Int {
-                size: *to_size,
-                signed: *signed,
-            }),
+                expr: inner,
+                to_size,
+                signed,
+            } => {
+                if let Some(inner_type) = self.infer_expr_type(inner) {
+                    if inner_type.is_pointer_like() {
+                        return Some(inner_type);
+                    }
+                }
+                Some(ExprType::Int {
+                    size: *to_size,
+                    signed: *signed,
+                })
+            }
             ExprKind::AddressOf(inner) => {
                 if let Some(inner_type) = self.infer_expr_type(inner) {
                     Some(inner_type.address_of())
@@ -1506,7 +1552,11 @@ impl ExpressionTypePropagation {
     fn get_call_name(&self, target: &CallTarget) -> Option<String> {
         match target {
             CallTarget::Named(name) => Some(normalize_function_name(name)),
-            CallTarget::Direct { .. } => None,
+            CallTarget::Direct { target, call_site } => self
+                .direct_call_names_by_call_site
+                .get(call_site)
+                .or_else(|| self.direct_call_names_by_address.get(target))
+                .map(|name| normalize_function_name(name)),
             CallTarget::Indirect(_) => None,
             CallTarget::IndirectGot { .. } => None,
         }
@@ -1517,6 +1567,7 @@ impl ExpressionTypePropagation {
     fn extract_var_name(&self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Var(var) => Some(var.name.clone()),
+            ExprKind::Unknown(name) => Some(name.clone()),
             ExprKind::Cast { expr: inner, .. } => self.extract_var_name(inner),
             _ => None,
         }
@@ -1645,14 +1696,14 @@ fn normalize_function_name(name: &str) -> String {
         result = result[1..].to_string();
     }
 
-    // Strip @plt suffix (PLT entries)
-    if let Some(idx) = result.find("@plt") {
-        result = result[..idx].to_string();
-    }
-
-    // Strip __imp_ prefix (Windows imports)
+    // Strip import prefixes after underscore normalization.
     if let Some(rest) = result.strip_prefix("imp_") {
         result = rest.to_string();
+    }
+
+    // Strip ELF version / PLT suffixes.
+    if let Some(idx) = result.find('@') {
+        result = result[..idx].to_string();
     }
 
     result
@@ -1709,8 +1760,58 @@ mod tests {
         assert_eq!(normalize_function_name("_printf"), "printf");
         assert_eq!(normalize_function_name("__printf"), "printf");
         assert_eq!(normalize_function_name("printf@plt"), "printf");
+        assert_eq!(normalize_function_name("strlen@GLIBC_2.2.5"), "strlen");
         assert_eq!(normalize_function_name("_printf@plt"), "printf");
         assert_eq!(normalize_function_name("imp_printf"), "printf");
+    }
+
+    #[test]
+    fn test_infer_expr_type_uses_resolved_direct_call_name_from_binary_context() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010f0, "malloc@GLIBC_2.2.5");
+
+        let engine = ExpressionTypePropagation::with_libc().with_binary_data(Some(&binary_data));
+        let call = Expr::call(
+            CallTarget::Direct {
+                target: 0x4010f0,
+                call_site: 0x5000,
+            },
+            vec![Expr::int(16)],
+        );
+
+        assert_eq!(
+            engine.infer_expr_type(&call),
+            Some(ExprType::ptr(ExprType::Void))
+        );
+    }
+
+    #[test]
+    fn test_type_propagation_tracks_unknown_local_assigned_from_versioned_malloc_call() {
+        let mut engine = ExpressionTypePropagation::with_libc();
+        let body = vec![StructuredNode::Expr(Expr::assign(
+            Expr::unknown("local_8"),
+            Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(Expr::call(
+                        CallTarget::Named("malloc@GLIBC_2.2.5".to_string()),
+                        vec![Expr::int(16)],
+                    )),
+                    to_size: 4,
+                    signed: true,
+                },
+            },
+        ))];
+
+        engine.analyze(&body);
+
+        assert_eq!(
+            engine.get_variable_type("local_8"),
+            Some(&ExprType::ptr(ExprType::Void))
+        );
+        assert_eq!(
+            engine.export_for_decompiler().get("local_8"),
+            Some(&"void*".to_string())
+        );
     }
 
     #[test]

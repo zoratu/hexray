@@ -338,7 +338,9 @@ pub fn get_arg_register_index(name: &str) -> Option<usize> {
         "a5" => Some(5),
         "a6" => Some(6),
         "a7" => Some(7),
-        _ => None,
+        _ => name
+            .strip_prefix("arg")
+            .and_then(|suffix| suffix.parse::<usize>().ok()),
     }
 }
 
