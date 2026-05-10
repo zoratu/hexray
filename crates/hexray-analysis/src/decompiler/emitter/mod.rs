@@ -3745,12 +3745,42 @@ impl PseudoCodeEmitter {
 
         // Check if this is a standalone condition comment (no operands found)
         // These look like "/* signed_le */" or similar
-        if formatted.starts_with("/*") && formatted.ends_with("*/") {
-            // This is a degenerate condition - we couldn't find the comparison
-            // Output as true with the comment to preserve semantic information
-            format!("true {}", formatted)
+        if let Some(placeholder) = Self::placeholder_condition_name(&formatted) {
+            // This is a degenerate condition - we couldn't find the comparison.
+            // Emit a named placeholder instead of forcing the branch to look
+            // unconditionally taken.
+            format!("{placeholder} {formatted}")
         } else {
             formatted
+        }
+    }
+
+    fn placeholder_condition_name(formatted: &str) -> Option<String> {
+        let inner = formatted.strip_prefix("/*")?.strip_suffix("*/")?.trim();
+        if inner.is_empty() {
+            return Some("cond_unknown".to_string());
+        }
+
+        let mut name = String::from("cond_");
+        let mut last_was_separator = false;
+        for ch in inner.chars() {
+            if ch.is_ascii_alphanumeric() {
+                name.push(ch.to_ascii_lowercase());
+                last_was_separator = false;
+            } else if !last_was_separator && !name.ends_with('_') {
+                name.push('_');
+                last_was_separator = true;
+            }
+        }
+
+        while name.ends_with('_') {
+            name.pop();
+        }
+
+        if name == "cond" || name == "cond_" {
+            Some("cond_unknown".to_string())
+        } else {
+            Some(name)
         }
     }
 
@@ -8913,6 +8943,35 @@ mod tests {
         assert!(output.contains("y = 1"));
         assert!(output.contains("else"));
         assert!(output.contains("y = 2"));
+    }
+
+    #[test]
+    fn test_emit_if_with_unresolved_condition_comment_uses_placeholder_name() {
+        let node = StructuredNode::If {
+            condition: Expr::unknown("/* negative */"),
+            then_body: vec![StructuredNode::Expr(Expr::assign(
+                Expr::unknown("y"),
+                Expr::int(1),
+            ))],
+            else_body: None,
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![node],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        assert!(
+            output.contains("if (cond_negative /* negative */)"),
+            "expected unresolved condition placeholder, got:\n{output}"
+        );
+        assert!(
+            !output.contains("if (true /* negative */)"),
+            "truthy fallback regressed:\n{output}"
+        );
     }
 
     #[test]
