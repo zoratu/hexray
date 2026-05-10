@@ -617,6 +617,14 @@ impl PseudoCodeEmitter {
         Some((func_name[..open_idx].trim_end(), suffix))
     }
 
+    fn special_function_prelude_comment(func_name: &str) -> Option<&'static str> {
+        let lower = func_name.to_ascii_lowercase();
+        if lower.contains("coroutine_handle") && lower.contains("::resume") {
+            return Some("/* resume coroutine via coroutine frame */");
+        }
+        None
+    }
+
     /// Creates a new emitter.
     pub fn new(indent: &str, emit_addresses: bool) -> Self {
         Self {
@@ -5673,6 +5681,9 @@ impl PseudoCodeEmitter {
             &func_info.skip_statements,
             &mut declared_vars,
         );
+        if let Some(comment) = Self::special_function_prelude_comment(func_name) {
+            body_output = format!("{}{}\n{}", self.indent, comment, body_output);
+        }
         if body_output.trim().is_empty() {
             writeln!(
                 body_output,
@@ -5864,6 +5875,9 @@ impl PseudoCodeEmitter {
             &func_info.skip_statements,
             &mut declared_vars,
         );
+        if let Some(comment) = Self::special_function_prelude_comment(func_name) {
+            body_output = format!("{}{}\n{}", self.indent, comment, body_output);
+        }
         if body_output.trim().is_empty() {
             writeln!(
                 body_output,
@@ -8936,6 +8950,32 @@ mod tests {
         let output = emitter.emit(&cfg, "empty_body");
 
         assert!(output.contains("/* decompilation body not recoverable */"));
+    }
+
+    #[test]
+    fn test_emit_tags_coroutine_handle_resume_bodies() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::call(
+                    CallTarget::Indirect(Box::new(Expr::unknown("frame_slot"))),
+                    vec![],
+                )],
+                address_range: (0x1000, 0x1004),
+            }],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(
+            &cfg,
+            "std::__n4861::coroutine_handle<generator::promise_type>::resume() const",
+        );
+
+        assert!(
+            output.contains("/* resume coroutine via coroutine frame */"),
+            "expected recognized coroutine handle op to emit a tagging comment:\n{output}"
+        );
     }
 
     #[test]
