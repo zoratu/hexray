@@ -3119,8 +3119,36 @@ impl<'a> Structurer<'a> {
             .collect();
 
         let mut exprs = Vec::new();
+        let mut pending_packed_xmm_store: Option<PendingPackedXmmStore> = None;
         let mut idx = 0usize;
         while idx < filtered_instructions.len() {
+            let inst = filtered_instructions[idx].1;
+
+            if let Some(pending) = pending_packed_xmm_store.as_mut() {
+                if pending.try_record_high_lane(inst) {
+                    idx += 1;
+                    continue;
+                }
+                if let Some(store_exprs) = pending.try_emit_store(inst) {
+                    exprs.extend(store_exprs);
+                    pending_packed_xmm_store = None;
+                    idx += 1;
+                    continue;
+                }
+                if instruction_mentions_register_name(inst, &pending.reg_name) {
+                    flush_pending_packed_xmm_store(&mut exprs, pending_packed_xmm_store.take());
+                    continue;
+                }
+            }
+
+            if pending_packed_xmm_store.is_none() {
+                if let Some(pending) = PendingPackedXmmStore::start(inst) {
+                    pending_packed_xmm_store = Some(pending);
+                    idx += 1;
+                    continue;
+                }
+            }
+
             if let Some((expr, consumed)) =
                 lift_branchless_strcmp_mask_pattern(&filtered_instructions[idx..])
             {
@@ -3128,8 +3156,6 @@ impl<'a> Structurer<'a> {
                 idx += consumed;
                 continue;
             }
-
-            let inst = filtered_instructions[idx].1;
 
             // Special handling for SETcc and CMOVcc to use block context
             let main_expr = match inst.operation {
@@ -3149,6 +3175,8 @@ impl<'a> Structurer<'a> {
             idx += 1;
         }
 
+        flush_pending_packed_xmm_store(&mut exprs, pending_packed_xmm_store);
+
         // Resolve ADRP + ADD patterns (ARM64 PC-relative addressing)
         let exprs = resolve_adrp_patterns(exprs);
 
@@ -3167,6 +3195,117 @@ impl<'a> Structurer<'a> {
             exprs
         }
     }
+}
+
+struct PendingPackedXmmStore {
+    reg_name: String,
+    low_expr: Expr,
+    low_fallback_expr: Expr,
+    high_expr: Option<Expr>,
+    high_fallback_expr: Option<Expr>,
+}
+
+impl PendingPackedXmmStore {
+    fn start(inst: &Instruction) -> Option<Self> {
+        if !matches!(inst.mnemonic.to_ascii_lowercase().as_str(), "movq" | "movd") {
+            return None;
+        }
+
+        let [Operand::Register(dst), src] = inst.operands.as_slice() else {
+            return None;
+        };
+
+        let reg_name = dst.name();
+        if !reg_name.starts_with("xmm") {
+            return None;
+        }
+
+        Some(Self {
+            reg_name: reg_name.to_ascii_lowercase(),
+            low_expr: Expr::from_operand_with_inst(src, inst),
+            low_fallback_expr: Expr::from_instruction(inst),
+            high_expr: None,
+            high_fallback_expr: None,
+        })
+    }
+
+    fn try_record_high_lane(&mut self, inst: &Instruction) -> bool {
+        if self.high_expr.is_some() || !inst.mnemonic.eq_ignore_ascii_case("movhps") {
+            return false;
+        }
+
+        let [Operand::Register(dst), src] = inst.operands.as_slice() else {
+            return false;
+        };
+        if dst.name().to_ascii_lowercase() != self.reg_name {
+            return false;
+        }
+
+        self.high_expr = Some(Expr::from_operand_with_inst(src, inst));
+        self.high_fallback_expr = Some(Expr::from_instruction(inst));
+        true
+    }
+
+    fn try_emit_store(&self, inst: &Instruction) -> Option<Vec<Expr>> {
+        if !inst.mnemonic.eq_ignore_ascii_case("movups") {
+            return None;
+        }
+
+        let [Operand::Memory(store_mem), Operand::Register(src)] = inst.operands.as_slice() else {
+            return None;
+        };
+        if src.name().to_ascii_lowercase() != self.reg_name {
+            return None;
+        }
+
+        let high_expr = self.high_expr.clone()?;
+        let high_comment = Expr::unknown(format!("/* frame header + 8 = {} */", high_expr));
+        let low_store = Operand::Memory(hexray_core::MemoryRef {
+            size: 8,
+            ..store_mem.clone()
+        });
+        let high_store = Operand::Memory(hexray_core::MemoryRef {
+            displacement: store_mem.displacement + 8,
+            size: 8,
+            ..store_mem.clone()
+        });
+
+        Some(vec![
+            Expr::assign(
+                Expr::from_operand_with_inst(&low_store, inst),
+                self.low_expr.clone(),
+            ),
+            Expr::assign(Expr::from_operand_with_inst(&high_store, inst), high_expr),
+            high_comment,
+        ])
+    }
+}
+
+fn flush_pending_packed_xmm_store(exprs: &mut Vec<Expr>, pending: Option<PendingPackedXmmStore>) {
+    let Some(pending) = pending else {
+        return;
+    };
+    exprs.push(pending.low_fallback_expr);
+    if let Some(high_fallback_expr) = pending.high_fallback_expr {
+        exprs.push(high_fallback_expr);
+    }
+}
+
+fn instruction_mentions_register_name(inst: &Instruction, reg_name: &str) -> bool {
+    inst.operands.iter().any(|operand| match operand {
+        Operand::Register(reg) => reg.name().eq_ignore_ascii_case(reg_name),
+        Operand::Memory(mem) => {
+            mem.base
+                .is_some_and(|reg| reg.name().eq_ignore_ascii_case(reg_name))
+                || mem
+                    .index
+                    .is_some_and(|reg| reg.name().eq_ignore_ascii_case(reg_name))
+                || mem
+                    .segment
+                    .is_some_and(|reg| reg.name().eq_ignore_ascii_case(reg_name))
+        }
+        _ => false,
+    })
 }
 
 fn lift_branchless_strcmp_mask_pattern(
@@ -7706,6 +7845,70 @@ mod tests {
         );
 
         assert_eq!(format!("{rewritten}"), "rdi / rsi");
+    }
+
+    #[test]
+    fn test_block_to_statements_decomposes_packed_xmm_frame_header_store() {
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 64);
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rcx), Operand::imm(0x401220, 8)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1005, 5, vec![], "movd")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(xmm0), Operand::Register(rcx)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x100a, 7, vec![], "movhps")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(xmm0),
+                    Operand::Memory(MemoryRef::absolute(0x402018, 8)),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1011, 3, vec![], "movups")
+                .with_operation(Operation::Store)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base(rax, 16)),
+                    Operand::Register(xmm0),
+                ]),
+        );
+        bb0.terminator = BlockTerminator::Return;
+        cfg.add_block(bb0);
+
+        let structurer = Structurer::new(&cfg);
+        let rendered: Vec<_> = structurer
+            .block_to_statements(BasicBlockId::new(0))
+            .into_iter()
+            .map(|expr| format!("{expr}"))
+            .collect();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|expr| expr.contains("*(uint64_t*)(rax) = rcx")),
+            "expected scalar low-lane store, got {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|expr| expr.contains("*(uint64_t*)(rax + 8)")),
+            "expected scalar high-lane store, got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|expr| !expr.contains("xmm0")),
+            "did not expect packed xmm temp to survive, got {rendered:?}"
+        );
     }
 
     #[test]
