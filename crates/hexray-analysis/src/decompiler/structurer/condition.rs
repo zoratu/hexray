@@ -1159,7 +1159,7 @@ mod tests {
         let expr = condition_to_expr_with_block(Condition::NotEqual, &block);
         let rendered = format!("{expr}");
         assert!(
-            rendered.contains("& 1"),
+            rendered.contains("& 1") || rendered.contains("BITS("),
             "expected ALU update to survive through TEST lowering, got {rendered}"
         );
     }

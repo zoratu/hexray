@@ -696,6 +696,11 @@ impl Expr {
                     return cast;
                 }
 
+                // Combine nested constant shifts before later pattern matching.
+                if let Some(combined) = try_combine_shift_chain(&left, op, &right) {
+                    return combined;
+                }
+
                 // Zero extension pattern: x & mask where mask is 0xFF, 0xFFFF, etc.
                 // becomes (uintN_t)x
                 if let Some(cast) = try_match_zero_extension(&left, op, &right) {
@@ -714,6 +719,12 @@ impl Expr {
                 // becomes BITS(x, start, width) where width = popcount(mask)
                 if let Some(bitfield) = try_match_bitfield_extraction(&left, op, &right) {
                     return bitfield;
+                }
+
+                // Bit field insertion pattern: (carrier & ~mask) | (value << start)
+                // becomes SET_BITS(carrier, value, start, width)
+                if let Some(bitfield_insert) = try_match_bitfield_insert(&left, op, &right) {
+                    return bitfield_insert;
                 }
 
                 // Boolean simplification: (cmp) == 1 → cmp, (cmp) != 1 → !(cmp)
@@ -3238,7 +3249,8 @@ fn try_match_bitfield_extraction(left: &Expr, op: BinOpKind, right: &Expr) -> Op
         return None;
     };
 
-    // The shifted expression must be a right shift
+    // The shifted expression must be a right shift, or an unshifted value
+    // for low-bit field extraction after `>> 0` has been simplified away.
     let (inner_expr, shift_amount) = match &shifted_expr.kind {
         ExprKind::BinOp {
             op: BinOpKind::Shr | BinOpKind::Sar,
@@ -3254,7 +3266,7 @@ fn try_match_bitfield_extraction(left: &Expr, op: BinOpKind, right: &Expr) -> Op
                 return None;
             }
         }
-        _ => return None,
+        _ => (shifted_expr, 0),
     };
 
     // Check if mask is a valid contiguous bit mask: (1 << width) - 1
@@ -3266,8 +3278,10 @@ fn try_match_bitfield_extraction(left: &Expr, op: BinOpKind, right: &Expr) -> Op
         return None;
     }
 
-    // Skip if start is 0 (that's just zero extension, already handled)
-    if shift_amount == 0 {
+    // Skip full-width low-bit masks at shift 0; that's just zero extension.
+    if shift_amount == 0
+        && infer_expr_bit_width(inner_expr).is_some_and(|bit_width| width >= bit_width)
+    {
         return None;
     }
 
@@ -3278,6 +3292,21 @@ fn try_match_bitfield_extraction(left: &Expr, op: BinOpKind, right: &Expr) -> Op
             width,
         },
     })
+}
+
+fn infer_expr_bit_width(expr: &Expr) -> Option<u8> {
+    match &expr.kind {
+        ExprKind::Var(var) => Some(var.size.saturating_mul(8)).filter(|width| *width > 0),
+        ExprKind::Deref { size, .. } => Some(size.saturating_mul(8)).filter(|width| *width > 0),
+        ExprKind::ArrayAccess { element_size, .. } => u8::try_from(*element_size)
+            .ok()
+            .map(|size| size.saturating_mul(8)),
+        ExprKind::Cast { to_size, .. } => {
+            Some(to_size.saturating_mul(8)).filter(|width| *width > 0)
+        }
+        ExprKind::BitField { width, .. } => Some(*width),
+        _ => None,
+    }
 }
 
 /// Converts a contiguous bit mask to a width.
@@ -3307,6 +3336,141 @@ fn mask_to_width(mask: i128) -> Option<u8> {
     } else {
         None
     }
+}
+
+fn mask_to_shifted_field(mask: i128) -> Option<(u8, u8)> {
+    if mask <= 0 {
+        return None;
+    }
+
+    let start = mask.trailing_zeros() as u8;
+    let shifted = mask >> start;
+    let width = mask_to_width(shifted)?;
+    Some((start, width))
+}
+
+fn try_combine_shift_chain(left: &Expr, op: BinOpKind, right: &Expr) -> Option<Expr> {
+    let ExprKind::IntLit(outer_shift) = right.kind else {
+        return None;
+    };
+    let ExprKind::BinOp {
+        op: inner_op,
+        left: inner_expr,
+        right: inner_shift,
+    } = &left.kind
+    else {
+        return None;
+    };
+    if *inner_op != op {
+        return None;
+    }
+    let ExprKind::IntLit(inner_shift) = inner_shift.kind else {
+        return None;
+    };
+
+    match op {
+        BinOpKind::Shl | BinOpKind::Shr | BinOpKind::Sar => Some(
+            Expr::binop(
+                op,
+                inner_expr.as_ref().clone(),
+                Expr::int(inner_shift + outer_shift),
+            )
+            .simplify(),
+        ),
+        _ => None,
+    }
+}
+
+fn try_match_bitfield_insert(left: &Expr, op: BinOpKind, right: &Expr) -> Option<Expr> {
+    if op != BinOpKind::Or {
+        return None;
+    }
+
+    for (carrier_side, insert_side) in [(left, right), (right, left)] {
+        let Some((carrier, clear_mask)) = extract_bitfield_clear_side(carrier_side) else {
+            continue;
+        };
+        let field_mask = !clear_mask;
+        let Some((start, width)) = mask_to_shifted_field(field_mask) else {
+            continue;
+        };
+        let Some(value) = extract_bitfield_insert_value(insert_side, field_mask, start) else {
+            continue;
+        };
+        return Some(Expr::call(
+            CallTarget::Named("SET_BITS".to_string()),
+            vec![
+                carrier.clone(),
+                value,
+                Expr::int(i128::from(start)),
+                Expr::int(i128::from(width)),
+            ],
+        ));
+    }
+
+    None
+}
+
+fn extract_bitfield_clear_side(expr: &Expr) -> Option<(&Expr, i128)> {
+    let ExprKind::BinOp {
+        op: BinOpKind::And,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    if let ExprKind::IntLit(mask) = right.kind {
+        return Some((left.as_ref(), mask));
+    }
+    if let ExprKind::IntLit(mask) = left.kind {
+        return Some((right.as_ref(), mask));
+    }
+    None
+}
+
+fn extract_bitfield_insert_value(expr: &Expr, field_mask: i128, start: u8) -> Option<Expr> {
+    if let Some(value) = extract_shifted_value(expr, start) {
+        return Some(value);
+    }
+
+    let ExprKind::BinOp {
+        op: BinOpKind::And,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    if let ExprKind::IntLit(mask) = right.kind {
+        if mask == field_mask {
+            return extract_shifted_value(left, start);
+        }
+    }
+    if let ExprKind::IntLit(mask) = left.kind {
+        if mask == field_mask {
+            return extract_shifted_value(right, start);
+        }
+    }
+    None
+}
+
+fn extract_shifted_value(expr: &Expr, start: u8) -> Option<Expr> {
+    let ExprKind::BinOp {
+        op: BinOpKind::Shl,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let ExprKind::IntLit(shift) = right.kind else {
+        return None;
+    };
+    if shift != i128::from(start) {
+        return None;
+    }
+    Some(left.as_ref().clone())
 }
 
 /// Simplifies boolean comparison patterns.
@@ -4357,13 +4521,14 @@ mod tests {
             other => panic!("Expected Cast, got {:?}", other),
         }
 
-        // Non-standard masks should not simplify: x & 0x7F
+        // Low-bit masks are recognized as bitfield extraction idioms.
         let expr = Expr::binop(BinOpKind::And, x.clone(), Expr::int(0x7F));
         let simplified = expr.simplify();
         assert!(matches!(
             simplified.kind,
-            ExprKind::BinOp {
-                op: BinOpKind::And,
+            ExprKind::BitField {
+                start: 0,
+                width: 7,
                 ..
             }
         ));
@@ -4425,6 +4590,14 @@ mod tests {
         // Edge cases
         assert_eq!(mask_to_width(0), None);
         assert_eq!(mask_to_width(-1), None);
+    }
+
+    #[test]
+    fn test_mask_to_shifted_field() {
+        assert_eq!(mask_to_shifted_field(0xff0), Some((4, 8)));
+        assert_eq!(mask_to_shifted_field(0xe), Some((1, 3)));
+        assert_eq!(mask_to_shifted_field(0), None);
+        assert_eq!(mask_to_shifted_field(0x14), None);
     }
 
     #[test]
@@ -4503,11 +4676,23 @@ mod tests {
             }
         ));
 
-        // Shift of 0 should not match (that's zero extension)
-        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(0));
+        // Shift of 0 should match sub-byte fields when the source width is known.
+        let byte = Expr::var(Variable::reg("al", 1));
+        let shifted = Expr::binop(BinOpKind::Shr, byte, Expr::int(0));
         let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0xF));
         let simplified = expr.simplify();
-        // This should either remain as BinOp or become a zero extension Cast, not BitField
+        match &simplified.kind {
+            ExprKind::BitField { start, width, .. } => {
+                assert_eq!(*start, 0);
+                assert_eq!(*width, 4);
+            }
+            other => panic!("Expected BitField, got {:?}", other),
+        }
+
+        // Full-width masks at shift 0 should still behave as zero extension.
+        let shifted = Expr::binop(BinOpKind::Shr, x.clone(), Expr::int(0));
+        let expr = Expr::binop(BinOpKind::And, shifted, Expr::int(0xFF));
+        let simplified = expr.simplify();
         assert!(!matches!(simplified.kind, ExprKind::BitField { .. }));
     }
 
@@ -4533,6 +4718,47 @@ mod tests {
             },
         };
         assert_eq!(bitfield2.to_string(), "BITS(x, 16, 8)");
+    }
+
+    #[test]
+    fn test_shift_chain_combines_nested_left_shifts() {
+        let x = Expr::unknown("x");
+        let expr = Expr::binop(
+            BinOpKind::Shl,
+            Expr::binop(BinOpKind::Shl, x.clone(), Expr::int(4)),
+            Expr::int(8),
+        );
+        let simplified = expr.simplify();
+        assert_eq!(simplified.to_string(), "x << 0xc");
+    }
+
+    #[test]
+    fn test_bitfield_insert_patterns() {
+        let carrier = Expr::unknown("carrier");
+        let value = Expr::unknown("value");
+
+        let expr = Expr::binop(
+            BinOpKind::Or,
+            Expr::binop(BinOpKind::And, carrier.clone(), Expr::int(!0xff0)),
+            Expr::binop(BinOpKind::Shl, value.clone(), Expr::int(4)),
+        );
+        let simplified = expr.simplify();
+        assert_eq!(simplified.to_string(), "SET_BITS(carrier, value, 4, 8)");
+
+        let masked_expr = Expr::binop(
+            BinOpKind::Or,
+            Expr::binop(BinOpKind::And, carrier.clone(), Expr::int(!0xff0)),
+            Expr::binop(
+                BinOpKind::And,
+                Expr::binop(BinOpKind::Shl, value.clone(), Expr::int(4)),
+                Expr::int(0xff0),
+            ),
+        );
+        let masked_simplified = masked_expr.simplify();
+        assert_eq!(
+            masked_simplified.to_string(),
+            "SET_BITS(carrier, value, 4, 8)"
+        );
     }
 
     // ============================================

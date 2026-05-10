@@ -672,6 +672,77 @@ impl PseudoCodeEmitter {
                 .any(|token| token == name)
         }
 
+        fn parse_simple_copy_assign(line: &str) -> Option<(String, String)> {
+            let trimmed = line.trim().strip_suffix(';')?;
+            let (lhs, rhs) = trimmed.split_once(" = ")?;
+            let lhs = lhs.trim();
+            let rhs = rhs.trim();
+            if is_simple_identifier(lhs) && is_simple_identifier(rhs) {
+                Some((lhs.to_string(), rhs.to_string()))
+            } else {
+                None
+            }
+        }
+
+        fn parse_simple_shift_assign(line: &str) -> Option<(String, String)> {
+            let trimmed = line.trim().strip_suffix(';')?;
+            let (lhs, rhs) = trimmed.split_once(" <<= ")?;
+            let lhs = lhs.trim();
+            let rhs = rhs.trim();
+            if is_simple_identifier(lhs) && rhs.chars().all(|c| c.is_ascii_digit()) {
+                Some((lhs.to_string(), rhs.to_string()))
+            } else {
+                None
+            }
+        }
+
+        fn split_top_level_csv(input: &str) -> Option<Vec<String>> {
+            let mut parts = Vec::new();
+            let mut depth = 0i32;
+            let mut start = 0usize;
+            for (idx, ch) in input.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' if depth == 0 => {
+                        parts.push(input[start..idx].trim().to_string());
+                        start = idx + 1;
+                    }
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+            parts.push(input[start..].trim().to_string());
+            Some(parts)
+        }
+
+        fn parse_set_bits_call(line: &str) -> Option<(std::ops::Range<usize>, Vec<String>)> {
+            let start = line.find("SET_BITS(")?;
+            let args_start = start + "SET_BITS(".len();
+            let mut depth = 1i32;
+            let mut end = args_start;
+            for (offset, ch) in line[args_start..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = args_start + offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+            let args = split_top_level_csv(&line[args_start..end])?;
+            Some((start..end + 1, args))
+        }
+
         let mut lines: Vec<String> = output.lines().map(str::to_string).collect();
         if lines.is_empty() {
             return output;
@@ -702,6 +773,71 @@ impl PseudoCodeEmitter {
                 }
                 *line = line.replacen("local_4", &format!("BITS({}, 32, 32)", source), 1);
             }
+        }
+
+        let mut shifted_bitfield_sources: HashMap<String, (String, String)> = HashMap::new();
+        for window in lines.windows(2) {
+            let Some((temp_name, source_name)) = parse_simple_copy_assign(&window[0]) else {
+                continue;
+            };
+            let Some((shifted_name, shift_amount)) = parse_simple_shift_assign(&window[1]) else {
+                continue;
+            };
+            if temp_name == shifted_name {
+                shifted_bitfield_sources.insert(temp_name, (source_name, shift_amount));
+            }
+        }
+
+        for line in &mut lines {
+            let Some((call_range, args)) = parse_set_bits_call(line) else {
+                continue;
+            };
+            if args.len() < 4 {
+                continue;
+            }
+            let value_arg = args[1].trim();
+            let start_arg = args[2].trim();
+            let Some((source_name, shift_amount)) = shifted_bitfield_sources.get(value_arg) else {
+                continue;
+            };
+            if start_arg != shift_amount {
+                continue;
+            }
+            let mut rewritten_args = args;
+            rewritten_args[1] = source_name.clone();
+            let replacement = format!("SET_BITS({})", rewritten_args.join(", "));
+            line.replace_range(call_range, &replacement);
+        }
+
+        let mut idx = 0usize;
+        while idx + 1 < lines.len() {
+            let trimmed = lines[idx].trim();
+            let Some((lhs, rhs)) = trimmed
+                .strip_suffix(';')
+                .and_then(|line| line.split_once(" = "))
+                .map(|(lhs, rhs)| (lhs.trim(), rhs.trim()))
+            else {
+                idx += 1;
+                continue;
+            };
+            if !is_simple_identifier(lhs) || !rhs.starts_with("SET_BITS(") {
+                idx += 1;
+                continue;
+            }
+            let next_trimmed = lines[idx + 1].trim();
+            let Some(next_rhs) = next_trimmed
+                .strip_suffix(';')
+                .and_then(|line| line.split_once(" = "))
+                .map(|(_, rhs)| rhs.trim())
+            else {
+                idx += 1;
+                continue;
+            };
+            if rhs == next_rhs {
+                lines.remove(idx);
+                continue;
+            }
+            idx += 1;
         }
 
         let is_int64_return = lines
@@ -2609,6 +2745,7 @@ impl PseudoCodeEmitter {
                 }
                 None
             }
+            ExprKind::Unknown(name) => self.lookup_type_info(name).map(str::to_string),
             _ => None,
         }
     }
@@ -4993,6 +5130,8 @@ impl PseudoCodeEmitter {
             .into_iter()
             .filter(|var| contains_identifier_token(&body_output, var))
             .collect();
+        let inferred_assignment_types = self.collect_assignment_based_local_types(&display_body);
+        let inferred_pointer_usage_types = self.collect_pointer_usage_types(&display_body);
         for inferred in collect_decl_identifiers_from_emitted_body(&body_output) {
             if !param_exclusion_list.contains(&inferred)
                 && !self.is_known_global_identifier(&inferred)
@@ -5015,12 +5154,18 @@ impl PseudoCodeEmitter {
         if !all_vars.is_empty() {
             let indent = &self.indent;
             for var in &all_vars {
-                let var_type =
-                    if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var)) {
-                        "char*"
-                    } else {
-                        self.get_type(var)
-                    };
+                let var_type = inferred_assignment_types
+                    .get(var)
+                    .map(String::as_str)
+                    .or_else(|| inferred_pointer_usage_types.get(var).map(String::as_str))
+                    .unwrap_or_else(|| {
+                        if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var))
+                        {
+                            "char*"
+                        } else {
+                            self.get_type(var)
+                        }
+                    });
                 let scope_comment = self.dwarf_scope_comment(var).unwrap_or_default();
                 if loop_zero_init_vars.contains(var) {
                     writeln!(
@@ -5166,6 +5311,8 @@ impl PseudoCodeEmitter {
             .into_iter()
             .filter(|var| contains_identifier_token(&body_output, var))
             .collect();
+        let inferred_assignment_types = self.collect_assignment_based_local_types(&display_body);
+        let inferred_pointer_usage_types = self.collect_pointer_usage_types(&display_body);
         for inferred in collect_decl_identifiers_from_emitted_body(&body_output) {
             if !param_exclusion_list.contains(&inferred)
                 && !self.is_known_global_identifier(&inferred)
@@ -5188,12 +5335,18 @@ impl PseudoCodeEmitter {
         if !all_vars.is_empty() {
             let indent = &self.indent;
             for var in &all_vars {
-                let var_type =
-                    if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var)) {
-                        "char*"
-                    } else {
-                        self.get_type(var)
-                    };
+                let var_type = inferred_assignment_types
+                    .get(var)
+                    .map(String::as_str)
+                    .or_else(|| inferred_pointer_usage_types.get(var).map(String::as_str))
+                    .unwrap_or_else(|| {
+                        if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var))
+                        {
+                            "char*"
+                        } else {
+                            self.get_type(var)
+                        }
+                    });
                 let scope_comment = self.dwarf_scope_comment(var).unwrap_or_default();
                 if loop_zero_init_vars.contains(var) {
                     writeln!(
@@ -5970,6 +6123,391 @@ impl PseudoCodeEmitter {
                 }
             }
         }
+    }
+
+    fn collect_assignment_based_local_types(
+        &self,
+        nodes: &[StructuredNode],
+    ) -> HashMap<String, String> {
+        let mut inferred = HashMap::new();
+        self.collect_assignment_based_local_types_from_nodes(nodes, &mut inferred);
+        inferred
+    }
+
+    fn collect_pointer_usage_types(&self, nodes: &[StructuredNode]) -> HashMap<String, String> {
+        let mut inferred = HashMap::new();
+        self.collect_pointer_usage_types_from_nodes(nodes, &mut inferred);
+        inferred
+    }
+
+    fn collect_pointer_usage_types_from_nodes(
+        &self,
+        nodes: &[StructuredNode],
+        inferred: &mut HashMap<String, String>,
+    ) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.collect_pointer_usage_types_from_expr(stmt, inferred);
+                    }
+                }
+                StructuredNode::Expr(expr) => {
+                    self.collect_pointer_usage_types_from_expr(expr, inferred);
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    self.collect_pointer_usage_types_from_expr(condition, inferred);
+                    self.collect_pointer_usage_types_from_nodes(then_body, inferred);
+                    if let Some(else_body) = else_body {
+                        self.collect_pointer_usage_types_from_nodes(else_body, inferred);
+                    }
+                }
+                StructuredNode::While {
+                    condition, body, ..
+                }
+                | StructuredNode::DoWhile {
+                    condition, body, ..
+                } => {
+                    self.collect_pointer_usage_types_from_expr(condition, inferred);
+                    self.collect_pointer_usage_types_from_nodes(body, inferred);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(init) = init {
+                        self.collect_pointer_usage_types_from_expr(init, inferred);
+                    }
+                    self.collect_pointer_usage_types_from_expr(condition, inferred);
+                    if let Some(update) = update {
+                        self.collect_pointer_usage_types_from_expr(update, inferred);
+                    }
+                    self.collect_pointer_usage_types_from_nodes(body, inferred);
+                }
+                StructuredNode::Loop { body, .. } => {
+                    self.collect_pointer_usage_types_from_nodes(body, inferred);
+                }
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    self.collect_pointer_usage_types_from_expr(value, inferred);
+                    for (_, body) in cases {
+                        self.collect_pointer_usage_types_from_nodes(body, inferred);
+                    }
+                    if let Some(default) = default {
+                        self.collect_pointer_usage_types_from_nodes(default, inferred);
+                    }
+                }
+                StructuredNode::Return(Some(expr)) => {
+                    self.collect_pointer_usage_types_from_expr(expr, inferred);
+                }
+                StructuredNode::Sequence(nodes) => {
+                    self.collect_pointer_usage_types_from_nodes(nodes, inferred);
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    self.collect_pointer_usage_types_from_nodes(try_body, inferred);
+                    for handler in catch_handlers {
+                        self.collect_pointer_usage_types_from_nodes(&handler.body, inferred);
+                    }
+                }
+                StructuredNode::Return(None)
+                | StructuredNode::Break
+                | StructuredNode::Continue
+                | StructuredNode::Goto(_)
+                | StructuredNode::Label(_) => {}
+            }
+        }
+    }
+
+    fn collect_pointer_usage_types_from_expr(
+        &self,
+        expr: &Expr,
+        inferred: &mut HashMap<String, String>,
+    ) {
+        match &expr.kind {
+            ExprKind::ArrayAccess {
+                base,
+                index,
+                element_size,
+            } => {
+                if let Some(base_name) = self.try_get_assigned_var_name(base) {
+                    let should_update = inferred
+                        .get(&base_name)
+                        .map_or(true, |existing| !Self::is_pointer_like_type(existing));
+                    if should_update {
+                        if let Some(pointer_type) =
+                            Self::pointer_type_for_element_size(*element_size)
+                        {
+                            inferred.insert(base_name, pointer_type.to_string());
+                        }
+                    }
+                }
+                self.collect_pointer_usage_types_from_expr(base, inferred);
+                self.collect_pointer_usage_types_from_expr(index, inferred);
+            }
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.collect_pointer_usage_types_from_expr(lhs, inferred);
+                self.collect_pointer_usage_types_from_expr(rhs, inferred);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.collect_pointer_usage_types_from_expr(left, inferred);
+                self.collect_pointer_usage_types_from_expr(right, inferred);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                self.collect_pointer_usage_types_from_expr(operand, inferred);
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                self.collect_pointer_usage_types_from_expr(base, inferred);
+            }
+            ExprKind::Call { target, args } => {
+                match target {
+                    CallTarget::Indirect(expr) => {
+                        self.collect_pointer_usage_types_from_expr(expr, inferred);
+                    }
+                    CallTarget::IndirectGot { expr, .. } => {
+                        self.collect_pointer_usage_types_from_expr(expr, inferred);
+                    }
+                    CallTarget::Direct { .. } | CallTarget::Named(_) => {}
+                }
+                for arg in args {
+                    self.collect_pointer_usage_types_from_expr(arg, inferred);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_pointer_usage_types_from_expr(cond, inferred);
+                self.collect_pointer_usage_types_from_expr(then_expr, inferred);
+                self.collect_pointer_usage_types_from_expr(else_expr, inferred);
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    self.collect_pointer_usage_types_from_expr(value, inferred);
+                }
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                self.collect_pointer_usage_types_from_expr(display_expr, inferred);
+            }
+            ExprKind::Var(_) | ExprKind::IntLit(_) | ExprKind::Unknown(_) => {}
+        }
+    }
+
+    fn pointer_type_for_element_size(element_size: usize) -> Option<&'static str> {
+        match element_size {
+            1 => Some("char*"),
+            2 => Some("int16_t*"),
+            4 => Some("int32_t*"),
+            8 => Some("int64_t*"),
+            _ => None,
+        }
+    }
+
+    fn collect_assignment_based_local_types_from_nodes(
+        &self,
+        nodes: &[StructuredNode],
+        inferred: &mut HashMap<String, String>,
+    ) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.collect_assignment_based_local_types_from_expr(stmt, inferred);
+                    }
+                }
+                StructuredNode::Expr(expr) => {
+                    self.collect_assignment_based_local_types_from_expr(expr, inferred);
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    self.collect_assignment_based_local_types_from_expr(condition, inferred);
+                    self.collect_assignment_based_local_types_from_nodes(then_body, inferred);
+                    if let Some(else_body) = else_body {
+                        self.collect_assignment_based_local_types_from_nodes(else_body, inferred);
+                    }
+                }
+                StructuredNode::While {
+                    condition, body, ..
+                }
+                | StructuredNode::DoWhile {
+                    condition, body, ..
+                } => {
+                    self.collect_assignment_based_local_types_from_expr(condition, inferred);
+                    self.collect_assignment_based_local_types_from_nodes(body, inferred);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(init) = init {
+                        self.collect_assignment_based_local_types_from_expr(init, inferred);
+                    }
+                    self.collect_assignment_based_local_types_from_expr(condition, inferred);
+                    if let Some(update) = update {
+                        self.collect_assignment_based_local_types_from_expr(update, inferred);
+                    }
+                    self.collect_assignment_based_local_types_from_nodes(body, inferred);
+                }
+                StructuredNode::Loop { body, .. } => {
+                    self.collect_assignment_based_local_types_from_nodes(body, inferred);
+                }
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    self.collect_assignment_based_local_types_from_expr(value, inferred);
+                    for (_, body) in cases {
+                        self.collect_assignment_based_local_types_from_nodes(body, inferred);
+                    }
+                    if let Some(default) = default {
+                        self.collect_assignment_based_local_types_from_nodes(default, inferred);
+                    }
+                }
+                StructuredNode::Return(Some(expr)) => {
+                    self.collect_assignment_based_local_types_from_expr(expr, inferred);
+                }
+                StructuredNode::Sequence(nodes) => {
+                    self.collect_assignment_based_local_types_from_nodes(nodes, inferred);
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    self.collect_assignment_based_local_types_from_nodes(try_body, inferred);
+                    for handler in catch_handlers {
+                        self.collect_assignment_based_local_types_from_nodes(
+                            &handler.body,
+                            inferred,
+                        );
+                    }
+                }
+                StructuredNode::Return(None)
+                | StructuredNode::Break
+                | StructuredNode::Continue
+                | StructuredNode::Goto(_)
+                | StructuredNode::Label(_) => {}
+            }
+        }
+    }
+
+    fn collect_assignment_based_local_types_from_expr(
+        &self,
+        expr: &Expr,
+        inferred: &mut HashMap<String, String>,
+    ) {
+        match &expr.kind {
+            ExprKind::Assign { lhs, rhs } => {
+                if let Some(lhs_name) = self.try_get_assigned_var_name(lhs) {
+                    if self.get_type(&lhs_name) == "int" {
+                        if let Some(rhs_type) = self.infer_assignment_rhs_type(rhs) {
+                            inferred.entry(lhs_name).or_insert(rhs_type);
+                        }
+                    }
+                }
+                self.collect_assignment_based_local_types_from_expr(lhs, inferred);
+                self.collect_assignment_based_local_types_from_expr(rhs, inferred);
+            }
+            ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                self.collect_assignment_based_local_types_from_expr(lhs, inferred);
+                self.collect_assignment_based_local_types_from_expr(rhs, inferred);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                self.collect_assignment_based_local_types_from_expr(left, inferred);
+                self.collect_assignment_based_local_types_from_expr(right, inferred);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                self.collect_assignment_based_local_types_from_expr(operand, inferred);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                self.collect_assignment_based_local_types_from_expr(base, inferred);
+                self.collect_assignment_based_local_types_from_expr(index, inferred);
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                self.collect_assignment_based_local_types_from_expr(base, inferred);
+            }
+            ExprKind::Call { target, args } => {
+                match target {
+                    CallTarget::Indirect(expr) => {
+                        self.collect_assignment_based_local_types_from_expr(expr, inferred);
+                    }
+                    CallTarget::IndirectGot { expr, .. } => {
+                        self.collect_assignment_based_local_types_from_expr(expr, inferred);
+                    }
+                    CallTarget::Direct { .. } | CallTarget::Named(_) => {}
+                }
+                for arg in args {
+                    self.collect_assignment_based_local_types_from_expr(arg, inferred);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_assignment_based_local_types_from_expr(cond, inferred);
+                self.collect_assignment_based_local_types_from_expr(then_expr, inferred);
+                self.collect_assignment_based_local_types_from_expr(else_expr, inferred);
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    self.collect_assignment_based_local_types_from_expr(value, inferred);
+                }
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                self.collect_assignment_based_local_types_from_expr(display_expr, inferred);
+            }
+            ExprKind::Var(_) | ExprKind::IntLit(_) | ExprKind::Unknown(_) => {}
+        }
+    }
+
+    fn infer_assignment_rhs_type(&self, rhs: &Expr) -> Option<String> {
+        self.try_get_var_name(rhs)
+            .and_then(|name| self.lookup_type_info(&name).map(str::to_string))
+            .or_else(|| {
+                if let ExprKind::Unknown(name) = &rhs.kind {
+                    self.lookup_type_info(name).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .filter(|ty| Self::is_pointer_like_type(ty))
+            .or_else(|| {
+                self.get_expr_type(rhs)
+                    .filter(|ty| Self::is_pointer_like_type(ty))
+            })
+    }
+
+    fn is_pointer_like_type(ty: &str) -> bool {
+        let ty = ty.trim();
+        ty.contains("(*)") || ty.contains('*') || ty.ends_with("[]")
     }
 
     /// Analyzes a function body to detect parameters and return type.
@@ -8744,6 +9282,32 @@ mod tests {
     }
 
     #[test]
+    fn test_repair_packed_small_aggregate_output_normalizes_shifted_set_bits_source() {
+        let input = r#"int32_t set_count(int16_t* arr, int8_t arg1)
+{
+    int ret;
+
+    ret = arg1;
+    ret <<= 4;
+    arg1 = SET_BITS(*(uint16_t*)(arr), ret, 4, 8);
+    *(uint16_t*)(arr) = SET_BITS(*(uint16_t*)(arr), ret, 4, 8);
+    return ret;
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            repaired.contains("*(uint16_t*)(arr) = SET_BITS(*(uint16_t*)(arr), arg1, 4, 8);"),
+            "Expected SET_BITS repair to recover the unshifted source value, got:\n{}",
+            repaired
+        );
+        assert!(
+            !repaired.contains("arg1 = SET_BITS("),
+            "Expected redundant alias assignment to be removed, got:\n{}",
+            repaired
+        );
+    }
+
+    #[test]
     fn test_canonical_decl_var_name_strips_array_suffix() {
         assert_eq!(
             canonical_decl_var_name("tmp1[idx]"),
@@ -8943,6 +9507,49 @@ mod tests {
         assert!(
             output.contains("size_t local_4") || output.contains("size_t ptr"),
             "Expected 'size_t local_4' or 'size_t ptr' in output:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_infers_spilled_pointer_width_from_assignment_and_indexed_use() {
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::assign(Expr::unknown("local_8"), Expr::unknown("arr"))],
+            address_range: (0x1000, 0x1008),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::Return(Some(Expr::array_access(
+                    Expr::unknown("local_8"),
+                    Expr::int(1),
+                    2,
+                ))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut type_info = HashMap::new();
+        type_info.insert("arr".to_string(), "int16_t*".to_string());
+
+        let output = PseudoCodeEmitter::new("    ", false)
+            .with_type_info(type_info)
+            .emit(&cfg, "read_version");
+
+        assert!(
+            output.contains("int16_t* arr"),
+            "Expected preserved 16-bit pointer type in the emitted signature, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("return arr[1];") || output.contains("return local_8[1];"),
+            "Expected indexed reload to stay 16-bit wide, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("char* local_8"),
+            "Did not expect the spill to degrade into a byte pointer, got:\n{}",
             output
         );
     }

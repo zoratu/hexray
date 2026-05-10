@@ -1041,6 +1041,7 @@ impl Decompiler {
             }
         }
 
+        self.seed_assignment_alias_type_info(&structured.body, &mut merged_types);
         self.seed_cpp_special_type_info(&structured.body, &mut merged_types);
 
         // Step 3: Apply exception handling if available
@@ -1535,6 +1536,253 @@ impl Decompiler {
         for alias in aliases {
             merged_types.insert(alias, this_type.clone());
         }
+    }
+
+    fn seed_assignment_alias_type_info(
+        &self,
+        body: &[StructuredNode],
+        merged_types: &mut HashMap<String, String>,
+    ) {
+        loop {
+            let mut changed = false;
+            Self::collect_assignment_alias_type_info(body, merged_types, &mut changed);
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn collect_assignment_alias_type_info(
+        nodes: &[StructuredNode],
+        merged_types: &mut HashMap<String, String>,
+        changed: &mut bool,
+    ) {
+        for node in nodes {
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        Self::collect_assignment_alias_type_info_from_expr(
+                            stmt,
+                            merged_types,
+                            changed,
+                        );
+                    }
+                }
+                StructuredNode::Expr(expr) => {
+                    Self::collect_assignment_alias_type_info_from_expr(expr, merged_types, changed);
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    Self::collect_assignment_alias_type_info_from_expr(
+                        condition,
+                        merged_types,
+                        changed,
+                    );
+                    Self::collect_assignment_alias_type_info(then_body, merged_types, changed);
+                    if let Some(else_body) = else_body {
+                        Self::collect_assignment_alias_type_info(else_body, merged_types, changed);
+                    }
+                }
+                StructuredNode::While {
+                    condition, body, ..
+                }
+                | StructuredNode::DoWhile {
+                    condition, body, ..
+                } => {
+                    Self::collect_assignment_alias_type_info_from_expr(
+                        condition,
+                        merged_types,
+                        changed,
+                    );
+                    Self::collect_assignment_alias_type_info(body, merged_types, changed);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(init) = init {
+                        Self::collect_assignment_alias_type_info_from_expr(
+                            init,
+                            merged_types,
+                            changed,
+                        );
+                    }
+                    Self::collect_assignment_alias_type_info_from_expr(
+                        condition,
+                        merged_types,
+                        changed,
+                    );
+                    if let Some(update) = update {
+                        Self::collect_assignment_alias_type_info_from_expr(
+                            update,
+                            merged_types,
+                            changed,
+                        );
+                    }
+                    Self::collect_assignment_alias_type_info(body, merged_types, changed);
+                }
+                StructuredNode::Loop { body, .. } => {
+                    Self::collect_assignment_alias_type_info(body, merged_types, changed);
+                }
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    Self::collect_assignment_alias_type_info_from_expr(
+                        value,
+                        merged_types,
+                        changed,
+                    );
+                    for (_, body) in cases {
+                        Self::collect_assignment_alias_type_info(body, merged_types, changed);
+                    }
+                    if let Some(default) = default {
+                        Self::collect_assignment_alias_type_info(default, merged_types, changed);
+                    }
+                }
+                StructuredNode::Return(Some(expr)) => {
+                    Self::collect_assignment_alias_type_info_from_expr(expr, merged_types, changed);
+                }
+                StructuredNode::Sequence(nodes) => {
+                    Self::collect_assignment_alias_type_info(nodes, merged_types, changed);
+                }
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    Self::collect_assignment_alias_type_info(try_body, merged_types, changed);
+                    for handler in catch_handlers {
+                        Self::collect_assignment_alias_type_info(
+                            &handler.body,
+                            merged_types,
+                            changed,
+                        );
+                    }
+                }
+                StructuredNode::Return(None)
+                | StructuredNode::Break
+                | StructuredNode::Continue
+                | StructuredNode::Goto(_)
+                | StructuredNode::Label(_) => {}
+            }
+        }
+    }
+
+    fn collect_assignment_alias_type_info_from_expr(
+        expr: &Expr,
+        merged_types: &mut HashMap<String, String>,
+        changed: &mut bool,
+    ) {
+        match &expr.kind {
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                if let (Some(lhs_name), Some(rhs_name)) = (
+                    Self::expr_identifier_name(lhs),
+                    Self::expr_identifier_name(rhs),
+                ) {
+                    if lhs_name != rhs_name {
+                        if let Some(rhs_type) = merged_types.get(&rhs_name).cloned() {
+                            if Self::is_pointer_like_type(&rhs_type) {
+                                let should_update = merged_types
+                                    .get(&lhs_name)
+                                    .map_or(true, |existing| !Self::is_pointer_like_type(existing));
+                                if should_update {
+                                    merged_types.insert(lhs_name, rhs_type);
+                                    *changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                Self::collect_assignment_alias_type_info_from_expr(lhs, merged_types, changed);
+                Self::collect_assignment_alias_type_info_from_expr(rhs, merged_types, changed);
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                Self::collect_assignment_alias_type_info_from_expr(left, merged_types, changed);
+                Self::collect_assignment_alias_type_info_from_expr(right, merged_types, changed);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                Self::collect_assignment_alias_type_info_from_expr(operand, merged_types, changed);
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                Self::collect_assignment_alias_type_info_from_expr(base, merged_types, changed);
+                Self::collect_assignment_alias_type_info_from_expr(index, merged_types, changed);
+            }
+            ExprKind::FieldAccess { base, .. } => {
+                Self::collect_assignment_alias_type_info_from_expr(base, merged_types, changed);
+            }
+            ExprKind::Call { target, args } => {
+                match target {
+                    expression::CallTarget::Indirect(expr) => {
+                        Self::collect_assignment_alias_type_info_from_expr(
+                            expr,
+                            merged_types,
+                            changed,
+                        );
+                    }
+                    expression::CallTarget::IndirectGot { expr, .. } => {
+                        Self::collect_assignment_alias_type_info_from_expr(
+                            expr,
+                            merged_types,
+                            changed,
+                        );
+                    }
+                    expression::CallTarget::Direct { .. } | expression::CallTarget::Named(_) => {}
+                }
+                for arg in args {
+                    Self::collect_assignment_alias_type_info_from_expr(arg, merged_types, changed);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_assignment_alias_type_info_from_expr(cond, merged_types, changed);
+                Self::collect_assignment_alias_type_info_from_expr(
+                    then_expr,
+                    merged_types,
+                    changed,
+                );
+                Self::collect_assignment_alias_type_info_from_expr(
+                    else_expr,
+                    merged_types,
+                    changed,
+                );
+            }
+            ExprKind::Phi(values) => {
+                for value in values {
+                    Self::collect_assignment_alias_type_info_from_expr(
+                        value,
+                        merged_types,
+                        changed,
+                    );
+                }
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                Self::collect_assignment_alias_type_info_from_expr(
+                    display_expr,
+                    merged_types,
+                    changed,
+                );
+            }
+            ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => {}
+        }
+    }
+
+    fn is_pointer_like_type(ty: &str) -> bool {
+        let ty = ty.trim();
+        ty.contains("(*)") || ty.contains('*') || ty.ends_with("[]")
     }
 
     fn cpp_special_explicit_param_count(
@@ -2249,6 +2497,31 @@ mod tests {
         // Should contain if/else structure
         assert!(output.contains("if"));
         assert!(output.contains("else"));
+    }
+
+    #[test]
+    fn test_seed_assignment_alias_type_info_propagates_pointer_types() {
+        let body = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("local_8"), Expr::unknown("arg0")),
+                Expr::assign(Expr::unknown("ptr_copy"), Expr::unknown("local_8")),
+            ],
+            address_range: (0x1000, 0x1008),
+        }];
+
+        let mut merged_types = HashMap::from([("arg0".to_string(), "int16_t*".to_string())]);
+        let decompiler = Decompiler::new();
+        decompiler.seed_assignment_alias_type_info(&body, &mut merged_types);
+
+        assert_eq!(
+            merged_types.get("local_8").map(String::as_str),
+            Some("int16_t*")
+        );
+        assert_eq!(
+            merged_types.get("ptr_copy").map(String::as_str),
+            Some("int16_t*")
+        );
     }
 
     #[test]

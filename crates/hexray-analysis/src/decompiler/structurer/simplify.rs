@@ -1419,7 +1419,9 @@ fn collect_temps_from_node(node: &StructuredNode, temps: &mut HashMap<String, Ex
                         if is_temp_register(&v.name) {
                             // Substitute existing temps in the RHS
                             let rhs_substituted = substitute_vars(rhs, temps);
-                            temps.insert(v.name.clone(), rhs_substituted);
+                            for alias in get_register_aliases(&v.name) {
+                                temps.insert(alias, rhs_substituted.clone());
+                            }
                         }
                     }
                 }
@@ -1427,15 +1429,27 @@ fn collect_temps_from_node(node: &StructuredNode, temps: &mut HashMap<String, Ex
                     // Handle x |= y as x = x | y, etc.
                     if let ExprKind::Var(v) = &lhs.kind {
                         if is_temp_register(&v.name) {
-                            // Get current value (or use the var itself if not tracked)
-                            let lhs_val = temps
-                                .get(&v.name)
-                                .cloned()
-                                .unwrap_or_else(|| (**lhs).clone());
+                            let aliases = get_register_aliases(&v.name);
+                            let lhs_val =
+                                aliases.iter().find_map(|alias| temps.get(alias).cloned());
                             let rhs_substituted = substitute_vars(rhs, temps);
-                            // Build the compound expression
-                            let new_val = Expr::binop(*op, lhs_val, rhs_substituted);
-                            temps.insert(v.name.clone(), new_val);
+                            if let Some(lhs_val) = lhs_val {
+                                if expr_uses_any_alias(&lhs_val, &aliases) {
+                                    for alias in aliases {
+                                        temps.remove(&alias);
+                                    }
+                                    continue;
+                                }
+                                // Build the compound expression from the stabilized pre-update value.
+                                let new_val = Expr::binop(*op, lhs_val, rhs_substituted).simplify();
+                                for alias in aliases {
+                                    temps.insert(alias, new_val.clone());
+                                }
+                            } else {
+                                for alias in aliases {
+                                    temps.remove(&alias);
+                                }
+                            }
                         }
                     }
                 }
@@ -2289,24 +2303,60 @@ fn get_register_aliases(name: &str) -> Vec<String> {
             "eax".to_string(),
             "rax".to_string(),
         ],
-        "ebx" => vec!["ebx".to_string(), "rbx".to_string()],
-        "rbx" => vec!["ebx".to_string(), "rbx".to_string()],
-        "ecx" => vec!["ecx".to_string(), "rcx".to_string()],
-        "rcx" => vec!["ecx".to_string(), "rcx".to_string()],
-        "edx" => vec!["edx".to_string(), "rdx".to_string()],
-        "rdx" => vec!["edx".to_string(), "rdx".to_string()],
-        "esi" => vec!["esi".to_string(), "rsi".to_string()],
-        "rsi" => vec!["esi".to_string(), "rsi".to_string()],
-        "edi" => vec!["edi".to_string(), "rdi".to_string()],
-        "rdi" => vec!["edi".to_string(), "rdi".to_string()],
-        "r8d" => vec!["r8d".to_string(), "r8".to_string()],
-        "r8" => vec!["r8d".to_string(), "r8".to_string()],
-        "r9d" => vec!["r9d".to_string(), "r9".to_string()],
-        "r9" => vec!["r9d".to_string(), "r9".to_string()],
-        "r10d" => vec!["r10d".to_string(), "r10".to_string()],
-        "r10" => vec!["r10d".to_string(), "r10".to_string()],
-        "r11d" => vec!["r11d".to_string(), "r11".to_string()],
-        "r11" => vec!["r11d".to_string(), "r11".to_string()],
+        "bl" | "bx" | "ebx" | "rbx" => vec![
+            "bl".to_string(),
+            "bx".to_string(),
+            "ebx".to_string(),
+            "rbx".to_string(),
+        ],
+        "cl" | "cx" | "ecx" | "rcx" => vec![
+            "cl".to_string(),
+            "cx".to_string(),
+            "ecx".to_string(),
+            "rcx".to_string(),
+        ],
+        "dl" | "dx" | "edx" | "rdx" => vec![
+            "dl".to_string(),
+            "dx".to_string(),
+            "edx".to_string(),
+            "rdx".to_string(),
+        ],
+        "sil" | "si" | "esi" | "rsi" => vec![
+            "sil".to_string(),
+            "si".to_string(),
+            "esi".to_string(),
+            "rsi".to_string(),
+        ],
+        "dil" | "di" | "edi" | "rdi" => vec![
+            "dil".to_string(),
+            "di".to_string(),
+            "edi".to_string(),
+            "rdi".to_string(),
+        ],
+        "r8b" | "r8w" | "r8d" | "r8" => vec![
+            "r8b".to_string(),
+            "r8w".to_string(),
+            "r8d".to_string(),
+            "r8".to_string(),
+        ],
+        "r9b" | "r9w" | "r9d" | "r9" => vec![
+            "r9b".to_string(),
+            "r9w".to_string(),
+            "r9d".to_string(),
+            "r9".to_string(),
+        ],
+        "r10b" | "r10w" | "r10d" | "r10" => vec![
+            "r10b".to_string(),
+            "r10w".to_string(),
+            "r10d".to_string(),
+            "r10".to_string(),
+        ],
+        "r11b" | "r11w" | "r11d" | "r11" => vec![
+            "r11b".to_string(),
+            "r11w".to_string(),
+            "r11d".to_string(),
+            "r11".to_string(),
+        ],
         _ => vec![name.to_string()],
     }
 }
@@ -2352,7 +2402,27 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         if let ExprKind::CompoundAssign { op, lhs, rhs } = &stmt.kind {
             let new_rhs = substitute_vars(rhs, &reg_values);
             if let ExprKind::Var(lhs_var) = &lhs.kind {
+                let aliases = get_register_aliases(&lhs_var.name);
+                let prior_value = if is_temp_register(&lhs_var.name) {
+                    aliases
+                        .iter()
+                        .find_map(|alias| reg_values.get(alias).cloned())
+                } else {
+                    None
+                };
                 invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
+                if is_temp_register(&lhs_var.name)
+                    && compound_update_defines_full_alias_value(&lhs_var.name)
+                {
+                    if let Some(current) = prior_value {
+                        if !expr_uses_any_alias(&current, &aliases) {
+                            let new_val = Expr::binop(*op, current, new_rhs.clone()).simplify();
+                            for alias in aliases {
+                                reg_values.insert(alias, new_val.clone());
+                            }
+                        }
+                    }
+                }
             }
             result.push(Expr {
                 kind: ExprKind::CompoundAssign {
@@ -2388,6 +2458,35 @@ fn invalidate_clobbered_register_mappings(reg_values: &mut HashMap<String, Expr>
     reg_values.retain(|name, value| {
         !aliases.iter().any(|alias| alias == name) && !expr_uses_any_alias(value, &aliases)
     });
+}
+
+fn compound_update_defines_full_alias_value(name: &str) -> bool {
+    !matches!(
+        name,
+        "al" | "ah"
+            | "ax"
+            | "bl"
+            | "bh"
+            | "bx"
+            | "cl"
+            | "ch"
+            | "cx"
+            | "dl"
+            | "dh"
+            | "dx"
+            | "sil"
+            | "si"
+            | "dil"
+            | "di"
+            | "r8b"
+            | "r8w"
+            | "r9b"
+            | "r9w"
+            | "r10b"
+            | "r10w"
+            | "r11b"
+            | "r11w"
+    )
 }
 
 fn invalidate_pseudo_call_output_copies(
@@ -2512,9 +2611,7 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
         ),
         ExprKind::Call { target, args } => Expr::call(
             substitute_call_target_vars(target, reg_values),
-            args.iter()
-                .map(|arg| substitute_vars(arg, reg_values))
-                .collect(),
+            substitute_call_args(target, args, reg_values),
         ),
         ExprKind::Cast {
             expr: inner,
@@ -2567,6 +2664,94 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
     };
     // Simplify after substitution to handle boolean patterns like (x == 1) != 1 → x != 1
     result.simplify()
+}
+
+fn substitute_call_args(
+    target: &CallTarget,
+    args: &[Expr],
+    reg_values: &HashMap<String, Expr>,
+) -> Vec<Expr> {
+    match target {
+        CallTarget::Named(name) if name == "SET_BITS" => {
+            substitute_set_bits_call_args(args, reg_values)
+        }
+        _ => args
+            .iter()
+            .map(|arg| substitute_vars(arg, reg_values))
+            .collect(),
+    }
+}
+
+fn substitute_set_bits_call_args(args: &[Expr], reg_values: &HashMap<String, Expr>) -> Vec<Expr> {
+    let substituted_start = args.get(2).map(|arg| substitute_vars(arg, reg_values));
+    let bit_start = substituted_start.as_ref().and_then(|expr| match expr.kind {
+        ExprKind::IntLit(value) if (0..=u8::MAX as i128).contains(&value) => Some(value as u8),
+        _ => None,
+    });
+
+    args.iter()
+        .enumerate()
+        .map(|(idx, arg)| match idx {
+            1 => bit_start
+                .map(|start| substitute_set_bits_value_arg(arg, start, reg_values))
+                .unwrap_or_else(|| substitute_vars(arg, reg_values)),
+            2 => substituted_start
+                .clone()
+                .unwrap_or_else(|| substitute_vars(arg, reg_values)),
+            _ => substitute_vars(arg, reg_values),
+        })
+        .collect()
+}
+
+fn substitute_set_bits_value_arg(
+    arg: &Expr,
+    bit_start: u8,
+    reg_values: &HashMap<String, Expr>,
+) -> Expr {
+    if let Some(inner) = strip_matching_left_shift(arg, bit_start) {
+        return substitute_set_bits_value_arg(&inner, bit_start, reg_values);
+    }
+
+    if let Some(normalized) = lookup_shifted_register_value(arg, bit_start, reg_values) {
+        return normalized;
+    }
+
+    let substituted = substitute_vars(arg, reg_values);
+    strip_matching_left_shift(&substituted, bit_start).unwrap_or(substituted)
+}
+
+fn lookup_shifted_register_value(
+    expr: &Expr,
+    bit_start: u8,
+    reg_values: &HashMap<String, Expr>,
+) -> Option<Expr> {
+    match &expr.kind {
+        ExprKind::Var(var) => reg_values
+            .get(&var.name)
+            .and_then(|value| strip_matching_left_shift(value, bit_start)),
+        ExprKind::Unknown(name) => reg_values
+            .get(name)
+            .and_then(|value| strip_matching_left_shift(value, bit_start)),
+        _ => None,
+    }
+}
+
+fn strip_matching_left_shift(expr: &Expr, bit_start: u8) -> Option<Expr> {
+    let ExprKind::BinOp {
+        op: BinOpKind::Shl,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let ExprKind::IntLit(shift_amount) = right.kind else {
+        return None;
+    };
+    if shift_amount != i128::from(bit_start) {
+        return None;
+    }
+    Some(left.as_ref().clone())
 }
 
 fn substitute_call_target_vars(
@@ -2817,10 +3002,8 @@ fn propagate_args_in_block_with_binary_data(
                 let substituted_target =
                     substitute_call_target(target.clone(), &call_target_values);
                 if is_real_function_call(target) {
-                    let mut rewritten_args: Vec<Expr> = args
-                        .iter()
-                        .map(|arg| substitute_vars(arg, &reg_values))
-                        .collect();
+                    let mut rewritten_args: Vec<Expr> =
+                        substitute_call_args(target, args, &reg_values);
                     let excluded_arg_regs = collect_target_argument_registers(target);
                     if let Some((recovered_args, used_stmt_indices)) =
                         try_recover_format_call_arguments(
@@ -2870,9 +3053,7 @@ fn propagate_args_in_block_with_binary_data(
                 } else {
                     let rewritten_call = Expr::call(
                         substituted_target,
-                        args.iter()
-                            .map(|arg| substitute_vars(arg, &reg_values))
-                            .collect(),
+                        substitute_call_args(target, args, &reg_values),
                     );
                     if invalidate_pseudo_call_outputs(
                         target,
@@ -2900,6 +3081,14 @@ fn propagate_args_in_block_with_binary_data(
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
+                let prior_aliases: Vec<String> = written_aliases.iter().cloned().collect();
+                let prior_value = if is_temp_register(&v.name) {
+                    prior_aliases
+                        .iter()
+                        .find_map(|alias| reg_values.get(alias).cloned())
+                } else {
+                    None
+                };
                 invalidate_dependent_register_values(&mut reg_values, &written_aliases);
                 invalidate_dependent_arg_values(&mut arg_values, &written_aliases);
                 invalidate_written_call_target_values(&mut call_target_values, &written_aliases);
@@ -2908,15 +3097,15 @@ fn propagate_args_in_block_with_binary_data(
                     stack_slot_values.clear();
                 }
 
-                if is_temp_register(&v.name) {
-                    let current = reg_values
-                        .get(&v.name)
-                        .cloned()
-                        .unwrap_or_else(|| (**lhs).clone());
-                    let new_val = Expr::binop(*op, current, tracked_rhs.clone());
-                    for alias in &written_aliases {
-                        reg_values.insert(alias.clone(), new_val.clone());
-                        call_target_values.insert(alias.clone(), new_val.clone());
+                if is_temp_register(&v.name) && compound_update_defines_full_alias_value(&v.name) {
+                    if let Some(current) = prior_value {
+                        if !expr_uses_any_register_alias(&current, &written_aliases) {
+                            let new_val = Expr::binop(*op, current, tracked_rhs.clone()).simplify();
+                            for alias in &written_aliases {
+                                reg_values.insert(alias.clone(), new_val.clone());
+                                call_target_values.insert(alias.clone(), new_val.clone());
+                            }
+                        }
                     }
                 }
                 if is_tracked_call_arg_register(&v.name) {
@@ -3005,17 +3194,16 @@ fn propagate_args_in_block_with_binary_data(
                     }
                 }
 
-                let substituted_args = args.iter().map(|arg| substitute_vars(arg, &reg_values));
-                result.push(Expr::call(substituted_target, substituted_args.collect()));
+                result.push(Expr::call(
+                    substituted_target,
+                    substitute_call_args(target, args, &reg_values),
+                ));
                 arg_values.clear();
                 reg_values.clear();
                 call_target_values.clear();
                 continue;
             } else {
-                let substituted_args: Vec<_> = args
-                    .iter()
-                    .map(|arg| substitute_vars(arg, &reg_values))
-                    .collect();
+                let substituted_args: Vec<_> = substitute_call_args(target, args, &reg_values);
                 if invalidate_pseudo_call_outputs(
                     target,
                     &mut reg_values,
@@ -7264,6 +7452,170 @@ mod tests {
     }
 
     #[test]
+    fn test_propagate_copies_tracks_compound_update_from_prior_value() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("edi", 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Shl,
+                    lhs: Box::new(reg("eax", 4)),
+                    rhs: Box::new(Expr::int(4)),
+                },
+            },
+            Expr::assign(reg("ecx", 4), reg("eax", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+        assert_eq!(format!("{}", propagated[2]), "ecx = edi << 4");
+    }
+
+    #[test]
+    fn test_propagate_copies_normalizes_set_bits_value_arg_after_shift_update() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("edi", 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Shl,
+                    lhs: Box::new(reg("eax", 4)),
+                    rhs: Box::new(Expr::int(4)),
+                },
+            },
+            Expr::assign(
+                reg("esi", 4),
+                Expr::call(
+                    CallTarget::Named("SET_BITS".to_string()),
+                    vec![
+                        Expr::unknown("carrier"),
+                        reg("eax", 4),
+                        Expr::int(4),
+                        Expr::int(8),
+                    ],
+                ),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        assert_eq!(
+            format!("{}", propagated[2]),
+            "esi = SET_BITS(carrier, edi, 4, 8)"
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_normalizes_set_bits_value_arg_after_shift_update() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("edi", 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Shl,
+                    lhs: Box::new(reg("eax", 4)),
+                    rhs: Box::new(Expr::int(4)),
+                },
+            },
+            Expr::assign(
+                reg("esi", 4),
+                Expr::call(
+                    CallTarget::Named("SET_BITS".to_string()),
+                    vec![
+                        Expr::unknown("carrier"),
+                        reg("eax", 4),
+                        Expr::int(4),
+                        Expr::int(8),
+                    ],
+                ),
+            ),
+        ];
+
+        let propagated = propagate_args_in_block_with_binary_data(statements, None, None);
+        assert_eq!(
+            format!("{}", propagated[2]),
+            "esi = SET_BITS(carrier, edi, 4, 8)"
+        );
+    }
+
+    #[test]
+    fn test_propagate_copies_normalizes_nested_set_bits_value_shift_for_store() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("edi", 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Shl,
+                    lhs: Box::new(reg("eax", 4)),
+                    rhs: Box::new(Expr::int(4)),
+                },
+            },
+            Expr::assign(
+                Expr::deref(reg("rdi", 8), 2),
+                Expr::call(
+                    CallTarget::Named("SET_BITS".to_string()),
+                    vec![
+                        Expr::unknown("carrier"),
+                        Expr::binop(BinOpKind::Shl, reg("eax", 4), Expr::int(4)),
+                        Expr::int(4),
+                        Expr::int(8),
+                    ],
+                ),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        assert_eq!(
+            format!("{}", propagated[2]),
+            "*(uint16_t*)(rdi) = SET_BITS(carrier, edi, 4, 8)"
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_normalizes_nested_set_bits_value_shift_for_store() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("edi", 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Shl,
+                    lhs: Box::new(reg("eax", 4)),
+                    rhs: Box::new(Expr::int(4)),
+                },
+            },
+            Expr::assign(
+                Expr::deref(reg("rdi", 8), 2),
+                Expr::call(
+                    CallTarget::Named("SET_BITS".to_string()),
+                    vec![
+                        Expr::unknown("carrier"),
+                        Expr::binop(BinOpKind::Shl, reg("eax", 4), Expr::int(4)),
+                        Expr::int(4),
+                        Expr::int(8),
+                    ],
+                ),
+            ),
+        ];
+
+        let propagated = propagate_args_in_block_with_binary_data(statements, None, None);
+        assert_eq!(
+            format!("{}", propagated[2]),
+            "*(uint16_t*)(rdi) = SET_BITS(carrier, edi, 4, 8)"
+        );
+    }
+
+    #[test]
+    fn test_propagate_copies_invalidates_partial_x86_alias_updates() {
+        let statements = vec![
+            Expr::assign(reg("esi", 4), Expr::unknown("loaded")),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::And,
+                    lhs: Box::new(reg("si", 2)),
+                    rhs: Box::new(Expr::int(0xf00f)),
+                },
+            },
+            Expr::assign(reg("eax", 4), reg("esi", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+        assert_eq!(format!("{}", propagated[2]), "eax = esi");
+    }
+
+    #[test]
     fn test_propagate_call_args_keeps_saved_snapshot_after_induction_update() {
         let statements = vec![
             Expr::assign(reg("edx", 4), reg("edi", 4)),
@@ -7300,6 +7652,24 @@ mod tests {
         let propagated = propagate_args_in_block(statements);
         assert_eq!(format!("{}", propagated[2]), "rdx = edi * 4");
         assert_eq!(format!("{}", propagated[4]), "rcx = edi * 4 + rsi");
+    }
+
+    #[test]
+    fn test_propagate_call_args_tracks_compound_update_from_prior_value() {
+        let statements = vec![
+            Expr::assign(reg("eax", 4), reg("edi", 4)),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Shl,
+                    lhs: Box::new(reg("eax", 4)),
+                    rhs: Box::new(Expr::int(4)),
+                },
+            },
+            Expr::assign(reg("ecx", 4), reg("eax", 4)),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        assert_eq!(format!("{}", propagated[2]), "ecx = edi << 4");
     }
 
     #[test]

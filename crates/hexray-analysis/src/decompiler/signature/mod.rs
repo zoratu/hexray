@@ -1073,6 +1073,9 @@ impl SignatureRecovery {
                 }
                 self.analyze_expr_reads_with_context(index, false, false);
             }
+            ExprKind::BitField { expr, .. } => {
+                self.analyze_expr_reads_with_context(expr, false, false);
+            }
             ExprKind::Assign { lhs, rhs } => {
                 self.analyze_expr_reads_with_context(rhs, false, false);
                 // Don't analyze LHS reads - it's being written

@@ -413,10 +413,16 @@ fn eliminate_consecutive_expr_overwrites(nodes: Vec<StructuredNode>) -> Vec<Stru
                         lhs: lhs_a,
                         rhs: rhs_a,
                     },
-                    ExprKind::Assign { lhs: lhs_b, .. },
+                    ExprKind::Assign {
+                        lhs: lhs_b,
+                        rhs: rhs_b,
+                    },
                 ) = (&cur.kind, &next.kind)
                 {
-                    if exprs_equivalent_lvalue(lhs_a, lhs_b) && !has_side_effects(rhs_a) {
+                    if exprs_equivalent_lvalue(lhs_a, lhs_b)
+                        && !has_side_effects(rhs_a)
+                        && !expr_reads_lvalue(rhs_b, lhs_a)
+                    {
                         // Skip current assignment; it's immediately overwritten.
                         i += 1;
                         continue;
@@ -624,10 +630,16 @@ fn eliminate_consecutive_overwrites(statements: Vec<Expr>) -> Vec<Expr> {
                     lhs: lhs_a,
                     rhs: rhs_a,
                 },
-                ExprKind::Assign { lhs: lhs_b, .. },
+                ExprKind::Assign {
+                    lhs: lhs_b,
+                    rhs: rhs_b,
+                },
             ) = (&cur.kind, &next.kind)
             {
-                if exprs_equivalent_lvalue(lhs_a, lhs_b) && !has_side_effects(rhs_a) {
+                if exprs_equivalent_lvalue(lhs_a, lhs_b)
+                    && !has_side_effects(rhs_a)
+                    && !expr_reads_lvalue(rhs_b, lhs_a)
+                {
                     // Skip current write; it's immediately overwritten.
                     i += 1;
                     continue;
@@ -679,6 +691,57 @@ fn exprs_equivalent_lvalue(a: &Expr, b: &Expr) -> bool {
         ) => oa == ob && exprs_equivalent_lvalue(ba, bb),
         (ExprKind::IntLit(na), ExprKind::IntLit(nb)) => na == nb,
         _ => false,
+    }
+}
+
+fn expr_reads_lvalue(expr: &Expr, target: &Expr) -> bool {
+    if exprs_equivalent_lvalue(expr, target) {
+        return true;
+    }
+
+    match &expr.kind {
+        ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            expr_reads_lvalue(lhs, target) || expr_reads_lvalue(rhs, target)
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            expr_reads_lvalue(left, target) || expr_reads_lvalue(right, target)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_reads_lvalue(operand, target),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_reads_lvalue(base, target) || expr_reads_lvalue(index, target)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_reads_lvalue(base, target),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_reads_lvalue(cond, target)
+                || expr_reads_lvalue(then_expr, target)
+                || expr_reads_lvalue(else_expr, target)
+        }
+        ExprKind::Call {
+            target: call_target,
+            args,
+        } => {
+            let target_reads = match call_target {
+                super::expression::CallTarget::Indirect(expr)
+                | super::expression::CallTarget::IndirectGot { expr, .. } => {
+                    expr_reads_lvalue(expr, target)
+                }
+                super::expression::CallTarget::Direct { .. }
+                | super::expression::CallTarget::Named(_) => false,
+            };
+            target_reads || args.iter().any(|arg| expr_reads_lvalue(arg, target))
+        }
+        ExprKind::Phi(values) => values.iter().any(|value| expr_reads_lvalue(value, target)),
+        ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) | ExprKind::GotRef { .. } => {
+            false
+        }
     }
 }
 
@@ -855,6 +918,38 @@ mod tests {
             } else {
                 panic!("expected assignment");
             }
+        } else {
+            panic!("expected block");
+        }
+    }
+
+    #[test]
+    fn test_eliminate_consecutive_overwrites_keeps_read_modify_write() {
+        let nodes = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                make_assign("local_4", Expr::unknown("enabled_update")),
+                make_assign(
+                    "local_4",
+                    Expr::binop(
+                        BinOpKind::Or,
+                        make_var("local_4"),
+                        Expr::unknown("mode_update"),
+                    ),
+                ),
+            ],
+            address_range: (0, 0),
+        }];
+
+        let mut uses = HashSet::new();
+        uses.insert("local_4".to_string());
+        let out = eliminate_in_nodes(nodes, &uses);
+        if let StructuredNode::Block { statements, .. } = &out[0] {
+            assert_eq!(
+                statements.len(),
+                2,
+                "read-modify-write overwrite should keep the earlier store"
+            );
         } else {
             panic!("expected block");
         }
