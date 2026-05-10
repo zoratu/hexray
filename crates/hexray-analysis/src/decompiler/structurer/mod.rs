@@ -5,8 +5,8 @@
 #![allow(dead_code)]
 
 use hexray_core::{
-    cfg::Loop, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlow, ControlFlowGraph,
-    Instruction, Operand, Operation,
+    cfg::Loop, register::x86, BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlow,
+    ControlFlowGraph, Instruction, Operand, Operation,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -33,11 +33,9 @@ pub use cleanup::{
     remove_orphan_gotos, remove_orphan_labels, structure_shared_exits,
 };
 #[cfg(test)]
-use condition::condition_to_expr_with_block;
-#[cfg(test)]
 use condition::try_extract_arm64_branch_condition;
 use condition::{
-    condition_to_expr_with_block_and_fallback,
+    condition_to_expr_with_block, condition_to_expr_with_block_and_fallback,
     condition_to_expr_with_block_no_alu_updates_and_fallback, generate_writeback_expr,
     lift_cmovcc_with_context, lift_setcc_with_context, negate_condition,
 };
@@ -1138,11 +1136,7 @@ impl<'a> Structurer<'a> {
         None
     }
 
-    fn is_stack_canary_fail_block(
-        &self,
-        block_id: BasicBlockId,
-        normal_target: BasicBlockId,
-    ) -> bool {
+    fn is_stack_canary_fail_block(&self, block_id: BasicBlockId) -> bool {
         let Some(block) = self.cfg.block(block_id) else {
             return false;
         };
@@ -1158,13 +1152,11 @@ impl<'a> Structurer<'a> {
         if !name.contains("stack_chk_fail") {
             return false;
         }
-        if !matches!(
+        if matches!(
             block.terminator,
-            BlockTerminator::Call { return_block, .. } if return_block == normal_target
-        ) && !matches!(
-            block.terminator,
-            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target }
-                if target == normal_target
+            BlockTerminator::ConditionalBranch { .. }
+                | BlockTerminator::IndirectJump { .. }
+                | BlockTerminator::ExternalJump { .. }
         ) {
             return false;
         }
@@ -1174,15 +1166,97 @@ impl<'a> Structurer<'a> {
             .all(|inst| !inst.is_branch() && inst.operation != Operation::Syscall)
     }
 
+    fn block_ends_with_stack_canary_guard_check(&self, block: &BasicBlock) -> bool {
+        let Some(check_inst) = block.instructions.last() else {
+            return false;
+        };
+
+        let is_compare = matches!(check_inst.operation, Operation::Compare)
+            || matches!(check_inst.operation, Operation::Sub if check_inst.operands.len() < 3);
+        let references_guard = check_inst.operands.iter().any(|operand| {
+            matches!(operand, Operand::Memory(mem)
+                if mem.segment.as_ref().is_some_and(|segment| segment.id == x86::FS)
+                    && mem.displacement == 0x28)
+        });
+
+        is_compare && references_guard
+    }
+
+    fn expr_mentions_stack_canary_guard(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => var.name.contains("stack_chk_guard"),
+            ExprKind::Unknown(name) => name.contains("stack_chk_guard"),
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                Self::expr_mentions_stack_canary_guard(left)
+                    || Self::expr_mentions_stack_canary_guard(right)
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                Self::expr_mentions_stack_canary_guard(operand)
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                Self::expr_mentions_stack_canary_guard(base)
+                    || Self::expr_mentions_stack_canary_guard(index)
+            }
+            ExprKind::FieldAccess { base, .. } => Self::expr_mentions_stack_canary_guard(base),
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+                args.iter().any(Self::expr_mentions_stack_canary_guard)
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_mentions_stack_canary_guard(cond)
+                    || Self::expr_mentions_stack_canary_guard(then_expr)
+                    || Self::expr_mentions_stack_canary_guard(else_expr)
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                Self::expr_mentions_stack_canary_guard(display_expr)
+            }
+            ExprKind::IntLit(_) => false,
+        }
+    }
+
     fn stack_canary_probe_normal_target(
         &self,
+        block: &BasicBlock,
+        condition: Condition,
         true_target: BasicBlockId,
         false_target: BasicBlockId,
     ) -> Option<(BasicBlockId, BasicBlockId)> {
-        if self.is_stack_canary_fail_block(true_target, false_target) {
+        let condition_expr = condition_to_expr_with_block(condition, block);
+        let has_guard_check = self.block_ends_with_stack_canary_guard_check(block)
+            || Self::expr_mentions_stack_canary_guard(&condition_expr);
+
+        if has_guard_check
+            && self.is_stack_canary_fail_block(true_target)
+            && matches!(
+                self.cfg.block(false_target).map(|block| &block.terminator),
+                Some(BlockTerminator::Return)
+            )
+        {
             return Some((true_target, false_target));
         }
-        if self.is_stack_canary_fail_block(false_target, true_target) {
+        if has_guard_check
+            && self.is_stack_canary_fail_block(false_target)
+            && matches!(
+                self.cfg.block(true_target).map(|block| &block.terminator),
+                Some(BlockTerminator::Return)
+            )
+        {
             return Some((false_target, true_target));
         }
         None
@@ -1618,8 +1692,13 @@ impl<'a> Structurer<'a> {
                         current = Some(normal_target);
                         continue;
                     }
-                    if let Some((handler_target, normal_target)) =
-                        self.stack_canary_probe_normal_target(*true_target, *false_target)
+                    if let Some((handler_target, normal_target)) = self
+                        .stack_canary_probe_normal_target(
+                            block,
+                            *condition,
+                            *true_target,
+                            *false_target,
+                        )
                     {
                         let Some(normal_block) = self.cfg.block(normal_target) else {
                             break;
@@ -6630,34 +6709,48 @@ mod tests {
     }
 
     #[test]
-    fn test_structure_elides_stack_canary_fail_branch_and_keeps_return_value() {
-        use hexray_core::basic_block::CallTarget as BlockCallTarget;
-        use hexray_core::{Architecture, Register, RegisterClass};
+    fn test_structure_elides_real_stack_canary_epilogue_and_keeps_return_value() {
+        use hexray_core::{Architecture, IndexMode, MemoryRef, Register, RegisterClass};
 
-        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
-        let ebx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 32);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
         let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+        let ebp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 32);
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
 
         let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
 
         let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x2000);
-        let mut save_value = Instruction::new(0x2000, 2, vec![], "mov")
-            .with_operation(Operation::Move)
-            .with_operands(vec![Operand::Register(ebx), Operand::Register(edi)]);
-        save_value.reads = vec![edi];
-        save_value.writes = vec![ebx];
-        bb0.instructions.push(save_value);
-
-        let mut move_ret = Instruction::new(0x2002, 2, vec![], "mov")
-            .with_operation(Operation::Move)
-            .with_operands(vec![Operand::Register(eax), Operand::Register(ebx)]);
-        move_ret.reads = vec![ebx];
-        move_ret.writes = vec![eax];
-        bb0.instructions.push(move_ret);
+        bb0.instructions.push(
+            Instruction::new(0x2000, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rsp, 0x48, 8)),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x2005, 9, vec![], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef {
+                        base: None,
+                        index: None,
+                        scale: 1,
+                        displacement: 0x28,
+                        size: 8,
+                        segment: Some(fs),
+                        broadcast: false,
+                        index_mode: IndexMode::None,
+                        space: hexray_core::MemorySpace::Generic,
+                    }),
+                ]),
+        );
         bb0.terminator = BlockTerminator::ConditionalBranch {
-            condition: Condition::Equal,
-            true_target: BasicBlockId::new(2),
-            false_target: BasicBlockId::new(1),
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
         };
         cfg.add_block(bb0);
 
@@ -6671,15 +6764,26 @@ mod tests {
                     return_addr: 0x2015,
                 }),
         );
-        handler.terminator = BlockTerminator::Call {
-            target: BlockCallTarget::Direct(0x5000),
-            return_block: BasicBlockId::new(2),
-        };
+        handler.terminator = BlockTerminator::Unreachable;
         cfg.add_block(handler);
 
         let mut cont = BasicBlock::new(BasicBlockId::new(2), 0x2020);
         cont.instructions.push(
-            Instruction::new(0x2020, 1, vec![], "ret")
+            Instruction::new(0x2020, 4, vec![], "add")
+                .with_operation(Operation::Add)
+                .with_operands(vec![
+                    Operand::Register(rsp),
+                    Operand::imm_unsigned(0x58, 64),
+                ]),
+        );
+        let mut move_ret = Instruction::new(0x2024, 2, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(eax), Operand::Register(ebp)]);
+        move_ret.reads = vec![ebp];
+        move_ret.writes = vec![eax];
+        cont.instructions.push(move_ret);
+        cont.instructions.push(
+            Instruction::new(0x2026, 1, vec![], "ret")
                 .with_operation(Operation::Return)
                 .with_control_flow(ControlFlow::Return),
         );
@@ -6688,7 +6792,6 @@ mod tests {
 
         cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
         cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
-        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
 
         let mut structurer = Structurer::new_with_binary_data_annotations_and_known_targets(
             &cfg,
@@ -6711,7 +6814,7 @@ mod tests {
                 node,
                 StructuredNode::Return(Some(Expr {
                     kind: ExprKind::Var(var)
-                })) if var.name == "eax" || var.name == "rbx"
+                })) if matches!(var.name.as_str(), "eax" | "ebp" | "rbp")
             )),
             "expected return value to be preserved, got {structured:?}"
         );
