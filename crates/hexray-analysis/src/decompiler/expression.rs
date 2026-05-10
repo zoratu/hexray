@@ -2515,6 +2515,7 @@ impl Expr {
             if let Some(expr) = Self::x86_single_operand_div(inst, ops) {
                 return expr;
             }
+            return Self::unknown(format!("/* {} */", mnemonic.to_ascii_lowercase()));
         }
 
         if ops.len() >= 3 {
@@ -2538,7 +2539,11 @@ impl Expr {
                 ),
             )
         } else {
-            Self::unknown(mnemonic)
+            if op == BinOpKind::Div {
+                Self::unknown(format!("/* {} */", mnemonic.to_ascii_lowercase()))
+            } else {
+                Self::unknown(mnemonic)
+            }
         }
     }
 
@@ -4131,6 +4136,13 @@ mod tests {
             format!("{}", Expr::from_instruction(&inst)),
             "eax = eax / rcx"
         );
+    }
+
+    #[test]
+    fn test_unsupported_div_renders_as_comment_not_bare_mnemonic() {
+        let inst = Instruction::new(0x1000, 2, vec![], "div").with_operation(Operation::Div);
+
+        assert_eq!(format!("{}", Expr::from_instruction(&inst)), "/* div */");
     }
 
     #[test]

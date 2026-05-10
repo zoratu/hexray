@@ -285,9 +285,10 @@ fn condition_to_expr_before_address_with_fallback(
         _ => BinOpKind::Ne,
     };
 
-    let reg_values = build_register_value_map_with_options(block, before_addr, track_alu_updates);
+    let branch_reg_values =
+        build_register_value_map_with_options(block, before_addr, track_alu_updates);
 
-    if let Some(cond_expr) = try_extract_arm64_branch_condition(block, op, &reg_values) {
+    if let Some(cond_expr) = try_extract_arm64_branch_condition(block, op, &branch_reg_values) {
         return cond_expr;
     }
 
@@ -447,13 +448,18 @@ fn condition_to_expr_before_address_with_fallback(
     };
 
     if let Some(inst) = find_flag_setting_instruction(block, before_addr) {
+        let reg_values =
+            build_register_value_map_with_options(block, Some(inst.address), track_alu_updates);
         if let Some(expr) = lift_condition_from_inst(inst, &reg_values) {
             return expr;
         }
     } else if let Some(fallback_block) = fallback_block {
-        let fallback_reg_values =
-            build_register_value_map_with_options(fallback_block, None, track_alu_updates);
         if let Some(inst) = find_flag_setting_instruction(fallback_block, None) {
+            let fallback_reg_values = build_register_value_map_with_options(
+                fallback_block,
+                Some(inst.address),
+                track_alu_updates,
+            );
             if let Some(expr) = lift_condition_from_inst(inst, &fallback_reg_values) {
                 return expr;
             }
@@ -1311,6 +1317,45 @@ mod tests {
         assert!(
             rendered.contains("ret_0"),
             "expected TEST on al to resolve through call return temp, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_ignores_post_test_clobbers_in_same_block() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x3200);
+        block.instructions.push(
+            Instruction::new(0x3200, 5, vec![], "call").with_control_flow(ControlFlow::Call {
+                target: 0x4000,
+                return_addr: 0x3205,
+            }),
+        );
+        block.instructions.push(
+            Instruction::new(0x3205, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x3207, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -8, 8)),
+                ]),
+        );
+
+        let expr = condition_to_expr_with_block(Condition::NotEqual, &block);
+        let rendered = format!("{expr}");
+        assert!(
+            rendered.contains("ret_0"),
+            "expected condition to use the call result before later clobbers, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("rbp + -0x8"),
+            "expected later register writes to be ignored for the TEST predicate, got {rendered}"
         );
     }
 

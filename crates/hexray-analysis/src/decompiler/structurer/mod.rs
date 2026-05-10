@@ -1667,6 +1667,7 @@ impl<'a> Structurer<'a> {
                     if let Some(expr) = self.tail_jump_call_expr(block) {
                         statements.push(expr);
                         statements = propagate_args_in_block(statements);
+                        sanitize_noncallable_indirect_tail_calls(&mut statements);
                     }
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
@@ -2061,6 +2062,7 @@ impl<'a> Structurer<'a> {
                     if let Some(expr) = self.tail_jump_call_expr(block) {
                         statements.push(expr);
                         statements = propagate_args_in_block(statements);
+                        sanitize_noncallable_indirect_tail_calls(&mut statements);
                     }
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
@@ -2076,6 +2078,7 @@ impl<'a> Structurer<'a> {
                     if let Some(expr) = self.tail_jump_call_expr(block) {
                         statements.push(expr);
                         statements = propagate_args_in_block(statements);
+                        sanitize_noncallable_indirect_tail_calls(&mut statements);
                     }
                     if !statements.is_empty() {
                         result.push(StructuredNode::Block {
@@ -3471,6 +3474,49 @@ fn extract_folded_predecessor_call_expr(block: &BasicBlock) -> Option<Expr> {
         .filter(|expr| matches!(expr.kind, ExprKind::Call { .. }))
         .cloned()
         .or_else(|| block.instructions.last().and_then(direct_call_expr))
+}
+
+fn sanitize_noncallable_indirect_tail_calls(statements: &mut [Expr]) {
+    for stmt in statements {
+        let Some(target_expr) = (match &stmt.kind {
+            ExprKind::Call {
+                target: ExprCallTarget::Indirect(target_expr),
+                args,
+            } if args.is_empty() => Some(target_expr.as_ref()),
+            _ => None,
+        }) else {
+            continue;
+        };
+
+        if indirect_call_target_looks_callable(target_expr) {
+            continue;
+        }
+
+        *stmt = Expr::unknown(format!("/* indirect jump via {} */", target_expr));
+    }
+}
+
+fn indirect_call_target_looks_callable(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Var(_)
+        | ExprKind::Unknown(_)
+        | ExprKind::Deref { .. }
+        | ExprKind::ArrayAccess { .. }
+        | ExprKind::FieldAccess { .. }
+        | ExprKind::Call { .. } => true,
+        ExprKind::GotRef { is_deref, .. } => *is_deref,
+        ExprKind::AddressOf(inner) | ExprKind::Cast { expr: inner, .. } => {
+            indirect_call_target_looks_callable(inner)
+        }
+        ExprKind::IntLit(_)
+        | ExprKind::BinOp { .. }
+        | ExprKind::UnaryOp { .. }
+        | ExprKind::Assign { .. }
+        | ExprKind::CompoundAssign { .. }
+        | ExprKind::Conditional { .. }
+        | ExprKind::BitField { .. }
+        | ExprKind::Phi(_) => false,
+    }
 }
 
 fn simplify_folded_call_condition(expr: Expr) -> Expr {
@@ -6816,6 +6862,25 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["arg1"]
+        );
+    }
+
+    #[test]
+    fn test_sanitize_noncallable_indirect_tail_call_renders_comment() {
+        let mut statements = vec![Expr::call(
+            ExprCallTarget::Indirect(Box::new(Expr::binop(
+                BinOpKind::Add,
+                Expr::var(Variable::reg("ret_3", 1)),
+                Expr::unknown("*(uint32_t*)(&g_ptr_23344)"),
+            ))),
+            vec![],
+        )];
+
+        sanitize_noncallable_indirect_tail_calls(&mut statements);
+
+        assert_eq!(
+            format!("{}", statements[0]),
+            "/* indirect jump via ret_3 + *(uint32_t*)(&g_ptr_23344) */"
         );
     }
 
