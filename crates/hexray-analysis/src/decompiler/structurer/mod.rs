@@ -6188,7 +6188,7 @@ mod tests {
         };
 
         match target {
-            ExprCallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "rdi"),
+            ExprCallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "arg0"),
             other => panic!("expected indirect target, got {other:?}"),
         }
         assert_eq!(

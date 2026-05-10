@@ -1086,7 +1086,9 @@ impl SignatureRecovery {
             ExprKind::Call { target, args } => {
                 self.observe_x87_call(target, args);
                 if let super::expression::CallTarget::Indirect(inner) = target {
-                    if let ExprKind::Var(var) = &inner.kind {
+                    if let Some(idx) = self.resolve_param_index_from_expr_precise(inner) {
+                        self.record_function_pointer_call_signature_by_index(idx, args);
+                    } else if let ExprKind::Var(var) = &inner.kind {
                         let name = var.name.to_lowercase();
                         if self.arg_register_index(&name).is_some() {
                             self.record_function_pointer_call_signature(&name, args);
@@ -1096,7 +1098,9 @@ impl SignatureRecovery {
                     }
                     self.analyze_expr_reads_with_context(inner, false, false);
                 } else if let super::expression::CallTarget::IndirectGot { expr, .. } = target {
-                    if let ExprKind::Var(var) = &expr.kind {
+                    if let Some(idx) = self.resolve_param_index_from_expr_precise(expr) {
+                        self.record_function_pointer_call_signature_by_index(idx, args);
+                    } else if let ExprKind::Var(var) = &expr.kind {
                         let name = var.name.to_lowercase();
                         if self.arg_register_index(&name).is_some() {
                             self.record_function_pointer_call_signature(&name, args);
@@ -4697,6 +4701,44 @@ mod tests {
         assert_eq!(
             sig.parameters[0].param_type.format_with_name("cb"),
             "int64_t (*cb)(void*, int32_t)"
+        );
+    }
+
+    #[test]
+    fn test_signature_recovery_detects_lifted_arg_name_indirect_call_prototype() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Indirect(Box::new(Expr::unknown("arg1"))),
+            vec![Expr::unknown("arg0"), Expr::unknown("arg2")],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.parameters.len() >= 2, "params: {:?}", sig.parameters);
+        assert!(
+            matches!(
+                sig.parameters[1].param_type,
+                ParamType::FunctionPointer { .. }
+            ),
+            "params: {:?}",
+            sig.parameters
+        );
+        assert_eq!(
+            sig.parameters[1].param_type.format_with_name("cb"),
+            "int64_t (*cb)(void*, void*)"
         );
     }
 

@@ -2792,10 +2792,7 @@ pub(super) fn propagate_call_args_with_binary_data_and_arch(
     arch: Option<Architecture>,
 ) -> Vec<StructuredNode> {
     let preferred_family = arch.and_then(argument_abi_family_from_arch);
-    nodes
-        .into_iter()
-        .map(|node| propagate_call_args_node_with_binary_data(node, binary_data, preferred_family))
-        .collect()
+    propagate_call_args_node_sequence(nodes, binary_data, preferred_family)
 }
 
 pub(super) fn propagate_call_args_node(node: StructuredNode) -> StructuredNode {
@@ -2807,52 +2804,176 @@ fn propagate_call_args_node_with_binary_data(
     binary_data: Option<&BinaryDataContext>,
     preferred_family: Option<ArgumentAbiFamily>,
 ) -> StructuredNode {
+    propagate_call_args_node_with_state(
+        node,
+        binary_data,
+        preferred_family,
+        CallArgPropagationState::default(),
+    )
+    .0
+}
+
+#[derive(Clone, Default)]
+struct CallArgPropagationState {
+    arg_values: HashMap<String, (Option<usize>, Expr)>,
+    reg_values: HashMap<String, Expr>,
+    call_target_values: HashMap<String, Expr>,
+    stack_slot_values: HashMap<String, Expr>,
+}
+
+impl CallArgPropagationState {
+    fn clear_after_real_call(&mut self) {
+        self.arg_values.clear();
+        self.reg_values.clear();
+        self.call_target_values.clear();
+    }
+
+    fn clear_arg_statement_indices(&mut self) {
+        for (stmt_idx, _) in self.arg_values.values_mut() {
+            *stmt_idx = None;
+        }
+    }
+}
+
+fn body_definitely_terminates(nodes: &[StructuredNode]) -> bool {
+    let Some(last) = nodes.last() else {
+        return false;
+    };
+
+    match last {
+        StructuredNode::Return(_)
+        | StructuredNode::Break
+        | StructuredNode::Continue
+        | StructuredNode::Goto(_) => true,
+        StructuredNode::Sequence(nodes) => body_definitely_terminates(nodes),
+        StructuredNode::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } => body_definitely_terminates(then_body) && body_definitely_terminates(else_body),
+        _ => false,
+    }
+}
+
+fn propagate_call_args_node_with_state(
+    node: StructuredNode,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+    incoming_state: CallArgPropagationState,
+) -> (StructuredNode, CallArgPropagationState) {
     match node {
         StructuredNode::Block {
             id,
             statements,
             address_range,
         } => {
-            let statements =
-                propagate_args_in_block_with_binary_data(statements, binary_data, preferred_family);
-            StructuredNode::Block {
-                id,
+            let mut state = incoming_state;
+            let statements = propagate_args_in_block_with_state(
                 statements,
-                address_range,
-            }
+                &mut state,
+                binary_data,
+                preferred_family,
+            );
+            state.clear_arg_statement_indices();
+            (
+                StructuredNode::Block {
+                    id,
+                    statements,
+                    address_range,
+                },
+                state,
+            )
         }
         StructuredNode::If {
             condition,
             then_body,
             else_body,
-        } => StructuredNode::If {
-            condition,
-            then_body: propagate_call_args_node_sequence(then_body, binary_data, preferred_family),
-            else_body: else_body
-                .map(|body| propagate_call_args_node_sequence(body, binary_data, preferred_family)),
-        },
+        } => {
+            let (then_body, then_state) = propagate_call_args_node_sequence_with_state(
+                then_body,
+                binary_data,
+                preferred_family,
+                incoming_state.clone(),
+            );
+            let else_result = else_body.map(|body| {
+                propagate_call_args_node_sequence_with_state(
+                    body,
+                    binary_data,
+                    preferred_family,
+                    incoming_state.clone(),
+                )
+            });
+            let then_terminates = body_definitely_terminates(&then_body);
+            let (else_body, else_state, else_terminates) = match else_result {
+                Some((body, state)) => {
+                    let terminates = body_definitely_terminates(&body);
+                    (Some(body), Some(state), terminates)
+                }
+                None => (None, None, false),
+            };
+            let mut outgoing_state = if then_terminates && else_body.is_none() {
+                incoming_state
+            } else if then_terminates && !else_terminates {
+                else_state.unwrap_or_default()
+            } else if else_terminates && !then_terminates {
+                then_state
+            } else {
+                CallArgPropagationState::default()
+            };
+            outgoing_state.clear_arg_statement_indices();
+            (
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                },
+                outgoing_state,
+            )
+        }
         StructuredNode::While {
             condition,
             body,
             header,
             exit_block,
-        } => StructuredNode::While {
-            condition,
-            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
-            header,
-            exit_block,
-        },
+        } => {
+            let (body, _) = propagate_call_args_node_sequence_with_state(
+                body,
+                binary_data,
+                preferred_family,
+                incoming_state,
+            );
+            (
+                StructuredNode::While {
+                    condition,
+                    body,
+                    header,
+                    exit_block,
+                },
+                CallArgPropagationState::default(),
+            )
+        }
         StructuredNode::DoWhile {
             body,
             condition,
             header,
             exit_block,
-        } => StructuredNode::DoWhile {
-            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
-            condition,
-            header,
-            exit_block,
-        },
+        } => {
+            let (body, _) = propagate_call_args_node_sequence_with_state(
+                body,
+                binary_data,
+                preferred_family,
+                incoming_state,
+            );
+            (
+                StructuredNode::DoWhile {
+                    body,
+                    condition,
+                    header,
+                    exit_block,
+                },
+                CallArgPropagationState::default(),
+            )
+        }
         StructuredNode::For {
             init,
             condition,
@@ -2860,45 +2981,93 @@ fn propagate_call_args_node_with_binary_data(
             body,
             header,
             exit_block,
-        } => StructuredNode::For {
-            init,
-            condition,
-            update,
-            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
-            header,
-            exit_block,
-        },
+        } => {
+            let (body, _) = propagate_call_args_node_sequence_with_state(
+                body,
+                binary_data,
+                preferred_family,
+                incoming_state,
+            );
+            (
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    header,
+                    exit_block,
+                },
+                CallArgPropagationState::default(),
+            )
+        }
         StructuredNode::Loop {
             body,
             header,
             exit_block,
-        } => StructuredNode::Loop {
-            body: propagate_call_args_node_sequence(body, binary_data, preferred_family),
-            header,
-            exit_block,
-        },
+        } => {
+            let (body, _) = propagate_call_args_node_sequence_with_state(
+                body,
+                binary_data,
+                preferred_family,
+                incoming_state,
+            );
+            (
+                StructuredNode::Loop {
+                    body,
+                    header,
+                    exit_block,
+                },
+                CallArgPropagationState::default(),
+            )
+        }
         StructuredNode::Switch {
             value,
             cases,
             default,
-        } => StructuredNode::Switch {
-            value,
-            cases: cases
+        } => {
+            let cases = cases
                 .into_iter()
                 .map(|(vals, body)| {
                     (
                         vals,
-                        propagate_call_args_node_sequence(body, binary_data, preferred_family),
+                        propagate_call_args_node_sequence_with_state(
+                            body,
+                            binary_data,
+                            preferred_family,
+                            incoming_state.clone(),
+                        )
+                        .0,
                     )
                 })
-                .collect(),
-            default: default
-                .map(|body| propagate_call_args_node_sequence(body, binary_data, preferred_family)),
-        },
-        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
-            propagate_call_args_node_sequence(nodes, binary_data, preferred_family),
-        ),
-        other => other,
+                .collect();
+            let default = default.map(|body| {
+                propagate_call_args_node_sequence_with_state(
+                    body,
+                    binary_data,
+                    preferred_family,
+                    incoming_state.clone(),
+                )
+                .0
+            });
+            (
+                StructuredNode::Switch {
+                    value,
+                    cases,
+                    default,
+                },
+                CallArgPropagationState::default(),
+            )
+        }
+        StructuredNode::Sequence(nodes) => {
+            let (nodes, state) = propagate_call_args_node_sequence_with_state(
+                nodes,
+                binary_data,
+                preferred_family,
+                incoming_state,
+            );
+            (StructuredNode::Sequence(nodes), state)
+        }
+        other => (other, CallArgPropagationState::default()),
     }
 }
 
@@ -2907,10 +3076,29 @@ fn propagate_call_args_node_sequence(
     binary_data: Option<&BinaryDataContext>,
     preferred_family: Option<ArgumentAbiFamily>,
 ) -> Vec<StructuredNode> {
-    nodes
-        .into_iter()
-        .map(|node| propagate_call_args_node_with_binary_data(node, binary_data, preferred_family))
-        .collect()
+    propagate_call_args_node_sequence_with_state(
+        nodes,
+        binary_data,
+        preferred_family,
+        CallArgPropagationState::default(),
+    )
+    .0
+}
+
+fn propagate_call_args_node_sequence_with_state(
+    nodes: Vec<StructuredNode>,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+    mut state: CallArgPropagationState,
+) -> (Vec<StructuredNode>, CallArgPropagationState) {
+    let mut propagated = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let (node, next_state) =
+            propagate_call_args_node_with_state(node, binary_data, preferred_family, state);
+        propagated.push(node);
+        state = next_state;
+    }
+    (propagated, state)
 }
 
 /// Propagates arguments into function calls within a block.
@@ -2928,44 +3116,64 @@ fn propagate_args_in_block_with_binary_data(
     binary_data: Option<&BinaryDataContext>,
     preferred_family: Option<ArgumentAbiFamily>,
 ) -> Vec<Expr> {
+    let mut state = CallArgPropagationState::default();
+    propagate_args_in_block_with_state(statements, &mut state, binary_data, preferred_family)
+}
+
+fn propagate_args_in_block_with_state(
+    statements: Vec<Expr>,
+    state: &mut CallArgPropagationState,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> Vec<Expr> {
     use super::super::expression::ExprKind;
 
-    // Track argument register values and their statement indices
-    let mut arg_values: HashMap<String, (usize, Expr)> = HashMap::new();
-    let mut reg_values: HashMap<String, Expr> = HashMap::new();
-    let mut call_target_values: HashMap<String, Expr> = HashMap::new();
-    let mut stack_slot_values: HashMap<String, Expr> = HashMap::new();
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for (i, stmt) in statements.into_iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
-            let substituted_lhs = substitute_assignment_lhs(lhs, &reg_values);
-            let tracked_rhs =
-                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
+            let substituted_lhs = substitute_assignment_lhs(lhs, &state.reg_values);
+            let tracked_rhs = substitute_stack_slot_values(
+                substitute_vars(rhs, &state.reg_values),
+                &state.stack_slot_values,
+            );
 
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
-                invalidate_dependent_register_values(&mut reg_values, &written_aliases);
-                invalidate_dependent_arg_values(&mut arg_values, &written_aliases);
-                invalidate_written_call_target_values(&mut call_target_values, &written_aliases);
-                invalidate_dependent_stack_slot_values(&mut stack_slot_values, &written_aliases);
+                invalidate_dependent_register_values(&mut state.reg_values, &written_aliases);
+                invalidate_dependent_arg_values(&mut state.arg_values, &written_aliases);
+                invalidate_written_call_target_values(
+                    &mut state.call_target_values,
+                    &written_aliases,
+                );
+                invalidate_dependent_stack_slot_values(
+                    &mut state.stack_slot_values,
+                    &written_aliases,
+                );
                 if aliases_include_stack_base(&written_aliases) {
-                    stack_slot_values.clear();
+                    state.stack_slot_values.clear();
                 }
 
                 if is_temp_register(&v.name) {
+                    let stabilized_temp_rhs = stabilize_saved_arg_registers(tracked_rhs.clone());
                     for alias in &written_aliases {
-                        reg_values.insert(alias.clone(), tracked_rhs.clone());
-                        call_target_values.insert(alias.clone(), tracked_rhs.clone());
+                        state
+                            .reg_values
+                            .insert(alias.clone(), stabilized_temp_rhs.clone());
+                        state
+                            .call_target_values
+                            .insert(alias.clone(), stabilized_temp_rhs.clone());
                     }
                 }
 
                 if is_tracked_call_arg_register(&v.name) {
                     for alias in &written_aliases {
-                        reg_values.insert(alias.clone(), tracked_rhs.clone());
-                        call_target_values.insert(alias.clone(), tracked_rhs.clone());
+                        state.reg_values.insert(alias.clone(), tracked_rhs.clone());
+                        state
+                            .call_target_values
+                            .insert(alias.clone(), tracked_rhs.clone());
                     }
                     // If one ABI argument register is only staging a value into another
                     // argument register, keep the destination but drop the staged source.
@@ -2973,7 +3181,7 @@ fn propagate_args_in_block_with_binary_data(
                         if let Some(src_idx) = get_arg_register_index(&src_var.name) {
                             if get_arg_register_index(&v.name) != Some(src_idx) {
                                 for alias in get_register_aliases(&src_var.name) {
-                                    arg_values.remove(&alias);
+                                    state.arg_values.remove(&alias);
                                 }
                             }
                         }
@@ -2981,9 +3189,9 @@ fn propagate_args_in_block_with_binary_data(
 
                     // Preserve copies of incoming ABI arguments even if the source
                     // registers get reused later in the setup sequence.
-                    arg_values.insert(
+                    state.arg_values.insert(
                         v.name.to_lowercase(),
-                        (i, stabilize_saved_arg_registers(tracked_rhs.clone())),
+                        (Some(i), stabilize_saved_arg_registers(tracked_rhs.clone())),
                     );
                     result.push(Expr::assign((**lhs).clone(), tracked_rhs));
                     continue;
@@ -2992,24 +3200,26 @@ fn propagate_args_in_block_with_binary_data(
 
             if let Some(slot_key) = stack_slot_key(&substituted_lhs) {
                 let stabilized_rhs = stabilize_saved_arg_registers(tracked_rhs);
-                stack_slot_values.insert(slot_key, stabilized_rhs.clone());
-                forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
+                state
+                    .stack_slot_values
+                    .insert(slot_key, stabilized_rhs.clone());
+                forget_pending_arg_values_from_expr(&stmt, &mut state.arg_values);
                 result.push(Expr::assign(substituted_lhs, stabilized_rhs));
                 continue;
             }
 
             if let ExprKind::Call { target, args } = &rhs.kind {
                 let substituted_target =
-                    substitute_call_target(target.clone(), &call_target_values);
+                    substitute_call_target(target.clone(), &state.call_target_values);
                 if is_real_function_call(target) {
                     let mut rewritten_args: Vec<Expr> =
-                        substitute_call_args(target, args, &reg_values);
+                        substitute_call_args(target, args, &state.reg_values);
                     let excluded_arg_regs = collect_target_argument_registers(target);
                     if let Some((recovered_args, used_stmt_indices)) =
                         try_recover_format_call_arguments(
                             target,
                             args,
-                            &arg_values,
+                            &state.arg_values,
                             &excluded_arg_regs,
                             binary_data,
                             preferred_family,
@@ -3023,7 +3233,7 @@ fn propagate_args_in_block_with_binary_data(
                         let recovered_args = extract_call_arguments_with_indices(
                             Some(target),
                             args,
-                            &arg_values,
+                            &state.arg_values,
                             &excluded_arg_regs,
                             preferred_family,
                         );
@@ -3038,14 +3248,12 @@ fn propagate_args_in_block_with_binary_data(
                         }
                     }
                     let rewritten_call = Expr::call(substituted_target, rewritten_args);
-                    arg_values.clear();
-                    reg_values.clear();
-                    call_target_values.clear();
+                    state.clear_after_real_call();
                     if let ExprKind::Var(_) = &substituted_lhs.kind {
                         track_call_result_aliases(
                             &substituted_lhs,
-                            &mut reg_values,
-                            &mut call_target_values,
+                            &mut state.reg_values,
+                            &mut state.call_target_values,
                         );
                     }
                     result.push(Expr::assign(substituted_lhs, rewritten_call));
@@ -3053,14 +3261,14 @@ fn propagate_args_in_block_with_binary_data(
                 } else {
                     let rewritten_call = Expr::call(
                         substituted_target,
-                        substitute_call_args(target, args, &reg_values),
+                        substitute_call_args(target, args, &state.reg_values),
                     );
                     if invalidate_pseudo_call_outputs(
                         target,
-                        &mut reg_values,
-                        &mut arg_values,
-                        &mut call_target_values,
-                        &mut stack_slot_values,
+                        &mut state.reg_values,
+                        &mut state.arg_values,
+                        &mut state.call_target_values,
+                        &mut state.stack_slot_values,
                     ) {
                         result.push(Expr::assign(substituted_lhs, rewritten_call));
                         continue;
@@ -3068,15 +3276,17 @@ fn propagate_args_in_block_with_binary_data(
                 }
             }
 
-            forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
+            forget_pending_arg_values_from_expr(&stmt, &mut state.arg_values);
             result.push(Expr::assign(substituted_lhs, tracked_rhs));
             continue;
         }
 
         if let ExprKind::CompoundAssign { op, lhs, rhs } = &stmt.kind {
-            let substituted_lhs = substitute_assignment_lhs(lhs, &reg_values);
-            let tracked_rhs =
-                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
+            let substituted_lhs = substitute_assignment_lhs(lhs, &state.reg_values);
+            let tracked_rhs = substitute_stack_slot_values(
+                substitute_vars(rhs, &state.reg_values),
+                &state.stack_slot_values,
+            );
 
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
@@ -3085,16 +3295,22 @@ fn propagate_args_in_block_with_binary_data(
                 let prior_value = if is_temp_register(&v.name) {
                     prior_aliases
                         .iter()
-                        .find_map(|alias| reg_values.get(alias).cloned())
+                        .find_map(|alias| state.reg_values.get(alias).cloned())
                 } else {
                     None
                 };
-                invalidate_dependent_register_values(&mut reg_values, &written_aliases);
-                invalidate_dependent_arg_values(&mut arg_values, &written_aliases);
-                invalidate_written_call_target_values(&mut call_target_values, &written_aliases);
-                invalidate_dependent_stack_slot_values(&mut stack_slot_values, &written_aliases);
+                invalidate_dependent_register_values(&mut state.reg_values, &written_aliases);
+                invalidate_dependent_arg_values(&mut state.arg_values, &written_aliases);
+                invalidate_written_call_target_values(
+                    &mut state.call_target_values,
+                    &written_aliases,
+                );
+                invalidate_dependent_stack_slot_values(
+                    &mut state.stack_slot_values,
+                    &written_aliases,
+                );
                 if aliases_include_stack_base(&written_aliases) {
-                    stack_slot_values.clear();
+                    state.stack_slot_values.clear();
                 }
 
                 if is_temp_register(&v.name) && compound_update_defines_full_alias_value(&v.name) {
@@ -3102,21 +3318,23 @@ fn propagate_args_in_block_with_binary_data(
                         if !expr_uses_any_register_alias(&current, &written_aliases) {
                             let new_val = Expr::binop(*op, current, tracked_rhs.clone()).simplify();
                             for alias in &written_aliases {
-                                reg_values.insert(alias.clone(), new_val.clone());
-                                call_target_values.insert(alias.clone(), new_val.clone());
+                                state.reg_values.insert(alias.clone(), new_val.clone());
+                                state
+                                    .call_target_values
+                                    .insert(alias.clone(), new_val.clone());
                             }
                         }
                     }
                 }
                 if is_tracked_call_arg_register(&v.name) {
                     for alias in &written_aliases {
-                        reg_values.remove(alias);
+                        state.reg_values.remove(alias);
                     }
-                    arg_values.remove(&v.name.to_lowercase());
+                    state.arg_values.remove(&v.name.to_lowercase());
                 }
             }
 
-            forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
+            forget_pending_arg_values_from_expr(&stmt, &mut state.arg_values);
             result.push(Expr {
                 kind: ExprKind::CompoundAssign {
                     op: *op,
@@ -3130,13 +3348,14 @@ fn propagate_args_in_block_with_binary_data(
         // Check if this is an assignment to an argument register
         // Check if this is a function call (not push/pop/syscall/etc.)
         if let ExprKind::Call { target, args } = &stmt.kind {
-            let substituted_target = substitute_call_target(target.clone(), &call_target_values);
+            let substituted_target =
+                substitute_call_target(target.clone(), &state.call_target_values);
             if is_real_function_call(target) {
                 let excluded_arg_regs = collect_target_argument_registers(target);
                 if let Some((recovered_args, used_stmt_indices)) = try_recover_format_call_arguments(
                     target,
                     args,
-                    &arg_values,
+                    &state.arg_values,
                     &excluded_arg_regs,
                     binary_data,
                     preferred_family,
@@ -3145,16 +3364,14 @@ fn propagate_args_in_block_with_binary_data(
                         to_remove.insert(idx);
                     }
                     result.push(Expr::call(substituted_target, recovered_args));
-                    arg_values.clear();
-                    reg_values.clear();
-                    call_target_values.clear();
+                    state.clear_after_real_call();
                     continue;
                 }
                 // Try to extract arguments from tracked registers
                 let new_args = extract_call_arguments_with_indices(
                     Some(target),
                     args,
-                    &arg_values,
+                    &state.arg_values,
                     &excluded_arg_regs,
                     preferred_family,
                 );
@@ -3163,9 +3380,7 @@ fn propagate_args_in_block_with_binary_data(
                         to_remove.insert(idx);
                     }
                     result.push(Expr::call(substituted_target, new_args.0));
-                    arg_values.clear();
-                    reg_values.clear();
-                    call_target_values.clear();
+                    state.clear_after_real_call();
                     continue;
                 }
                 if args.is_empty() && (!new_args.0.is_empty() || !new_args.1.is_empty()) {
@@ -3177,9 +3392,7 @@ fn propagate_args_in_block_with_binary_data(
                     let new_call = Expr::call(substituted_target, new_args.0);
                     result.push(new_call);
                     // Clear argument tracking after the call
-                    arg_values.clear();
-                    reg_values.clear();
-                    call_target_values.clear();
+                    state.clear_after_real_call();
                     continue;
                 }
                 if args.is_empty() {
@@ -3187,29 +3400,26 @@ fn propagate_args_in_block_with_binary_data(
                         synthesize_leading_passthrough_args_from_target(&excluded_arg_regs);
                     if !passthrough_args.is_empty() {
                         result.push(Expr::call(substituted_target, passthrough_args));
-                        arg_values.clear();
-                        reg_values.clear();
-                        call_target_values.clear();
+                        state.clear_after_real_call();
                         continue;
                     }
                 }
 
                 result.push(Expr::call(
                     substituted_target,
-                    substitute_call_args(target, args, &reg_values),
+                    substitute_call_args(target, args, &state.reg_values),
                 ));
-                arg_values.clear();
-                reg_values.clear();
-                call_target_values.clear();
+                state.clear_after_real_call();
                 continue;
             } else {
-                let substituted_args: Vec<_> = substitute_call_args(target, args, &reg_values);
+                let substituted_args: Vec<_> =
+                    substitute_call_args(target, args, &state.reg_values);
                 if invalidate_pseudo_call_outputs(
                     target,
-                    &mut reg_values,
-                    &mut arg_values,
-                    &mut call_target_values,
-                    &mut stack_slot_values,
+                    &mut state.reg_values,
+                    &mut state.arg_values,
+                    &mut state.call_target_values,
+                    &mut state.stack_slot_values,
                 ) {
                     result.push(Expr::call(substituted_target, substituted_args));
                     continue;
@@ -3240,7 +3450,7 @@ fn propagate_args_in_block_with_binary_data(
         }
 
         // Pass through other statements
-        forget_pending_arg_values_from_expr(&stmt, &mut arg_values);
+        forget_pending_arg_values_from_expr(&stmt, &mut state.arg_values);
         result.push(stmt);
     }
 
@@ -3299,7 +3509,7 @@ fn track_call_result_aliases(
 fn invalidate_pseudo_call_outputs(
     target: &super::super::expression::CallTarget,
     reg_values: &mut HashMap<String, Expr>,
-    arg_values: &mut HashMap<String, (usize, Expr)>,
+    arg_values: &mut HashMap<String, (Option<usize>, Expr)>,
     call_target_values: &mut HashMap<String, Expr>,
     stack_slot_values: &mut HashMap<String, Expr>,
 ) -> bool {
@@ -3332,7 +3542,7 @@ fn invalidate_dependent_register_values(
 }
 
 fn invalidate_dependent_arg_values(
-    arg_values: &mut HashMap<String, (usize, Expr)>,
+    arg_values: &mut HashMap<String, (Option<usize>, Expr)>,
     written_aliases: &HashSet<String>,
 ) {
     arg_values.retain(|alias, (_, expr)| {
@@ -3694,7 +3904,7 @@ fn expr_uses_any_register_alias(expr: &Expr, aliases: &HashSet<String>) -> bool 
 
 fn forget_pending_arg_values_from_expr(
     expr: &Expr,
-    arg_values: &mut HashMap<String, (usize, Expr)>,
+    arg_values: &mut HashMap<String, (Option<usize>, Expr)>,
 ) {
     use super::super::expression::ExprKind;
 
@@ -4047,12 +4257,12 @@ fn known_call_signature(
 fn extract_call_arguments_with_indices(
     target: Option<&super::super::expression::CallTarget>,
     existing_args: &[Expr],
-    arg_values: &HashMap<String, (usize, Expr)>,
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
     excluded_regs: &HashSet<String>,
     preferred_family: Option<ArgumentAbiFamily>,
 ) -> (Vec<Expr>, Vec<usize>) {
     let signature = target.and_then(known_call_signature);
-    let mut args: Vec<(usize, usize, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
+    let mut args: Vec<(usize, Option<usize>, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
     let mut removable_indices = Vec::new();
 
     for (reg_name, (stmt_idx, value)) in arg_values {
@@ -4061,7 +4271,9 @@ fn extract_call_arguments_with_indices(
         }
         if let Some(arg_idx) = get_arg_register_index(reg_name) {
             if signature.is_some_and(|sig| !sig.variadic && arg_idx >= sig.fixed_arg_count) {
-                removable_indices.push(*stmt_idx);
+                if let Some(stmt_idx) = stmt_idx {
+                    removable_indices.push(*stmt_idx);
+                }
                 continue;
             }
             args.push((arg_idx, *stmt_idx, value.clone()));
@@ -4078,13 +4290,26 @@ fn extract_call_arguments_with_indices(
             .chain(excluded_regs.iter().map(String::as_str)),
     )
     .or(preferred_family);
-    let explicit_by_index: HashMap<usize, (usize, Expr)> = args
+    let explicit_by_index: HashMap<usize, (Option<usize>, Expr)> = args
         .into_iter()
         .map(|(arg_idx, stmt_idx, value)| (arg_idx, (stmt_idx, value)))
         .collect();
     let Some(max_idx) = explicit_by_index.keys().copied().max() else {
         return (existing_args.to_vec(), removable_indices);
     };
+
+    if !existing_args.is_empty() {
+        if target.is_some_and(|target| {
+            matches!(
+                target,
+                super::super::expression::CallTarget::Indirect(_)
+                    | super::super::expression::CallTarget::IndirectGot { .. }
+            )
+        }) && signature.is_none()
+        {
+            return (existing_args.to_vec(), removable_indices);
+        }
+    }
 
     if signature.is_some_and(|sig| !sig.variadic && sig.fixed_arg_count == 0) {
         return (existing_args.to_vec(), removable_indices);
@@ -4109,7 +4334,9 @@ fn extract_call_arguments_with_indices(
     for expected_idx in start_idx..=max_idx {
         if let Some((stmt_idx, value)) = explicit_by_index.get(&expected_idx) {
             result.push(value.clone());
-            used_indices.push(*stmt_idx);
+            if let Some(stmt_idx) = stmt_idx {
+                used_indices.push(*stmt_idx);
+            }
             continue;
         }
 
@@ -4288,7 +4515,7 @@ fn get_float_arg_register_index(name: &str) -> Option<usize> {
 fn try_recover_format_call_arguments(
     target: &super::super::expression::CallTarget,
     args: &[Expr],
-    arg_values: &HashMap<String, (usize, Expr)>,
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
     excluded_regs: &HashSet<String>,
     binary_data: Option<&BinaryDataContext>,
     preferred_family: Option<ArgumentAbiFamily>,
@@ -4324,7 +4551,9 @@ fn try_recover_format_call_arguments(
                     int_slot,
                     excluded_regs,
                 ) {
-                    used_stmt_indices.push(stmt_idx);
+                    if let Some(stmt_idx) = stmt_idx {
+                        used_stmt_indices.push(stmt_idx);
+                    }
                     recovered_args.push(value);
                 } else if let Some(value) = reuse_existing_integer_variadic_arg(
                     existing_variadic_args,
@@ -4349,7 +4578,9 @@ fn try_recover_format_call_arguments(
                     float_slot,
                     excluded_regs,
                 ) {
-                    used_stmt_indices.push(stmt_idx);
+                    if let Some(stmt_idx) = stmt_idx {
+                        used_stmt_indices.push(stmt_idx);
+                    }
                     recovered_args.push(value);
                 } else if let Some(value) = reuse_existing_float_variadic_arg(
                     existing_variadic_args,
@@ -4372,13 +4603,13 @@ fn try_recover_format_call_arguments(
 }
 
 fn lookup_slot_value_or_passthrough(
-    arg_values: &HashMap<String, (usize, Expr)>,
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
     existing_variadic_args: &[Expr],
     existing_variadic_index: &mut usize,
     family: ArgumentAbiFamily,
     int_slot: usize,
     excluded_regs: &HashSet<String>,
-) -> Option<(usize, Expr)> {
+) -> Option<(Option<usize>, Expr)> {
     let reg_name = pass_through_arg_register_name(family, int_slot)?;
     if excluded_regs.contains(reg_name) {
         return None;
@@ -4398,13 +4629,13 @@ fn lookup_slot_value_or_passthrough(
 }
 
 fn lookup_float_slot_value_or_passthrough(
-    arg_values: &HashMap<String, (usize, Expr)>,
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
     existing_variadic_args: &[Expr],
     existing_variadic_index: &mut usize,
     family: ArgumentAbiFamily,
     float_slot: usize,
     excluded_regs: &HashSet<String>,
-) -> Option<(usize, Expr)> {
+) -> Option<(Option<usize>, Expr)> {
     let reg_name = pass_through_float_arg_register_name(family, float_slot)?;
     if excluded_regs.contains(reg_name) {
         return None;
@@ -4549,9 +4780,9 @@ fn is_plausible_format_call_prefix(args: &[Expr], fixed_arg_count: usize) -> boo
 }
 
 fn lookup_tracked_register_value(
-    arg_values: &HashMap<String, (usize, Expr)>,
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
     reg_name: &str,
-) -> Option<(usize, Expr)> {
+) -> Option<(Option<usize>, Expr)> {
     for alias in get_register_aliases(reg_name) {
         if let Some((stmt_idx, value)) = arg_values.get(&alias) {
             return Some((*stmt_idx, value.clone()));
@@ -6540,7 +6771,7 @@ mod tests {
         let mut arg_values = HashMap::new();
         arg_values.insert(
             "rsi".to_string(),
-            (0usize, Expr::address_of(Expr::unknown("arg_local"))),
+            (Some(0usize), Expr::address_of(Expr::unknown("arg_local"))),
         );
         let excluded = HashSet::from(["rdi".to_string()]);
 
@@ -6551,6 +6782,127 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["&arg_local"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_keeps_existing_indirect_arity_on_second_pass() {
+        let statements = vec![
+            Expr::assign(reg("rdx", 8), Expr::unknown("user")),
+            Expr::assign(reg("rcx", 8), Expr::unknown("cb")),
+            Expr::call(
+                CallTarget::Indirect(Box::new(Expr::unknown("cb"))),
+                vec![Expr::unknown("evt"), Expr::unknown("user")],
+            ),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing indirect call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["evt", "user"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_carries_pending_state_into_if_branch_tail_call() {
+        let nodes = vec![
+            block(
+                0,
+                vec![
+                    Expr::assign(reg("rax", 8), reg("rsi", 8)),
+                    Expr::assign(reg("rsi", 8), reg("rdx", 8)),
+                ],
+            ),
+            StructuredNode::If {
+                condition: Expr::binop(BinOpKind::Eq, reg("rax", 8), Expr::int(0)),
+                then_body: vec![StructuredNode::Return(Some(reg("rax", 8)))],
+                else_body: Some(vec![block(
+                    1,
+                    vec![Expr::call(
+                        CallTarget::Indirect(Box::new(reg("rax", 8))),
+                        vec![],
+                    )],
+                )]),
+            },
+        ];
+
+        let propagated = propagate_call_args_node_sequence(nodes, None, None);
+        let StructuredNode::If {
+            else_body: Some(else_body),
+            ..
+        } = &propagated[1]
+        else {
+            panic!("expected trailing if with else branch");
+        };
+        let StructuredNode::Block { statements, .. } = &else_body[0] else {
+            panic!("expected else body block");
+        };
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = statements.last()
+        else {
+            panic!("expected tail-call block expression");
+        };
+
+        match target {
+            CallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "arg1"),
+            other => panic!("expected carried indirect target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rdi", "arg2"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_preserves_state_across_guard_if_to_fallthrough_call() {
+        let nodes = vec![
+            block(
+                0,
+                vec![
+                    Expr::assign(reg("rax", 8), reg("rsi", 8)),
+                    Expr::assign(reg("rsi", 8), reg("rdx", 8)),
+                ],
+            ),
+            StructuredNode::If {
+                condition: Expr::binop(BinOpKind::Eq, reg("rax", 8), Expr::int(0)),
+                then_body: vec![StructuredNode::Return(Some(reg("rax", 8)))],
+                else_body: None,
+            },
+            block(
+                1,
+                vec![Expr::call(
+                    CallTarget::Indirect(Box::new(reg("rax", 8))),
+                    vec![],
+                )],
+            ),
+        ];
+
+        let propagated = propagate_call_args_node_sequence(nodes, None, None);
+        let StructuredNode::Block { statements, .. } = &propagated[2] else {
+            panic!("expected trailing call block");
+        };
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = statements.last()
+        else {
+            panic!("expected fallthrough tail-call expression");
+        };
+
+        match target {
+            CallTarget::Indirect(expr) => assert_eq!(format!("{expr}"), "arg1"),
+            other => panic!("expected carried indirect target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["rdi", "arg2"]
         );
     }
 
@@ -7529,7 +7881,7 @@ mod tests {
         let propagated = propagate_args_in_block_with_binary_data(statements, None, None);
         assert_eq!(
             format!("{}", propagated[2]),
-            "esi = SET_BITS(carrier, edi, 4, 8)"
+            "esi = SET_BITS(carrier, arg0, 4, 8)"
         );
     }
 
@@ -7593,7 +7945,7 @@ mod tests {
         let propagated = propagate_args_in_block_with_binary_data(statements, None, None);
         assert_eq!(
             format!("{}", propagated[2]),
-            "*(uint16_t*)(rdi) = SET_BITS(carrier, edi, 4, 8)"
+            "*(uint16_t*)(rdi) = SET_BITS(carrier, arg0, 4, 8)"
         );
     }
 
@@ -7650,8 +8002,8 @@ mod tests {
         ];
 
         let propagated = propagate_args_in_block(statements);
-        assert_eq!(format!("{}", propagated[2]), "rdx = edi * 4");
-        assert_eq!(format!("{}", propagated[4]), "rcx = edi * 4 + rsi");
+        assert_eq!(format!("{}", propagated[2]), "rdx = arg0 * 4");
+        assert_eq!(format!("{}", propagated[4]), "rcx = arg0 * 4 + arg1");
     }
 
     #[test]
@@ -7669,7 +8021,7 @@ mod tests {
         ];
 
         let propagated = propagate_args_in_block(statements);
-        assert_eq!(format!("{}", propagated[2]), "ecx = edi << 4");
+        assert_eq!(format!("{}", propagated[2]), "ecx = arg0 << 4");
     }
 
     #[test]
