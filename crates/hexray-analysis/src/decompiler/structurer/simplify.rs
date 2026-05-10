@@ -4493,7 +4493,20 @@ pub(super) fn merge_return_value_captures_with_counter(
 
     for node in nodes {
         // First, recursively process nested structures
-        let node = merge_return_value_captures_node(node, capture_counter);
+        let mut node = merge_return_value_captures_node(node, capture_counter);
+
+        if let Some((aliases, primary_alias)) = first_return_value_alias_use_in_node(&node) {
+            if let Some(block_index) = find_previous_call_capture_block(&result, &aliases) {
+                if let Some(temp_expr) = capture_previous_call_result(
+                    &mut result,
+                    block_index,
+                    capture_counter,
+                    &primary_alias,
+                ) {
+                    node = substitute_return_value_aliases_in_node(node, &aliases, &temp_expr);
+                }
+            }
+        }
 
         match node {
             StructuredNode::Block {
@@ -5150,6 +5163,221 @@ fn return_value_aliases(name: &str) -> Vec<String> {
         vec![name.to_string()]
     } else {
         return_register_aliases(name)
+    }
+}
+
+fn broad_return_value_aliases(name: &str) -> Vec<String> {
+    let mut aliases = return_value_aliases(name);
+    for alias in [
+        "al", "ax", "eax", "rax", "ret", "ret_0", "arg0", "w0", "x0", "a0",
+    ] {
+        if !aliases.iter().any(|existing| existing == alias) {
+            aliases.push(alias.to_string());
+        }
+    }
+    aliases
+}
+
+fn first_return_value_alias_use_in_node(node: &StructuredNode) -> Option<(Vec<String>, String)> {
+    match node {
+        StructuredNode::If { condition, .. }
+        | StructuredNode::While { condition, .. }
+        | StructuredNode::DoWhile { condition, .. } => {
+            first_return_value_alias_use_in_expr(condition)
+                .map(|name| (broad_return_value_aliases(&name), name))
+        }
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            ..
+        } => init
+            .as_ref()
+            .and_then(first_return_value_alias_use_in_expr)
+            .or_else(|| first_return_value_alias_use_in_expr(condition))
+            .or_else(|| {
+                update
+                    .as_ref()
+                    .and_then(first_return_value_alias_use_in_expr)
+            })
+            .map(|name| (broad_return_value_aliases(&name), name)),
+        StructuredNode::Switch { value, .. } => first_return_value_alias_use_in_expr(value)
+            .map(|name| (broad_return_value_aliases(&name), name)),
+        _ => None,
+    }
+}
+
+fn first_return_value_alias_use_in_expr(expr: &Expr) -> Option<String> {
+    fn walk(expr: &Expr) -> Option<String> {
+        use super::super::expression::{CallTarget, ExprKind};
+
+        match &expr.kind {
+            ExprKind::Var(var) => {
+                let lower = var.name.to_lowercase();
+                is_return_value_alias(&lower).then_some(lower)
+            }
+            ExprKind::BinOp { left, right, .. } => walk(left).or_else(|| walk(right)),
+            ExprKind::UnaryOp { operand, .. } => walk(operand),
+            ExprKind::Deref { addr, .. } => walk(addr),
+            ExprKind::AddressOf(inner) => walk(inner),
+            ExprKind::ArrayAccess { base, index, .. } => walk(base).or_else(|| walk(index)),
+            ExprKind::FieldAccess { base, .. } => walk(base),
+            ExprKind::Call { target, args } => match target {
+                CallTarget::Indirect(inner) | CallTarget::IndirectGot { expr: inner, .. } => {
+                    walk(inner)
+                }
+                CallTarget::Direct { .. } | CallTarget::Named(_) => None,
+            }
+            .or_else(|| args.iter().find_map(walk)),
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                walk(lhs).or_else(|| walk(rhs))
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => walk(cond)
+                .or_else(|| walk(then_expr))
+                .or_else(|| walk(else_expr)),
+            ExprKind::Cast { expr, .. } | ExprKind::BitField { expr, .. } => walk(expr),
+            ExprKind::Phi(values) => values.iter().find_map(walk),
+            ExprKind::IntLit(_) | ExprKind::Unknown(_) | ExprKind::GotRef { .. } => None,
+        }
+    }
+
+    walk(expr)
+}
+
+fn substitute_return_value_aliases_in_node(
+    node: StructuredNode,
+    aliases: &[String],
+    replacement: &Expr,
+) -> StructuredNode {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => StructuredNode::Block {
+            id,
+            statements: statements
+                .into_iter()
+                .map(|stmt| substitute_return_register_uses(stmt, aliases, replacement))
+                .collect(),
+            address_range,
+        },
+        StructuredNode::Expr(expr) => {
+            StructuredNode::Expr(substitute_return_register_uses(expr, aliases, replacement))
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition: substitute_return_register_uses(condition, aliases, replacement),
+            then_body: then_body
+                .into_iter()
+                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                .collect(),
+            else_body: else_body.map(|body| {
+                body.into_iter()
+                    .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                    .collect()
+            }),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition: substitute_return_register_uses(condition, aliases, replacement),
+            body: body
+                .into_iter()
+                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                .collect(),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: body
+                .into_iter()
+                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                .collect(),
+            condition: substitute_return_register_uses(condition, aliases, replacement),
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init: init.map(|expr| substitute_return_register_uses(expr, aliases, replacement)),
+            condition: substitute_return_register_uses(condition, aliases, replacement),
+            update: update.map(|expr| substitute_return_register_uses(expr, aliases, replacement)),
+            body: body
+                .into_iter()
+                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                .collect(),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: body
+                .into_iter()
+                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                .collect(),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value: substitute_return_register_uses(value, aliases, replacement),
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| {
+                    (
+                        values,
+                        body.into_iter()
+                            .map(|node| {
+                                substitute_return_value_aliases_in_node(node, aliases, replacement)
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+            default: default.map(|body| {
+                body.into_iter()
+                    .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                    .collect()
+            }),
+        },
+        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
+            nodes
+                .into_iter()
+                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
+                .collect(),
+        ),
+        StructuredNode::Return(Some(expr)) => StructuredNode::Return(Some(
+            substitute_return_register_uses(expr, aliases, replacement),
+        )),
+        other => other,
     }
 }
 
@@ -6586,6 +6814,77 @@ mod tests {
 
         assert_eq!(format!("{}", first_block[0]), "ret_0 = foo(1)");
         assert_eq!(format!("{}", second_block[0]), "sum += ret_0");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_rewrites_nested_if_chain_after_call_block() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(
+                    CallTarget::Named("getopt_long".to_string()),
+                    vec![Expr::unknown("argc"), Expr::unknown("argv")],
+                )],
+            ),
+            StructuredNode::If {
+                condition: Expr::binop(BinOpKind::Eq, local("ret_0", 4), Expr::int(-1)),
+                then_body: vec![StructuredNode::Return(Some(Expr::int(0)))],
+                else_body: Some(vec![StructuredNode::If {
+                    condition: Expr::binop(BinOpKind::Eq, reg("eax", 4), Expr::int(104)),
+                    then_body: vec![block(1, vec![Expr::assign(local("help", 4), Expr::int(1))])],
+                    else_body: Some(vec![StructuredNode::If {
+                        condition: Expr::binop(BinOpKind::Eq, reg("eax", 4), Expr::int(118)),
+                        then_body: vec![block(
+                            2,
+                            vec![Expr::assign(local("verbose", 4), Expr::int(1))],
+                        )],
+                        else_body: None,
+                    }]),
+                }]),
+            },
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        assert_eq!(
+            format!("{}", first_block[0]),
+            "ret_0 = getopt_long(argc, argv)"
+        );
+
+        let StructuredNode::If {
+            condition,
+            else_body: Some(else_body),
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected rewritten if chain");
+        };
+        assert_eq!(format!("{condition}"), "ret_0 == -0x1");
+
+        let StructuredNode::If {
+            condition: nested_cond,
+            else_body: Some(nested_else),
+            ..
+        } = &else_body[0]
+        else {
+            panic!("expected nested if");
+        };
+        assert_eq!(format!("{nested_cond}"), "ret_0 == 'h'");
+
+        let StructuredNode::If {
+            condition: deeper_cond,
+            ..
+        } = &nested_else[0]
+        else {
+            panic!("expected deeper if");
+        };
+        assert_eq!(format!("{deeper_cond}"), "ret_0 == 'v'");
     }
 
     #[test]

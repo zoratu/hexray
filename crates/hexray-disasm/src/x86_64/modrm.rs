@@ -191,11 +191,17 @@ pub fn decode_modrm_rm(
         if bytes.is_empty() {
             return None;
         }
-        let sib = Sib::parse(*bytes.first()?, prefixes.rex);
+        let sib_byte = *bytes.first()?;
+        let sib = Sib::parse(sib_byte, prefixes.rex);
         offset = offset.saturating_add(1);
 
-        // Index register (RSP encoding means no index)
-        if (sib.index & 0x7) != 0x4 {
+        // Index register.
+        //
+        // In 64-bit mode the SIB "no index" sentinel only applies to the raw
+        // 3-bit encoding 100 when REX.X is clear. With REX.X set, the same raw
+        // encoding names r12 and must be preserved.
+        let raw_index = (sib_byte >> 3) & 0x7;
+        if raw_index != 0x4 || prefixes.rex.is_some_and(|rex| rex.x) {
             index = Some(decode_gpr(sib.index, 64));
             scale = sib.scale_factor();
         }
@@ -318,5 +324,33 @@ mod tests {
             mem.segment.as_ref().map(|segment| segment.id),
             Some(x86::FS)
         );
+    }
+
+    #[test]
+    fn decode_modrm_rm_preserves_extended_sib_index_register() {
+        let prefixes = Prefixes {
+            rex: Some(Rex {
+                x: true,
+                b: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let modrm = ModRM {
+            mod_: 0b00,
+            reg: 0,
+            rm: 0b100,
+        };
+        let bytes = [0x24];
+
+        let (operand, consumed) = decode_modrm_rm(&bytes, modrm, &prefixes, 32).unwrap();
+
+        assert_eq!(consumed, 1);
+        let Operand::Memory(mem) = operand else {
+            panic!("expected memory operand");
+        };
+        assert_eq!(mem.base.as_ref().map(|reg| reg.name()), Some("r12"));
+        assert_eq!(mem.index.as_ref().map(|reg| reg.name()), Some("r12"));
+        assert_eq!(mem.scale, 1);
     }
 }

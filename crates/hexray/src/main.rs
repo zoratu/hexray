@@ -2702,6 +2702,26 @@ fn disassemble_for_cfg<D: Disassembler>(
                 offset += decoded.size;
 
                 let branch_index = instructions.len() - 1;
+                match instructions[branch_index].control_flow {
+                    hexray_core::ControlFlow::ConditionalBranch { target, .. } => {
+                        if target >= start_addr && target < scan_limit {
+                            min_scan_end = min_scan_end.max(target);
+                        }
+                    }
+                    hexray_core::ControlFlow::IndirectBranch {
+                        ref possible_targets,
+                    } => {
+                        if let Some(max_target) = possible_targets
+                            .iter()
+                            .copied()
+                            .filter(|target| *target >= start_addr && *target < scan_limit)
+                            .max()
+                        {
+                            min_scan_end = min_scan_end.max(max_target);
+                        }
+                    }
+                    _ => {}
+                }
                 if !binary_data_ctx.is_empty() {
                     let targets = resolve_computed_dispatch_targets(
                         &instructions,
@@ -10246,6 +10266,76 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].mnemonic, "endbr64");
         assert_eq!(instructions[1].mnemonic, "ud2");
+    }
+
+    #[test]
+    fn heuristic_cfg_disassembly_keeps_forward_branch_targets_after_early_return() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x4012f0,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0x41, 0x55, // push r13
+                    0x45, 0x31, 0xed, // xor r13d, r13d
+                    0x41, 0x54, // push r12
+                    0x45, 0x31, 0xe4, // xor r12d, r12d
+                    0x55, // push rbp
+                    0x89, 0xfd, // mov ebp, edi
+                    0x53, // push rbx
+                    0x48, 0x89, 0xf3, // mov rbx, rsi
+                    0x48, 0x83, 0xec, 0x08, // sub rsp, 8
+                    0x45, 0x31, 0xc0, // xor r8d, r8d
+                    0xb9, 0x40, 0x40, 0x40, 0x00, // mov ecx, 0x404040
+                    0xba, 0x25, 0x20, 0x40, 0x00, // mov edx, 0x402025
+                    0x48, 0x89, 0xde, // mov rsi, rbx
+                    0x89, 0xef, // mov edi, ebp
+                    0xe8, 0x40, 0xfd, 0xff, 0xff, // call 0x401060
+                    0x83, 0xf8, 0xff, // cmp eax, -1
+                    0x74, 0x3b, // je 0x401360
+                    0x83, 0xf8, 0x68, // cmp eax, 'h'
+                    0x74, 0x26, // je 0x401350
+                    0x83, 0xf8, 0x76, // cmp eax, 'v'
+                    0x74, 0x19, // je 0x401348
+                    0x83, 0xf8, 0x66, // cmp eax, 'f'
+                    0x74, 0xd5, // je 0x401309
+                    0x48, 0x83, 0xc4, 0x08, // add rsp, 8
+                    0xb8, 0xff, 0xff, 0xff, 0xff, // mov eax, -1
+                    0x5b, // pop rbx
+                    0x5d, // pop rbp
+                    0x41, 0x5c, // pop r12
+                    0x41, 0x5d, // pop r13
+                    0xc3, // ret
+                    0x0f, 0x1f, 0x40, 0x00, // nop
+                    0x41, 0xbc, 0x01, 0x00, 0x00, 0x00, // mov r12d, 1
+                    0xeb, 0xb9, // jmp 0x401309
+                    0x41, 0xbd, 0x01, 0x00, 0x00, 0x00, // mov r13d, 1
+                    0xeb, 0xb1, // jmp 0x401309
+                    0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, // nop
+                    0x48, 0x83, 0xc4, 0x08, // add rsp, 8
+                    0x43, 0x8d, 0x04, 0x24, // lea eax, [r12 + r12]
+                    0x5b, // pop rbx
+                    0x44, 0x09, 0xe8, // or eax, r13d
+                    0x5d, // pop rbp
+                    0x41, 0x5c, // pop r12
+                    0x41, 0x5d, // pop r13
+                    0xc3, // ret
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x4012f0, 0x82).unwrap();
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x4012f0, true);
+
+        assert!(instructions.iter().any(|inst| inst.address == 0x401348));
+        assert!(instructions.iter().any(|inst| inst.address == 0x401350));
+        assert!(instructions.iter().any(|inst| inst.address == 0x401360));
+        assert!(instructions.iter().any(|inst| inst.address == 0x401371));
     }
 
     #[test]
