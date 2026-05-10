@@ -152,6 +152,54 @@ fn x86_float_compare_binop(cond: Condition, inst: &Instruction) -> Option<BinOpK
     })
 }
 
+fn expr_requires_single_evaluation(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Call { .. } | ExprKind::Assign { .. } | ExprKind::CompoundAssign { .. } => true,
+        ExprKind::Deref { .. } | ExprKind::ArrayAccess { .. } | ExprKind::FieldAccess { .. } => {
+            true
+        }
+        ExprKind::GotRef { is_deref, .. } => *is_deref,
+        ExprKind::BinOp { left, right, .. } => {
+            expr_requires_single_evaluation(left) || expr_requires_single_evaluation(right)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_requires_single_evaluation(operand),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_requires_single_evaluation(cond)
+                || expr_requires_single_evaluation(then_expr)
+                || expr_requires_single_evaluation(else_expr)
+        }
+        ExprKind::Phi(args) => args.iter().any(expr_requires_single_evaluation),
+        ExprKind::AddressOf(_) | ExprKind::IntLit(_) | ExprKind::Unknown(_) | ExprKind::Var(_) => {
+            false
+        }
+    }
+}
+
+fn expr_is_boolean_wrapper(expr: &Expr) -> bool {
+    use super::super::expression::{ExprKind, UnaryOpKind};
+
+    match &expr.kind {
+        ExprKind::BinOp { op, .. } => {
+            op.is_comparison() || matches!(op, BinOpKind::LogicalAnd | BinOpKind::LogicalOr)
+        }
+        ExprKind::UnaryOp {
+            op: UnaryOpKind::LogicalNot,
+            ..
+        }
+        | ExprKind::Conditional { .. } => true,
+        ExprKind::Cast { expr, .. } => expr_is_boolean_wrapper(expr),
+        _ => false,
+    }
+}
+
 /// Converts a Condition to an Expr, extracting operands from the block's compare instruction.
 /// Also substitutes register names with their values from preceding MOV instructions.
 pub(super) fn condition_to_expr_with_block(cond: Condition, block: &BasicBlock) -> Expr {
@@ -359,17 +407,31 @@ fn condition_to_expr_before_address_with_fallback(
             let result = Expr::binop(binop_kind, dst, src);
             return Some(Expr::binop(op, result, Expr::int(0)));
         } else if inst.operands.len() >= 2 {
-            let left = substitute_register_in_expr(
-                Expr::from_operand_with_inst(&inst.operands[0], inst),
-                reg_values,
-            );
-            let right = substitute_register_in_expr(
-                Expr::from_operand_with_inst(&inst.operands[1], inst),
-                reg_values,
-            );
+            let raw_left = Expr::from_operand_with_inst(&inst.operands[0], inst);
+            let raw_right = Expr::from_operand_with_inst(&inst.operands[1], inst);
+            let mut left = substitute_register_in_expr(raw_left.clone(), reg_values);
+            let mut right = substitute_register_in_expr(raw_right.clone(), reg_values);
 
-            if matches!(inst.operation, Operation::Test) && inst.operands[0] == inst.operands[1] {
-                return Some(Expr::binop(cmp_op, left, Expr::int(0)));
+            if matches!(inst.operation, Operation::Test) {
+                if matches!(inst.operands[0], Operand::Register(_))
+                    && expr_requires_single_evaluation(&left)
+                    && !expr_is_boolean_wrapper(&left)
+                {
+                    left = raw_left;
+                }
+                if matches!(inst.operands[1], Operand::Register(_))
+                    && expr_requires_single_evaluation(&right)
+                    && !expr_is_boolean_wrapper(&right)
+                {
+                    right = raw_right;
+                }
+
+                if inst.operands[0] == inst.operands[1] {
+                    return Some(Expr::binop(cmp_op, left, Expr::int(0)));
+                }
+
+                let tested = Expr::binop(BinOpKind::And, left, right).simplify();
+                return Some(Expr::binop(cmp_op, tested, Expr::int(0)));
             }
 
             return Some(Expr::binop(cmp_op, left, right));
@@ -1159,8 +1221,39 @@ mod tests {
         let expr = condition_to_expr_with_block(Condition::NotEqual, &block);
         let rendered = format!("{expr}");
         assert!(
-            rendered.contains("& 1") || rendered.contains("BITS("),
-            "expected ALU update to survive through TEST lowering, got {rendered}"
+            (rendered.contains("rax") || rendered.contains("eax"))
+                && !rendered.contains("rbp + -0x8")
+                && !rendered.contains("[rbp"),
+            "expected TEST lowering to reuse the loaded register without re-reading memory, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_lifts_test_mask_as_and_zero_compare() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x2200);
+        block.instructions.push(
+            Instruction::new(0x2200, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(ecx)]),
+        );
+
+        let equal = format!("{}", condition_to_expr_with_block(Condition::Equal, &block));
+        assert!(
+            equal.contains('&') && (equal.contains("== 0") || equal.contains("== '\\0'")),
+            "expected TEST/JE to lower as an AND-against-zero predicate, got {equal}"
+        );
+
+        let not_equal = format!(
+            "{}",
+            condition_to_expr_with_block(Condition::NotEqual, &block)
+        );
+        assert!(
+            not_equal.contains('&')
+                && (not_equal.contains("!= 0") || not_equal.contains("!= '\\0'")),
+            "expected TEST/JNE to lower as an AND-against-zero predicate, got {not_equal}"
         );
     }
 
