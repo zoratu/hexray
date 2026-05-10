@@ -47,7 +47,7 @@ use super::super::abi::{
     is_temp_register,
 };
 use super::super::dead_store::collect_all_uses;
-use super::super::expression::{BinOpKind, CallTarget, Expr, ExprKind, Variable};
+use super::super::expression::{BinOpKind, CallTarget, Expr, ExprKind, VarKind, Variable};
 use super::super::BinaryDataContext;
 use super::{CatchHandler, StructuredNode};
 
@@ -64,10 +64,7 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     for (stmt_idx, stmt) in statements.iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             if let ExprKind::Var(v) = &lhs.kind {
-                if is_temp_register(&v.name)
-                    || is_return_register(&v.name)
-                    || is_argument_register(&v.name)
-                {
+                if matches!(v.kind, VarKind::Register(_) | VarKind::Arg(_)) {
                     // Substitute known values in RHS before storing
                     let substituted_rhs = substitute_vars(rhs, &reg_values);
                     substituted_assignments.insert(stmt_idx, substituted_rhs.clone());
@@ -77,7 +74,9 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     {
                         reg_values.remove(&v.name);
                     } else {
-                        reg_values.insert(v.name.clone(), substituted_rhs);
+                        for alias in get_register_aliases(&v.name) {
+                            reg_values.insert(alias, substituted_rhs.clone());
+                        }
                     }
                 }
             }
@@ -211,6 +210,48 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     }
 
     (statements, return_value)
+}
+
+pub(super) fn substitute_prior_register_assignments(expr: Expr, statements: &[Expr]) -> Expr {
+    use super::super::expression::ExprKind;
+
+    let mut reg_values: HashMap<String, Expr> = HashMap::new();
+
+    for stmt in statements {
+        match &stmt.kind {
+            ExprKind::Assign { lhs, rhs } => {
+                let ExprKind::Var(var) = &lhs.kind else {
+                    continue;
+                };
+                if !matches!(var.kind, VarKind::Register(_) | VarKind::Arg(_)) {
+                    continue;
+                }
+
+                let substituted_rhs = substitute_vars(rhs, &reg_values);
+                invalidate_clobbered_register_mappings(&mut reg_values, &var.name);
+                if expr_requires_single_evaluation(&substituted_rhs)
+                    && !expr_is_pure_stack_slot_expression(&substituted_rhs)
+                {
+                    reg_values.remove(&var.name);
+                    continue;
+                }
+
+                for alias in get_register_aliases(&var.name) {
+                    reg_values.insert(alias, substituted_rhs.clone());
+                }
+            }
+            ExprKind::Call { target, .. } => {
+                if statement_contains_real_call(stmt) {
+                    reg_values.clear();
+                } else {
+                    invalidate_pseudo_call_output_copies(&mut reg_values, target);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    substitute_vars(&expr, &reg_values)
 }
 
 fn expr_mentions_stack_canary_guard(expr: &Expr) -> bool {
@@ -7885,6 +7926,26 @@ mod tests {
         assert_eq!(
             format!("{}", return_value.expect("return value")),
             "atomic_exchange(&g_counter, arg0)"
+        );
+    }
+
+    #[test]
+    fn test_extract_return_value_substitutes_cross_width_x86_aliases_for_idiv() {
+        let statements = vec![
+            Expr::assign(reg("rax", 8), reg("rdi", 8)),
+            Expr::assign(reg("rbx", 8), reg("rsi", 8)),
+            Expr::call(CallTarget::Named("cdq".to_string()), vec![]),
+            Expr::assign(
+                reg("eax", 4),
+                Expr::binop(BinOpKind::Div, reg("eax", 4), reg("rbx", 8)),
+            ),
+        ];
+
+        let (_, return_value) = extract_return_value(statements);
+
+        assert_eq!(
+            format!("{}", return_value.expect("return value")),
+            "rdi / rsi"
         );
     }
 

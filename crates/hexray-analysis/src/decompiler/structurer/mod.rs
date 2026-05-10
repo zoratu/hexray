@@ -50,7 +50,8 @@ use simplify::capture_return_register_uses_in_block;
 use simplify::{
     extract_return_value, merge_return_value_captures, propagate_args_in_block,
     propagate_call_args_with_binary_data_and_arch, simplify_statements,
-    statement_contains_real_call, substitute_return_register_uses,
+    statement_contains_real_call, substitute_prior_register_assignments,
+    substitute_return_register_uses,
 };
 use switch::{detect_switch_statements, simplify_strcmp_switch_patterns};
 #[cfg(test)]
@@ -1633,7 +1634,9 @@ impl<'a> Structurer<'a> {
                     ) {
                         filtered_stmts.pop();
                     }
-                    let return_value = return_value.or(implicit_return);
+                    let return_value = return_value.or(implicit_return).map(|expr| {
+                        self.substitute_predecessor_register_values_in_return_expr(block_id, expr)
+                    });
 
                     if !filtered_stmts.is_empty() {
                         result.push(StructuredNode::Block {
@@ -1776,7 +1779,12 @@ impl<'a> Structurer<'a> {
                                 ) {
                                     filtered_stmts.pop();
                                 }
-                                let return_value = return_value.or(implicit_return);
+                                let return_value = return_value.or(implicit_return).map(|expr| {
+                                    self.substitute_predecessor_register_values_in_return_expr(
+                                        normal_target,
+                                        expr,
+                                    )
+                                });
 
                                 if !filtered_stmts.is_empty() {
                                     result.push(StructuredNode::Block {
@@ -1833,6 +1841,12 @@ impl<'a> Structurer<'a> {
                                     address_range,
                                 });
                             }
+                            let return_value = return_value.map(|expr| {
+                                self.substitute_predecessor_register_values_in_return_expr(
+                                    normal_target,
+                                    expr,
+                                )
+                            });
                             result.push(StructuredNode::Return(return_value));
                             break;
                         }
@@ -1878,7 +1892,14 @@ impl<'a> Structurer<'a> {
                                     ) {
                                         filtered_stmts.pop();
                                     }
-                                    let return_value = return_value.or(implicit_return);
+                                    let return_value = return_value
+                                        .or(implicit_return)
+                                        .map(|expr| {
+                                            self.substitute_predecessor_register_values_in_return_expr(
+                                                normal_target,
+                                                expr,
+                                            )
+                                        });
 
                                     if !filtered_stmts.is_empty() {
                                         result.push(StructuredNode::Block {
@@ -2142,6 +2163,40 @@ impl<'a> Structurer<'a> {
         }
 
         candidate.map(Expr::var)
+    }
+
+    fn substitute_predecessor_register_values_in_return_expr(
+        &self,
+        block_id: BasicBlockId,
+        expr: Expr,
+    ) -> Expr {
+        self.substitute_predecessor_register_values_in_return_expr_inner(
+            block_id,
+            expr,
+            &mut HashSet::new(),
+        )
+    }
+
+    fn substitute_predecessor_register_values_in_return_expr_inner(
+        &self,
+        block_id: BasicBlockId,
+        expr: Expr,
+        visited: &mut HashSet<BasicBlockId>,
+    ) -> Expr {
+        if !visited.insert(block_id) {
+            return expr;
+        }
+
+        let preds = self.cfg.predecessors(block_id);
+        if preds.len() != 1 {
+            return expr;
+        }
+
+        let pred = preds[0];
+        let pred_statements = self.block_to_statements(pred);
+        let substituted = substitute_prior_register_assignments(expr, &pred_statements);
+
+        self.substitute_predecessor_register_values_in_return_expr_inner(pred, substituted, visited)
     }
 
     fn last_safe_return_register_expr_in_statements(statements: &[Expr]) -> Option<Expr> {
@@ -7564,6 +7619,93 @@ mod tests {
         };
 
         assert_eq!(format!("{expr}"), "eax / rcx");
+    }
+
+    #[test]
+    fn test_substitute_predecessor_register_values_in_return_expr_recovers_split_idiv_inputs() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ebx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 32);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+        let esi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 32);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(edi)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1002, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(ebx), Operand::Register(esi)]),
+        );
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.instructions.push(
+            Instruction::new(0x1010, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(esi), Operand::Register(esi)]),
+        );
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        let mut sign_extend =
+            Instruction::new(0x1020, 1, vec![], "cdq").with_operation(Operation::SignExtend);
+        sign_extend.reads = vec![eax];
+        sign_extend.writes = vec![edx];
+        bb2.instructions.push(sign_extend);
+        let mut divide = Instruction::new(0x1021, 2, vec![], "idiv")
+            .with_operation(Operation::Div)
+            .with_operands(vec![Operand::Register(ebx)]);
+        divide.reads = vec![edx, eax, ebx];
+        divide.writes = vec![eax, edx];
+        bb2.instructions.push(divide);
+        bb2.instructions.push(
+            Instruction::new(0x1023, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb2.terminator = BlockTerminator::Return;
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.instructions.push(
+            Instruction::new(0x1030, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+
+        let structurer = Structurer::new(&cfg);
+        let rewritten = structurer.substitute_predecessor_register_values_in_return_expr(
+            BasicBlockId::new(2),
+            Expr::binop(
+                BinOpKind::Div,
+                Expr::var(Variable::reg("eax", 4)),
+                Expr::var(Variable::reg("rbx", 4)),
+            ),
+        );
+
+        assert_eq!(format!("{rewritten}"), "rdi / rsi");
     }
 
     #[test]
