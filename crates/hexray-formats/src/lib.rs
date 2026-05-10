@@ -40,6 +40,7 @@
 )]
 #![allow(clippy::panic)]
 
+pub mod ar;
 pub mod cuda;
 pub mod dwarf;
 pub mod elf;
@@ -48,6 +49,7 @@ pub mod macho;
 pub mod pe;
 pub mod traits;
 
+pub use ar::{ArArchive, ArMember, ArMemberKind};
 pub use cuda::{
     FatbinEntry, FatbinEntryKind, FatbinError, FatbinWrapper, HipBundleEntry, HipBundleEntryKind,
     HipBundleError, HipBundleWrapper,
@@ -69,6 +71,7 @@ pub use traits::{BinaryFormat, Section};
 /// Detected binary format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryType {
+    Ar,
     Elf,
     MachO,
     Pe,
@@ -107,6 +110,10 @@ pub fn name_from_bytes(bytes: &[u8]) -> String {
 pub fn detect_format(data: &[u8]) -> BinaryType {
     if data.len() < 4 {
         return BinaryType::Unknown;
+    }
+
+    if data.len() >= 8 && data.get(..8) == Some(b"!<arch>\n".as_slice()) {
+        return BinaryType::Ar;
     }
 
     // Check ELF magic
@@ -222,5 +229,10 @@ mod tests {
         // newline character (no escaping).
         let out = name_from_bytes(b"a\nb");
         assert_eq!(out.as_bytes(), b"a\nb");
+    }
+
+    #[test]
+    fn detect_ar_archive_format() {
+        assert_eq!(detect_format(b"!<arch>\n"), BinaryType::Ar);
     }
 }

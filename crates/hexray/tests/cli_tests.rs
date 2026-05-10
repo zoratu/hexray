@@ -54,6 +54,37 @@ fn temp_path(prefix: &str, extension: &str) -> PathBuf {
     ))
 }
 
+fn append_archive_member(bytes: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let display_name = if name == "/" || name == "//" {
+        name.to_string()
+    } else {
+        format!("{name}/")
+    };
+    let header = format!(
+        "{display_name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        0,
+        0,
+        0,
+        0o644,
+        data.len()
+    );
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        bytes.push(b'\n');
+    }
+}
+
+fn create_test_archive(prefix: &str) -> PathBuf {
+    let path = temp_path(prefix, "a");
+    let mut archive = b"!<arch>\n".to_vec();
+    append_archive_member(&mut archive, "/", &[0, 0, 0, 0]);
+    append_archive_member(&mut archive, "alpha.o", b"AAAA");
+    append_archive_member(&mut archive, "beta.o", b"BBBBB");
+    fs::write(&path, archive).expect("archive fixture should be written");
+    path
+}
+
 const TEST_STRINGS_PRINT_MESSAGE: &str = "0x1000004f8";
 const TEST_STRINGS_MAIN: &str = "0x10000052c";
 const TEST_STRINGS_GREETING: &str = "0x100008000";
@@ -1983,6 +2014,55 @@ fn test_format_auto_detection_pe() {
         stdout.to_lowercase().contains("pe"),
         "Should auto-detect PE format"
     );
+}
+
+#[test]
+fn test_format_auto_detection_ar_archive() {
+    let archive = create_test_archive("cli-ar-info");
+    let archive_arg = archive.to_string_lossy().into_owned();
+    let output = run_hexray(&[&archive_arg, "info"]);
+    assert!(
+        output.status.success(),
+        "archive info should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("ar archive"),
+        "Should identify ar archive format: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("alpha.o"),
+        "Should list archive members: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("beta.o"),
+        "Should list archive members: {}",
+        stdout
+    );
+    let _ = fs::remove_file(archive);
+}
+
+#[test]
+fn test_archive_analysis_reports_extraction_guidance() {
+    let archive = create_test_archive("cli-ar-guidance");
+    let archive_arg = archive.to_string_lossy().into_owned();
+    let output = run_hexray(&[&archive_arg, "decompile", "alpha"]);
+    assert!(!output.status.success(), "archive decompile should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ar x"),
+        "Should suggest extracting archive members: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("alpha.o") && stderr.contains("beta.o"),
+        "Should list archive members in error output: {}",
+        stderr
+    );
+    let _ = fs::remove_file(archive);
 }
 
 // =============================================================================

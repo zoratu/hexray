@@ -32,7 +32,7 @@ use hexray_disasm::{Arm64Disassembler, Disassembler, RiscVDisassembler, X86_64Di
 use hexray_formats::dwarf::{
     decode_uleb128, parse_debug_info, AttributeValue, DebugInfo, Die, DwAt, DwTag,
 };
-use hexray_formats::{detect_format, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
+use hexray_formats::{detect_format, ArArchive, BinaryFormat, BinaryType, Elf, MachO, Pe, Section};
 use hexray_signatures::{builtin as sig_builtin, SignatureMatcher};
 use hexray_types::TypeDatabase;
 use serde::Serialize;
@@ -532,13 +532,16 @@ fn validate_project_address(
     let data = fs::read(binary_path)
         .with_context(|| format!("Failed to read binary: {}", binary_path.display()))?;
     let binary = match detect_format(&data) {
+        BinaryType::Ar => {
+            bail!("ar archives do not have a unified address space; extract a member first")
+        }
         BinaryType::Elf => Binary::Elf(Elf::parse(&data).context("Failed to parse ELF file")?),
         BinaryType::MachO => Binary::MachO(
             MachO::parse_with_arch(&data, None).context("Failed to parse Mach-O file")?,
         ),
         BinaryType::Pe => Binary::Pe(Pe::parse(&data).context("Failed to parse PE file")?),
         BinaryType::Unknown => {
-            bail!("Unknown binary format. Supported formats: ELF, Mach-O, PE");
+            bail!("Unknown binary format. Supported formats: ar, ELF, Mach-O, PE");
         }
     };
 
@@ -717,8 +720,13 @@ fn main() -> Result<()> {
     let data = fs::read(binary_path)
         .with_context(|| format!("Failed to read binary: {}", binary_path.display()))?;
 
+    let binary_type = detect_format(&data);
+    if matches!(binary_type, BinaryType::Ar) {
+        return handle_archive_input(binary_path, &data, cli.command.as_ref());
+    }
+
     // Detect and parse the binary format
-    let binary = match detect_format(&data) {
+    let binary = match binary_type {
         BinaryType::Elf => {
             let elf = Elf::parse(&data).context("Failed to parse ELF file")?;
             Binary::Elf(elf)
@@ -732,8 +740,9 @@ fn main() -> Result<()> {
             let pe = Pe::parse(&data).context("Failed to parse PE file")?;
             Binary::Pe(pe)
         }
+        BinaryType::Ar => unreachable!("handled above"),
         BinaryType::Unknown => {
-            bail!("Unknown binary format. Supported formats: ELF, Mach-O, PE");
+            bail!("Unknown binary format. Supported formats: ar, ELF, Mach-O, PE");
         }
     };
 
@@ -1019,6 +1028,50 @@ fn print_info(binary: &Binary) {
     if !exception_output.is_empty() {
         print!("{}", exception_output);
     }
+}
+
+fn handle_archive_input(binary_path: &Path, data: &[u8], command: Option<&Commands>) -> Result<()> {
+    let archive = ArArchive::parse(data).context("Failed to parse ar archive")?;
+
+    match command {
+        Some(Commands::Info) => {
+            print_archive_info(binary_path, &archive);
+            Ok(())
+        }
+        _ => bail!("{}", archive_usage_message(binary_path, &archive)),
+    }
+}
+
+fn print_archive_info(binary_path: &Path, archive: &ArArchive<'_>) {
+    println!("Archive Information");
+    println!("===================");
+    println!("Format:        ar archive");
+    println!("Path:          {}", binary_path.display());
+    println!("Members:       {}", archive.regular_members().count());
+    println!("\nArchive Members:");
+    for member in archive.regular_members() {
+        println!("  {:<24} {} bytes", member.name(), member.size());
+    }
+}
+
+fn archive_usage_message(binary_path: &Path, archive: &ArArchive<'_>) -> String {
+    let members = archive
+        .regular_members()
+        .map(|member| format!("  {}", member.name()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if members.is_empty() {
+        return format!(
+            "ar archive input is not directly analyzable. Use `ar x {}` to extract members first.",
+            binary_path.display()
+        );
+    }
+
+    format!(
+        "ar archive input is not directly analyzable.\nMembers:\n{}\nUse `ar x {}` to extract members, then analyze each .o file.",
+        members,
+        binary_path.display()
+    )
 }
 
 fn print_sections(binary: &Binary) {
@@ -7071,6 +7124,9 @@ fn handle_diff_command(
 
     // Parse the original binary to find function symbols
     let original_binary = match detect_format(&original_data) {
+        BinaryType::Ar => {
+            bail!("Diff does not support ar archives; extract members first");
+        }
         BinaryType::Elf => {
             let elf = Elf::parse(&original_data).context("Failed to parse original as ELF")?;
             Binary::Elf(elf)
@@ -7287,6 +7343,9 @@ fn handle_session_resume(session_path: &Path) -> Result<()> {
         .with_context(|| format!("Failed to read binary: {}", binary_path.display()))?;
 
     let binary = match detect_format(&data) {
+        BinaryType::Ar => {
+            bail!("Cannot resume a session from an ar archive; extract a member first")
+        }
         BinaryType::Elf => Binary::Elf(Elf::parse(&data)?),
         BinaryType::MachO => Binary::MachO(MachO::parse(&data)?),
         BinaryType::Pe => Binary::Pe(Pe::parse(&data)?),
@@ -7317,6 +7376,7 @@ fn handle_session_new(binary_path: &Path, output: Option<&PathBuf>) -> Result<()
     // Load binary and start REPL
     let data = fs::read(binary_path)?;
     let binary = match detect_format(&data) {
+        BinaryType::Ar => bail!("Cannot start a session on an ar archive; extract a member first"),
         BinaryType::Elf => Binary::Elf(Elf::parse(&data)?),
         BinaryType::MachO => Binary::MachO(MachO::parse(&data)?),
         BinaryType::Pe => Binary::Pe(Pe::parse(&data)?),
@@ -8603,6 +8663,12 @@ fn cmp_recognizes_gpu_binary(binary: &Binary) -> bool {
 fn cmp_kernels(a: &Binary, b_path: &Path) -> Result<()> {
     let b_data = fs::read(b_path).with_context(|| format!("reading {}", b_path.display()))?;
     let b = match detect_format(&b_data) {
+        BinaryType::Ar => {
+            bail!(
+                "Kernel comparison does not support ar archives: {}",
+                b_path.display()
+            );
+        }
         BinaryType::Elf => Binary::Elf(Elf::parse(&b_data).context("Failed to parse ELF (b)")?),
         BinaryType::MachO => {
             Binary::MachO(MachO::parse(&b_data).context("Failed to parse Mach-O (b)")?)
