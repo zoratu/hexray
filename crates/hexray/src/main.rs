@@ -3138,11 +3138,11 @@ fn decompile_function(
         let signature = decompiler.recover_signature(&cfg);
         print_signature_diagnostics(&name, &signature);
     }
-    let pseudocode = annotate_pseudocode_with_project_comments(
+    let pseudocode = ensure_nonempty_pseudocode(annotate_pseudocode_with_project_comments(
         decompiler.decompile(&cfg, &name),
         project,
         show_addresses,
-    );
+    ));
 
     println!("{}", pseudocode);
 
@@ -3203,6 +3203,13 @@ fn annotate_pseudocode_with_project_comments(
     } else {
         rendered.trim_end_matches('\n').to_string()
     }
+}
+
+fn ensure_nonempty_pseudocode(mut pseudocode: String) -> String {
+    if pseudocode.trim().is_empty() {
+        pseudocode.push_str("/* decompilation body not recoverable */");
+    }
+    pseudocode
 }
 
 fn parse_basic_block_address_line(line: &str) -> Option<(u64, u64, String)> {
@@ -6110,11 +6117,11 @@ fn decompile_with_follow(
             let signature = decompiler.recover_signature(&cfg);
             print_signature_diagnostics(&func_name, &signature);
         }
-        let pseudocode = annotate_pseudocode_with_project_comments(
+        let pseudocode = ensure_nonempty_pseudocode(annotate_pseudocode_with_project_comments(
             decompiler.decompile(&cfg, &func_name),
             project,
             show_addresses,
-        );
+        ));
 
         println!("{}", pseudocode);
 
@@ -8350,7 +8357,8 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     decompiler = decompiler.with_exception_info(info);
                 }
 
-                let pseudo_code = decompiler.decompile(&cfg, &func_name);
+                let pseudo_code =
+                    ensure_nonempty_pseudocode(decompiler.decompile(&cfg, &func_name));
 
                 if json_mode {
                     let result = JsonDecompile {

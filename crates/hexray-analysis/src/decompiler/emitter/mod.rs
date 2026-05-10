@@ -5673,6 +5673,14 @@ impl PseudoCodeEmitter {
             &func_info.skip_statements,
             &mut declared_vars,
         );
+        if body_output.trim().is_empty() {
+            writeln!(
+                body_output,
+                "{}/* decompilation body not recoverable */",
+                self.indent
+            )
+            .unwrap();
+        }
         if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
             if !self.body_ends_with_control_exit(&display_body)
                 && !Self::output_ends_with_return_stmt(&body_output)
@@ -5856,6 +5864,14 @@ impl PseudoCodeEmitter {
             &func_info.skip_statements,
             &mut declared_vars,
         );
+        if body_output.trim().is_empty() {
+            writeln!(
+                body_output,
+                "{}/* decompilation body not recoverable */",
+                self.indent
+            )
+            .unwrap();
+        }
         if let Some(fallback) = self.return_fallback_expr.borrow().clone() {
             if !self.body_ends_with_control_exit(&display_body)
                 && !Self::output_ends_with_return_stmt(&body_output)
@@ -8907,6 +8923,19 @@ mod tests {
             output.contains("__stack_chk_fail"),
             "user-authored fail call should not be elided:\n{output}"
         );
+    }
+
+    #[test]
+    fn test_emit_inserts_placeholder_for_empty_body() {
+        let cfg = StructuredCfg {
+            body: Vec::new(),
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "empty_body");
+
+        assert!(output.contains("/* decompilation body not recoverable */"));
     }
 
     #[test]

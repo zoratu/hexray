@@ -4947,8 +4947,8 @@ fn extract_call_arguments_with_indices(
             }
         }
     }
-    let mut args: Vec<(usize, Option<usize>, Expr)> = Vec::new(); // (arg_idx, stmt_idx, value)
     let mut removable_indices = Vec::new();
+    let mut explicit_by_index: HashMap<usize, (Option<usize>, String, Expr)> = HashMap::new();
 
     for (reg_name, (stmt_idx, value)) in arg_values {
         if excluded_regs.contains(&reg_name.to_lowercase()) {
@@ -4964,12 +4964,21 @@ fn extract_call_arguments_with_indices(
                 }
                 continue;
             }
-            args.push((arg_idx, *stmt_idx, value.clone()));
+            let candidate = (*stmt_idx, reg_name.to_lowercase(), value.clone());
+            match explicit_by_index.get_mut(&arg_idx) {
+                Some(existing) => {
+                    if tracked_arg_candidate_priority(candidate.0, &candidate.1)
+                        > tracked_arg_candidate_priority(existing.0, &existing.1)
+                    {
+                        *existing = candidate;
+                    }
+                }
+                None => {
+                    explicit_by_index.insert(arg_idx, candidate);
+                }
+            }
         }
     }
-
-    // Sort by argument index
-    args.sort_by_key(|(arg_idx, _, _)| *arg_idx);
 
     let family = infer_argument_abi_family(
         arg_values
@@ -4978,10 +4987,6 @@ fn extract_call_arguments_with_indices(
             .chain(excluded_regs.iter().map(String::as_str)),
     )
     .or(preferred_family);
-    let explicit_by_index: HashMap<usize, (Option<usize>, Expr)> = args
-        .into_iter()
-        .map(|(arg_idx, stmt_idx, value)| (arg_idx, (stmt_idx, value)))
-        .collect();
     let Some(max_idx) = explicit_by_index.keys().copied().max() else {
         if let Some(sig) = signature.as_ref() {
             if sig.fixed_arg_count == 0 {
@@ -5050,7 +5055,7 @@ fn extract_call_arguments_with_indices(
     let mut result = existing_args.to_vec();
     let mut used_indices = removable_indices;
     for expected_idx in start_idx..=max_idx {
-        if let Some((stmt_idx, value)) = explicit_by_index.get(&expected_idx) {
+        if let Some((stmt_idx, _, value)) = explicit_by_index.get(&expected_idx) {
             result.push(value.clone());
             if let Some(stmt_idx) = stmt_idx {
                 used_indices.push(*stmt_idx);
@@ -5071,6 +5076,29 @@ fn extract_call_arguments_with_indices(
     }
 
     (result, used_indices)
+}
+
+fn tracked_arg_candidate_priority(
+    stmt_idx: Option<usize>,
+    reg_name: &str,
+) -> (usize, usize, usize, String) {
+    (
+        usize::from(stmt_idx.is_some()),
+        stmt_idx.unwrap_or(0),
+        tracked_arg_register_priority(reg_name),
+        reg_name.to_lowercase(),
+    )
+}
+
+fn tracked_arg_register_priority(reg_name: &str) -> usize {
+    match reg_name.to_lowercase().as_str() {
+        "rdi" | "rsi" | "rdx" | "rcx" | "r8" | "r9" | "xmm0" | "xmm1" | "xmm2" | "xmm3"
+        | "xmm4" | "xmm5" | "xmm6" | "xmm7" | "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6"
+        | "x7" | "a0" | "a1" | "a2" | "a3" | "a4" | "a5" | "a6" | "a7" => 2,
+        "edi" | "esi" | "edx" | "ecx" | "r8d" | "r9d" | "d0" | "d1" | "d2" | "d3" | "d4" | "d5"
+        | "d6" | "d7" | "w0" | "w1" | "w2" | "w3" | "w4" | "w5" | "w6" | "w7" => 1,
+        _ => 0,
+    }
 }
 
 fn recover_typed_call_arguments(
@@ -6518,8 +6546,7 @@ pub(super) fn capture_return_register_uses_in_block(
         let direct_capture = call_target.is_some_and(should_capture_call_result_directly);
         let primary_reg = if !next_regs.is_empty() {
             next_regs
-                .iter()
-                .next()
+                .first()
                 .cloned()
                 .unwrap_or_else(|| "x0".to_string())
         } else if let Some(reg) = first_return_register_use_before_clobber(&stmts[i + 1..]) {
@@ -7187,21 +7214,27 @@ fn return_register_aliases(reg_name: &str) -> Vec<String> {
     }
 }
 
-fn collect_return_register_uses(stmt: &Expr) -> HashSet<String> {
+fn push_unique_return_register_use(out: &mut Vec<String>, name: String) {
+    if !out.iter().any(|existing| existing == &name) {
+        out.push(name);
+    }
+}
+
+fn collect_return_register_uses(stmt: &Expr) -> Vec<String> {
     use super::super::expression::ExprKind;
 
-    fn walk(expr: &Expr, out: &mut HashSet<String>) {
+    fn walk(expr: &Expr, out: &mut Vec<String>) {
         match &expr.kind {
             ExprKind::Var(v) => {
                 let name = v.name.to_lowercase();
                 if is_return_value_alias(&name) {
-                    out.insert(name);
+                    push_unique_return_register_use(out, name);
                 }
             }
             ExprKind::Unknown(name) => {
                 let lower = name.to_lowercase();
                 if is_return_value_alias(&lower) {
-                    out.insert(lower);
+                    push_unique_return_register_use(out, lower);
                 }
             }
             ExprKind::BinOp { left, right, .. } => {
@@ -7251,7 +7284,7 @@ fn collect_return_register_uses(stmt: &Expr) -> HashSet<String> {
         }
     }
 
-    let mut out = HashSet::new();
+    let mut out = Vec::new();
     walk(stmt, &mut out);
     out
 }
@@ -9450,6 +9483,36 @@ mod tests {
 
         assert_eq!(format!("{}", merged[0]), "ret_0 = strtol()");
         assert_eq!(format!("{}", merged[1]), "format_msg(rsp, ret_0)");
+    }
+
+    #[test]
+    fn test_collect_return_register_uses_preserves_first_seen_order() {
+        let stmt = Expr::binop(BinOpKind::Add, reg("eax", 4), reg("rax", 8));
+
+        let uses = collect_return_register_uses(&stmt);
+
+        assert_eq!(uses, vec!["eax".to_string(), "rax".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_call_arguments_prefers_latest_alias_for_same_slot() {
+        let mut arg_values = HashMap::new();
+        arg_values.insert("edi".to_string(), (Some(0), Expr::int(1)));
+        arg_values.insert("rdi".to_string(), (Some(1), Expr::int(2)));
+
+        let (args, used_indices) = extract_call_arguments_with_indices(
+            None,
+            &[],
+            &arg_values,
+            None,
+            &HashSet::new(),
+            None,
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+
+        assert_eq!(args.len(), 1);
+        assert_eq!(format!("{}", args[0]), "2");
+        assert_eq!(used_indices, vec![1]);
     }
 
     #[test]
