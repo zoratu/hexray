@@ -15,10 +15,11 @@ use crate::dataflow::infer_cfg_arch;
 use super::abi;
 use super::expression::{
     resolve_adrp_patterns, BinOpKind, CallTarget as ExprCallTarget, Expr, ExprKind, UnaryOpKind,
-    Variable,
+    VarKind, Variable,
 };
 use super::for_loop_detection::detect_for_loops;
 use super::short_circuit::detect_short_circuit;
+use super::signature::known_function_param_count;
 use super::switch_recovery::SwitchRecovery;
 use super::{BinaryDataContext, ExceptionInfo};
 
@@ -1543,9 +1544,9 @@ impl<'a> Structurer<'a> {
 
                 BlockTerminator::Jump { target }
                     if self.is_empty_placeholder_block(*target)
-                        && Self::tail_jump_call_expr(block).is_some() =>
+                        && self.tail_jump_call_expr(block).is_some() =>
                 {
-                    if let Some(expr) = Self::tail_jump_call_expr(block) {
+                    if let Some(expr) = self.tail_jump_call_expr(block) {
                         statements.push(expr);
                         statements = propagate_args_in_block(statements);
                     }
@@ -1916,7 +1917,7 @@ impl<'a> Structurer<'a> {
                     }
 
                     // Fallback: emit block and break
-                    if let Some(expr) = Self::tail_jump_call_expr(block) {
+                    if let Some(expr) = self.tail_jump_call_expr(block) {
                         statements.push(expr);
                         statements = propagate_args_in_block(statements);
                     }
@@ -1931,7 +1932,7 @@ impl<'a> Structurer<'a> {
                 }
 
                 BlockTerminator::Unknown => {
-                    if let Some(expr) = Self::tail_jump_call_expr(block) {
+                    if let Some(expr) = self.tail_jump_call_expr(block) {
                         statements.push(expr);
                         statements = propagate_args_in_block(statements);
                     }
@@ -2055,26 +2056,32 @@ impl<'a> Structurer<'a> {
             .is_some_and(|block| block.instructions.is_empty())
     }
 
-    fn tail_jump_call_expr(block: &BasicBlock) -> Option<Expr> {
+    fn tail_jump_call_expr(&self, block: &BasicBlock) -> Option<Expr> {
         let inst = block.instructions.last()?;
 
         match (&block.terminator, &inst.control_flow) {
             (BlockTerminator::Unknown, ControlFlow::UnconditionalBranch { target }) => {
-                Some(Expr::call(
-                    ExprCallTarget::Direct {
+                let target_expr = self
+                    .resolved_direct_tail_target(*target, inst.address)
+                    .unwrap_or(ExprCallTarget::Direct {
                         target: *target,
                         call_site: inst.address,
-                    },
-                    Self::direct_tail_passthrough_args(block),
+                    });
+                Some(Expr::call(
+                    target_expr,
+                    self.direct_tail_passthrough_args(block, *target, inst.address),
                 ))
             }
             (BlockTerminator::Jump { .. }, ControlFlow::UnconditionalBranch { target }) => {
-                Some(Expr::call(
-                    ExprCallTarget::Direct {
+                let target_expr = self
+                    .resolved_direct_tail_target(*target, inst.address)
+                    .unwrap_or(ExprCallTarget::Direct {
                         target: *target,
                         call_site: inst.address,
-                    },
-                    Self::direct_tail_passthrough_args(block),
+                    });
+                Some(Expr::call(
+                    target_expr,
+                    self.direct_tail_passthrough_args(block, *target, inst.address),
                 ))
             }
             (
@@ -2089,18 +2096,108 @@ impl<'a> Structurer<'a> {
         }
     }
 
-    fn direct_tail_passthrough_args(block: &BasicBlock) -> Vec<Expr> {
+    fn resolved_direct_tail_target(&self, target: u64, call_site: u64) -> Option<ExprCallTarget> {
+        self.binary_data
+            .and_then(|ctx| {
+                ctx.call_target_name_by_call_site(call_site)
+                    .or_else(|| ctx.call_target_name_by_address(target))
+            })
+            .map(|name| ExprCallTarget::Named(name.to_string()))
+    }
+
+    fn direct_tail_passthrough_args(
+        &self,
+        block: &BasicBlock,
+        target: u64,
+        call_site: u64,
+    ) -> Vec<Expr> {
         let is_pure_jump_wrapper = block.instructions.iter().all(|inst| {
             inst.operation == Operation::Jump
                 || inst.operation == Operation::Nop
                 || inst.mnemonic.starts_with("endbr")
         });
 
-        if is_pure_jump_wrapper {
-            vec![Expr::var(Variable::reg("edi", 4))]
-        } else {
-            vec![]
+        if !is_pure_jump_wrapper {
+            return vec![];
         }
+
+        let known_arg_count = self
+            .binary_data
+            .and_then(|ctx| {
+                ctx.call_target_name_by_address(target)
+                    .and_then(known_function_param_count)
+                    .or_else(|| ctx.call_signature_hint_by_address(target))
+            })
+            .or_else(|| {
+                self.resolved_direct_tail_target(target, call_site)
+                    .and_then(|target| match target {
+                        ExprCallTarget::Named(name) => known_function_param_count(&name),
+                        _ => None,
+                    })
+            });
+
+        if let Some(arg_count) = known_arg_count {
+            return match infer_cfg_arch(self.cfg) {
+                Some(arch) => Self::abi_passthrough_args(Some(arch), arg_count),
+                None => Self::lifted_passthrough_args(arg_count),
+            };
+        }
+
+        vec![Expr::var(Variable::reg("edi", 4))]
+    }
+
+    fn abi_passthrough_args(
+        arch: Option<hexray_core::Architecture>,
+        arg_count: usize,
+    ) -> Vec<Expr> {
+        let regs: &[(&str, u8)] = match arch {
+            Some(hexray_core::Architecture::X86_64) => &[
+                ("edi", 4),
+                ("esi", 4),
+                ("edx", 4),
+                ("ecx", 4),
+                ("r8d", 4),
+                ("r9d", 4),
+            ],
+            Some(hexray_core::Architecture::Arm64) => &[
+                ("w0", 4),
+                ("w1", 4),
+                ("w2", 4),
+                ("w3", 4),
+                ("w4", 4),
+                ("w5", 4),
+                ("w6", 4),
+                ("w7", 4),
+            ],
+            Some(hexray_core::Architecture::RiscV64) => &[
+                ("a0", 8),
+                ("a1", 8),
+                ("a2", 8),
+                ("a3", 8),
+                ("a4", 8),
+                ("a5", 8),
+                ("a6", 8),
+                ("a7", 8),
+            ],
+            _ => &[("edi", 4)],
+        };
+
+        regs.iter()
+            .take(arg_count)
+            .map(|(name, size)| Expr::var(Variable::reg(*name, *size)))
+            .collect()
+    }
+
+    fn lifted_passthrough_args(arg_count: usize) -> Vec<Expr> {
+        (0..arg_count)
+            .map(|idx| {
+                Expr::var(Variable {
+                    kind: VarKind::Arg(idx as u8),
+                    name: format!("arg{idx}"),
+                    size: 8,
+                })
+            })
+            .collect()
     }
 
     fn tail_jump_indirect_target(inst: &hexray_core::Instruction) -> ExprCallTarget {
@@ -6137,6 +6234,87 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["edi"]
+        );
+    }
+
+    #[test]
+    fn test_structure_known_direct_tail_jump_uses_known_arity() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x2000, "strcpy@GLIBC_2.2.5");
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 5, vec![0xe9, 0, 0, 0, 0], "jmp")
+                .with_operation(Operation::Jump)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000), Operand::Register(edi)])
+                .with_control_flow(ControlFlow::UnconditionalBranch { target: 0x2000 }),
+        );
+        bb0.terminator = BlockTerminator::Unknown;
+        cfg.add_block(bb0);
+
+        let mut structurer = Structurer::new_with_binary_data(&cfg, Some(&binary_data));
+        let structured = structurer.structure();
+        let Some(StructuredNode::Block { statements, .. }) = structured.first() else {
+            panic!("expected single block body");
+        };
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = statements.last()
+        else {
+            panic!("expected synthesized tail call");
+        };
+
+        match target {
+            ExprCallTarget::Named(name) => assert_eq!(name, "strcpy@GLIBC_2.2.5"),
+            other => panic!("expected resolved named target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["edi", "esi"]
+        );
+    }
+
+    #[test]
+    fn test_structure_known_direct_tail_jump_without_arch_uses_arg_placeholders() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x2000, "strcpy@GLIBC_2.2.5@plt");
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 5, vec![0xe9, 0, 0, 0, 0], "jmp")
+                .with_operation(Operation::Jump)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000)])
+                .with_control_flow(ControlFlow::UnconditionalBranch { target: 0x2000 }),
+        );
+        bb0.terminator = BlockTerminator::Unknown;
+        cfg.add_block(bb0);
+
+        let mut structurer = Structurer::new_with_binary_data(&cfg, Some(&binary_data));
+        let structured = structurer.structure();
+        let Some(StructuredNode::Block { statements, .. }) = structured.first() else {
+            panic!("expected single block body");
+        };
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = statements.last()
+        else {
+            panic!("expected synthesized tail call");
+        };
+
+        match target {
+            ExprCallTarget::Named(name) => assert_eq!(name, "strcpy@GLIBC_2.2.5@plt"),
+            other => panic!("expected resolved named target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["arg0", "arg1"]
         );
     }
 

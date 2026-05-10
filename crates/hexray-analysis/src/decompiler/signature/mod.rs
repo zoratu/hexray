@@ -51,6 +51,7 @@ use std::sync::OnceLock;
 mod known_funcs;
 mod types;
 use known_funcs::get_known_function_params;
+pub(crate) use known_funcs::known_function_param_count;
 pub use types::{
     CallingConvention, FunctionSignature, ParamType, Parameter, ParameterLocation,
     ParameterUsageHints,
@@ -99,6 +100,8 @@ pub struct SignatureRecovery {
     return_function_pointer: Option<ParamType>,
     /// Candidate return type inferred from tail-position call forwarding.
     tail_call_return_type: Option<ParamType>,
+    /// Minimum arity required by a pure known tail-call wrapper.
+    tail_call_min_arity: Option<usize>,
     /// Whether the return value is likely a pointer based on usage patterns.
     return_is_pointer: bool,
     /// Human-readable reasons that led to return type inference.
@@ -178,6 +181,7 @@ impl SignatureRecovery {
             x87_stack_arg_offsets: BTreeSet::new(),
             return_function_pointer: None,
             tail_call_return_type: None,
+            tail_call_min_arity: None,
             return_is_pointer: false,
             return_provenance: Vec::new(),
             return_confidence: 0,
@@ -255,6 +259,7 @@ impl SignatureRecovery {
         self.x87_stack_arg_offsets.clear();
         self.return_function_pointer = None;
         self.tail_call_return_type = None;
+        self.tail_call_min_arity = None;
         self.return_is_pointer = false;
         self.return_provenance.clear();
         self.return_confidence = 0;
@@ -832,6 +837,49 @@ impl SignatureRecovery {
                 if near_return && !self.return_value_set {
                     if let Some(candidate) = self.infer_tail_call_return_type(expr) {
                         self.tail_call_return_type = Some(candidate);
+                    }
+                    if let ExprKind::Call { target, args } = &expr.kind {
+                        if let Some(name) = self.extract_call_name(target) {
+                            if let Some(params) = get_known_function_params(&name) {
+                                let mut is_pure_prefix_wrapper =
+                                    !args.is_empty() && args.len() < params.len();
+                                for (arg_index, arg) in args.iter().enumerate() {
+                                    let resolved_param_idx =
+                                        self.resolve_param_index_from_expr_precise(arg);
+                                    if let Some(param_idx) = resolved_param_idx {
+                                        if let Some((param_name, param_type)) =
+                                            params.get(arg_index)
+                                        {
+                                            self.param_names
+                                                .entry(param_idx)
+                                                .or_insert_with(|| (*param_name).to_string());
+                                            self.param_type_overrides
+                                                .entry(param_idx)
+                                                .or_insert_with(|| param_type.clone());
+                                        }
+                                        is_pure_prefix_wrapper &= param_idx == arg_index;
+                                    } else {
+                                        is_pure_prefix_wrapper = false;
+                                    }
+                                }
+
+                                if is_pure_prefix_wrapper {
+                                    self.tail_call_min_arity = Some(
+                                        self.tail_call_min_arity.unwrap_or(0).max(params.len()),
+                                    );
+                                    for (param_idx, (param_name, param_type)) in
+                                        params.iter().enumerate()
+                                    {
+                                        self.param_names
+                                            .entry(param_idx)
+                                            .or_insert_with(|| (*param_name).to_string());
+                                        self.param_type_overrides
+                                            .entry(param_idx)
+                                            .or_insert_with(|| param_type.clone());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 self.analyze_expr_reads(expr);
@@ -3176,6 +3224,21 @@ impl SignatureRecovery {
         for idx in 0..self.dwarf_param_names.len().min(int_regs.len()) {
             if !used_args.contains(&idx) {
                 used_args.push(idx);
+            }
+        }
+        if self.tail_call_min_arity.is_some()
+            && self
+                .current_func_name
+                .as_ref()
+                .and_then(|name| get_known_function_params(name))
+                .is_none()
+        {
+            if let Some(min_arity) = self.tail_call_min_arity {
+                for idx in 0..min_arity.min(int_regs.len()) {
+                    if !used_args.contains(&idx) {
+                        used_args.push(idx);
+                    }
+                }
             }
         }
         used_args.sort_unstable();
@@ -5863,6 +5926,98 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_recovery_uses_known_tail_call_params_for_wrapper() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("strcpy@GLIBC_2.2.5".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::var(Variable::reg("rsi", 8)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(sig.parameters[0].name, "dst");
+        assert_eq!(sig.parameters[1].name, "src");
+        assert_eq!(sig.parameters[0].param_type, ParamType::Pointer);
+        assert_eq!(sig.parameters[1].param_type, ParamType::Pointer);
+    }
+
+    #[test]
+    fn test_signature_recovery_pads_known_tail_call_wrapper_arity() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("strcpy@GLIBC_2.2.5".to_string()),
+            vec![Expr::var(Variable::reg("rdi", 8))],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(sig.parameters[0].name, "dst");
+        assert_eq!(sig.parameters[1].name, "src");
+    }
+
+    #[test]
+    fn test_signature_recovery_does_not_extend_non_passthrough_chk_wrapper_arity() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("__sprintf_chk@GLIBC_2.3.4".to_string()),
+            vec![
+                Expr::var(Variable::reg("rdi", 8)),
+                Expr::int(2),
+                Expr::int(-1),
+                Expr::unknown("\"x=%d\""),
+                Expr::var(Variable::reg("esi", 4)),
+            ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2);
+        assert_eq!(sig.parameters[0].name, "dst");
+        assert_eq!(sig.parameters[1].name, "arg1");
+    }
+
+    #[test]
     fn test_signature_recovery_tracks_temp_value_width_for_return() {
         use hexray_core::BasicBlockId;
 
@@ -6809,6 +6964,35 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert_eq!(params[0].0, "haystack");
         assert_eq!(params[1].0, "needle");
+    }
+
+    #[test]
+    fn test_known_function_params_chk_variants() {
+        let strcpy_chk = get_known_function_params("__strcpy_chk@GLIBC_2.3.4").unwrap();
+        assert_eq!(strcpy_chk.len(), 3);
+        assert_eq!(strcpy_chk[0].0, "dst");
+        assert_eq!(strcpy_chk[2].0, "dstlen");
+
+        let memcpy_chk = get_known_function_params("__memcpy_chk@GLIBC_2.3.4").unwrap();
+        assert_eq!(memcpy_chk.len(), 4);
+        assert_eq!(memcpy_chk[3].0, "dstlen");
+
+        let sprintf_chk = get_known_function_params("__sprintf_chk@GLIBC_2.3.4").unwrap();
+        assert_eq!(sprintf_chk.len(), 4);
+        assert_eq!(sprintf_chk[3].0, "format");
+
+        let snprintf_chk = get_known_function_params("__snprintf_chk@GLIBC_2.3.4").unwrap();
+        assert_eq!(snprintf_chk.len(), 5);
+        assert_eq!(snprintf_chk[4].0, "format");
+
+        assert_eq!(
+            known_function_param_count("__strcpy_chk@GLIBC_2.3.4"),
+            Some(3)
+        );
+        assert_eq!(
+            known_function_param_count("__snprintf_chk@GLIBC_2.3.4"),
+            Some(5)
+        );
     }
 
     #[test]

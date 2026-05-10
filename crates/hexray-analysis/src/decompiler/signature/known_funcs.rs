@@ -44,6 +44,12 @@ pub(super) fn get_known_function_params(
             ("src", ParamType::Pointer),
             ("n", ParamType::UnsignedInt(64)),
         ]),
+        "memcpy_chk" => Some(&[
+            ("dst", ParamType::Pointer),
+            ("src", ParamType::Pointer),
+            ("n", ParamType::UnsignedInt(64)),
+            ("dstlen", ParamType::UnsignedInt(64)),
+        ]),
         "memset" => Some(&[
             ("s", ParamType::Pointer),
             ("c", ParamType::SignedInt(32)),
@@ -64,6 +70,11 @@ pub(super) fn get_known_function_params(
         // String functions
         "strlen" | "wcslen" => Some(&[("s", ParamType::Pointer)]),
         "strcpy" | "wcscpy" => Some(&[("dst", ParamType::Pointer), ("src", ParamType::Pointer)]),
+        "strcpy_chk" => Some(&[
+            ("dst", ParamType::Pointer),
+            ("src", ParamType::Pointer),
+            ("dstlen", ParamType::UnsignedInt(64)),
+        ]),
         "strncpy" | "wcsncpy" => Some(&[
             ("dst", ParamType::Pointer),
             ("src", ParamType::Pointer),
@@ -94,6 +105,19 @@ pub(super) fn get_known_function_params(
             ("str", ParamType::Pointer),
             ("delim", ParamType::Pointer),
             ("saveptr", ParamType::Pointer),
+        ]),
+        "sprintf_chk" => Some(&[
+            ("dst", ParamType::Pointer),
+            ("flag", ParamType::SignedInt(32)),
+            ("dstlen", ParamType::UnsignedInt(64)),
+            ("format", ParamType::Pointer),
+        ]),
+        "snprintf_chk" => Some(&[
+            ("dst", ParamType::Pointer),
+            ("maxlen", ParamType::UnsignedInt(64)),
+            ("flag", ParamType::SignedInt(32)),
+            ("dstlen", ParamType::UnsignedInt(64)),
+            ("format", ParamType::Pointer),
         ]),
 
         // String conversion
@@ -435,4 +459,8 @@ pub(super) fn get_known_function_params(
 
         _ => None,
     }
+}
+
+pub(crate) fn known_function_param_count(func_name: &str) -> Option<usize> {
+    get_known_function_params(func_name).map(|params| params.len())
 }
