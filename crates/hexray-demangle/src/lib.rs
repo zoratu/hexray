@@ -69,7 +69,52 @@ fn split_symbol_suffix(name: &str) -> (&str, &str) {
 }
 
 fn postprocess_demangled(mangled: &str, demangled: String) -> String {
-    recover_make_shared_signature(mangled, &demangled).unwrap_or(demangled)
+    let demangled = recover_make_shared_signature(mangled, &demangled).unwrap_or(demangled);
+    append_itanium_special_member_variant(mangled, demangled)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialMemberVariant {
+    CompleteCtor,
+    BaseCtor,
+    AllocatingCtor,
+    DeletingDtor,
+    CompleteDtor,
+    BaseDtor,
+}
+
+impl SpecialMemberVariant {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CompleteCtor | Self::CompleteDtor => "complete",
+            Self::BaseCtor | Self::BaseDtor => "base",
+            Self::AllocatingCtor => "allocating",
+            Self::DeletingDtor => "deleting",
+        }
+    }
+}
+
+fn append_itanium_special_member_variant(mangled: &str, demangled: String) -> String {
+    let Some(variant) = detect_itanium_special_member_variant(mangled) else {
+        return demangled;
+    };
+
+    let label = variant.label();
+    if demangled.ends_with(&format!(" [{label}]")) {
+        demangled
+    } else {
+        format!("{demangled} [{label}]")
+    }
+}
+
+fn detect_itanium_special_member_variant(name: &str) -> Option<SpecialMemberVariant> {
+    let normalized = normalize_prefixed_name(name, "_Z")?;
+    let mut demangler = ItaniumDemangler::new(normalized);
+    if !demangler.expect("_Z") {
+        return None;
+    }
+    demangler.parse_name()?;
+    demangler.special_member_variant
 }
 
 fn recover_make_shared_signature(mangled: &str, demangled: &str) -> Option<String> {
@@ -199,6 +244,8 @@ struct ItaniumDemangler<'a> {
     substitutions: Vec<String>,
     /// Template argument substitutions
     template_args: Vec<String>,
+    /// Constructor/destructor ABI variant for the parsed symbol name.
+    special_member_variant: Option<SpecialMemberVariant>,
 }
 
 impl<'a> ItaniumDemangler<'a> {
@@ -208,6 +255,7 @@ impl<'a> ItaniumDemangler<'a> {
             pos: 0,
             substitutions: Vec::new(),
             template_args: Vec::new(),
+            special_member_variant: None,
         }
     }
 
@@ -512,10 +560,22 @@ impl<'a> ItaniumDemangler<'a> {
     fn parse_ctor_dtor_name(&mut self, class_name: &str) -> Option<String> {
         match self.peek_n(2) {
             "C1" | "C2" | "C3" => {
+                self.special_member_variant = Some(match self.peek_n(2) {
+                    "C1" => SpecialMemberVariant::CompleteCtor,
+                    "C2" => SpecialMemberVariant::BaseCtor,
+                    "C3" => SpecialMemberVariant::AllocatingCtor,
+                    _ => unreachable!(),
+                });
                 self.consume(2);
                 Some(class_name.to_string())
             }
             "D0" | "D1" | "D2" => {
+                self.special_member_variant = Some(match self.peek_n(2) {
+                    "D0" => SpecialMemberVariant::DeletingDtor,
+                    "D1" => SpecialMemberVariant::CompleteDtor,
+                    "D2" => SpecialMemberVariant::BaseDtor,
+                    _ => unreachable!(),
+                });
                 self.consume(2);
                 Some(format!("~{}", class_name))
             }
@@ -1229,13 +1289,33 @@ mod tests {
         // Constructor: _ZN5ClassC1Ev -> Class::Class()
         assert_eq!(
             demangle("_ZN5ClassC1Ev"),
-            Some("Class::Class()".to_string())
+            Some("Class::Class() [complete]".to_string())
         );
 
         // Destructor: _ZN5ClassD1Ev -> Class::~Class()
         assert_eq!(
             demangle("_ZN5ClassD1Ev"),
-            Some("Class::~Class()".to_string())
+            Some("Class::~Class() [complete]".to_string())
+        );
+    }
+
+    #[test]
+    fn test_constructor_destructor_variants_are_preserved() {
+        assert_eq!(
+            demangle("_ZN3DogC2Ev"),
+            Some("Dog::Dog() [base]".to_string())
+        );
+        assert_eq!(
+            demangle("_ZN3DogC3Ev"),
+            Some("Dog::Dog() [allocating]".to_string())
+        );
+        assert_eq!(
+            demangle("_ZN3DogD0Ev"),
+            Some("Dog::~Dog() [deleting]".to_string())
+        );
+        assert_eq!(
+            demangle("_ZN3DogD2Ev"),
+            Some("Dog::~Dog() [base]".to_string())
         );
     }
 
