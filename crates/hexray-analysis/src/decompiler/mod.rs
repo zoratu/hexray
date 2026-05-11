@@ -58,7 +58,7 @@ pub use structurer::{CatchHandler, LoopKind, StructuredCfg, StructuredNode};
 pub use switch_recovery::{JumpTableInfo, SwitchInfo, SwitchKind, SwitchRecovery};
 pub use type_propagation::{ExprType, ExpressionTypePropagation, KnownSignature};
 
-use hexray_core::ControlFlowGraph;
+use hexray_core::{ControlFlowGraph, SymbolKind};
 use hexray_types::TypeDatabase;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -824,6 +824,8 @@ pub struct Decompiler {
     pub binary_data: Option<BinaryDataContext>,
     /// Split cold helper targets whose bodies end in C++ throw/rethrow machinery.
     pub throw_thunks: HashMap<u64, String>,
+    /// Symbol kind for the current function when known.
+    pub current_function_kind: Option<SymbolKind>,
 }
 
 impl Default for Decompiler {
@@ -851,6 +853,7 @@ impl Default for Decompiler {
             summary_database: None,
             binary_data: None,
             throw_thunks: HashMap::new(),
+            current_function_kind: None,
         }
     }
 }
@@ -897,6 +900,12 @@ impl Decompiler {
     /// Sets known cold-split throw thunk targets.
     pub fn with_throw_thunks(mut self, throw_thunks: HashMap<u64, String>) -> Self {
         self.throw_thunks = throw_thunks;
+        self
+    }
+
+    /// Sets the symbol kind for the current function when known.
+    pub fn with_current_function_kind(mut self, kind: Option<SymbolKind>) -> Self {
+        self.current_function_kind = kind;
         self
     }
 
@@ -1215,6 +1224,7 @@ impl Decompiler {
                 .with_symbol_table(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone())
                 .with_dwarf_param_names(self.dwarf_param_names.clone())
+                .with_current_function_kind(self.current_function_kind)
                 .with_function_name(func_name)
                 .analyze(&structured);
             emitter.emit_with_signature(&structured, &display_name, &signature)
@@ -2089,7 +2099,8 @@ impl Decompiler {
             .with_relocation_table(self.relocation_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone())
-            .with_dwarf_param_names(self.dwarf_param_names.clone());
+            .with_dwarf_param_names(self.dwarf_param_names.clone())
+            .with_current_function_kind(self.current_function_kind);
         recovery.analyze(&structured)
     }
 

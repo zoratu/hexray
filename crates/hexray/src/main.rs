@@ -2887,6 +2887,7 @@ struct DecompileTargetInfo {
     name: String,
     max_bytes: usize,
     stop_after_first_return: bool,
+    symbol_kind: Option<hexray_core::SymbolKind>,
 }
 
 fn decompile_target_info_for_address(
@@ -2916,6 +2917,7 @@ fn decompile_target_info_for_address(
         name,
         max_bytes,
         stop_after_first_return,
+        symbol_kind: exact_symbol.map(|symbol| symbol.kind),
     }
 }
 
@@ -2935,6 +2937,10 @@ fn resolve_decompile_target_info(
             } else {
                 4096usize
             };
+            let symbol_kind = fmt
+                .symbol_at(symbol.address)
+                .map(|preferred| preferred.kind)
+                .or(Some(symbol.kind));
             let name = project
                 .and_then(|p| p.get_function_name(symbol.address))
                 .map(|n| n.to_string())
@@ -2944,6 +2950,7 @@ fn resolve_decompile_target_info(
                 name,
                 max_bytes,
                 stop_after_first_return: symbol.size == 0,
+                symbol_kind,
             })
         }
     }
@@ -3070,6 +3077,7 @@ fn decompile_function(
         name,
         max_bytes,
         stop_after_first_return,
+        symbol_kind,
     } = resolve_decompile_target_info(fmt, project, target, &relocation_table).map_err(|_| {
         anyhow::anyhow!(
             "Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).",
@@ -3160,6 +3168,7 @@ fn decompile_function(
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
         .with_throw_thunks(throw_thunks)
+        .with_current_function_kind(symbol_kind)
         .with_binary_data(binary_data_ctx)
         .with_dwarf_names(dwarf_names.stack_names)
         .with_dwarf_param_names(dwarf_names.parameter_names)

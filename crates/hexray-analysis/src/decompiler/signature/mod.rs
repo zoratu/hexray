@@ -40,6 +40,7 @@
 use super::expression::{BinOpKind, Expr, ExprKind, Variable};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{BinaryDataContext, RelocationTable, SymbolTable};
+use hexray_core::SymbolKind;
 use hexray_types::{
     builtin::{load_libc_functions, load_linux_types, load_posix_types},
     CType, TypeDatabase,
@@ -155,6 +156,8 @@ pub struct SignatureRecovery {
     binary_data: Option<Arc<BinaryDataContext>>,
     /// Function name being analyzed (for known function lookup).
     current_func_name: Option<String>,
+    /// Symbol kind for the function being analyzed when known.
+    current_func_kind: Option<SymbolKind>,
     /// SysV `va_list.gp_offset` field slots initialized in the body.
     sysv_va_list_gp_offset_slots: HashSet<String>,
     /// SysV `va_list.fp_offset` field slots initialized in the body.
@@ -215,6 +218,7 @@ impl SignatureRecovery {
             summary_database: None,
             binary_data: None,
             current_func_name: None,
+            current_func_kind: None,
             sysv_va_list_gp_offset_slots: HashSet::new(),
             sysv_va_list_fp_offset_slots: HashSet::new(),
             sysv_va_list_pointer_slots: HashSet::new(),
@@ -225,6 +229,12 @@ impl SignatureRecovery {
     /// Sets the function name for known function signature lookup.
     pub fn with_function_name(mut self, name: &str) -> Self {
         self.current_func_name = Some(name.to_string());
+        self
+    }
+
+    /// Sets the current function's symbol kind when known.
+    pub fn with_current_function_kind(mut self, kind: Option<SymbolKind>) -> Self {
+        self.current_func_kind = kind;
         self
     }
 
@@ -3491,6 +3501,17 @@ impl SignatureRecovery {
             } else if self.return_is_pointer && self.return_size == 8 {
                 // Return value is a pointer
                 sig.return_type = ParamType::Pointer;
+            } else if matches!(self.current_func_kind, Some(SymbolKind::IndirectFunction)) {
+                sig.return_type = ParamType::Pointer;
+                if !sig
+                    .return_provenance
+                    .iter()
+                    .any(|reason| reason == "IFUNC resolver default return type")
+                {
+                    sig.return_provenance
+                        .push("IFUNC resolver default return type".to_string());
+                }
+                sig.return_confidence = sig.return_confidence.max(200);
             } else {
                 // Infer return type based on size
                 sig.return_type = match self.return_size {
@@ -7369,6 +7390,27 @@ mod tests {
 
         assert_eq!(sig.parameters.len(), 1);
         assert_eq!(sig.parameters[0].name, "size");
+    }
+
+    #[test]
+    fn test_signature_recovery_defaults_ifunc_returns_to_pointer() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::var(Variable::reg(
+                "rax", 8,
+            ))))],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_current_function_kind(Some(SymbolKind::IndirectFunction));
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Pointer);
+        assert!(sig
+            .return_provenance
+            .iter()
+            .any(|reason| reason == "IFUNC resolver default return type"));
     }
 
     #[test]
