@@ -16,6 +16,12 @@ use hexray_core::{
     RegisterClass,
 };
 
+#[derive(Clone, Copy)]
+struct EvexMemorySemantics {
+    compressed_disp_scale: Option<i64>,
+    allow_broadcast: bool,
+}
+
 /// x86_64 instruction decoder.
 pub struct X86_64Disassembler {
     /// Whether to use Intel syntax (true) or AT&T syntax (false).
@@ -2286,6 +2292,15 @@ impl X86_64Disassembler {
         })?;
         let allow_mem_broadcast =
             self.evex_memory_broadcast_allowed(evex.mm, opcode, evex.pp, operation);
+        let memory_semantics = EvexMemorySemantics {
+            compressed_disp_scale: self.evex_compressed_disp8_scale(
+                evex.mm,
+                opcode,
+                evex.pp,
+                vector_size,
+            ),
+            allow_broadcast: allow_mem_broadcast,
+        };
 
         // Decode operands
         let mut operands = Vec::new();
@@ -2299,7 +2314,7 @@ impl X86_64Disassembler {
                 prefixes,
                 &evex,
                 vector_size,
-                allow_mem_broadcast,
+                memory_semantics,
             )
             .ok_or_else(|| {
                 DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
@@ -2526,7 +2541,7 @@ impl X86_64Disassembler {
         prefixes: &Prefixes,
         evex: &super::prefix::Evex,
         vector_size: u16,
-        allow_mem_broadcast: bool,
+        memory_semantics: EvexMemorySemantics,
     ) -> Option<(Operand, usize)> {
         // If it's a register operand, decode as XMM/YMM/ZMM
         if modrm.is_register() {
@@ -2540,11 +2555,61 @@ impl X86_64Disassembler {
         let (operand, consumed) = decode_modrm_rm(bytes, modrm, prefixes, vector_size)?;
         let operand = match operand {
             Operand::Memory(mem) => {
-                Operand::Memory(mem.with_broadcast(allow_mem_broadcast && evex.broadcast))
+                let mut mem = mem;
+                if modrm.has_disp8() {
+                    if let Some(scale) = memory_semantics.compressed_disp_scale {
+                        mem.displacement = mem.displacement.saturating_mul(scale);
+                    }
+                }
+                Operand::Memory(
+                    mem.with_broadcast(memory_semantics.allow_broadcast && evex.broadcast),
+                )
             }
             other => other,
         };
         Some((operand, consumed))
+    }
+
+    fn evex_compressed_disp8_scale(
+        &self,
+        mm: u8,
+        opcode: u8,
+        pp: u8,
+        vector_size: u16,
+    ) -> Option<i64> {
+        let full_mem = || Some(i64::from(vector_size / 8));
+        let half_mem = || Some(i64::from(vector_size / 16));
+
+        match mm {
+            1 => match (opcode, pp) {
+                // Packed moves/arithmetic/logic use the full vector tuple.
+                (
+                    0x10 | 0x11 | 0x28 | 0x29 | 0x54 | 0x56 | 0x57 | 0x58 | 0x59 | 0x5C | 0x5E,
+                    0 | 1,
+                )
+                | (0x6F | 0x7F, 1 | 2) => full_mem(),
+                // Scalar move/arithmetic forms use Tuple1Scalar.
+                (0x10 | 0x11 | 0x58 | 0x59 | 0x5C | 0x5E, 2) => Some(4),
+                (0x10 | 0x11 | 0x58 | 0x59 | 0x5C | 0x5E, 3) => Some(8),
+                _ => None,
+            },
+            2 => match (opcode, pp) {
+                // Broadcast loads use Tuple1Scalar.
+                (0x58, 1) => Some(4),
+                (0x59, 1) => Some(8),
+                // The supported widening loads with ymm/m256 sources use HalfMem.
+                (0x33 | 0x35, 1) => half_mem(),
+                _ => None,
+            },
+            3 => match (opcode, pp) {
+                // Shuffles consume a full vector memory operand.
+                (0xC6, 0 | 1) => full_mem(),
+                // The supported 256-bit insert forms use HalfMem.
+                (0x1A, 1) => half_mem(),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn evex_memory_broadcast_allowed(
@@ -3463,6 +3528,16 @@ impl X86_64Disassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_memory_displacement(instruction: &Instruction) -> Option<i64> {
+        instruction
+            .operands
+            .iter()
+            .find_map(|operand| match operand {
+                Operand::Memory(mem) => Some(mem.displacement),
+                _ => None,
+            })
+    }
 
     #[test]
     fn test_nop() {
@@ -4613,6 +4688,39 @@ mod tests {
     }
 
     #[test]
+    fn test_evex_fullmem_disp8_scales_by_vector_width() {
+        let disasm = X86_64Disassembler::new();
+        // 62 F1 74 48 58 44 24 01 = vaddps zmm0, zmm1, [rsp+0x40]
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0x74, 0x48, 0x58, 0x44, 0x24, 0x01], 0x1000)
+            .unwrap();
+        assert_eq!(first_memory_displacement(&result.instruction), Some(0x40));
+    }
+
+    #[test]
+    fn test_evex_tuple1_scalar_disp8_scales_by_element_width() {
+        let disasm = X86_64Disassembler::new();
+        // 62 F2 7D 48 58 44 24 01 = vpbroadcastd zmm0, [rsp+0x4]
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf2, 0x7d, 0x48, 0x58, 0x44, 0x24, 0x01], 0x1000)
+            .unwrap();
+        assert_eq!(first_memory_displacement(&result.instruction), Some(0x4));
+    }
+
+    #[test]
+    fn test_evex_halfmem_disp8_scales_by_half_vector_width() {
+        let disasm = X86_64Disassembler::new();
+        // 62 F3 75 48 1A 44 24 01 01 = vinsertf32x8 zmm0, zmm1, [rsp+0x20], 0x1
+        let result = disasm
+            .decode_instruction(
+                &[0x62, 0xf3, 0x75, 0x48, 0x1a, 0x44, 0x24, 0x01, 0x01],
+                0x1000,
+            )
+            .unwrap();
+        assert_eq!(first_memory_displacement(&result.instruction), Some(0x20));
+    }
+
+    #[test]
     fn test_evex_128bit_xmm() {
         let disasm = X86_64Disassembler::new();
         // EVEX.128.0F.W0 28 /r = vmovaps xmm0, xmm1
@@ -4650,9 +4758,13 @@ mod tests {
             broadcast: true,
             ..Default::default()
         };
+        let memory_semantics = EvexMemorySemantics {
+            compressed_disp_scale: None,
+            allow_broadcast: true,
+        };
 
         let (operand, consumed) = disasm
-            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512, true)
+            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512, memory_semantics)
             .expect("expected decoded operand");
         assert_eq!(consumed, 0);
         match operand {
@@ -4670,9 +4782,13 @@ mod tests {
             broadcast: true,
             ..Default::default()
         };
+        let memory_semantics = EvexMemorySemantics {
+            compressed_disp_scale: None,
+            allow_broadcast: false,
+        };
 
         let (operand, _) = disasm
-            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512, false)
+            .decode_evex_modrm_rm(&[], modrm, &prefixes, &evex, 512, memory_semantics)
             .expect("expected decoded operand");
         match operand {
             Operand::Memory(mem) => assert!(!mem.broadcast),
