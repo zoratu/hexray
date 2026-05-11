@@ -98,6 +98,7 @@ impl<'a> Elf<'a> {
 
     fn symbol_preference_key(symbol: &Symbol) -> (u8, u8, u8, u8, u64) {
         let kind_rank = match symbol.kind {
+            SymbolKind::IndirectFunction => 4u8,
             SymbolKind::Function => 3u8,
             SymbolKind::Object => 2u8,
             SymbolKind::Section => 0u8,

@@ -78,7 +78,15 @@ pub struct Symbol {
 impl Symbol {
     /// Returns true if this symbol is a function.
     pub fn is_function(&self) -> bool {
-        matches!(self.kind, SymbolKind::Function)
+        matches!(
+            self.kind,
+            SymbolKind::Function | SymbolKind::IndirectFunction
+        )
+    }
+
+    /// Returns true if this symbol is an indirect function (ELF IFUNC).
+    pub fn is_ifunc(&self) -> bool {
+        matches!(self.kind, SymbolKind::IndirectFunction)
     }
 
     /// Returns true if this symbol is a data object.
@@ -132,6 +140,8 @@ pub enum SymbolKind {
     Object,
     /// Function or other executable code.
     Function,
+    /// Indirect function (ELF `STT_GNU_IFUNC`).
+    IndirectFunction,
     /// Section symbol.
     Section,
     /// File name symbol.

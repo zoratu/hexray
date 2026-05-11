@@ -19,6 +19,7 @@ const STT_SECTION: u8 = 3;
 const STT_FILE: u8 = 4;
 const STT_COMMON: u8 = 5;
 const STT_TLS: u8 = 6;
+const STT_GNU_IFUNC: u8 = 10;
 
 // Special section indices
 pub const SHN_UNDEF: u16 = 0;
@@ -164,6 +165,7 @@ impl SymbolEntry {
             STT_NOTYPE => SymbolKind::None,
             STT_OBJECT => SymbolKind::Object,
             STT_FUNC => SymbolKind::Function,
+            STT_GNU_IFUNC => SymbolKind::IndirectFunction,
             STT_SECTION => SymbolKind::Section,
             STT_FILE => SymbolKind::File,
             STT_COMMON => SymbolKind::Common,

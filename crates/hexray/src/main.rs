@@ -1143,7 +1143,8 @@ fn print_symbols(binary: &Binary, functions_only: bool, project: Option<&Analysi
     );
     println!("{}", "-".repeat(70));
 
-    let mut symbols = collect_analysis_symbols(binary, &relocation_table);
+    let mut symbols =
+        filter_ifunc_display_aliases(collect_analysis_symbols(binary, &relocation_table));
     if matches!(binary, Binary::Elf(elf) if elf.is_relocatable()) {
         let undefined_names: std::collections::HashSet<_> = fmt
             .symbols()
@@ -1195,6 +1196,7 @@ fn print_symbols(binary: &Binary, functions_only: bool, project: Option<&Analysi
         }
 
         let type_str = match symbol.kind {
+            hexray_core::SymbolKind::IndirectFunction => "IFUNC",
             hexray_core::SymbolKind::Function => "FUNC",
             hexray_core::SymbolKind::Object => "OBJ",
             hexray_core::SymbolKind::Section => "SECT",
@@ -1230,6 +1232,7 @@ fn compare_symbol_display_priority(
 fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u8, u8, u64) {
     let defined_rank = u8::from(symbol.is_defined());
     let kind_rank = match symbol.kind {
+        hexray_core::SymbolKind::IndirectFunction => 4u8,
         hexray_core::SymbolKind::Function => 3u8,
         hexray_core::SymbolKind::Tls => 2u8,
         hexray_core::SymbolKind::Object => 2u8,
@@ -1256,6 +1259,27 @@ fn symbol_display_priority(symbol: &hexray_core::Symbol) -> (u8, u8, u8, u8, u8,
         name_rank,
         symbol.size,
     )
+}
+
+fn filter_ifunc_display_aliases(symbols: Vec<hexray_core::Symbol>) -> Vec<hexray_core::Symbol> {
+    let ifunc_names: std::collections::HashSet<_> = symbols
+        .iter()
+        .filter(|symbol| symbol.is_ifunc())
+        .map(|symbol| symbol.name.clone())
+        .collect();
+
+    if ifunc_names.is_empty() {
+        return symbols;
+    }
+
+    symbols
+        .into_iter()
+        .filter(|symbol| {
+            !(matches!(symbol.kind, hexray_core::SymbolKind::Function)
+                && symbol.section_index.is_none()
+                && ifunc_names.contains(symbol.name.as_str()))
+        })
+        .collect()
 }
 
 /// Resolve the target for decompilation.
@@ -1702,7 +1726,11 @@ fn find_symbol_in_candidates(
             .is_some_and(|stripped| stripped == name)
     };
     let symbol_priority = |s: &hexray_core::Symbol| {
-        let is_func = if s.is_function() { 1u8 } else { 0u8 };
+        let callable_rank = match s.kind {
+            hexray_core::SymbolKind::Function => 2u8,
+            hexray_core::SymbolKind::IndirectFunction => 1u8,
+            _ => 0u8,
+        };
         let is_defined = u8::from(s.is_defined());
         let version_rank = match s.version() {
             Some(version) if version.is_default => 2u8,
@@ -1714,7 +1742,13 @@ fn find_symbol_in_candidates(
             hexray_core::SymbolBinding::Weak => 1u8,
             _ => 0u8,
         };
-        (is_func, is_defined, version_rank, binding_rank, s.size)
+        (
+            callable_rank,
+            is_defined,
+            version_rank,
+            binding_rank,
+            s.size,
+        )
     };
     let pick_best = |mut candidates: Vec<hexray_core::Symbol>| {
         candidates.sort_by(|a, b| {
@@ -3952,7 +3986,7 @@ fn ifunc_symbol_alias(
         .iter()
         .find(|symbol| {
             symbol.address == resolver_addr
-                && matches!(symbol.kind, hexray_core::SymbolKind::Other(10))
+                && matches!(symbol.kind, hexray_core::SymbolKind::IndirectFunction)
                 && !symbol.name.is_empty()
         })
         .cloned()
@@ -7780,7 +7814,8 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
             let functions_only = parts.iter().any(|&p| p == "-f" || p == "--functions");
             let json_mode = is_json_mode(&parts);
 
-            let mut symbols: Vec<_> = fmt.symbols().collect();
+            let mut symbols: Vec<_> =
+                filter_ifunc_display_aliases(fmt.symbols().cloned().collect());
             symbols.sort_by_key(|s| s.address);
 
             if json_mode {
@@ -7797,10 +7832,10 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                         JsonSymbol {
                             address: format!("{:#x}", symbol.address),
                             size: symbol.size,
-                            symbol_type: if symbol.is_function() {
-                                "function".to_string()
-                            } else {
-                                "other".to_string()
+                            symbol_type: match symbol.kind {
+                                hexray_core::SymbolKind::IndirectFunction => "ifunc".to_string(),
+                                _ if symbol.is_function() => "function".to_string(),
+                                _ => "other".to_string(),
                             },
                             binding: match symbol.binding {
                                 hexray_core::SymbolBinding::Local => "local".to_string(),
@@ -7834,10 +7869,10 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                         continue;
                     }
 
-                    let type_str = if symbol.is_function() {
-                        "FUNC"
-                    } else {
-                        "OTHER"
+                    let type_str = match symbol.kind {
+                        hexray_core::SymbolKind::IndirectFunction => "IFUNC",
+                        _ if symbol.is_function() => "FUNC",
+                        _ => "OTHER",
                     };
                     let bind_str = match symbol.binding {
                         hexray_core::SymbolBinding::Local => "LOCAL",
@@ -8999,9 +9034,9 @@ mod tests {
         apply_instruction_relocations, default_calling_convention,
         demangle_exception_typeinfo_symbol_name, discover_function_starts,
         discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
-        ensure_distinct_export_paths, find_symbol_in_candidates, format_callgraph_text,
-        infer_main_symbol_from_entry, parse_address_str, patch_affects_function,
-        resolve_analysis_target, resolve_analysis_target_with_entry_main,
+        ensure_distinct_export_paths, filter_ifunc_display_aliases, find_symbol_in_candidates,
+        format_callgraph_text, infer_main_symbol_from_entry, parse_address_str,
+        patch_affects_function, resolve_analysis_target, resolve_analysis_target_with_entry_main,
         resolve_materialized_callback_targets, resolve_xref_source_label,
         resolve_xref_target_addresses, string_tags, truncate_for_display, DiffPatchAddressSpace,
         FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
@@ -9556,7 +9591,7 @@ mod tests {
                 name: "strlen".to_string(),
                 address: 0x4115f0,
                 size: 112,
-                kind: SymbolKind::Other(10),
+                kind: SymbolKind::IndirectFunction,
                 binding: SymbolBinding::Global,
                 section_index: Some(7),
             },
@@ -9568,6 +9603,45 @@ mod tests {
 
         assert_eq!(resolved.address, 0x401160);
         assert!(resolved.is_function());
+    }
+
+    #[test]
+    fn display_listing_hides_same_name_ifunc_plt_aliases() {
+        let filtered = filter_ifunc_display_aliases(vec![
+            Symbol {
+                name: "memcpy@@GLIBC_2.14".to_string(),
+                address: 0xb1740,
+                size: 128,
+                kind: SymbolKind::IndirectFunction,
+                binding: SymbolBinding::Global,
+                section_index: Some(7),
+            },
+            Symbol {
+                name: "memcpy@@GLIBC_2.14".to_string(),
+                address: 0x286b0,
+                size: 16,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: None,
+            },
+            Symbol {
+                name: "memcpy@@GLIBC_2.14@plt".to_string(),
+                address: 0x286b0,
+                size: 16,
+                kind: SymbolKind::Function,
+                binding: SymbolBinding::Global,
+                section_index: None,
+            },
+        ]);
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().any(|symbol| symbol.is_ifunc()));
+        assert!(filtered.iter().any(|symbol| symbol.name.ends_with("@plt")));
+        assert!(!filtered.iter().any(|symbol| {
+            symbol.name == "memcpy@@GLIBC_2.14"
+                && matches!(symbol.kind, SymbolKind::Function)
+                && symbol.section_index.is_none()
+        }));
     }
 
     #[test]
