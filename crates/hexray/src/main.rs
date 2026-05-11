@@ -2756,6 +2756,15 @@ fn disassemble_for_cfg<D: Disassembler>(
 
                 let branch_index = instructions.len() - 1;
                 match instructions[branch_index].control_flow {
+                    hexray_core::ControlFlow::UnconditionalBranch { target } => {
+                        // Shared epilogues and cold exits are often reached via a
+                        // forward branch within the same heuristic window. Keep
+                        // scanning through those local targets instead of cutting
+                        // the function at the jump itself.
+                        if target >= start_addr && target < scan_limit {
+                            min_scan_end = min_scan_end.max(target);
+                        }
+                    }
                     hexray_core::ControlFlow::ConditionalBranch { target, .. } => {
                         if target >= start_addr && target < scan_limit {
                             min_scan_end = min_scan_end.max(target);
@@ -10512,6 +10521,39 @@ mod tests {
         assert!(instructions.iter().any(|inst| inst.address == 0x401350));
         assert!(instructions.iter().any(|inst| inst.address == 0x401360));
         assert!(instructions.iter().any(|inst| inst.address == 0x401371));
+    }
+
+    #[test]
+    fn heuristic_cfg_disassembly_keeps_forward_unconditional_branch_targets() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401000,
+                data: vec![
+                    0x85, 0xff, // test edi, edi
+                    0x74, 0x04, // je 0x401008
+                    0x31, 0xc0, // xor eax, eax
+                    0xeb, 0x05, // jmp 0x40100d
+                    0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+                    0xc3, // ret
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x401000, 14).unwrap();
+        let disasm = X86_64Disassembler::new();
+
+        let instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x401000, true);
+
+        assert!(instructions.iter().any(|inst| inst.address == 0x401008));
+        assert!(instructions.iter().any(|inst| inst.address == 0x40100d));
+        assert_eq!(
+            instructions.last().map(|inst| inst.mnemonic.as_str()),
+            Some("ret")
+        );
     }
 
     #[test]
