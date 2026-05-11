@@ -5133,7 +5133,29 @@ impl PseudoCodeEmitter {
                     super::expression::CallTarget::Indirect(e) => {
                         // Mark any GotRef in the indirect target as a function pointer
                         self.mark_gotref_as_funcptr(e);
-                        format!("({})", self.format_expr_with_strings(e, table))
+                        // If the indirect target collapsed to a literal address
+                        // that matches a known function symbol, render the
+                        // symbol name instead of `(0xNNNNNN)(...)`. This
+                        // happens when a stack-spilled function pointer
+                        // (movq $func, [rbp-N]; call *[rbp-N]) is propagated.
+                        let resolved = if let super::expression::ExprKind::IntLit(addr) = &e.kind {
+                            if *addr >= 0 && *addr <= u64::MAX as i128 {
+                                let addr64 = *addr as u64;
+                                self.symbol_table
+                                    .as_ref()
+                                    .and_then(|st| st.get(addr64))
+                                    .map(|name| Self::strip_plt_suffix(name).to_string())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(name) = resolved {
+                            name
+                        } else {
+                            format!("({})", self.format_expr_with_strings(e, table))
+                        }
                     }
                     super::expression::CallTarget::IndirectGot { got_address, expr } => {
                         // Mark this as a function pointer access

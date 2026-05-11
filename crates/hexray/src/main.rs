@@ -934,6 +934,11 @@ fn print_info(binary: &Binary) {
             println!("\nSections:      {}", elf.sections.len());
             println!("Segments:      {}", elf.segments.len());
 
+            // Surface .note.gnu.property feature bits (CET / IBT / SHSTK).
+            if let Some(notes) = decode_gnu_property_note(elf) {
+                print_gnu_property_info(&notes);
+            }
+
             // Display CUDA CUBIN info if this is an EM_CUDA ELF.
             if let Ok(view) = elf.cubin_view() {
                 print_cubin_info(&view);
@@ -8653,6 +8658,88 @@ fn disassemble_block_for_arch(
         | Architecture::Arm
         | Architecture::Unknown(_) => Vec::new(),
     }
+}
+
+/// CET / IBT / SHSTK feature bits decoded from `.note.gnu.property`.
+#[derive(Default)]
+struct GnuPropertyInfo {
+    ibt: bool,
+    shstk: bool,
+}
+
+fn decode_gnu_property_note(elf: &hexray_formats::elf::Elf) -> Option<GnuPropertyInfo> {
+    let section = elf.section_by_name(".note.gnu.property")?;
+    let data = elf.section_data(section)?;
+
+    let mut info = GnuPropertyInfo::default();
+    let mut found = false;
+    let mut offset = 0usize;
+    while offset + 12 <= data.len() {
+        let n_namesz = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+        let n_descsz = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().ok()?) as usize;
+        let n_type = u32::from_le_bytes(data[offset + 8..offset + 12].try_into().ok()?);
+        offset += 12;
+        let name_end = offset.checked_add(n_namesz)?;
+        let name_padded = (name_end + 3) & !3;
+        let desc_end = name_padded.checked_add(n_descsz)?;
+        let desc_padded = (desc_end + 3) & !3;
+        if desc_padded > data.len() {
+            break;
+        }
+        // NT_GNU_PROPERTY_TYPE_0 = 5, name = "GNU\0"
+        if n_type == 5 && &data[offset..name_end] == b"GNU\0" {
+            let mut p = name_padded;
+            // 64-bit alignment for properties inside .note.gnu.property in
+            // ELFCLASS64 binaries. Use 8-byte alignment when bitness=64.
+            let align = match elf.header.class {
+                hexray_formats::elf::ElfClass::Elf64 => 8usize,
+                hexray_formats::elf::ElfClass::Elf32 => 4usize,
+            };
+            while p + 8 <= desc_end {
+                let pr_type = u32::from_le_bytes(data[p..p + 4].try_into().ok()?);
+                let pr_datasz = u32::from_le_bytes(data[p + 4..p + 8].try_into().ok()?) as usize;
+                let pr_data_start = p + 8;
+                let pr_data_end = pr_data_start.checked_add(pr_datasz)?;
+                if pr_data_end > desc_end {
+                    break;
+                }
+                // GNU_PROPERTY_X86_FEATURE_1_AND = 0xC0000002
+                if pr_type == 0xC000_0002 && pr_datasz >= 4 {
+                    let bits =
+                        u32::from_le_bytes(data[pr_data_start..pr_data_start + 4].try_into().ok()?);
+                    info.ibt = bits & 0x1 != 0;
+                    info.shstk = bits & 0x2 != 0;
+                    found = true;
+                }
+                let next = (pr_data_end + (align - 1)) & !(align - 1);
+                if next <= p {
+                    break;
+                }
+                p = next;
+            }
+        }
+        offset = desc_padded;
+    }
+
+    if found {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+fn print_gnu_property_info(info: &GnuPropertyInfo) {
+    let mut features: Vec<&'static str> = Vec::new();
+    if info.ibt {
+        features.push("IBT");
+    }
+    if info.shstk {
+        features.push("SHSTK");
+    }
+    if features.is_empty() {
+        return;
+    }
+    println!("CET features:  {}", features.join(", "));
 }
 
 /// Print the CUDA-specific summary block for a CUBIN: kernels, memory
