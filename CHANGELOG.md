@@ -5,6 +5,49 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.7] - 2026-05-10
+
+### Highlights — corrode.dev hardening, call-site migration
+
+Follow-through release on the bulk-refactor work v1.3.6 deferred.
+The lint posture documented in v1.3.6 is now enforced crate-wide
+in the two crates that ingest untrusted input.
+
+What's new:
+
+- **`clippy::unwrap_used` + `expect_used` enforced as deny** across
+  `hexray-formats` and `hexray-disasm`. Pre-existing `unwrap()` /
+  `expect()` call sites were migrated to `?` / `ok_or(...)` /
+  `unwrap_or(...)` or to a documented invariant.
+- **`clippy::indexing_slicing` + `arithmetic_side_effects` enforced
+  as deny** across the same two crates. Direct indexing migrated to
+  `.get(...)` / `.get_mut(...)`; raw `+`/`-`/`*` on parser-derived
+  integers migrated to `checked_*` / `saturating_*` / `try_into()`.
+- **31 refactor batches** dropping per-file
+  `#![allow(clippy::...)]` exemptions in favour of localised fixes:
+  PE / Mach-O / ELF header, symbol, relocation, AMDGPU, and CUDA
+  parsing paths; DWARF eh_frame / lsda / line / loclists /
+  rnglists / str_offsets; x86_64 / arm64 / amdgpu decoder modules;
+  hexray-analysis structurer (switch, condition, cleanup,
+  simplify, gotos), emitter (predicates), and signature (types,
+  known_funcs) split into focused modules.
+- **Five fuzz crash fixes** surfaced by the v1.3.6 fuzz CI gate
+  (`scripts/run-fuzz-corpus`): three in one pass, two in a follow-up.
+- **Rust 1.95 compatibility.** New style lints (`collapsible_match`,
+  `collapsible_if`, unnecessary same-width casts) addressed across
+  hexray-formats / hexray-disasm / hexray-analysis / hexray-emulate
+  and the `hexray` binary crate. Where the new style would obscure
+  intent, the lint is `#[allow]`'d locally with rationale.
+
+What's deferred:
+
+- **Same deny-set on `hexray-analysis` / `hexray-core` /
+  `hexray-emulate`.** The two ingest crates carry the highest
+  adversarial-input risk and are now covered; the analysis path
+  operates on already-validated structures and is a lower priority.
+  Several files in hexray-analysis are split off file-level allow
+  in this release as preparation.
+
 ## [1.3.6] - 2026-04-30
 
 ### Highlights — adversarial-input hardening
