@@ -539,6 +539,8 @@ impl StructuredCfg {
             body = flatten_guard_clauses(body);
         }
 
+        body = rewrite_single_call_condition_loops(body);
+
         // Post-process for constant folding and propagation
         if config.is_pass_enabled(OptimizationPass::ConstantPropagation) {
             body = super::constant_propagation::propagate_constants(body);
@@ -4381,6 +4383,231 @@ fn attach_shared_return_to_branch(
     body
 }
 
+fn rewrite_single_call_condition_loops(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    rewrite_single_call_condition_loops_in_list(nodes)
+}
+
+fn rewrite_single_call_condition_loops_in_list(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .map(rewrite_single_call_condition_loops_in_node)
+        .map(rewrite_single_call_condition_loop_node)
+        .collect()
+}
+
+fn rewrite_single_call_condition_loops_in_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: rewrite_single_call_condition_loops_in_list(then_body),
+            else_body: else_body.map(rewrite_single_call_condition_loops_in_list),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition,
+            body: rewrite_single_call_condition_loops_in_list(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: rewrite_single_call_condition_loops_in_list(body),
+            condition,
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: rewrite_single_call_condition_loops_in_list(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: rewrite_single_call_condition_loops_in_list(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| (values, rewrite_single_call_condition_loops_in_list(body)))
+                .collect(),
+            default: default.map(rewrite_single_call_condition_loops_in_list),
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(rewrite_single_call_condition_loops_in_list(nodes))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: rewrite_single_call_condition_loops_in_list(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: rewrite_single_call_condition_loops_in_list(handler.body),
+                    ..handler
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn rewrite_single_call_condition_loop_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => {
+            if let Some((prefix, exit_body)) =
+                match_extract_single_call_loop_exit(&body, &condition)
+            {
+                if loop_prefix_ends_with_real_call(prefix) {
+                    return StructuredNode::Loop {
+                        body: build_single_call_condition_loop_body(
+                            prefix.to_vec(),
+                            condition,
+                            exit_body,
+                        ),
+                        header,
+                        exit_block,
+                    };
+                }
+            }
+
+            StructuredNode::DoWhile {
+                body,
+                condition,
+                header,
+                exit_block,
+            }
+        }
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => {
+            if expr_contains_real_call(&condition) {
+                if let Some((prefix, exit_body)) =
+                    match_extract_single_call_loop_exit(&body, &condition)
+                {
+                    if prefix.is_empty() {
+                        return StructuredNode::Loop {
+                            body: build_single_call_condition_loop_body(
+                                Vec::new(),
+                                condition,
+                                exit_body,
+                            ),
+                            header,
+                            exit_block,
+                        };
+                    }
+                }
+            }
+
+            StructuredNode::While {
+                condition,
+                body,
+                header,
+                exit_block,
+            }
+        }
+        other => other,
+    }
+}
+
+fn match_extract_single_call_loop_exit<'a>(
+    body: &'a [StructuredNode],
+    loop_condition: &Expr,
+) -> Option<(&'a [StructuredNode], Vec<StructuredNode>)> {
+    let (tail, prefix) = body.split_last()?;
+    let StructuredNode::If {
+        condition,
+        then_body,
+        else_body,
+    } = tail
+    else {
+        return None;
+    };
+
+    if exprs_match_for_loop_rewrite(condition, loop_condition) && then_body.is_empty() {
+        let exit_body = else_body.clone()?;
+        return Some((prefix, exit_body));
+    }
+
+    let negated = negate_condition(loop_condition.clone());
+    if exprs_match_for_loop_rewrite(condition, &negated) && else_body.is_none() {
+        return Some((prefix, then_body.clone()));
+    }
+
+    None
+}
+
+fn build_single_call_condition_loop_body(
+    mut prefix: Vec<StructuredNode>,
+    condition: Expr,
+    mut exit_body: Vec<StructuredNode>,
+) -> Vec<StructuredNode> {
+    if !body_terminates(&exit_body) {
+        exit_body.push(StructuredNode::Break);
+    }
+
+    prefix.push(StructuredNode::If {
+        condition: negate_condition(condition),
+        then_body: exit_body,
+        else_body: None,
+    });
+
+    prefix
+}
+
+fn loop_prefix_ends_with_real_call(prefix: &[StructuredNode]) -> bool {
+    let Some(StructuredNode::Block { statements, .. }) = prefix.last() else {
+        return false;
+    };
+
+    let propagated = propagate_args_in_block(statements.clone());
+    propagated.last().is_some_and(statement_contains_real_call)
+}
+
+fn exprs_match_for_loop_rewrite(left: &Expr, right: &Expr) -> bool {
+    format!("{left}") == format!("{right}")
+}
+
 fn body_contains_condition_call(nodes: &[StructuredNode]) -> bool {
     nodes.iter().any(node_contains_condition_call)
 }
@@ -4536,8 +4763,8 @@ mod tests {
     use super::*;
     use crate::decompiler::{config::DecompilerConfig, PseudoCodeEmitter};
     use hexray_core::{
-        Architecture, BasicBlock, BlockTerminator, Condition, ControlFlow, Operand, Operation,
-        Register, RegisterClass,
+        Architecture, BasicBlock, BlockTerminator, Condition, ControlFlow, MemoryRef, Operand,
+        Operation, Register, RegisterClass,
     };
 
     // --- Helper functions to create test CFGs ---
@@ -4861,6 +5088,221 @@ mod tests {
         cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
         cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(1));
         cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        cfg
+    }
+
+    fn make_self_loop_call_condition_cfg() -> ControlFlowGraph {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.instructions.push(
+            Instruction::new(0x1010, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(edi), Operand::imm(1, 4)]),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x1012, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1017,
+                }),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x1017, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.instructions.push(
+            Instruction::new(0x1020, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm(42, 4)]),
+        );
+        bb2.instructions.push(
+            Instruction::new(0x1025, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb2.terminator = BlockTerminator::Return;
+        cfg.add_block(bb2);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+
+        cfg
+    }
+
+    fn make_counter_poll_cfg() -> ControlFlowGraph {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let mem = Operand::Memory(MemoryRef::base(rdi, 4));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), mem.clone()]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1002, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        bb0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.instructions.push(
+            Instruction::new(0x1010, 2, vec![], "dec")
+                .with_operation(Operation::Dec)
+                .with_operands(vec![Operand::Register(eax)]),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x1012, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![mem, Operand::Register(eax)]),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x1014, 2, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(al), Operand::imm(1, 1)]),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x1016, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.instructions.push(
+            Instruction::new(0x1020, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        bb2.instructions.push(
+            Instruction::new(0x1022, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb2.terminator = BlockTerminator::Return;
+        cfg.add_block(bb2);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+
+        cfg
+    }
+
+    fn make_block_on_counter_cfg() -> ControlFlowGraph {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rbx = Register::new(Architecture::X86_64, RegisterClass::General, 3, 64);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+        let counter_slot = Operand::Memory(MemoryRef::base_disp(rsp, 0xc, 4));
+        let ret_slot = Operand::Memory(MemoryRef::base_disp(rsp, 0x8, 4));
+        let counter_addr = Operand::Memory(MemoryRef::base_disp(rsp, 0xc, 8));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 7, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![counter_slot.clone(), Operand::imm(0, 4)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1007, 5, vec![], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![Operand::Register(rbx), counter_addr]),
+        );
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.instructions.push(
+            Instruction::new(0x1010, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rdi), Operand::Register(rbx)]),
+        );
+        bb1.instructions.push(
+            Instruction::new(0x1013, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1018,
+                }),
+        );
+        bb1.terminator = BlockTerminator::Call {
+            target: hexray_core::basic_block::CallTarget::Direct(0x2000),
+            return_block: BasicBlockId::new(2),
+        };
+        cfg.add_block(bb1);
+
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1018);
+        bb2.instructions.push(
+            Instruction::new(0x1018, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        bb2.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb2);
+
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1020);
+        bb3.instructions.push(
+            Instruction::new(0x1020, 7, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![ret_slot.clone(), Operand::imm(42, 4)]),
+        );
+        bb3.instructions.push(
+            Instruction::new(0x1027, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), ret_slot]),
+        );
+        bb3.instructions.push(
+            Instruction::new(0x102a, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
 
         cfg
     }
@@ -6197,6 +6639,47 @@ mod tests {
             &StructuringAnnotations::default(),
         );
         assert_eq!(kind, LoopKind::DoWhile);
+    }
+
+    #[test]
+    fn test_self_loop_call_condition_does_not_duplicate_poll_in_output() {
+        let cfg = make_self_loop_call_condition_cfg();
+        let structured = StructuredCfg::from_cfg_with_config(&cfg, &DecompilerConfig::default());
+        let output = PseudoCodeEmitter::new("    ", false).emit(&structured, "loop_call");
+
+        assert!(
+            !output.contains("ret_0 = sub_2000(1);"),
+            "expected loop condition call to stay single-evaluated, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_counter_poll_store_uses_single_decrement_value_in_output() {
+        let cfg = make_counter_poll_cfg();
+        let structured = StructuredCfg::from_cfg_with_config(&cfg, &DecompilerConfig::standard());
+        let output = PseudoCodeEmitter::new("    ", false).emit(&structured, "counter_poll");
+
+        assert!(
+            output.contains("*(uint32_t*)(arr) = ret;"),
+            "expected store-back to reuse the decremented temp, got:\n{output}"
+        );
+        assert!(
+            !output.contains("ret - 1 - 1"),
+            "expected decrement to be applied once, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_split_poll_loop_does_not_duplicate_condition_call_in_output() {
+        let cfg = make_block_on_counter_cfg();
+        let structured = StructuredCfg::from_cfg_with_config(&cfg, &DecompilerConfig::standard());
+        let output = PseudoCodeEmitter::new("    ", false).emit(&structured, "block_on_counter");
+
+        assert_eq!(
+            output.matches("sub_2000(").count(),
+            1,
+            "expected one poll call per iteration, got:\n{output}"
+        );
     }
 
     // --- Find Loop Exits Tests ---

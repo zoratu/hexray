@@ -2492,6 +2492,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
 
     // Track the last value assigned to each temp register
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
+    let mut compound_updated_aliases: HashSet<String> = HashSet::new();
     let mut stack_slot_values: HashMap<String, Expr> = HashMap::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
@@ -2499,13 +2500,24 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
             // Always substitute known register values in the RHS
             let new_lhs = substitute_assignment_lhs(lhs, &reg_values);
-            let new_rhs =
-                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
+            let new_rhs = if should_preserve_materialized_compound_temp_rhs(
+                lhs,
+                rhs,
+                &compound_updated_aliases,
+            ) {
+                (**rhs).clone()
+            } else {
+                substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values)
+            };
 
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&lhs_var.name).into_iter().collect();
                 invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
+                invalidate_tracked_compound_updated_aliases(
+                    &mut compound_updated_aliases,
+                    &written_aliases,
+                );
                 invalidate_dependent_stack_slot_values(&mut stack_slot_values, &written_aliases);
                 if aliases_include_stack_base(&written_aliases) {
                     stack_slot_values.clear();
@@ -2519,6 +2531,9 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                         for alias in get_register_aliases(&lhs_var.name) {
                             reg_values.insert(alias, new_rhs.clone());
                         }
+                    }
+                    if expr_uses_any_register_alias(&new_rhs, &written_aliases) {
+                        compound_updated_aliases.extend(written_aliases.iter().cloned());
                     }
                     // Emit with substituted RHS (keep the assignment for now)
                     result.push(Expr::assign((**lhs).clone(), new_rhs));
@@ -2546,6 +2561,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                 substitute_stack_slot_values(substitute_vars(rhs, &reg_values), &stack_slot_values);
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 let aliases = get_register_aliases(&lhs_var.name);
+                let alias_set: HashSet<String> = aliases.iter().cloned().collect();
                 let prior_value = if is_temp_register(&lhs_var.name) {
                     aliases
                         .iter()
@@ -2554,6 +2570,10 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                     None
                 };
                 invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
+                invalidate_tracked_compound_updated_aliases(
+                    &mut compound_updated_aliases,
+                    &alias_set,
+                );
                 if is_temp_register(&lhs_var.name)
                     && compound_update_defines_full_alias_value(&lhs_var.name)
                 {
@@ -2564,6 +2584,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                                 for alias in aliases {
                                     reg_values.insert(alias, new_val.clone());
                                 }
+                                compound_updated_aliases.extend(alias_set);
                             }
                         }
                     }
@@ -2587,6 +2608,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             if let ExprKind::Call { target, .. } = &substituted.kind {
                 if is_real_function_call(target) {
                     reg_values.clear();
+                    compound_updated_aliases.clear();
                     stack_slot_values.clear();
                 } else {
                     invalidate_pseudo_call_output_copies(&mut reg_values, target);
@@ -2595,6 +2617,10 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                         .flatten()
                         .collect();
                     if !written_aliases.is_empty() {
+                        invalidate_tracked_compound_updated_aliases(
+                            &mut compound_updated_aliases,
+                            &written_aliases,
+                        );
                         invalidate_dependent_stack_slot_values(
                             &mut stack_slot_values,
                             &written_aliases,
@@ -3125,6 +3151,7 @@ fn propagate_call_args_node_with_binary_data(
 struct CallArgPropagationState {
     arg_values: HashMap<String, (Option<usize>, Expr)>,
     reg_values: HashMap<String, Expr>,
+    compound_updated_aliases: HashSet<String>,
     saved_temp_values: HashMap<String, Expr>,
     call_target_values: HashMap<String, Expr>,
     stack_slot_values: HashMap<String, Expr>,
@@ -3134,6 +3161,7 @@ impl CallArgPropagationState {
     fn clear_after_real_call(&mut self) {
         self.arg_values.clear();
         self.reg_values.clear();
+        self.compound_updated_aliases.clear();
         self.saved_temp_values.clear();
         self.call_target_values.clear();
     }
@@ -3467,16 +3495,28 @@ fn propagate_args_in_block_with_state(
             }
 
             let substituted_lhs = substitute_assignment_lhs(lhs, &state.reg_values);
-            let tracked_rhs = substitute_stack_slot_values(
-                substitute_vars(rhs, &state.reg_values),
-                &state.stack_slot_values,
-            );
+            let tracked_rhs = if should_preserve_materialized_compound_temp_rhs(
+                lhs,
+                rhs,
+                &state.compound_updated_aliases,
+            ) {
+                (**rhs).clone()
+            } else {
+                substitute_stack_slot_values(
+                    substitute_vars(rhs, &state.reg_values),
+                    &state.stack_slot_values,
+                )
+            };
 
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
                 invalidate_dependent_stabilized_register_values(
                     &mut state.reg_values,
+                    &written_aliases,
+                );
+                invalidate_tracked_compound_updated_aliases(
+                    &mut state.compound_updated_aliases,
                     &written_aliases,
                 );
                 invalidate_dependent_register_values(
@@ -3514,6 +3554,11 @@ fn propagate_args_in_block_with_state(
                                 .saved_temp_values
                                 .insert(alias.clone(), stabilized_temp_rhs.clone());
                         }
+                    }
+                    if expr_uses_any_register_alias(&stabilized_temp_rhs, &written_aliases) {
+                        state
+                            .compound_updated_aliases
+                            .extend(written_aliases.iter().cloned());
                     }
                 }
 
@@ -3654,6 +3699,14 @@ fn propagate_args_in_block_with_state(
                         &mut state.call_target_values,
                         &mut state.stack_slot_values,
                     ) {
+                        let written_aliases: HashSet<String> = call_output_alias_groups(target)
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        invalidate_tracked_compound_updated_aliases(
+                            &mut state.compound_updated_aliases,
+                            &written_aliases,
+                        );
                         result.push(Expr::assign(substituted_lhs, rewritten_call));
                         continue;
                     }
@@ -3687,6 +3740,10 @@ fn propagate_args_in_block_with_state(
                     &mut state.reg_values,
                     &written_aliases,
                 );
+                invalidate_tracked_compound_updated_aliases(
+                    &mut state.compound_updated_aliases,
+                    &written_aliases,
+                );
                 invalidate_dependent_register_values(
                     &mut state.saved_temp_values,
                     &written_aliases,
@@ -3715,6 +3772,9 @@ fn propagate_args_in_block_with_state(
                                         .call_target_values
                                         .insert(alias.clone(), new_val.clone());
                                 }
+                                state
+                                    .compound_updated_aliases
+                                    .extend(written_aliases.iter().cloned());
                             }
                         }
                     }
@@ -3843,6 +3903,14 @@ fn propagate_args_in_block_with_state(
                     &mut state.call_target_values,
                     &mut state.stack_slot_values,
                 ) {
+                    let written_aliases: HashSet<String> = call_output_alias_groups(target)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    invalidate_tracked_compound_updated_aliases(
+                        &mut state.compound_updated_aliases,
+                        &written_aliases,
+                    );
                     result.push(Expr::call(substituted_target, substituted_args));
                     continue;
                 }
@@ -3906,6 +3974,35 @@ fn invalidate_dependent_stack_slot_values(
     written_aliases: &HashSet<String>,
 ) {
     stack_slot_values.retain(|_, expr| !expr_uses_any_register_alias(expr, written_aliases));
+}
+
+fn invalidate_tracked_compound_updated_aliases(
+    compound_updated_aliases: &mut HashSet<String>,
+    written_aliases: &HashSet<String>,
+) {
+    compound_updated_aliases.retain(|alias| !written_aliases.contains(alias));
+}
+
+fn should_preserve_materialized_compound_temp_rhs(
+    lhs: &Expr,
+    rhs: &Expr,
+    compound_updated_aliases: &HashSet<String>,
+) -> bool {
+    use super::super::expression::ExprKind;
+
+    if matches!(lhs.kind, ExprKind::Var(_)) {
+        return false;
+    }
+
+    let rhs_name = match &rhs.kind {
+        ExprKind::Var(var) => var.name.as_str(),
+        ExprKind::Unknown(name) => name.as_str(),
+        _ => return false,
+    };
+
+    get_register_aliases(rhs_name)
+        .into_iter()
+        .any(|alias| compound_updated_aliases.contains(&alias))
 }
 
 fn aliases_include_stack_base(written_aliases: &HashSet<String>) -> bool {
@@ -10564,6 +10661,50 @@ mod tests {
         let propagated = propagate_args_in_block(statements);
         assert_eq!(format!("{}", propagated[1]), "edx = eax");
         assert_eq!(format!("{}", propagated[2]), "ecx = eax");
+    }
+
+    #[test]
+    fn test_propagate_copies_preserves_compound_update_temp_for_store_back() {
+        let cases = vec![
+            vec![
+                Expr::assign(local("ret", 4), Expr::deref(reg("rdi", 8), 4)),
+                Expr::assign(reg("eax", 4), local("ret", 4)),
+                Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Sub,
+                        lhs: Box::new(reg("eax", 4)),
+                        rhs: Box::new(Expr::int(1)),
+                    },
+                },
+                Expr::assign(Expr::deref(reg("rdi", 8), 4), reg("eax", 4)),
+            ],
+            vec![
+                Expr::assign(local("ret", 4), Expr::deref(reg("rdi", 8), 4)),
+                Expr::assign(reg("eax", 4), local("ret", 4)),
+                Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Sub,
+                        lhs: Box::new(reg("eax", 4)),
+                        rhs: Box::new(Expr::int(1)),
+                    },
+                },
+                Expr::assign(local("ret", 4), reg("eax", 4)),
+                Expr::assign(Expr::deref(reg("rdi", 8), 4), local("ret", 4)),
+            ],
+        ];
+
+        for statements in cases {
+            let propagated = propagate_copies(statements);
+            let rendered = propagated
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert!(
+                !rendered.contains("- 1 - 1"),
+                "expected store-back to avoid duplicating the decrement, got: {rendered}"
+            );
+        }
     }
 
     #[test]

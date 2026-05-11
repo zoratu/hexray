@@ -7308,6 +7308,159 @@ impl PseudoCodeEmitter {
         }
     }
 
+    fn rewrite_single_call_condition_while_for_emission(
+        &self,
+        condition: &Expr,
+        body: &[StructuredNode],
+    ) -> Option<Vec<StructuredNode>> {
+        let (tail, prefix) = body.split_last()?;
+
+        if prefix.is_empty() {
+            if let Some(exit_body) = self.match_single_call_loop_exit_for_emission(tail, condition)
+            {
+                return Some(self.build_single_call_loop_body_for_emission(
+                    Vec::new(),
+                    condition.clone(),
+                    exit_body,
+                ));
+            }
+        }
+
+        let captured_condition =
+            self.extract_single_call_loop_condition_capture_for_emission(prefix, condition)?;
+        let exit_body = self.match_single_call_loop_exit_for_emission(tail, &captured_condition)?;
+        Some(self.build_single_call_loop_body_for_emission(
+            prefix.to_vec(),
+            captured_condition,
+            exit_body,
+        ))
+    }
+
+    fn build_single_call_loop_body_for_emission(
+        &self,
+        mut prefix: Vec<StructuredNode>,
+        condition: Expr,
+        mut exit_body: Vec<StructuredNode>,
+    ) -> Vec<StructuredNode> {
+        if !super::structurer::body_terminates(&exit_body) {
+            exit_body.push(StructuredNode::Break);
+        }
+
+        prefix.push(StructuredNode::If {
+            condition: condition.negate(),
+            then_body: exit_body,
+            else_body: None,
+        });
+        prefix
+    }
+
+    fn extract_single_call_loop_condition_capture_for_emission(
+        &self,
+        prefix: &[StructuredNode],
+        loop_condition: &Expr,
+    ) -> Option<Expr> {
+        let last_expr = match prefix.last()? {
+            StructuredNode::Expr(expr) => Some(expr),
+            StructuredNode::Block { statements, .. } => statements.last(),
+            _ => None,
+        }?;
+
+        let ExprKind::Assign { lhs, rhs } = &last_expr.kind else {
+            return None;
+        };
+
+        if self.exprs_match_for_single_call_loop_emission(rhs, loop_condition) {
+            return Some((**lhs).clone());
+        }
+
+        None
+    }
+
+    fn match_single_call_loop_exit_for_emission(
+        &self,
+        tail: &StructuredNode,
+        success_condition: &Expr,
+    ) -> Option<Vec<StructuredNode>> {
+        let StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } = tail
+        else {
+            return None;
+        };
+
+        let success_base = self.single_call_loop_condition_base_for_emission(success_condition)?;
+        let (if_base, if_positive) =
+            self.single_call_loop_condition_base_with_polarity_for_emission(condition)?;
+        if if_base != success_base {
+            return None;
+        }
+
+        if if_positive && then_body.is_empty() {
+            return else_body.clone();
+        }
+
+        if !if_positive && else_body.is_none() {
+            return Some(then_body.clone());
+        }
+
+        None
+    }
+
+    fn single_call_loop_condition_base_for_emission(&self, expr: &Expr) -> Option<String> {
+        let (base, _) = self.single_call_loop_condition_base_with_polarity_for_emission(expr)?;
+        Some(base)
+    }
+
+    fn single_call_loop_condition_base_with_polarity_for_emission(
+        &self,
+        expr: &Expr,
+    ) -> Option<(String, bool)> {
+        match &expr.kind {
+            ExprKind::UnaryOp {
+                op: UnaryOpKind::Not,
+                operand,
+            } => self
+                .single_call_loop_condition_base_with_polarity_for_emission(operand)
+                .map(|(base, positive)| (base, !positive)),
+            ExprKind::BinOp {
+                op: BinOpKind::Ne,
+                left,
+                right,
+            } => {
+                if matches!(right.kind, ExprKind::IntLit(0)) {
+                    return Some((format!("{left}"), true));
+                }
+                if matches!(left.kind, ExprKind::IntLit(0)) {
+                    return Some((format!("{right}"), true));
+                }
+                None
+            }
+            ExprKind::BinOp {
+                op: BinOpKind::Eq,
+                left,
+                right,
+            } => {
+                if matches!(right.kind, ExprKind::IntLit(0)) {
+                    return Some((format!("{left}"), false));
+                }
+                if matches!(left.kind, ExprKind::IntLit(0)) {
+                    return Some((format!("{right}"), false));
+                }
+                None
+            }
+            ExprKind::Var(_) | ExprKind::Call { .. } | ExprKind::Unknown(_) => {
+                Some((format!("{expr}"), true))
+            }
+            _ => None,
+        }
+    }
+
+    fn exprs_match_for_single_call_loop_emission(&self, left: &Expr, right: &Expr) -> bool {
+        format!("{left}") == format!("{right}")
+    }
+
     fn emit_node_with_skip_and_decls(
         &self,
         node: &StructuredNode,
@@ -7438,6 +7591,14 @@ impl PseudoCodeEmitter {
                     return;
                 }
                 let indent = self.indent.repeat(depth);
+                if let Some(rewritten_body) =
+                    self.rewrite_single_call_condition_while_for_emission(condition, body)
+                {
+                    writeln!(output, "{}while (1) {{", indent).unwrap();
+                    self.emit_nodes_with_decls(&rewritten_body, output, depth + 1, declared_vars);
+                    writeln!(output, "{}}}", indent).unwrap();
+                    return;
+                }
                 writeln!(
                     output,
                     "{}while ({}) {{",
@@ -7609,6 +7770,14 @@ impl PseudoCodeEmitter {
                     return;
                 }
                 let indent = self.indent.repeat(depth);
+                if let Some(rewritten_body) =
+                    self.rewrite_single_call_condition_while_for_emission(condition, body)
+                {
+                    writeln!(output, "{}while (1) {{", indent).unwrap();
+                    self.emit_nodes_with_decls(&rewritten_body, output, depth + 1, declared_vars);
+                    writeln!(output, "{}}}", indent).unwrap();
+                    return;
+                }
                 writeln!(
                     output,
                     "{}while ({}) {{",
@@ -8284,6 +8453,14 @@ impl PseudoCodeEmitter {
             } => {
                 // Eliminate dead loops: while (0) { ... } - body never executes
                 if let Some(0) = self.try_eval_constant(condition) {
+                    return;
+                }
+                if let Some(rewritten_body) =
+                    self.rewrite_single_call_condition_while_for_emission(condition, body)
+                {
+                    writeln!(output, "{}while (1) {{", indent).unwrap();
+                    self.emit_nodes(&rewritten_body, output, depth + 1);
+                    writeln!(output, "{}}}", indent).unwrap();
                     return;
                 }
                 writeln!(
@@ -9235,6 +9412,44 @@ mod tests {
             output.contains("i++") || output.contains("i = i + 1"),
             "Expected increment, got: {}",
             output
+        );
+    }
+
+    #[test]
+    fn test_emit_single_call_condition_while_with_captured_poll_result_once() {
+        let poll_call = Expr::call(
+            CallTarget::Named("poll".to_string()),
+            vec![Expr::unknown("err")],
+        );
+        let body = vec![
+            StructuredNode::Expr(Expr::assign(Expr::unknown("ret_0"), poll_call.clone())),
+            StructuredNode::If {
+                condition: Expr::unknown("ret_0"),
+                then_body: vec![],
+                else_body: Some(vec![StructuredNode::Return(Some(Expr::int(42)))]),
+            },
+        ];
+
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::While {
+                    condition: poll_call,
+                    body,
+                    header: None,
+                    exit_block: None,
+                },
+                StructuredNode::Return(Some(Expr::int(0))),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit(&cfg, "test");
+
+        assert_eq!(
+            output.matches("poll(err)").count(),
+            1,
+            "expected one poll call in the emitted loop, got:\n{output}"
         );
     }
 
