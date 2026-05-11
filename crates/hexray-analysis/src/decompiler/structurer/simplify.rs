@@ -7172,10 +7172,15 @@ fn substitute_return_value_aliases_in_node(
             address_range,
         } => StructuredNode::Block {
             id,
-            statements: statements
-                .into_iter()
-                .map(|stmt| substitute_return_register_uses(stmt, aliases, replacement))
-                .collect(),
+            statements: {
+                let mut statements = statements;
+                substitute_return_register_uses_until_clobber(
+                    &mut statements,
+                    aliases,
+                    replacement,
+                );
+                statements
+            },
             address_range,
         },
         StructuredNode::Expr(expr) => {
@@ -7187,15 +7192,9 @@ fn substitute_return_value_aliases_in_node(
             else_body,
         } => StructuredNode::If {
             condition: substitute_return_register_uses(condition, aliases, replacement),
-            then_body: then_body
-                .into_iter()
-                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                .collect(),
-            else_body: else_body.map(|body| {
-                body.into_iter()
-                    .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                    .collect()
-            }),
+            then_body: substitute_return_value_aliases_in_nodes(then_body, aliases, replacement),
+            else_body: else_body
+                .map(|body| substitute_return_value_aliases_in_nodes(body, aliases, replacement)),
         },
         StructuredNode::While {
             condition,
@@ -7204,10 +7203,7 @@ fn substitute_return_value_aliases_in_node(
             exit_block,
         } => StructuredNode::While {
             condition: substitute_return_register_uses(condition, aliases, replacement),
-            body: body
-                .into_iter()
-                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                .collect(),
+            body: substitute_return_value_aliases_in_nodes(body, aliases, replacement),
             header,
             exit_block,
         },
@@ -7217,10 +7213,7 @@ fn substitute_return_value_aliases_in_node(
             header,
             exit_block,
         } => StructuredNode::DoWhile {
-            body: body
-                .into_iter()
-                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                .collect(),
+            body: substitute_return_value_aliases_in_nodes(body, aliases, replacement),
             condition: substitute_return_register_uses(condition, aliases, replacement),
             header,
             exit_block,
@@ -7236,10 +7229,7 @@ fn substitute_return_value_aliases_in_node(
             init: init.map(|expr| substitute_return_register_uses(expr, aliases, replacement)),
             condition: substitute_return_register_uses(condition, aliases, replacement),
             update: update.map(|expr| substitute_return_register_uses(expr, aliases, replacement)),
-            body: body
-                .into_iter()
-                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                .collect(),
+            body: substitute_return_value_aliases_in_nodes(body, aliases, replacement),
             header,
             exit_block,
         },
@@ -7248,10 +7238,7 @@ fn substitute_return_value_aliases_in_node(
             header,
             exit_block,
         } => StructuredNode::Loop {
-            body: body
-                .into_iter()
-                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                .collect(),
+            body: substitute_return_value_aliases_in_nodes(body, aliases, replacement),
             header,
             exit_block,
         },
@@ -7266,30 +7253,68 @@ fn substitute_return_value_aliases_in_node(
                 .map(|(values, body)| {
                     (
                         values,
-                        body.into_iter()
-                            .map(|node| {
-                                substitute_return_value_aliases_in_node(node, aliases, replacement)
-                            })
-                            .collect(),
+                        substitute_return_value_aliases_in_nodes(body, aliases, replacement),
                     )
                 })
                 .collect(),
-            default: default.map(|body| {
-                body.into_iter()
-                    .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                    .collect()
-            }),
+            default: default
+                .map(|body| substitute_return_value_aliases_in_nodes(body, aliases, replacement)),
         },
         StructuredNode::Sequence(nodes) => StructuredNode::Sequence(
-            nodes
-                .into_iter()
-                .map(|node| substitute_return_value_aliases_in_node(node, aliases, replacement))
-                .collect(),
+            substitute_return_value_aliases_in_nodes(nodes, aliases, replacement),
         ),
         StructuredNode::Return(Some(expr)) => StructuredNode::Return(Some(
             substitute_return_register_uses(expr, aliases, replacement),
         )),
         other => other,
+    }
+}
+
+fn substitute_return_value_aliases_in_nodes(
+    nodes: Vec<StructuredNode>,
+    aliases: &[String],
+    replacement: &Expr,
+) -> Vec<StructuredNode> {
+    let mut rewritten = Vec::with_capacity(nodes.len());
+    let mut propagation_live = true;
+
+    for node in nodes {
+        if !propagation_live {
+            rewritten.push(node);
+            continue;
+        }
+
+        let node = substitute_return_value_aliases_in_node(node, aliases, replacement);
+        propagation_live = !node_stops_return_value_alias_propagation(&node, aliases);
+        rewritten.push(node);
+    }
+
+    rewritten
+}
+
+fn node_stops_return_value_alias_propagation(node: &StructuredNode, aliases: &[String]) -> bool {
+    use super::super::expression::ExprKind;
+
+    match node {
+        StructuredNode::Block { statements, .. } => statements.iter().any(|stmt| {
+            matches!(
+                &stmt.kind,
+                ExprKind::Call { target, .. } if is_call_capture_boundary(target)
+            ) || matches!(
+                &stmt.kind,
+                ExprKind::Assign { rhs, .. }
+                    if matches!(
+                        &rhs.kind,
+                        ExprKind::Call { target, .. } if is_call_capture_boundary(target)
+                    )
+            ) || statement_clobbers_return_register(stmt, aliases)
+        }),
+        StructuredNode::Expr(expr) => match &expr.kind {
+            ExprKind::Call { target, .. } if is_call_capture_boundary(target) => true,
+            _ => statement_clobbers_return_register(expr, aliases),
+        },
+        StructuredNode::Return(Some(expr)) => statement_clobbers_return_register(expr, aliases),
+        _ => false,
     }
 }
 
@@ -7381,13 +7406,15 @@ fn substitute_return_register_uses_until_clobber(
 ) {
     for stmt in statements.iter_mut() {
         let original = stmt.clone();
-        if let super::super::expression::ExprKind::Call { target, .. } = &original.kind {
-            if is_call_capture_boundary(target) {
-                break;
-            }
-        }
-
         *stmt = substitute_return_register_uses(original.clone(), aliases, replacement);
+
+        if matches!(
+            &original.kind,
+            super::super::expression::ExprKind::Call { target, .. }
+                if is_call_capture_boundary(target)
+        ) {
+            break;
+        }
 
         if statement_clobbers_return_register(&original, aliases) {
             break;
@@ -9556,6 +9583,98 @@ mod tests {
             panic!("expected deeper if");
         };
         assert_eq!(format!("{deeper_cond}"), "ret_0 == 'v'");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_stops_outer_alias_rewrite_at_inner_call_boundary() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(
+                    CallTarget::Named("strncmp".to_string()),
+                    vec![Expr::unknown("lhs1"), Expr::unknown("rhs1"), Expr::int(7)],
+                )],
+            ),
+            StructuredNode::If {
+                condition: Expr::unary(UnaryOpKind::LogicalNot, reg("eax", 4)),
+                then_body: vec![
+                    block(
+                        1,
+                        vec![Expr::call(
+                            CallTarget::Named("strncmp".to_string()),
+                            vec![Expr::unknown("lhs2"), Expr::unknown("rhs2"), Expr::int(3)],
+                        )],
+                    ),
+                    StructuredNode::If {
+                        condition: Expr::unary(UnaryOpKind::LogicalNot, reg("eax", 4)),
+                        then_body: vec![block(
+                            2,
+                            vec![Expr::assign(
+                                Expr::deref(reg("rax", 8), 8),
+                                Expr::unknown("err"),
+                            )],
+                        )],
+                        else_body: None,
+                    },
+                ],
+                else_body: None,
+            },
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+
+        let StructuredNode::Block {
+            statements: first_block,
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected first node to remain a block");
+        };
+        assert_eq!(
+            format!("{}", first_block[0]),
+            "ret_1 = strncmp(lhs1, rhs1, 7)"
+        );
+
+        let StructuredNode::If {
+            condition,
+            then_body,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected outer if");
+        };
+        assert_eq!(format!("{condition}"), "!ret_1");
+
+        let StructuredNode::Block {
+            statements: inner_call_block,
+            ..
+        } = &then_body[0]
+        else {
+            panic!("expected nested call block");
+        };
+        assert_eq!(
+            format!("{}", inner_call_block[0]),
+            "ret_0 = strncmp(lhs2, rhs2, 3)"
+        );
+
+        let StructuredNode::If {
+            condition: inner_cond,
+            then_body: inner_then,
+            ..
+        } = &then_body[1]
+        else {
+            panic!("expected nested if after inner call");
+        };
+        assert_eq!(format!("{inner_cond}"), "!ret_0");
+
+        let StructuredNode::Block {
+            statements: inner_store,
+            ..
+        } = &inner_then[0]
+        else {
+            panic!("expected nested store block");
+        };
+        assert_eq!(format!("{}", inner_store[0]), "*(uint64_t*)(ret_0) = err");
     }
 
     #[test]
