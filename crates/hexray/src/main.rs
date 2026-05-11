@@ -939,6 +939,9 @@ fn print_info(binary: &Binary) {
                 print_gnu_property_info(&notes);
             }
 
+            // Surface .init_array / .fini_array constructor/destructor entries.
+            print_lifecycle_arrays(binary);
+
             // Display CUDA CUBIN info if this is an EM_CUDA ELF.
             if let Ok(view) = elf.cubin_view() {
                 print_cubin_info(&view);
@@ -4286,8 +4289,60 @@ fn collect_analysis_symbols(
 
     synthesize_startup_function_symbols(fmt, relocations, &mut symbols);
     synthesize_signature_function_symbols(fmt, &mut symbols);
+    synthesize_lifecycle_array_symbols(binary, &mut symbols);
 
     symbols
+}
+
+/// Inject synthetic `init_array_entry_N` / `fini_array_entry_N` symbols for
+/// constructors and destructors only reachable through the lifecycle arrays.
+/// In stripped binaries these `__attribute__((constructor))` functions are
+/// otherwise unenumerable.
+fn synthesize_lifecycle_array_symbols(binary: &Binary, symbols: &mut Vec<hexray_core::Symbol>) {
+    let known_addresses: std::collections::HashSet<u64> =
+        symbols.iter().map(|s| s.address).collect();
+    let entries = discover_lifecycle_array_entries_for_binary(binary);
+    if entries.is_empty() {
+        return;
+    }
+    let fmt = binary.as_format();
+    let init_ranges: Vec<(u64, u64)> = fmt
+        .sections()
+        .filter(|s| s.name() == ".init_array")
+        .map(|s| {
+            (
+                s.virtual_address(),
+                s.virtual_address().saturating_add(s.size()),
+            )
+        })
+        .collect();
+    let mut init_idx = 0usize;
+    let mut fini_idx = 0usize;
+    for (slot, target) in entries {
+        if known_addresses.contains(&target) {
+            continue;
+        }
+        let in_init = init_ranges
+            .iter()
+            .any(|(start, end)| slot >= *start && slot < *end);
+        let (label, n) = if in_init {
+            let n = init_idx;
+            init_idx += 1;
+            ("init_array_entry", n)
+        } else {
+            let n = fini_idx;
+            fini_idx += 1;
+            ("fini_array_entry", n)
+        };
+        symbols.push(hexray_core::Symbol {
+            address: target,
+            size: 0,
+            name: format!("{label}_{n}"),
+            kind: hexray_core::SymbolKind::Function,
+            binding: hexray_core::SymbolBinding::Local,
+            section_index: None,
+        });
+    }
 }
 
 ///
@@ -7915,6 +7970,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
 
             let mut symbols: Vec<_> =
                 filter_ifunc_display_aliases(fmt.symbols().cloned().collect());
+            synthesize_lifecycle_array_symbols(binary, &mut symbols);
             symbols.sort_by_key(|s| s.address);
 
             if json_mode {
@@ -8725,6 +8781,44 @@ fn decode_gnu_property_note(elf: &hexray_formats::elf::Elf) -> Option<GnuPropert
         Some(info)
     } else {
         None
+    }
+}
+
+fn print_lifecycle_arrays(binary: &Binary) {
+    let entries = discover_lifecycle_array_entries_for_binary(binary);
+    if entries.is_empty() {
+        return;
+    }
+    // Group entries by which lifecycle section they live in. Walk sections
+    // again so we know which is init_array vs fini_array.
+    let fmt = binary.as_format();
+    let mut init = Vec::new();
+    let mut fini = Vec::new();
+    for section in fmt.sections() {
+        let name = section.name();
+        if name != ".init_array" && name != ".fini_array" {
+            continue;
+        }
+        let start = section.virtual_address();
+        let end = start.saturating_add(section.size());
+        for (slot, target) in &entries {
+            if *slot >= start && *slot < end {
+                if name == ".init_array" {
+                    init.push((*slot, *target));
+                } else {
+                    fini.push((*slot, *target));
+                }
+            }
+        }
+    }
+    for (label, list) in [("init_array", &init), ("fini_array", &fini)] {
+        if list.is_empty() {
+            continue;
+        }
+        println!("\n.{label} entries:");
+        for (i, (slot, target)) in list.iter().enumerate() {
+            println!("  [{i}]  slot {slot:#x} -> target {target:#x}");
+        }
     }
 }
 
