@@ -22,6 +22,13 @@ struct EvexMemorySemantics {
     allow_broadcast: bool,
 }
 
+#[derive(Clone, Copy)]
+enum EvexOperandPattern {
+    BinaryRegRm,
+    BinaryRmReg,
+    TernaryRegVvvvvRm,
+}
+
 /// x86_64 instruction decoder.
 pub struct X86_64Disassembler {
     /// Whether to use Intel syntax (true) or AT&T syntax (false).
@@ -2321,12 +2328,23 @@ impl X86_64Disassembler {
             })?;
         offset = offset.saturating_add(rm_consumed);
 
-        // Build operand list: dest=reg, src1=vvvv, src2=rm
-        // For EVEX, dest uses extended reg (R, R')
-        operands.push(Operand::Register(decode_xmm(modrm.reg, vector_size)));
-        // vvvv operand (5-bit with V')
-        operands.push(Operand::Register(decode_xmm(evex.vvvvv(), vector_size)));
-        operands.push(rm_operand);
+        let dest = Operand::Register(decode_xmm(modrm.reg, vector_size));
+        let vvvv = Operand::Register(decode_xmm(evex.vvvvv(), vector_size));
+        match self.evex_operand_pattern(evex.mm, opcode, evex.pp, rm_is_register) {
+            EvexOperandPattern::BinaryRegRm => {
+                operands.push(dest);
+                operands.push(rm_operand);
+            }
+            EvexOperandPattern::BinaryRmReg => {
+                operands.push(rm_operand);
+                operands.push(dest);
+            }
+            EvexOperandPattern::TernaryRegVvvvvRm => {
+                operands.push(dest);
+                operands.push(vvvv);
+                operands.push(rm_operand);
+            }
+        }
 
         // For 0F3A map, read immediate byte
         if evex.mm == 3 {
@@ -2609,6 +2627,37 @@ impl X86_64Disassembler {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    fn evex_operand_pattern(
+        &self,
+        mm: u8,
+        opcode: u8,
+        pp: u8,
+        rm_is_register: bool,
+    ) -> EvexOperandPattern {
+        match mm {
+            1 => match (opcode, pp) {
+                // Packed moves and aligned/unaligned integer moves are plain two-operand copies.
+                (0x28 | 0x6F, _) => EvexOperandPattern::BinaryRegRm,
+                (0x29 | 0x7F, _) => EvexOperandPattern::BinaryRmReg,
+                // Packed vmovups/vmovupd are also two-operand copies.
+                (0x10, 0 | 1) => EvexOperandPattern::BinaryRegRm,
+                (0x11, 0 | 1) => EvexOperandPattern::BinaryRmReg,
+                // Scalar memory moves suppress the synthetic vvvv source on load/store forms.
+                (0x10, 2 | 3) if !rm_is_register => EvexOperandPattern::BinaryRegRm,
+                (0x11, 2 | 3) if !rm_is_register => EvexOperandPattern::BinaryRmReg,
+                _ => EvexOperandPattern::TernaryRegVvvvvRm,
+            },
+            2 => match (opcode, pp) {
+                // The supported broadcast and widening move forms are all two-operand.
+                (0x31 | 0x32 | 0x33 | 0x34 | 0x35 | 0x58 | 0x59, 1) => {
+                    EvexOperandPattern::BinaryRegRm
+                }
+                _ => EvexOperandPattern::TernaryRegVvvvvRm,
+            },
+            _ => EvexOperandPattern::TernaryRegVvvvvRm,
         }
     }
 
@@ -4585,7 +4634,9 @@ mod tests {
         assert_eq!(result.instruction.mnemonic, "vmovaps");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
-        assert_eq!(result.instruction.operands.len(), 3);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(result.instruction.operands[0].to_string(), "zmm0");
+        assert_eq!(result.instruction.operands[1].to_string(), "zmm1");
     }
 
     #[test]
@@ -4671,6 +4722,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.instruction.mnemonic, "vmovdqa32");
         assert_eq!(result.instruction.operation, Operation::Move);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(result.instruction.operands[0].to_string(), "zmm0");
+        assert_eq!(result.instruction.operands[1].to_string(), "zmm1");
         assert_eq!(result.size, 6);
     }
 
@@ -4685,6 +4739,33 @@ mod tests {
         assert_eq!(result.instruction.mnemonic, "vmovdqa64");
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
+    }
+
+    #[test]
+    fn test_evex_vpbroadcastd_uses_two_operands() {
+        let disasm = X86_64Disassembler::new();
+        // 62 F2 7D 48 58 44 24 01 = vpbroadcastd zmm0, [rsp+0x4]
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf2, 0x7d, 0x48, 0x58, 0x44, 0x24, 0x01], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vpbroadcastd");
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(result.instruction.operands[0].to_string(), "zmm0");
+        assert_eq!(first_memory_displacement(&result.instruction), Some(0x4));
+    }
+
+    #[test]
+    fn test_evex_vmovdqu64_store_uses_two_operands() {
+        let disasm = X86_64Disassembler::new();
+        // 62 F1 FE 48 7F 07 = vmovdqu64 [rdi], zmm0
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0xfe, 0x48, 0x7f, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmovdqu64");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(result.instruction.operands[0].to_string(), "[rdi]");
+        assert_eq!(result.instruction.operands[1].to_string(), "zmm0");
     }
 
     #[test]
