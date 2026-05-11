@@ -6574,10 +6574,11 @@ fn merge_previous_block_call_capture(result: &mut Vec<StructuredNode>, statement
         id: prev_id,
         statements: prev_stmts,
         address_range: prev_range,
-    }) = result.pop()
+    }) = result.last().cloned()
     else {
         return;
     };
+    result.pop();
 
     let Some(last_stmt) = prev_stmts.last().cloned() else {
         result.push(StructuredNode::Block {
@@ -6727,12 +6728,12 @@ fn capture_return_register_uses_from_previous_block(
     };
 
     let aliases = return_register_aliases(&primary_reg);
-    let Some(block_index) = find_previous_call_capture_block(result, &aliases) else {
-        return;
-    };
-    let Some(temp_expr) =
+    let temp_expr = if let Some(block_index) = find_previous_call_capture_block(result, &aliases) {
         capture_previous_call_result(result, block_index, capture_counter, &primary_reg)
-    else {
+    } else {
+        capture_previous_if_result(result, capture_counter, &primary_reg)
+    };
+    let Some(temp_expr) = temp_expr else {
         return;
     };
 
@@ -7550,6 +7551,111 @@ fn capture_previous_call_result(
     }
 
     Some(temp_expr)
+}
+
+fn capture_previous_if_result(
+    nodes: &mut [StructuredNode],
+    capture_counter: &mut u32,
+    primary_reg: &str,
+) -> Option<Expr> {
+    use super::super::expression::{VarKind, Variable};
+
+    let StructuredNode::If {
+        then_body,
+        else_body: Some(else_body),
+        ..
+    } = nodes.last()?.clone()
+    else {
+        return None;
+    };
+    if body_definitely_terminates(&then_body) || body_definitely_terminates(&else_body) {
+        return None;
+    }
+
+    let reg_size = if matches!(primary_reg, "eax" | "w0") {
+        4
+    } else {
+        8
+    };
+    let temp_name = format!("ret_{}", *capture_counter);
+    *capture_counter += 1;
+    let temp_expr = Expr::var(Variable {
+        kind: VarKind::Temp(*capture_counter),
+        name: temp_name,
+        size: reg_size,
+    });
+
+    let aliases = return_register_aliases(primary_reg);
+    let mut then_body = then_body;
+    let mut else_body = else_body;
+    if !capture_branch_tail_result(&mut then_body, &temp_expr, &aliases)
+        || !capture_branch_tail_result(&mut else_body, &temp_expr, &aliases)
+    {
+        return None;
+    }
+
+    let StructuredNode::If {
+        then_body: actual_then,
+        else_body: Some(actual_else),
+        ..
+    } = nodes.last_mut()?
+    else {
+        return None;
+    };
+    *actual_then = then_body;
+    *actual_else = else_body;
+
+    Some(temp_expr)
+}
+
+fn capture_branch_tail_result(
+    body: &mut [StructuredNode],
+    temp_expr: &Expr,
+    return_aliases: &[String],
+) -> bool {
+    use super::super::expression::ExprKind;
+
+    let Some(last) = body.last_mut() else {
+        return false;
+    };
+
+    match last {
+        StructuredNode::Block { statements, .. } => {
+            let Some(stmt) = statements.last_mut() else {
+                return false;
+            };
+            match &stmt.kind {
+                ExprKind::Call { target, args } if is_call_capture_boundary(target) => {
+                    *stmt =
+                        Expr::assign(temp_expr.clone(), Expr::call(target.clone(), args.clone()));
+                    true
+                }
+                ExprKind::Assign { lhs, rhs } => {
+                    let Some(lhs_name) = expr_simple_identifier(lhs) else {
+                        return false;
+                    };
+                    let lower = lhs_name.to_lowercase();
+                    if !return_aliases.iter().any(|alias| alias == &lower) {
+                        return false;
+                    }
+                    *stmt = Expr::assign(temp_expr.clone(), (**rhs).clone());
+                    true
+                }
+                _ => false,
+            }
+        }
+        StructuredNode::Expr(expr) => match &expr.kind {
+            ExprKind::Call { target, args } if is_call_capture_boundary(target) => {
+                *expr = Expr::assign(temp_expr.clone(), Expr::call(target.clone(), args.clone()));
+                true
+            }
+            _ => false,
+        },
+        StructuredNode::Sequence(nodes) => {
+            capture_branch_tail_result(nodes.as_mut_slice(), temp_expr, return_aliases)
+        }
+        _ => false,
+    }
 }
 
 fn substitute_return_register_uses_until_clobber(
@@ -10178,6 +10284,67 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(format!("{}", merged[0]), "ret_0 = foo()");
         assert_eq!(format!("{}", merged[1]), "sum += *(uint32_t*)(ret_0)");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_materializes_joined_if_call_result() {
+        let nodes = vec![
+            StructuredNode::If {
+                condition: Expr::binop(BinOpKind::Eq, arg("arg0", 0, 8), Expr::int(0)),
+                then_body: vec![block(0, vec![Expr::assign(reg("eax", 4), Expr::int(0))])],
+                else_body: Some(vec![block(
+                    1,
+                    vec![Expr::call(
+                        CallTarget::Named("__dynamic_cast".to_string()),
+                        vec![
+                            arg("arg0", 0, 8),
+                            Expr::unknown("typeinfo_animal"),
+                            Expr::unknown("typeinfo_dog"),
+                            Expr::int(0),
+                        ],
+                    )],
+                )]),
+            },
+            block(2, vec![Expr::assign(local("local_8", 8), reg("rax", 8))]),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        } = &merged[0]
+        else {
+            panic!("expected leading if node, got {merged:?}");
+        };
+        let StructuredNode::Block {
+            statements: then_stmts,
+            ..
+        } = &then_body[0]
+        else {
+            panic!("expected then block");
+        };
+        let StructuredNode::Block {
+            statements: else_stmts,
+            ..
+        } = &else_body[0]
+        else {
+            panic!("expected else block");
+        };
+        let StructuredNode::Block {
+            statements: join_stmts,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected join block, got {merged:?}");
+        };
+
+        assert_eq!(format!("{}", then_stmts[0]), "ret_0 = 0");
+        assert_eq!(
+            format!("{}", else_stmts[0]),
+            "ret_0 = __dynamic_cast(arg0, typeinfo_animal, typeinfo_dog, 0)"
+        );
+        assert_eq!(format!("{}", join_stmts[0]), "local_8 = ret_0");
     }
 
     #[test]
