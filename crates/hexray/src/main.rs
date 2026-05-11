@@ -1026,6 +1026,17 @@ fn print_info(binary: &Binary) {
             println!("\nSections:      {}", pe.sections.len());
             println!("Imports:       {}", pe.imports.len());
             println!("Exports:       {}", pe.exports.len());
+            if !pe.optional_header.data_directories.is_empty() {
+                println!("\nData directories:");
+                for (index, directory) in pe.optional_header.data_directories.iter().enumerate() {
+                    println!(
+                        "  [{index:>2}] {:<25} RVA {:#x}   size {:#x}",
+                        format!("{}:", pe_data_directory_name(index)),
+                        directory.virtual_address,
+                        directory.size
+                    );
+                }
+            }
         }
     }
 
@@ -2072,6 +2083,32 @@ fn infer_start_symbol_from_entry(fmt: &dyn BinaryFormat) -> Option<hexray_core::
         binding: SymbolBinding::Local,
         section_index: fmt.section_containing(address).map(|_| 0),
     })
+}
+
+fn pe_data_directory_name(index: usize) -> &'static str {
+    const PE_DATA_DIRECTORY_NAMES: [&str; 16] = [
+        "Export Table",
+        "Import Table",
+        "Resource Table",
+        "Exception Table",
+        "Certificate Table",
+        "Base Relocation Table",
+        "Debug",
+        "Architecture",
+        "Global Ptr",
+        "TLS Directory",
+        "Load Config Table",
+        "Bound Import",
+        "IAT",
+        "Delay Import Descriptor",
+        "CLR Runtime Header",
+        "Reserved",
+    ];
+
+    PE_DATA_DIRECTORY_NAMES
+        .get(index)
+        .copied()
+        .unwrap_or("Unknown")
 }
 
 fn synthesize_startup_function_symbols(

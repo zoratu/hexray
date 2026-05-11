@@ -17,4 +17,22 @@ Sections:      1
 Imports:       0
 Exports:       0
 
+Data directories:
+  [ 0] Export Table:             RVA 0x0   size 0x0
+  [ 1] Import Table:             RVA 0x0   size 0x0
+  [ 2] Resource Table:           RVA 0x0   size 0x0
+  [ 3] Exception Table:          RVA 0x0   size 0x0
+  [ 4] Certificate Table:        RVA 0x0   size 0x0
+  [ 5] Base Relocation Table:    RVA 0x0   size 0x0
+  [ 6] Debug:                    RVA 0x0   size 0x0
+  [ 7] Architecture:             RVA 0x0   size 0x0
+  [ 8] Global Ptr:               RVA 0x0   size 0x0
+  [ 9] TLS Directory:            RVA 0x0   size 0x0
+  [10] Load Config Table:        RVA 0x0   size 0x0
+  [11] Bound Import:             RVA 0x0   size 0x0
+  [12] IAT:                      RVA 0x0   size 0x0
+  [13] Delay Import Descriptor:  RVA 0x0   size 0x0
+  [14] CLR Runtime Header:       RVA 0x0   size 0x0
+  [15] Reserved:                 RVA 0x0   size 0x0
+
 Symbols:       0
