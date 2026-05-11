@@ -3475,7 +3475,10 @@ fn propagate_args_in_block_with_state(
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
-                invalidate_dependent_register_values(&mut state.reg_values, &written_aliases);
+                invalidate_dependent_stabilized_register_values(
+                    &mut state.reg_values,
+                    &written_aliases,
+                );
                 invalidate_dependent_register_values(
                     &mut state.saved_temp_values,
                     &written_aliases,
@@ -3516,8 +3519,14 @@ fn propagate_args_in_block_with_state(
 
                 if let Some(tracked_arg_key) = tracked_call_arg_key(v, preferred_family) {
                     let tracks_register_aliases = is_tracked_call_arg_register(&v.name);
+                    let preserved_tracked_arg_value = resolve_tracked_arg_snapshot_value(
+                        rhs,
+                        &tracked_rhs,
+                        &state.arg_values,
+                        Some(&state.saved_temp_values),
+                    );
                     if tracks_register_aliases && !expr_requires_single_evaluation(&tracked_rhs) {
-                        let tracked_reg_value = stabilize_saved_arg_registers(tracked_rhs.clone());
+                        let tracked_reg_value = preserved_tracked_arg_value.clone();
                         for alias in &written_aliases {
                             state
                                 .reg_values
@@ -3546,11 +3555,9 @@ fn propagate_args_in_block_with_state(
                         _ => match &tracked_rhs.kind {
                             ExprKind::Call { target, .. } if is_real_function_call(target) => {
                                 call_result_placeholder_expr(preferred_family, &v.name, v.size)
-                                    .unwrap_or_else(|| {
-                                        stabilize_saved_arg_registers(tracked_rhs.clone())
-                                    })
+                                    .unwrap_or_else(|| preserved_tracked_arg_value.clone())
                             }
-                            _ => stabilize_saved_arg_registers(tracked_rhs.clone()),
+                            _ => preserved_tracked_arg_value.clone(),
                         },
                     };
                     let stmt_idx = match v.kind {
@@ -3676,7 +3683,10 @@ fn propagate_args_in_block_with_state(
                 } else {
                     None
                 };
-                invalidate_dependent_register_values(&mut state.reg_values, &written_aliases);
+                invalidate_dependent_stabilized_register_values(
+                    &mut state.reg_values,
+                    &written_aliases,
+                );
                 invalidate_dependent_register_values(
                     &mut state.saved_temp_values,
                     &written_aliases,
@@ -3963,7 +3973,7 @@ fn invalidate_pseudo_call_outputs(
         return false;
     }
 
-    invalidate_dependent_register_values(reg_values, &written_aliases);
+    invalidate_dependent_stabilized_register_values(reg_values, &written_aliases);
     invalidate_dependent_register_values(saved_temp_values, &written_aliases);
     invalidate_dependent_arg_values(arg_values, &written_aliases);
     invalidate_written_call_target_values(call_target_values, &written_aliases);
@@ -3975,12 +3985,37 @@ fn invalidate_pseudo_call_outputs(
     true
 }
 
+fn expand_written_aliases_with_arg_placeholders(
+    written_aliases: &HashSet<String>,
+) -> HashSet<String> {
+    let mut expanded = written_aliases.clone();
+    for alias in written_aliases {
+        if let Some(index) = get_arg_register_index(alias) {
+            expanded.insert(format!("arg{index}"));
+        }
+        if let Some(index) = get_float_arg_register_index(alias) {
+            expanded.insert(format!("farg{index}"));
+        }
+    }
+    expanded
+}
+
 fn invalidate_dependent_register_values(
     reg_values: &mut HashMap<String, Expr>,
     written_aliases: &HashSet<String>,
 ) {
     reg_values.retain(|alias, expr| {
         !written_aliases.contains(alias) && !expr_uses_any_register_alias(expr, written_aliases)
+    });
+}
+
+fn invalidate_dependent_stabilized_register_values(
+    reg_values: &mut HashMap<String, Expr>,
+    written_aliases: &HashSet<String>,
+) {
+    let expanded = expand_written_aliases_with_arg_placeholders(written_aliases);
+    reg_values.retain(|alias, expr| {
+        !expanded.contains(alias) && !expr_uses_any_register_alias(expr, &expanded)
     });
 }
 
@@ -5960,6 +5995,27 @@ fn lookup_tracked_register_value(
         }
     }
     None
+}
+
+fn resolve_tracked_arg_snapshot_value(
+    original_rhs: &Expr,
+    tracked_rhs: &Expr,
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
+) -> Expr {
+    use super::super::expression::ExprKind;
+
+    if let ExprKind::Var(src_var) = &original_rhs.kind {
+        if is_tracked_call_arg_register(&src_var.name) {
+            if let Some((_, value)) =
+                lookup_tracked_register_value(arg_values, &src_var.name, saved_temp_values)
+            {
+                return value;
+            }
+        }
+    }
+
+    stabilize_saved_arg_registers(tracked_rhs.clone())
 }
 
 fn resolve_string_literal(expr: &Expr, binary_data: Option<&BinaryDataContext>) -> Option<String> {
