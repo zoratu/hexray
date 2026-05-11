@@ -24,6 +24,8 @@ pub const LC_MAIN: u32 = 0x80000028;
 pub const LC_DATA_IN_CODE: u32 = 0x29;
 pub const LC_SOURCE_VERSION: u32 = 0x2A;
 pub const LC_BUILD_VERSION: u32 = 0x32;
+pub const LC_DYLD_EXPORTS_TRIE: u32 = 0x80000033;
+pub const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034;
 
 // Bounds-checked little-endian readers (caller has already verified
 // the buffer length at function entry).
@@ -88,6 +90,10 @@ pub enum LoadCommand {
     BuildVersion { platform: u32, minos: u32, sdk: u32 },
     /// LC_FUNCTION_STARTS
     FunctionStarts { dataoff: u32, datasize: u32 },
+    /// LC_DYLD_EXPORTS_TRIE
+    DyldExportsTrie { dataoff: u32, datasize: u32 },
+    /// LC_DYLD_CHAINED_FIXUPS
+    DyldChainedFixups { dataoff: u32, datasize: u32 },
     /// Other/unknown load command
     Other { cmd: u32, cmdsize: u32 },
 }
@@ -206,6 +212,24 @@ impl LoadCommand {
                     datasize: read_u32(data, 12),
                 })
             }
+            LC_DYLD_EXPORTS_TRIE => {
+                if data.len() < 16 {
+                    return Ok(Some(Self::Other { cmd, cmdsize }));
+                }
+                Some(Self::DyldExportsTrie {
+                    dataoff: read_u32(data, 8),
+                    datasize: read_u32(data, 12),
+                })
+            }
+            LC_DYLD_CHAINED_FIXUPS => {
+                if data.len() < 16 {
+                    return Ok(Some(Self::Other { cmd, cmdsize }));
+                }
+                Some(Self::DyldChainedFixups {
+                    dataoff: read_u32(data, 8),
+                    datasize: read_u32(data, 12),
+                })
+            }
             _ => Some(Self::Other { cmd, cmdsize }),
         };
 
@@ -225,24 +249,43 @@ impl LoadCommand {
             Self::LoadDylib { .. } => LC_LOAD_DYLIB,
             Self::BuildVersion { .. } => LC_BUILD_VERSION,
             Self::FunctionStarts { .. } => LC_FUNCTION_STARTS,
+            Self::DyldExportsTrie { .. } => LC_DYLD_EXPORTS_TRIE,
+            Self::DyldChainedFixups { .. } => LC_DYLD_CHAINED_FIXUPS,
             Self::Other { cmd, .. } => *cmd,
         }
     }
 
     /// Returns a human-readable name for this command type.
     pub fn name(&self) -> &'static str {
-        match self {
-            Self::Segment(_) => "LC_SEGMENT",
-            Self::Segment64(_) => "LC_SEGMENT_64",
-            Self::Symtab { .. } => "LC_SYMTAB",
-            Self::Dysymtab { .. } => "LC_DYSYMTAB",
-            Self::Main { .. } => "LC_MAIN",
-            Self::UnixThread { .. } => "LC_UNIXTHREAD",
-            Self::Uuid { .. } => "LC_UUID",
-            Self::LoadDylib { .. } => "LC_LOAD_DYLIB",
-            Self::BuildVersion { .. } => "LC_BUILD_VERSION",
-            Self::FunctionStarts { .. } => "LC_FUNCTION_STARTS",
-            Self::Other { .. } => "LC_OTHER",
+        Self::cmd_name(self.cmd_type())
+    }
+
+    /// Returns a human-readable name for a raw load-command type.
+    pub fn cmd_name(cmd: u32) -> &'static str {
+        match cmd {
+            LC_SEGMENT => "LC_SEGMENT",
+            LC_SEGMENT_64 => "LC_SEGMENT_64",
+            LC_SYMTAB => "LC_SYMTAB",
+            LC_DYSYMTAB => "LC_DYSYMTAB",
+            LC_UNIXTHREAD => "LC_UNIXTHREAD",
+            LC_LOAD_DYLIB => "LC_LOAD_DYLIB",
+            LC_ID_DYLIB => "LC_ID_DYLIB",
+            LC_LOAD_DYLINKER => "LC_LOAD_DYLINKER",
+            LC_UUID => "LC_UUID",
+            LC_CODE_SIGNATURE => "LC_CODE_SIGNATURE",
+            LC_ENCRYPTION_INFO => "LC_ENCRYPTION_INFO",
+            LC_DYLD_INFO => "LC_DYLD_INFO",
+            LC_DYLD_INFO_ONLY => "LC_DYLD_INFO_ONLY",
+            LC_VERSION_MIN_MACOSX => "LC_VERSION_MIN_MACOSX",
+            LC_VERSION_MIN_IPHONEOS => "LC_VERSION_MIN_IPHONEOS",
+            LC_FUNCTION_STARTS => "LC_FUNCTION_STARTS",
+            LC_MAIN => "LC_MAIN",
+            LC_DATA_IN_CODE => "LC_DATA_IN_CODE",
+            LC_SOURCE_VERSION => "LC_SOURCE_VERSION",
+            LC_BUILD_VERSION => "LC_BUILD_VERSION",
+            LC_DYLD_EXPORTS_TRIE => "LC_DYLD_EXPORTS_TRIE",
+            LC_DYLD_CHAINED_FIXUPS => "LC_DYLD_CHAINED_FIXUPS",
+            _ => "LC_OTHER",
         }
     }
 }

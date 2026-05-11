@@ -994,6 +994,14 @@ fn print_info(binary: &Binary) {
             }
             println!("\nSegments:      {}", macho.segments.len());
             println!("Load Commands: {}", macho.load_commands.len());
+            println!("\nLoad Commands:");
+            for (command, size) in macho
+                .load_commands
+                .iter()
+                .zip(macho.load_command_sizes.iter())
+            {
+                println!("  {:<24} {} bytes", command.name(), size);
+            }
 
             // Print segments
             println!("\nSegments:");
@@ -1181,6 +1189,16 @@ fn print_symbols(binary: &Binary, functions_only: bool, project: Option<&Analysi
         }
         symbols = deduped.into_values().collect();
     }
+    let defined_names: std::collections::HashSet<_> = symbols
+        .iter()
+        .filter(|symbol| symbol.address != 0 || symbol.section_index.is_some())
+        .map(|symbol| symbol.name.clone())
+        .collect();
+    symbols.retain(|symbol| {
+        !(symbol.address == 0
+            && symbol.kind != hexray_core::SymbolKind::Tls
+            && defined_names.contains(&symbol.name))
+    });
     symbols.sort_by(|left, right| {
         left.address
             .cmp(&right.address)
@@ -1423,6 +1441,9 @@ fn resolve_analysis_target_with_entry_main(
     match resolve_analysis_target(fmt, project, target) {
         Ok(resolved) => Ok(resolved),
         Err(err) if target == "main" => infer_main_symbol_from_entry(fmt, relocation_table)
+            .map(ResolvedAnalysisTarget::Symbol)
+            .ok_or(err),
+        Err(err) if matches!(target, "_start" | "start") => infer_start_symbol_from_entry(fmt)
             .map(ResolvedAnalysisTarget::Symbol)
             .ok_or(err),
         Err(err) => Err(err),
@@ -2031,6 +2052,20 @@ fn infer_main_symbol_from_entry(
     let (address, _) = infer_main_bootstrap_from_entry(fmt, relocation_table)?;
     Some(hexray_core::Symbol {
         name: "main".to_string(),
+        address,
+        size: 0,
+        kind: SymbolKind::Function,
+        binding: SymbolBinding::Local,
+        section_index: fmt.section_containing(address).map(|_| 0),
+    })
+}
+
+fn infer_start_symbol_from_entry(fmt: &dyn BinaryFormat) -> Option<hexray_core::Symbol> {
+    use hexray_core::{SymbolBinding, SymbolKind};
+
+    let address = fmt.entry_point()?;
+    Some(hexray_core::Symbol {
+        name: "_start".to_string(),
         address,
         size: 0,
         kind: SymbolKind::Function,
@@ -9851,6 +9886,40 @@ mod tests {
             }
             ResolvedAnalysisTarget::Address(address) => {
                 panic!("resolved {address:#x} instead of synthesized main symbol")
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_analysis_target_with_entry_main_falls_back_for_start_symbol() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401000,
+                data: vec![0x90; 0x100],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: Some(0x401040),
+        };
+
+        let resolved = resolve_analysis_target_with_entry_main(
+            &binary,
+            None,
+            "_start",
+            &RelocationTable::new(),
+        )
+        .expect("entry fallback should resolve _start");
+
+        match resolved {
+            ResolvedAnalysisTarget::Symbol(symbol) => {
+                assert_eq!(symbol.name, "_start");
+                assert_eq!(symbol.address, 0x401040);
+                assert!(symbol.is_function());
+            }
+            ResolvedAnalysisTarget::Address(address) => {
+                panic!("resolved {address:#x} instead of synthesized _start")
             }
         }
     }

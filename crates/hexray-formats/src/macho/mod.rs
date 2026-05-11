@@ -19,7 +19,7 @@ pub use segment::{Section as MachSection, Segment};
 pub use symbol::Nlist;
 
 use crate::{BinaryFormat, ParseError, Section};
-use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolKind};
+use hexray_core::{Architecture, Bitness, Endianness, Symbol, SymbolBinding, SymbolKind};
 
 // Bounds-checked little-endian readers (caller has already verified
 // the buffer length at function entry).
@@ -35,6 +35,17 @@ fn read_u32_le(data: &[u8], at: usize) -> u32 {
 }
 
 #[inline]
+fn read_u16_le(data: &[u8], at: usize) -> u16 {
+    let end = at.saturating_add(2);
+    let arr: [u8; 2] = data
+        .get(at..end)
+        .unwrap_or(&[0; 2])
+        .try_into()
+        .unwrap_or_default();
+    u16::from_le_bytes(arr)
+}
+
+#[inline]
 fn read_u32_ne(data: &[u8], at: usize) -> u32 {
     let end = at.saturating_add(4);
     let arr: [u8; 4] = data
@@ -43,6 +54,17 @@ fn read_u32_ne(data: &[u8], at: usize) -> u32 {
         .try_into()
         .unwrap_or_default();
     u32::from_ne_bytes(arr)
+}
+
+#[inline]
+fn read_u64_le(data: &[u8], at: usize) -> u64 {
+    let end = at.saturating_add(8);
+    let arr: [u8; 8] = data
+        .get(at..end)
+        .unwrap_or(&[0; 8])
+        .try_into()
+        .unwrap_or_default();
+    u64::from_le_bytes(arr)
 }
 
 /// Read a NUL-terminated name from a string-table slice.
@@ -63,6 +85,8 @@ pub struct MachO<'a> {
     pub header: MachHeader,
     /// Load commands.
     pub load_commands: Vec<LoadCommand>,
+    /// Raw load-command sizes, in the same order as `load_commands`.
+    pub load_command_sizes: Vec<u32>,
     /// Segments.
     pub segments: Vec<Segment>,
     /// Parsed symbols.
@@ -258,7 +282,8 @@ impl<'a> MachO<'a> {
                 actual: data.len(),
                 context: "Mach-O load commands",
             })?;
-        let load_commands = Self::parse_load_commands(lc_slice, header.ncmds as usize, is_64)?;
+        let (load_commands, load_command_sizes) =
+            Self::parse_load_commands(lc_slice, header.ncmds as usize, is_64)?;
 
         // Extract segments and populate section data
         let mut segments: Vec<Segment> = load_commands
@@ -330,6 +355,13 @@ impl<'a> MachO<'a> {
             Vec::new()
         };
 
+        let mut chained_fixup_symbols =
+            Self::parse_chained_fixup_symbols(data, offset, &load_commands, &segments);
+        let chained_fixup_names: std::collections::HashMap<u64, String> = chained_fixup_symbols
+            .iter()
+            .map(|symbol| (symbol.address, symbol.name.clone()))
+            .collect();
+
         // Parse stub symbols (map stub addresses to import symbol names)
         let stub_symbols = Self::parse_stub_symbols(
             data,
@@ -340,7 +372,15 @@ impl<'a> MachO<'a> {
             symtab_offset,
             symtab_count,
             is_64,
+            &chained_fixup_names,
         );
+        let callable_import_names: std::collections::HashSet<_> = stub_symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        chained_fixup_symbols
+            .retain(|symbol| !callable_import_names.contains(symbol.name.as_str()));
+        symbols.extend(chained_fixup_symbols);
         symbols.extend(stub_symbols);
 
         // Parse GOT symbols (map GOT entry addresses to import symbol names)
@@ -364,6 +404,7 @@ impl<'a> MachO<'a> {
             offset,
             header,
             load_commands,
+            load_command_sizes,
             segments,
             symbols,
             strtab,
@@ -398,8 +439,9 @@ impl<'a> MachO<'a> {
         data: &[u8],
         ncmds: usize,
         is_64: bool,
-    ) -> Result<Vec<LoadCommand>, ParseError> {
+    ) -> Result<(Vec<LoadCommand>, Vec<u32>), ParseError> {
         let mut commands = Vec::with_capacity(ncmds.min(1000));
+        let mut sizes = Vec::with_capacity(ncmds.min(1000));
         let mut offset: usize = 0;
 
         for command_index in 0..ncmds {
@@ -448,12 +490,13 @@ impl<'a> MachO<'a> {
             })?;
             if let Some(lc) = LoadCommand::parse(cmd, cmd_data, is_64)? {
                 commands.push(lc);
+                sizes.push(cmdsize as u32);
             }
 
             offset = command_end;
         }
 
-        Ok(commands)
+        Ok((commands, sizes))
     }
 
     /// Parse stub symbols from the __stubs section.
@@ -468,6 +511,7 @@ impl<'a> MachO<'a> {
         symtab_offset: usize,
         symtab_count: usize,
         is_64: bool,
+        chained_fixup_names: &std::collections::HashMap<u64, String>,
     ) -> Vec<Symbol> {
         let mut stub_symbols = Vec::new();
 
@@ -488,97 +532,528 @@ impl<'a> MachO<'a> {
             })
             .unwrap_or((0, 0));
 
-        if indirect_symoff == 0 || symtab_offset == 0 {
-            return stub_symbols;
-        }
-
-        // Find the __stubs section
-        let stubs_section = segments
-            .iter()
-            .flat_map(|seg| seg.sections.iter())
-            .find(|sect| sect.sectname == "__stubs");
-
-        let Some(stubs) = stubs_section else {
-            return stub_symbols;
-        };
-
-        // reserved1 contains the index into the indirect symbol table
-        let indirect_start_index = stubs.reserved1 as usize;
-        // reserved2 contains the stub size (on ARM64 it's 12 bytes typically)
-        let stub_size = if stubs.reserved2 > 0 {
-            stubs.reserved2 as usize
-        } else {
-            // Default stub sizes by architecture
-            if is_64 {
-                12
-            } else {
-                6
-            }
-        };
-
-        if stub_size == 0 {
-            return stub_symbols;
-        }
-
-        let num_stubs = (stubs.size as usize).checked_div(stub_size).unwrap_or(0);
-        let entry_size = if is_64 { 16 } else { 12 };
-
-        for i in 0..num_stubs {
-            // Read the indirect symbol table entry (4 bytes each)
-            let indirect_offset = file_offset
-                .saturating_add(indirect_symoff as usize)
-                .saturating_add(indirect_start_index.saturating_add(i).saturating_mul(4));
-            if indirect_offset.saturating_add(4) > data.len() {
-                break;
-            }
-
-            let sym_index = read_u32_le(data, indirect_offset) as usize;
-
-            // Skip special indirect symbol values
-            const INDIRECT_SYMBOL_LOCAL: u32 = 0x80000000;
-            const INDIRECT_SYMBOL_ABS: u32 = 0x40000000;
-            if sym_index as u32 == INDIRECT_SYMBOL_LOCAL || sym_index as u32 == INDIRECT_SYMBOL_ABS
+        if indirect_symoff != 0 && symtab_offset != 0 {
+            // Find the legacy __stubs section, which uses the indirect symbol table.
+            if let Some(stubs) = segments
+                .iter()
+                .flat_map(|seg| seg.sections.iter())
+                .find(|sect| sect.sectname == "__stubs")
             {
+                // reserved1 contains the index into the indirect symbol table
+                let indirect_start_index = stubs.reserved1 as usize;
+                // reserved2 contains the stub size (on ARM64 it's 12 bytes typically)
+                let stub_size = if stubs.reserved2 > 0 {
+                    stubs.reserved2 as usize
+                } else if is_64 {
+                    12
+                } else {
+                    6
+                };
+
+                if stub_size > 0 {
+                    let num_stubs = (stubs.size as usize).checked_div(stub_size).unwrap_or(0);
+                    let entry_size = if is_64 { 16 } else { 12 };
+
+                    for i in 0..num_stubs {
+                        // Read the indirect symbol table entry (4 bytes each)
+                        let indirect_offset = file_offset
+                            .saturating_add(indirect_symoff as usize)
+                            .saturating_add(
+                                indirect_start_index.saturating_add(i).saturating_mul(4),
+                            );
+                        if indirect_offset.saturating_add(4) > data.len() {
+                            break;
+                        }
+
+                        let sym_index = read_u32_le(data, indirect_offset) as usize;
+
+                        // Skip special indirect symbol values
+                        const INDIRECT_SYMBOL_LOCAL: u32 = 0x80000000;
+                        const INDIRECT_SYMBOL_ABS: u32 = 0x40000000;
+                        if sym_index as u32 == INDIRECT_SYMBOL_LOCAL
+                            || sym_index as u32 == INDIRECT_SYMBOL_ABS
+                        {
+                            continue;
+                        }
+
+                        // Look up the symbol in the main symbol table
+                        if sym_index >= symtab_count {
+                            continue;
+                        }
+
+                        let sym_offset =
+                            symtab_offset.saturating_add(sym_index.saturating_mul(entry_size));
+                        let sym_end = sym_offset.saturating_add(entry_size);
+                        let Some(sym_slice) = data.get(sym_offset..sym_end) else {
+                            continue;
+                        };
+
+                        // Parse the nlist to get the name
+                        if let Ok(nlist) = Nlist::parse(sym_slice, is_64) {
+                            let Some(name) = read_strtab_name(strtab, nlist.n_strx as usize) else {
+                                continue;
+                            };
+
+                            if name.is_empty() {
+                                continue;
+                            }
+
+                            let stub_addr = stubs
+                                .addr
+                                .saturating_add(i.saturating_mul(stub_size) as u64);
+                            stub_symbols.push(Symbol {
+                                name,
+                                address: stub_addr,
+                                size: stub_size as u64,
+                                kind: SymbolKind::Function,
+                                binding: SymbolBinding::Global,
+                                section_index: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        stub_symbols.extend(Self::parse_auth_stub_symbols(segments, chained_fixup_names));
+
+        stub_symbols
+    }
+
+    /// Parse import symbols referenced by LC_DYLD_CHAINED_FIXUPS.
+    fn parse_chained_fixup_symbols(
+        data: &[u8],
+        file_offset: usize,
+        load_commands: &[LoadCommand],
+        segments: &[Segment],
+    ) -> Vec<Symbol> {
+        let Some((dataoff, datasize)) = load_commands.iter().find_map(|lc| {
+            if let LoadCommand::DyldChainedFixups { dataoff, datasize } = lc {
+                Some((*dataoff as usize, *datasize as usize))
+            } else {
+                None
+            }
+        }) else {
+            return Vec::new();
+        };
+
+        let payload_start = file_offset.saturating_add(dataoff);
+        let payload_end = payload_start.saturating_add(datasize);
+        let Some(payload) = data.get(payload_start..payload_end) else {
+            return Vec::new();
+        };
+
+        let Some(import_names) = Self::parse_chained_fixup_import_names(payload) else {
+            return Vec::new();
+        };
+
+        Self::parse_chained_fixup_sites(data, file_offset, payload, segments)
+            .into_iter()
+            .filter_map(|(address, ordinal, size)| {
+                let name = import_names.get(ordinal)?.clone();
+                if name.is_empty() {
+                    return None;
+                }
+
+                Some(Symbol {
+                    name,
+                    address,
+                    size,
+                    kind: SymbolKind::Object,
+                    binding: SymbolBinding::Global,
+                    section_index: None,
+                })
+            })
+            .collect()
+    }
+
+    fn parse_chained_fixup_import_names(chain_data: &[u8]) -> Option<Vec<String>> {
+        if chain_data.len() < 28 {
+            return None;
+        }
+
+        let imports_offset = read_u32_le(chain_data, 8) as usize;
+        let symbols_offset = read_u32_le(chain_data, 12) as usize;
+        let imports_count = read_u32_le(chain_data, 16) as usize;
+        let imports_format = read_u32_le(chain_data, 20);
+        let symbols_format = read_u32_le(chain_data, 24);
+
+        if symbols_format != 0 {
+            return None;
+        }
+
+        let entry_size = match imports_format {
+            1 => 4usize,
+            2 => 8usize,
+            3 => 16usize,
+            _ => return None,
+        };
+
+        let mut names = Vec::with_capacity(imports_count.min(1024));
+        for index in 0..imports_count {
+            let entry_offset = imports_offset.saturating_add(index.saturating_mul(entry_size));
+            let name_offset = match imports_format {
+                1 | 2 => {
+                    let entry_end = entry_offset.saturating_add(4);
+                    if entry_end > chain_data.len() {
+                        return None;
+                    }
+                    (read_u32_le(chain_data, entry_offset) >> 9) as usize
+                }
+                3 => {
+                    let entry_end = entry_offset.saturating_add(8);
+                    if entry_end > chain_data.len() {
+                        return None;
+                    }
+                    (read_u64_le(chain_data, entry_offset) >> 32) as usize
+                }
+                _ => unreachable!(),
+            };
+
+            let string_offset = symbols_offset.saturating_add(name_offset);
+            let bytes = chain_data.get(string_offset..)?;
+            let end = bytes
+                .iter()
+                .position(|&byte| byte == 0)
+                .unwrap_or(bytes.len());
+            names.push(crate::name_from_bytes(bytes.get(..end).unwrap_or(&[])));
+        }
+
+        Some(names)
+    }
+
+    fn parse_chained_fixup_sites(
+        data: &[u8],
+        file_offset: usize,
+        chain_data: &[u8],
+        segments: &[Segment],
+    ) -> Vec<(u64, usize, u64)> {
+        if chain_data.len() < 28 {
+            return Vec::new();
+        }
+
+        let starts_offset = read_u32_le(chain_data, 4) as usize;
+        let Some(image_base) = Self::image_base(segments) else {
+            return Vec::new();
+        };
+
+        let Some(seg_count_end) = starts_offset.checked_add(4) else {
+            return Vec::new();
+        };
+        if seg_count_end > chain_data.len() {
+            return Vec::new();
+        }
+
+        let seg_count = read_u32_le(chain_data, starts_offset) as usize;
+        let seg_info_table = starts_offset.saturating_add(4);
+        let seg_info_table_end = seg_info_table.saturating_add(seg_count.saturating_mul(4));
+        if seg_info_table_end > chain_data.len() {
+            return Vec::new();
+        }
+
+        let mut sites = Vec::new();
+        for seg_index in 0..seg_count {
+            let seg_info_offset = read_u32_le(
+                chain_data,
+                seg_info_table.saturating_add(seg_index.saturating_mul(4)),
+            ) as usize;
+            if seg_info_offset == 0 {
                 continue;
             }
 
-            // Look up the symbol in the main symbol table
-            if sym_index >= symtab_count {
+            let info_offset = starts_offset.saturating_add(seg_info_offset);
+            let header_end = info_offset.saturating_add(22);
+            if header_end > chain_data.len() {
                 continue;
             }
 
-            let sym_offset = symtab_offset.saturating_add(sym_index.saturating_mul(entry_size));
-            let sym_end = sym_offset.saturating_add(entry_size);
-            let Some(sym_slice) = data.get(sym_offset..sym_end) else {
+            let page_size = read_u16_le(chain_data, info_offset.saturating_add(4)) as u64;
+            let pointer_format = read_u16_le(chain_data, info_offset.saturating_add(6));
+            let segment_runtime_offset = read_u64_le(chain_data, info_offset.saturating_add(8));
+            let page_count = read_u16_le(chain_data, info_offset.saturating_add(20)) as usize;
+
+            let Some(segment) =
+                Self::segment_for_runtime_offset(segments, image_base, segment_runtime_offset)
+            else {
                 continue;
             };
 
-            // Parse the nlist to get the name
-            if let Ok(nlist) = Nlist::parse(sym_slice, is_64) {
-                let Some(name) = read_strtab_name(strtab, nlist.n_strx as usize) else {
+            let Some(step) = Self::chained_pointer_step(pointer_format) else {
+                continue;
+            };
+            let entry_size = Self::chained_pointer_size(pointer_format).unwrap_or(step);
+
+            let page_starts_offset = info_offset.saturating_add(22);
+            let page_starts_end = page_starts_offset.saturating_add(page_count.saturating_mul(2));
+            if page_starts_end > chain_data.len() {
+                continue;
+            }
+            let chain_starts_base = page_starts_end;
+
+            for page_index in 0..page_count {
+                let start = read_u16_le(
+                    chain_data,
+                    page_starts_offset.saturating_add(page_index.saturating_mul(2)),
+                );
+
+                for start_in_page in
+                    Self::expand_chained_page_starts(chain_data, start, chain_starts_base)
+                {
+                    let mut segment_offset = (page_index as u64)
+                        .saturating_mul(page_size)
+                        .saturating_add(start_in_page as u64);
+
+                    loop {
+                        let site_address = segment.vmaddr.saturating_add(segment_offset);
+                        let site_file_offset = file_offset
+                            .saturating_add(segment.fileoff as usize)
+                            .saturating_add(segment_offset as usize);
+                        let entry_end = site_file_offset.saturating_add(8);
+                        if entry_end > data.len() {
+                            break;
+                        }
+
+                        let raw = read_u64_le(data, site_file_offset);
+                        let next = match Self::chained_pointer_next(raw, pointer_format) {
+                            Some(next) => next,
+                            None => break,
+                        };
+                        if let Some(ordinal) = Self::chained_pointer_ordinal(raw, pointer_format) {
+                            sites.push((site_address, ordinal, entry_size));
+                        }
+
+                        if next == 0 {
+                            break;
+                        }
+                        segment_offset =
+                            segment_offset.saturating_add((next as u64).saturating_mul(step));
+                    }
+                }
+            }
+        }
+
+        sites
+    }
+
+    fn parse_auth_stub_symbols(
+        segments: &[Segment],
+        chained_fixup_names: &std::collections::HashMap<u64, String>,
+    ) -> Vec<Symbol> {
+        let mut stub_symbols = Vec::new();
+        if chained_fixup_names.is_empty() {
+            return stub_symbols;
+        }
+
+        for section in segments
+            .iter()
+            .flat_map(|seg| seg.sections.iter())
+            .filter(|sect| sect.sectname == "__auth_stubs")
+        {
+            let stub_size = if section.reserved2 > 0 {
+                section.reserved2 as usize
+            } else {
+                16usize
+            };
+            if stub_size == 0 {
+                continue;
+            }
+
+            for (stub_index, stub_bytes) in section.data().chunks(stub_size).enumerate() {
+                let stub_addr = section
+                    .addr
+                    .saturating_add((stub_index as u64).saturating_mul(stub_size as u64));
+                let Some(target_addr) = Self::decode_arm64_stub_target(stub_addr, stub_bytes)
+                else {
+                    continue;
+                };
+                let Some(name) = chained_fixup_names.get(&target_addr) else {
                     continue;
                 };
 
-                if name.is_empty() {
-                    continue;
-                }
-
-                // Create a symbol at the stub address
-                let stub_addr = stubs
-                    .addr
-                    .saturating_add(i.saturating_mul(stub_size) as u64);
                 stub_symbols.push(Symbol {
-                    name,
+                    name: name.clone(),
                     address: stub_addr,
                     size: stub_size as u64,
                     kind: SymbolKind::Function,
-                    binding: hexray_core::SymbolBinding::Global,
+                    binding: SymbolBinding::Global,
                     section_index: None,
                 });
             }
         }
 
         stub_symbols
+    }
+
+    fn image_base(segments: &[Segment]) -> Option<u64> {
+        segments
+            .iter()
+            .filter(|segment| segment.filesize > 0)
+            .map(|segment| segment.vmaddr)
+            .min()
+    }
+
+    fn segment_for_runtime_offset(
+        segments: &[Segment],
+        image_base: u64,
+        runtime_offset: u64,
+    ) -> Option<&Segment> {
+        segments
+            .iter()
+            .find(|segment| segment.vmaddr.saturating_sub(image_base) == runtime_offset)
+            .or_else(|| {
+                segments
+                    .iter()
+                    .find(|segment| segment.fileoff == runtime_offset)
+            })
+    }
+
+    fn expand_chained_page_starts(
+        chain_data: &[u8],
+        start: u16,
+        chain_starts_base: usize,
+    ) -> Vec<u16> {
+        const DYLD_CHAINED_PTR_START_NONE: u16 = 0xFFFF;
+        const DYLD_CHAINED_PTR_START_MULTI: u16 = 0x8000;
+        const DYLD_CHAINED_PTR_START_LAST: u16 = 0x8000;
+
+        if start == DYLD_CHAINED_PTR_START_NONE {
+            return Vec::new();
+        }
+
+        if start & DYLD_CHAINED_PTR_START_MULTI == 0 {
+            return vec![start];
+        }
+
+        let mut starts = Vec::new();
+        let mut chain_index = (start & !DYLD_CHAINED_PTR_START_MULTI) as usize;
+        if chain_starts_base > chain_data.len() {
+            return starts;
+        }
+
+        loop {
+            let entry_offset = chain_starts_base.saturating_add(chain_index.saturating_mul(2));
+            let entry_end = entry_offset.saturating_add(2);
+            if entry_end > chain_data.len() {
+                break;
+            }
+
+            let chain_start = read_u16_le(chain_data, entry_offset);
+            starts.push(chain_start & !DYLD_CHAINED_PTR_START_LAST);
+            if chain_start & DYLD_CHAINED_PTR_START_LAST != 0 {
+                break;
+            }
+            chain_index = chain_index.saturating_add(1);
+        }
+
+        starts
+    }
+
+    fn chained_pointer_step(pointer_format: u16) -> Option<u64> {
+        match pointer_format {
+            1 | 9 | 12 | 13 => Some(8),
+            2 | 6 | 8 => Some(4),
+            3 | 4 | 5 | 7 | 10 | 14 => Some(4),
+            11 => Some(1),
+            _ => None,
+        }
+    }
+
+    fn chained_pointer_size(pointer_format: u16) -> Option<u64> {
+        match pointer_format {
+            1 | 2 | 6 | 8 | 9 | 11 | 12 | 13 => Some(8),
+            3 | 4 | 5 | 7 | 10 | 14 => Some(4),
+            _ => None,
+        }
+    }
+
+    fn chained_pointer_next(raw: u64, pointer_format: u16) -> Option<usize> {
+        match pointer_format {
+            1 | 9 | 12 | 13 => Some(((raw >> 51) & 0x7ff) as usize),
+            2 | 6 | 8 | 11 => Some(((raw >> 51) & 0xfff) as usize),
+            3 | 4 | 5 | 7 | 10 | 14 => Some(((raw >> 26) & 0x3f) as usize),
+            _ => None,
+        }
+    }
+
+    fn chained_pointer_ordinal(raw: u64, pointer_format: u16) -> Option<usize> {
+        match pointer_format {
+            1 | 9 => (((raw >> 62) & 1) != 0).then_some((raw & 0xffff) as usize),
+            12 => (((raw >> 62) & 1) != 0).then_some((raw & 0x00ff_ffff) as usize),
+            2 | 6 => (((raw >> 63) & 1) != 0).then_some((raw & 0x00ff_ffff) as usize),
+            _ => None,
+        }
+    }
+
+    fn decode_arm64_stub_target(stub_addr: u64, stub_bytes: &[u8]) -> Option<u64> {
+        if stub_bytes.len() < 8 {
+            return None;
+        }
+
+        let adrp = read_u32_le(stub_bytes, 0);
+        let (register, mut base) = Self::decode_arm64_adrp(adrp, stub_addr)?;
+        let mut ldr_index = 4usize;
+
+        if stub_bytes.len() >= 12 {
+            let add = read_u32_le(stub_bytes, 4);
+            if let Some((rd, rn, imm)) = Self::decode_arm64_add_immediate(add) {
+                if rd == register && rn == register {
+                    base = base.saturating_add(imm);
+                    ldr_index = 8;
+                }
+            }
+        }
+
+        if stub_bytes.len() < ldr_index.saturating_add(4) {
+            return None;
+        }
+
+        let ldr = read_u32_le(stub_bytes, ldr_index);
+        let (_, rn, offset) = Self::decode_arm64_ldr_unsigned_offset(ldr)?;
+        if rn != register {
+            return None;
+        }
+
+        Some(base.saturating_add(offset))
+    }
+
+    fn decode_arm64_adrp(word: u32, instruction_addr: u64) -> Option<(u32, u64)> {
+        if word & 0x9f00_0000 != 0x9000_0000 {
+            return None;
+        }
+
+        let rd = word & 0x1f;
+        let immlo = ((word >> 29) & 0x3) as i64;
+        let immhi = ((word >> 5) & 0x7ffff) as i64;
+        let imm21 = (immhi << 2) | immlo;
+        let signed = (imm21 << 43) >> 43;
+        let page_base = (instruction_addr & !0xfff) as i64;
+        let target = page_base.saturating_add(signed << 12);
+        (target >= 0).then_some((rd, target as u64))
+    }
+
+    fn decode_arm64_add_immediate(word: u32) -> Option<(u32, u32, u64)> {
+        if word & 0xff00_0000 != 0x9100_0000 {
+            return None;
+        }
+
+        let rd = word & 0x1f;
+        let rn = (word >> 5) & 0x1f;
+        let mut imm = ((word >> 10) & 0x0fff) as u64;
+        if (word >> 22) & 1 != 0 {
+            imm <<= 12;
+        }
+        Some((rd, rn, imm))
+    }
+
+    fn decode_arm64_ldr_unsigned_offset(word: u32) -> Option<(u32, u32, u64)> {
+        if word & 0xffc0_0000 != 0xf940_0000 {
+            return None;
+        }
+
+        let rt = word & 0x1f;
+        let rn = (word >> 5) & 0x1f;
+        let offset = (((word >> 10) & 0x0fff) as u64).saturating_mul(8);
+        Some((rt, rn, offset))
     }
 
     /// Parse GOT symbols from the __got section.
@@ -971,6 +1446,7 @@ mod tests {
 
         let macho = MachO::parse(&data).expect("single in-bounds load command should parse");
         assert_eq!(macho.load_commands.len(), 1);
+        assert_eq!(macho.load_command_sizes, vec![8]);
     }
 
     #[test]
@@ -1020,5 +1496,79 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn decode_arm64_auth_stub_target_resolves_got_slot() {
+        let stub_addr = 0x100000730;
+        let stub = [
+            0x31, 0x00, 0x00, 0x90, // adrp x17, 0x100004000
+            0x31, 0x42, 0x00, 0x91, // add  x17, x17, #0x10
+            0x30, 0x02, 0x40, 0xf9, // ldr  x16, [x17]
+            0x11, 0x0a, 0x1f, 0xd7, // braa x16, x17
+        ];
+
+        let target = MachO::decode_arm64_stub_target(stub_addr, &stub)
+            .expect("stub should resolve its GOT target");
+        assert_eq!(target, 0x100004010);
+    }
+
+    #[test]
+    fn chained_fixups_recover_import_names_and_sites() {
+        let mut chain_data = vec![0u8; 80];
+        chain_data[4..8].copy_from_slice(&28u32.to_le_bytes()); // starts_offset
+        chain_data[8..12].copy_from_slice(&60u32.to_le_bytes()); // imports_offset
+        chain_data[12..16].copy_from_slice(&64u32.to_le_bytes()); // symbols_offset
+        chain_data[16..20].copy_from_slice(&1u32.to_le_bytes()); // imports_count
+        chain_data[20..24].copy_from_slice(&1u32.to_le_bytes()); // imports_format
+
+        chain_data[28..32].copy_from_slice(&1u32.to_le_bytes()); // seg_count
+        chain_data[32..36].copy_from_slice(&8u32.to_le_bytes()); // seg_info_offset[0]
+
+        let starts = 36usize;
+        chain_data[starts..starts + 4].copy_from_slice(&24u32.to_le_bytes()); // size
+        chain_data[starts + 4..starts + 6].copy_from_slice(&0x4000u16.to_le_bytes()); // page_size
+        chain_data[starts + 6..starts + 8].copy_from_slice(&12u16.to_le_bytes()); // USERLAND24
+        chain_data[starts + 8..starts + 16].copy_from_slice(&0x4000u64.to_le_bytes()); // segment_offset
+        chain_data[starts + 20..starts + 22].copy_from_slice(&1u16.to_le_bytes()); // page_count
+        chain_data[starts + 22..starts + 24].copy_from_slice(&0u16.to_le_bytes()); // page_start[0]
+
+        chain_data[60..64].copy_from_slice(&1u32.to_le_bytes()); // import entry, name_offset=0
+        chain_data[64..72].copy_from_slice(b"_strcmp\0");
+
+        let mut data = vec![0u8; 0x5000];
+        data[0x4000..0x4008].copy_from_slice(&0xc000_0000_0000_0000u64.to_le_bytes());
+
+        let segments = vec![
+            Segment {
+                segname: "__TEXT".to_string(),
+                vmaddr: 0x100000000,
+                vmsize: 0x4000,
+                fileoff: 0,
+                filesize: 0x4000,
+                maxprot: 0,
+                initprot: 0,
+                flags: 0,
+                sections: Vec::new(),
+            },
+            Segment {
+                segname: "__DATA_CONST".to_string(),
+                vmaddr: 0x100004000,
+                vmsize: 0x1000,
+                fileoff: 0x4000,
+                filesize: 0x1000,
+                maxprot: 0,
+                initprot: 0,
+                flags: 0,
+                sections: Vec::new(),
+            },
+        ];
+
+        let names = MachO::parse_chained_fixup_import_names(&chain_data)
+            .expect("import table should parse");
+        assert_eq!(names, vec!["_strcmp".to_string()]);
+
+        let sites = MachO::parse_chained_fixup_sites(&data, 0, &chain_data, &segments);
+        assert_eq!(sites, vec![(0x100004000, 0, 8)]);
     }
 }
