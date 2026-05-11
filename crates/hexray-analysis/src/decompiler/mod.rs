@@ -2811,6 +2811,119 @@ mod tests {
     }
 
     #[test]
+    fn test_decompile_x86_hidden_rep_stos_saved_arg_tail_call_recovers_sigaction_args() {
+        use crate::SymbolTable;
+        use hexray_core::{Architecture, MemoryRef, Operand, Register, RegisterClass};
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let r8d = Register::new(Architecture::X86_64, RegisterClass::General, 8, 32);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let rsi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 64);
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1400);
+        bb0.instructions.push(
+            Instruction::new(0x1400, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(r8d), Operand::Register(edi)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1403, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(ecx), Operand::imm(0x12, 4)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1408, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(edx), Operand::Register(edx)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x140a, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x140c, 5, vec![], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![
+                    Operand::Register(rdi),
+                    Operand::Memory(MemoryRef::base_disp(rsp, 0x8, 8)),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1411, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rsi), Operand::Register(rsp)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1414, 8, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rsp, 0, 8)),
+                    Operand::imm(0x401300, 8),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x141c, 3, vec![], "__rep_stosq")
+                .with_operation(Operation::Other(0xab)),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x141f, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(edi), Operand::Register(r8d)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1422, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x4010c0)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x4010c0,
+                    return_addr: 0x1427,
+                }),
+        );
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1430);
+        bb1.instructions.push(
+            Instruction::new(0x1430, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "sigaction@GLIBC_2.2.5");
+
+        let mut symbols = SymbolTable::new();
+        symbols.insert_with_metadata(0x401300, "handler".to_string(), 8, true, false);
+
+        let decompiler = Decompiler::new()
+            .with_addresses(false)
+            .with_binary_data(binary_data)
+            .with_symbol_table(symbols);
+        let output = decompiler.decompile(&cfg, "install_handler");
+
+        assert!(
+            output.contains("return ") && output.contains("(arg0, rsp, 0);"),
+            "expected saved arg restore to win over rep stos clobber:\n{output}"
+        );
+        assert!(
+            !output.contains("(rsp + 152, arg0, rsp);")
+                && !output.contains("(rsp + 0x98, arg0, rsp);"),
+            "did not expect rep stos tail pointer to survive as arg0:\n{output}"
+        );
+    }
+
+    #[test]
     fn test_apply_exception_handling_wraps_cleanup_only_landing_pad_in_catch_all() {
         let body = vec![
             StructuredNode::Block {

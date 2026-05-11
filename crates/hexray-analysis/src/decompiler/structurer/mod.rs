@@ -7393,6 +7393,130 @@ mod tests {
     }
 
     #[test]
+    fn test_block_to_statements_plus_call_arg_propagation_recovers_hidden_rep_stos_sigaction() {
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let r8d = Register::new(Architecture::X86_64, RegisterClass::General, 8, 32);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let rsi = Register::new(Architecture::X86_64, RegisterClass::General, 6, 64);
+        let rsp = Register::new(Architecture::X86_64, RegisterClass::General, 4, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1400);
+        bb0.instructions.push(
+            Instruction::new(0x1400, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(r8d), Operand::Register(edi)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1403, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(ecx), Operand::imm(0x12, 4)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1408, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(edx), Operand::Register(edx)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x140a, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x140c, 5, vec![], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![
+                    Operand::Register(rdi),
+                    Operand::Memory(MemoryRef::base_disp(rsp, 0x8, 8)),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1411, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(rsi), Operand::Register(rsp)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1414, 8, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rsp, 0, 8)),
+                    Operand::imm(0x401300, 8),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x141c, 3, vec![], "__rep_stosq")
+                .with_operation(Operation::Other(0xab)),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x141f, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(edi), Operand::Register(r8d)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1422, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x4010c0)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x4010c0,
+                    return_addr: 0x1427,
+                }),
+        );
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1430);
+        bb1.instructions.push(
+            Instruction::new(0x1430, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+
+        let structurer = Structurer::new(&cfg);
+        let raw = structurer.block_to_statements(BasicBlockId::new(0));
+        let structured_before = Structurer::new(&cfg).structure();
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "sigaction@GLIBC_2.2.5");
+
+        let propagated = propagate_call_args_with_binary_data_and_arch(
+            structured_before.clone(),
+            Some(&binary_data),
+            Some(Architecture::X86_64),
+        );
+
+        let Some(StructuredNode::Block { statements, .. }) = propagated.first() else {
+            panic!("expected propagated block");
+        };
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = statements.last()
+        else {
+            panic!(
+                "expected propagated trailing call\nraw = {:#?}\nstructured_before = {:#?}\npropagated = {:#?}",
+                raw, structured_before, propagated
+            );
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["arg0", "rsp", "0"],
+            "raw = {:#?}\nstructured_before = {:#?}\npropagated = {:#?}",
+            raw,
+            structured_before,
+            propagated
+        );
+    }
+
+    #[test]
     fn test_structure_split_tail_call_leaves_bare_return_for_emitter_fold() {
         use hexray_core::{Architecture, Register, RegisterClass};
 

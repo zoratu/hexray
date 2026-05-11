@@ -388,6 +388,29 @@ impl Variable {
 }
 
 impl Expr {
+    fn lift_hidden_rep_stos_state_update(inst: &Instruction) -> Option<Self> {
+        let scale = match inst.mnemonic.as_str() {
+            "__rep_stosb" => 1,
+            "__rep_stosw" => 2,
+            "__rep_stosd" => 4,
+            "__rep_stosq" => 8,
+            _ => return None,
+        };
+
+        Some(Self::assign(
+            Self::var(Variable::reg("rdi", 8)),
+            Self::binop(
+                BinOpKind::Add,
+                Self::var(Variable::reg("rdi", 8)),
+                Self::binop(
+                    BinOpKind::Mul,
+                    Self::var(Variable::reg("rcx", 8)),
+                    Self::int(scale),
+                ),
+            ),
+        ))
+    }
+
     /// Creates a variable expression.
     pub fn var(v: Variable) -> Self {
         Self {
@@ -1580,6 +1603,10 @@ impl Expr {
 
     /// Converts an instruction to an expression/statement.
     pub fn from_instruction(inst: &Instruction) -> Self {
+        if let Some(expr) = Self::lift_hidden_rep_stos_state_update(inst) {
+            return expr;
+        }
+
         if Self::should_lift_as_opaque_x86_integer_simd(inst) {
             return Self::opaque_x86_integer_simd_comment(&inst.mnemonic);
         }
@@ -6220,5 +6247,16 @@ mod tests {
         let rendered = Expr::from_instruction(&inst).to_string();
 
         assert_eq!(rendered, "cpuid(eax)");
+    }
+
+    #[test]
+    fn test_hidden_rep_stosq_lifts_to_rdi_clobber() {
+        let inst = Instruction::new(0x401408, 3, vec![0xf3, 0x48, 0xab], "__rep_stosq")
+            .with_operation(Operation::Other(0xab));
+
+        assert_eq!(
+            Expr::from_instruction(&inst).to_string(),
+            "rdi = rdi + rcx * 8"
+        );
     }
 }

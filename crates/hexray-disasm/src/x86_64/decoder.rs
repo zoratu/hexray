@@ -50,6 +50,47 @@ impl X86_64Disassembler {
             _ => unreachable!(),
         }
     }
+
+    fn decode_hidden_rep_stos(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        offset: usize,
+        opcode: u8,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let mnemonic = match opcode {
+            0xAA => "__rep_stosb",
+            0xAB => match prefixes.operand_size(false) {
+                16 => "__rep_stosw",
+                64 => "__rep_stosq",
+                _ => "__rep_stosd",
+            },
+            _ => {
+                let end = offset.min(bytes.len());
+                return Err(DecodeError::unknown_opcode(
+                    address,
+                    bytes.get(..end).unwrap_or(&[]),
+                ));
+            }
+        };
+
+        Ok(DecodedInstruction {
+            instruction: Instruction {
+                address,
+                size: offset,
+                bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+                operation: Operation::Other(opcode as u16),
+                mnemonic: mnemonic.to_string(),
+                operands: vec![],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![],
+                writes: vec![],
+                guard: None,
+            },
+            size: offset,
+        })
+    }
 }
 
 impl Default for X86_64Disassembler {
@@ -299,6 +340,9 @@ impl Disassembler for X86_64Disassembler {
                 .get(opcode as usize)
                 .and_then(|e| e.as_ref())
         } else {
+            if prefixes.rep && matches!(opcode, 0xAA | 0xAB) {
+                return self.decode_hidden_rep_stos(bytes, address, &prefixes, offset, opcode);
+            }
             // Handle group 1 (0x80-0x83) specially
             if (0x80..=0x83).contains(&opcode) {
                 return self.decode_group1(bytes, address, &prefixes, offset, opcode);
@@ -4859,5 +4903,18 @@ mod tests {
         assert_eq!(result.instruction.mnemonic, "sldt");
         assert_eq!(result.size, 3);
         assert_eq!(result.instruction.operands.len(), 1);
+    }
+
+    #[test]
+    fn test_rep_stosq_decodes_as_hidden_state_update() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x48, 0xab], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "__rep_stosq");
+        assert_eq!(result.instruction.operation, Operation::Other(0xab));
+        assert_eq!(result.size, 3);
+        assert!(result.instruction.operands.is_empty());
     }
 }

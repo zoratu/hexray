@@ -1015,6 +1015,16 @@ pub(super) fn parse_arm64_condition(suffix: &str) -> Option<Condition> {
 pub(super) fn generate_writeback_expr(inst: &hexray_core::Instruction) -> Option<Expr> {
     use super::super::expression::{ExprKind, VarKind, Variable};
 
+    if matches!(
+        inst.mnemonic.as_str(),
+        "__rep_stosb" | "__rep_stosw" | "__rep_stosd" | "__rep_stosq"
+    ) {
+        return Some(Expr::assign(
+            Expr::var(Variable::reg("rcx", 8)),
+            Expr::int(0),
+        ));
+    }
+
     // Check if this is a load or store operation
     if !matches!(inst.operation, Operation::Load | Operation::Store) {
         return None;
@@ -1660,5 +1670,14 @@ mod tests {
 
         let rendered = format!("{}", condition_to_expr_with_block(Condition::Above, &block));
         assert_eq!(rendered, "xmm1 > xmm0");
+    }
+
+    #[test]
+    fn test_generate_writeback_expr_zeroes_rcx_after_hidden_rep_stos() {
+        let inst = Instruction::new(0x401408, 3, vec![0xf3, 0x48, 0xab], "__rep_stosq")
+            .with_operation(Operation::Other(0xab));
+
+        let writeback = generate_writeback_expr(&inst).expect("rep stos writeback");
+        assert_eq!(writeback.to_string(), "rcx = 0");
     }
 }

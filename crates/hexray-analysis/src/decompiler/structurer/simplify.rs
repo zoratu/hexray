@@ -3517,11 +3517,14 @@ fn propagate_args_in_block_with_state(
                 if let Some(tracked_arg_key) = tracked_call_arg_key(v, preferred_family) {
                     let tracks_register_aliases = is_tracked_call_arg_register(&v.name);
                     if tracks_register_aliases && !expr_requires_single_evaluation(&tracked_rhs) {
+                        let tracked_reg_value = stabilize_saved_arg_registers(tracked_rhs.clone());
                         for alias in &written_aliases {
-                            state.reg_values.insert(alias.clone(), tracked_rhs.clone());
+                            state
+                                .reg_values
+                                .insert(alias.clone(), tracked_reg_value.clone());
                             state
                                 .call_target_values
-                                .insert(alias.clone(), tracked_rhs.clone());
+                                .insert(alias.clone(), tracked_reg_value.clone());
                         }
                     }
                     // If one ABI argument register is only staging a value into another
@@ -5178,7 +5181,6 @@ fn recover_typed_call_arguments(
     )
     .or(preferred_family);
     let mut recovered_args = Vec::with_capacity(param_classes.len());
-    let mut existing_arg_index = 0usize;
     let mut used_stmt_indices = Vec::new();
     let mut int_slot = 0usize;
     let mut float_slot = 0usize;
@@ -5190,22 +5192,37 @@ fn recover_typed_call_arguments(
         match class {
             CallParamClass::Integer => {
                 if let Some(family) = family {
-                    if let Some((stmt_idx, value)) = lookup_slot_value_or_passthrough(
+                    let tracked = lookup_fixed_integer_slot_value(
                         arg_values,
                         saved_temp_values,
-                        existing_args,
-                        &mut existing_arg_index,
                         family,
                         int_slot,
                         excluded_regs,
-                    ) {
+                    );
+                    if let Some(existing) =
+                        reuse_existing_positional_integer_arg(existing_args, param_index)
+                    {
+                        if let Some((stmt_idx, tracked_value)) = tracked {
+                            if should_prefer_tracked_fixed_integer_arg(
+                                &existing,
+                                &tracked_value,
+                                family,
+                                int_slot,
+                            ) {
+                                if let Some(stmt_idx) = stmt_idx {
+                                    used_stmt_indices.push(stmt_idx);
+                                }
+                                recovered_args.push(tracked_value);
+                            } else {
+                                recovered_args.push(existing);
+                            }
+                        } else {
+                            recovered_args.push(existing);
+                        }
+                    } else if let Some((stmt_idx, value)) = tracked {
                         if let Some(stmt_idx) = stmt_idx {
                             used_stmt_indices.push(stmt_idx);
                         }
-                        recovered_args.push(value);
-                    } else if let Some(value) =
-                        reuse_existing_integer_variadic_arg(existing_args, &mut existing_arg_index)
-                    {
                         recovered_args.push(value);
                     } else if signature.source != KnownCallSignatureSource::Recovered {
                         if !recovered_args.is_empty()
@@ -5215,7 +5232,6 @@ fn recover_typed_call_arguments(
                                 arg_values,
                                 saved_temp_values,
                                 existing_args,
-                                existing_arg_index,
                                 Some(family),
                                 int_slot + 1,
                                 float_slot,
@@ -5237,7 +5253,7 @@ fn recover_typed_call_arguments(
                         recovered_args.push(pass_through_arg_expr(reg_name));
                     }
                 } else if let Some(value) =
-                    reuse_existing_integer_variadic_arg(existing_args, &mut existing_arg_index)
+                    reuse_existing_positional_integer_arg(existing_args, param_index)
                 {
                     recovered_args.push(value);
                 } else {
@@ -5247,22 +5263,37 @@ fn recover_typed_call_arguments(
             }
             CallParamClass::Float => {
                 if let Some(family) = family {
-                    if let Some((stmt_idx, value)) = lookup_float_slot_value_or_passthrough(
+                    let tracked = lookup_fixed_float_slot_value(
                         arg_values,
                         saved_temp_values,
-                        existing_args,
-                        &mut existing_arg_index,
                         family,
                         float_slot,
                         excluded_regs,
-                    ) {
+                    );
+                    if let Some(existing) =
+                        reuse_existing_positional_float_arg(existing_args, param_index)
+                    {
+                        if let Some((stmt_idx, tracked_value)) = tracked {
+                            if should_prefer_tracked_fixed_float_arg(
+                                &existing,
+                                &tracked_value,
+                                family,
+                                float_slot,
+                            ) {
+                                if let Some(stmt_idx) = stmt_idx {
+                                    used_stmt_indices.push(stmt_idx);
+                                }
+                                recovered_args.push(tracked_value);
+                            } else {
+                                recovered_args.push(existing);
+                            }
+                        } else {
+                            recovered_args.push(existing);
+                        }
+                    } else if let Some((stmt_idx, value)) = tracked {
                         if let Some(stmt_idx) = stmt_idx {
                             used_stmt_indices.push(stmt_idx);
                         }
-                        recovered_args.push(value);
-                    } else if let Some(value) =
-                        reuse_existing_float_variadic_arg(existing_args, &mut existing_arg_index)
-                    {
                         recovered_args.push(value);
                     } else if signature.source != KnownCallSignatureSource::Recovered {
                         if !recovered_args.is_empty()
@@ -5272,7 +5303,6 @@ fn recover_typed_call_arguments(
                                 arg_values,
                                 saved_temp_values,
                                 existing_args,
-                                existing_arg_index,
                                 Some(family),
                                 int_slot,
                                 float_slot + 1,
@@ -5294,7 +5324,7 @@ fn recover_typed_call_arguments(
                         recovered_args.push(pass_through_float_arg_expr(reg_name));
                     }
                 } else if let Some(value) =
-                    reuse_existing_float_variadic_arg(existing_args, &mut existing_arg_index)
+                    reuse_existing_positional_float_arg(existing_args, param_index)
                 {
                     recovered_args.push(value);
                 } else {
@@ -5315,25 +5345,22 @@ fn has_remaining_typed_materialized_arg(
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
     saved_temp_values: Option<&HashMap<String, Expr>>,
     existing_args: &[Expr],
-    existing_arg_index: usize,
     family: Option<ArgumentAbiFamily>,
     int_slot: usize,
     float_slot: usize,
     excluded_regs: &HashSet<String>,
 ) -> bool {
-    let mut existing_arg_index = existing_arg_index;
     let mut int_slot = int_slot;
     let mut float_slot = float_slot;
 
-    for class in &param_classes[start_index..] {
+    for (offset, class) in param_classes[start_index..].iter().enumerate() {
+        let param_index = start_index + offset;
         match class {
             CallParamClass::Integer => {
                 if let Some(family) = family {
-                    if lookup_slot_value_or_passthrough(
+                    if lookup_fixed_integer_slot_value(
                         arg_values,
                         saved_temp_values,
-                        existing_args,
-                        &mut existing_arg_index,
                         family,
                         int_slot,
                         excluded_regs,
@@ -5343,20 +5370,16 @@ fn has_remaining_typed_materialized_arg(
                         return true;
                     }
                 }
-                if reuse_existing_integer_variadic_arg(existing_args, &mut existing_arg_index)
-                    .is_some()
-                {
+                if reuse_existing_positional_integer_arg(existing_args, param_index).is_some() {
                     return true;
                 }
                 int_slot += 1;
             }
             CallParamClass::Float => {
                 if let Some(family) = family {
-                    if lookup_float_slot_value_or_passthrough(
+                    if lookup_fixed_float_slot_value(
                         arg_values,
                         saved_temp_values,
-                        existing_args,
-                        &mut existing_arg_index,
                         family,
                         float_slot,
                         excluded_regs,
@@ -5366,9 +5389,7 @@ fn has_remaining_typed_materialized_arg(
                         return true;
                     }
                 }
-                if reuse_existing_float_variadic_arg(existing_args, &mut existing_arg_index)
-                    .is_some()
-                {
+                if reuse_existing_positional_float_arg(existing_args, param_index).is_some() {
                     return true;
                 }
                 float_slot += 1;
@@ -5377,6 +5398,87 @@ fn has_remaining_typed_materialized_arg(
     }
 
     false
+}
+
+fn lookup_fixed_integer_slot_value(
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
+    family: ArgumentAbiFamily,
+    int_slot: usize,
+    excluded_regs: &HashSet<String>,
+) -> Option<(Option<usize>, Expr)> {
+    let reg_name = pass_through_arg_register_name(family, int_slot)?;
+    if excluded_regs.contains(reg_name) {
+        return None;
+    }
+    lookup_tracked_register_value(arg_values, reg_name, saved_temp_values)
+}
+
+fn lookup_fixed_float_slot_value(
+    arg_values: &HashMap<String, (Option<usize>, Expr)>,
+    saved_temp_values: Option<&HashMap<String, Expr>>,
+    family: ArgumentAbiFamily,
+    float_slot: usize,
+    excluded_regs: &HashSet<String>,
+) -> Option<(Option<usize>, Expr)> {
+    let reg_name = pass_through_float_arg_register_name(family, float_slot)?;
+    if excluded_regs.contains(reg_name) {
+        return None;
+    }
+    lookup_tracked_register_value(arg_values, reg_name, saved_temp_values)
+}
+
+fn reuse_existing_positional_integer_arg(
+    existing_args: &[Expr],
+    param_index: usize,
+) -> Option<Expr> {
+    let candidate = existing_args.get(param_index)?;
+    (!expr_looks_float_like(candidate)).then(|| candidate.clone())
+}
+
+fn reuse_existing_positional_float_arg(existing_args: &[Expr], param_index: usize) -> Option<Expr> {
+    let candidate = existing_args.get(param_index)?;
+    expr_looks_float_like(candidate).then(|| candidate.clone())
+}
+
+fn should_prefer_tracked_fixed_integer_arg(
+    existing: &Expr,
+    tracked: &Expr,
+    family: ArgumentAbiFamily,
+    int_slot: usize,
+) -> bool {
+    let _ = tracked;
+    let Some(reg_name) = pass_through_arg_register_name(family, int_slot) else {
+        return false;
+    };
+    expr_is_exact_passthrough_register(existing, reg_name)
+}
+
+fn should_prefer_tracked_fixed_float_arg(
+    existing: &Expr,
+    tracked: &Expr,
+    family: ArgumentAbiFamily,
+    float_slot: usize,
+) -> bool {
+    let _ = tracked;
+    let Some(reg_name) = pass_through_float_arg_register_name(family, float_slot) else {
+        return false;
+    };
+    expr_is_exact_passthrough_register(existing, reg_name)
+}
+
+fn expr_is_exact_passthrough_register(expr: &Expr, reg_name: &str) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::Var(var) => get_register_aliases(&var.name)
+            .into_iter()
+            .any(|alias| alias == reg_name),
+        ExprKind::Unknown(name) => get_register_aliases(name)
+            .into_iter()
+            .any(|alias| alias == reg_name),
+        _ => false,
+    }
 }
 
 fn synthesize_leading_passthrough_args_from_target(excluded_regs: &HashSet<String>) -> Vec<Expr> {
@@ -8719,6 +8821,152 @@ mod tests {
                 .iter()
                 .any(|expr| format!("{expr}") == "ecx = 18"),
             "truncated fixed-arg setup should be removed: {propagated:#?}"
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_sigaction_after_hidden_rep_stos_clobber() {
+        let statements = vec![
+            Expr::assign(reg("r8d", 4), reg("edi", 4)),
+            Expr::assign(reg("ecx", 4), Expr::int(18)),
+            Expr::assign(reg("edx", 4), Expr::int(0)),
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(BinOpKind::Add, reg("rsp", 8), Expr::int(8)),
+            ),
+            Expr::assign(reg("rsi", 8), reg("rsp", 8)),
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(
+                    BinOpKind::Add,
+                    reg("rdi", 8),
+                    Expr::binop(BinOpKind::Mul, reg("rcx", 8), Expr::int(8)),
+                ),
+            ),
+            Expr::assign(reg("rcx", 8), Expr::int(0)),
+            Expr::assign(reg("edi", 4), reg("r8d", 4)),
+            Expr::call(CallTarget::Named("sigaction".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing sigaction call after propagation");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "sigaction"),
+            other => panic!("expected named sigaction target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["arg0", "rsp", "0"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_direct_sigaction_after_hidden_rep_stos_clobber() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "sigaction@GLIBC_2.2.5");
+
+        let statements = vec![
+            Expr::assign(reg("r8d", 4), reg("edi", 4)),
+            Expr::assign(reg("ecx", 4), Expr::int(18)),
+            Expr::assign(reg("edx", 4), Expr::int(0)),
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(BinOpKind::Add, reg("rsp", 8), Expr::int(8)),
+            ),
+            Expr::assign(reg("rsi", 8), reg("rsp", 8)),
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(
+                    BinOpKind::Add,
+                    reg("rdi", 8),
+                    Expr::binop(BinOpKind::Mul, reg("rcx", 8), Expr::int(8)),
+                ),
+            ),
+            Expr::assign(reg("rcx", 8), Expr::int(0)),
+            Expr::assign(reg("edi", 4), reg("r8d", 4)),
+            Expr::call(
+                CallTarget::Direct {
+                    target: 0x4010c0,
+                    call_site: 0x40140e,
+                },
+                vec![],
+            ),
+        ];
+
+        let propagated = propagate_args_in_block_with_binary_data(
+            statements,
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing sigaction call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["arg0", "rsp", "0"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_recovers_normalized_sigaction_after_hidden_rep_stos_clobber() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "sigaction@GLIBC_2.2.5");
+
+        let statements = vec![
+            Expr::assign(reg("r8", 4), reg("rdi", 4)),
+            Expr::assign(reg("rcx", 4), Expr::int(18)),
+            Expr::assign(reg("rdx", 4), Expr::int(0)),
+            Expr::assign(reg("rax", 4), Expr::int(0)),
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(BinOpKind::Add, reg("rsp", 8), Expr::int(8)),
+            ),
+            Expr::assign(reg("rsi", 8), reg("rsp", 8)),
+            Expr::assign(Expr::deref(reg("rsp", 8), 8), Expr::int(0x401300)),
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(
+                    BinOpKind::Add,
+                    reg("rdi", 8),
+                    Expr::binop(BinOpKind::Mul, reg("rcx", 8), Expr::int(8)),
+                ),
+            ),
+            Expr::assign(reg("rcx", 8), Expr::int(0)),
+            Expr::assign(reg("rdi", 4), reg("r8", 4)),
+            Expr::call(
+                CallTarget::Direct {
+                    target: 0x4010c0,
+                    call_site: 0x40140e,
+                },
+                vec![],
+            ),
+        ];
+
+        let propagated = propagate_args_in_block_with_binary_data(
+            statements,
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing sigaction call after propagation");
+        };
+
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["arg0", "rsp", "0"]
         );
     }
 
