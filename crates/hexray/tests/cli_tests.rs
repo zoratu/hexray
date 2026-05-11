@@ -677,6 +677,52 @@ fn test_cfg_json_format() {
     }
 }
 
+#[test]
+fn test_cfg_pe_start_symbol_uses_entry_fallback() {
+    let binary = workspace_fixture_path("pe/complex_x64.exe");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture pe/complex_x64.exe not found");
+        return;
+    }
+
+    let output = run_hexray(&[&binary, "cfg", "_start", "--json"]);
+    assert!(
+        output.status.success(),
+        "cfg _start should resolve the PE entry fallback: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with('{') || stdout.starts_with('['),
+        "cfg _start --json should emit JSON: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_disassemble_pe_start_symbol_uses_entry_fallback() {
+    let binary = workspace_fixture_path("pe/complex_x64.exe");
+    if !Path::new(&binary).exists() {
+        eprintln!("Skipping test: fixture pe/complex_x64.exe not found");
+        return;
+    }
+
+    let output = run_hexray(&[&binary, "--symbol", "_start", "--count", "5"]);
+    assert!(
+        output.status.success(),
+        "disassemble --symbol _start should resolve the PE entry fallback: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Disassembling _start at 0x140001000"),
+        "disassemble --symbol _start should target the PE entry point: {}",
+        stdout
+    );
+}
+
 // =============================================================================
 // Decompile Command Tests
 // =============================================================================

@@ -1338,12 +1338,6 @@ fn resolve_decompile_target(binary: &Binary, target: Option<String>) -> Result<S
     bail!("No target specified and could not find 'main' or entry point")
 }
 
-/// Find a symbol by name, preferring exact matches over partial matches.
-/// For function decompilation, we want the most specific match.
-fn find_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
-    find_symbol_with_mode(fmt, name, SymbolLookupMode::Fuzzy)
-}
-
 fn find_exact_symbol(fmt: &dyn BinaryFormat, name: &str) -> Option<hexray_core::Symbol> {
     find_symbol_with_mode(fmt, name, SymbolLookupMode::ExactOnly)
 }
@@ -1438,6 +1432,12 @@ fn resolve_analysis_target(
 
     if let Some(symbol) = find_symbol_for_project(fmt, project, target) {
         return Ok(ResolvedAnalysisTarget::Symbol(symbol));
+    }
+
+    if matches!(target, "_start" | "start") {
+        if let Some(symbol) = infer_start_symbol_from_entry(fmt) {
+            return Ok(ResolvedAnalysisTarget::Symbol(symbol));
+        }
     }
 
     bail!("Symbol '{}' not found", target)
@@ -2529,23 +2529,36 @@ fn format_instruction_for_output(
 
 fn disassemble_symbol(binary: &Binary, name: &str, max_count: usize) -> Result<()> {
     let fmt = binary.as_format();
-    // Find the symbol - prefer exact or alias matches, then prefix matches.
-    let symbol = find_symbol(fmt, name).with_context(|| format!("Symbol '{}' not found", name))?;
+    let (display_name, address, size) = match resolve_analysis_target(fmt, None, name)? {
+        ResolvedAnalysisTarget::Address(address) => {
+            let exact_symbol = fmt.symbol_at(address);
+            (
+                exact_symbol
+                    .map(|symbol| demangle_or_original(&symbol.name))
+                    .unwrap_or_else(|| format!("{address:#x}")),
+                address,
+                exact_symbol.map_or(0, |symbol| symbol.size),
+            )
+        }
+        ResolvedAnalysisTarget::Symbol(symbol) => (
+            demangle_or_original(&symbol.name),
+            symbol.address,
+            symbol.size,
+        ),
+    };
 
     println!(
         "Disassembling {} at {:#x} (size: {} bytes)\n",
-        demangle_or_original(&symbol.name),
-        symbol.address,
-        symbol.size
+        display_name, address, size
     );
 
-    let size = if symbol.size > 0 {
-        symbol.size as usize
+    let size = if size > 0 {
+        size as usize
     } else {
         max_count * 15 // Estimate: max x86 instruction is 15 bytes
     };
 
-    disassemble_at(binary, symbol.address, size.min(max_count * 15))
+    disassemble_at(binary, address, size.min(max_count * 15))
 }
 
 fn disassemble_at(binary: &Binary, address: u64, max_bytes: usize) -> Result<()> {
@@ -9948,6 +9961,35 @@ mod tests {
             &RelocationTable::new(),
         )
         .expect("entry fallback should resolve _start");
+
+        match resolved {
+            ResolvedAnalysisTarget::Symbol(symbol) => {
+                assert_eq!(symbol.name, "_start");
+                assert_eq!(symbol.address, 0x401040);
+                assert!(symbol.is_function());
+            }
+            ResolvedAnalysisTarget::Address(address) => {
+                panic!("resolved {address:#x} instead of synthesized _start")
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_analysis_target_falls_back_for_start_symbol() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401000,
+                data: vec![0x90; 0x100],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: Some(0x401040),
+        };
+
+        let resolved = resolve_analysis_target(&binary, None, "_start")
+            .expect("entry fallback should resolve _start");
 
         match resolved {
             ResolvedAnalysisTarget::Symbol(symbol) => {
