@@ -3712,17 +3712,6 @@ impl PseudoCodeEmitter {
             ExprKind::Deref { size, .. } if *size == 1 => true,
             // Cast to 1-byte type
             ExprKind::Cast { to_size, .. } if *to_size == 1 => true,
-            // Array indexing with implicit 1-byte element
-            ExprKind::BinOp {
-                op: BinOpKind::Add,
-                left,
-                right,
-            } => {
-                // Check for ptr[index] pattern where the final deref would be 1 byte
-                // This is heuristic - check if one side looks like a base pointer
-                matches!(left.kind, ExprKind::Var(_) | ExprKind::GotRef { .. })
-                    || matches!(right.kind, ExprKind::Var(_) | ExprKind::GotRef { .. })
-            }
             _ => false,
         }
     }
