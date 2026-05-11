@@ -1254,12 +1254,28 @@ impl Expr {
         }
     }
 
+    fn segmented_address_base_expr(mem: &MemoryRef) -> Option<Self> {
+        let segment = mem.segment.as_ref()?;
+
+        match segment.id {
+            x86::FS | x86::GS => Some(Self::call(
+                CallTarget::Named("__builtin_thread_pointer".to_string()),
+                vec![],
+            )),
+            _ => None,
+        }
+    }
+
     fn memory_address_expr_with_size(mem: &MemoryRef, forced_size_bytes: Option<u8>) -> Self {
-        let mut addr_expr: Option<Expr> = None;
+        let mut addr_expr = Self::segmented_address_base_expr(mem);
 
         // Build address expression: base + index*scale + disp
         if let Some(ref base) = mem.base {
-            addr_expr = Some(Self::address_register_expr(base, forced_size_bytes));
+            let base_expr = Self::address_register_expr(base, forced_size_bytes);
+            addr_expr = Some(match addr_expr {
+                Some(segment_base) => Self::binop(BinOpKind::Add, segment_base, base_expr),
+                None => base_expr,
+            });
         }
 
         if let Some(ref index) = mem.index {
@@ -5904,6 +5920,46 @@ mod tests {
         let expr = Expr::from_operand(&operand);
 
         assert_eq!(expr.to_string(), "__builtin_thread_pointer()");
+    }
+
+    #[test]
+    fn test_fs_based_memory_keeps_thread_pointer_base_when_general_base_is_present() {
+        use hexray_core::{Architecture, IndexMode, MemoryRef, Operand, Register, RegisterClass};
+
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        let operand = Operand::Memory(MemoryRef {
+            base: Some(rax),
+            index: None,
+            scale: 1,
+            displacement: 0,
+            size: 8,
+            segment: Some(fs),
+            broadcast: false,
+            index_mode: IndexMode::None,
+            space: hexray_core::MemorySpace::Generic,
+        });
+
+        let expr = Expr::from_operand(&operand);
+
+        let ExprKind::Deref { addr, size } = &expr.kind else {
+            panic!("expected deref expression, got {:?}", expr.kind);
+        };
+        assert_eq!(*size, 8);
+
+        let ExprKind::BinOp {
+            op: BinOpKind::Add,
+            left,
+            right,
+        } = &addr.kind
+        else {
+            panic!(
+                "expected thread-pointer-relative address, got {:?}",
+                addr.kind
+            );
+        };
+        assert_eq!(left.to_string(), "__builtin_thread_pointer()");
+        assert_eq!(right.to_string(), "rax");
     }
 
     #[test]
