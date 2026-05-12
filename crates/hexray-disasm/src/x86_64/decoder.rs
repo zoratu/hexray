@@ -41,6 +41,48 @@ impl X86_64Disassembler {
         Self { intel_syntax: true }
     }
 
+    fn finalize_legacy_prefixes(
+        prefixes: &Prefixes,
+        mut decoded: DecodedInstruction,
+    ) -> DecodedInstruction {
+        if Self::should_render_lock_prefix(prefixes, &decoded.instruction) {
+            decoded.instruction.mnemonic = format!("lock {}", decoded.instruction.mnemonic);
+        }
+
+        decoded
+    }
+
+    fn should_render_lock_prefix(prefixes: &Prefixes, instruction: &Instruction) -> bool {
+        if !prefixes.lock || prefixes.is_vector_encoded() {
+            return false;
+        }
+
+        if !instruction.operands.first().is_some_and(Operand::is_memory) {
+            return false;
+        }
+
+        matches!(
+            instruction.mnemonic.as_str(),
+            "add"
+                | "adc"
+                | "sub"
+                | "sbb"
+                | "or"
+                | "and"
+                | "xor"
+                | "inc"
+                | "dec"
+                | "neg"
+                | "not"
+                | "xadd"
+                | "cmpxchg"
+                | "xchg"
+                | "bts"
+                | "btr"
+                | "btc"
+        )
+    }
+
     /// Decodes the condition for a conditional jump based on opcode.
     fn decode_condition(opcode: u8) -> Condition {
         match opcode & 0x0F {
@@ -148,25 +190,31 @@ impl Disassembler for X86_64Disassembler {
             if vex.mmmmm == 1 {
                 if let Some(sse) = lookup_sse_opcode(opcode, prefix_66, prefix_f2, prefix_f3) {
                     return self
-                        .decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse);
+                        .decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse)
+                        .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                 }
             }
             // For VEX.mmmmm == 2 (0x0F 0x38 escape)
             if vex.mmmmm == 2 {
                 // Check for AMX instructions (tile operations)
                 if super::opcodes_0f38::is_amx_opcode(opcode) {
-                    return self.decode_amx_instruction(bytes, address, &prefixes, offset, opcode);
+                    return self
+                        .decode_amx_instruction(bytes, address, &prefixes, offset, opcode)
+                        .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                 }
                 // Check for BMI1/BMI2 instructions (F2-F7 range) which use GPRs
                 if (0xF2..=0xF7).contains(&opcode) {
-                    return self.decode_bmi_instruction(bytes, address, &prefixes, offset, opcode);
+                    return self
+                        .decode_bmi_instruction(bytes, address, &prefixes, offset, opcode)
+                        .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                 }
                 if let Some(entry) = super::opcodes_0f38::OPCODE_TABLE_0F38
                     .get(opcode as usize)
                     .and_then(|e| e.as_ref())
                 {
                     return self
-                        .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
+                        .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry)
+                        .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                 }
             }
             // For VEX.mmmmm == 3 (0x0F 0x3A escape) - instructions with immediate
@@ -176,7 +224,8 @@ impl Disassembler for X86_64Disassembler {
                     .and_then(|e| e.as_ref())
                 {
                     return self
-                        .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry);
+                        .decode_vex_instruction(bytes, address, &prefixes, offset, opcode, entry)
+                        .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                 }
             }
             // Unknown VEX opcode
@@ -189,7 +238,9 @@ impl Disassembler for X86_64Disassembler {
 
         // Check if this is an EVEX-encoded instruction (AVX-512)
         if prefixes.is_evex() {
-            return self.decode_evex_instruction(bytes, address, &prefixes, offset);
+            return self
+                .decode_evex_instruction(bytes, address, &prefixes, offset)
+                .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
         }
 
         // Check for two-byte opcode escape
@@ -218,9 +269,11 @@ impl Disassembler for X86_64Disassembler {
                     if !remaining.is_empty() {
                         let modrm_byte = remaining.first().copied().unwrap_or(0);
                         offset = offset.saturating_add(1);
-                        return self.decode_cet_instruction(
-                            bytes, address, &prefixes, offset, opcode, modrm_byte,
-                        );
+                        return self
+                            .decode_cet_instruction(
+                                bytes, address, &prefixes, offset, opcode, modrm_byte,
+                            )
+                            .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                     }
                 }
                 // F3 0F AE /5: INCSSPD/INCSSPQ
@@ -231,9 +284,11 @@ impl Disassembler for X86_64Disassembler {
                         let modrm = ModRM::parse(modrm_byte, prefixes.rex);
                         if modrm.is_register() && (modrm.reg & 0x7) == 5 {
                             offset = offset.saturating_add(1);
-                            return self.decode_cet_instruction(
-                                bytes, address, &prefixes, offset, opcode, modrm_byte,
-                            );
+                            return self
+                                .decode_cet_instruction(
+                                    bytes, address, &prefixes, offset, opcode, modrm_byte,
+                                )
+                                .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                         }
                     }
                 }
@@ -246,7 +301,8 @@ impl Disassembler for X86_64Disassembler {
                         if modrm_byte == 0xEA || ((modrm_byte >> 3) & 0x7) == 5 {
                             offset = offset.saturating_add(1);
                             return self
-                                .decode_cet_0f01(bytes, address, &prefixes, offset, modrm_byte);
+                                .decode_cet_0f01(bytes, address, &prefixes, offset, modrm_byte)
+                                .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
                         }
                     }
                 }
@@ -279,10 +335,13 @@ impl Disassembler for X86_64Disassembler {
 
                                 guard: None,
                             };
-                            return Ok(DecodedInstruction {
-                                instruction,
-                                size: offset,
-                            });
+                            return Ok(Self::finalize_legacy_prefixes(
+                                &prefixes,
+                                DecodedInstruction {
+                                    instruction,
+                                    size: offset,
+                                },
+                            ));
                         }
                     }
                 }
@@ -299,7 +358,9 @@ impl Disassembler for X86_64Disassembler {
                 }
                 let opcode3 = bytes.get(offset).copied().unwrap_or(0);
                 offset = offset.saturating_add(1);
-                return self.decode_0f38_instruction(bytes, address, &prefixes, offset, opcode3);
+                return self
+                    .decode_0f38_instruction(bytes, address, &prefixes, offset, opcode3)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // Handle 0F 3A three-byte escape (SSE4.1, SSE4.2 with immediate)
@@ -313,7 +374,9 @@ impl Disassembler for X86_64Disassembler {
                 }
                 let opcode3 = bytes.get(offset).copied().unwrap_or(0);
                 offset = offset.saturating_add(1);
-                return self.decode_0f3a_instruction(bytes, address, &prefixes, offset, opcode3);
+                return self
+                    .decode_0f3a_instruction(bytes, address, &prefixes, offset, opcode3)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // First check if this is an SSE instruction
@@ -326,27 +389,37 @@ impl Disassembler for X86_64Disassembler {
 
             if let Some(sse) = sse_entry {
                 // Decode SSE instruction
-                return self.decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse);
+                return self
+                    .decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // Handle 0F 00 system instructions (SLDT, STR, LLDT, LTR, VERR, VERW)
             if opcode == 0x00 {
-                return self.decode_0f00_group(bytes, address, &prefixes, offset);
+                return self
+                    .decode_0f00_group(bytes, address, &prefixes, offset)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // Handle 0F 01 system instructions (SGDT, SIDT, LGDT, LIDT, SMSW, LMSW, INVLPG, RDTSCP)
             if opcode == 0x01 {
-                return self.decode_0f01_group(bytes, address, &prefixes, offset);
+                return self
+                    .decode_0f01_group(bytes, address, &prefixes, offset)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // Handle 0F BA group 8 (BT/BTS/BTR/BTC with immediate)
             if opcode == 0xBA {
-                return self.decode_group8(bytes, address, &prefixes, offset);
+                return self
+                    .decode_group8(bytes, address, &prefixes, offset)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // Handle 0F 18 prefetch hint / long NOP encodings via ModR/M.reg dispatch.
             if opcode == 0x18 {
-                return self.decode_0f18_prefetch_group(bytes, address, &prefixes, offset);
+                return self
+                    .decode_0f18_prefetch_group(bytes, address, &prefixes, offset)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             OPCODE_TABLE_0F
@@ -354,33 +427,47 @@ impl Disassembler for X86_64Disassembler {
                 .and_then(|e| e.as_ref())
         } else {
             if prefixes.rep && matches!(opcode, 0xAA | 0xAB) {
-                return self.decode_hidden_rep_stos(bytes, address, &prefixes, offset, opcode);
+                return self
+                    .decode_hidden_rep_stos(bytes, address, &prefixes, offset, opcode)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
             // Handle group 1 (0x80-0x83) specially
             if (0x80..=0x83).contains(&opcode) {
-                return self.decode_group1(bytes, address, &prefixes, offset, opcode);
+                return self
+                    .decode_group1(bytes, address, &prefixes, offset, opcode)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
             // Handle group 2 (shift/rotate: 0xC0-0xC1, 0xD0-0xD3)
             if opcode == 0xC0 || opcode == 0xC1 || (0xD0..=0xD3).contains(&opcode) {
-                return self.decode_group2(bytes, address, &prefixes, offset, opcode);
+                return self
+                    .decode_group2(bytes, address, &prefixes, offset, opcode)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
             // Handle group 3 (0xF6/0xF7: TEST/NOT/NEG/MUL/DIV)
             if opcode == 0xF6 || opcode == 0xF7 {
-                return self.decode_group3(bytes, address, &prefixes, offset, opcode);
+                return self
+                    .decode_group3(bytes, address, &prefixes, offset, opcode)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
             // Handle group 5 (0xFF: INC/DEC/CALL/JMP/PUSH)
             if opcode == 0xFF {
-                return self.decode_group5(bytes, address, &prefixes, offset);
+                return self
+                    .decode_group5(bytes, address, &prefixes, offset)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
             // Handle x87 FPU instructions (0xD8-0xDF)
             if (0xD8..=0xDF).contains(&opcode) {
-                return self.decode_x87(bytes, address, &prefixes, offset, opcode);
+                return self
+                    .decode_x87(bytes, address, &prefixes, offset, opcode)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // Handle opcodes that are invalid in 64-bit mode
             // These were valid in 32-bit mode but repurposed or removed in long mode
             if is_invalid_64bit_opcode(opcode) {
-                return self.decode_invalid_64bit(bytes, address, offset, opcode);
+                return self
+                    .decode_invalid_64bit(bytes, address, offset, opcode)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             OPCODE_TABLE.get(opcode as usize).and_then(|e| e.as_ref())
@@ -994,10 +1081,13 @@ impl Disassembler for X86_64Disassembler {
             guard: None,
         };
 
-        Ok(DecodedInstruction {
-            instruction,
-            size: offset,
-        })
+        Ok(Self::finalize_legacy_prefixes(
+            &prefixes,
+            DecodedInstruction {
+                instruction,
+                size: offset,
+            },
+        ))
     }
 
     fn min_instruction_size(&self) -> usize {
@@ -3635,6 +3725,59 @@ mod tests {
             }
             other => panic!("expected memory operand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_lock_xadd_renders_explicit_prefix() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xf0, 0x0f, 0xc1, 0x08], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "lock xadd");
+        assert_eq!(result.instruction.operation, Operation::Add);
+    }
+
+    #[test]
+    fn test_lock_cmpxchg_renders_explicit_prefix() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xf0, 0x0f, 0xb1, 0x08], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "lock cmpxchg");
+        assert_eq!(result.instruction.operation, Operation::Exchange);
+    }
+
+    #[test]
+    fn test_lock_dec_renders_explicit_prefix() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xf0, 0xff, 0x08], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "lock dec");
+        assert_eq!(result.instruction.operation, Operation::Dec);
+    }
+
+    #[test]
+    fn test_lock_is_not_rendered_for_implicit_xchg() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm.decode_instruction(&[0x87, 0x08], 0x1000).unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xchg");
+        assert_eq!(result.instruction.operation, Operation::Exchange);
+    }
+
+    #[test]
+    fn test_lock_is_not_rendered_for_non_lockable_operand_order() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xf0, 0x03, 0x08], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "add");
+        assert_eq!(result.instruction.operation, Operation::Add);
     }
 
     #[test]
