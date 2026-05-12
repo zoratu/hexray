@@ -10,6 +10,7 @@ use super::naming::NamingContext;
 use super::signature::{CallingConvention, FunctionSignature, SignatureRecovery};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, StringTable, SummaryDatabase, SymbolTable};
+use crate::symbol_names::strip_demangled_signature as strip_demangled_symbol_signature;
 use hexray_core::BasicBlockId;
 use hexray_types::{get_argument_category, ConstantCategory, ConstantDatabase, TypeDatabase};
 use std::cell::{Cell, RefCell};
@@ -4165,11 +4166,7 @@ impl PseudoCodeEmitter {
     }
 
     fn strip_demangled_signature(name: &str) -> &str {
-        if name.contains('(') && name.ends_with(')') {
-            name.split('(').next().unwrap_or(name)
-        } else {
-            name
-        }
+        strip_demangled_symbol_signature(name)
     }
 
     fn format_indirect_got_call_target(name: &str) -> String {
@@ -9582,6 +9579,37 @@ mod tests {
 
         assert!(output.contains("return sum_ints(arg0, n);"), "{output}");
         assert!(!output.contains("sum_ints(int const*, int)("), "{output}");
+    }
+
+    #[test]
+    fn test_emit_direct_call_preserves_template_parens_when_stripping_signature() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::call(
+                CallTarget::Direct {
+                    target: 0x401000,
+                    call_site: 0x1010,
+                },
+                vec![Expr::unknown("arg0")],
+            )))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sym = SymbolTable::new();
+        sym.insert(
+            0x401000,
+            "std::__shared_ptr<Widget, std::allocator<Widget>(int)>::reset()".to_string(),
+        );
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let output = emitter.emit(&cfg, "reset_widget");
+
+        assert!(
+            output.contains(
+                "return std::__shared_ptr<Widget, std::allocator<Widget>(int)>::reset(arg0);"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("std::__shared_ptr<Widget, std::allocator<Widget>(arg0);"));
     }
 
     #[test]

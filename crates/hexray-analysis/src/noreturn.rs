@@ -1,5 +1,6 @@
 //! Shared helpers for recognizing known noreturn functions.
 
+use crate::symbol_names::strip_demangled_signature;
 use hexray_core::Symbol;
 use std::collections::HashSet;
 
@@ -58,10 +59,6 @@ pub fn is_ubsan_handler_function_name(name: &str) -> bool {
 
 fn is_asan_report_function(name: &str) -> bool {
     name.starts_with("asan_report_") && !name.ends_with("_noabort")
-}
-
-fn strip_demangled_signature(name: &str) -> &str {
-    name.split('(').next().unwrap_or(name)
 }
 
 fn is_std_noreturn_helper(name: &str) -> bool {

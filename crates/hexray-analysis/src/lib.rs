@@ -47,6 +47,7 @@ pub mod rtti;
 pub mod ssa;
 pub mod stack_canary;
 pub mod strings;
+pub(crate) mod symbol_names;
 pub mod types;
 pub mod vtable;
 pub mod xrefs;
