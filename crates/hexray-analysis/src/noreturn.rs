@@ -15,10 +15,12 @@ pub fn is_noreturn_function_name(name: &str) -> bool {
         .split_once("@@")
         .map(|(base, _)| base)
         .unwrap_or_else(|| name.split('@').next().unwrap_or(name));
+    let bare_name = strip_demangled_signature(name);
 
-    is_asan_report_function(name)
+    is_asan_report_function(bare_name)
+        || is_std_noreturn_helper(bare_name)
         || matches!(
-            name,
+            bare_name,
             "exit"
                 | "Exit"
                 | "abort"
@@ -31,7 +33,9 @@ pub fn is_noreturn_function_name(name: &str) -> bool {
                 | "cxa_rethrow"
                 | "cxa_bad_cast"
                 | "cxa_bad_typeid"
+                | "cxa_pure_virtual"
                 | "Unwind_Resume"
+                | "Unwind_RaiseException"
                 | "err"
                 | "errx"
                 | "verr"
@@ -54,6 +58,63 @@ pub fn is_ubsan_handler_function_name(name: &str) -> bool {
 
 fn is_asan_report_function(name: &str) -> bool {
     name.starts_with("asan_report_") && !name.ends_with("_noabort")
+}
+
+fn strip_demangled_signature(name: &str) -> &str {
+    name.split('(').next().unwrap_or(name)
+}
+
+fn is_std_noreturn_helper(name: &str) -> bool {
+    const DEMANGLED: &[&str] = &[
+        "std::__throw_bad_optional_access",
+        "std::__throw_bad_variant_access",
+        "std::__throw_bad_alloc",
+        "std::__throw_out_of_range",
+        "std::__throw_out_of_range_fmt",
+        "std::__throw_length_error",
+        "std::__throw_logic_error",
+        "std::__throw_runtime_error",
+        "std::__throw_invalid_argument",
+        "std::__throw_overflow_error",
+        "std::__throw_underflow_error",
+        "std::__throw_domain_error",
+        "std::__throw_range_error",
+        "std::__throw_system_error",
+        "std::__throw_ios_failure",
+        "std::__throw_future_error",
+        "std::__throw_bad_function_call",
+        "std::__throw_bad_cast",
+        "std::__throw_bad_typeid",
+        "std::terminate",
+    ];
+    const ITANIUM_FRAGMENTS: &[&str] = &[
+        "__throw_bad_optional_access",
+        "__throw_bad_variant_access",
+        "__throw_bad_alloc",
+        "__throw_out_of_range",
+        "__throw_out_of_range_fmt",
+        "__throw_length_error",
+        "__throw_logic_error",
+        "__throw_runtime_error",
+        "__throw_invalid_argument",
+        "__throw_overflow_error",
+        "__throw_underflow_error",
+        "__throw_domain_error",
+        "__throw_range_error",
+        "__throw_system_error",
+        "__throw_ios_failure",
+        "__throw_future_error",
+        "__throw_bad_function_call",
+        "__throw_bad_cast",
+        "__throw_bad_typeid",
+    ];
+
+    DEMANGLED.contains(&name)
+        || name.starts_with("ZSt9terminate")
+        || (name.starts_with("ZSt")
+            && ITANIUM_FRAGMENTS
+                .iter()
+                .any(|fragment| name.contains(fragment)))
 }
 
 /// Collect the addresses of known noreturn symbols.
@@ -96,6 +157,44 @@ mod tests {
     #[test]
     fn matches_longjmp_family_names() {
         for name in ["longjmp", "_longjmp", "siglongjmp", "__longjmp_chk"] {
+            assert!(is_noreturn_function_name(name), "{name} should be noreturn");
+        }
+    }
+
+    #[test]
+    fn matches_cpp_throw_helper_names() {
+        for name in [
+            "std::__throw_bad_optional_access",
+            "std::__throw_bad_variant_access()",
+            "std::__throw_out_of_range(char const*)",
+            "std::__throw_system_error(int)",
+            "std::terminate()",
+        ] {
+            assert!(is_noreturn_function_name(name), "{name} should be noreturn");
+        }
+    }
+
+    #[test]
+    fn matches_itanium_std_throw_helper_names() {
+        for name in [
+            "_ZSt30__throw_bad_optional_accessv",
+            "_ZSt27__throw_bad_variant_accessPKc",
+            "_ZSt20__throw_bad_castv",
+            "_ZSt9terminatev",
+        ] {
+            assert!(is_noreturn_function_name(name), "{name} should be noreturn");
+        }
+    }
+
+    #[test]
+    fn matches_cxx_runtime_and_unwind_helpers() {
+        for name in [
+            "__cxa_throw",
+            "__cxa_rethrow",
+            "__cxa_pure_virtual",
+            "_Unwind_Resume",
+            "_Unwind_RaiseException",
+        ] {
             assert!(is_noreturn_function_name(name), "{name} should be noreturn");
         }
     }

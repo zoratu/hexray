@@ -1715,8 +1715,10 @@ impl<'a> Structurer<'a> {
                             "/* throw via {}() */",
                             name
                         ))));
+                        result.push(StructuredNode::Expr(call));
+                    } else {
+                        result.push(StructuredNode::Return(Some(call)));
                     }
-                    result.push(StructuredNode::Return(Some(call)));
                     break;
                 }
 
@@ -6295,7 +6297,7 @@ mod tests {
     }
 
     #[test]
-    fn test_external_jump_to_throw_thunk_emits_comment() {
+    fn test_external_jump_to_throw_thunk_emits_terminal_call() {
         let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
         let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
         bb0.terminator = BlockTerminator::ExternalJump { target: 0x2000 };
@@ -6321,8 +6323,12 @@ mod tests {
             "expected throw-thunk comment, got:\n{output}"
         );
         assert!(
-            output.contains("return may_throw(int) [clone .cold]();"),
-            "expected named cold thunk return, got:\n{output}"
+            output.contains("may_throw(int) [clone .cold]();"),
+            "expected named cold thunk call, got:\n{output}"
+        );
+        assert!(
+            !output.contains("return may_throw(int) [clone .cold]();"),
+            "throw thunk call should not be rendered as a synthetic return:\n{output}"
         );
     }
 

@@ -6678,6 +6678,32 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_recovery_does_not_infer_tail_return_for_std_throw_helper() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("std::__throw_bad_optional_access".to_string()),
+            vec![],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(!sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Void);
+    }
+
+    #[test]
     fn test_signature_recovery_does_not_infer_tail_return_for_builtin_prefetch() {
         use hexray_core::BasicBlockId;
 

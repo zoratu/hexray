@@ -8179,6 +8179,7 @@ impl PseudoCodeEmitter {
     /// Checks if a body (list of nodes) ends with a control flow exit.
     fn body_ends_with_control_exit(&self, body: &[StructuredNode]) -> bool {
         body.last().is_some_and(|n| self.is_control_exit(n))
+            || Self::body_ends_with_throw_thunk_call(body)
     }
 
     /// Checks if a node is a control flow exit (goto, return, break, continue, noreturn call).
@@ -8195,11 +8196,10 @@ impl PseudoCodeEmitter {
                 else_body,
                 ..
             } => {
-                let then_exits = then_body.last().is_some_and(|n| self.is_control_exit(n));
+                let then_exits = self.body_ends_with_control_exit(then_body);
                 let else_exits = else_body
                     .as_ref()
-                    .and_then(|e| e.last())
-                    .is_some_and(|n| self.is_control_exit(n));
+                    .is_some_and(|body| self.body_ends_with_control_exit(body));
                 then_exits && else_exits
             }
             // Check for noreturn function calls
@@ -8209,6 +8209,27 @@ impl PseudoCodeEmitter {
             }
             _ => false,
         }
+    }
+
+    fn body_ends_with_throw_thunk_call(body: &[StructuredNode]) -> bool {
+        let Some(StructuredNode::Expr(call)) = body.last() else {
+            return false;
+        };
+        let Some(StructuredNode::Expr(comment)) = body.get(body.len().saturating_sub(2)) else {
+            return false;
+        };
+        let ExprKind::Unknown(comment_text) = &comment.kind else {
+            return false;
+        };
+        let ExprKind::Call {
+            target: CallTarget::Named(name),
+            ..
+        } = &call.kind
+        else {
+            return false;
+        };
+
+        comment_text.trim() == format!("/* throw via {}() */", name)
     }
 
     /// Checks if an expression is a call to a noreturn function.
@@ -11195,6 +11216,92 @@ mod tests {
         assert!(
             !output.contains("return __longjmp_chk@GLIBC_2.11@plt"),
             "noreturn tail call must not be folded into a return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_does_not_fold_std_throw_tail_call() {
+        let tail_call = Expr::call(
+            CallTarget::Named("std::__throw_bad_optional_access".to_string()),
+            vec![],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![tail_call],
+            address_range: (0x1050, 0x1060),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "unwrap_or_throw", &sig);
+        assert!(
+            output.contains("\n    std::__throw_bad_optional_access();\n"),
+            "noreturn tail call should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return std::__throw_bad_optional_access"),
+            "noreturn tail call must not be folded into a return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_does_not_append_fallback_after_throw_thunk_call() {
+        let cfg = StructuredCfg {
+            body: vec![
+                StructuredNode::If {
+                    condition: Expr::unknown("arg0 != 0"),
+                    then_body: vec![StructuredNode::Return(Some(Expr::int(7)))],
+                    else_body: None,
+                },
+                StructuredNode::Expr(Expr::unknown(
+                    "/* throw via unwrap_or_throw(std::optional<int>) [clone .cold]() */",
+                )),
+                StructuredNode::Expr(Expr::call(
+                    CallTarget::Named(
+                        "unwrap_or_throw(std::optional<int>) [clone .cold]".to_string(),
+                    ),
+                    vec![],
+                )),
+            ],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "unwrap_or_throw", &sig);
+        assert!(
+            output.contains("/* throw via unwrap_or_throw(std::optional<int>) [clone .cold]() */"),
+            "throw thunk comment should be preserved:\n{}",
+            output
+        );
+        assert!(
+            output.contains("\n    unwrap_or_throw(std::optional<int>) [clone .cold]();\n"),
+            "throw thunk call should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return unwrap_or_throw(std::optional<int>) [clone .cold]();"),
+            "throw thunk call must not be folded into a return:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("\n    return 0;\n"),
+            "terminal throw thunk call must suppress fallback return:\n{}",
             output
         );
     }
