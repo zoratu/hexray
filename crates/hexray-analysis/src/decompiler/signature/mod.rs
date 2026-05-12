@@ -776,7 +776,7 @@ impl SignatureRecovery {
                     }
                 }
                 if near_return && !self.return_value_set {
-                    if let Some(candidate) = self.infer_tail_call_return_type(rhs) {
+                    if let Some(candidate) = self.infer_tail_call_forwarded_return_type(rhs) {
                         self.tail_call_return_type = Some(candidate);
                     }
                 }
@@ -886,9 +886,7 @@ impl SignatureRecovery {
             }
             ExprKind::Call { .. } => {
                 if near_return && !self.return_value_set {
-                    if let Some(candidate) = self.infer_tail_call_return_type(expr) {
-                        self.tail_call_return_type = Some(candidate);
-                    }
+                    self.tail_call_return_type = self.infer_tail_call_forwarded_return_type(expr);
                     if let ExprKind::Call { target, args } = &expr.kind {
                         if let Some(name) = self.extract_call_name(target) {
                             if let Some(params) = get_known_function_params(&name) {
@@ -1788,6 +1786,26 @@ impl SignatureRecovery {
         }
     }
 
+    fn is_discardable_tail_call_return_function(function_name: &str) -> bool {
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
+        matches!(
+            clean,
+            "pthread_mutex_lock"
+                | "pthread_mutex_unlock"
+                | "pthread_cond_broadcast"
+                | "pthread_cond_signal"
+                | "pthread_detach"
+                | "pthread_join"
+                | "pthread_rwlock_unlock"
+                | "pthread_spin_unlock"
+                | "free"
+                | "kfree"
+                | "fclose"
+                | "pthread_setspecific"
+                | "sigaction"
+        )
+    }
+
     fn infer_tail_call_return_type(&self, expr: &Expr) -> Option<ParamType> {
         if let ExprKind::Cast { expr: inner, .. } = &expr.kind {
             return self.infer_tail_call_return_type(inner);
@@ -1813,6 +1831,20 @@ impl SignatureRecovery {
             return Some(ParamType::SignedInt(32));
         }
         None
+    }
+
+    fn infer_tail_call_forwarded_return_type(&self, expr: &Expr) -> Option<ParamType> {
+        if let ExprKind::Cast { expr: inner, .. } = &expr.kind {
+            return self.infer_tail_call_forwarded_return_type(inner);
+        }
+        if let ExprKind::Call { target, .. } = &expr.kind {
+            if let Some(name) = self.extract_call_name(target) {
+                if Self::is_discardable_tail_call_return_function(&name) {
+                    return None;
+                }
+            }
+        }
+        self.infer_tail_call_return_type(expr)
     }
 
     fn infer_atomic_pseudo_call_return_type(&self, name: &str, args: &[Expr]) -> Option<ParamType> {
@@ -6277,6 +6309,86 @@ mod tests {
 
         assert!(sig.has_return);
         assert_eq!(sig.return_type, ParamType::SignedInt(32));
+    }
+
+    #[test]
+    fn test_signature_recovery_ignores_discardable_tail_call_forwarding_return_type() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("pthread_mutex_unlock".to_string()),
+            vec![Expr::var(Variable::reg("rdi", 8))],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(!sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Void);
+    }
+
+    #[test]
+    fn test_signature_recovery_keeps_explicit_discardable_call_return_type() {
+        use hexray_core::BasicBlockId;
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::call(
+                CallTarget::Named("pthread_mutex_unlock".to_string()),
+                vec![Expr::var(Variable::reg("rdi", 8))],
+            )))],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert!(!matches!(sig.return_type, ParamType::Void));
+    }
+
+    #[test]
+    fn test_signature_recovery_last_discardable_tail_call_clears_prior_candidate() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::call(
+                    CallTarget::Named("pthread_create".to_string()),
+                    vec![
+                        Expr::var(Variable::reg("rdi", 8)),
+                        Expr::var(Variable::reg("rsi", 8)),
+                        Expr::var(Variable::reg("rdx", 8)),
+                        Expr::var(Variable::reg("rcx", 8)),
+                    ],
+                ),
+                Expr::call(
+                    CallTarget::Named("pthread_detach".to_string()),
+                    vec![Expr::var(Variable::reg("rdi", 8))],
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(!sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Void);
     }
 
     #[test]
