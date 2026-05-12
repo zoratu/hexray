@@ -495,6 +495,139 @@ pub(super) fn elide_stack_clash_probe_scaffolding(
     prune_dead_stack_clash_target_assignments(nodes)
 }
 
+pub(super) fn elide_profiling_probe_calls(
+    nodes: Vec<StructuredNode>,
+    binary_data: Option<&BinaryDataContext>,
+) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .filter_map(|node| elide_profiling_probe_calls_in_node(node, binary_data))
+        .collect()
+}
+
+fn elide_profiling_probe_calls_in_node(
+    node: StructuredNode,
+    binary_data: Option<&BinaryDataContext>,
+) -> Option<StructuredNode> {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => {
+            let statements: Vec<_> = statements
+                .into_iter()
+                .filter(|stmt| !is_profiling_probe_statement(stmt, binary_data))
+                .collect();
+            if statements.is_empty() {
+                None
+            } else {
+                Some(StructuredNode::Block {
+                    id,
+                    statements,
+                    address_range,
+                })
+            }
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            let then_body = elide_profiling_probe_calls(then_body, binary_data);
+            let else_body = else_body
+                .map(|body| elide_profiling_probe_calls(body, binary_data))
+                .filter(|body| !body.is_empty());
+            if then_body.is_empty() && else_body.is_none() {
+                None
+            } else {
+                Some(StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                })
+            }
+        }
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::While {
+            condition,
+            body: elide_profiling_probe_calls(body, binary_data),
+            header,
+            exit_block,
+        }),
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => Some(StructuredNode::DoWhile {
+            body: elide_profiling_probe_calls(body, binary_data),
+            condition,
+            header,
+            exit_block,
+        }),
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: elide_profiling_probe_calls(body, binary_data),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::Loop {
+            body: elide_profiling_probe_calls(body, binary_data),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => Some(StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| (values, elide_profiling_probe_calls(body, binary_data)))
+                .collect(),
+            default: default.map(|body| elide_profiling_probe_calls(body, binary_data)),
+        }),
+        StructuredNode::Sequence(nodes) => Some(StructuredNode::Sequence(
+            elide_profiling_probe_calls(nodes, binary_data),
+        )),
+        StructuredNode::Expr(expr) => (!is_profiling_probe_statement(&expr, binary_data))
+            .then_some(StructuredNode::Expr(expr)),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => Some(StructuredNode::TryCatch {
+            try_body: elide_profiling_probe_calls(try_body, binary_data),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: elide_profiling_probe_calls(handler.body, binary_data),
+                    ..handler
+                })
+                .collect(),
+        }),
+        other => Some(other),
+    }
+}
+
 fn elide_stack_clash_probe_scaffolding_in_list(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     let nodes: Vec<_> = nodes
         .into_iter()
@@ -1170,6 +1303,38 @@ fn is_asan_helper_call_expr(expr: &Expr) -> bool {
             ..
         } if normalize_known_call_name(name).starts_with("asan_")
     )
+}
+
+fn is_profiling_probe_statement(expr: &Expr, binary_data: Option<&BinaryDataContext>) -> bool {
+    match &expr.kind {
+        ExprKind::Call { target, .. } => call_target_is_profiling_probe(target, binary_data),
+        ExprKind::Assign { rhs, .. } => match &rhs.kind {
+            ExprKind::Call { target, .. } => call_target_is_profiling_probe(target, binary_data),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn call_target_is_profiling_probe(
+    target: &CallTarget,
+    binary_data: Option<&BinaryDataContext>,
+) -> bool {
+    resolved_known_call_name(target, binary_data)
+        .and_then(|name| {
+            let base = name.split('@').next().unwrap_or(name.as_str());
+            matches!(
+                base,
+                "mcount"
+                    | "_mcount"
+                    | "__gnu_mcount_nc"
+                    | "__fentry__"
+                    | "__cyg_profile_func_enter"
+                    | "__cyg_profile_func_exit"
+            )
+            .then_some(())
+        })
+        .is_some()
 }
 
 fn expr_contains_asan_shadow_marker(expr: &Expr) -> bool {
@@ -12211,6 +12376,81 @@ mod tests {
         assert!(matches!(
             &cleaned[0],
             StructuredNode::Block { statements, .. }
+                if matches!(
+                    statements.as_slice(),
+                    [Expr {
+                        kind: ExprKind::Call {
+                            target: CallTarget::Named(name),
+                            ..
+                        }
+                    }] if name == "work"
+                )
+        ));
+    }
+
+    #[test]
+    fn test_elide_profiling_probe_calls_removes_named_probe_statements_and_assignments() {
+        let cleaned = elide_profiling_probe_calls(
+            vec![block(
+                0,
+                vec![
+                    Expr::call(
+                        CallTarget::Named("__cyg_profile_func_enter".to_string()),
+                        vec![Expr::unknown("&hot_func"), local("var_8", 8)],
+                    ),
+                    Expr::assign(
+                        local("ret_0", 4),
+                        Expr::call(CallTarget::Named("mcount@GLIBC_2.2.5".to_string()), vec![]),
+                    ),
+                    Expr::call(
+                        CallTarget::Named("work".to_string()),
+                        vec![arg("arg0", 0, 4)],
+                    ),
+                ],
+            )],
+            None,
+        );
+
+        assert!(matches!(
+            cleaned.as_slice(),
+            [StructuredNode::Block { statements, .. }]
+                if matches!(
+                    statements.as_slice(),
+                    [Expr {
+                        kind: ExprKind::Call {
+                            target: CallTarget::Named(name),
+                            ..
+                        }
+                    }] if name == "work"
+                )
+        ));
+    }
+
+    #[test]
+    fn test_elide_profiling_probe_calls_removes_resolved_direct_probe_calls() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "mcount@GLIBC_2.2.5");
+
+        let cleaned = elide_profiling_probe_calls(
+            vec![block(
+                0,
+                vec![
+                    Expr::call(
+                        CallTarget::Direct {
+                            target: 0x4010c0,
+                            call_site: 0x5000,
+                        },
+                        vec![],
+                    ),
+                    Expr::call(CallTarget::Named("work".to_string()), vec![]),
+                ],
+            )],
+            Some(&binary_data),
+        );
+
+        assert!(matches!(
+            cleaned.as_slice(),
+            [StructuredNode::Block { statements, .. }]
                 if matches!(
                     statements.as_slice(),
                     [Expr {

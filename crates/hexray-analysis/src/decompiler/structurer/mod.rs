@@ -48,8 +48,9 @@ use gotos::{
 #[cfg(test)]
 use simplify::capture_return_register_uses_in_block;
 use simplify::{
-    elide_stack_clash_probe_scaffolding, extract_return_value, merge_return_value_captures,
-    propagate_args_in_block, propagate_call_args_with_binary_data_and_arch, simplify_statements,
+    elide_profiling_probe_calls, elide_stack_clash_probe_scaffolding, extract_return_value,
+    merge_return_value_captures, propagate_args_in_block,
+    propagate_call_args_with_binary_data_and_arch, simplify_statements,
     statement_contains_real_call, substitute_prior_register_assignments,
     substitute_return_register_uses,
 };
@@ -427,6 +428,10 @@ impl StructuredCfg {
         if !structurer.known_noreturn_targets.is_empty() {
             body = rewrite_known_noreturn_calls(body, &structurer.known_noreturn_targets);
         }
+
+        // Strip profiling hooks before any value propagation so they cannot
+        // poison parameter recovery or leak into emitted pseudo-C.
+        body = elide_profiling_probe_calls(body, structurer.binary_data);
 
         // Materialize folded condition call results early so later call-argument
         // propagation can still see the producer when a branch body reuses the
@@ -8302,6 +8307,115 @@ mod tests {
                 })
             ),
             "post-processed tail call should remain available for emitter folding"
+        );
+    }
+
+    #[test]
+    fn test_structured_cfg_elides_mcount_before_signature_recovery() {
+        use crate::decompiler::{BinaryDataContext, CallingConvention, SignatureRecovery};
+
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let edi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 32);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x2000, "mcount@GLIBC_2.2.5");
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.instructions.push(
+            Instruction::new(0x1000, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x2000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1005,
+                }),
+        );
+
+        let mut store_arg = Instruction::new(0x1005, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x4, 4)),
+                Operand::Register(edi),
+            ]);
+        store_arg.reads = vec![rbp, edi];
+        bb0.instructions.push(store_arg);
+
+        let mut load_arg = Instruction::new(0x1008, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Register(eax),
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x4, 4)),
+            ]);
+        load_arg.reads = vec![rbp];
+        load_arg.writes = vec![eax];
+        bb0.instructions.push(load_arg);
+
+        let mut square = Instruction::new(0x100b, 2, vec![], "imul")
+            .with_operation(Operation::Mul)
+            .with_operands(vec![Operand::Register(eax), Operand::Register(eax)]);
+        square.reads = vec![eax];
+        square.writes = vec![eax];
+        bb0.instructions.push(square);
+
+        let mut add_one = Instruction::new(0x100d, 3, vec![], "add")
+            .with_operation(Operation::Add)
+            .with_operands(vec![Operand::Register(eax), Operand::imm(1, 32)]);
+        add_one.reads = vec![eax];
+        add_one.writes = vec![eax];
+        bb0.instructions.push(add_one);
+
+        bb0.terminator = BlockTerminator::Fallthrough {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.instructions.push(
+            Instruction::new(0x1010, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        bb1.terminator = BlockTerminator::Return;
+        cfg.add_block(bb1);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+
+        let structured = StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info(
+            &cfg,
+            &DecompilerConfig::default(),
+            Some(&binary_data),
+            None,
+        );
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let signature = recovery.analyze(&structured);
+        assert_eq!(
+            signature.parameters.len(),
+            1,
+            "expected mcount elision to preserve arg recovery: {signature:?}"
+        );
+        assert_eq!(signature.parameters[0].name, "arg0");
+
+        let output = PseudoCodeEmitter::new("    ", false).emit_with_signature(
+            &structured,
+            "hot_func",
+            &signature,
+        );
+        assert!(
+            !output.contains("mcount"),
+            "expected profiling probe to be removed from pseudo-C: {output}"
+        );
+        assert!(
+            output.contains("hot_func(") && output.contains("arg0"),
+            "expected recovered parameter in signature: {output}"
+        );
+        assert!(
+            output.contains("arg0 * arg0")
+                || (output.contains("local_4 = arg0") && output.contains("local_4 * local_4")),
+            "expected user computation to stay rooted in the recovered argument: {output}"
         );
     }
 
