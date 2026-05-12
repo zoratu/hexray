@@ -3551,6 +3551,10 @@ impl PseudoCodeEmitter {
             }
         }
 
+        if let Some(name) = self.resolve_function_literal_arg(arg) {
+            return name;
+        }
+
         // Try to recognize magic constants based on the function and argument position
         if let Some(ref const_db) = self.constant_database {
             // Check if this argument position has a known constant category
@@ -3585,6 +3589,9 @@ impl PseudoCodeEmitter {
         if let Some(address_str) = self.try_format_global_address_materialization(arg) {
             return address_str;
         }
+        if let Some(name) = Self::format_known_callback_literal(func_name, arg_index, arg) {
+            return name;
+        }
         self.format_expr_with_explicit_string_len(
             arg,
             table,
@@ -3600,6 +3607,56 @@ impl PseudoCodeEmitter {
             ExprKind::GotRef { address, .. } => sym.get(*address).map(ToOwned::to_owned),
             _ => None,
         }
+    }
+
+    fn resolve_function_literal_arg(&self, arg: &Expr) -> Option<String> {
+        let ExprKind::IntLit(addr) = &arg.kind else {
+            return None;
+        };
+        if *addr < 0 || *addr > u64::MAX as i128 {
+            return None;
+        }
+
+        let symbol = self.symbol_table.as_ref()?.get_match(*addr as u64)?;
+        if !symbol.is_defined || symbol.is_data_symbol {
+            return None;
+        }
+
+        Some(Self::strip_plt_suffix(symbol.name).to_string())
+    }
+
+    fn format_known_callback_literal(
+        func_name: &str,
+        arg_index: usize,
+        arg: &Expr,
+    ) -> Option<String> {
+        let ExprKind::IntLit(addr) = &arg.kind else {
+            return None;
+        };
+        if *addr <= 0 || *addr > u64::MAX as i128 {
+            return None;
+        }
+        if !Self::is_known_callback_arg_position(func_name, arg_index) {
+            return None;
+        }
+        Some(format!("sub_{:x}", *addr as u64))
+    }
+
+    fn is_known_callback_arg_position(func_name: &str, arg_index: usize) -> bool {
+        let normalized = hexray_core::unversioned_symbol_name(Self::strip_plt_suffix(func_name))
+            .trim_start_matches('_');
+        matches!(
+            (normalized, arg_index),
+            ("qsort", 3)
+                | ("qsort_r" | "hexray_qsort_r" | "qsort_s", 3)
+                | ("bsd_qsort_r" | "hexray_bsd_qsort_r", 4)
+                | ("bsearch", 4)
+                | ("pthread_create", 2)
+                | ("signal", 1)
+                | ("atexit" | "at_quick_exit", 0)
+                | ("on_exit" | "hexray_on_exit", 0)
+                | ("pthread_atfork", 0..=2)
+        )
     }
 
     fn explicit_string_arg_len(
@@ -11876,6 +11933,40 @@ mod tests {
         );
 
         assert_eq!(emitter.format_expr(&call), "signal(2, signal_handler)");
+    }
+
+    #[test]
+    fn test_call_literal_argument_prefers_exact_function_symbol() {
+        let mut sym = SymbolTable::new();
+        sym.insert_with_metadata(0x4012b0, "sub_4012b0".to_string(), 0, true, false);
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+
+        let call = Expr::call(
+            super::super::expression::CallTarget::Named("helper".to_string()),
+            vec![Expr::int(0x4012b0)],
+        );
+
+        assert_eq!(emitter.format_expr(&call), "helper(sub_4012b0)");
+    }
+
+    #[test]
+    fn test_qsort_callback_literal_argument_falls_back_to_sub_name() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        let call = Expr::call(
+            super::super::expression::CallTarget::Named("qsort".to_string()),
+            vec![
+                Expr::unknown("base"),
+                Expr::unknown("nmemb"),
+                Expr::int(4),
+                Expr::int(0x4012b0),
+            ],
+        );
+
+        assert_eq!(
+            emitter.format_expr(&call),
+            "qsort(base, nmemb, 4, sub_4012b0)"
+        );
     }
 
     #[test]
