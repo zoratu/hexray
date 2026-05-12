@@ -3203,6 +3203,7 @@ fn decompile_function(
         disassemble_function_for_cfg(fmt, start_addr, max_bytes, stop_after_first_return)?;
     apply_instruction_relocations(&mut instructions, &relocation_table);
     let tls_access_targets = build_tls_access_targets(binary);
+    let tls_symbol_offsets = build_tls_symbol_offset_map(binary);
     let tls_slot_map = build_tls_slot_map(binary);
     rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
 
@@ -3260,6 +3261,7 @@ fn decompile_function(
         .with_string_table(string_table)
         .with_symbol_table(symbol_table)
         .with_relocation_table(relocation_table)
+        .with_tls_symbol_offsets(tls_symbol_offsets)
         .with_throw_thunks(throw_thunks)
         .with_current_function_kind(symbol_kind)
         .with_binary_data(binary_data_ctx)
@@ -3494,6 +3496,36 @@ fn build_tls_access_targets(binary: &Binary) -> Vec<TlsAccessTarget> {
     targets
 }
 
+fn build_tls_symbol_offset_map(binary: &Binary) -> std::collections::HashMap<i64, String> {
+    let Some(layout) = elf_tls_layout(binary) else {
+        return std::collections::HashMap::new();
+    };
+    let Some(static_block_size) = tls_static_block_size(layout) else {
+        return std::collections::HashMap::new();
+    };
+
+    let mut offsets = std::collections::HashMap::new();
+    for symbol in binary.as_format().symbols() {
+        if symbol.kind != hexray_core::SymbolKind::Tls
+            || !symbol.is_defined()
+            || symbol.name.is_empty()
+        {
+            continue;
+        }
+        let Ok(raw_offset) = i64::try_from(symbol.address) else {
+            continue;
+        };
+        let Some(tpoff) = raw_offset.checked_sub(static_block_size) else {
+            continue;
+        };
+        offsets
+            .entry(tpoff)
+            .or_insert_with(|| demangle_or_original(&symbol.name));
+    }
+
+    offsets
+}
+
 fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
     let Binary::Elf(elf) = binary else {
         return std::collections::HashMap::new();
@@ -3534,6 +3566,12 @@ fn rip_relative_memory_target(
 fn add_signed_offset(base: u64, displacement: i64) -> Option<i64> {
     let target = i128::from(base) + i128::from(displacement);
     i64::try_from(target).ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackedTlsBase {
+    Absolute(u64),
+    ThreadPointer(i64),
 }
 
 fn resolve_tls_access_target(
@@ -3587,28 +3625,124 @@ fn rewrite_tls_memory_operands(
         return;
     }
 
-    let mut tls_regs: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    let mut tls_regs: std::collections::HashMap<u16, TrackedTlsBase> =
+        std::collections::HashMap::new();
 
     for instruction in instructions {
-        let tls_reg_load = if instruction.operation == hexray_core::Operation::Move {
-            match instruction.operands.as_slice() {
-                [hexray_core::Operand::Register(dest), hexray_core::Operand::Memory(mem), ..]
-                    if dest.class == hexray_core::RegisterClass::General =>
-                {
-                    rip_relative_memory_target(mem, instruction)
+        let tls_reg_load = match instruction.operands.as_slice() {
+            [hexray_core::Operand::Register(dest), hexray_core::Operand::Memory(mem), ..]
+                if dest.class == hexray_core::RegisterClass::General =>
+            {
+                match instruction.operation {
+                    hexray_core::Operation::Move => rip_relative_memory_target(mem, instruction)
                         .and_then(|slot| tls_slot_map.get(&slot).copied())
-                        .map(|target| (dest.id, target))
+                        .map(TrackedTlsBase::Absolute)
+                        .or_else(|| {
+                            let segment = mem.segment.as_ref()?;
+                            if matches!(
+                                segment.id,
+                                hexray_core::register::x86::FS | hexray_core::register::x86::GS
+                            ) && mem.base.is_none()
+                                && mem.index.is_none()
+                                && mem.displacement == 0
+                            {
+                                Some(TrackedTlsBase::ThreadPointer(0))
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|state| (dest.id, state)),
+                    hexray_core::Operation::LoadEffectiveAddress => {
+                        if mem.segment.is_some() || mem.index.is_some() {
+                            None
+                        } else {
+                            mem.base
+                                .as_ref()
+                                .and_then(|base| tls_regs.get(&base.id).copied())
+                                .and_then(|tracked| match tracked {
+                                    TrackedTlsBase::Absolute(target) => {
+                                        add_signed_offset(target, mem.displacement)
+                                            .and_then(|addr| u64::try_from(addr).ok())
+                                            .map(TrackedTlsBase::Absolute)
+                                    }
+                                    TrackedTlsBase::ThreadPointer(offset) => offset
+                                        .checked_add(mem.displacement)
+                                        .map(TrackedTlsBase::ThreadPointer),
+                                })
+                                .map(|state| (dest.id, state))
+                        }
+                    }
+                    _ => None,
                 }
-                _ => None,
             }
-        } else {
-            None
+            [hexray_core::Operand::Register(dest), hexray_core::Operand::Register(src), ..]
+                if dest.class == hexray_core::RegisterClass::General
+                    && src.class == hexray_core::RegisterClass::General
+                    && instruction.operation == hexray_core::Operation::Move =>
+            {
+                tls_regs.get(&src.id).copied().map(|state| (dest.id, state))
+            }
+            [hexray_core::Operand::Register(dest), hexray_core::Operand::Immediate(imm), ..]
+                if dest.class == hexray_core::RegisterClass::General =>
+            {
+                let adjust = match instruction.operation {
+                    hexray_core::Operation::Add => Some(imm.as_i64()),
+                    hexray_core::Operation::Sub => imm.as_i64().checked_neg(),
+                    _ => None,
+                };
+                adjust
+                    .and_then(|adjust| {
+                        tls_regs
+                            .get(&dest.id)
+                            .copied()
+                            .and_then(|tracked| match tracked {
+                                TrackedTlsBase::Absolute(target) => {
+                                    add_signed_offset(target, adjust)
+                                        .and_then(|addr| u64::try_from(addr).ok())
+                                        .map(TrackedTlsBase::Absolute)
+                                }
+                                TrackedTlsBase::ThreadPointer(offset) => offset
+                                    .checked_add(adjust)
+                                    .map(TrackedTlsBase::ThreadPointer),
+                            })
+                    })
+                    .map(|state| (dest.id, state))
+            }
+            _ => None,
         };
 
         for operand in &mut instruction.operands {
             let hexray_core::Operand::Memory(mem) = operand else {
                 continue;
             };
+            if mem.index.is_none() {
+                if let Some(base) = mem.base.as_ref() {
+                    if let Some(target) = tls_regs.get(&base.id).copied() {
+                        match target {
+                            TrackedTlsBase::Absolute(target) => {
+                                let Some(target_addr) = add_signed_offset(target, mem.displacement)
+                                else {
+                                    continue;
+                                };
+                                *mem = hexray_core::MemoryRef::absolute(target_addr, mem.size);
+                                continue;
+                            }
+                            TrackedTlsBase::ThreadPointer(offset) => {
+                                let Some(tpoff) = offset.checked_add(mem.displacement) else {
+                                    continue;
+                                };
+                                let Some(target_addr) =
+                                    resolve_tls_access_target(tls_access_targets, tpoff, mem.size)
+                                else {
+                                    continue;
+                                };
+                                *mem = hexray_core::MemoryRef::absolute(target_addr, mem.size);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             let Some(segment) = mem.segment.as_ref() else {
                 continue;
             };
@@ -3617,17 +3751,6 @@ fn rewrite_tls_memory_operands(
                 hexray_core::register::x86::FS | hexray_core::register::x86::GS
             ) {
                 continue;
-            }
-            if mem.index.is_none() {
-                if let Some(base) = mem.base.as_ref() {
-                    if let Some(&target) = tls_regs.get(&base.id) {
-                        let Some(target_addr) = add_signed_offset(target, mem.displacement) else {
-                            continue;
-                        };
-                        *mem = hexray_core::MemoryRef::absolute(target_addr, mem.size);
-                        continue;
-                    }
-                }
             }
             if mem.base.is_some() || mem.index.is_some() {
                 continue;
@@ -6195,6 +6318,7 @@ fn decompile_with_follow(
     let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
     let binary_data_ctx = build_binary_data_context(fmt);
     let tls_access_targets = build_tls_access_targets(binary);
+    let tls_symbol_offsets = build_tls_symbol_offset_map(binary);
     let tls_slot_map = build_tls_slot_map(binary);
 
     // Create constant database for magic number recognition
@@ -6293,6 +6417,7 @@ fn decompile_with_follow(
             .with_string_table(string_table.clone())
             .with_symbol_table(symbol_table.clone())
             .with_relocation_table(relocation_table.clone())
+            .with_tls_symbol_offsets(tls_symbol_offsets.clone())
             .with_throw_thunks(throw_thunks.clone())
             .with_dwarf_names(dwarf_names.stack_names)
             .with_dwarf_param_names(dwarf_names.parameter_names)
@@ -11262,6 +11387,82 @@ mod tests {
 
         let Operand::Memory(mem) = &instructions[1].operands[0] else {
             panic!("expected rewritten TLS store operand");
+        };
+        assert_eq!(mem.displacement, 0x403de0);
+        assert!(mem.base.is_none());
+        assert!(mem.segment.is_none());
+    }
+
+    #[test]
+    fn tls_thread_pointer_register_rewrites_lea_derived_access() {
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, x86::RAX, 64);
+        let mut instructions = vec![
+            Instruction {
+                address: 0x1000,
+                size: 9,
+                bytes: vec![],
+                operation: Operation::Move,
+                mnemonic: "mov".to_string(),
+                operands: vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::absolute(0, 8).with_segment(fs)),
+                ],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![],
+                writes: vec![rax],
+                guard: None,
+            },
+            Instruction {
+                address: 0x1009,
+                size: 7,
+                bytes: vec![],
+                operation: Operation::LoadEffectiveAddress,
+                mnemonic: "lea".to_string(),
+                operands: vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rax, -4, 8)),
+                ],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![rax],
+                writes: vec![rax],
+                guard: None,
+            },
+            Instruction {
+                address: 0x1010,
+                size: 2,
+                bytes: vec![],
+                operation: Operation::Move,
+                mnemonic: "mov".to_string(),
+                operands: vec![
+                    Operand::Register(Register::new(
+                        Architecture::X86_64,
+                        RegisterClass::General,
+                        x86::RAX,
+                        32,
+                    )),
+                    Operand::Memory(MemoryRef::base_disp(rax, 0, 4)),
+                ],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![rax],
+                writes: vec![],
+                guard: None,
+            },
+        ];
+        let tls_access_targets = vec![crate::TlsAccessTarget {
+            tpoff: -0x4,
+            address: 0x403de0,
+            size: 4,
+        }];
+
+        crate::rewrite_tls_memory_operands(
+            &mut instructions,
+            &tls_access_targets,
+            &std::collections::HashMap::new(),
+        );
+
+        let Operand::Memory(mem) = &instructions[2].operands[1] else {
+            panic!("expected rewritten TLS load operand");
         };
         assert_eq!(mem.displacement, 0x403de0);
         assert!(mem.base.is_none());

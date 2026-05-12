@@ -595,7 +595,12 @@ fn is_dead_store(expr: &Expr, uses: &HashSet<String>) -> bool {
 /// Check if an expression has side effects.
 fn has_side_effects(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Call { .. } => true,
+        ExprKind::Call { target, .. } => match target {
+            super::expression::CallTarget::Named(name) => {
+                hexray_core::unversioned_symbol_name(name) != "__builtin_thread_pointer"
+            }
+            _ => true,
+        },
         ExprKind::Assign { .. } => true,
         ExprKind::CompoundAssign { .. } => true,
         ExprKind::BinOp { left, right, .. } => has_side_effects(left) || has_side_effects(right),
@@ -1038,6 +1043,31 @@ mod tests {
         assert_eq!(result.len(), 1);
         if let StructuredNode::Block { statements, .. } = &result[0] {
             // Should keep the call even though temp is unused
+            assert_eq!(statements.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_dead_store_eliminates_pure_thread_pointer_builtin() {
+        let call_expr = Expr::call(
+            super::super::expression::CallTarget::Named("__builtin_thread_pointer".to_string()),
+            vec![],
+        );
+        let nodes = vec![StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                make_assign("temp", call_expr),
+                make_assign("temp", Expr::int(1)),
+            ],
+            address_range: (0, 0),
+        }];
+
+        let mut uses = HashSet::new();
+        uses.insert("temp".to_string());
+
+        let result = eliminate_in_nodes(nodes, &uses);
+        assert_eq!(result.len(), 1);
+        if let StructuredNode::Block { statements, .. } = &result[0] {
             assert_eq!(statements.len(), 1);
         }
     }

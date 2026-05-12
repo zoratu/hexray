@@ -380,6 +380,7 @@ pub struct PseudoCodeEmitter {
     string_table: Option<StringTable>,
     symbol_table: Option<SymbolTable>,
     relocation_table: Option<RelocationTable>,
+    tls_symbol_offsets: HashMap<i64, String>,
     /// Type information for variables (var_name -> type_string).
     type_info: std::collections::HashMap<String, String>,
     /// DWARF variable names (stack_offset -> name).
@@ -633,6 +634,7 @@ impl PseudoCodeEmitter {
             string_table: None,
             symbol_table: None,
             relocation_table: None,
+            tls_symbol_offsets: HashMap::new(),
             type_info: std::collections::HashMap::new(),
             dwarf_names: std::collections::HashMap::new(),
             dwarf_param_names: Vec::new(),
@@ -3217,6 +3219,12 @@ impl PseudoCodeEmitter {
         self
     }
 
+    /// Sets thread-pointer-relative TLS symbol names keyed by byte offset.
+    pub fn with_tls_symbol_offsets(mut self, offsets: HashMap<i64, String>) -> Self {
+        self.tls_symbol_offsets = offsets;
+        self
+    }
+
     /// Sets type information for variables.
     /// Keys should be variable names (e.g., "var_8", "local_10"),
     /// values should be C type strings (e.g., "int", "char*", "float").
@@ -3938,6 +3946,24 @@ impl PseudoCodeEmitter {
             .to_string()
     }
 
+    fn libc_global_matches_candidate(&self, raw: &str, candidate: &str) -> bool {
+        self.simplify_libc_global_name(raw) == Some(candidate)
+            || self.simplify_libc_global_name(hexray_core::unversioned_symbol_name(raw))
+                == Some(candidate)
+    }
+
+    fn has_libc_global_evidence(&self, candidate: &str) -> bool {
+        self.symbol_table.as_ref().is_some_and(|table| {
+            table
+                .iter()
+                .any(|(_, name)| self.libc_global_matches_candidate(name, candidate))
+        }) || self.relocation_table.as_ref().is_some_and(|table| {
+            table
+                .symbol_names()
+                .any(|name| self.libc_global_matches_candidate(name, candidate))
+        })
+    }
+
     fn global_deref_prefix(size: u8) -> &'static str {
         match size {
             1 => "*(uint8_t*)",
@@ -4088,12 +4114,43 @@ impl PseudoCodeEmitter {
         unversioned == "__tls_get_addr"
     }
 
+    fn is_thread_pointer_expr(expr: &Expr) -> bool {
+        matches!(
+            &Self::strip_expr_casts(expr).kind,
+            ExprKind::Call {
+                target: CallTarget::Named(name),
+                args,
+            } if args.is_empty()
+                && hexray_core::unversioned_symbol_name(Self::strip_plt_suffix(name))
+                    == "__builtin_thread_pointer"
+        )
+    }
+
     fn try_format_tls_descriptor_arg(&self, expr: &Expr) -> Option<String> {
         let descriptor_addr = Self::try_extract_materialized_address(expr)?;
         let relocations = self.relocation_table.as_ref()?;
         let symbol = relocations.get_tls_descriptor(descriptor_addr)?;
         let simplified = self.simplify_symbol_name(symbol);
         Some(format!("&_TLS_{simplified}_"))
+    }
+
+    fn try_format_tls_thread_pointer_access(
+        &self,
+        base: &Expr,
+        index: &Expr,
+        element_size: usize,
+    ) -> Option<String> {
+        if !Self::is_thread_pointer_expr(base) {
+            return None;
+        }
+
+        let ExprKind::IntLit(index) = &Self::strip_expr_casts(index).kind else {
+            return None;
+        };
+        let index = i64::try_from(*index).ok()?;
+        let element_size = i64::try_from(element_size).ok()?;
+        let byte_offset = index.checked_mul(element_size)?;
+        self.tls_symbol_offsets.get(&byte_offset).cloned()
     }
 
     fn try_format_global_array_base(&self, expr: &Expr) -> Option<String> {
@@ -4146,11 +4203,13 @@ impl PseudoCodeEmitter {
 
         // Check for well-known libc globals by common address patterns
         if let Some(libc_name) = Self::detect_libc_global_by_pattern(address) {
-            let name = format!("g_{}", libc_name);
-            self.global_tracker
-                .borrow_mut()
-                .cache_name(address, name.clone());
-            return name;
+            if self.has_libc_global_evidence(libc_name) {
+                let name = format!("g_{}", libc_name);
+                self.global_tracker
+                    .borrow_mut()
+                    .cache_name(address, name.clone());
+                return name;
+            }
         }
 
         // Get the best hint by combining explicit hint with inferred patterns
@@ -5328,6 +5387,11 @@ impl PseudoCodeEmitter {
                 index,
                 element_size,
             } => {
+                if let Some(symbol) =
+                    self.try_format_tls_thread_pointer_access(base, index, *element_size)
+                {
+                    return symbol;
+                }
                 if let Some(stack_array) =
                     self.try_format_stack_slot_array_access(base, index, *element_size)
                 {
@@ -11606,6 +11670,44 @@ mod tests {
     }
 
     #[test]
+    fn test_thread_pointer_array_access_resolves_tls_symbol_name() {
+        let mut tls_symbol_offsets = HashMap::new();
+        tls_symbol_offsets.insert(-4, "tls_counter".to_string());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_tls_symbol_offsets(tls_symbol_offsets);
+        let expr = Expr::array_access(
+            Expr::call(
+                CallTarget::Named("__builtin_thread_pointer".to_string()),
+                vec![],
+            ),
+            Expr::int(-4),
+            1,
+        );
+
+        assert_eq!(emitter.format_expr(&expr), "tls_counter");
+    }
+
+    #[test]
+    fn test_thread_pointer_array_access_scales_index_for_tls_lookup() {
+        let mut tls_symbol_offsets = HashMap::new();
+        tls_symbol_offsets.insert(-4, "tls_counter".to_string());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_tls_symbol_offsets(tls_symbol_offsets);
+        let expr = Expr::array_access(
+            Expr::call(
+                CallTarget::Named("__builtin_thread_pointer".to_string()),
+                vec![],
+            ),
+            Expr::int(-1),
+            4,
+        );
+
+        assert_eq!(emitter.format_expr(&expr), "tls_counter");
+    }
+
+    #[test]
     fn test_flag_name_for_rip_relative_array_lvalue() {
         use super::super::expression::Variable;
 
@@ -11785,6 +11887,25 @@ mod tests {
         assert_eq!(
             emitter.format_global_fallback_name(0x6000, GlobalUsageHint::StdioStream),
             "g_stream_6000"
+        );
+    }
+
+    #[test]
+    fn test_libc_global_pattern_guess_requires_import_evidence() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(
+            emitter.format_global_fallback_name(0x1040, GlobalUsageHint::Unknown),
+            "g_1040"
+        );
+
+        let mut relocations = RelocationTable::new();
+        relocations.insert_got(0x5000, "stdin@GLIBC_2.2.5".to_string());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_relocation_table(Some(relocations));
+        assert_eq!(
+            emitter.format_global_fallback_name(0x1040, GlobalUsageHint::Unknown),
+            "g_stdin"
         );
     }
 

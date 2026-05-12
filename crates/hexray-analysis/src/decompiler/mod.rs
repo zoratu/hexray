@@ -752,6 +752,20 @@ impl RelocationTable {
             .map(|s| s.as_str())
     }
 
+    /// Returns an iterator over all symbol names referenced by relocations.
+    pub fn symbol_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.call_relocations
+            .values()
+            .map(|reloc| reloc.symbol.as_str())
+            .chain(
+                self.data_relocations
+                    .values()
+                    .map(|reloc| reloc.symbol.as_str()),
+            )
+            .chain(self.got_symbols.values().map(|symbol| symbol.as_str()))
+            .chain(self.tls_descriptors.values().map(|symbol| symbol.as_str()))
+    }
+
     /// Returns descriptor addresses that resolve to the given TLS symbol.
     pub fn tls_descriptor_addresses(&self, symbol: &str) -> Vec<u64> {
         self.tls_descriptors
@@ -826,6 +840,8 @@ pub struct Decompiler {
     pub throw_thunks: HashMap<u64, String>,
     /// Symbol kind for the current function when known.
     pub current_function_kind: Option<SymbolKind>,
+    /// Thread-pointer-relative TLS symbol names keyed by byte offset.
+    pub tls_symbol_offsets: HashMap<i64, String>,
 }
 
 impl Default for Decompiler {
@@ -854,6 +870,7 @@ impl Default for Decompiler {
             binary_data: None,
             throw_thunks: HashMap::new(),
             current_function_kind: None,
+            tls_symbol_offsets: HashMap::new(),
         }
     }
 }
@@ -906,6 +923,12 @@ impl Decompiler {
     /// Sets the symbol kind for the current function when known.
     pub fn with_current_function_kind(mut self, kind: Option<SymbolKind>) -> Self {
         self.current_function_kind = kind;
+        self
+    }
+
+    /// Sets thread-pointer-relative TLS symbol names keyed by byte offset.
+    pub fn with_tls_symbol_offsets(mut self, offsets: HashMap<i64, String>) -> Self {
+        self.tls_symbol_offsets = offsets;
         self
     }
 
@@ -1199,6 +1222,7 @@ impl Decompiler {
             .with_string_table(self.string_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_relocation_table(self.relocation_table.clone())
+            .with_tls_symbol_offsets(self.tls_symbol_offsets.clone())
             .with_type_info(merged_types)
             .with_dwarf_names(self.dwarf_names.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone())
