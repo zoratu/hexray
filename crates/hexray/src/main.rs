@@ -2791,9 +2791,15 @@ fn disassemble_cfg(
         }
     };
     apply_instruction_relocations(&mut instructions, &relocation_table);
+    let noreturn_call_sites = collect_noreturn_call_sites(&instructions, fmt, &relocation_table);
     // Build CFG
     let binary_data_ctx = build_binary_data_context(fmt);
-    let cfg = CfgBuilder::build_with_binary_context(&instructions, start_addr, &binary_data_ctx);
+    let cfg = CfgBuilder::build_with_binary_context_and_noreturn_calls(
+        &instructions,
+        start_addr,
+        &binary_data_ctx,
+        &noreturn_call_sites,
+    );
 
     if html {
         // Output in interactive HTML format
@@ -2876,7 +2882,7 @@ fn disassemble_for_cfg<D: Disassembler>(
                 let is_noreturn_call = matches!(
                     decoded.instruction.control_flow,
                     hexray_core::ControlFlow::Call { target, .. }
-                        if is_known_noreturn_call_target(fmt, target)
+                        if is_known_noreturn_call_target(fmt, None, addr, target)
                 );
                 instructions.push(decoded.instruction);
                 offset += decoded.size;
@@ -2950,9 +2956,18 @@ fn disassemble_for_cfg<D: Disassembler>(
     instructions
 }
 
-fn is_known_noreturn_call_target(fmt: &dyn BinaryFormat, target: u64) -> bool {
-    fmt.symbol_at(target)
-        .is_some_and(|symbol| is_noreturn_function_name(&symbol.name))
+fn is_known_noreturn_call_target(
+    fmt: &dyn BinaryFormat,
+    relocations: Option<&RelocationTable>,
+    call_addr: u64,
+    target: u64,
+) -> bool {
+    relocations
+        .and_then(|table| table.get_call(call_addr))
+        .is_some_and(|relocation| is_noreturn_function_name(&relocation.symbol))
+        || fmt
+            .symbol_at(target)
+            .is_some_and(|symbol| is_noreturn_function_name(&symbol.name))
         || looks_like_x86_ud2_trap_stub(fmt, target)
 }
 
@@ -3251,7 +3266,13 @@ fn decompile_function(
     seed_direct_callee_signature_hints(binary, &instructions, &mut binary_data_ctx, &seed_ctx);
 
     // Build CFG using both read-only section bytes and direct-callee signature hints.
-    let cfg = CfgBuilder::build_with_binary_context(&instructions, start_addr, &binary_data_ctx);
+    let noreturn_call_sites = collect_noreturn_call_sites(&instructions, fmt, &relocation_table);
+    let cfg = CfgBuilder::build_with_binary_context_and_noreturn_calls(
+        &instructions,
+        start_addr,
+        &binary_data_ctx,
+        &noreturn_call_sites,
+    );
 
     // Build string table from data sections
     let string_table = build_string_table(fmt);
@@ -5155,6 +5176,29 @@ fn apply_instruction_relocations(
     apply_data_relocations(instructions, relocations);
 }
 
+fn collect_noreturn_call_sites(
+    instructions: &[hexray_core::Instruction],
+    fmt: &dyn BinaryFormat,
+    relocations: &RelocationTable,
+) -> std::collections::HashSet<u64> {
+    instructions
+        .iter()
+        .filter_map(|instruction| match instruction.control_flow {
+            hexray_core::ControlFlow::Call { target, .. }
+                if is_known_noreturn_call_target(
+                    fmt,
+                    Some(relocations),
+                    instruction.address,
+                    target,
+                ) =>
+            {
+                Some(instruction.address)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 // Shared function-start recovery for analyses that need whole-function
 // coverage, including partially symbolized CET/IBT binaries. Callers
 // can still layer additional discoveries on top (for example
@@ -6392,9 +6436,16 @@ fn decompile_with_follow(
         };
         apply_instruction_relocations(&mut instructions, &relocation_table);
         crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
+        let noreturn_call_sites =
+            collect_noreturn_call_sites(&instructions, fmt, &relocation_table);
 
         // Build CFG
-        let cfg = CfgBuilder::build_with_binary_context(&instructions, func_addr, &binary_data_ctx);
+        let cfg = CfgBuilder::build_with_binary_context_and_noreturn_calls(
+            &instructions,
+            func_addr,
+            &binary_data_ctx,
+            &noreturn_call_sites,
+        );
 
         // Get DWARF variable and parameter names for this function.
         let dwarf_names = if let Some(ref di) = debug_info {
@@ -9431,7 +9482,7 @@ fn format_arch_for_info(arch: Architecture) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_instruction_relocations, default_calling_convention,
+        apply_instruction_relocations, collect_noreturn_call_sites, default_calling_convention,
         demangle_exception_typeinfo_symbol_name, discover_function_starts,
         discover_materialized_internal_targets, discover_stripped_x86_function_seeds,
         ensure_distinct_export_paths, filter_ifunc_display_aliases, find_symbol_in_candidates,
@@ -11122,6 +11173,41 @@ mod tests {
         assert_eq!(instructions.len(), 2);
         assert_eq!(instructions[0].mnemonic, "endbr64");
         assert_eq!(instructions[1].mnemonic, "call");
+    }
+
+    #[test]
+    fn relocated_noreturn_import_marks_call_site_before_cfg_build() {
+        let binary = TestBinary {
+            sections: vec![TestSection {
+                name: ".text",
+                address: 0x401580,
+                data: vec![
+                    0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                    0xe8, 0x07, 0x00, 0x00, 0x00, // call 0x401590
+                    0x31, 0xc0, // xor eax, eax
+                    0xc3, // ret
+                ],
+                executable: true,
+                allocated: true,
+            }],
+            symbols: vec![],
+            entry_point: None,
+        };
+        let bytes = binary.bytes_at(0x401580, 12).unwrap();
+        let disasm = X86_64Disassembler::new();
+        let mut instructions = crate::disassemble_for_cfg(&disasm, &binary, bytes, 0x401580, true);
+        let mut relocations = RelocationTable::new();
+        relocations.insert_call(
+            0x401584,
+            "_ZSt20__throw_length_errorPKc@GLIBCXX_3.4".to_string(),
+            0,
+            true,
+        );
+
+        apply_instruction_relocations(&mut instructions, &relocations);
+        let noreturn_calls = collect_noreturn_call_sites(&instructions, &binary, &relocations);
+
+        assert!(noreturn_calls.contains(&0x401584));
     }
 
     #[test]

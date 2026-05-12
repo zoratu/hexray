@@ -18,6 +18,23 @@ impl CfgBuilder {
         entry: u64,
         binary_ctx: &BinaryDataContext,
     ) -> ControlFlowGraph {
+        Self::build_with_binary_context_and_noreturn_calls(
+            instructions,
+            entry,
+            binary_ctx,
+            &HashSet::new(),
+        )
+    }
+
+    /// Build a CFG from a sequence of instructions, using binary data when
+    /// available to recover computed-dispatch tables and suppressing
+    /// fallthrough edges from known noreturn call sites.
+    pub fn build_with_binary_context_and_noreturn_calls(
+        instructions: &[Instruction],
+        entry: u64,
+        binary_ctx: &BinaryDataContext,
+        known_noreturn_calls: &HashSet<u64>,
+    ) -> ControlFlowGraph {
         let mut annotated = instructions.to_vec();
         let function_end = annotated
             .iter()
@@ -25,13 +42,21 @@ impl CfgBuilder {
             .max()
             .unwrap_or(entry);
         annotate_computed_dispatch_targets(&mut annotated, binary_ctx, entry, function_end);
-        Self::build(&annotated, entry)
+        Self::build_with_noreturn_calls(&annotated, entry, known_noreturn_calls)
     }
 
     /// Build a CFG from a sequence of instructions.
     ///
     /// The instructions should be from a single function or code region.
     pub fn build(instructions: &[Instruction], entry: u64) -> ControlFlowGraph {
+        Self::build_with_noreturn_calls(instructions, entry, &HashSet::new())
+    }
+
+    fn build_with_noreturn_calls(
+        instructions: &[Instruction],
+        entry: u64,
+        known_noreturn_calls: &HashSet<u64>,
+    ) -> ControlFlowGraph {
         if instructions.is_empty() {
             let mut cfg = ControlFlowGraph::new(BasicBlockId::ENTRY);
             cfg.add_block(BasicBlock::new(BasicBlockId::ENTRY, entry));
@@ -270,7 +295,9 @@ impl CfgBuilder {
                         return_addr,
                         target,
                     } => {
-                        if let Some(&return_id) = address_to_block.get(return_addr) {
+                        if known_noreturn_calls.contains(&last_inst.address) {
+                            BlockTerminator::Unreachable
+                        } else if let Some(&return_id) = address_to_block.get(return_addr) {
                             cfg.add_edge(block_id, return_id);
                             BlockTerminator::Call {
                                 target: hexray_core::basic_block::CallTarget::Direct(*target),
@@ -643,6 +670,7 @@ mod tests {
         register::x86, Architecture, BlockTerminator, ControlFlow, IndexMode, Instruction,
         MemoryRef, Operand, Operation, Register, RegisterClass,
     };
+    use std::collections::HashSet;
 
     fn x86_reg(id: u16, size: u16) -> Register {
         Register::new(Architecture::X86_64, RegisterClass::General, id, size)
@@ -666,6 +694,28 @@ mod tests {
         let block = cfg.entry_block().unwrap();
         assert!(cfg.successors(block.id).is_empty());
         assert!(matches!(block.terminator, BlockTerminator::Unknown));
+    }
+
+    #[test]
+    fn known_noreturn_call_site_suppresses_cfg_fallthrough() {
+        let instructions = vec![
+            Instruction::new(0x1000, 5, vec![0xe8, 0, 0, 0, 0], "call")
+                .with_operation(Operation::Call)
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x2000,
+                    return_addr: 0x1005,
+                }),
+            Instruction::new(0x1005, 1, vec![0xc3], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        ];
+        let noreturn_calls = HashSet::from([0x1000]);
+
+        let cfg = CfgBuilder::build_with_noreturn_calls(&instructions, 0x1000, &noreturn_calls);
+
+        let entry = cfg.entry_block().unwrap();
+        assert!(cfg.successors(entry.id).is_empty());
+        assert!(matches!(entry.terminator, BlockTerminator::Unreachable));
     }
 
     #[test]
