@@ -48,8 +48,8 @@ use gotos::{
 #[cfg(test)]
 use simplify::capture_return_register_uses_in_block;
 use simplify::{
-    extract_return_value, merge_return_value_captures, propagate_args_in_block,
-    propagate_call_args_with_binary_data_and_arch, simplify_statements,
+    elide_stack_clash_probe_scaffolding, extract_return_value, merge_return_value_captures,
+    propagate_args_in_block, propagate_call_args_with_binary_data_and_arch, simplify_statements,
     statement_contains_real_call, substitute_prior_register_assignments,
     substitute_return_register_uses,
 };
@@ -550,6 +550,8 @@ impl StructuredCfg {
         if config.is_pass_enabled(OptimizationPass::ExpressionSimplification) {
             body = simplify_expressions(body);
         }
+
+        body = elide_stack_clash_probe_scaffolding(body);
 
         // Post-process to detect string function patterns (strlen, strcpy, etc.)
         if config.is_pass_enabled(OptimizationPass::StringPatternDetection) {

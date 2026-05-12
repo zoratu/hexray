@@ -488,6 +488,678 @@ fn is_asan_scaffolding_statement(stmt: &Expr) -> bool {
     }
 }
 
+pub(super) fn elide_stack_clash_probe_scaffolding(
+    nodes: Vec<StructuredNode>,
+) -> Vec<StructuredNode> {
+    let nodes = elide_stack_clash_probe_scaffolding_in_list(nodes);
+    prune_dead_stack_clash_target_assignments(nodes)
+}
+
+fn elide_stack_clash_probe_scaffolding_in_list(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let nodes: Vec<_> = nodes
+        .into_iter()
+        .filter_map(elide_stack_clash_probe_scaffolding_in_node)
+        .collect();
+
+    let mut result = Vec::with_capacity(nodes.len());
+    let mut idx = 0;
+    while idx < nodes.len() {
+        if let Some((consumed, replacements)) = try_elide_stack_clash_probe_sequence(&nodes[idx..])
+        {
+            result.extend(replacements);
+            idx += consumed;
+            continue;
+        }
+
+        result.push(nodes[idx].clone());
+        idx += 1;
+    }
+
+    result
+}
+
+fn elide_stack_clash_probe_scaffolding_in_node(node: StructuredNode) -> Option<StructuredNode> {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            let then_body = elide_stack_clash_probe_scaffolding_in_list(then_body);
+            let else_body = else_body
+                .map(elide_stack_clash_probe_scaffolding_in_list)
+                .filter(|body| !body.is_empty());
+            if then_body.is_empty() && else_body.is_none() {
+                None
+            } else {
+                Some(StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                })
+            }
+        }
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::While {
+            condition,
+            body: elide_stack_clash_probe_scaffolding_in_list(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => Some(StructuredNode::DoWhile {
+            body: elide_stack_clash_probe_scaffolding_in_list(body),
+            condition,
+            header,
+            exit_block,
+        }),
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: elide_stack_clash_probe_scaffolding_in_list(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::Loop {
+            body: elide_stack_clash_probe_scaffolding_in_list(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => Some(StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| (values, elide_stack_clash_probe_scaffolding_in_list(body)))
+                .collect(),
+            default: default.map(elide_stack_clash_probe_scaffolding_in_list),
+        }),
+        StructuredNode::Sequence(nodes) => Some(StructuredNode::Sequence(
+            elide_stack_clash_probe_scaffolding_in_list(nodes),
+        )),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => Some(StructuredNode::TryCatch {
+            try_body: elide_stack_clash_probe_scaffolding_in_list(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: elide_stack_clash_probe_scaffolding_in_list(handler.body),
+                    ..handler
+                })
+                .collect(),
+        }),
+        other => Some(other),
+    }
+}
+
+fn prune_dead_stack_clash_target_assignments(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut uses = HashSet::new();
+    collect_all_uses(&nodes, &mut uses);
+    nodes
+        .into_iter()
+        .filter_map(|node| prune_dead_stack_clash_target_assignments_in_node(node, &uses))
+        .collect()
+}
+
+fn prune_dead_stack_clash_target_assignments_in_node(
+    node: StructuredNode,
+    uses: &HashSet<String>,
+) -> Option<StructuredNode> {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => {
+            let statements: Vec<_> = statements
+                .into_iter()
+                .filter(|stmt| {
+                    stack_clash_probe_target_assignment_name(stmt)
+                        .map_or(true, |name| uses.contains(&name))
+                })
+                .collect();
+            if statements.is_empty() {
+                None
+            } else {
+                Some(StructuredNode::Block {
+                    id,
+                    statements,
+                    address_range,
+                })
+            }
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            let then_body = prune_dead_stack_clash_target_assignments(then_body);
+            let else_body = else_body
+                .map(prune_dead_stack_clash_target_assignments)
+                .filter(|body| !body.is_empty());
+            if then_body.is_empty() && else_body.is_none() {
+                None
+            } else {
+                Some(StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                })
+            }
+        }
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::While {
+            condition,
+            body: prune_dead_stack_clash_target_assignments(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => Some(StructuredNode::DoWhile {
+            body: prune_dead_stack_clash_target_assignments(body),
+            condition,
+            header,
+            exit_block,
+        }),
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: prune_dead_stack_clash_target_assignments(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::Loop {
+            body: prune_dead_stack_clash_target_assignments(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => Some(StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| (values, prune_dead_stack_clash_target_assignments(body)))
+                .collect(),
+            default: default.map(prune_dead_stack_clash_target_assignments),
+        }),
+        StructuredNode::Sequence(nodes) => Some(StructuredNode::Sequence(
+            prune_dead_stack_clash_target_assignments(nodes),
+        )),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => Some(StructuredNode::TryCatch {
+            try_body: prune_dead_stack_clash_target_assignments(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: prune_dead_stack_clash_target_assignments(handler.body),
+                    ..handler
+                })
+                .collect(),
+        }),
+        other => Some(other),
+    }
+}
+
+fn try_elide_stack_clash_probe_sequence(
+    nodes: &[StructuredNode],
+) -> Option<(usize, Vec<StructuredNode>)> {
+    if let Some((prefix, target_name)) = nodes
+        .first()
+        .and_then(split_trailing_stack_clash_target_assignment)
+    {
+        if nodes.len() >= 4
+            && node_is_runtime_stack_clash_probe_guard(&nodes[1], &target_name)
+            && node_is_single_stack_pointer_adjustment(&nodes[2])
+            && node_is_single_probe_tail_touch_if(&nodes[3])
+        {
+            let mut replacements = Vec::new();
+            if let Some(prefix) = prefix {
+                replacements.push(prefix);
+            }
+            return Some((4, replacements));
+        }
+
+        if nodes.len() >= 3
+            && node_is_runtime_stack_clash_probe_guard(&nodes[1], &target_name)
+            && node_is_single_stack_pointer_adjustment(&nodes[2])
+        {
+            let mut replacements = Vec::new();
+            if let Some(prefix) = prefix {
+                replacements.push(prefix);
+            }
+            return Some((3, replacements));
+        }
+
+        if nodes.len() >= 2 && node_is_runtime_stack_clash_probe_guard(&nodes[1], &target_name) {
+            let mut replacements = Vec::new();
+            if let Some(prefix) = prefix {
+                replacements.push(prefix);
+            }
+            return Some((2, replacements));
+        }
+
+        if nodes.len() >= 2 && node_is_stack_clash_probe_loop(&nodes[1], &target_name) {
+            let mut replacements = Vec::new();
+            if let Some(prefix) = prefix {
+                replacements.push(prefix);
+            }
+            return Some((2, replacements));
+        }
+    }
+
+    if runtime_stack_clash_probe_guard_target(nodes.first()?).is_some() {
+        if nodes.len() >= 3
+            && node_is_single_stack_pointer_adjustment(&nodes[1])
+            && node_is_single_probe_tail_touch_if(&nodes[2])
+        {
+            return Some((3, Vec::new()));
+        }
+        if nodes.len() >= 2 && node_is_single_stack_pointer_adjustment(&nodes[1]) {
+            return Some((2, Vec::new()));
+        }
+        return Some((1, Vec::new()));
+    }
+
+    if nodes.len() >= 2
+        && node_is_single_stack_pointer_adjustment(nodes.first()?)
+        && node_is_single_probe_tail_touch_if(&nodes[1])
+    {
+        return Some((2, Vec::new()));
+    }
+
+    if stack_clash_probe_loop_target(nodes.first()?).is_some() {
+        return Some((1, Vec::new()));
+    }
+
+    None
+}
+
+fn split_trailing_stack_clash_target_assignment(
+    node: &StructuredNode,
+) -> Option<(Option<StructuredNode>, String)> {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => {
+            let (last, prefix) = statements.split_last()?;
+            let target_name = stack_clash_probe_target_assignment_name(last)?;
+            let prefix = (!prefix.is_empty()).then(|| StructuredNode::Block {
+                id: *id,
+                statements: prefix.to_vec(),
+                address_range: *address_range,
+            });
+            Some((prefix, target_name))
+        }
+        StructuredNode::Expr(expr) => {
+            let target_name = stack_clash_probe_target_assignment_name(expr)?;
+            Some((None, target_name))
+        }
+        _ => None,
+    }
+}
+
+fn stack_clash_probe_target_assignment_name(expr: &Expr) -> Option<String> {
+    let ExprKind::Assign { lhs, rhs } = &expr.kind else {
+        return None;
+    };
+    let target_name = expr_simple_identifier(lhs)?;
+    if matches!(target_name, "sp" | "rsp" | "esp") {
+        return None;
+    }
+    if expr_has_side_effects(rhs)
+        || !expr_mentions_stack_pointer(rhs)
+        || expr_mentions_identifier(rhs, target_name)
+    {
+        return None;
+    }
+    Some(target_name.to_string())
+}
+
+fn node_is_runtime_stack_clash_probe_guard(node: &StructuredNode, target_name: &str) -> bool {
+    runtime_stack_clash_probe_guard_target(node).as_deref() == Some(target_name)
+}
+
+fn runtime_stack_clash_probe_guard_target(node: &StructuredNode) -> Option<String> {
+    let StructuredNode::If {
+        condition,
+        then_body,
+        else_body,
+    } = node
+    else {
+        return None;
+    };
+    if else_body.is_some() {
+        return None;
+    }
+    let target_name = body_is_single_stack_clash_probe_loop_target(then_body)?;
+    if stack_pointer_compare_matches_target(condition, &target_name)
+        || stack_pointer_self_compare(condition)
+    {
+        Some(target_name)
+    } else {
+        None
+    }
+}
+
+fn body_is_single_stack_clash_probe_loop(body: &[StructuredNode], target_name: &str) -> bool {
+    body_is_single_stack_clash_probe_loop_target(body).as_deref() == Some(target_name)
+}
+
+fn body_is_single_stack_clash_probe_loop_target(body: &[StructuredNode]) -> Option<String> {
+    stack_clash_probe_loop_target(extract_single_node(body)?)
+}
+
+fn node_is_stack_clash_probe_loop(node: &StructuredNode, target_name: &str) -> bool {
+    stack_clash_probe_loop_target(node).as_deref() == Some(target_name)
+}
+
+fn stack_clash_probe_loop_target(node: &StructuredNode) -> Option<String> {
+    match node {
+        StructuredNode::While {
+            condition, body, ..
+        }
+        | StructuredNode::DoWhile {
+            body, condition, ..
+        } => {
+            let target_name = stack_pointer_compare_target_name(condition)?;
+            ((structured_nodes_are_empty(body) || stack_clash_probe_loop_body_matches(body))
+                && !target_name.is_empty())
+            .then_some(target_name)
+        }
+        StructuredNode::Sequence(nodes) => body_is_single_stack_clash_probe_loop_target(nodes),
+        _ => None,
+    }
+}
+
+fn node_is_single_stack_pointer_adjustment(node: &StructuredNode) -> bool {
+    single_statement_from_node(node).is_some_and(expr_is_stack_pointer_adjustment)
+}
+
+fn node_is_single_probe_tail_touch_if(node: &StructuredNode) -> bool {
+    let StructuredNode::If {
+        then_body,
+        else_body,
+        ..
+    } = node
+    else {
+        return false;
+    };
+    else_body.is_none()
+        && extract_single_node(then_body)
+            .and_then(single_statement_from_node)
+            .is_some_and(expr_is_probe_tail_touch_assignment)
+}
+
+fn stack_clash_probe_loop_body_matches(body: &[StructuredNode]) -> bool {
+    let mut statements = Vec::new();
+    if !collect_flat_statements(body, &mut statements) {
+        return false;
+    }
+
+    matches!(
+        statements.as_slice(),
+        [sub, touch]
+            if expr_is_page_probe_subtraction(sub) && expr_is_stack_probe_touch_assignment(touch)
+    )
+}
+
+fn extract_single_node(nodes: &[StructuredNode]) -> Option<&StructuredNode> {
+    match nodes {
+        [node] => match node {
+            StructuredNode::Sequence(inner) => extract_single_node(inner),
+            other => Some(other),
+        },
+        _ => None,
+    }
+}
+
+fn single_statement_from_node(node: &StructuredNode) -> Option<&Expr> {
+    match node {
+        StructuredNode::Block { statements, .. } => match statements.as_slice() {
+            [stmt] => Some(stmt),
+            _ => None,
+        },
+        StructuredNode::Expr(expr) => Some(expr),
+        StructuredNode::Sequence(nodes) => {
+            extract_single_node(nodes).and_then(single_statement_from_node)
+        }
+        _ => None,
+    }
+}
+
+fn expr_is_stack_pointer_adjustment(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Assign { lhs, rhs } if expr_is_stack_pointer(lhs) => match &rhs.kind {
+            ExprKind::BinOp {
+                op: BinOpKind::Sub,
+                left,
+                ..
+            } => expr_is_stack_pointer(left),
+            _ => false,
+        },
+        ExprKind::CompoundAssign {
+            op: BinOpKind::Sub,
+            lhs,
+            ..
+        } => expr_is_stack_pointer(lhs),
+        _ => false,
+    }
+}
+
+fn expr_is_page_probe_subtraction(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Assign { lhs, rhs } if expr_is_stack_pointer(lhs) => match &rhs.kind {
+            ExprKind::BinOp {
+                op: BinOpKind::Sub,
+                left,
+                right,
+            } => expr_is_stack_pointer(left) && matches!(right.kind, ExprKind::IntLit(0x1000)),
+            _ => false,
+        },
+        ExprKind::CompoundAssign {
+            op: BinOpKind::Sub,
+            lhs,
+            rhs,
+        } => expr_is_stack_pointer(lhs) && matches!(rhs.kind, ExprKind::IntLit(0x1000)),
+        _ => false,
+    }
+}
+
+fn expr_is_probe_tail_touch_assignment(expr: &Expr) -> bool {
+    let ExprKind::Assign { lhs, rhs } = &expr.kind else {
+        return false;
+    };
+    expr_is_memory_lvalue(lhs) && exprs_structurally_equal(lhs, rhs)
+}
+
+fn expr_is_stack_probe_touch_assignment(expr: &Expr) -> bool {
+    let ExprKind::Assign { lhs, rhs } = &expr.kind else {
+        return false;
+    };
+    expr_is_memory_lvalue(lhs)
+        && exprs_structurally_equal(lhs, rhs)
+        && expr_mentions_stack_pointer(lhs)
+        && expr_mentions_stack_pointer(rhs)
+}
+
+fn expr_is_memory_lvalue(expr: &Expr) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::Deref { .. }
+            | ExprKind::ArrayAccess { .. }
+            | ExprKind::FieldAccess { .. }
+            | ExprKind::BitField { .. }
+    )
+}
+
+fn stack_pointer_compare_matches_target(expr: &Expr, target_name: &str) -> bool {
+    stack_pointer_compare_target_name(expr).as_deref() == Some(target_name)
+}
+
+fn stack_pointer_compare_target_name(expr: &Expr) -> Option<String> {
+    let ExprKind::BinOp {
+        op: BinOpKind::Ne,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return None;
+    };
+
+    if expr_is_stack_pointer(left) {
+        return expr_simple_identifier(right).map(str::to_string);
+    }
+    if expr_is_stack_pointer(right) {
+        return expr_simple_identifier(left).map(str::to_string);
+    }
+    None
+}
+
+fn stack_pointer_self_compare(expr: &Expr) -> bool {
+    let ExprKind::BinOp {
+        op: BinOpKind::Ne,
+        left,
+        right,
+    } = &expr.kind
+    else {
+        return false;
+    };
+    expr_is_stack_pointer(left) && expr_is_stack_pointer(right)
+}
+
+fn expr_mentions_stack_pointer(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Var(var) => matches!(var.name.as_str(), "sp" | "rsp" | "esp"),
+        ExprKind::Unknown(_) | ExprKind::IntLit(_) => false,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_mentions_stack_pointer(left) || expr_mentions_stack_pointer(right),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_mentions_stack_pointer(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_mentions_stack_pointer(base) || expr_mentions_stack_pointer(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_mentions_stack_pointer(base),
+        ExprKind::Call { target, args } => {
+            let target_mentions = match target {
+                CallTarget::Indirect(expr) | CallTarget::IndirectGot { expr, .. } => {
+                    expr_mentions_stack_pointer(expr)
+                }
+                CallTarget::Direct { .. } | CallTarget::Named(_) => false,
+            };
+            target_mentions || args.iter().any(expr_mentions_stack_pointer)
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_mentions_stack_pointer(cond)
+                || expr_mentions_stack_pointer(then_expr)
+                || expr_mentions_stack_pointer(else_expr)
+        }
+        ExprKind::Phi(values) => values.iter().any(expr_mentions_stack_pointer),
+        ExprKind::GotRef { display_expr, .. } => expr_mentions_stack_pointer(display_expr),
+    }
+}
+
+fn expr_is_stack_pointer(expr: &Expr) -> bool {
+    matches!(
+        expr_simple_identifier(expr),
+        Some("sp") | Some("rsp") | Some("esp")
+    )
+}
+
+fn structured_nodes_are_empty(nodes: &[StructuredNode]) -> bool {
+    nodes.iter().all(structured_node_is_empty)
+}
+
+fn structured_node_is_empty(node: &StructuredNode) -> bool {
+    match node {
+        StructuredNode::Block { statements, .. } => statements.is_empty(),
+        StructuredNode::Sequence(nodes) => structured_nodes_are_empty(nodes),
+        _ => false,
+    }
+}
+
+fn collect_flat_statements<'a>(nodes: &'a [StructuredNode], out: &mut Vec<&'a Expr>) -> bool {
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => out.extend(statements.iter()),
+            StructuredNode::Expr(expr) => out.push(expr),
+            StructuredNode::Sequence(inner) => {
+                if !collect_flat_statements(inner, out) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn is_asan_helper_call_expr(expr: &Expr) -> bool {
     use super::super::expression::ExprKind;
 
@@ -8541,6 +9213,7 @@ mod tests {
     use crate::decompiler::BinaryDataContext;
     use crate::decompiler::{
         CallingConvention, FunctionSignature, ParamType, Parameter, ParameterLocation,
+        SignatureRecovery, StructuredCfg,
     };
     use hexray_core::BasicBlockId;
 
@@ -11493,5 +12166,163 @@ mod tests {
         };
 
         assert_eq!(format!("{}", condition), "rdi != rdx");
+    }
+
+    #[test]
+    fn test_elide_stack_clash_probe_scaffolding_removes_static_probe_loop() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::assign(
+                    reg("r11", 8),
+                    Expr::binop(BinOpKind::Add, reg("rsp", 8), Expr::int(-0x4000)),
+                )],
+            ),
+            StructuredNode::DoWhile {
+                body: vec![block(
+                    9,
+                    vec![
+                        Expr {
+                            kind: ExprKind::CompoundAssign {
+                                op: BinOpKind::Sub,
+                                lhs: Box::new(reg("rsp", 8)),
+                                rhs: Box::new(Expr::int(0x1000)),
+                            },
+                        },
+                        Expr::assign(Expr::deref(reg("rsp", 8), 8), Expr::deref(reg("rsp", 8), 8)),
+                    ],
+                )],
+                condition: Expr::binop(BinOpKind::Ne, reg("rsp", 8), reg("r11", 8)),
+                header: Some(BasicBlockId::new(0)),
+                exit_block: Some(BasicBlockId::new(1)),
+            },
+            block(
+                1,
+                vec![Expr::call(
+                    CallTarget::Named("work".to_string()),
+                    vec![reg("rsp", 8)],
+                )],
+            ),
+        ];
+
+        let cleaned = elide_stack_clash_probe_scaffolding(nodes);
+
+        assert_eq!(cleaned.len(), 1, "expected probe scaffolding to be removed");
+        assert!(matches!(
+            &cleaned[0],
+            StructuredNode::Block { statements, .. }
+                if matches!(
+                    statements.as_slice(),
+                    [Expr {
+                        kind: ExprKind::Call {
+                            target: CallTarget::Named(name),
+                            ..
+                        }
+                    }] if name == "work"
+                )
+        ));
+    }
+
+    #[test]
+    fn test_elide_stack_clash_probe_scaffolding_removes_runtime_probe_and_fixes_signature() {
+        let touch = Expr::array_access(local("local_8", 8), reg("rdx", 8), 1);
+        let cleaned = elide_stack_clash_probe_scaffolding(vec![
+            block(
+                0,
+                vec![
+                    Expr::assign(reg("rsi", 8), reg("rdi", 8)),
+                    Expr::assign(
+                        reg("rcx", 8),
+                        Expr::binop(BinOpKind::Sub, reg("rsp", 8), reg("rax", 8)),
+                    ),
+                ],
+            ),
+            StructuredNode::If {
+                condition: Expr::binop(BinOpKind::Ne, reg("rsp", 8), reg("rsp", 8)),
+                then_body: vec![StructuredNode::DoWhile {
+                    body: vec![block(
+                        10,
+                        vec![
+                            Expr {
+                                kind: ExprKind::CompoundAssign {
+                                    op: BinOpKind::Sub,
+                                    lhs: Box::new(reg("rsp", 8)),
+                                    rhs: Box::new(Expr::int(0x1000)),
+                                },
+                            },
+                            Expr::assign(
+                                Expr::deref(
+                                    Expr::binop(BinOpKind::Add, reg("rsp", 8), Expr::int(0xff8)),
+                                    8,
+                                ),
+                                Expr::deref(
+                                    Expr::binop(BinOpKind::Add, reg("rsp", 8), Expr::int(0xff8)),
+                                    8,
+                                ),
+                            ),
+                        ],
+                    )],
+                    condition: Expr::binop(BinOpKind::Ne, reg("rsp", 8), reg("rcx", 8)),
+                    header: Some(BasicBlockId::new(1)),
+                    exit_block: Some(BasicBlockId::new(2)),
+                }],
+                else_body: None,
+            },
+            block(
+                2,
+                vec![Expr {
+                    kind: ExprKind::CompoundAssign {
+                        op: BinOpKind::Sub,
+                        lhs: Box::new(reg("rsp", 8)),
+                        rhs: Box::new(reg("rdx", 8)),
+                    },
+                }],
+            ),
+            StructuredNode::If {
+                condition: Expr::binop(BinOpKind::Ne, reg("rdx", 8), Expr::int(0)),
+                then_body: vec![StructuredNode::Expr(Expr::assign(touch.clone(), touch))],
+                else_body: None,
+            },
+            block(
+                3,
+                vec![
+                    Expr::call(
+                        CallTarget::Named("__snprintf_chk".to_string()),
+                        vec![
+                            reg("rsp", 8),
+                            reg("rsi", 8),
+                            Expr::int(2),
+                            reg("rsi", 8),
+                            Expr::unknown("fmt"),
+                            reg("rdi", 8),
+                        ],
+                    ),
+                    Expr::call(CallTarget::Named("strlen".to_string()), vec![reg("rsp", 8)]),
+                ],
+            ),
+            StructuredNode::Return(None),
+        ]);
+
+        assert_eq!(
+            cleaned
+                .iter()
+                .filter(|node| matches!(node, StructuredNode::If { .. }))
+                .count(),
+            0,
+            "expected runtime stack-clash probe conditionals to be removed: {cleaned:#?}"
+        );
+
+        let cfg = StructuredCfg {
+            body: cleaned,
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let signature = recovery.analyze(&cfg);
+
+        assert_eq!(
+            signature.parameters.len(),
+            1,
+            "expected probe scaffolding to stop inventing extra parameters: {signature:?}"
+        );
     }
 }
