@@ -95,12 +95,18 @@ pub struct SignatureRecovery {
     return_size: u8,
     /// Whether a float return register was used.
     float_return: bool,
+    /// An explicit `return ...` expression referenced a float ABI register.
+    float_abi_return_expr_observed: bool,
     /// Float ABI registers observed in expressions even if the value was rewritten before use.
     observed_float_arg_regs: HashSet<String>,
     /// Integer SSE/AVX-style opaque operations observed in the function body.
     integer_simd_ops_observed: bool,
     /// The final scalar result is extracted from a float ABI register into the integer return.
     return_from_integer_simd_lane: bool,
+    /// Explicit scalar-literal returns seen alongside opaque integer SIMD returns.
+    integer_simd_scalar_literal_return_size_hint: Option<u8>,
+    /// Explicit non-float scalar returns seen alongside opaque integer SIMD returns.
+    integer_simd_scalar_return_size_hint: Option<u8>,
     /// Direct argument-register copies that shadow an earlier ABI parameter.
     arg_register_copy_sources: HashMap<usize, usize>,
     /// x87 stack operations were observed in the function body.
@@ -189,9 +195,12 @@ impl SignatureRecovery {
             return_value_set: false,
             return_size: 8,
             float_return: false,
+            float_abi_return_expr_observed: false,
             observed_float_arg_regs: HashSet::new(),
             integer_simd_ops_observed: false,
             return_from_integer_simd_lane: false,
+            integer_simd_scalar_literal_return_size_hint: None,
+            integer_simd_scalar_return_size_hint: None,
             arg_register_copy_sources: HashMap::new(),
             x87_ops_observed: false,
             x87_st0_input_observed: false,
@@ -281,9 +290,12 @@ impl SignatureRecovery {
         self.return_value_set = false;
         self.return_size = 8;
         self.float_return = false;
+        self.float_abi_return_expr_observed = false;
         self.observed_float_arg_regs.clear();
         self.integer_simd_ops_observed = false;
         self.return_from_integer_simd_lane = false;
+        self.integer_simd_scalar_literal_return_size_hint = None;
+        self.integer_simd_scalar_return_size_hint = None;
         self.arg_register_copy_sources.clear();
         self.x87_ops_observed = false;
         self.x87_st0_input_observed = false;
@@ -330,6 +342,8 @@ impl SignatureRecovery {
                 }
             }
         }
+
+        self.reconcile_integer_simd_scalar_return();
 
         if self.float_return
             && self.return_size == 8
@@ -649,6 +663,7 @@ impl SignatureRecovery {
                     }
                 }
                 if self.expr_uses_float_abi_value(expr) {
+                    self.float_abi_return_expr_observed = true;
                     if !self.return_from_integer_simd_lane {
                         self.float_return = true;
                         if !self
@@ -661,6 +676,8 @@ impl SignatureRecovery {
                             );
                         }
                     }
+                } else {
+                    self.note_integer_simd_scalar_return_hint(expr);
                 }
                 if self.expr_is_x87_return_value(expr) {
                     self.x87_ops_observed = true;
@@ -1059,6 +1076,62 @@ impl SignatureRecovery {
             }
             self.return_confidence = self.return_confidence.max(205);
         }
+    }
+
+    fn note_integer_simd_scalar_return_hint(&mut self, expr: &Expr) {
+        if self.expr_uses_float_abi_value(expr) || self.is_expr_likely_pointer(expr) {
+            return;
+        }
+
+        let Some(size) = self
+            .infer_expr_size(expr)
+            .filter(|size| *size > 0 && *size <= 8)
+        else {
+            return;
+        };
+
+        if matches!(expr.kind, ExprKind::IntLit(_)) {
+            let current = self
+                .integer_simd_scalar_literal_return_size_hint
+                .unwrap_or_default();
+            self.integer_simd_scalar_literal_return_size_hint = Some(current.max(size));
+            return;
+        }
+
+        let current = self
+            .integer_simd_scalar_return_size_hint
+            .unwrap_or_default();
+        self.integer_simd_scalar_return_size_hint = Some(current.max(size));
+    }
+
+    fn reconcile_integer_simd_scalar_return(&mut self) {
+        if self.return_from_integer_simd_lane
+            || !self.integer_simd_ops_observed
+            || !self.float_return
+            || !self.float_abi_return_expr_observed
+        {
+            return;
+        }
+
+        let Some(size) = self
+            .integer_simd_scalar_literal_return_size_hint
+            .or(self.integer_simd_scalar_return_size_hint)
+        else {
+            return;
+        };
+
+        self.return_from_integer_simd_lane = true;
+        self.return_size = size;
+        self.float_return = false;
+        if !self
+            .return_provenance
+            .iter()
+            .any(|r| r == "integer scalar return recovered from integer SIMD branches")
+        {
+            self.return_provenance
+                .push("integer scalar return recovered from integer SIMD branches".to_string());
+        }
+        self.return_confidence = self.return_confidence.max(205);
     }
 
     /// Analyzes an expression for register reads (argument detection).
@@ -7058,6 +7131,43 @@ mod tests {
         assert_eq!(sig.return_type, ParamType::SignedInt(32));
         assert_eq!(sig.parameters.len(), 1);
         assert_eq!(sig.parameters[0].param_type, ParamType::SimdInt128);
+    }
+
+    #[test]
+    fn test_signature_recovery_recovers_scalar_integer_return_from_mixed_simd_returns() {
+        use hexray_core::BasicBlockId;
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::unknown("/* SSE: pmaxsd */")],
+            address_range: (0x1000, 0x1004),
+        };
+        let cfg = StructuredCfg {
+            body: vec![
+                block,
+                StructuredNode::If {
+                    condition: Expr::binop(
+                        BinOpKind::Gt,
+                        Expr::var(Variable::reg("esi", 4)),
+                        Expr::int(1),
+                    ),
+                    then_body: vec![StructuredNode::Return(Some(Expr::var(Variable::reg(
+                        "xmm0", 16,
+                    ))))],
+                    else_body: Some(vec![StructuredNode::Return(Some(Expr::int(1)))]),
+                },
+            ],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(sig.has_return);
+        assert_eq!(sig.return_type, ParamType::SignedInt(32));
+        assert!(sig.return_provenance.iter().any(|reason| {
+            reason == "integer scalar return recovered from integer SIMD branches"
+        }));
     }
 
     #[test]
