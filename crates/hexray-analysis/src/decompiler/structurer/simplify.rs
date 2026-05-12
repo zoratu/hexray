@@ -325,12 +325,247 @@ pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredN
     // Sixth pass: remove temp register assignments that have been propagated.
     let nodes = remove_temp_assignments(nodes);
 
-    // Seventh pass: prune dead register artifacts that only exist to shuttle
+    // Seventh pass: suppress ASan frame/shadow scaffolding that has no
+    // user-visible semantics.
+    let nodes = suppress_asan_scaffolding(nodes);
+
+    // Eighth pass: prune dead register artifacts that only exist to shuttle
     // machine state between adjacent lowered blocks.
     let nodes = prune_dead_register_artifacts(nodes);
 
-    // Eighth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
+    // Ninth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
     nodes.into_iter().map(simplify_conditions_in_node).collect()
+}
+
+fn suppress_asan_scaffolding(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .filter_map(suppress_asan_scaffolding_in_node)
+        .collect()
+}
+
+fn suppress_asan_scaffolding_in_node(node: StructuredNode) -> Option<StructuredNode> {
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => {
+            let statements = suppress_asan_scaffolding_in_statements(statements);
+            Some(StructuredNode::Block {
+                id,
+                statements,
+                address_range,
+            })
+        }
+        StructuredNode::Expr(expr) => {
+            (!is_asan_scaffolding_statement(&expr)).then_some(StructuredNode::Expr(expr))
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            let then_body = suppress_asan_scaffolding(then_body);
+            let else_body = else_body.map(suppress_asan_scaffolding);
+            if then_body.is_empty() && else_body.as_ref().map_or(true, Vec::is_empty) {
+                None
+            } else {
+                Some(StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                })
+            }
+        }
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::While {
+            condition,
+            body: suppress_asan_scaffolding(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => Some(StructuredNode::DoWhile {
+            body: suppress_asan_scaffolding(body),
+            condition,
+            header,
+            exit_block,
+        }),
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: suppress_asan_scaffolding(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => Some(StructuredNode::Loop {
+            body: suppress_asan_scaffolding(body),
+            header,
+            exit_block,
+        }),
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => Some(StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| (values, suppress_asan_scaffolding(body)))
+                .collect(),
+            default: default.map(suppress_asan_scaffolding),
+        }),
+        StructuredNode::Sequence(nodes) => {
+            Some(StructuredNode::Sequence(suppress_asan_scaffolding(nodes)))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => Some(StructuredNode::TryCatch {
+            try_body: suppress_asan_scaffolding(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: suppress_asan_scaffolding(handler.body),
+                    ..handler
+                })
+                .collect(),
+        }),
+        StructuredNode::Return(_)
+        | StructuredNode::Break
+        | StructuredNode::Continue
+        | StructuredNode::Goto(_)
+        | StructuredNode::Label(_) => Some(node),
+    }
+}
+
+fn suppress_asan_scaffolding_in_statements(statements: Vec<Expr>) -> Vec<Expr> {
+    let mut filtered = Vec::with_capacity(statements.len());
+    for stmt in statements {
+        if is_asan_scaffolding_statement(&stmt) {
+            continue;
+        }
+        filtered.push(stmt);
+    }
+    filtered
+}
+
+fn is_asan_scaffolding_statement(stmt: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &stmt.kind {
+        ExprKind::Assign { lhs, rhs } => {
+            is_asan_helper_call_expr(rhs)
+                || (expr_contains_asan_shadow_marker(lhs)
+                    && matches!(rhs.kind, ExprKind::IntLit(_)))
+                || expr_is_asan_magic_constant(rhs)
+                || expr_is_asan_stack_metadata(rhs)
+        }
+        ExprKind::CompoundAssign { lhs, .. } => expr_contains_asan_shadow_marker(lhs),
+        ExprKind::Call { .. } => is_asan_helper_call_expr(stmt),
+        _ => false,
+    }
+}
+
+fn is_asan_helper_call_expr(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    matches!(
+        &expr.kind,
+        ExprKind::Call {
+            target: CallTarget::Named(name),
+            ..
+        } if normalize_known_call_name(name).starts_with("asan_")
+    )
+}
+
+fn expr_contains_asan_shadow_marker(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    match &expr.kind {
+        ExprKind::IntLit(value) => matches!(
+            *value as i64 as u64,
+            0x7fff8000 | 0x1fffe000 | 0x1fffe001 | 0x1fffe002 | 0x1fffe003
+        ),
+        ExprKind::Var(_) | ExprKind::Unknown(_) => false,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_contains_asan_shadow_marker(left) || expr_contains_asan_shadow_marker(right),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_contains_asan_shadow_marker(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_contains_asan_shadow_marker(base) || expr_contains_asan_shadow_marker(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_contains_asan_shadow_marker(base),
+        ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+            args.iter().any(expr_contains_asan_shadow_marker)
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_contains_asan_shadow_marker(cond)
+                || expr_contains_asan_shadow_marker(then_expr)
+                || expr_contains_asan_shadow_marker(else_expr)
+        }
+        ExprKind::GotRef { display_expr, .. } => expr_contains_asan_shadow_marker(display_expr),
+    }
+}
+
+fn expr_is_asan_magic_constant(expr: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+
+    let ExprKind::IntLit(value) = expr.kind else {
+        return false;
+    };
+    matches!(
+        value as i64 as u32,
+        0x41b58ab3 | 0x45e0360e | 0xf1f1f1f1 | 0xf3f3f3f3
+    )
+}
+
+fn expr_is_asan_stack_metadata(expr: &Expr) -> bool {
+    match resolve_string_literal(expr, None) {
+        Some(text) => {
+            text.chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+                && text.contains("buf:")
+        }
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3671,8 +3906,28 @@ fn propagate_args_in_block_with_state(
                             }
                             rewritten_args = recovered_args.0;
                         } else if args.is_empty() {
-                            rewritten_args =
-                                synthesize_leading_passthrough_args_from_target(&excluded_arg_regs);
+                            let fallback_args = recover_call_arguments_from_recent_statements(
+                                Some(target),
+                                args,
+                                &result,
+                                &excluded_arg_regs,
+                                binary_data,
+                                preferred_family,
+                            );
+                            if should_replace_existing_call_args(
+                                args,
+                                &fallback_args.0,
+                                &fallback_args.1,
+                            ) {
+                                for idx in fallback_args.1 {
+                                    to_remove.insert(idx);
+                                }
+                                rewritten_args = fallback_args.0;
+                            } else {
+                                rewritten_args = synthesize_leading_passthrough_args_from_target(
+                                    &excluded_arg_regs,
+                                );
+                            }
                         }
                     }
                     let rewritten_call = Expr::call(substituted_target, rewritten_args);
@@ -3841,6 +4096,27 @@ fn propagate_args_in_block_with_state(
                         to_remove.insert(idx);
                     }
                     result.push(Expr::call(substituted_target, new_args.0));
+                    state.clear_after_real_call();
+                    track_bare_call_result_aliases(
+                        &mut state.reg_values,
+                        &mut state.call_target_values,
+                        preferred_family,
+                    );
+                    continue;
+                }
+                let fallback_args = recover_call_arguments_from_recent_statements(
+                    Some(target),
+                    args,
+                    &result,
+                    &excluded_arg_regs,
+                    binary_data,
+                    preferred_family,
+                );
+                if should_replace_existing_call_args(args, &fallback_args.0, &fallback_args.1) {
+                    for idx in fallback_args.1 {
+                        to_remove.insert(idx);
+                    }
+                    result.push(Expr::call(substituted_target, fallback_args.0));
                     state.clear_after_real_call();
                     track_bare_call_result_aliases(
                         &mut state.reg_values,
@@ -4769,6 +5045,54 @@ fn collect_target_argument_registers(
     regs
 }
 
+fn recover_call_arguments_from_recent_statements(
+    target: Option<&super::super::expression::CallTarget>,
+    existing_args: &[Expr],
+    prior_statements: &[Expr],
+    excluded_regs: &HashSet<String>,
+    binary_data: Option<&BinaryDataContext>,
+    preferred_family: Option<ArgumentAbiFamily>,
+) -> (Vec<Expr>, Vec<usize>) {
+    let mut recent_arg_values: HashMap<String, (Option<usize>, Expr)> = HashMap::new();
+
+    for (idx, stmt) in prior_statements.iter().enumerate().rev() {
+        if statement_contains_real_call(stmt) {
+            break;
+        }
+
+        let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+            continue;
+        };
+        let ExprKind::Var(var) = &lhs.kind else {
+            continue;
+        };
+        let Some(arg_key) = tracked_call_arg_key(var, preferred_family) else {
+            continue;
+        };
+        if recent_arg_values.contains_key(&arg_key) {
+            continue;
+        }
+
+        recent_arg_values.insert(
+            arg_key,
+            (
+                Some(idx),
+                substitute_prior_register_assignments((**rhs).clone(), &prior_statements[..idx]),
+            ),
+        );
+    }
+
+    extract_call_arguments_with_indices(
+        target,
+        existing_args,
+        &recent_arg_values,
+        None,
+        excluded_regs,
+        binary_data,
+        preferred_family,
+    )
+}
+
 pub(super) fn statement_contains_real_call(expr: &Expr) -> bool {
     use super::super::expression::ExprKind;
 
@@ -5173,26 +5497,19 @@ fn extract_call_arguments_with_indices(
             if sig.fixed_arg_count == 0 {
                 return (existing_args.to_vec(), removable_indices);
             }
-            let Some(family) = infer_argument_abi_family(
-                excluded_regs
-                    .iter()
-                    .map(String::as_str)
-                    .chain(arg_values.keys().map(String::as_str)),
-            )
-            .or(preferred_family) else {
-                return (existing_args.to_vec(), removable_indices);
-            };
             let start_idx = existing_args.len();
             let end_idx = sig.fixed_arg_count.saturating_sub(1);
             let mut result = existing_args.to_vec();
             for expected_idx in start_idx..=end_idx {
-                let Some(reg_name) = pass_through_arg_register_name(family, expected_idx) else {
-                    break;
-                };
-                if excluded_regs.contains(reg_name) {
+                if family
+                    .and_then(|family| pass_through_arg_register_name(family, expected_idx))
+                    .is_some_and(|reg_name| excluded_regs.contains(reg_name))
+                {
                     continue;
                 }
-                result.push(pass_through_arg_expr(reg_name));
+                if let Some(arg_expr) = fallback_pass_through_integer_arg(expected_idx, family) {
+                    result.push(arg_expr);
+                }
             }
             return (result, removable_indices);
         }
@@ -5244,19 +5561,35 @@ fn extract_call_arguments_with_indices(
             continue;
         }
 
-        let Some(family) = family else {
-            break;
-        };
-        let Some(reg_name) = pass_through_arg_register_name(family, expected_idx) else {
-            break;
-        };
-        if excluded_regs.contains(reg_name) {
+        if family
+            .and_then(|family| pass_through_arg_register_name(family, expected_idx))
+            .is_some_and(|reg_name| excluded_regs.contains(reg_name))
+        {
             continue;
         }
-        result.push(pass_through_arg_expr(reg_name));
+        let Some(arg_expr) = fallback_pass_through_integer_arg(expected_idx, family) else {
+            break;
+        };
+        result.push(arg_expr);
     }
 
     (result, used_indices)
+}
+
+fn fallback_pass_through_integer_arg(
+    index: usize,
+    family: Option<ArgumentAbiFamily>,
+) -> Option<Expr> {
+    if let Some(family) = family {
+        return pass_through_arg_register_name(family, index).map(pass_through_arg_expr);
+    }
+    u8::try_from(index).ok().map(|index| {
+        Expr::var(Variable {
+            kind: VarKind::Arg(index),
+            name: format!("arg{index}"),
+            size: 8,
+        })
+    })
 }
 
 fn tracked_arg_candidate_priority(
@@ -5656,6 +5989,9 @@ fn infer_argument_abi_family<'a>(
 ) -> Option<ArgumentAbiFamily> {
     for name in names {
         let lower = name.to_lowercase();
+        if lower.starts_with("arg") || lower.starts_with("farg") {
+            continue;
+        }
         if get_arg_register_index(&lower).is_none()
             && get_float_arg_register_index(&lower).is_none()
         {
@@ -6591,12 +6927,46 @@ fn merge_previous_block_call_capture(result: &mut Vec<StructuredNode>, statement
 
     let call = match (&expected_capture_name, &last_stmt.kind) {
         (None, ExprKind::Call { target, args }) if is_real_function_call(target) => {
-            Some(Expr::call(target.clone(), args.clone()))
+            let excluded_arg_regs = collect_target_argument_registers(target);
+            let recovered = recover_call_arguments_from_recent_statements(
+                Some(target),
+                args,
+                &prev_stmts[..prev_stmts.len().saturating_sub(1)],
+                &excluded_arg_regs,
+                None,
+                None,
+            );
+            let args = if should_replace_existing_call_args(args, &recovered.0, &recovered.1) {
+                recovered.0
+            } else {
+                args.clone()
+            };
+            Some(Expr::call(target.clone(), args))
         }
         (Some(expected_name), ExprKind::Assign { lhs, rhs }) => match &rhs.kind {
             ExprKind::Call { target, args } if is_real_function_call(target) => {
                 if let Some(actual_name) = expr_simple_identifier(lhs) {
-                    (actual_name == expected_name).then(|| Expr::call(target.clone(), args.clone()))
+                    (actual_name == expected_name).then(|| {
+                        let excluded_arg_regs = collect_target_argument_registers(target);
+                        let recovered = recover_call_arguments_from_recent_statements(
+                            Some(target),
+                            args,
+                            &prev_stmts[..prev_stmts.len().saturating_sub(1)],
+                            &excluded_arg_regs,
+                            None,
+                            None,
+                        );
+                        let args = if should_replace_existing_call_args(
+                            args,
+                            &recovered.0,
+                            &recovered.1,
+                        ) {
+                            recovered.0
+                        } else {
+                            args.clone()
+                        };
+                        Expr::call(target.clone(), args)
+                    })
                 } else {
                     None
                 }
@@ -8276,6 +8646,30 @@ mod tests {
     }
 
     #[test]
+    fn test_suppress_asan_scaffolding_drops_shadow_and_magic_statements() {
+        let nodes = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    Expr::array_access(local("shadow", 8), Expr::int(0x1fffe000), 4),
+                    Expr::int(0xf1f1f1f1u32 as i128),
+                ),
+                Expr::assign(Expr::deref(local("err", 8), 8), Expr::int(0x41b58ab3)),
+                Expr::assign(local("meta", 8), Expr::unknown("\"1 32 64 6 buf:12\"")),
+                Expr::assign(local("live", 4), Expr::int(1)),
+            ],
+        )];
+
+        let suppressed = suppress_asan_scaffolding(nodes);
+        let StructuredNode::Block { statements, .. } = &suppressed[0] else {
+            panic!("expected surviving block");
+        };
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(format!("{}", statements[0]), "live = 1");
+    }
+
+    #[test]
     fn test_extract_return_value_skips_stack_canary_compare_setup() {
         let statements = vec![
             Expr::assign(reg("eax", 4), reg("ebx", 4)),
@@ -9153,6 +9547,50 @@ mod tests {
     }
 
     #[test]
+    fn test_recover_recent_call_args_fills_missing_leading_slot_without_abi_family() {
+        let mut binary_data = BinaryDataContext::new();
+        let mut signature = FunctionSignature::new(CallingConvention::SystemV);
+        signature.parameters.push(Parameter::new(
+            "arg0",
+            ParamType::Pointer,
+            ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        ));
+        signature.parameters.push(Parameter::new(
+            "arg1",
+            ParamType::SignedInt(32),
+            ParameterLocation::IntegerRegister {
+                name: "rsi".to_string(),
+                index: 1,
+            },
+        ));
+        binary_data.add_call_signature_by_name("sum_array", signature);
+
+        let prior_statements = vec![
+            Expr::assign(
+                reg("rax", 8),
+                Expr::binop(BinOpKind::Add, reg("rbp", 8), Expr::int(-80)),
+            ),
+            Expr::assign(arg("arg1", 1, 4), Expr::int(16)),
+            Expr::assign(arg("arg0", 0, 8), reg("rax", 8)),
+        ];
+        let recovered = recover_call_arguments_from_recent_statements(
+            Some(&CallTarget::Named("sum_array".to_string())),
+            &[],
+            &prior_statements,
+            &HashSet::new(),
+            Some(&binary_data),
+            None,
+        );
+
+        assert_eq!(recovered.0.len(), 2);
+        assert!(format!("{}", recovered.0[0]).contains("rbp + -"));
+        assert!(matches!(recovered.0[1].kind, ExprKind::IntLit(16)));
+    }
+
+    #[test]
     fn test_propagate_call_args_recovers_direct_sigaction_after_hidden_rep_stos_clobber() {
         let mut binary_data = BinaryDataContext::new();
         binary_data.add_call_target_name_by_address(0x4010c0, "sigaction@GLIBC_2.2.5");
@@ -9771,6 +10209,44 @@ mod tests {
 
         assert_eq!(format!("{}", first_block[0]), "ret_0 = strtol(err, 0, 0xa)");
         assert_eq!(format!("{}", second_block[0]), "format_msg(rsp, ret_0)");
+    }
+
+    #[test]
+    fn test_merge_return_value_captures_recovers_args_from_previous_block_setup() {
+        let nodes = vec![
+            block(
+                0,
+                vec![
+                    Expr::assign(
+                        reg("rax", 8),
+                        Expr::binop(BinOpKind::Add, reg("rbp", 8), Expr::int(-80)),
+                    ),
+                    Expr::assign(reg("esi", 4), Expr::int(16)),
+                    Expr::assign(reg("rdi", 8), reg("rax", 8)),
+                    Expr::call(CallTarget::Named("sum_array".to_string()), vec![]),
+                ],
+            ),
+            block(1, vec![Expr::assign(local("out", 4), reg("eax", 4))]),
+        ];
+
+        let merged = merge_return_value_captures(nodes);
+        let StructuredNode::Block {
+            statements: second_block,
+            ..
+        } = &merged[1]
+        else {
+            panic!("expected captured call block");
+        };
+        let ExprKind::Assign { rhs, .. } = &second_block[0].kind else {
+            panic!("expected merged assignment");
+        };
+        let ExprKind::Call { args, .. } = &rhs.kind else {
+            panic!("expected merged call rhs");
+        };
+
+        assert_eq!(args.len(), 2);
+        assert!(format!("{}", args[0]).contains("rbp + -"));
+        assert!(matches!(args[1].kind, ExprKind::IntLit(16)));
     }
 
     #[test]
