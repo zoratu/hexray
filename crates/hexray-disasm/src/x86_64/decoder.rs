@@ -188,6 +188,11 @@ impl Disassembler for X86_64Disassembler {
 
             // For VEX.mmmmm == 1 (0x0F escape), look up in SSE tables
             if vex.mmmmm == 1 {
+                if let Some(decoded) =
+                    self.decode_vex_map1_special(bytes, address, &prefixes, offset, opcode)?
+                {
+                    return Ok(Self::finalize_legacy_prefixes(&prefixes, decoded));
+                }
                 if let Some(sse) = lookup_sse_opcode(opcode, prefix_66, prefix_f2, prefix_f3) {
                     return self
                         .decode_sse_instruction(bytes, address, &prefixes, offset, opcode, sse)
@@ -1816,6 +1821,43 @@ impl X86_64Disassembler {
             instruction,
             size: offset,
         })
+    }
+
+    /// Decode VEX 0F-map instructions that do not follow the regular SSE ModR/M forms.
+    fn decode_vex_map1_special(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        offset: usize,
+        opcode: u8,
+    ) -> Result<Option<DecodedInstruction>, DecodeError> {
+        let Some(vex) = prefixes.vex else {
+            return Ok(None);
+        };
+
+        if opcode == 0x77 && vex.pp == 0 {
+            let mnemonic = if vex.l { "vzeroall" } else { "vzeroupper" };
+            let instruction = Instruction {
+                address,
+                size: offset,
+                bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+                operation: Operation::Other(0x0F77),
+                mnemonic: mnemonic.to_string(),
+                operands: vec![],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![],
+                writes: vec![],
+                guard: None,
+            };
+
+            return Ok(Some(DecodedInstruction {
+                instruction,
+                size: offset,
+            }));
+        }
+
+        Ok(None)
     }
 
     /// Decode SSE/AVX instructions.
@@ -4063,6 +4105,72 @@ mod tests {
             })
             .collect();
         assert_eq!(operand_names, vec!["xmm0", "xmm1", "xmm2"]);
+    }
+
+    #[test]
+    fn test_vex2_vzeroupper() {
+        let disasm = X86_64Disassembler::new();
+        // C5 F8 77 = vzeroupper
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xf8, 0x77], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vzeroupper");
+        assert_eq!(result.size, 3);
+        assert!(result.instruction.operands.is_empty());
+    }
+
+    #[test]
+    fn test_vex2_vpmovmskb_ymm() {
+        let disasm = X86_64Disassembler::new();
+        // C5 FD D7 C3 = vpmovmskb eax, ymm3
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xfd, 0xd7, 0xc3], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vpmovmskb");
+        assert_eq!(result.size, 4);
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(operand_names, vec!["eax", "ymm3"]);
+    }
+
+    #[test]
+    fn test_vex2_vpminub_ymm() {
+        let disasm = X86_64Disassembler::new();
+        // C5 FD DA C1 = vpminub ymm0, ymm0, ymm1
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xfd, 0xda, 0xc1], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vpminub");
+        assert_eq!(result.size, 4);
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(operand_names, vec!["ymm0", "ymm0", "ymm1"]);
+    }
+
+    #[test]
+    fn test_vex2_vmovntdq_store() {
+        let disasm = X86_64Disassembler::new();
+        // C5 FD E7 07 = vmovntdq [rdi], ymm0
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xfd, 0xe7, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmovntdq");
+        assert_eq!(result.size, 4);
+        assert_eq!(result.instruction.operands.len(), 2);
     }
 
     // ==========================================================================

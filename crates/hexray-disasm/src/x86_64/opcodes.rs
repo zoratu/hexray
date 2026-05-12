@@ -1992,6 +1992,18 @@ pub static SSE2_OPCODE_TABLE_66: [Option<SseOpcodeEntry>; 256] = {
             .with_vex_mnemonic("vshufpd"),
     );
 
+    // PMOVMSKB r32, xmm (66 0F D7)
+    table[0xD7] = Some(
+        SseOpcodeEntry::new("pmovmskb", Operation::Move, SseEncoding::GprXmm)
+            .with_vex_mnemonic("vpmovmskb"),
+    );
+
+    // PMINUB xmm, xmm/m128 (66 0F DA)
+    table[0xDA] = Some(
+        SseOpcodeEntry::new("pminub", Operation::Other(0xDA), SseEncoding::XmmRm)
+            .with_vex_mnemonic("vpminub"),
+    );
+
     // PSHUFD xmm, xmm/m128, imm8 (66 0F 70)
     table[0x70] = Some(
         SseOpcodeEntry::new("pshufd", Operation::Other(0x70), SseEncoding::XmmRmImm8)
@@ -2019,6 +2031,12 @@ pub static SSE2_OPCODE_TABLE_66: [Option<SseOpcodeEntry>; 256] = {
     table[0xE3] = Some(
         SseOpcodeEntry::new("pavgw", Operation::Other(0xE3), SseEncoding::XmmRm)
             .with_vex_mnemonic("vpavgw"),
+    );
+
+    // MOVNTDQ m128, xmm (66 0F E7)
+    table[0xE7] = Some(
+        SseOpcodeEntry::new("movntdq", Operation::Store, SseEncoding::RmXmm)
+            .with_vex_mnemonic("vmovntdq"),
     );
 
     // POR xmm, xmm/m128 (66 0F EB)
