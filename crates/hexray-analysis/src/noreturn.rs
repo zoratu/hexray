@@ -41,6 +41,15 @@ pub fn is_noreturn_function_name(name: &str) -> bool {
                 | "errx"
                 | "verr"
                 | "verrx"
+                | "execl"
+                | "execlp"
+                | "execle"
+                | "execv"
+                | "execvp"
+                | "execvpe"
+                | "execve"
+                | "execveat"
+                | "fexecve"
                 | "longjmp"
                 | "longjmp_chk"
                 | "siglongjmp"
@@ -154,6 +163,23 @@ mod tests {
     #[test]
     fn matches_longjmp_family_names() {
         for name in ["longjmp", "_longjmp", "siglongjmp", "__longjmp_chk"] {
+            assert!(is_noreturn_function_name(name), "{name} should be noreturn");
+        }
+    }
+
+    #[test]
+    fn matches_exec_family_names() {
+        for name in [
+            "execl",
+            "_execlp",
+            "execle@GLIBC_2.2.5",
+            "__execv",
+            "execvp@plt",
+            "__execvpe",
+            "execve",
+            "execveat@plt",
+            "__fexecve@GLIBC_2.2.5",
+        ] {
             assert!(is_noreturn_function_name(name), "{name} should be noreturn");
         }
     }
