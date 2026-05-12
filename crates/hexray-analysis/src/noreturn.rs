@@ -37,6 +37,7 @@ pub fn is_noreturn_function_name(name: &str) -> bool {
                 | "verr"
                 | "verrx"
                 | "longjmp"
+                | "longjmp_chk"
                 | "siglongjmp"
                 | "pthread_exit"
                 | "thrd_exit"
@@ -85,7 +86,16 @@ mod tests {
             "__stack_chk_fail@GLIBC_2.4",
             "__stack_chk_fail@GLIBC_2.4@plt",
             "__fortify_fail@plt",
+            "__longjmp_chk@GLIBC_2.11",
+            "__longjmp_chk@GLIBC_2.11@plt",
         ] {
+            assert!(is_noreturn_function_name(name), "{name} should be noreturn");
+        }
+    }
+
+    #[test]
+    fn matches_longjmp_family_names() {
+        for name in ["longjmp", "_longjmp", "siglongjmp", "__longjmp_chk"] {
             assert!(is_noreturn_function_name(name), "{name} should be noreturn");
         }
     }

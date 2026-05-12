@@ -2853,6 +2853,9 @@ impl PseudoCodeEmitter {
         let CallTarget::Named(name) = target else {
             return true;
         };
+        if crate::is_noreturn_function_name(name) {
+            return false;
+        }
 
         !matches!(
             name.as_str(),
@@ -11157,6 +11160,41 @@ mod tests {
         assert!(
             output.contains("return;"),
             "void signature should preserve bare return:\n{}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_emit_with_signature_does_not_fold_noreturn_tail_call() {
+        let tail_call = Expr::call(
+            CallTarget::Named("__longjmp_chk@GLIBC_2.11@plt".to_string()),
+            vec![Expr::unknown("&env"), Expr::int(2)],
+        );
+        let block = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![tail_call],
+            address_range: (0x1040, 0x1050),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+        let mut sig = super::super::signature::FunctionSignature::new(
+            super::super::signature::CallingConvention::SystemV,
+        );
+        sig.has_return = true;
+        sig.return_type = super::super::signature::ParamType::SignedInt(32);
+
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let output = emitter.emit_with_signature(&cfg, "inner", &sig);
+        assert!(
+            output.contains("\n    __longjmp_chk@GLIBC_2.11@plt(&env, 2);\n"),
+            "noreturn tail call should remain a statement:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("return __longjmp_chk@GLIBC_2.11@plt"),
+            "noreturn tail call must not be folded into a return:\n{}",
             output
         );
     }

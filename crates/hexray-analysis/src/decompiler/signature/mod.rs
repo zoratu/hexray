@@ -1794,6 +1794,9 @@ impl SignatureRecovery {
         }
         if let ExprKind::Call { target, args } = &expr.kind {
             if let Some(name) = self.extract_call_name(target) {
+                if crate::is_noreturn_function_name(&name) {
+                    return Some(ParamType::Void);
+                }
                 if let Some(ty) = self.infer_atomic_pseudo_call_return_type(&name, args) {
                     return Some(ty);
                 }
@@ -6629,6 +6632,32 @@ mod tests {
                 Expr::var(Variable::reg("rdx", 8)),
                 Expr::var(Variable::reg("rcx", 8)),
             ],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(!sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Void);
+    }
+
+    #[test]
+    fn test_signature_recovery_does_not_infer_tail_return_for_noreturn_callee() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("__longjmp_chk@GLIBC_2.11@plt".to_string()),
+            vec![Expr::unknown("&env"), Expr::int(2)],
         );
 
         let block = StructuredNode::Block {
