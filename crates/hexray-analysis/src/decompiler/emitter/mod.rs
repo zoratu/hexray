@@ -3640,6 +3640,7 @@ impl PseudoCodeEmitter {
         &self,
         left: &Expr,
         right: &Expr,
+        op: BinOpKind,
         _table: &StringTable,
     ) -> (String, String) {
         // First format both sides normally
@@ -3651,9 +3652,13 @@ impl PseudoCodeEmitter {
         let right_is_char_context =
             self.is_byte_context(right) || looks_like_char_context(&right_str);
 
-        // Check if either side is a variable (register) that might hold a character
-        let left_is_var = matches!(left.kind, ExprKind::Var(_));
-        let right_is_var = matches!(right.kind, ExprKind::Var(_));
+        // The "this Var might hold a character" heuristic is only safe for
+        // equality comparisons (`x == 'A'`). For ordering comparisons
+        // (`x > 100`), char rendering would turn the numeric threshold into
+        // a nonsense letter like `'e'`.
+        let allow_var_char_promotion = matches!(op, BinOpKind::Eq | BinOpKind::Ne);
+        let left_is_var = allow_var_char_promotion && matches!(left.kind, ExprKind::Var(_));
+        let right_is_var = allow_var_char_promotion && matches!(right.kind, ExprKind::Var(_));
 
         let left_str = if let ExprKind::IntLit(n) = &left.kind {
             if is_likely_character_constant(*n) {
@@ -4850,7 +4855,7 @@ impl PseudoCodeEmitter {
                 if op.is_comparison() {
                     // Check if this looks like a character comparison and format accordingly
                     let (left_str, right_str) =
-                        self.format_char_comparison_operands(left, right, table);
+                        self.format_char_comparison_operands(left, right, *op, table);
                     format!("{} {} {}", left_str, op.as_str(), right_str)
                 } else {
                     // Use precedence-aware formatting for arithmetic operations
