@@ -4164,6 +4164,14 @@ impl PseudoCodeEmitter {
         name.split_once("@plt").map_or(name, |(base, _)| base)
     }
 
+    fn strip_demangled_signature(name: &str) -> &str {
+        if name.contains('(') && name.ends_with(')') {
+            name.split('(').next().unwrap_or(name)
+        } else {
+            name
+        }
+    }
+
     fn format_indirect_got_call_target(name: &str) -> String {
         format!("(*{}@got)", Self::strip_plt_suffix(name))
     }
@@ -5214,11 +5222,13 @@ impl PseudoCodeEmitter {
                         // This uses the call instruction address to find the target symbol
                         if let Some(ref reloc_table) = self.relocation_table {
                             if let Some(name) = reloc_table.get(*call_site) {
-                                Self::strip_plt_suffix(name).to_string()
+                                Self::strip_demangled_signature(Self::strip_plt_suffix(name))
+                                    .to_string()
                             } else if let Some(ref sym_table) = self.symbol_table {
                                 // Fall back to symbol table by target address
                                 if let Some(name) = sym_table.get(*addr) {
-                                    Self::strip_plt_suffix(name).to_string()
+                                    Self::strip_demangled_signature(Self::strip_plt_suffix(name))
+                                        .to_string()
                                 } else {
                                     format!("sub_{:x}", addr)
                                 }
@@ -5228,7 +5238,8 @@ impl PseudoCodeEmitter {
                         } else if let Some(ref sym_table) = self.symbol_table {
                             // Check symbol table by target address
                             if let Some(name) = sym_table.get(*addr) {
-                                Self::strip_plt_suffix(name).to_string()
+                                Self::strip_demangled_signature(Self::strip_plt_suffix(name))
+                                    .to_string()
                             } else if let Some(s) = table.get(*addr) {
                                 // Check if this is a string address (for lea/adr patterns)
                                 return format!("\"{}\"", escape_string(s));
@@ -5242,7 +5253,9 @@ impl PseudoCodeEmitter {
                             format!("sub_{:x}", addr)
                         }
                     }
-                    super::expression::CallTarget::Named(name) => name.clone(),
+                    super::expression::CallTarget::Named(name) => {
+                        Self::strip_demangled_signature(name).to_string()
+                    }
                     super::expression::CallTarget::Indirect(e) => {
                         // Mark any GotRef in the indirect target as a function pointer
                         self.mark_gotref_as_funcptr(e);
@@ -5257,7 +5270,12 @@ impl PseudoCodeEmitter {
                                 self.symbol_table
                                     .as_ref()
                                     .and_then(|st| st.get(addr64))
-                                    .map(|name| Self::strip_plt_suffix(name).to_string())
+                                    .map(|name| {
+                                        Self::strip_demangled_signature(Self::strip_plt_suffix(
+                                            name,
+                                        ))
+                                        .to_string()
+                                    })
                             } else {
                                 None
                             }
@@ -7972,11 +7990,11 @@ impl PseudoCodeEmitter {
             } => {
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get(*call_site) {
-                        name.to_string()
+                        Self::strip_demangled_signature(name).to_string()
                     } else if let Some(ref sym_table) = self.symbol_table {
                         sym_table
                             .get(*addr)
-                            .map(|s| s.to_string())
+                            .map(|s| Self::strip_demangled_signature(s).to_string())
                             .unwrap_or_else(|| format!("sub_{:x}", addr))
                     } else {
                         format!("sub_{:x}", addr)
@@ -7984,13 +8002,15 @@ impl PseudoCodeEmitter {
                 } else if let Some(ref sym_table) = self.symbol_table {
                     sym_table
                         .get(*addr)
-                        .map(|s| s.to_string())
+                        .map(|s| Self::strip_demangled_signature(s).to_string())
                         .unwrap_or_else(|| format!("sub_{:x}", addr))
                 } else {
                     format!("sub_{:x}", addr)
                 }
             }
-            super::expression::CallTarget::Named(name) => name.clone(),
+            super::expression::CallTarget::Named(name) => {
+                Self::strip_demangled_signature(name).to_string()
+            }
             super::expression::CallTarget::Indirect(e) => format!("({})", self.format_expr(e)),
             super::expression::CallTarget::IndirectGot { got_address, expr } => {
                 if let Some(ref reloc_table) = self.relocation_table {
@@ -9536,9 +9556,32 @@ mod tests {
 
         let output = PseudoCodeEmitter::new("    ", false).emit(&cfg, "cleanup_wrapper");
 
-        assert!(output.contains("Circle::~Circle()();"));
+        assert!(output.contains("Circle::~Circle();"));
         assert!(output.contains("return err;"));
         assert!(!output.contains("return ret_0;"));
+    }
+
+    #[test]
+    fn test_emit_direct_call_strips_demangled_signature_suffix() {
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::call(
+                CallTarget::Direct {
+                    target: 0x401000,
+                    call_site: 0x1010,
+                },
+                vec![Expr::unknown("arg0"), Expr::unknown("n")],
+            )))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let mut sym = SymbolTable::new();
+        sym.insert(0x401000, "sum_ints(int const*, int)".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let output = emitter.emit(&cfg, "call_sum");
+
+        assert!(output.contains("return sum_ints(arg0, n);"), "{output}");
+        assert!(!output.contains("sum_ints(int const*, int)("), "{output}");
     }
 
     #[test]
