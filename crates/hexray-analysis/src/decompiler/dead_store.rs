@@ -449,6 +449,14 @@ fn eliminate_in_node(node: StructuredNode, uses: &HashSet<String>) -> Option<Str
                 .filter(|stmt| !is_dead_store(stmt, uses))
                 .collect();
             let statements = eliminate_consecutive_overwrites(statements);
+            // Final per-block pass: drop ABI-arg-register self-updates
+            // (`Assign(arg_reg, op(arg_reg, ...))`) whose new value isn't
+            // read by any subsequent statement in the block. The global-use
+            // pass cannot do this because the RHS read of the same register
+            // makes the register look "used" function-wide. After the
+            // propagator's symbolic-arg{N} rewrite, subsequent statements
+            // no longer reference the raw register, so the write is dead.
+            let statements = eliminate_arg_register_self_update_dead_writes(statements);
 
             // Don't emit empty blocks
             if statements.is_empty() {
@@ -614,6 +622,208 @@ fn has_side_effects(expr: &Expr) -> bool {
 ///
 /// This is conservative: we only remove the earlier store when the two writes
 /// are adjacent and the earlier RHS has no side effects.
+/// Detect and drop `Assign(arg_reg, expr)` where `expr` reads the SAME
+/// register (self-update like `imul edi, edi` → `Assign(edi, Mul(edi, edi))`)
+/// and no later statement in the block reads that register's name. The
+/// propagator has already substituted post-write reads into symbolic
+/// `arg{N}` form, so the only place the raw register name appears is in
+/// the write's own RHS — making the write provably dead within the block.
+///
+/// This is intentionally narrow: not touching plain `Assign(arg_reg, rhs)`
+/// where `rhs` doesn't read the same register, because parameter inference
+/// uses those as evidence the arg register is being clobbered into a local.
+fn eliminate_arg_register_self_update_dead_writes(statements: Vec<Expr>) -> Vec<Expr> {
+    if statements.is_empty() {
+        return statements;
+    }
+    let n = statements.len();
+    let mut keep = vec![true; n];
+    for i in 0..n {
+        let (lhs, rhs, is_compound) = match &statements[i].kind {
+            ExprKind::Assign { lhs, rhs } => (lhs.as_ref(), rhs.as_ref(), false),
+            ExprKind::CompoundAssign { lhs, rhs, .. } => (lhs.as_ref(), rhs.as_ref(), true),
+            _ => continue,
+        };
+        let Some(name) = lhs_var_name(lhs) else {
+            continue;
+        };
+        if !is_abi_arg_register(&name) {
+            continue;
+        }
+        if has_side_effects(rhs) {
+            continue;
+        }
+        // The write must be a self-update — either CompoundAssign (lhs is
+        // implicitly read) or Assign whose RHS references the same register.
+        let target_aliases: Vec<String> = std::iter::once(name.clone())
+            .chain(
+                get_aliased_registers(&name)
+                    .into_iter()
+                    .map(|s| s.to_string()),
+            )
+            .collect();
+        if !is_compound {
+            let mut rhs_var_reads = HashSet::new();
+            collect_var_reads(rhs, &mut rhs_var_reads);
+            if !target_aliases.iter().any(|n| rhs_var_reads.contains(n)) {
+                continue;
+            }
+        }
+        // Look for any LATER raw-register Var read of this register in the
+        // block. We deliberately ignore Unknown("argN") reads here because
+        // those carry the propagator's symbolic "incoming arg" semantics
+        // — distinct from a read of the CURRENT register contents.
+        let mut read_later = false;
+        for stmt in &statements[i + 1..] {
+            let mut later_var_reads = HashSet::new();
+            collect_var_reads(stmt, &mut later_var_reads);
+            if target_aliases.iter().any(|n| later_var_reads.contains(n)) {
+                read_later = true;
+                break;
+            }
+        }
+        if !read_later {
+            keep[i] = false;
+        }
+    }
+    statements
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(s, k)| if k { Some(s) } else { None })
+        .collect()
+}
+
+/// Collect ONLY ExprKind::Var reads (skip Unknown). Used by the
+/// self-update DSE so the propagator's `Unknown("argN")` symbolic
+/// references — which represent the incoming-arg value, NOT the
+/// current register contents — don't block elimination.
+fn collect_var_reads(expr: &Expr, reads: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Var(v) => {
+            reads.insert(v.name.clone());
+        }
+        ExprKind::Unknown(_) => {}
+        ExprKind::Assign { lhs, rhs } => {
+            // Don't count the lhs as a read (it's a def); descend into
+            // any reads embedded in the lhs (array index, deref addr).
+            collect_var_reads_in_lhs(lhs, reads);
+            collect_var_reads(rhs, reads);
+        }
+        ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            collect_var_reads(lhs, reads);
+            collect_var_reads(rhs, reads);
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            collect_var_reads(left, reads);
+            collect_var_reads(right, reads);
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. } => {
+            collect_var_reads(operand, reads);
+        }
+        ExprKind::Call { target, args } => {
+            if let super::expression::CallTarget::Indirect(expr) = target {
+                collect_var_reads(expr, reads);
+            }
+            for arg in args {
+                collect_var_reads(arg, reads);
+            }
+        }
+        ExprKind::ArrayAccess { base, index, .. } => {
+            collect_var_reads(base, reads);
+            collect_var_reads(index, reads);
+        }
+        ExprKind::FieldAccess { base, .. } => {
+            collect_var_reads(base, reads);
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_var_reads(cond, reads);
+            collect_var_reads(then_expr, reads);
+            collect_var_reads(else_expr, reads);
+        }
+        _ => {}
+    }
+}
+
+fn collect_var_reads_in_lhs(expr: &Expr, reads: &mut HashSet<String>) {
+    match &expr.kind {
+        ExprKind::Var(_) | ExprKind::Unknown(_) => {}
+        ExprKind::Deref { addr, .. } => collect_var_reads(addr, reads),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            collect_var_reads(base, reads);
+            collect_var_reads(index, reads);
+        }
+        ExprKind::FieldAccess { base, .. } => collect_var_reads(base, reads),
+        _ => collect_var_reads(expr, reads),
+    }
+}
+
+fn lhs_var_name(lhs: &Expr) -> Option<String> {
+    match &lhs.kind {
+        ExprKind::Var(v) => Some(v.name.clone()),
+        ExprKind::Unknown(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+fn is_abi_arg_register(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "rdi"
+            | "edi"
+            | "rsi"
+            | "esi"
+            | "rdx"
+            | "edx"
+            | "rcx"
+            | "ecx"
+            | "r8"
+            | "r8d"
+            | "r9"
+            | "r9d"
+            | "x1"
+            | "x2"
+            | "x3"
+            | "x4"
+            | "x5"
+            | "x6"
+            | "x7"
+            | "w1"
+            | "w2"
+            | "w3"
+            | "w4"
+            | "w5"
+            | "w6"
+            | "w7"
+            | "a1"
+            | "a2"
+            | "a3"
+            | "a4"
+            | "a5"
+            | "a6"
+            | "a7"
+    ) {
+        return true;
+    }
+    // Also recognize the post-naming `argN` form (where N is a small
+    // index). The Var node may carry either the raw register name or
+    // the renamed `arg{N}` token depending on which simplify pass set
+    // it. Note: x0/w0/a0 are excluded (they're return registers too).
+    if let Some(suffix) = lower.strip_prefix("arg") {
+        if let Ok(n) = suffix.parse::<u32>() {
+            return n < 32;
+        }
+    }
+    false
+}
+
 fn eliminate_consecutive_overwrites(statements: Vec<Expr>) -> Vec<Expr> {
     if statements.len() < 2 {
         return statements;
