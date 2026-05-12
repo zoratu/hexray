@@ -1803,6 +1803,19 @@ impl SignatureRecovery {
                 | "fclose"
                 | "pthread_setspecific"
                 | "sigaction"
+                | "sigsuspend"
+                | "sigprocmask"
+                | "pthread_sigmask"
+                | "sigemptyset"
+                | "sigfillset"
+                | "sigaddset"
+                | "sigdelset"
+                | "sigismember"
+                | "kill"
+                | "raise"
+                | "tgkill"
+                | "usleep"
+                | "sleep"
         )
     }
 
@@ -6317,6 +6330,32 @@ mod tests {
 
         let call = Expr::call(
             CallTarget::Named("pthread_mutex_unlock".to_string()),
+            vec![Expr::var(Variable::reg("rdi", 8))],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block, StructuredNode::Return(None)],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert!(!sig.has_return);
+        assert_eq!(sig.return_type, ParamType::Void);
+    }
+
+    #[test]
+    fn test_signature_recovery_ignores_sigsuspend_tail_call_forwarding_return_type() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("sigsuspend".to_string()),
             vec![Expr::var(Variable::reg("rdi", 8))],
         );
 
