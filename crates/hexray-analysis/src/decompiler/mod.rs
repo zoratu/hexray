@@ -2810,12 +2810,12 @@ mod tests {
         let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
         block.instructions.push(Instruction {
             address: 0x1000,
-            size: 6,
-            bytes: vec![0xf0, 0x48, 0x83, 0x0c, 0x24, 0x00],
-            operation: Operation::Or,
-            mnemonic: "or".to_string(),
+            size: 7,
+            bytes: vec![0xf0, 0x48, 0x83, 0x44, 0x24, 0x08, 0x00],
+            operation: Operation::Add,
+            mnemonic: "add".to_string(),
             operands: vec![
-                Operand::Memory(MemoryRef::base_disp(rsp, 0, 8)),
+                Operand::Memory(MemoryRef::base_disp(rsp, 8, 8)),
                 Operand::imm(0, 1),
             ],
             control_flow: ControlFlow::Sequential,
@@ -2824,7 +2824,7 @@ mod tests {
             guard: None,
         });
         block.instructions.push(
-            Instruction::new(0x1006, 1, vec![], "ret")
+            Instruction::new(0x1007, 1, vec![], "ret")
                 .with_operation(Operation::Return)
                 .with_control_flow(ControlFlow::Return),
         );
@@ -2840,8 +2840,16 @@ mod tests {
             "expected seq-cst fence pseudo-call, got:\n{output}"
         );
         assert!(
+            output.contains("void mem_fence(void)"),
+            "expected fence helper to keep a void signature, got:\n{output}"
+        );
+        assert!(
             !output.contains("int memory_order_seq_cst;"),
             "did not expect memory_order_seq_cst to be declared as a local:\n{output}"
+        );
+        assert!(
+            !output.contains("atomic_fetch_add("),
+            "did not expect lock-add fence idiom to survive as atomic_fetch_add:\n{output}"
         );
     }
 

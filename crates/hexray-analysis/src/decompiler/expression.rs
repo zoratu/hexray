@@ -1374,7 +1374,6 @@ impl Expr {
 
     fn is_stack_fence_memory(mem: &MemoryRef) -> bool {
         mem.index.is_none()
-            && mem.displacement == 0
             && mem
                 .base
                 .as_ref()
@@ -1392,7 +1391,7 @@ impl Expr {
 
         Self::is_stack_fence_memory(mem)
             && Self::is_zero_immediate(&inst.operands[1])
-            && matches!(inst.mnemonic.as_str(), "or" | "add")
+            && matches!(inst.operation, Operation::Or | Operation::Add)
     }
 
     fn x86_atomic_pair(ops: &[Operand]) -> Option<(&MemoryRef, usize)> {
@@ -6264,10 +6263,21 @@ mod tests {
                 Operand::Memory(MemoryRef::base_disp(rsp, 0, 8)),
                 Operand::imm_unsigned(0, 8),
             ]);
+        let lock_add = Instruction::new(
+            0x4012ea,
+            7,
+            vec![0xf0, 0x48, 0x83, 0x44, 0x24, 0x08, 0x00],
+            "add",
+        )
+        .with_operation(Operation::Add)
+        .with_operands(vec![
+            Operand::Memory(MemoryRef::base_disp(rsp, 8, 8)),
+            Operand::imm_unsigned(0, 8),
+        ]);
         let mfence = Instruction::new(0x401300, 3, vec![0x0f, 0xae, 0xf0], "mfence")
             .with_operation(Operation::Other(0x0FAE));
 
-        for inst in [lock_or, mfence] {
+        for inst in [lock_or, lock_add, mfence] {
             let expr = Expr::from_instruction(&inst);
             let ExprKind::Call { target, args } = &expr.kind else {
                 panic!("expected call, got {:?}", expr.kind);
