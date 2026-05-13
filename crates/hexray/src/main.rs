@@ -1791,10 +1791,16 @@ fn find_symbol_in_candidates(
         )
     };
     let pick_best = |mut candidates: Vec<hexray_core::Symbol>| {
+        let prefer_default_version = candidates
+            .iter()
+            .any(|candidate| candidate.is_default_version());
         candidates.sort_by(|a, b| {
-            symbol_priority(b)
-                .cmp(&symbol_priority(a))
+            u8::from(prefer_default_version && b.is_default_version())
+                .cmp(&u8::from(prefer_default_version && a.is_default_version()))
+                .then_with(|| symbol_priority(b).cmp(&symbol_priority(a)))
                 .then_with(|| a.name.len().cmp(&b.name.len()))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.address.cmp(&b.address))
         });
         candidates.into_iter().next()
     };
@@ -10094,6 +10100,51 @@ mod tests {
 
         assert_eq!(resolved.name, "foo@@VER_2");
         assert_eq!(resolved.address, 0x110c);
+    }
+
+    #[test]
+    fn unversioned_lookup_prefers_default_gnu_ifunc_over_compat_function() {
+        let symbols = vec![
+            test_symbol("memcpy@GLIBC_2.2.5", 0xba870),
+            Symbol {
+                name: "memcpy@@GLIBC_2.14".to_string(),
+                address: 0xb1740,
+                size: 273,
+                kind: SymbolKind::IndirectFunction,
+                binding: SymbolBinding::Global,
+                section_index: Some(17),
+            },
+        ];
+
+        let resolved = find_symbol_in_candidates(&symbols, "memcpy", SymbolLookupMode::ExactOnly)
+            .expect("default version should resolve");
+
+        assert_eq!(resolved.name, "memcpy@@GLIBC_2.14");
+        assert_eq!(resolved.address, 0xb1740);
+        assert!(resolved.is_ifunc());
+    }
+
+    #[test]
+    fn exact_lookup_preserves_fully_qualified_compat_version() {
+        let symbols = vec![
+            test_symbol("memcpy@GLIBC_2.2.5", 0xba870),
+            Symbol {
+                name: "memcpy@@GLIBC_2.14".to_string(),
+                address: 0xb1740,
+                size: 273,
+                kind: SymbolKind::IndirectFunction,
+                binding: SymbolBinding::Global,
+                section_index: Some(17),
+            },
+        ];
+
+        let resolved =
+            find_symbol_in_candidates(&symbols, "memcpy@GLIBC_2.2.5", SymbolLookupMode::ExactOnly)
+                .expect("fully qualified version should resolve");
+
+        assert_eq!(resolved.name, "memcpy@GLIBC_2.2.5");
+        assert_eq!(resolved.address, 0xba870);
+        assert!(resolved.is_function());
     }
 
     #[test]
