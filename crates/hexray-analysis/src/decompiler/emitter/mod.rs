@@ -381,6 +381,7 @@ pub struct PseudoCodeEmitter {
     string_table: Option<StringTable>,
     symbol_table: Option<SymbolTable>,
     relocation_table: Option<RelocationTable>,
+    gnu_version_ambiguous_bases: RefCell<Option<HashSet<String>>>,
     tls_symbol_offsets: HashMap<i64, String>,
     /// Type information for variables (var_name -> type_string).
     type_info: std::collections::HashMap<String, String>,
@@ -635,6 +636,7 @@ impl PseudoCodeEmitter {
             string_table: None,
             symbol_table: None,
             relocation_table: None,
+            gnu_version_ambiguous_bases: RefCell::new(None),
             tls_symbol_offsets: HashMap::new(),
             type_info: std::collections::HashMap::new(),
             dwarf_names: std::collections::HashMap::new(),
@@ -3214,12 +3216,14 @@ impl PseudoCodeEmitter {
     /// Sets the symbol table for resolving function addresses.
     pub fn with_symbol_table(mut self, table: Option<SymbolTable>) -> Self {
         self.symbol_table = table;
+        *self.gnu_version_ambiguous_bases.borrow_mut() = None;
         self
     }
 
     /// Sets the relocation table for resolving call targets in relocatable files.
     pub fn with_relocation_table(mut self, table: Option<RelocationTable>) -> Self {
         self.relocation_table = table;
+        *self.gnu_version_ambiguous_bases.borrow_mut() = None;
         self
     }
 
@@ -3623,7 +3627,7 @@ impl PseudoCodeEmitter {
             return None;
         }
 
-        Some(Self::strip_plt_suffix(symbol.name).to_string())
+        Some(self.format_call_target_name(symbol.name))
     }
 
     fn format_known_callback_literal(
@@ -4002,8 +4006,9 @@ impl PseudoCodeEmitter {
     }
 
     fn simplify_symbol_name(&self, raw: &str) -> String {
-        self.simplify_libc_global_name(raw)
-            .unwrap_or(raw)
+        let normalized = self.normalize_pseudo_c_symbol_name(raw);
+        self.simplify_libc_global_name(normalized)
+            .unwrap_or(normalized)
             .to_string()
     }
 
@@ -4165,12 +4170,93 @@ impl PseudoCodeEmitter {
         name.split_once("@plt").map_or(name, |(base, _)| base)
     }
 
+    fn is_glibc_family_version(version_name: &str) -> bool {
+        version_name.starts_with("GLIBC_") || version_name.starts_with("GLIBCXX_")
+    }
+
+    fn collect_ambiguous_gnu_version_bases(&self) -> HashSet<String> {
+        let mut names_by_base: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut has_glibc_version = HashSet::new();
+
+        let mut record = |name: &str| {
+            let bare = Self::strip_plt_suffix(name);
+            let base = hexray_core::unversioned_symbol_name(bare);
+            names_by_base
+                .entry(base.to_string())
+                .or_default()
+                .insert(bare.to_string());
+            if hexray_core::gnu_symbol_version(bare)
+                .is_some_and(|version| Self::is_glibc_family_version(version.name))
+            {
+                has_glibc_version.insert(base.to_string());
+            }
+        };
+
+        if let Some(symbol_table) = &self.symbol_table {
+            for (_, name) in symbol_table.iter() {
+                record(name);
+            }
+        }
+
+        if let Some(relocation_table) = &self.relocation_table {
+            for name in relocation_table.symbol_names() {
+                record(name);
+            }
+        }
+
+        names_by_base
+            .into_iter()
+            .filter_map(|(base, names)| {
+                (names.len() > 1 && has_glibc_version.contains(base.as_str())).then_some(base)
+            })
+            .collect()
+    }
+
+    fn has_ambiguous_gnu_version_base(&self, base_name: &str) -> bool {
+        if self.gnu_version_ambiguous_bases.borrow().is_none() {
+            let ambiguous = self.collect_ambiguous_gnu_version_bases();
+            *self.gnu_version_ambiguous_bases.borrow_mut() = Some(ambiguous);
+        }
+
+        self.gnu_version_ambiguous_bases
+            .borrow()
+            .as_ref()
+            .is_some_and(|bases| bases.contains(base_name))
+    }
+
+    /// Strips GLIBC/GLIBCXX version suffixes for pseudo-C output unless the
+    /// current binary imports multiple symbols with the same unversioned base.
+    fn strip_glibc_version_suffix<'a>(&self, name: &'a str) -> &'a str {
+        let Some(version) = hexray_core::gnu_symbol_version(name) else {
+            return name;
+        };
+        if !Self::is_glibc_family_version(version.name) {
+            return name;
+        }
+
+        let base = hexray_core::unversioned_symbol_name(name);
+        if self.has_ambiguous_gnu_version_base(base) {
+            name
+        } else {
+            base
+        }
+    }
+
+    fn normalize_pseudo_c_symbol_name<'a>(&self, name: &'a str) -> &'a str {
+        let stripped = Self::strip_plt_suffix(name);
+        self.strip_glibc_version_suffix(stripped)
+    }
+
     fn strip_demangled_signature(name: &str) -> &str {
         strip_demangled_symbol_signature(name)
     }
 
-    fn format_indirect_got_call_target(name: &str) -> String {
-        format!("(*{}@got)", Self::strip_plt_suffix(name))
+    fn format_call_target_name(&self, name: &str) -> String {
+        Self::strip_demangled_signature(self.normalize_pseudo_c_symbol_name(name)).to_string()
+    }
+
+    fn format_indirect_got_call_target(&self, name: &str) -> String {
+        format!("(*{}@got)", self.normalize_pseudo_c_symbol_name(name))
     }
 
     fn is_tls_get_addr_name(name: &str) -> bool {
@@ -5219,13 +5305,11 @@ impl PseudoCodeEmitter {
                         // This uses the call instruction address to find the target symbol
                         if let Some(ref reloc_table) = self.relocation_table {
                             if let Some(name) = reloc_table.get(*call_site) {
-                                Self::strip_demangled_signature(Self::strip_plt_suffix(name))
-                                    .to_string()
+                                self.format_call_target_name(name)
                             } else if let Some(ref sym_table) = self.symbol_table {
                                 // Fall back to symbol table by target address
                                 if let Some(name) = sym_table.get(*addr) {
-                                    Self::strip_demangled_signature(Self::strip_plt_suffix(name))
-                                        .to_string()
+                                    self.format_call_target_name(name)
                                 } else {
                                     format!("sub_{:x}", addr)
                                 }
@@ -5235,8 +5319,7 @@ impl PseudoCodeEmitter {
                         } else if let Some(ref sym_table) = self.symbol_table {
                             // Check symbol table by target address
                             if let Some(name) = sym_table.get(*addr) {
-                                Self::strip_demangled_signature(Self::strip_plt_suffix(name))
-                                    .to_string()
+                                self.format_call_target_name(name)
                             } else if let Some(s) = table.get(*addr) {
                                 // Check if this is a string address (for lea/adr patterns)
                                 return format!("\"{}\"", escape_string(s));
@@ -5251,7 +5334,7 @@ impl PseudoCodeEmitter {
                         }
                     }
                     super::expression::CallTarget::Named(name) => {
-                        Self::strip_demangled_signature(name).to_string()
+                        self.format_call_target_name(name)
                     }
                     super::expression::CallTarget::Indirect(e) => {
                         // Mark any GotRef in the indirect target as a function pointer
@@ -5267,12 +5350,7 @@ impl PseudoCodeEmitter {
                                 self.symbol_table
                                     .as_ref()
                                     .and_then(|st| st.get(addr64))
-                                    .map(|name| {
-                                        Self::strip_demangled_signature(Self::strip_plt_suffix(
-                                            name,
-                                        ))
-                                        .to_string()
-                                    })
+                                    .map(|name| self.format_call_target_name(name))
                             } else {
                                 None
                             }
@@ -5293,7 +5371,7 @@ impl PseudoCodeEmitter {
                         // Try to resolve the GOT entry to a symbol name
                         if let Some(ref reloc_table) = self.relocation_table {
                             if let Some(name) = reloc_table.get_got(*got_address) {
-                                Self::format_indirect_got_call_target(name)
+                                self.format_indirect_got_call_target(name)
                             } else {
                                 // Fall back to showing the expression
                                 format!("({})", self.format_expr_with_strings(expr, table))
@@ -5301,7 +5379,7 @@ impl PseudoCodeEmitter {
                         } else if let Some(ref sym_table) = self.symbol_table {
                             // Try symbol table by GOT address (rare, but possible)
                             if let Some(name) = sym_table.get(*got_address) {
-                                Self::format_indirect_got_call_target(name)
+                                self.format_indirect_got_call_target(name)
                             } else {
                                 format!("({})", self.format_expr_with_strings(expr, table))
                             }
@@ -7987,11 +8065,11 @@ impl PseudoCodeEmitter {
             } => {
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get(*call_site) {
-                        Self::strip_demangled_signature(name).to_string()
+                        self.format_call_target_name(name)
                     } else if let Some(ref sym_table) = self.symbol_table {
                         sym_table
                             .get(*addr)
-                            .map(|s| Self::strip_demangled_signature(s).to_string())
+                            .map(|s| self.format_call_target_name(s))
                             .unwrap_or_else(|| format!("sub_{:x}", addr))
                     } else {
                         format!("sub_{:x}", addr)
@@ -7999,20 +8077,18 @@ impl PseudoCodeEmitter {
                 } else if let Some(ref sym_table) = self.symbol_table {
                     sym_table
                         .get(*addr)
-                        .map(|s| Self::strip_demangled_signature(s).to_string())
+                        .map(|s| self.format_call_target_name(s))
                         .unwrap_or_else(|| format!("sub_{:x}", addr))
                 } else {
                     format!("sub_{:x}", addr)
                 }
             }
-            super::expression::CallTarget::Named(name) => {
-                Self::strip_demangled_signature(name).to_string()
-            }
+            super::expression::CallTarget::Named(name) => self.format_call_target_name(name),
             super::expression::CallTarget::Indirect(e) => format!("({})", self.format_expr(e)),
             super::expression::CallTarget::IndirectGot { got_address, expr } => {
                 if let Some(ref reloc_table) = self.relocation_table {
                     if let Some(name) = reloc_table.get_got(*got_address) {
-                        Self::format_indirect_got_call_target(name)
+                        self.format_indirect_got_call_target(name)
                     } else {
                         format!("({})", self.format_expr(expr))
                     }
@@ -11337,12 +11413,12 @@ mod tests {
         let emitter = PseudoCodeEmitter::new("    ", false);
         let output = emitter.emit_with_signature(&cfg, "inner", &sig);
         assert!(
-            output.contains("\n    __longjmp_chk@GLIBC_2.11@plt(&env, 2);\n"),
+            output.contains("\n    __longjmp_chk(&env, 2);\n"),
             "noreturn tail call should remain a statement:\n{}",
             output
         );
         assert!(
-            !output.contains("return __longjmp_chk@GLIBC_2.11@plt"),
+            !output.contains("return __longjmp_chk"),
             "noreturn tail call must not be folded into a return:\n{}",
             output
         );
@@ -11763,6 +11839,38 @@ mod tests {
     }
 
     #[test]
+    fn test_call_target_strips_unambiguous_glibc_version_suffix() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let call = Expr::call(CallTarget::Named("printf@GLIBC_2.2.5".to_string()), vec![]);
+
+        assert_eq!(emitter.format_expr(&call), "printf()");
+    }
+
+    #[test]
+    fn test_call_target_keeps_glibc_version_suffix_for_mixed_versions() {
+        let mut relocations = RelocationTable::new();
+        relocations.insert(0x1000, "printf@GLIBC_2.2.5".to_string());
+        relocations.insert(0x1008, "printf@GLIBC_2.34".to_string());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_relocation_table(Some(relocations));
+        let call = Expr::call(CallTarget::Named("printf@GLIBC_2.2.5".to_string()), vec![]);
+
+        assert_eq!(emitter.format_expr(&call), "printf@GLIBC_2.2.5()");
+    }
+
+    #[test]
+    fn test_global_ref_strips_unambiguous_glibc_version_suffix() {
+        let mut sym = SymbolTable::new();
+        sym.insert(0x1000, "stdout@@GLIBC_2.2.5".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
+        let expr = Expr::got_ref(0x1000, 0, 8, Expr::unknown("rip_ref"));
+
+        assert_eq!(emitter.format_expr(&expr), "stdout");
+    }
+
+    #[test]
     fn test_libc_global_nested_deref_simplification() {
         let mut sym = SymbolTable::new();
         sym.insert(0x2000, "__stdoutp".to_string());
@@ -11938,7 +12046,7 @@ mod tests {
 
         assert_eq!(
             emitter.format_expr(&call),
-            "__tls_get_addr@GLIBC_2.3(&_TLS_lib_counter_)"
+            "__tls_get_addr(&_TLS_lib_counter_)"
         );
     }
 
@@ -12738,6 +12846,32 @@ mod tests {
         assert!(
             !output.contains("return public_add();"),
             "PLT trampoline should not collapse into a recursive self-call:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_emit_plt_stub_strips_unambiguous_glibc_version_suffix_from_got_target() {
+        let mut relocations = RelocationTable::new();
+        relocations.insert_got(0x404000, "puts@GLIBC_2.2.5".to_string());
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Return(Some(Expr::call(
+                CallTarget::IndirectGot {
+                    got_address: 0x404000,
+                    expr: Box::new(Expr::unknown("jmp *[rip+0x2f76]")),
+                },
+                vec![],
+            )))],
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let output = PseudoCodeEmitter::new("    ", false)
+            .with_relocation_table(Some(relocations))
+            .emit(&cfg, "puts@plt");
+
+        assert!(
+            output.contains("return (*puts@got)();"),
+            "expected versionless GOT trampoline rendering, got:\n{output}"
         );
     }
 
