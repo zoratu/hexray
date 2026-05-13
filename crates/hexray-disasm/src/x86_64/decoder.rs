@@ -41,6 +41,22 @@ impl X86_64Disassembler {
         Self { intel_syntax: true }
     }
 
+    fn vector_shift_group_info(opcode: u8, subopcode: u8) -> Option<(&'static str, Operation)> {
+        match (opcode, subopcode) {
+            (0x71, 2) => Some(("vpsrlw", Operation::Shr)),
+            (0x71, 4) => Some(("vpsraw", Operation::Sar)),
+            (0x71, 6) => Some(("vpsllw", Operation::Shl)),
+            (0x72, 2) => Some(("vpsrld", Operation::Shr)),
+            (0x72, 4) => Some(("vpsrad", Operation::Sar)),
+            (0x72, 6) => Some(("vpslld", Operation::Shl)),
+            (0x73, 2) => Some(("vpsrlq", Operation::Shr)),
+            (0x73, 3) => Some(("vpsrldq", Operation::Shr)),
+            (0x73, 6) => Some(("vpsllq", Operation::Shl)),
+            (0x73, 7) => Some(("vpslldq", Operation::Shl)),
+            _ => None,
+        }
+    }
+
     fn finalize_legacy_prefixes(
         prefixes: &Prefixes,
         mut decoded: DecodedInstruction,
@@ -81,6 +97,128 @@ impl X86_64Disassembler {
                 | "btr"
                 | "btc"
         )
+    }
+
+    fn decode_vector_shift_group(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        opcode: u8,
+    ) -> Result<Option<DecodedInstruction>, DecodeError> {
+        if !matches!(opcode, 0x71..=0x73) {
+            return Ok(None);
+        }
+
+        let vector_size = prefixes.vector_size();
+        let mut operand_prefixes = prefixes.clone();
+        operand_prefixes.rex = prefixes.effective_rex();
+
+        let (mnemonic, operation, dest, rm_operand, rm_consumed) = if let Some(evex) = prefixes.evex
+        {
+            if evex.mm != 1 || evex.pp != 1 {
+                return Ok(None);
+            }
+
+            let modrm_byte = *bytes.get(offset).ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+            let modrm = ModRM::parse_evex(modrm_byte, &evex);
+            let Some((mnemonic, operation)) =
+                Self::vector_shift_group_info(opcode, modrm.reg & 0x7)
+            else {
+                return Ok(None);
+            };
+            offset = offset.saturating_add(1);
+
+            let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
+            let memory_semantics = EvexMemorySemantics {
+                compressed_disp_scale: self.evex_compressed_disp8_scale(
+                    evex.mm,
+                    opcode,
+                    evex.pp,
+                    vector_size,
+                ),
+                allow_broadcast: false,
+            };
+            let (rm_operand, rm_consumed) = self
+                .decode_evex_modrm_rm(
+                    rm_bytes,
+                    modrm,
+                    &operand_prefixes,
+                    &evex,
+                    vector_size,
+                    memory_semantics,
+                )
+                .ok_or_else(|| {
+                    DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                })?;
+
+            (
+                self.format_evex_mnemonic(mnemonic, &evex, None),
+                operation,
+                Operand::Register(decode_xmm(evex.vvvvv(), vector_size)),
+                rm_operand,
+                rm_consumed,
+            )
+        } else if let Some(vex) = prefixes.vex {
+            if vex.mmmmm != 1 || vex.pp != 1 {
+                return Ok(None);
+            }
+
+            let modrm_byte = *bytes.get(offset).ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+            let modrm = ModRM::parse(modrm_byte, prefixes.effective_rex());
+            let Some((mnemonic, operation)) =
+                Self::vector_shift_group_info(opcode, modrm.reg & 0x7)
+            else {
+                return Ok(None);
+            };
+            offset = offset.saturating_add(1);
+
+            let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
+            let (rm_operand, rm_consumed) =
+                decode_modrm_rm_xmm(rm_bytes, modrm, &operand_prefixes, vector_size).ok_or_else(
+                    || DecodeError::truncated(address, offset.saturating_add(1), bytes.len()),
+                )?;
+
+            (
+                mnemonic.to_string(),
+                operation,
+                Operand::Register(decode_xmm(vex.vvvv, vector_size)),
+                rm_operand,
+                rm_consumed,
+            )
+        } else {
+            return Ok(None);
+        };
+
+        offset = offset.saturating_add(rm_consumed);
+
+        let imm = *bytes.get(offset).ok_or_else(|| {
+            DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+        })?;
+        offset = offset.saturating_add(1);
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+            operation,
+            mnemonic,
+            operands: vec![dest, rm_operand, Operand::imm(imm as i128, 8)],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+
+        Ok(Some(DecodedInstruction {
+            instruction,
+            size: offset,
+        }))
     }
 
     /// Decodes the condition for a conditional jump based on opcode.
@@ -1912,6 +2050,12 @@ impl X86_64Disassembler {
             return Ok(None);
         };
 
+        if let Some(decoded) =
+            self.decode_vector_shift_group(bytes, address, prefixes, offset, opcode)?
+        {
+            return Ok(Some(decoded));
+        }
+
         if opcode == 0x77 && vex.pp == 0 {
             let mnemonic = if vex.l { "vzeroall" } else { "vzeroupper" };
             let instruction = Instruction {
@@ -2486,6 +2630,12 @@ impl X86_64Disassembler {
         let opcode = bytes.get(offset).copied().unwrap_or(0);
         offset = offset.saturating_add(1);
 
+        if let Some(decoded) =
+            self.decode_vector_shift_group(bytes, address, prefixes, offset, opcode)?
+        {
+            return Ok(decoded);
+        }
+
         // Read ModR/M byte
         if offset >= bytes.len() {
             return Err(DecodeError::truncated(
@@ -2828,6 +2978,7 @@ impl X86_64Disassembler {
                     | 0x5E,
                     0 | 1,
                 )
+                | (0x71..=0x73, 1)
                 | (0x6F | 0x7F, 1 | 2)
                 | (0xE7, 1) => full_mem(),
                 // Scalar move/arithmetic forms use Tuple1Scalar.
@@ -4311,6 +4462,90 @@ mod tests {
             })
             .collect();
         assert_eq!(operand_names, vec!["ymm0", "ymm0", "ymm1"]);
+    }
+
+    #[test]
+    fn test_vex2_vpsrld_xmm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // C5 C9 72 D4 07 = vpsrld xmm6, xmm4, 0x7
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xc9, 0x72, 0xd4, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vpsrld");
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 3);
+        let operand_names: Vec<_> = result.instruction.operands[..2]
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(operand_names, vec!["xmm6", "xmm4"]);
+        assert_eq!(result.instruction.operands[2], Operand::imm(7, 8));
+    }
+
+    #[test]
+    fn test_vex2_vpsrld_ymm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // C5 CD 72 D4 07 = vpsrld ymm6, ymm4, 0x7
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xcd, 0x72, 0xd4, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vpsrld");
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 3);
+        let operand_names: Vec<_> = result.instruction.operands[..2]
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(operand_names, vec!["ymm6", "ymm4"]);
+        assert_eq!(result.instruction.operands[2], Operand::imm(7, 8));
+    }
+
+    #[test]
+    fn test_vex2_vpsllw_ymm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // C5 F5 71 F2 04 = vpsllw ymm1, ymm2, 0x4
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xf5, 0x71, 0xf2, 0x04], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vpsllw");
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 3);
+        let operand_names: Vec<_> = result.instruction.operands[..2]
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(operand_names, vec!["ymm1", "ymm2"]);
+        assert_eq!(result.instruction.operands[2], Operand::imm(4, 8));
+    }
+
+    #[test]
+    fn test_vex2_vpsrldq_ymm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // C5 D5 73 DE 10 = vpsrldq ymm5, ymm6, 0x10
+        let result = disasm
+            .decode_instruction(&[0xc5, 0xd5, 0x73, 0xde, 0x10], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vpsrldq");
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 3);
+        let operand_names: Vec<_> = result.instruction.operands[..2]
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(operand_names, vec!["ymm5", "ymm6"]);
+        assert_eq!(result.instruction.operands[2], Operand::imm(16, 8));
     }
 
     #[test]
