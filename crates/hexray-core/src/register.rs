@@ -317,6 +317,12 @@ pub mod x86 {
     // Flags
     pub const RFLAGS: u16 = 17;
 
+    // 8-bit legacy high registers.
+    pub const AH: u16 = 18;
+    pub const CH: u16 = 19;
+    pub const DH: u16 = 20;
+    pub const BH: u16 = 21;
+
     // Segment registers
     pub const CS: u16 = 32;
     pub const DS: u16 = 33;
@@ -478,6 +484,12 @@ fn x86_reg_name(id: u16, size: u16) -> &'static str {
         (x86::R13, 8) => "r13b",
         (x86::R14, 8) => "r14b",
         (x86::R15, 8) => "r15b",
+
+        // 8-bit legacy high
+        (x86::AH, 8) => "ah",
+        (x86::CH, 8) => "ch",
+        (x86::DH, 8) => "dh",
+        (x86::BH, 8) => "bh",
 
         // 16-bit extended registers (r8w-r15w)
         (x86::R8, 16) => "r8w",
@@ -1441,6 +1453,21 @@ mod tests {
             (x86::RDI, "dil"),
             (x86::R8, "r8b"),
             (x86::R9, "r9b"),
+        ];
+
+        for (id, expected) in names {
+            let reg = Register::new(Architecture::X86_64, RegisterClass::General, id, 8);
+            assert_eq!(reg.name(), expected, "Failed for register id {}", id);
+        }
+    }
+
+    #[test]
+    fn test_x86_64_gpr_8bit_high() {
+        let names = [
+            (x86::AH, "ah"),
+            (x86::CH, "ch"),
+            (x86::DH, "dh"),
+            (x86::BH, "bh"),
         ];
 
         for (id, expected) in names {

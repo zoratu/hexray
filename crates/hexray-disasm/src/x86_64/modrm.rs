@@ -92,12 +92,26 @@ impl Sib {
     }
 }
 
+fn decode_gpr_id(reg: u8, size: u16, rex_present: bool) -> u16 {
+    if size == 8 && !rex_present {
+        match reg {
+            4 => x86::AH,
+            5 => x86::CH,
+            6 => x86::DH,
+            7 => x86::BH,
+            _ => reg as u16,
+        }
+    } else {
+        reg as u16
+    }
+}
+
 /// Decode a register operand from a register number.
-pub fn decode_gpr(reg: u8, size: u16) -> Register {
+pub fn decode_gpr(reg: u8, size: u16, rex_present: bool) -> Register {
     Register::new(
         Architecture::X86_64,
         RegisterClass::General,
-        reg as u16,
+        decode_gpr_id(reg, size, rex_present),
         size,
     )
 }
@@ -155,8 +169,8 @@ fn decode_segment(segment: Segment) -> Register {
 }
 
 /// Decode the reg field of ModR/M as a register operand.
-pub fn decode_modrm_reg(modrm: ModRM, size: u16) -> Operand {
-    Operand::Register(decode_gpr(modrm.reg, size))
+pub fn decode_modrm_reg(modrm: ModRM, size: u16, rex_present: bool) -> Operand {
+    Operand::Register(decode_gpr(modrm.reg, size, rex_present))
 }
 
 /// Decode the reg field of ModR/M as an XMM/YMM register operand.
@@ -176,7 +190,10 @@ pub fn decode_modrm_rm(
 
     // Register operand
     if modrm.is_register() {
-        return Some((Operand::Register(decode_gpr(modrm.rm, operand_size)), 0));
+        return Some((
+            Operand::Register(decode_gpr(modrm.rm, operand_size, prefixes.rex.is_some())),
+            0,
+        ));
     }
 
     // Memory operand
@@ -202,7 +219,7 @@ pub fn decode_modrm_rm(
         // encoding names r12 and must be preserved.
         let raw_index = (sib_byte >> 3) & 0x7;
         if raw_index != 0x4 || prefixes.rex.is_some_and(|rex| rex.x) {
-            index = Some(decode_gpr(sib.index, 64));
+            index = Some(decode_gpr(sib.index, 64, false));
             scale = sib.scale_factor();
         }
 
@@ -212,7 +229,7 @@ pub fn decode_modrm_rm(
             // No base, just displacement (disp32)
             sib_disp32 = true;
         } else {
-            base = Some(decode_gpr(sib.base, 64));
+            base = Some(decode_gpr(sib.base, 64, false));
         }
     } else if (modrm.rm & 0x7) == 0x5 && modrm.mod_ == 0b00 {
         // RIP-relative addressing
@@ -245,7 +262,7 @@ pub fn decode_modrm_rm(
         ));
     } else {
         // Simple register addressing
-        base = Some(decode_gpr(modrm.rm, 64));
+        base = Some(decode_gpr(modrm.rm, 64, false));
     }
 
     // Read displacement

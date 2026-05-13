@@ -27,6 +27,10 @@ pub mod x86_regs {
     pub const R14: u16 = 14;
     pub const R15: u16 = 15;
     pub const RIP: u16 = 16;
+    pub const AH: u16 = 18;
+    pub const CH: u16 = 19;
+    pub const DH: u16 = 20;
+    pub const BH: u16 = 21;
 
     /// Get the register name.
     pub fn name(id: u16) -> &'static str {
@@ -48,6 +52,10 @@ pub mod x86_regs {
             R14 => "r14",
             R15 => "r15",
             RIP => "rip",
+            AH => "ah",
+            CH => "ch",
+            DH => "dh",
+            BH => "bh",
             _ => "unknown",
         }
     }
@@ -55,6 +63,16 @@ pub mod x86_regs {
     /// Get the 32-bit version of a 64-bit register.
     pub fn to_32bit(id: u16) -> u16 {
         id // Same ID, different size handling
+    }
+
+    pub fn high_byte_base(id: u16) -> Option<u16> {
+        match id {
+            AH => Some(RAX),
+            CH => Some(RCX),
+            DH => Some(RDX),
+            BH => Some(RBX),
+            _ => None,
+        }
     }
 }
 
@@ -351,5 +369,13 @@ mod tests {
             state.get_register(x86_regs::RAX),
             Value::Concrete(0x11223344556677FF)
         );
+    }
+
+    #[test]
+    fn test_high_byte_register_ids_alias_full_registers() {
+        assert_eq!(x86_regs::high_byte_base(x86_regs::AH), Some(x86_regs::RAX));
+        assert_eq!(x86_regs::high_byte_base(x86_regs::CH), Some(x86_regs::RCX));
+        assert_eq!(x86_regs::high_byte_base(x86_regs::DH), Some(x86_regs::RDX));
+        assert_eq!(x86_regs::high_byte_base(x86_regs::BH), Some(x86_regs::RBX));
     }
 }

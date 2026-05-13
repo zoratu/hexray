@@ -501,7 +501,7 @@ impl Disassembler for X86_64Disassembler {
                 // Register encoded in opcode
                 let reg_num =
                     (opcode & 0x07) | (prefixes.rex.map(|r| (r.b as u8) << 3).unwrap_or(0));
-                let reg = decode_gpr(reg_num, operand_size);
+                let reg = decode_gpr(reg_num, operand_size, prefixes.rex.is_some());
                 operands.push(Operand::Register(reg));
 
                 // For MOV r, imm variants (B0-BF), also read immediate
@@ -586,10 +586,18 @@ impl Disassembler for X86_64Disassembler {
                 match entry.encoding {
                     OperandEncoding::ModRmRm_Reg => {
                         operands.push(rm_operand);
-                        operands.push(decode_modrm_reg(modrm, reg_operand_size));
+                        operands.push(decode_modrm_reg(
+                            modrm,
+                            reg_operand_size,
+                            prefixes.rex.is_some(),
+                        ));
                     }
                     OperandEncoding::ModRmReg_Rm => {
-                        operands.push(decode_modrm_reg(modrm, reg_operand_size));
+                        operands.push(decode_modrm_reg(
+                            modrm,
+                            reg_operand_size,
+                            prefixes.rex.is_some(),
+                        ));
                         operands.push(rm_operand);
                     }
                     OperandEncoding::ModRmRmOnly => {
@@ -847,7 +855,11 @@ impl Disassembler for X86_64Disassembler {
                 offset = offset.saturating_add(1);
 
                 operands.push(rm_operand);
-                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(decode_modrm_reg(
+                    modrm,
+                    operand_size,
+                    prefixes.rex.is_some(),
+                ));
                 operands.push(Operand::imm_unsigned(imm as u64, 8));
             }
 
@@ -871,7 +883,11 @@ impl Disassembler for X86_64Disassembler {
                 offset = offset.saturating_add(rm_consumed);
 
                 operands.push(rm_operand);
-                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(decode_modrm_reg(
+                    modrm,
+                    operand_size,
+                    prefixes.rex.is_some(),
+                ));
                 operands.push(Operand::Register(Register::new(
                     Architecture::X86_64,
                     RegisterClass::General,
@@ -891,7 +907,7 @@ impl Disassembler for X86_64Disassembler {
                 } else {
                     32
                 };
-                let reg = decode_gpr(reg_num, reg_size);
+                let reg = decode_gpr(reg_num, reg_size, prefixes.rex.is_some());
                 operands.push(Operand::Register(reg));
             }
 
@@ -969,7 +985,11 @@ impl Disassembler for X86_64Disassembler {
                     (imm, 32)
                 };
 
-                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(decode_modrm_reg(
+                    modrm,
+                    operand_size,
+                    prefixes.rex.is_some(),
+                ));
                 operands.push(rm_operand);
                 operands.push(Operand::imm(imm_val, imm_size));
             }
@@ -1006,7 +1026,11 @@ impl Disassembler for X86_64Disassembler {
                 let imm = imm_remaining.first().copied().unwrap_or(0) as i8 as i128;
                 offset = offset.saturating_add(1);
 
-                operands.push(decode_modrm_reg(modrm, operand_size));
+                operands.push(decode_modrm_reg(
+                    modrm,
+                    operand_size,
+                    prefixes.rex.is_some(),
+                ));
                 operands.push(rm_operand);
                 operands.push(Operand::imm(imm, 8));
             }
@@ -2074,7 +2098,11 @@ impl X86_64Disassembler {
                 } else {
                     32
                 };
-                operands.push(Operand::Register(decode_gpr(modrm.reg, gpr_size)));
+                operands.push(Operand::Register(decode_gpr(
+                    modrm.reg,
+                    gpr_size,
+                    prefixes.rex.is_some(),
+                )));
                 operands.push(rm_operand);
             }
 
@@ -2097,7 +2125,11 @@ impl X86_64Disassembler {
                     })?;
                 offset = offset.saturating_add(rm_consumed);
 
-                operands.push(Operand::Register(decode_gpr(modrm.reg, gpr_size)));
+                operands.push(Operand::Register(decode_gpr(
+                    modrm.reg,
+                    gpr_size,
+                    prefixes.rex.is_some(),
+                )));
                 operands.push(rm_operand);
             }
         }
@@ -2937,8 +2969,8 @@ impl X86_64Disassembler {
 
                 // ANDN: dest=reg, src1=vvvv (to be inverted), src2=r/m
                 let operands = vec![
-                    decode_modrm_reg(modrm, operand_size),
-                    Operand::Register(decode_gpr(vex.vvvv, operand_size)),
+                    decode_modrm_reg(modrm, operand_size, prefixes.rex.is_some()),
+                    Operand::Register(decode_gpr(vex.vvvv, operand_size, prefixes.rex.is_some())),
                     rm_operand,
                 ];
                 ("andn", Operation::AndNot, operands)
@@ -2958,7 +2990,7 @@ impl X86_64Disassembler {
 
                 // VEX.vvvv is the destination, r/m is the source
                 let operands = vec![
-                    Operand::Register(decode_gpr(vex.vvvv, operand_size)),
+                    Operand::Register(decode_gpr(vex.vvvv, operand_size, prefixes.rex.is_some())),
                     rm_operand,
                 ];
                 (mnemonic, operation, operands)
@@ -2981,15 +3013,23 @@ impl X86_64Disassembler {
                 let operands = if vex.pp == 0 {
                     // BZHI: dest, src, index
                     vec![
-                        decode_modrm_reg(modrm, operand_size),
+                        decode_modrm_reg(modrm, operand_size, prefixes.rex.is_some()),
                         rm_operand,
-                        Operand::Register(decode_gpr(vex.vvvv, operand_size)),
+                        Operand::Register(decode_gpr(
+                            vex.vvvv,
+                            operand_size,
+                            prefixes.rex.is_some(),
+                        )),
                     ]
                 } else {
                     // PDEP/PEXT: dest, src1, mask
                     vec![
-                        decode_modrm_reg(modrm, operand_size),
-                        Operand::Register(decode_gpr(vex.vvvv, operand_size)),
+                        decode_modrm_reg(modrm, operand_size, prefixes.rex.is_some()),
+                        Operand::Register(decode_gpr(
+                            vex.vvvv,
+                            operand_size,
+                            prefixes.rex.is_some(),
+                        )),
                         rm_operand,
                     ]
                 };
@@ -3016,8 +3056,8 @@ impl X86_64Disassembler {
                 // Note: This is a 3-operand form where reg and vvvv are both destinations
                 // The implicit source is EDX/RDX
                 let operands = vec![
-                    decode_modrm_reg(modrm, operand_size),
-                    Operand::Register(decode_gpr(vex.vvvv, operand_size)),
+                    decode_modrm_reg(modrm, operand_size, prefixes.rex.is_some()),
+                    Operand::Register(decode_gpr(vex.vvvv, operand_size, prefixes.rex.is_some())),
                     rm_operand,
                 ];
                 ("mulx", Operation::MulNoFlags, operands)
@@ -3036,9 +3076,9 @@ impl X86_64Disassembler {
 
                 // All F7 variants: dest=reg, src=r/m, control=vvvv
                 let operands = vec![
-                    decode_modrm_reg(modrm, operand_size),
+                    decode_modrm_reg(modrm, operand_size, prefixes.rex.is_some()),
                     rm_operand,
-                    Operand::Register(decode_gpr(vex.vvvv, operand_size)),
+                    Operand::Register(decode_gpr(vex.vvvv, operand_size, prefixes.rex.is_some())),
                 ];
                 (mnemonic, operation, operands)
             }
@@ -3161,7 +3201,11 @@ impl X86_64Disassembler {
         let operands = if modrm.is_register() {
             // SMSW/LMSW can use register
             let operand_size = 16; // These instructions use 16-bit operand
-            vec![Operand::Register(decode_gpr(modrm.rm, operand_size))]
+            vec![Operand::Register(decode_gpr(
+                modrm.rm,
+                operand_size,
+                prefixes.rex.is_some(),
+            ))]
         } else {
             // Memory operand
             let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
@@ -3253,7 +3297,11 @@ impl X86_64Disassembler {
         // Decode operand - all these instructions use r/m16 operand
         let operand_size = 16;
         let operands = if modrm.is_register() {
-            vec![Operand::Register(decode_gpr(modrm.rm, operand_size))]
+            vec![Operand::Register(decode_gpr(
+                modrm.rm,
+                operand_size,
+                prefixes.rex.is_some(),
+            ))]
         } else {
             let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
             let (rm_operand, rm_consumed) =
@@ -3582,7 +3630,11 @@ impl X86_64Disassembler {
                             bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                             operation: Operation::CetReadSsp,
                             mnemonic: mnemonic.to_string(),
-                            operands: vec![Operand::Register(decode_gpr(modrm.rm, operand_size))],
+                            operands: vec![Operand::Register(decode_gpr(
+                                modrm.rm,
+                                operand_size,
+                                prefixes.rex.is_some(),
+                            ))],
                             control_flow: ControlFlow::Sequential,
                             reads: vec![],
                             writes: vec![],
@@ -3627,7 +3679,11 @@ impl X86_64Disassembler {
                     bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
                     operation: Operation::CetIncSsp,
                     mnemonic: mnemonic.to_string(),
-                    operands: vec![Operand::Register(decode_gpr(modrm.rm, operand_size))],
+                    operands: vec![Operand::Register(decode_gpr(
+                        modrm.rm,
+                        operand_size,
+                        prefixes.rex.is_some(),
+                    ))],
                     control_flow: ControlFlow::Sequential,
                     reads: vec![],
                     writes: vec![],
@@ -4022,6 +4078,42 @@ mod tests {
             .unwrap();
         assert_eq!(result.instruction.mnemonic, "xorps");
         assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_xor_rm8_reg8_uses_legacy_high_byte_without_rex() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm.decode_instruction(&[0x30, 0xe0], 0x1000).unwrap();
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(result.instruction.mnemonic, "xor");
+        assert_eq!(operand_names, vec!["al", "ah"]);
+    }
+
+    #[test]
+    fn test_xor_rm8_reg8_uses_spl_with_rex_prefix() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x40, 0x30, 0xe0], 0x1000)
+            .unwrap();
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| match operand {
+                Operand::Register(reg) => reg.name().to_string(),
+                _ => panic!("expected register operand"),
+            })
+            .collect();
+        assert_eq!(result.instruction.mnemonic, "xor");
+        assert_eq!(operand_names, vec!["al", "spl"]);
     }
 
     #[test]

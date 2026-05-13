@@ -84,10 +84,16 @@ fn read_operand(state: &MachineState, op: &Operand, inst: &Instruction) -> Value
             let full = state.get_register(reg.id);
             // reg.size is in bits
             match reg.size {
-                8 => full.trunc(8),
+                8 => {
+                    if let Some(base) = x86_regs::high_byte_base(reg.id) {
+                        state.get_register_8h(base)
+                    } else {
+                        state.get_register_8l(reg.id)
+                    }
+                }
                 16 => full.trunc(16),
                 32 => full.trunc(32),
-                _ => full, // 64-bit or larger
+                _ => state.get_register(reg.id), // 64-bit or larger
             }
         }
         Operand::Memory(mem) => {
@@ -116,7 +122,13 @@ fn write_operand(state: &mut MachineState, op: &Operand, value: Value, inst: &In
     match op {
         // reg.size is in bits
         Operand::Register(reg) => match reg.size {
-            8 => state.set_register_8l(reg.id, value),
+            8 => {
+                if let Some(base) = x86_regs::high_byte_base(reg.id) {
+                    state.set_register_8h(base, value);
+                } else {
+                    state.set_register_8l(reg.id, value);
+                }
+            }
             16 => state.set_register_16(reg.id, value),
             32 => state.set_register_32(reg.id, value),
             _ => state.set_register(reg.id, value), // 64-bit or larger
@@ -917,5 +929,22 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, EmulationError::DivisionByZero));
+    }
+
+    #[test]
+    fn test_high_byte_operands_alias_their_base_register() {
+        let mut state = MachineState::new();
+        state.set_register(x86_regs::RAX, Value::Concrete(0x1234));
+        state.set_register(x86_regs::RBX, Value::Concrete(0xf000));
+
+        let inst = make_inst(
+            Operation::Xor,
+            "xor",
+            vec![reg(x86_regs::AH, 8), reg(x86_regs::BH, 8)],
+        );
+
+        execute(&mut state, &inst).unwrap();
+
+        assert_eq!(state.get_register(x86_regs::RAX), Value::Concrete(0xe234));
     }
 }
