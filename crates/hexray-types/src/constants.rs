@@ -42,6 +42,8 @@ pub enum ConstantCategory {
     PollEvents,
     /// epoll_ctl operations
     EpollCtl,
+    /// epoll_create1() flags
+    EpollCreateFlags,
     /// *at() syscall flags (AT_FDCWD, AT_SYMLINK_NOFOLLOW, etc.)
     AtFlags,
     /// Signal handler values (SIG_IGN, SIG_DFL)
@@ -80,6 +82,14 @@ pub enum ConstantCategory {
     RlimitResource,
     /// dup3/pipe2/etc flags
     FdFlags,
+    /// signalfd() flags
+    SignalfdFlags,
+    /// eventfd() flags
+    EventfdFlags,
+    /// timerfd_*() flags
+    TimerfdFlags,
+    /// clockid_t values
+    ClockId,
 }
 
 /// A named constant with its value and category.
@@ -972,6 +982,12 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         description: Some("Modify fd in epoll"),
     });
     db.add(NamedConstant {
+        name: "EPOLL_CLOEXEC",
+        value: 0x80000,
+        category: EpollCreateFlags,
+        description: Some("Close the epoll fd on exec"),
+    });
+    db.add(NamedConstant {
         name: "EPOLLIN",
         value: 0x001,
         category: PollEvents,
@@ -994,6 +1010,18 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         value: 0x010,
         category: PollEvents,
         description: Some("Hang up"),
+    });
+    db.add(NamedConstant {
+        name: "EPOLLRDHUP",
+        value: 0x2000,
+        category: PollEvents,
+        description: Some("Peer closed connection"),
+    });
+    db.add(NamedConstant {
+        name: "EPOLLONESHOT",
+        value: 1 << 30,
+        category: PollEvents,
+        description: Some("One-shot event"),
     });
     db.add(NamedConstant {
         name: "EPOLLET",
@@ -2155,7 +2183,7 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
     // File descriptor flags (dup3, pipe2, etc.)
     db.add(NamedConstant {
         name: "O_CLOEXEC",
-        value: 0x1000000, // Linux value
+        value: 0x80000,
         category: FdFlags,
         description: Some("Close on exec"),
     });
@@ -2164,6 +2192,112 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         value: 0x800, // Linux value
         category: FdFlags,
         description: Some("Non-blocking I/O"),
+    });
+
+    // signalfd/eventfd/timerfd/epoll_create1 flags
+    db.add(NamedConstant {
+        name: "SFD_CLOEXEC",
+        value: 0x80000,
+        category: SignalfdFlags,
+        description: Some("Close on exec"),
+    });
+    db.add(NamedConstant {
+        name: "SFD_NONBLOCK",
+        value: 0x800,
+        category: SignalfdFlags,
+        description: Some("Non-blocking I/O"),
+    });
+    db.add(NamedConstant {
+        name: "EFD_CLOEXEC",
+        value: 0x80000,
+        category: EventfdFlags,
+        description: Some("Close on exec"),
+    });
+    db.add(NamedConstant {
+        name: "EFD_NONBLOCK",
+        value: 0x800,
+        category: EventfdFlags,
+        description: Some("Non-blocking I/O"),
+    });
+    db.add(NamedConstant {
+        name: "EFD_SEMAPHORE",
+        value: 0x1,
+        category: EventfdFlags,
+        description: Some("Semaphore-like eventfd semantics"),
+    });
+    db.add(NamedConstant {
+        name: "TFD_CLOEXEC",
+        value: 0x80000,
+        category: TimerfdFlags,
+        description: Some("Close on exec"),
+    });
+    db.add(NamedConstant {
+        name: "TFD_NONBLOCK",
+        value: 0x800,
+        category: TimerfdFlags,
+        description: Some("Non-blocking I/O"),
+    });
+    db.add(NamedConstant {
+        name: "TFD_TIMER_ABSTIME",
+        value: 0x1,
+        category: TimerfdFlags,
+        description: Some("Interpret timeout as absolute"),
+    });
+    db.add(NamedConstant {
+        name: "TFD_TIMER_CANCEL_ON_SET",
+        value: 0x2,
+        category: TimerfdFlags,
+        description: Some("Cancel on discontinuous clock changes"),
+    });
+
+    // Linux clock ids
+    db.add(NamedConstant {
+        name: "CLOCK_REALTIME",
+        value: 0,
+        category: ClockId,
+        description: Some("System-wide realtime clock"),
+    });
+    db.add(NamedConstant {
+        name: "CLOCK_MONOTONIC",
+        value: 1,
+        category: ClockId,
+        description: Some("Monotonic clock"),
+    });
+    db.add(NamedConstant {
+        name: "CLOCK_PROCESS_CPUTIME_ID",
+        value: 2,
+        category: ClockId,
+        description: Some("Per-process CPU-time clock"),
+    });
+    db.add(NamedConstant {
+        name: "CLOCK_THREAD_CPUTIME_ID",
+        value: 3,
+        category: ClockId,
+        description: Some("Per-thread CPU-time clock"),
+    });
+    db.add(NamedConstant {
+        name: "CLOCK_MONOTONIC_RAW",
+        value: 4,
+        category: ClockId,
+        description: Some("Raw hardware-based monotonic clock"),
+    });
+    db.add(NamedConstant {
+        name: "CLOCK_REALTIME_COARSE",
+        value: 5,
+        category: ClockId,
+        description: Some("Coarse realtime clock"),
+    });
+    db.add(NamedConstant {
+        name: "CLOCK_MONOTONIC_COARSE",
+        value: 6,
+        category: ClockId,
+        description: Some("Coarse monotonic clock"),
+    });
+    db.add(NamedConstant {
+        name: "CLOCK_BOOTTIME",
+        value: 7,
+        category: ClockId,
+        description: Some("Monotonic clock including suspend time"),
     });
 }
 
@@ -2407,6 +2541,9 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
         "poll" | "_poll" | "ppoll" | "_ppoll" => None, // events are in struct
         "read" | "_read" | "write" | "_write" if arg_index == 0 => Some(ConstantCategory::General),
         "epoll_ctl" | "_epoll_ctl" if arg_index == 1 => Some(ConstantCategory::EpollCtl),
+        "epoll_create1" | "_epoll_create1" if arg_index == 0 => {
+            Some(ConstantCategory::EpollCreateFlags)
+        }
         // *at() syscalls - first arg is directory fd (AT_FDCWD)
         "openat" | "_openat" | "fstatat" | "_fstatat" | "fstatat64" | "_fstatat64" | "fchmodat"
         | "_fchmodat" | "fchownat" | "_fchownat" | "linkat" | "_linkat" | "unlinkat"
@@ -2476,6 +2613,21 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
         // dup3, pipe2 (flags argument)
         "dup3" | "_dup3" if arg_index == 2 => Some(ConstantCategory::FdFlags),
         "pipe2" | "_pipe2" if arg_index == 1 => Some(ConstantCategory::FdFlags),
+        // signalfd/eventfd/timerfd/pidfd
+        "signalfd" | "_signalfd" if arg_index == 2 => Some(ConstantCategory::SignalfdFlags),
+        "signalfd4" | "_signalfd4" if arg_index == 3 => Some(ConstantCategory::SignalfdFlags),
+        "eventfd" | "_eventfd" | "eventfd2" | "_eventfd2" if arg_index == 1 => {
+            Some(ConstantCategory::EventfdFlags)
+        }
+        "timerfd_create" | "_timerfd_create" if arg_index == 0 => Some(ConstantCategory::ClockId),
+        "timerfd_create" | "_timerfd_create" | "timerfd_settime" | "_timerfd_settime"
+            if arg_index == 1 =>
+        {
+            Some(ConstantCategory::TimerfdFlags)
+        }
+        "pidfd_send_signal" | "_pidfd_send_signal" if arg_index == 1 => {
+            Some(ConstantCategory::Signal)
+        }
         _ => None,
     }
 }
@@ -2512,6 +2664,15 @@ mod tests {
         let flags = db.format_flags(0x3, ConstantCategory::MmapProt);
         assert!(flags.contains("PROT_READ"));
         assert!(flags.contains("PROT_WRITE"));
+
+        let timerfd_flags = db.format_flags(0x80800, ConstantCategory::TimerfdFlags);
+        assert!(timerfd_flags.contains("TFD_CLOEXEC"));
+        assert!(timerfd_flags.contains("TFD_NONBLOCK"));
+
+        let epoll_events = db.format_flags(0x40002001, ConstantCategory::PollEvents);
+        assert!(epoll_events.contains("EPOLLIN"));
+        assert!(epoll_events.contains("EPOLLRDHUP"));
+        assert!(epoll_events.contains("EPOLLONESHOT"));
     }
 
     #[test]
@@ -2527,6 +2688,36 @@ mod tests {
         assert_eq!(
             get_argument_category("mmap", 2),
             Some(ConstantCategory::MmapProt)
+        );
+        assert_eq!(
+            get_argument_category("epoll_create1", 0),
+            Some(ConstantCategory::EpollCreateFlags)
+        );
+        assert_eq!(
+            get_argument_category("timerfd_create", 0),
+            Some(ConstantCategory::ClockId)
+        );
+        assert_eq!(
+            get_argument_category("eventfd", 1),
+            Some(ConstantCategory::EventfdFlags)
+        );
+        assert_eq!(
+            get_argument_category("signalfd4", 3),
+            Some(ConstantCategory::SignalfdFlags)
+        );
+    }
+
+    #[test]
+    fn test_linux_clock_ids() {
+        let db = ConstantDatabase::with_builtins();
+
+        assert_eq!(
+            db.lookup(1, Some(ConstantCategory::ClockId)),
+            Some("CLOCK_MONOTONIC")
+        );
+        assert_eq!(
+            db.lookup(7, Some(ConstantCategory::ClockId)),
+            Some("CLOCK_BOOTTIME")
         );
     }
 }

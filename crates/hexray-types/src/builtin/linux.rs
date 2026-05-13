@@ -8,6 +8,14 @@ use crate::types::*;
 /// Returns the Linux x86_64 syscall name for the given ABI number when known.
 pub fn linux_x86_64_syscall_name(number: u64) -> Option<&'static str> {
     match number {
+        233 => Some("epoll_ctl"),
+        281 => Some("epoll_pwait"),
+        283 => Some("timerfd_create"),
+        286 => Some("timerfd_settime"),
+        287 => Some("timerfd_gettime"),
+        289 => Some("signalfd4"),
+        290 => Some("eventfd2"),
+        291 => Some("epoll_create1"),
         318 => Some("getrandom"),
         319 => Some("memfd_create"),
         322 => Some("execveat"),
@@ -23,6 +31,7 @@ pub fn linux_x86_64_syscall_name(number: u64) -> Option<&'static str> {
         332 => Some("statx"),
         333 => Some("io_pgetevents"),
         334 => Some("rseq"),
+        424 => Some("pidfd_send_signal"),
         425 => Some("io_uring_setup"),
         426 => Some("io_uring_enter"),
         427 => Some("io_uring_register"),
@@ -145,6 +154,10 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     utsname.finalize();
     db.add_type("struct utsname", CType::Struct(utsname));
 
+    db.add_typedef("clockid_t", CType::int());
+    db.add_typedef("sigset_t", CType::array(CType::ulong(), Some(16)));
+    db.add_typedef("siginfo_t", CType::Named("struct siginfo".to_string()));
+
     // struct sigaction (simplified)
     let mut sigaction = StructType::new(Some("sigaction".to_string()));
     sigaction.add_field("sa_handler".to_string(), CType::ptr(CType::void())); // Actually function pointer
@@ -156,6 +169,51 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     sigaction.add_field("sa_restorer".to_string(), CType::ptr(CType::void()));
     sigaction.finalize();
     db.add_type("struct sigaction", CType::Struct(sigaction));
+
+    let timespec_ty = db.get_type("struct timespec").cloned().unwrap_or_else(|| {
+        let mut timespec = StructType::new(Some("timespec".to_string()));
+        timespec.add_field("tv_sec".to_string(), CType::long());
+        timespec.add_field("tv_nsec".to_string(), CType::long());
+        timespec.finalize();
+        CType::Struct(timespec)
+    });
+
+    let mut signalfd_siginfo = StructType::new(Some("signalfd_siginfo".to_string()));
+    signalfd_siginfo.add_field("ssi_signo".to_string(), CType::uint());
+    signalfd_siginfo.add_field("ssi_errno".to_string(), CType::int());
+    signalfd_siginfo.add_field("ssi_code".to_string(), CType::int());
+    signalfd_siginfo.add_field("ssi_pid".to_string(), CType::uint());
+    signalfd_siginfo.add_field("ssi_uid".to_string(), CType::uint());
+    signalfd_siginfo.add_field("ssi_fd".to_string(), CType::int());
+    signalfd_siginfo.add_field("ssi_tid".to_string(), CType::uint());
+    signalfd_siginfo.add_field("ssi_band".to_string(), CType::uint());
+    signalfd_siginfo.add_field("ssi_overrun".to_string(), CType::uint());
+    signalfd_siginfo.add_field("ssi_trapno".to_string(), CType::uint());
+    signalfd_siginfo.add_field("ssi_status".to_string(), CType::int());
+    signalfd_siginfo.add_field("ssi_int".to_string(), CType::int());
+    signalfd_siginfo.add_field("ssi_ptr".to_string(), CType::ulonglong());
+    signalfd_siginfo.add_field("ssi_utime".to_string(), CType::ulonglong());
+    signalfd_siginfo.add_field("ssi_stime".to_string(), CType::ulonglong());
+    signalfd_siginfo.add_field("ssi_addr".to_string(), CType::ulonglong());
+    signalfd_siginfo.add_field("ssi_addr_lsb".to_string(), CType::ushort());
+    signalfd_siginfo.add_field("__pad".to_string(), CType::array(CType::uchar(), Some(46)));
+    signalfd_siginfo.finalize();
+    db.add_type("struct signalfd_siginfo", CType::Struct(signalfd_siginfo));
+
+    let mut itimerspec = StructType::new(Some("itimerspec".to_string()));
+    itimerspec.add_field("it_interval".to_string(), timespec_ty.clone());
+    itimerspec.add_field("it_value".to_string(), timespec_ty.clone());
+    itimerspec.finalize();
+    db.add_type("struct itimerspec", CType::Struct(itimerspec));
+
+    let mut epoll_data = UnionType::new(Some("epoll_data".to_string()));
+    epoll_data.add_member("ptr".to_string(), CType::ptr(CType::void()));
+    epoll_data.add_member("fd".to_string(), CType::int());
+    epoll_data.add_member("u32".to_string(), CType::uint());
+    epoll_data.add_member("u64".to_string(), CType::ulonglong());
+    epoll_data.finalize();
+    db.add_type("union epoll_data", CType::Union(epoll_data.clone()));
+    db.add_typedef("epoll_data_t", CType::Named("union epoll_data".to_string()));
 
     db.add_function(
         FunctionPrototype::new("sigaction", CType::int())
@@ -175,7 +233,7 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     let mut epoll_event = StructType::new(Some("epoll_event".to_string()));
     epoll_event.packed = true; // epoll_event is packed on x86_64
     epoll_event.add_field("events".to_string(), CType::uint());
-    epoll_event.add_field("data".to_string(), CType::ulonglong()); // epoll_data_t union
+    epoll_event.add_field("data".to_string(), CType::Union(epoll_data));
     epoll_event.finalize();
     db.add_type("struct epoll_event", CType::Struct(epoll_event));
 
@@ -324,6 +382,12 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     );
 
     db.add_function(
+        FunctionPrototype::new("epoll_create1", CType::int())
+            .param("flags", CType::int())
+            .doc("Create an epoll instance with flags"),
+    );
+
+    db.add_function(
         FunctionPrototype::new("epoll_ctl", CType::int())
             .param("epfd", CType::int())
             .param("op", CType::int())
@@ -346,6 +410,114 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
             .param("timeout", CType::int())
             .doc("Wait for an I/O event on an epoll file descriptor"),
     );
+
+    db.add_function(
+        FunctionPrototype::new("epoll_pwait", CType::int())
+            .param("epfd", CType::int())
+            .param(
+                "events",
+                CType::ptr(CType::Named("struct epoll_event".to_string())),
+            )
+            .param("maxevents", CType::int())
+            .param("timeout", CType::int())
+            .param("sigmask", CType::ptr(CType::typedef_ref("sigset_t")))
+            .doc("Wait for an I/O event on an epoll file descriptor with a signal mask"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("epoll_pwait2", CType::int())
+            .param("epfd", CType::int())
+            .param(
+                "events",
+                CType::ptr(CType::Named("struct epoll_event".to_string())),
+            )
+            .param("maxevents", CType::int())
+            .param(
+                "timeout",
+                CType::ptr(CType::Named("struct timespec".to_string())),
+            )
+            .param("sigmask", CType::ptr(CType::typedef_ref("sigset_t")))
+            .doc("Wait for an I/O event on an epoll file descriptor with nanosecond timeout"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("signalfd", CType::int())
+            .param("fd", CType::int())
+            .param("mask", CType::ptr(CType::typedef_ref("sigset_t")))
+            .param("flags", CType::int())
+            .doc("Create a file descriptor for accepting signals"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("signalfd4", CType::int())
+            .param("fd", CType::int())
+            .param("mask", CType::ptr(CType::typedef_ref("sigset_t")))
+            .param("sizemask", CType::typedef_ref("size_t"))
+            .param("flags", CType::int())
+            .doc("Create a file descriptor for accepting signals (raw syscall)"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("eventfd", CType::int())
+            .param("initval", CType::uint())
+            .param("flags", CType::int())
+            .doc("Create an eventfd object"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("eventfd2", CType::int())
+            .param("initval", CType::uint())
+            .param("flags", CType::int())
+            .doc("Create an eventfd object (raw syscall)"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("timerfd_create", CType::int())
+            .param("clockid", CType::typedef_ref("clockid_t"))
+            .param("flags", CType::int())
+            .doc("Create a timer file descriptor"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("timerfd_settime", CType::int())
+            .param("fd", CType::int())
+            .param("flags", CType::int())
+            .param(
+                "new_value",
+                CType::ptr(CType::Named("struct itimerspec".to_string())),
+            )
+            .param(
+                "old_value",
+                CType::ptr(CType::Named("struct itimerspec".to_string())),
+            )
+            .doc("Arm or disarm a timer file descriptor"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("timerfd_gettime", CType::int())
+            .param("fd", CType::int())
+            .param(
+                "curr_value",
+                CType::ptr(CType::Named("struct itimerspec".to_string())),
+            )
+            .doc("Get the current timer file descriptor setting"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("pidfd_open", CType::int())
+            .param("pid", CType::typedef_ref("pid_t"))
+            .param("flags", CType::uint())
+            .doc("Open a file descriptor for a process"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("pidfd_send_signal", CType::int())
+            .param("pidfd", CType::int())
+            .param("sig", CType::int())
+            .param("info", CType::ptr(CType::typedef_ref("siginfo_t")))
+            .param("flags", CType::uint())
+            .doc("Send a signal via a pidfd"),
+    );
 }
 
 #[cfg(test)]
@@ -361,10 +533,15 @@ mod tests {
 
         assert!(db.has_type("struct stat"));
         assert!(db.has_type("struct dirent"));
+        assert!(db.has_type("struct itimerspec"));
+        assert!(db.has_type("struct signalfd_siginfo"));
+        assert!(db.has_type("union epoll_data"));
         assert!(db.has_function("mmap"));
         assert!(db.has_function("socket"));
         assert!(db.has_function("sigaction"));
         assert!(db.has_function("syscall"));
+        assert!(db.has_function("timerfd_create"));
+        assert!(db.has_function("signalfd4"));
     }
 
     #[test]
@@ -397,10 +574,34 @@ mod tests {
 
     #[test]
     fn test_linux_x86_64_syscall_name_modern_entries() {
+        assert_eq!(linux_x86_64_syscall_name(233), Some("epoll_ctl"));
+        assert_eq!(linux_x86_64_syscall_name(281), Some("epoll_pwait"));
+        assert_eq!(linux_x86_64_syscall_name(283), Some("timerfd_create"));
+        assert_eq!(linux_x86_64_syscall_name(424), Some("pidfd_send_signal"));
         assert_eq!(linux_x86_64_syscall_name(318), Some("getrandom"));
         assert_eq!(linux_x86_64_syscall_name(425), Some("io_uring_setup"));
         assert_eq!(linux_x86_64_syscall_name(426), Some("io_uring_enter"));
         assert_eq!(linux_x86_64_syscall_name(462), Some("mseal"));
         assert_eq!(linux_x86_64_syscall_name(317), None);
+    }
+
+    #[test]
+    fn test_linux_eventfd_and_timerfd_struct_layouts() {
+        let mut db = TypeDatabase::new();
+        load_posix_types(&mut db);
+        load_linux_types(&mut db);
+
+        assert_eq!(
+            db.get_type("struct epoll_event").and_then(CType::size),
+            Some(12)
+        );
+        assert_eq!(
+            db.get_type("struct itimerspec").and_then(CType::size),
+            Some(32)
+        );
+        assert_eq!(
+            db.get_type("struct signalfd_siginfo").and_then(CType::size),
+            Some(128)
+        );
     }
 }

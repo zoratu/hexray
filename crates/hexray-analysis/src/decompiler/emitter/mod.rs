@@ -3569,9 +3569,14 @@ impl PseudoCodeEmitter {
                     // For flag-type arguments, try to format as combined flags
                     match category {
                         ConstantCategory::OpenFlags
+                        | ConstantCategory::FdFlags
                         | ConstantCategory::MmapProt
                         | ConstantCategory::MmapFlags
-                        | ConstantCategory::PollEvents => {
+                        | ConstantCategory::PollEvents
+                        | ConstantCategory::EpollCreateFlags
+                        | ConstantCategory::SignalfdFlags
+                        | ConstantCategory::EventfdFlags
+                        | ConstantCategory::TimerfdFlags => {
                             return const_db.format_flags(*value, category);
                         }
                         ConstantCategory::FileMode => {
