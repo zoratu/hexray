@@ -663,6 +663,8 @@ impl IndirectCallResolver {
         match operand {
             Operand::Immediate(imm) => ConstValue::Constant(imm.value),
             Operand::Register(reg) => state.get(&Location::Register(reg.id)),
+            Operand::Arm64SveVector(reg) => state.get(&Location::Register(reg.reg.id)),
+            Operand::Arm64SvePredicate(pred) => state.get(&Location::Register(pred.reg.id)),
             Operand::Memory(_) => ConstValue::NotConstant,
             Operand::PcRelative { target, .. } => ConstValue::Constant(*target as i128),
         }

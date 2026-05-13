@@ -4443,9 +4443,8 @@ mod tests {
     #[test]
     fn test_sve_cntd() {
         let disasm = Arm64Disassembler::new();
-        // CNTD X0: 0x04EE0FE0
-        // Encoding: 0000_0100_11_10_1110_0000_11_11111_00000
-        let bytes = [0xE0, 0x0F, 0xEE, 0x04];
+        // CNTD X0: 0x04E0E3E0
+        let bytes = [0xE0, 0xE3, 0xE0, 0x04];
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "cntd");
         assert_eq!(result.instruction.operation, Operation::SveCount);
@@ -4455,9 +4454,8 @@ mod tests {
     #[test]
     fn test_sve_cntb() {
         let disasm = Arm64Disassembler::new();
-        // CNTB X0: 0x042E0FE0
-        // Encoding: 0000_0100_00_10_1110_0000_11_11111_00000
-        let bytes = [0xE0, 0x0F, 0x2E, 0x04];
+        // CNTB X0: 0x0420E3E0
+        let bytes = [0xE0, 0xE3, 0x20, 0x04];
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "cntb");
         assert_eq!(result.instruction.operation, Operation::SveCount);
@@ -4466,9 +4464,8 @@ mod tests {
     #[test]
     fn test_sve_cnth() {
         let disasm = Arm64Disassembler::new();
-        // CNTH X1: 0x046E0FE1
-        // Encoding: 0000_0100_01_10_1110_0000_11_11111_00001
-        let bytes = [0xE1, 0x0F, 0x6E, 0x04];
+        // CNTH X1: 0x0460E3E1
+        let bytes = [0xE1, 0xE3, 0x60, 0x04];
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "cnth");
         assert_eq!(result.instruction.operation, Operation::SveCount);
@@ -4477,9 +4474,8 @@ mod tests {
     #[test]
     fn test_sve_cntw() {
         let disasm = Arm64Disassembler::new();
-        // CNTW X2: 0x04AE0FE2
-        // Encoding: 0000_0100_10_10_1110_0000_11_11111_00010
-        let bytes = [0xE2, 0x0F, 0xAE, 0x04];
+        // CNTW X2: 0x04A0E3E2
+        let bytes = [0xE2, 0xE3, 0xA0, 0x04];
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "cntw");
         assert_eq!(result.instruction.operation, Operation::SveCount);

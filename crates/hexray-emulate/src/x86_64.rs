@@ -62,6 +62,7 @@ fn operand_size(op: &Operand) -> u32 {
     match op {
         // Register.size is already in bits
         Operand::Register(reg) => reg.size as u32,
+        Operand::Arm64SveVector(_) | Operand::Arm64SvePredicate(_) => 64,
         // MemoryRef.size is in bytes, convert to bits
         Operand::Memory(mem) => (mem.size as u32) * 8,
         Operand::Immediate(_) => 64,
@@ -96,6 +97,8 @@ fn read_operand(state: &MachineState, op: &Operand, inst: &Instruction) -> Value
                 _ => state.get_register(reg.id), // 64-bit or larger
             }
         }
+        Operand::Arm64SveVector(reg) => state.get_register(reg.reg.id),
+        Operand::Arm64SvePredicate(pred) => state.get_register(pred.reg.id),
         Operand::Memory(mem) => {
             let addr = compute_effective_address(state, mem, inst);
             match addr {
@@ -133,6 +136,8 @@ fn write_operand(state: &mut MachineState, op: &Operand, value: Value, inst: &In
             32 => state.set_register_32(reg.id, value),
             _ => state.set_register(reg.id, value), // 64-bit or larger
         },
+        Operand::Arm64SveVector(reg) => state.set_register(reg.reg.id, value),
+        Operand::Arm64SvePredicate(pred) => state.set_register(pred.reg.id, value),
         Operand::Memory(mem) => {
             let addr = compute_effective_address(state, mem, inst);
             if let Value::Concrete(a) = addr {

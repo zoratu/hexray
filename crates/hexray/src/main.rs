@@ -2505,6 +2505,191 @@ fn format_disassembly_operand(
     }
 }
 
+fn format_arm64_sve_operands_for_output(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    symbols: &[hexray_core::Symbol],
+    relocations: &RelocationTable,
+    instruction: &hexray_core::Instruction,
+) -> Option<String> {
+    let styles = arm64_sve_render_styles_for_output(instruction)?;
+    if instruction.operands.len() != styles.len() {
+        return None;
+    }
+
+    instruction
+        .operands
+        .iter()
+        .zip(styles.iter().copied())
+        .map(|(operand, style)| {
+            format_arm64_sve_operand_for_output(
+                fmt,
+                project,
+                symbols,
+                relocations,
+                instruction,
+                operand,
+                style,
+            )
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|operands| operands.join(", "))
+}
+
+#[derive(Clone, Copy)]
+enum Arm64SveRenderStyle {
+    Default,
+    VectorList,
+    Pattern,
+    Multiplier,
+    Memory,
+}
+
+fn arm64_sve_render_styles_for_output(
+    instruction: &hexray_core::Instruction,
+) -> Option<Vec<Arm64SveRenderStyle>> {
+    match instruction.mnemonic.as_str() {
+        mnemonic if mnemonic.starts_with("ld1") || mnemonic.starts_with("st1") => {
+            if instruction.operands.len() == 3 {
+                Some(vec![
+                    Arm64SveRenderStyle::VectorList,
+                    Arm64SveRenderStyle::Default,
+                    Arm64SveRenderStyle::Memory,
+                ])
+            } else {
+                None
+            }
+        }
+        "ptrue" => Some(match instruction.operands.len() {
+            1 => vec![Arm64SveRenderStyle::Default],
+            2 => vec![Arm64SveRenderStyle::Default, Arm64SveRenderStyle::Pattern],
+            _ => return None,
+        }),
+        "cntb" | "cnth" | "cntw" | "cntd" | "incb" | "inch" | "incw" | "incd" => {
+            Some(match instruction.operands.len() {
+                1 => vec![Arm64SveRenderStyle::Default],
+                2 => vec![Arm64SveRenderStyle::Default, Arm64SveRenderStyle::Pattern],
+                3 => vec![
+                    Arm64SveRenderStyle::Default,
+                    Arm64SveRenderStyle::Pattern,
+                    Arm64SveRenderStyle::Multiplier,
+                ],
+                _ => return None,
+            })
+        }
+        _ if instruction.operands.iter().any(|operand| {
+            matches!(
+                operand,
+                hexray_core::Operand::Arm64SveVector(_)
+                    | hexray_core::Operand::Arm64SvePredicate(_)
+            )
+        }) =>
+        {
+            Some(vec![
+                Arm64SveRenderStyle::Default;
+                instruction.operands.len()
+            ])
+        }
+        _ => None,
+    }
+}
+
+fn format_arm64_sve_operand_for_output(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    symbols: &[hexray_core::Symbol],
+    relocations: &RelocationTable,
+    instruction: &hexray_core::Instruction,
+    operand: &hexray_core::Operand,
+    style: Arm64SveRenderStyle,
+) -> Option<String> {
+    match style {
+        Arm64SveRenderStyle::Default => Some(format_disassembly_operand(
+            fmt,
+            project,
+            symbols,
+            relocations,
+            instruction,
+            operand,
+        )),
+        Arm64SveRenderStyle::VectorList => match operand {
+            hexray_core::Operand::Arm64SveVector(_) => Some(format!(
+                "{{ {} }}",
+                format_disassembly_operand(
+                    fmt,
+                    project,
+                    symbols,
+                    relocations,
+                    instruction,
+                    operand,
+                )
+            )),
+            _ => None,
+        },
+        Arm64SveRenderStyle::Pattern => match operand {
+            hexray_core::Operand::Immediate(imm) => {
+                Some(render_arm64_sve_pattern(imm.as_u64() as u8))
+            }
+            _ => None,
+        },
+        Arm64SveRenderStyle::Multiplier => match operand {
+            hexray_core::Operand::Immediate(imm) => Some(format!("mul #{}", imm.as_u64())),
+            _ => None,
+        },
+        Arm64SveRenderStyle::Memory => format_arm64_sve_memory_for_output(operand),
+    }
+}
+
+fn format_arm64_sve_memory_for_output(operand: &hexray_core::Operand) -> Option<String> {
+    let hexray_core::Operand::Memory(mem) = operand else {
+        return None;
+    };
+    let base = mem.base.as_ref()?;
+
+    if let Some(index) = &mem.index {
+        let mut rendered = format!("[{}, {}", base.name(), index.name());
+        if mem.scale > 1 {
+            rendered.push_str(&format!(", lsl #{}", mem.scale.trailing_zeros()));
+        }
+        rendered.push(']');
+        return Some(rendered);
+    }
+
+    if mem.displacement == 0 {
+        return Some(format!("[{}]", base.name()));
+    }
+
+    let offset = if mem.displacement < 0 {
+        format!("#-{:#x}", -mem.displacement)
+    } else {
+        format!("#{:#x}", mem.displacement)
+    };
+    Some(format!("[{}, {}, mul vl]", base.name(), offset))
+}
+
+fn render_arm64_sve_pattern(pattern: u8) -> String {
+    match pattern {
+        0x00 => "pow2".to_string(),
+        0x01 => "vl1".to_string(),
+        0x02 => "vl2".to_string(),
+        0x03 => "vl3".to_string(),
+        0x04 => "vl4".to_string(),
+        0x05 => "vl5".to_string(),
+        0x06 => "vl6".to_string(),
+        0x07 => "vl7".to_string(),
+        0x08 => "vl8".to_string(),
+        0x09 => "vl16".to_string(),
+        0x0A => "vl32".to_string(),
+        0x0B => "vl64".to_string(),
+        0x0C => "vl128".to_string(),
+        0x0D => "vl256".to_string(),
+        0x1D => "mul4".to_string(),
+        0x1E => "mul3".to_string(),
+        0x1F => "all".to_string(),
+        _ => format!("#{}", pattern),
+    }
+}
+
 fn format_arm64_structure_ldst_operands_for_output(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
@@ -2650,6 +2835,11 @@ fn format_instruction_for_output(
     rendered.push(' ');
     rendered.push_str(&instruction.mnemonic);
     if let Some(operands) = format_arm64_crypto_operands_for_output(instruction) {
+        rendered.push(' ');
+        rendered.push_str(&operands);
+    } else if let Some(operands) =
+        format_arm64_sve_operands_for_output(fmt, project, symbols, relocations, instruction)
+    {
         rendered.push(' ');
         rendered.push_str(&operands);
     } else if let Some(operands) = format_arm64_structure_ldst_operands_for_output(

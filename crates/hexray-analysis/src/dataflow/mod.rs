@@ -412,6 +412,12 @@ impl InstructionEffects {
             Operand::Register(reg) => {
                 self.uses.push(Location::from_register(reg));
             }
+            Operand::Arm64SveVector(reg) => {
+                self.uses.push(Location::from_register(&reg.reg));
+            }
+            Operand::Arm64SvePredicate(pred) => {
+                self.uses.push(Location::from_register(&pred.reg));
+            }
             Operand::Memory(mem) => {
                 // Memory read uses the address components
                 self.add_address_uses(&Operand::Memory(mem.clone()));

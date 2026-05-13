@@ -295,6 +295,8 @@ impl ConstantPropagation {
         match operand {
             Operand::Immediate(imm) => ConstValue::Constant(imm.value),
             Operand::Register(reg) => state.get(&Location::Register(reg.id)),
+            Operand::Arm64SveVector(reg) => state.get(&Location::Register(reg.reg.id)),
+            Operand::Arm64SvePredicate(pred) => state.get(&Location::Register(pred.reg.id)),
             Operand::Memory(_) => ConstValue::NotConstant, // Conservative for memory
             Operand::PcRelative { target, .. } => ConstValue::Constant(*target as i128),
         }
@@ -349,6 +351,8 @@ impl ConstantPropagation {
 fn operand_to_location(operand: &Operand) -> Option<Location> {
     match operand {
         Operand::Register(reg) => Some(Location::Register(reg.id)),
+        Operand::Arm64SveVector(reg) => Some(Location::Register(reg.reg.id)),
+        Operand::Arm64SvePredicate(pred) => Some(Location::Register(pred.reg.id)),
         _ => None,
     }
 }

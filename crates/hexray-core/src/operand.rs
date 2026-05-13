@@ -8,6 +8,10 @@ use crate::Register;
 pub enum Operand {
     /// Register operand.
     Register(Register),
+    /// ARM64 SVE scalable vector register with an element suffix.
+    Arm64SveVector(Arm64SveVectorOperand),
+    /// ARM64 SVE predicate register with optional element suffix and `/z` or `/m` mode.
+    Arm64SvePredicate(Arm64SvePredicateOperand),
     /// Immediate value.
     Immediate(Immediate),
     /// Memory reference.
@@ -25,6 +29,24 @@ impl Operand {
     /// Creates a register operand.
     pub fn reg(reg: Register) -> Self {
         Self::Register(reg)
+    }
+
+    /// Creates an ARM64 SVE vector register operand.
+    pub fn arm64_sve_vector(reg: Register, element_size: Arm64SveElementSize) -> Self {
+        Self::Arm64SveVector(Arm64SveVectorOperand { reg, element_size })
+    }
+
+    /// Creates an ARM64 SVE predicate register operand.
+    pub fn arm64_sve_predicate(
+        reg: Register,
+        element_size: Option<Arm64SveElementSize>,
+        mode: Option<Arm64SvePredicateMode>,
+    ) -> Self {
+        Self::Arm64SvePredicate(Arm64SvePredicateOperand {
+            reg,
+            element_size,
+            mode,
+        })
     }
 
     /// Creates an immediate operand.
@@ -52,7 +74,10 @@ impl Operand {
 
     /// Returns true if this is a register operand.
     pub fn is_register(&self) -> bool {
-        matches!(self, Self::Register(_))
+        matches!(
+            self,
+            Self::Register(_) | Self::Arm64SveVector(_) | Self::Arm64SvePredicate(_)
+        )
     }
 
     /// Returns true if this is an immediate operand.
@@ -64,6 +89,69 @@ impl Operand {
     pub fn is_memory(&self) -> bool {
         matches!(self, Self::Memory(_))
     }
+}
+
+/// ARM64 SVE element size suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Arm64SveElementSize {
+    Byte,
+    Halfword,
+    Word,
+    Doubleword,
+}
+
+impl Arm64SveElementSize {
+    /// Returns the assembly suffix for this element size.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Byte => ".b",
+            Self::Halfword => ".h",
+            Self::Word => ".s",
+            Self::Doubleword => ".d",
+        }
+    }
+}
+
+/// ARM64 SVE predicate register mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Arm64SvePredicateMode {
+    /// Zero inactive elements.
+    Zeroing,
+    /// Merge inactive elements from the destination.
+    Merging,
+}
+
+impl Arm64SvePredicateMode {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Zeroing => "/z",
+            Self::Merging => "/m",
+        }
+    }
+}
+
+/// ARM64 SVE scalable vector operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Arm64SveVectorOperand {
+    /// The underlying `zN` register.
+    pub reg: Register,
+    /// The lane width suffix used for this operand.
+    pub element_size: Arm64SveElementSize,
+}
+
+/// ARM64 SVE predicate operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Arm64SvePredicateOperand {
+    /// The underlying `pN` register.
+    pub reg: Register,
+    /// Optional lane width suffix used by instructions like `ptrue` and `whilelt`.
+    pub element_size: Option<Arm64SveElementSize>,
+    /// Optional predicate mode suffix such as `/z` or `/m`.
+    pub mode: Option<Arm64SvePredicateMode>,
 }
 
 /// Immediate value operand.
@@ -269,6 +357,19 @@ impl std::fmt::Display for Operand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Register(reg) => write!(f, "{}", reg.name()),
+            Self::Arm64SveVector(reg) => {
+                write!(f, "{}{}", reg.reg.name(), reg.element_size.suffix())
+            }
+            Self::Arm64SvePredicate(pred) => {
+                write!(f, "{}", pred.reg.name())?;
+                if let Some(element_size) = pred.element_size {
+                    write!(f, "{}", element_size.suffix())?;
+                }
+                if let Some(mode) = pred.mode {
+                    write!(f, "{}", mode.suffix())?;
+                }
+                Ok(())
+            }
             Self::Immediate(imm) => {
                 if imm.signed && imm.value < 0 {
                     write!(f, "-{:#x}", -imm.value)

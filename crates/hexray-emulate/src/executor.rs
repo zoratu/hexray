@@ -294,6 +294,8 @@ impl Emulator {
             hexray_core::Operand::Immediate(imm) => Value::Concrete(imm.as_u64()),
             hexray_core::Operand::PcRelative { target, .. } => Value::Concrete(*target),
             hexray_core::Operand::Register(reg) => self.state.get_register(reg.id),
+            hexray_core::Operand::Arm64SveVector(_)
+            | hexray_core::Operand::Arm64SvePredicate(_) => Value::Unknown,
             hexray_core::Operand::Memory(mem) => {
                 // Indirect call through memory
                 let addr = self.compute_memory_address(mem, inst);

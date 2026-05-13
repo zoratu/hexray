@@ -227,6 +227,16 @@ impl<'a> SsaBuilder<'a> {
                 let version = self.current_def(&loc);
                 SsaOperand::Value(SsaValue::new(loc, version))
             }
+            Operand::Arm64SveVector(reg) => {
+                let loc = Location::from_register(&reg.reg);
+                let version = self.current_def(&loc);
+                SsaOperand::Value(SsaValue::new(loc, version))
+            }
+            Operand::Arm64SvePredicate(pred) => {
+                let loc = Location::from_register(&pred.reg);
+                let version = self.current_def(&loc);
+                SsaOperand::Value(SsaValue::new(loc, version))
+            }
             Operand::Immediate(imm) => SsaOperand::Immediate(imm.value),
             Operand::Memory(mem) => {
                 let base = mem.base.as_ref().map(|r| {

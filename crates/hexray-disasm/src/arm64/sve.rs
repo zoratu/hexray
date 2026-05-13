@@ -18,8 +18,8 @@
 
 use crate::DecodedInstruction;
 use hexray_core::{
-    register::arm64, Architecture, Instruction, MemoryRef, Operand, Operation, Register,
-    RegisterClass,
+    register::arm64, Architecture, Arm64SveElementSize, Arm64SvePredicateMode, Instruction,
+    MemoryRef, Operand, Operation, Register, RegisterClass,
 };
 
 /// SVE decoder implementation.
@@ -69,6 +69,11 @@ impl SveDecoder {
         // SVE2 crypto instructions: bits [31:24] = 0100_0101 (0x45)
         // This includes AES, SM4, SHA3 operations
         if bits_31_24 == 0x45 {
+            return true;
+        }
+
+        // Predicated SVE floating-point arithmetic: bits [31:24] = 0110_0101 (0x65)
+        if bits_31_24 == 0x65 {
             return true;
         }
 
@@ -125,6 +130,9 @@ impl SveDecoder {
             // SVE2 crypto and complex integer operations (0x45)
             0x45 => self.decode_sve2_crypto(insn, address, bytes),
 
+            // SVE floating-point arithmetic (0x65)
+            0x65 => self.decode_sve_fp_arith(insn, address, bytes),
+
             // SVE memory operations (loads: 0x84, 0x85, 0xA4, 0xA5; stores: 0xE4, 0xE5)
             0x84 | 0x85 | 0xA4 | 0xA5 | 0xE4 | 0xE5 => self.decode_sve_memory(insn, address, bytes),
 
@@ -139,25 +147,27 @@ impl SveDecoder {
         address: u64,
         bytes: Vec<u8>,
     ) -> Option<DecodedInstruction> {
-        // Check for element count instructions (CNTB, CNTH, CNTW, CNTD)
-        // Encoding: 0000_0100_ss_10_1110_imm4_11_ppppp_ddddd
-        // bits 21-16 = 0x2E (101110), bits 11-10 = 11
-        let bits_21_16 = (insn >> 16) & 0x3F;
-        let bits_11_10 = (insn >> 10) & 0x3;
+        let bits_31_24 = (insn >> 24) & 0xFF;
+        let bits_15_13 = (insn >> 13) & 0x7;
 
-        // Element count: bits [21:16] = 0b101110 (0x2E), bits [11:10] = 0b11
-        if bits_21_16 == 0b101110 && bits_11_10 == 0b11 {
-            return self.decode_sve_cnt(insn, address, bytes);
+        // CNT*/INC*: fixed low bits with size in [23:22] and INC in bit 20.
+        if bits_31_24 == 0x04 && (insn & 0xFF0F_E3E0) == 0x0400_E3E0 {
+            return self.decode_sve_cnt_inc(insn, address, bytes);
         }
 
-        // Check for DUP (scalar to vector)
-        // Encoding: 0000_0101_ss_10_0000_0011_10_nnnnn_ddddd
-        let bits_31_24 = (insn >> 24) & 0xFF;
-        let bits_23_20 = (insn >> 20) & 0xF;
-        let bits_15_10 = (insn >> 10) & 0x3F;
-
-        if bits_31_24 == 0x05 && bits_23_20 == 0b0010 && (bits_15_10 & 0x3E) == 0x38 {
+        // DUP (scalar to vector): DUP Zd.<T>, Wn/Xn
+        if bits_31_24 == 0x05 && ((insn >> 16) & 0x3F) == 0x20 && ((insn >> 10) & 0x3F) == 0x0E {
             return self.decode_sve_dup(insn, address, bytes);
+        }
+
+        // MOV Zd.<T>, Pg/M, Zn.<T> alias of SEL when Zm == Zd.
+        if bits_31_24 == 0x05 && bits_15_13 == 0b110 && ((insn >> 16) & 0x1F) == (insn & 0x1F) {
+            return self.decode_sve_mov_predicated_vector(insn, address, bytes);
+        }
+
+        // MOV Zd.<T>, Pg/M, <Bn|Hn|Sn|Dn> alias of CPY (SIMD&FP scalar).
+        if bits_31_24 == 0x05 && ((insn >> 16) & 0x3F) == 0x20 && bits_15_13 == 0b100 {
+            return self.decode_sve_mov_predicated_scalar(insn, address, bytes);
         }
 
         // Check for integer binary operations (ADD, SUB, MUL, etc.)
@@ -182,7 +192,6 @@ impl SveDecoder {
         // SVE2 bit manipulation (under 0x05)
         if bits_31_24 == 0x05 {
             // Check for BDEP/BEXT/BGRP patterns
-            let bits_15_13 = (insn >> 13) & 0x7;
             if bits_15_13 == 0b101 || bits_15_13 == 0b110 {
                 return self.decode_sve2_bit_manipulation(insn, address, bytes);
             }
@@ -190,6 +199,193 @@ impl SveDecoder {
 
         // Fallback: generic SVE instruction
         self.decode_sve_generic(insn, address, bytes)
+    }
+
+    /// Decode predicated SVE floating-point arithmetic.
+    fn decode_sve_fp_arith(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Option<DecodedInstruction> {
+        let element_size = Self::sve_fp_element_size((insn >> 22) & 0x3)?;
+        let pg = ((insn >> 10) & 0x7) as u16;
+        let pred = Operand::arm64_sve_predicate(
+            Self::preg(pg),
+            None,
+            Some(Arm64SvePredicateMode::Merging),
+        );
+
+        // Fused multiply-add/subtract family:
+        // mnemonic Zd.<T>, Pg/M, Zn.<T>, Zm.<T>
+        if ((insn >> 21) & 0x1) == 1 {
+            let zm = ((insn >> 16) & 0x1F) as u16;
+            let opc = (insn >> 13) & 0x7;
+            let zn = ((insn >> 5) & 0x1F) as u16;
+            let zd = (insn & 0x1F) as u16;
+
+            let (mnemonic, operation) = match opc {
+                0b000 => ("fmla", Operation::Add),
+                0b001 => ("fmls", Operation::Sub),
+                0b010 => ("fnmla", Operation::Add),
+                0b011 => ("fnmls", Operation::Sub),
+                _ => return self.decode_sve_generic(insn, address, bytes),
+            };
+
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(operation)
+                .with_operands(vec![
+                    Self::sve_z_operand(zd, element_size),
+                    pred,
+                    Self::sve_z_operand(zn, element_size),
+                    Self::sve_z_operand(zm, element_size),
+                ]);
+
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
+        }
+
+        // Destructive binary family:
+        // mnemonic Zdn.<T>, Pg/M, Zdn.<T>, Zm.<T>
+        if ((insn >> 13) & 0x7) == 0b100 {
+            let opc = (insn >> 16) & 0x1F;
+            let zm = ((insn >> 5) & 0x1F) as u16;
+            let zdn = (insn & 0x1F) as u16;
+
+            let (mnemonic, operation) = match opc {
+                0b00000 => ("fadd", Operation::Add),
+                0b00001 => ("fsub", Operation::Sub),
+                0b00010 => ("fmul", Operation::Mul),
+                0b01101 => ("fdiv", Operation::Div),
+                _ => return self.decode_sve_generic(insn, address, bytes),
+            };
+
+            let zdn_op = Self::sve_z_operand(zdn, element_size);
+            let inst = Instruction::new(address, 4, bytes, mnemonic)
+                .with_operation(operation)
+                .with_operands(vec![
+                    zdn_op.clone(),
+                    pred,
+                    zdn_op,
+                    Self::sve_z_operand(zm, element_size),
+                ]);
+
+            return Some(DecodedInstruction {
+                instruction: inst,
+                size: 4,
+            });
+        }
+
+        self.decode_sve_generic(insn, address, bytes)
+    }
+
+    /// Decode SVE CNT*/INC* scalar count/increment instructions.
+    fn decode_sve_cnt_inc(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Option<DecodedInstruction> {
+        let element_size = Self::sve_element_size((insn >> 22) & 0x3)?;
+        let is_inc = ((insn >> 20) & 0x1) == 1;
+        let imm4 = ((insn >> 16) & 0xF) as u8;
+        let pattern = ((insn >> 5) & 0x1F) as u8;
+        let rd = (insn & 0x1F) as u16;
+
+        let mnemonic = match (is_inc, element_size) {
+            (false, Arm64SveElementSize::Byte) => "cntb",
+            (false, Arm64SveElementSize::Halfword) => "cnth",
+            (false, Arm64SveElementSize::Word) => "cntw",
+            (false, Arm64SveElementSize::Doubleword) => "cntd",
+            (true, Arm64SveElementSize::Byte) => "incb",
+            (true, Arm64SveElementSize::Halfword) => "inch",
+            (true, Arm64SveElementSize::Word) => "incw",
+            (true, Arm64SveElementSize::Doubleword) => "incd",
+        };
+
+        let mut operands = vec![Operand::reg(Self::xreg(rd))];
+        if pattern != 0x1F || imm4 > 0 {
+            operands.push(Operand::imm_unsigned(pattern as u64, 8));
+        }
+        if imm4 > 0 {
+            operands.push(Operand::imm_unsigned(imm4.wrapping_add(1) as u64, 8));
+        }
+
+        let operation = if is_inc {
+            Operation::Inc
+        } else {
+            Operation::SveCount
+        };
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(operation)
+            .with_operands(operands);
+
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
+    }
+
+    /// Decode SVE MOV Zd.<T>, Pg/M, Zn.<T> alias of SEL.
+    fn decode_sve_mov_predicated_vector(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Option<DecodedInstruction> {
+        let element_size = Self::sve_element_size((insn >> 22) & 0x3)?;
+        let pg = ((insn >> 10) & 0x7) as u16;
+        let zn = ((insn >> 5) & 0x1F) as u16;
+        let zd = (insn & 0x1F) as u16;
+
+        let inst = Instruction::new(address, 4, bytes, "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Self::sve_z_operand(zd, element_size),
+                Operand::arm64_sve_predicate(
+                    Self::preg(pg),
+                    None,
+                    Some(Arm64SvePredicateMode::Merging),
+                ),
+                Self::sve_z_operand(zn, element_size),
+            ]);
+
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
+    }
+
+    /// Decode SVE MOV Zd.<T>, Pg/M, <Bn|Hn|Sn|Dn> alias of CPY (SIMD&FP scalar).
+    fn decode_sve_mov_predicated_scalar(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Option<DecodedInstruction> {
+        let element_size = Self::sve_element_size((insn >> 22) & 0x3)?;
+        let pg = ((insn >> 10) & 0x7) as u16;
+        let vn = ((insn >> 5) & 0x1F) as u16;
+        let zd = (insn & 0x1F) as u16;
+
+        let inst = Instruction::new(address, 4, bytes, "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Self::sve_z_operand(zd, element_size),
+                Operand::arm64_sve_predicate(
+                    Self::preg(pg),
+                    None,
+                    Some(Arm64SvePredicateMode::Merging),
+                ),
+                Operand::reg(Self::simd_scalar_reg(vn, element_size)),
+            ]);
+
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode SVE2 saturating operations (SQABS, SQNEG, SQDMULH, SQRDMULH).
@@ -498,54 +694,6 @@ impl SveDecoder {
         self.decode_sve_generic(insn, address, bytes)
     }
 
-    /// Decode SVE element count instructions (CNTB, CNTH, CNTW, CNTD).
-    fn decode_sve_cnt(
-        &self,
-        insn: u32,
-        address: u64,
-        bytes: Vec<u8>,
-    ) -> Option<DecodedInstruction> {
-        let size = (insn >> 22) & 0x3;
-        let imm4 = ((insn >> 16) & 0xF) as u8;
-        let pattern = ((insn >> 5) & 0x1F) as u8;
-        let rd = (insn & 0x1F) as u16;
-
-        let mnemonic = match size {
-            0 => "cntb",
-            1 => "cnth",
-            2 => "cntw",
-            3 => "cntd",
-            _ => "cnt?",
-        };
-
-        let dst = Self::xreg(rd);
-
-        // Pattern encodes the element pattern (ALL, POW2, VL1-VL256, etc.)
-        let _pattern_name = Self::sve_pattern_name(pattern);
-
-        let mut operands = vec![Operand::reg(dst)];
-
-        // Add pattern as operand if not ALL (0x1F)
-        if pattern != 0x1F {
-            // For simplicity, encode pattern as immediate
-            operands.push(Operand::imm_unsigned(pattern as u64, 8));
-        }
-
-        // Add multiplier if not 1 (imm4 encodes multiplier - 1)
-        if imm4 > 0 {
-            operands.push(Operand::imm_unsigned(imm4.wrapping_add(1) as u64, 8));
-        }
-
-        let inst = Instruction::new(address, 4, bytes, mnemonic)
-            .with_operation(Operation::SveCount)
-            .with_operands(operands);
-
-        Some(DecodedInstruction {
-            instruction: inst,
-            size: 4,
-        })
-    }
-
     /// Decode SVE DUP instruction (broadcast scalar to vector).
     fn decode_sve_dup(
         &self,
@@ -553,23 +701,22 @@ impl SveDecoder {
         address: u64,
         bytes: Vec<u8>,
     ) -> Option<DecodedInstruction> {
-        let size = (insn >> 22) & 0x3;
+        let element_size = Self::sve_element_size((insn >> 22) & 0x3)?;
         let rn = ((insn >> 5) & 0x1F) as u16;
         let zd = (insn & 0x1F) as u16;
 
-        let zreg = Self::zreg(zd);
-        let src = if size == 3 {
+        let src = if matches!(element_size, Arm64SveElementSize::Doubleword) {
             Self::xreg(rn)
         } else {
             Self::wreg(rn)
         };
 
-        let _suffix = Self::sve_size_suffix(size);
-        let mnemonic = "dup".to_string();
-
-        let inst = Instruction::new(address, 4, bytes, mnemonic)
+        let inst = Instruction::new(address, 4, bytes, "dup")
             .with_operation(Operation::SveDup)
-            .with_operands(vec![Operand::reg(zreg), Operand::reg(src)]);
+            .with_operands(vec![
+                Self::sve_z_operand(zd, element_size),
+                Operand::reg(src),
+            ]);
 
         Some(DecodedInstruction {
             instruction: inst,
@@ -625,18 +772,56 @@ impl SveDecoder {
         address: u64,
         bytes: Vec<u8>,
     ) -> Option<DecodedInstruction> {
-        let size = (insn >> 22) & 0x3;
+        let element_size = Self::sve_element_size((insn >> 22) & 0x3)?;
         let pattern = ((insn >> 5) & 0x1F) as u8;
         let pd = (insn & 0xF) as u16;
 
-        let pred = Self::preg(pd);
-        let _suffix = Self::sve_size_suffix(size);
+        let mut operands = vec![Operand::arm64_sve_predicate(
+            Self::preg(pd),
+            Some(element_size),
+            None,
+        )];
+        if pattern != 0x1F {
+            operands.push(Operand::imm_unsigned(pattern as u64, 8));
+        }
 
         let inst = Instruction::new(address, 4, bytes, "ptrue")
             .with_operation(Operation::SvePredicate)
+            .with_operands(operands);
+
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
+    }
+
+    /// Decode SVE WHILELT/WHILELO/WHILELS/WHILELE instructions.
+    fn decode_sve_while(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Option<DecodedInstruction> {
+        let element_size = Self::sve_element_size((insn >> 22) & 0x3)?;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let unsigned = ((insn >> 11) & 0x1) == 1;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let inclusive = ((insn >> 4) & 0x1) == 1;
+        let pd = (insn & 0xF) as u16;
+
+        let mnemonic = match (unsigned, inclusive) {
+            (false, false) => "whilelt",
+            (true, false) => "whilelo",
+            (true, true) => "whilels",
+            (false, true) => "whilele",
+        };
+
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::SvePredicate)
             .with_operands(vec![
-                Operand::reg(pred),
-                Operand::imm_unsigned(pattern as u64, 8),
+                Operand::arm64_sve_predicate(Self::preg(pd), Some(element_size), None),
+                Operand::reg(Self::xreg(rn)),
+                Operand::reg(Self::xreg(rm)),
             ]);
 
         Some(DecodedInstruction {
@@ -655,10 +840,15 @@ impl SveDecoder {
         // SVE predicate operations include PTRUE, PFALSE, etc.
         // Check for PTRUE: 0010_0101_xx_01_1000_111x_xxxx_xxxx_xxxx
         let bits_23_16 = (insn >> 16) & 0xFF;
-        let bits_13_10 = (insn >> 10) & 0xF;
+        let bits_15_10 = (insn >> 10) & 0x3F;
+
+        // WHILELT/WHILELO/WHILELS/WHILELE
+        if (bits_15_10 & 0x3C) == 0x04 {
+            return self.decode_sve_while(insn, address, bytes);
+        }
 
         // PTRUE pattern
-        if (bits_23_16 & 0x3F) == 0x18 && bits_13_10 == 0xE {
+        if (bits_23_16 & 0x3F) == 0x18 && bits_15_10 == 0x38 {
             return self.decode_sve_ptrue(insn, address, bytes);
         }
 
@@ -673,30 +863,28 @@ impl SveDecoder {
         address: u64,
         bytes: Vec<u8>,
     ) -> Option<DecodedInstruction> {
-        // SVE contiguous load/store encoding varies by type
-        // Common pattern: bits [31:25] identify SVE memory class
+        let bits_31_24 = (insn >> 24) & 0xFF;
+        let bits_15_13 = (insn >> 13) & 0x7;
 
-        let op_hi = (insn >> 25) & 0x7F;
-        let _bits_24_21 = (insn >> 21) & 0xF;
-
-        // Contiguous load (scalar+imm): 1010_010x_...
-        // LD1D: 1010_0101_1_11_xxxxx_010_xxx_xxxxx_xxxxx
-        // ST1D: 1110_0101_1_11_xxxxx_111_xxx_xxxxx_xxxxx
-
-        // Check for contiguous loads (LD1B, LD1H, LD1W, LD1D)
-        // General pattern: 1010_010x for loads
-        if (op_hi & 0b111_1110) == 0b101_0010 {
-            return self.decode_sve_contiguous_load(insn, address, bytes);
+        let is_load = matches!(bits_31_24, 0x84 | 0x85 | 0xA4 | 0xA5);
+        let is_store = matches!(bits_31_24, 0xE4 | 0xE5);
+        if !is_load && !is_store {
+            return self.decode_sve_generic(insn, address, bytes);
         }
 
-        // Check for contiguous stores (ST1B, ST1H, ST1W, ST1D)
-        // General pattern: 1110_010x for stores
-        if (op_hi & 0b111_1110) == 0b111_0010 {
-            return self.decode_sve_contiguous_store(insn, address, bytes);
+        if bits_15_13 == 0b010 {
+            return if is_load {
+                self.decode_sve_contiguous_load_indexed(insn, address, bytes)
+            } else {
+                self.decode_sve_contiguous_store_indexed(insn, address, bytes)
+            };
         }
 
-        // Fallback
-        self.decode_sve_generic(insn, address, bytes)
+        if is_load {
+            self.decode_sve_contiguous_load(insn, address, bytes)
+        } else {
+            self.decode_sve_contiguous_store(insn, address, bytes)
+        }
     }
 
     /// Decode SVE contiguous load instructions (LD1B, LD1H, LD1W, LD1D).
@@ -709,51 +897,44 @@ impl SveDecoder {
         // LD1D (scalar+immediate): 1010_0101_111_imm4_010_pg_rn_zt
         // LD1W (scalar+immediate): 1010_0101_010_imm4_010_pg_rn_zt (size=10)
         // etc.
-
         let dtype = (insn >> 21) & 0xF; // Data type encoding
-        let imm4 = ((insn >> 16) & 0xF) as i64;
+        let imm4 = Self::sign_extend(((insn >> 16) & 0xF) as i64, 4);
         let pg = ((insn >> 10) & 0x7) as u16;
         let rn = ((insn >> 5) & 0x1F) as u16;
         let zt = (insn & 0x1F) as u16;
 
         // Decode data type to get element size and signedness
-        let (mnemonic, elem_size) = match dtype {
-            0b0000 => ("ld1b", 1),
-            0b0001 => ("ld1b", 1), // ld1b with different size
-            0b0010 => ("ld1b", 1),
-            0b0011 => ("ld1b", 1),
-            0b0100 => ("ld1sw", 4), // sign-extended word
-            0b0101 => ("ld1h", 2),
-            0b0110 => ("ld1h", 2),
-            0b0111 => ("ld1h", 2),
-            0b1000 => ("ld1sh", 2), // sign-extended halfword
-            0b1001 => ("ld1sh", 2),
-            0b1010 => ("ld1w", 4),
-            0b1011 => ("ld1w", 4),
-            0b1100 => ("ld1sb", 1), // sign-extended byte
-            0b1101 => ("ld1sb", 1),
-            0b1110 => ("ld1sb", 1),
-            0b1111 => ("ld1d", 8),
-            _ => ("ld1?", 8),
+        let (mnemonic, element_size, access_size) = match dtype {
+            0b0000..=0b0011 => ("ld1b", Arm64SveElementSize::Byte, 1),
+            0b0100 => ("ld1sw", Arm64SveElementSize::Doubleword, 4),
+            0b0101..=0b0111 => ("ld1h", Arm64SveElementSize::Halfword, 2),
+            0b1000 | 0b1001 => ("ld1sh", Arm64SveElementSize::Word, 2),
+            0b1010 => ("ld1w", Arm64SveElementSize::Word, 4),
+            0b1011 => ("ld1w", Arm64SveElementSize::Doubleword, 4),
+            0b1100..=0b1110 => ("ld1sb", Arm64SveElementSize::Doubleword, 1),
+            0b1111 => ("ld1d", Arm64SveElementSize::Doubleword, 8),
+            _ => ("ld1?", Arm64SveElementSize::Doubleword, 8),
         };
 
-        let zreg = Self::zreg(zt);
-        let pred = Self::preg(pg);
         let base = Self::xreg_sp(rn);
 
         // Offset is scaled by vector length (VL)
         let mem = if imm4 == 0 {
-            MemoryRef::base(base, elem_size)
+            MemoryRef::base(base, access_size)
         } else {
             // SVE uses VL-scaled immediate, represented as mul * VL
-            MemoryRef::base_disp(base, imm4, elem_size)
+            MemoryRef::base_disp(base, imm4, access_size)
         };
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(Operation::SveLoad)
             .with_operands(vec![
-                Operand::reg(zreg),
-                Operand::reg(pred),
+                Self::sve_z_operand(zt, element_size),
+                Operand::arm64_sve_predicate(
+                    Self::preg(pg),
+                    None,
+                    Some(Arm64SvePredicateMode::Zeroing),
+                ),
                 Operand::Memory(mem),
             ]);
 
@@ -774,40 +955,110 @@ impl SveDecoder {
         // etc.
 
         let dtype = (insn >> 21) & 0xF;
-        let imm4 = ((insn >> 16) & 0xF) as i64;
+        let imm4 = Self::sign_extend(((insn >> 16) & 0xF) as i64, 4);
         let pg = ((insn >> 10) & 0x7) as u16;
         let rn = ((insn >> 5) & 0x1F) as u16;
         let zt = (insn & 0x1F) as u16;
 
-        let (mnemonic, elem_size) = match dtype {
-            0b0000 => ("st1b", 1),
-            0b0001 => ("st1b", 1),
-            0b0010 => ("st1b", 1),
-            0b0011 => ("st1b", 1),
-            0b0101 => ("st1h", 2),
-            0b0110 => ("st1h", 2),
-            0b0111 => ("st1h", 2),
-            0b1010 => ("st1w", 4),
-            0b1011 => ("st1w", 4),
-            0b1111 => ("st1d", 8),
-            _ => ("st1?", 8),
+        let (mnemonic, element_size, access_size) = match dtype {
+            0b0000..=0b0011 => ("st1b", Arm64SveElementSize::Byte, 1),
+            0b0101..=0b0111 => ("st1h", Arm64SveElementSize::Halfword, 2),
+            0b1010 | 0b1011 => ("st1w", Arm64SveElementSize::Word, 4),
+            0b1111 => ("st1d", Arm64SveElementSize::Doubleword, 8),
+            _ => ("st1?", Arm64SveElementSize::Doubleword, 8),
         };
 
-        let zreg = Self::zreg(zt);
-        let pred = Self::preg(pg);
         let base = Self::xreg_sp(rn);
 
         let mem = if imm4 == 0 {
-            MemoryRef::base(base, elem_size)
+            MemoryRef::base(base, access_size)
         } else {
-            MemoryRef::base_disp(base, imm4, elem_size)
+            MemoryRef::base_disp(base, imm4, access_size)
         };
 
         let inst = Instruction::new(address, 4, bytes, mnemonic)
             .with_operation(Operation::SveStore)
             .with_operands(vec![
-                Operand::reg(zreg),
-                Operand::reg(pred),
+                Self::sve_z_operand(zt, element_size),
+                Operand::reg(Self::preg(pg)),
+                Operand::Memory(mem),
+            ]);
+
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
+    }
+
+    /// Decode SVE contiguous scalar-plus-scalar loads (single register).
+    fn decode_sve_contiguous_load_indexed(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Option<DecodedInstruction> {
+        let bits_31_24 = (insn >> 24) & 0xFF;
+        let bits_23_21 = (insn >> 21) & 0x7;
+        let (mnemonic, element_size, access_size, scale) =
+            Self::decode_sve_indexed_mem_kind(bits_31_24, bits_23_21, true)?;
+        let zm = ((insn >> 16) & 0x1F) as u16;
+        let pg = ((insn >> 10) & 0x7) as u16;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let zt = (insn & 0x1F) as u16;
+
+        let mem = MemoryRef::sib(
+            Some(Self::xreg_sp(rn)),
+            Some(Self::xreg(zm)),
+            scale,
+            0,
+            access_size,
+        );
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::SveLoad)
+            .with_operands(vec![
+                Self::sve_z_operand(zt, element_size),
+                Operand::arm64_sve_predicate(
+                    Self::preg(pg),
+                    None,
+                    Some(Arm64SvePredicateMode::Zeroing),
+                ),
+                Operand::Memory(mem),
+            ]);
+
+        Some(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
+    }
+
+    /// Decode SVE contiguous scalar-plus-scalar stores (single register).
+    fn decode_sve_contiguous_store_indexed(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Option<DecodedInstruction> {
+        let bits_31_24 = (insn >> 24) & 0xFF;
+        let bits_23_21 = (insn >> 21) & 0x7;
+        let (mnemonic, element_size, access_size, scale) =
+            Self::decode_sve_indexed_mem_kind(bits_31_24, bits_23_21, false)?;
+        let zm = ((insn >> 16) & 0x1F) as u16;
+        let pg = ((insn >> 10) & 0x7) as u16;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let zt = (insn & 0x1F) as u16;
+
+        let mem = MemoryRef::sib(
+            Some(Self::xreg_sp(rn)),
+            Some(Self::xreg(zm)),
+            scale,
+            0,
+            access_size,
+        );
+        let inst = Instruction::new(address, 4, bytes, mnemonic)
+            .with_operation(Operation::SveStore)
+            .with_operands(vec![
+                Self::sve_z_operand(zt, element_size),
+                Operand::reg(Self::preg(pg)),
                 Operand::Memory(mem),
             ]);
 
@@ -893,6 +1144,73 @@ impl SveDecoder {
         )
     }
 
+    /// Create a scalar SIMD&FP register with the width implied by an SVE element size.
+    fn simd_scalar_reg(id: u16, element_size: Arm64SveElementSize) -> Register {
+        let size = match element_size {
+            Arm64SveElementSize::Byte => 8,
+            Arm64SveElementSize::Halfword => 16,
+            Arm64SveElementSize::Word => 32,
+            Arm64SveElementSize::Doubleword => 64,
+        };
+        Register::new(
+            Architecture::Arm64,
+            RegisterClass::Vector,
+            arm64::V0.wrapping_add(id),
+            size,
+        )
+    }
+
+    /// Create a qualified SVE vector operand.
+    fn sve_z_operand(id: u16, element_size: Arm64SveElementSize) -> Operand {
+        Operand::arm64_sve_vector(Self::zreg(id), element_size)
+    }
+
+    /// Decode an SVE integer element size.
+    fn sve_element_size(size: u32) -> Option<Arm64SveElementSize> {
+        match size {
+            0 => Some(Arm64SveElementSize::Byte),
+            1 => Some(Arm64SveElementSize::Halfword),
+            2 => Some(Arm64SveElementSize::Word),
+            3 => Some(Arm64SveElementSize::Doubleword),
+            _ => None,
+        }
+    }
+
+    /// Decode an SVE floating-point element size.
+    fn sve_fp_element_size(size: u32) -> Option<Arm64SveElementSize> {
+        match size {
+            1 => Some(Arm64SveElementSize::Halfword),
+            2 => Some(Arm64SveElementSize::Word),
+            3 => Some(Arm64SveElementSize::Doubleword),
+            _ => None,
+        }
+    }
+
+    /// Decode contiguous single-register scalar-plus-scalar load/store kinds.
+    fn decode_sve_indexed_mem_kind(
+        bits_31_24: u32,
+        bits_23_21: u32,
+        is_load: bool,
+    ) -> Option<(&'static str, Arm64SveElementSize, u8, u8)> {
+        match (bits_31_24, bits_23_21, is_load) {
+            (0xA4, 0b000, true) => Some(("ld1b", Arm64SveElementSize::Byte, 1, 1)),
+            (0xA4, 0b101, true) => Some(("ld1h", Arm64SveElementSize::Halfword, 2, 2)),
+            (0xA5, 0b010, true) => Some(("ld1w", Arm64SveElementSize::Word, 4, 4)),
+            (0xA5, 0b111, true) => Some(("ld1d", Arm64SveElementSize::Doubleword, 8, 8)),
+            (0xE4, 0b000, false) => Some(("st1b", Arm64SveElementSize::Byte, 1, 1)),
+            (0xE4, 0b101, false) => Some(("st1h", Arm64SveElementSize::Halfword, 2, 2)),
+            (0xE5, 0b010, false) => Some(("st1w", Arm64SveElementSize::Word, 4, 4)),
+            (0xE5, 0b111, false) => Some(("st1d", Arm64SveElementSize::Doubleword, 8, 8)),
+            _ => None,
+        }
+    }
+
+    /// Sign-extend a `bits`-wide integer value.
+    fn sign_extend(value: i64, bits: u32) -> i64 {
+        let shift = 64_u32.saturating_sub(bits);
+        (value << shift) >> shift
+    }
+
     /// Get SVE element size suffix.
     fn sve_size_suffix(size: u32) -> &'static str {
         match size {
@@ -901,19 +1219,6 @@ impl SveDecoder {
             2 => ".s",
             3 => ".d",
             _ => "",
-        }
-    }
-
-    /// Get SVE pattern name.
-    fn sve_pattern_name(pattern: u8) -> &'static str {
-        match pattern {
-            0x00 => "pow2",
-            0x01..=0x07 => "vl1-vl7",
-            0x08..=0x0D => "vl8-vl256",
-            0x1D => "mul4",
-            0x1E => "mul3",
-            0x1F => "all",
-            _ => "pattern",
         }
     }
 }
@@ -947,12 +1252,9 @@ mod tests {
     #[test]
     fn test_decode_cntd() {
         let decoder = SveDecoder::new();
-        // CNTD X0: 0x04EE0FE0
-        // Encoding: 0000_0100_11_10_1110_0000_11_11111_00000
-        // bits 31-24 = 0x04, bits 23-22 = 11 (D), bits 21-16 = 0x2E
-        // bits 15-12 = 0000 (imm4), bits 11-10 = 11, bits 9-5 = 11111 (pattern=ALL), bits 4-0 = 00000 (Rd=X0)
-        let bytes = vec![0xE0, 0x0F, 0xEE, 0x04];
-        let result = decoder.decode(0x04EE0FE0, 0x1000, bytes);
+        // CNTD X0: 0x04E0E3E0
+        let bytes = vec![0xE0, 0xE3, 0xE0, 0x04];
+        let result = decoder.decode(0x04E0E3E0, 0x1000, bytes);
 
         assert!(result.is_some());
         let decoded = result.unwrap();
@@ -984,9 +1286,7 @@ mod tests {
     fn test_decode_cntb() {
         let decoder = SveDecoder::new();
         // CNTB X0 (pattern=ALL, mul=1)
-        // Encoding: 0000_0100_00_10_1110_0000_11_11111_00000
-        // bits 23-22 = 00 (B), bits 21-16 = 0x2E, bits 11-10 = 11
-        let cntb_x0 = 0x042E0FE0u32;
+        let cntb_x0 = 0x0420E3E0u32;
         let bytes = cntb_x0.to_le_bytes().to_vec();
         let result = decoder.decode(cntb_x0, 0x1000, bytes);
 
@@ -1000,9 +1300,7 @@ mod tests {
     fn test_decode_cnth() {
         let decoder = SveDecoder::new();
         // CNTH X1 (pattern=ALL, mul=1)
-        // Encoding: 0000_0100_01_10_1110_0000_11_11111_00001
-        // bits 23-22 = 01 (H), bits 21-16 = 0x2E, bits 11-10 = 11, Rd = 1
-        let cnth_x1 = 0x046E0FE1u32;
+        let cnth_x1 = 0x0460E3E1u32;
         let bytes = cnth_x1.to_le_bytes().to_vec();
         let result = decoder.decode(cnth_x1, 0x1000, bytes);
 
@@ -1016,9 +1314,7 @@ mod tests {
     fn test_decode_cntw() {
         let decoder = SveDecoder::new();
         // CNTW X2 (pattern=ALL, mul=1)
-        // Encoding: 0000_0100_10_10_1110_0000_11_11111_00010
-        // bits 23-22 = 10 (W), bits 21-16 = 0x2E, bits 11-10 = 11, Rd = 2
-        let cntw_x2 = 0x04AE0FE2u32;
+        let cntw_x2 = 0x04A0E3E2u32;
         let bytes = cntw_x2.to_le_bytes().to_vec();
         let result = decoder.decode(cntw_x2, 0x1000, bytes);
 

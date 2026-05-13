@@ -1045,6 +1045,8 @@ impl Expr {
     pub fn from_operand(op: &Operand) -> Self {
         match op {
             Operand::Register(reg) => Self::var(Variable::from_register(reg)),
+            Operand::Arm64SveVector(reg) => Self::var(Variable::from_register(&reg.reg)),
+            Operand::Arm64SvePredicate(pred) => Self::var(Variable::from_register(&pred.reg)),
             Operand::Immediate(imm) => Self::int(imm.value),
             Operand::Memory(mem) => Self::from_memory_ref(mem),
             Operand::PcRelative { target, .. } => Self::int(*target as i128),
@@ -1079,6 +1081,8 @@ impl Expr {
         match op {
             Operand::Register(reg) => Self::scalar_x86_simd_register_expr(reg, inst)
                 .unwrap_or_else(|| Self::var(Variable::from_register(reg))),
+            Operand::Arm64SveVector(reg) => Self::var(Variable::from_register(&reg.reg)),
+            Operand::Arm64SvePredicate(pred) => Self::var(Variable::from_register(&pred.reg)),
             Operand::Immediate(imm) => Self::int(imm.value),
             Operand::Memory(mem) => Self::from_memory_with_context(mem, inst, false),
             Operand::PcRelative { target, .. } => Self::int(*target as i128),
@@ -2592,6 +2596,7 @@ impl Expr {
     fn x86_single_operand_div(inst: &Instruction, ops: &[Operand]) -> Option<Self> {
         let operand_size = match &ops[0] {
             Operand::Register(reg) => (reg.size / 8) as u8,
+            Operand::Arm64SveVector(_) | Operand::Arm64SvePredicate(_) => return None,
             Operand::Immediate(imm) => imm.size / 8,
             Operand::Memory(mem) => mem.size,
             Operand::PcRelative { .. } => return None,
