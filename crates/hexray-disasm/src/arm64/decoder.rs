@@ -16,6 +16,24 @@ pub struct Arm64Disassembler {
     sme_decoder: SmeDecoder,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CryptoOperandForm {
+    Aes2Reg,
+    Sha1Hash3Reg,
+    Sha1Su0,
+    Sha1H,
+    Sha1Su1,
+    Sha256Hash,
+    Sha256Su0,
+    Sha256Su1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CryptoInsn {
+    mnemonic: &'static str,
+    form: CryptoOperandForm,
+}
+
 impl Arm64Disassembler {
     /// Creates a new ARM64 disassembler.
     pub fn new() -> Self {
@@ -2896,25 +2914,7 @@ impl Arm64Disassembler {
 
     /// Check if instruction is a crypto instruction.
     fn is_crypto_insn(&self, insn: u32) -> bool {
-        // AES: bits 31-24 = 01001110 00, bit 21-17 for operation
-        // SHA: bits 31-24 = 01011110 or similar patterns
-        let top8 = (insn >> 24) & 0xFF;
-        let op21_17 = (insn >> 17) & 0x1F;
-
-        // AES instructions: 0x4E28xxxx pattern
-        if top8 == 0x4E && (insn >> 12) & 0x3FF == 0b0010100001 {
-            return true;
-        }
-
-        // SHA instructions: 0x5E28xxxx or 0x5E00xxxx patterns
-        if (top8 == 0x5E || top8 == 0x0E) && ((insn >> 10) & 0x3F) < 8 {
-            let op = (insn >> 12) & 0x1F;
-            if op <= 7 {
-                return true;
-            }
-        }
-
-        false
+        self.crypto_insn(insn).is_some()
     }
 
     /// Decode crypto instructions (AES, SHA).
@@ -2924,44 +2924,47 @@ impl Arm64Disassembler {
         address: u64,
         bytes: Vec<u8>,
     ) -> Result<DecodedInstruction, DecodeError> {
-        let op = (insn >> 12) & 0x1F;
+        let crypto = self.crypto_insn(insn).ok_or_else(|| {
+            DecodeError::invalid_encoding(address, "unknown AdvSIMD crypto encoding")
+        })?;
+        let rm = ((insn >> 16) & 0x1F) as u16;
         let rn = ((insn >> 5) & 0x1F) as u16;
         let rd = (insn & 0x1F) as u16;
 
-        // AES two-register
-        let (mnemonic, is_aes) = if (insn >> 24) & 0xFF == 0x4E {
-            match op {
-                0b00100 => ("aese", true),
-                0b00101 => ("aesd", true),
-                0b00110 => ("aesmc", true),
-                0b00111 => ("aesimc", true),
-                _ => ("aes_unknown", true),
+        let operands = match crypto.form {
+            CryptoOperandForm::Aes2Reg => {
+                vec![
+                    Operand::reg(self.vreg(rd, 128)),
+                    Operand::reg(self.vreg(rn, 128)),
+                ]
             }
-        } else {
-            // SHA instructions
-            match op {
-                0b00000 => ("sha1c", false),
-                0b00001 => ("sha1p", false),
-                0b00010 => ("sha1m", false),
-                0b00011 => ("sha1su0", false),
-                0b00100 => ("sha256h", false),
-                0b00101 => ("sha256h2", false),
-                0b00110 => ("sha256su1", false),
-                _ => ("sha_unknown", false),
+            CryptoOperandForm::Sha1Hash3Reg => vec![
+                Operand::reg(self.vreg(rd, 128)),
+                Operand::reg(Self::sreg(rn)),
+                Operand::reg(self.vreg(rm, 128)),
+            ],
+            CryptoOperandForm::Sha1Su0 | CryptoOperandForm::Sha256Su1 => vec![
+                Operand::reg(self.vreg(rd, 128)),
+                Operand::reg(self.vreg(rn, 128)),
+                Operand::reg(self.vreg(rm, 128)),
+            ],
+            CryptoOperandForm::Sha1H => {
+                vec![Operand::reg(Self::sreg(rd)), Operand::reg(Self::sreg(rn))]
             }
+            CryptoOperandForm::Sha1Su1 | CryptoOperandForm::Sha256Su0 => {
+                vec![
+                    Operand::reg(self.vreg(rd, 128)),
+                    Operand::reg(self.vreg(rn, 128)),
+                ]
+            }
+            CryptoOperandForm::Sha256Hash => vec![
+                Operand::reg(self.vreg(rd, 128)),
+                Operand::reg(self.vreg(rn, 128)),
+                Operand::reg(self.vreg(rm, 128)),
+            ],
         };
 
-        let vd = self.vreg(rd, 128);
-        let vn = self.vreg(rn, 128);
-
-        let operands = if is_aes && (op == 0b00110 || op == 0b00111) {
-            // Single source for AESMC/AESIMC
-            vec![Operand::reg(vd), Operand::reg(vn)]
-        } else {
-            vec![Operand::reg(vd), Operand::reg(vn)]
-        };
-
-        let inst = Instruction::new(address, 4, bytes, mnemonic)
+        let inst = Instruction::new(address, 4, bytes, crypto.mnemonic)
             .with_operation(Operation::Other(0x100)) // Crypto ops
             .with_operands(operands);
 
@@ -2969,6 +2972,78 @@ impl Arm64Disassembler {
             instruction: inst,
             size: 4,
         })
+    }
+
+    fn crypto_insn(&self, insn: u32) -> Option<CryptoInsn> {
+        const MASK_2REG: u32 = 0xFFFF_FC00;
+        const MASK_3REG: u32 = 0xFFE0_FC00;
+
+        let crypto = match insn & MASK_2REG {
+            0x4E28_4800 => Some(CryptoInsn {
+                mnemonic: "aese.16b",
+                form: CryptoOperandForm::Aes2Reg,
+            }),
+            0x4E28_5800 => Some(CryptoInsn {
+                mnemonic: "aesd.16b",
+                form: CryptoOperandForm::Aes2Reg,
+            }),
+            0x4E28_6800 => Some(CryptoInsn {
+                mnemonic: "aesmc.16b",
+                form: CryptoOperandForm::Aes2Reg,
+            }),
+            0x4E28_7800 => Some(CryptoInsn {
+                mnemonic: "aesimc.16b",
+                form: CryptoOperandForm::Aes2Reg,
+            }),
+            0x5E28_0800 => Some(CryptoInsn {
+                mnemonic: "sha1h",
+                form: CryptoOperandForm::Sha1H,
+            }),
+            0x5E28_1800 => Some(CryptoInsn {
+                mnemonic: "sha1su1.4s",
+                form: CryptoOperandForm::Sha1Su1,
+            }),
+            0x5E28_2800 => Some(CryptoInsn {
+                mnemonic: "sha256su0.4s",
+                form: CryptoOperandForm::Sha256Su0,
+            }),
+            _ => None,
+        };
+        if crypto.is_some() {
+            return crypto;
+        }
+
+        match insn & MASK_3REG {
+            0x5E00_0000 => Some(CryptoInsn {
+                mnemonic: "sha1c.4s",
+                form: CryptoOperandForm::Sha1Hash3Reg,
+            }),
+            0x5E00_1000 => Some(CryptoInsn {
+                mnemonic: "sha1p.4s",
+                form: CryptoOperandForm::Sha1Hash3Reg,
+            }),
+            0x5E00_2000 => Some(CryptoInsn {
+                mnemonic: "sha1m.4s",
+                form: CryptoOperandForm::Sha1Hash3Reg,
+            }),
+            0x5E00_3000 => Some(CryptoInsn {
+                mnemonic: "sha1su0.4s",
+                form: CryptoOperandForm::Sha1Su0,
+            }),
+            0x5E00_4000 => Some(CryptoInsn {
+                mnemonic: "sha256h.4s",
+                form: CryptoOperandForm::Sha256Hash,
+            }),
+            0x5E00_5000 => Some(CryptoInsn {
+                mnemonic: "sha256h2.4s",
+                form: CryptoOperandForm::Sha256Hash,
+            }),
+            0x5E00_6000 => Some(CryptoInsn {
+                mnemonic: "sha256su1.4s",
+                form: CryptoOperandForm::Sha256Su1,
+            }),
+            _ => None,
+        }
     }
 
     /// Decode SIMD three-same register instructions.
@@ -3883,6 +3958,54 @@ mod tests {
         assert_eq!(result.instruction.operands.len(), 4);
         assert_eq!(result.instruction.reads.len(), 4);
         assert!(format!("{}", result.instruction).contains("st1.8b { v0, v1 }, [x2], x3"));
+    }
+
+    #[test]
+    fn test_sha256su0_advsimd_crypto() {
+        let disasm = Arm64Disassembler::new();
+        let bytes = [0x20, 0x28, 0x28, 0x5E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "sha256su0.4s");
+        assert_eq!(
+            format!("{}", result.instruction),
+            "0x00001000:  20 28 28 5e              sha256su0.4s v0, v1"
+        );
+    }
+
+    #[test]
+    fn test_sha256h_advsimd_crypto() {
+        let disasm = Arm64Disassembler::new();
+        let bytes = [0x72, 0x42, 0x04, 0x5E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "sha256h.4s");
+        assert_eq!(
+            format!("{}", result.instruction),
+            "0x00001000:  72 42 04 5e              sha256h.4s q18, q19, v4"
+        );
+    }
+
+    #[test]
+    fn test_sha256su1_advsimd_crypto() {
+        let disasm = Arm64Disassembler::new();
+        let bytes = [0x40, 0x60, 0x03, 0x5E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "sha256su1.4s");
+        assert_eq!(
+            format!("{}", result.instruction),
+            "0x00001000:  40 60 03 5e              sha256su1.4s v0, v2, v3"
+        );
+    }
+
+    #[test]
+    fn test_sha256h2_advsimd_crypto() {
+        let disasm = Arm64Disassembler::new();
+        let bytes = [0x93, 0x52, 0x04, 0x5E];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "sha256h2.4s");
+        assert_eq!(
+            format!("{}", result.instruction),
+            "0x00001000:  93 52 04 5e              sha256h2.4s q19, q20, v4"
+        );
     }
 
     #[test]

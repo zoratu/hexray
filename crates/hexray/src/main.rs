@@ -2573,6 +2573,66 @@ fn format_arm64_structure_ldst_operands_for_output(
     Some(rendered)
 }
 
+fn format_arm64_crypto_operands_for_output(
+    instruction: &hexray_core::Instruction,
+) -> Option<String> {
+    let styles: &[Arm64CryptoRegStyle] = match instruction.mnemonic.as_str() {
+        "sha1c.4s" | "sha1p.4s" | "sha1m.4s" => &[
+            Arm64CryptoRegStyle::Q,
+            Arm64CryptoRegStyle::S,
+            Arm64CryptoRegStyle::V,
+        ],
+        "sha256h.4s" | "sha256h2.4s" => &[
+            Arm64CryptoRegStyle::Q,
+            Arm64CryptoRegStyle::Q,
+            Arm64CryptoRegStyle::V,
+        ],
+        _ => return None,
+    };
+
+    if instruction.operands.len() != styles.len() {
+        return None;
+    }
+
+    instruction
+        .operands
+        .iter()
+        .zip(styles.iter().copied())
+        .map(|(operand, style)| format_arm64_crypto_reg_for_output(operand, style))
+        .collect::<Option<Vec<_>>>()
+        .map(|operands| operands.join(", "))
+}
+
+#[derive(Clone, Copy)]
+enum Arm64CryptoRegStyle {
+    Q,
+    S,
+    V,
+}
+
+fn format_arm64_crypto_reg_for_output(
+    operand: &hexray_core::Operand,
+    style: Arm64CryptoRegStyle,
+) -> Option<String> {
+    let hexray_core::Operand::Register(reg) = operand else {
+        return None;
+    };
+    if reg.arch != Architecture::Arm64
+        || reg.id < hexray_core::register::arm64::V0
+        || reg.id >= hexray_core::register::arm64::V0.saturating_add(32)
+    {
+        return None;
+    }
+
+    let index = reg.id - hexray_core::register::arm64::V0;
+    let prefix = match style {
+        Arm64CryptoRegStyle::Q => "q",
+        Arm64CryptoRegStyle::S => "s",
+        Arm64CryptoRegStyle::V => "v",
+    };
+    Some(format!("{prefix}{index}"))
+}
+
 fn format_instruction_for_output(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
@@ -2589,7 +2649,10 @@ fn format_instruction_for_output(
     }
     rendered.push(' ');
     rendered.push_str(&instruction.mnemonic);
-    if let Some(operands) = format_arm64_structure_ldst_operands_for_output(
+    if let Some(operands) = format_arm64_crypto_operands_for_output(instruction) {
+        rendered.push(' ');
+        rendered.push_str(&operands);
+    } else if let Some(operands) = format_arm64_structure_ldst_operands_for_output(
         fmt,
         project,
         symbols,

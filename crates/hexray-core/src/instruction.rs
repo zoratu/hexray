@@ -883,7 +883,9 @@ impl std::fmt::Display for Instruction {
         // Print mnemonic and operands
         write!(f, " {}", self.mnemonic)?;
 
-        if let Some(operands) = format_arm64_structure_ldst_operands(self) {
+        if let Some(operands) = format_arm64_crypto_operands(self) {
+            write!(f, " {}", operands)?;
+        } else if let Some(operands) = format_arm64_structure_ldst_operands(self) {
             write!(f, " {}", operands)?;
         } else if !self.operands.is_empty() {
             write!(f, " ")?;
@@ -897,6 +899,61 @@ impl std::fmt::Display for Instruction {
 
         Ok(())
     }
+}
+
+fn format_arm64_crypto_operands(instruction: &Instruction) -> Option<String> {
+    let styles: &[Arm64CryptoRegStyle] = match instruction.mnemonic.as_str() {
+        "sha1c.4s" | "sha1p.4s" | "sha1m.4s" => &[
+            Arm64CryptoRegStyle::Q,
+            Arm64CryptoRegStyle::S,
+            Arm64CryptoRegStyle::V,
+        ],
+        "sha256h.4s" | "sha256h2.4s" => &[
+            Arm64CryptoRegStyle::Q,
+            Arm64CryptoRegStyle::Q,
+            Arm64CryptoRegStyle::V,
+        ],
+        _ => return None,
+    };
+
+    if instruction.operands.len() != styles.len() {
+        return None;
+    }
+
+    instruction
+        .operands
+        .iter()
+        .zip(styles.iter().copied())
+        .map(|(operand, style)| format_arm64_crypto_reg(operand, style))
+        .collect::<Option<Vec<_>>>()
+        .map(|operands| operands.join(", "))
+}
+
+#[derive(Clone, Copy)]
+enum Arm64CryptoRegStyle {
+    Q,
+    S,
+    V,
+}
+
+fn format_arm64_crypto_reg(operand: &Operand, style: Arm64CryptoRegStyle) -> Option<String> {
+    let Operand::Register(reg) = operand else {
+        return None;
+    };
+    if reg.arch != crate::Architecture::Arm64
+        || reg.id < arm64::V0
+        || reg.id >= arm64::V0.saturating_add(32)
+    {
+        return None;
+    }
+
+    let index = reg.id - arm64::V0;
+    let prefix = match style {
+        Arm64CryptoRegStyle::Q => "q",
+        Arm64CryptoRegStyle::S => "s",
+        Arm64CryptoRegStyle::V => "v",
+    };
+    Some(format!("{prefix}{index}"))
 }
 
 fn format_arm64_structure_ldst_operands(instruction: &Instruction) -> Option<String> {
