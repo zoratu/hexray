@@ -49,7 +49,7 @@ use super::super::abi::{
 use super::super::dead_store::collect_all_uses;
 use super::super::expression::{BinOpKind, CallTarget, Expr, ExprKind, VarKind, Variable};
 use super::super::BinaryDataContext;
-use super::{CatchHandler, StructuredNode};
+use super::{body_terminates, CatchHandler, StructuredNode};
 
 /// Extracts the return value from a return register assignment near the end of the block.
 /// Returns the filtered statements (without the return value assignment) and the return value.
@@ -299,7 +299,7 @@ fn expr_mentions_stack_canary_guard(expr: &Expr) -> bool {
 /// Simplifies statements by performing copy propagation on temporary registers.
 /// Transforms patterns like `eax = x; y = eax;` into `y = x;`.
 pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
-    let nodes = merge_adjacent_blocks(nodes);
+    let nodes = prune_unreachable_nodes(merge_adjacent_blocks(nodes));
 
     // First pass: collect all GotRef assignments
     let global_refs = collect_global_refs(&nodes);
@@ -335,6 +335,130 @@ pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredN
 
     // Ninth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
     nodes.into_iter().map(simplify_conditions_in_node).collect()
+}
+
+pub(super) fn prune_unreachable_nodes(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    prune_unreachable_nodes_in_list(nodes)
+}
+
+fn prune_unreachable_nodes_in_list(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut pruned = Vec::with_capacity(nodes.len());
+    let mut prior_node_terminates = false;
+
+    for node in nodes {
+        let node = prune_unreachable_nodes_in_node(node);
+        if prior_node_terminates {
+            if matches!(node, StructuredNode::Label(_)) {
+                prior_node_terminates = false;
+                pruned.push(node);
+            }
+            continue;
+        }
+
+        prior_node_terminates = node_definitely_terminates(&node);
+        pruned.push(node);
+    }
+
+    pruned
+}
+
+fn prune_unreachable_nodes_in_node(node: StructuredNode) -> StructuredNode {
+    match node {
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: prune_unreachable_nodes_in_list(then_body),
+            else_body: else_body.map(prune_unreachable_nodes_in_list),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition,
+            body: prune_unreachable_nodes_in_list(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: prune_unreachable_nodes_in_list(body),
+            condition,
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: prune_unreachable_nodes_in_list(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: prune_unreachable_nodes_in_list(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(values, body)| (values, prune_unreachable_nodes_in_list(body)))
+                .collect(),
+            default: default.map(prune_unreachable_nodes_in_list),
+        },
+        StructuredNode::Sequence(nodes) => {
+            StructuredNode::Sequence(prune_unreachable_nodes_in_list(nodes))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: prune_unreachable_nodes_in_list(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|handler| CatchHandler {
+                    body: prune_unreachable_nodes_in_list(handler.body),
+                    ..handler
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn node_definitely_terminates(node: &StructuredNode) -> bool {
+    body_terminates(std::slice::from_ref(node))
+        || matches!(node, StructuredNode::TryCatch { try_body, catch_handlers }
+            if body_terminates(try_body)
+                && !catch_handlers.is_empty()
+                && catch_handlers
+                    .iter()
+                    .all(|handler| body_terminates(&handler.body)))
 }
 
 fn suppress_asan_scaffolding(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
@@ -9762,6 +9886,82 @@ mod tests {
                 "eax = total".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_simplify_statements_drops_dead_tail_after_return() {
+        let nodes = vec![
+            StructuredNode::Return(Some(Expr::int(-1))),
+            block(
+                0,
+                vec![Expr::call(
+                    CallTarget::Named("sub_0".to_string()),
+                    vec![arg("arg0", 0, 4)],
+                )],
+            ),
+            StructuredNode::Return(Some(Expr::int(-1))),
+        ];
+
+        let simplified = simplify_statements(nodes);
+
+        assert!(
+            matches!(
+                simplified.as_slice(),
+                [StructuredNode::Return(Some(Expr {
+                    kind: ExprKind::IntLit(value),
+                }))] if *value == -1
+            ),
+            "expected dead tail after return to be pruned, got {simplified:#?}"
+        );
+    }
+
+    #[test]
+    fn test_prune_unreachable_nodes_keeps_labeled_tail() {
+        let nodes = vec![
+            StructuredNode::Return(None),
+            block(0, vec![Expr::unknown("dead_before_label")]),
+            StructuredNode::Label(BasicBlockId::new(7)),
+            block(1, vec![Expr::unknown("live_after_label")]),
+        ];
+
+        let pruned = prune_unreachable_nodes(nodes);
+
+        assert_eq!(
+            pruned.len(),
+            3,
+            "expected only unlabeled dead node to be removed"
+        );
+        assert!(matches!(pruned[0], StructuredNode::Return(None)));
+        assert!(matches!(pruned[1], StructuredNode::Label(id) if id == BasicBlockId::new(7)));
+        let StructuredNode::Block { statements, .. } = &pruned[2] else {
+            panic!("expected labeled tail block");
+        };
+        assert_eq!(statements.len(), 1);
+        assert_eq!(format!("{}", statements[0]), "live_after_label");
+    }
+
+    #[test]
+    fn test_prune_unreachable_nodes_drops_tail_after_noreturn_call() {
+        let nodes = vec![
+            block(
+                0,
+                vec![Expr::call(CallTarget::Named("abort".to_string()), vec![])],
+            ),
+            block(1, vec![Expr::assign(local("dead", 4), Expr::int(1))]),
+        ];
+
+        let pruned = prune_unreachable_nodes(nodes);
+
+        assert_eq!(
+            pruned.len(),
+            1,
+            "expected dead tail after abort() to be pruned"
+        );
+        let StructuredNode::Block { statements, .. } = &pruned[0] else {
+            panic!("expected noreturn block to remain");
+        };
+        assert_eq!(statements.len(), 1);
+        assert_eq!(format!("{}", statements[0]), "abort()");
     }
 
     #[test]
