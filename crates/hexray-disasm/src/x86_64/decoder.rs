@@ -41,20 +41,79 @@ impl X86_64Disassembler {
         Self { intel_syntax: true }
     }
 
-    fn vector_shift_group_info(opcode: u8, subopcode: u8) -> Option<(&'static str, Operation)> {
+    fn packed_shift_group_info(opcode: u8, subopcode: u8) -> Option<(&'static str, Operation)> {
         match (opcode, subopcode) {
-            (0x71, 2) => Some(("vpsrlw", Operation::Shr)),
-            (0x71, 4) => Some(("vpsraw", Operation::Sar)),
-            (0x71, 6) => Some(("vpsllw", Operation::Shl)),
-            (0x72, 2) => Some(("vpsrld", Operation::Shr)),
-            (0x72, 4) => Some(("vpsrad", Operation::Sar)),
-            (0x72, 6) => Some(("vpslld", Operation::Shl)),
-            (0x73, 2) => Some(("vpsrlq", Operation::Shr)),
-            (0x73, 3) => Some(("vpsrldq", Operation::Shr)),
-            (0x73, 6) => Some(("vpsllq", Operation::Shl)),
-            (0x73, 7) => Some(("vpslldq", Operation::Shl)),
+            (0x71, 2) => Some(("psrlw", Operation::Shr)),
+            (0x71, 4) => Some(("psraw", Operation::Sar)),
+            (0x71, 6) => Some(("psllw", Operation::Shl)),
+            (0x72, 2) => Some(("psrld", Operation::Shr)),
+            (0x72, 4) => Some(("psrad", Operation::Sar)),
+            (0x72, 6) => Some(("pslld", Operation::Shl)),
+            (0x73, 2) => Some(("psrlq", Operation::Shr)),
+            (0x73, 3) => Some(("psrldq", Operation::Shr)),
+            (0x73, 6) => Some(("psllq", Operation::Shl)),
+            (0x73, 7) => Some(("pslldq", Operation::Shl)),
             _ => None,
         }
+    }
+
+    fn decode_legacy_shift_group(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        opcode: u8,
+    ) -> Result<Option<DecodedInstruction>, DecodeError> {
+        if !matches!(opcode, 0x71..=0x73)
+            || !prefixes.operand_size
+            || prefixes.rep
+            || prefixes.repne
+        {
+            return Ok(None);
+        }
+
+        let modrm_byte = *bytes.get(offset).ok_or_else(|| {
+            DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+        })?;
+        let modrm = ModRM::parse(modrm_byte, prefixes.effective_rex());
+        let Some((mnemonic, operation)) = Self::packed_shift_group_info(opcode, modrm.reg & 0x7)
+        else {
+            return Ok(None);
+        };
+        if !modrm.is_register() {
+            return Err(DecodeError::invalid_encoding(
+                address,
+                "packed shift-group requires register operand",
+            ));
+        }
+        offset = offset.saturating_add(1);
+
+        let imm = *bytes.get(offset).ok_or_else(|| {
+            DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+        })?;
+        offset = offset.saturating_add(1);
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands: vec![
+                Operand::Register(decode_xmm(modrm.rm, 128)),
+                Operand::imm(imm as i128, 8),
+            ],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+
+        Ok(Some(DecodedInstruction {
+            instruction,
+            size: offset,
+        }))
     }
 
     fn finalize_legacy_prefixes(
@@ -126,7 +185,7 @@ impl X86_64Disassembler {
             })?;
             let modrm = ModRM::parse_evex(modrm_byte, &evex);
             let Some((mnemonic, operation)) =
-                Self::vector_shift_group_info(opcode, modrm.reg & 0x7)
+                Self::packed_shift_group_info(opcode, modrm.reg & 0x7)
             else {
                 return Ok(None);
             };
@@ -156,7 +215,7 @@ impl X86_64Disassembler {
                 })?;
 
             (
-                self.format_evex_mnemonic(mnemonic, &evex, None),
+                self.format_evex_mnemonic(&format!("v{mnemonic}"), &evex, None),
                 operation,
                 Operand::Register(decode_xmm(evex.vvvvv(), vector_size)),
                 rm_operand,
@@ -172,7 +231,7 @@ impl X86_64Disassembler {
             })?;
             let modrm = ModRM::parse(modrm_byte, prefixes.effective_rex());
             let Some((mnemonic, operation)) =
-                Self::vector_shift_group_info(opcode, modrm.reg & 0x7)
+                Self::packed_shift_group_info(opcode, modrm.reg & 0x7)
             else {
                 return Ok(None);
             };
@@ -185,7 +244,7 @@ impl X86_64Disassembler {
                 )?;
 
             (
-                mnemonic.to_string(),
+                format!("v{mnemonic}"),
                 operation,
                 Operand::Register(decode_xmm(vex.vvvv, vector_size)),
                 rm_operand,
@@ -536,6 +595,12 @@ impl Disassembler for X86_64Disassembler {
             }
 
             // First check if this is an SSE instruction
+            if let Some(decoded) =
+                self.decode_legacy_shift_group(bytes, address, &prefixes, offset, opcode)?
+            {
+                return Ok(Self::finalize_legacy_prefixes(&prefixes, decoded));
+            }
+
             let sse_entry = lookup_sse_opcode(
                 opcode,
                 prefixes.operand_size, // 66 prefix
@@ -4546,6 +4611,78 @@ mod tests {
             .collect();
         assert_eq!(operand_names, vec!["ymm5", "ymm6"]);
         assert_eq!(result.instruction.operands[2], Operand::imm(16, 8));
+    }
+
+    #[test]
+    fn test_sse2_pslldq_xmm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // 66 0F 73 FC 08 = pslldq xmm4, 0x8
+        let result = disasm
+            .decode_instruction(&[0x66, 0x0f, 0x73, 0xfc, 0x08], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "pslldq");
+        assert_eq!(result.instruction.operation, Operation::Shl);
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(
+            result.instruction.operands[0],
+            Operand::Register(decode_xmm(4, 128))
+        );
+        assert_eq!(result.instruction.operands[1], Operand::imm(8, 8));
+    }
+
+    #[test]
+    fn test_sse2_psrldq_xmm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // 66 0F 73 DD 08 = psrldq xmm5, 0x8
+        let result = disasm
+            .decode_instruction(&[0x66, 0x0f, 0x73, 0xdd, 0x08], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "psrldq");
+        assert_eq!(result.instruction.operation, Operation::Shr);
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(
+            result.instruction.operands[0],
+            Operand::Register(decode_xmm(5, 128))
+        );
+        assert_eq!(result.instruction.operands[1], Operand::imm(8, 8));
+    }
+
+    #[test]
+    fn test_sse2_psllw_xmm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // 66 0F 71 F2 04 = psllw xmm2, 0x4
+        let result = disasm
+            .decode_instruction(&[0x66, 0x0f, 0x71, 0xf2, 0x04], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "psllw");
+        assert_eq!(result.instruction.operation, Operation::Shl);
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(
+            result.instruction.operands[0],
+            Operand::Register(decode_xmm(2, 128))
+        );
+        assert_eq!(result.instruction.operands[1], Operand::imm(4, 8));
+    }
+
+    #[test]
+    fn test_sse2_psrld_xmm_imm8() {
+        let disasm = X86_64Disassembler::new();
+        // 66 0F 72 D4 07 = psrld xmm4, 0x7
+        let result = disasm
+            .decode_instruction(&[0x66, 0x0f, 0x72, 0xd4, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "psrld");
+        assert_eq!(result.instruction.operation, Operation::Shr);
+        assert_eq!(result.size, 5);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(
+            result.instruction.operands[0],
+            Operand::Register(decode_xmm(4, 128))
+        );
+        assert_eq!(result.instruction.operands[1], Operand::imm(7, 8));
     }
 
     #[test]
