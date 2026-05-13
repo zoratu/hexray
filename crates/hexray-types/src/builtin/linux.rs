@@ -5,6 +5,66 @@
 use crate::database::TypeDatabase;
 use crate::types::*;
 
+/// Returns the Linux x86_64 syscall name for the given ABI number when known.
+pub fn linux_x86_64_syscall_name(number: u64) -> Option<&'static str> {
+    match number {
+        318 => Some("getrandom"),
+        319 => Some("memfd_create"),
+        322 => Some("execveat"),
+        323 => Some("userfaultfd"),
+        324 => Some("membarrier"),
+        325 => Some("mlock2"),
+        326 => Some("copy_file_range"),
+        327 => Some("preadv2"),
+        328 => Some("pwritev2"),
+        329 => Some("pkey_mprotect"),
+        330 => Some("pkey_alloc"),
+        331 => Some("pkey_free"),
+        332 => Some("statx"),
+        333 => Some("io_pgetevents"),
+        334 => Some("rseq"),
+        425 => Some("io_uring_setup"),
+        426 => Some("io_uring_enter"),
+        427 => Some("io_uring_register"),
+        428 => Some("open_tree"),
+        429 => Some("move_mount"),
+        430 => Some("fsopen"),
+        431 => Some("fsconfig"),
+        432 => Some("fsmount"),
+        433 => Some("fspick"),
+        434 => Some("pidfd_open"),
+        435 => Some("clone3"),
+        436 => Some("close_range"),
+        437 => Some("openat2"),
+        438 => Some("pidfd_getfd"),
+        439 => Some("faccessat2"),
+        440 => Some("process_madvise"),
+        441 => Some("epoll_pwait2"),
+        442 => Some("mount_setattr"),
+        443 => Some("quotactl_fd"),
+        444 => Some("landlock_create_ruleset"),
+        445 => Some("landlock_add_rule"),
+        446 => Some("landlock_restrict_self"),
+        447 => Some("memfd_secret"),
+        448 => Some("process_mrelease"),
+        449 => Some("futex_waitv"),
+        450 => Some("set_mempolicy_home_node"),
+        451 => Some("cachestat"),
+        452 => Some("fchmodat2"),
+        453 => Some("map_shadow_stack"),
+        454 => Some("futex_wake"),
+        455 => Some("futex_wait"),
+        456 => Some("futex_requeue"),
+        457 => Some("statmount"),
+        458 => Some("listmount"),
+        459 => Some("lsm_get_self_attr"),
+        460 => Some("lsm_set_self_attr"),
+        461 => Some("lsm_list_modules"),
+        462 => Some("mseal"),
+        _ => None,
+    }
+}
+
 /// Load Linux-specific types into the database.
 pub fn load_linux_types(db: &mut TypeDatabase) {
     // struct stat (x86_64 Linux) - using concrete types for correct offsets
@@ -333,5 +393,14 @@ mod tests {
         let syscall = db.get_function("syscall").expect("syscall prototype");
         assert_eq!(syscall.parameters.len(), 1);
         assert!(syscall.variadic);
+    }
+
+    #[test]
+    fn test_linux_x86_64_syscall_name_modern_entries() {
+        assert_eq!(linux_x86_64_syscall_name(318), Some("getrandom"));
+        assert_eq!(linux_x86_64_syscall_name(425), Some("io_uring_setup"));
+        assert_eq!(linux_x86_64_syscall_name(426), Some("io_uring_enter"));
+        assert_eq!(linux_x86_64_syscall_name(462), Some("mseal"));
+        assert_eq!(linux_x86_64_syscall_name(317), None);
     }
 }

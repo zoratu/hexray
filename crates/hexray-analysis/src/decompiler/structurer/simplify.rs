@@ -38,7 +38,7 @@ use std::sync::OnceLock;
 
 use hexray_core::Architecture;
 use hexray_types::{
-    builtin::{load_libc_functions, load_linux_types, load_posix_types},
+    builtin::{linux_x86_64_syscall_name, load_libc_functions, load_linux_types, load_posix_types},
     CType, TypeDatabase,
 };
 
@@ -4891,7 +4891,11 @@ fn propagate_args_in_block_with_state(
                             }
                         }
                     }
-                    let rewritten_call = Expr::call(substituted_target, rewritten_args);
+                    let rewritten_call = rewrite_known_linux_syscall_call(
+                        substituted_target,
+                        rewritten_args,
+                        binary_data,
+                    );
                     state.clear_after_real_call();
                     if let ExprKind::Var(_) = &substituted_lhs.kind {
                         track_call_result_aliases(
@@ -4903,9 +4907,10 @@ fn propagate_args_in_block_with_state(
                     result.push(Expr::assign(substituted_lhs, rewritten_call));
                     continue;
                 } else {
-                    let rewritten_call = Expr::call(
+                    let rewritten_call = rewrite_known_linux_syscall_call(
                         substituted_target,
                         substitute_call_args(target, args, &state.reg_values),
+                        binary_data,
                     );
                     if invalidate_pseudo_call_outputs(
                         target,
@@ -5033,7 +5038,11 @@ fn propagate_args_in_block_with_state(
                     for idx in used_stmt_indices {
                         to_remove.insert(idx);
                     }
-                    result.push(Expr::call(substituted_target, recovered_args));
+                    result.push(rewrite_known_linux_syscall_call(
+                        substituted_target,
+                        recovered_args,
+                        binary_data,
+                    ));
                     state.clear_after_real_call();
                     track_bare_call_result_aliases(
                         &mut state.reg_values,
@@ -5056,7 +5065,11 @@ fn propagate_args_in_block_with_state(
                     for idx in new_args.1 {
                         to_remove.insert(idx);
                     }
-                    result.push(Expr::call(substituted_target, new_args.0));
+                    result.push(rewrite_known_linux_syscall_call(
+                        substituted_target,
+                        new_args.0,
+                        binary_data,
+                    ));
                     state.clear_after_real_call();
                     track_bare_call_result_aliases(
                         &mut state.reg_values,
@@ -5077,7 +5090,11 @@ fn propagate_args_in_block_with_state(
                     for idx in fallback_args.1 {
                         to_remove.insert(idx);
                     }
-                    result.push(Expr::call(substituted_target, fallback_args.0));
+                    result.push(rewrite_known_linux_syscall_call(
+                        substituted_target,
+                        fallback_args.0,
+                        binary_data,
+                    ));
                     state.clear_after_real_call();
                     track_bare_call_result_aliases(
                         &mut state.reg_values,
@@ -5092,7 +5109,11 @@ fn propagate_args_in_block_with_state(
                         to_remove.insert(idx);
                     }
                     // Create a new call with arguments
-                    let new_call = Expr::call(substituted_target, new_args.0);
+                    let new_call = rewrite_known_linux_syscall_call(
+                        substituted_target,
+                        new_args.0,
+                        binary_data,
+                    );
                     result.push(new_call);
                     // Clear argument tracking after the call
                     state.clear_after_real_call();
@@ -5107,7 +5128,11 @@ fn propagate_args_in_block_with_state(
                     let passthrough_args =
                         synthesize_leading_passthrough_args_from_target(&excluded_arg_regs);
                     if !passthrough_args.is_empty() {
-                        result.push(Expr::call(substituted_target, passthrough_args));
+                        result.push(rewrite_known_linux_syscall_call(
+                            substituted_target,
+                            passthrough_args,
+                            binary_data,
+                        ));
                         state.clear_after_real_call();
                         track_bare_call_result_aliases(
                             &mut state.reg_values,
@@ -5118,9 +5143,10 @@ fn propagate_args_in_block_with_state(
                     }
                 }
 
-                result.push(Expr::call(
+                result.push(rewrite_known_linux_syscall_call(
                     substituted_target,
                     substitute_call_args(target, args, &state.reg_values),
+                    binary_data,
                 ));
                 state.clear_after_real_call();
                 track_bare_call_result_aliases(
@@ -5148,7 +5174,11 @@ fn propagate_args_in_block_with_state(
                         &mut state.compound_updated_aliases,
                         &written_aliases,
                     );
-                    result.push(Expr::call(substituted_target, substituted_args));
+                    result.push(rewrite_known_linux_syscall_call(
+                        substituted_target,
+                        substituted_args,
+                        binary_data,
+                    ));
                     continue;
                 }
             }
@@ -6256,6 +6286,39 @@ enum KnownCallSignatureSource {
 fn normalize_known_call_name(name: &str) -> &str {
     let trimmed = name.trim_start_matches('_');
     trimmed.split('@').next().unwrap_or(trimmed)
+}
+
+fn rewrite_known_linux_syscall_call(
+    target: CallTarget,
+    args: Vec<Expr>,
+    binary_data: Option<&BinaryDataContext>,
+) -> Expr {
+    let Some(number) = args.first().and_then(extract_linux_syscall_number) else {
+        return Expr::call(target, args);
+    };
+
+    let is_linux_syscall = matches!(&target, CallTarget::Named(name) if name == "__linux_syscall")
+        || resolved_known_call_name(&target, binary_data)
+            .is_some_and(|name| normalize_known_call_name(&name) == "syscall");
+    if !is_linux_syscall {
+        return Expr::call(target, args);
+    }
+
+    let Some(name) = linux_x86_64_syscall_name(number) else {
+        return Expr::call(target, args);
+    };
+
+    Expr::call(
+        CallTarget::Named(name.to_string()),
+        args.into_iter().skip(1).collect(),
+    )
+}
+
+fn extract_linux_syscall_number(expr: &Expr) -> Option<u64> {
+    let ExprKind::IntLit(value) = &expr.kind else {
+        return None;
+    };
+    u64::try_from(*value).ok()
 }
 
 fn resolved_known_call_name(
@@ -10503,6 +10566,45 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["1", "arg0", "arg1", "arg2"]
+        );
+    }
+
+    #[test]
+    fn test_propagate_call_args_names_direct_syscall_imports_from_modern_numbers() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "syscall@GLIBC_2.2.5");
+
+        let statements = vec![Expr::call(
+            CallTarget::Direct {
+                target: 0x4010c0,
+                call_site: 0x5000,
+            },
+            vec![
+                Expr::int(425),
+                Expr::unknown("entries"),
+                Expr::unknown("params"),
+            ],
+        )];
+
+        let propagated = propagate_args_in_block_with_binary_data(
+            statements,
+            Some(&binary_data),
+            Some(ArgumentAbiFamily::X86_64SysV),
+        );
+        let Some(Expr {
+            kind: ExprKind::Call { target, args },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing syscall import call");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "io_uring_setup"),
+            other => panic!("expected io_uring_setup target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["entries", "params"]
         );
     }
 

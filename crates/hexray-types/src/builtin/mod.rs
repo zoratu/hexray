@@ -12,6 +12,6 @@ pub mod macos;
 pub mod posix;
 
 pub use libc::load_libc_functions;
-pub use linux::load_linux_types;
+pub use linux::{linux_x86_64_syscall_name, load_linux_types};
 pub use macos::load_macos_types;
 pub use posix::load_posix_types;
