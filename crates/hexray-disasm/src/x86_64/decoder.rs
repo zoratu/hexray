@@ -311,6 +311,19 @@ impl Disassembler for X86_64Disassembler {
                         }
                     }
                 }
+                // F3 0F C7 /7: RDPID r64 in long mode.
+                if opcode == 0xC7 {
+                    let remaining = bytes.get(offset..).unwrap_or(&[]);
+                    if let Some(&modrm_byte) = remaining.first() {
+                        let modrm = ModRM::parse(modrm_byte, prefixes.rex);
+                        if (modrm.reg & 0x7) == 7 {
+                            offset = offset.saturating_add(1);
+                            return self
+                                .decode_rdpid(bytes, address, &prefixes, offset, modrm)
+                                .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
+                        }
+                    }
+                }
             }
 
             // Fence instructions encoded via 0F AE /{5,6,7} with mod=11, rm=0.
@@ -1673,6 +1686,45 @@ impl X86_64Disassembler {
             operation,
             mnemonic: mnemonic.to_string(),
             operands: vec![rm_operand, Operand::imm_unsigned(imm as u64, 8)],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+
+            guard: None,
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    fn decode_rdpid(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        offset: usize,
+        modrm: ModRM,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        if !modrm.is_register() {
+            return Err(DecodeError::invalid_encoding(
+                address,
+                "rdpid requires register operand",
+            ));
+        }
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+            operation: Operation::Other(0x0FC7),
+            mnemonic: "rdpid".to_string(),
+            operands: vec![Operand::Register(decode_gpr(
+                modrm.rm,
+                64,
+                prefixes.rex.is_some(),
+            ))],
             control_flow: ControlFlow::Sequential,
             reads: vec![],
             writes: vec![],
@@ -4332,6 +4384,44 @@ mod tests {
         assert_eq!(result.instruction.operation, Operation::ReadTscP);
         assert_eq!(result.size, 3);
         assert!(result.instruction.operands.is_empty());
+    }
+
+    #[test]
+    fn test_rdpid_rax() {
+        let disasm = X86_64Disassembler::new();
+        // F3 0F C7 F8 = RDPID rax
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0xc7, 0xf8], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "rdpid");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FC7));
+        assert_eq!(result.size, 4);
+        assert_eq!(result.instruction.operands.len(), 1);
+        match &result.instruction.operands[0] {
+            Operand::Register(reg) => {
+                assert_eq!(reg.id, x86::RAX);
+                assert_eq!(reg.size, 64);
+            }
+            other => panic!("expected register destination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rdpid_extended_register() {
+        let disasm = X86_64Disassembler::new();
+        // F3 41 0F C7 FC = RDPID r12
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x41, 0x0f, 0xc7, 0xfc], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "rdpid");
+        assert_eq!(result.size, 5);
+        match &result.instruction.operands[0] {
+            Operand::Register(reg) => {
+                assert_eq!(reg.id, x86::R12);
+                assert_eq!(reg.size, 64);
+            }
+            other => panic!("expected register destination, got {other:?}"),
+        }
     }
 
     #[test]
