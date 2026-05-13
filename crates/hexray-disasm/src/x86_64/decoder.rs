@@ -2535,6 +2535,10 @@ impl X86_64Disassembler {
             (0x29, 0) => Some(("vmovaps".to_string(), Operation::Store)),
             // VMOVAPD zmm/m512, zmm (EVEX.512.66.0F.W1 29 /r)
             (0x29, 1) => Some(("vmovapd".to_string(), Operation::Store)),
+            // VMOVNTPS zmm/m512, zmm (EVEX.512.0F.W0 2B /r)
+            (0x2B, 0) => Some(("vmovntps".to_string(), Operation::Store)),
+            // VMOVNTPD zmm/m512, zmm (EVEX.512.66.0F.W1 2B /r)
+            (0x2B, 1) => Some(("vmovntpd".to_string(), Operation::Store)),
             // VMOVUPS zmm, zmm/m512 (EVEX.512.0F.W0 10 /r)
             (0x10, 0) => Some(("vmovups".to_string(), Operation::Move)),
             // VMOVUPD zmm, zmm/m512 (EVEX.512.66.0F.W1 10 /r)
@@ -2627,6 +2631,8 @@ impl X86_64Disassembler {
                     Some(("vmovdqu32".to_string(), Operation::Store))
                 }
             }
+            // VMOVNTDQ zmm/m512, zmm (EVEX.512.66.0F.WIG E7 /r)
+            (0xE7, 1) => Some(("vmovntdq".to_string(), Operation::Store)),
             _ => None,
         }
     }
@@ -2734,10 +2740,12 @@ impl X86_64Disassembler {
             1 => match (opcode, pp) {
                 // Packed moves/arithmetic/logic use the full vector tuple.
                 (
-                    0x10 | 0x11 | 0x28 | 0x29 | 0x54 | 0x56 | 0x57 | 0x58 | 0x59 | 0x5C | 0x5E,
+                    0x10 | 0x11 | 0x28 | 0x29 | 0x2B | 0x54 | 0x56 | 0x57 | 0x58 | 0x59 | 0x5C
+                    | 0x5E,
                     0 | 1,
                 )
-                | (0x6F | 0x7F, 1 | 2) => full_mem(),
+                | (0x6F | 0x7F, 1 | 2)
+                | (0xE7, 1) => full_mem(),
                 // Scalar move/arithmetic forms use Tuple1Scalar.
                 (0x10 | 0x11 | 0x58 | 0x59 | 0x5C | 0x5E, 2) => Some(4),
                 (0x10 | 0x11 | 0x58 | 0x59 | 0x5C | 0x5E, 3) => Some(8),
@@ -2773,7 +2781,7 @@ impl X86_64Disassembler {
             1 => match (opcode, pp) {
                 // Packed moves and aligned/unaligned integer moves are plain two-operand copies.
                 (0x28 | 0x6F, _) => EvexOperandPattern::BinaryRegRm,
-                (0x29 | 0x7F, _) => EvexOperandPattern::BinaryRmReg,
+                (0x29 | 0x2B | 0x7F | 0xE7, _) => EvexOperandPattern::BinaryRmReg,
                 // Packed vmovups/vmovupd are also two-operand copies.
                 (0x10, 0 | 1) => EvexOperandPattern::BinaryRegRm,
                 (0x11, 0 | 1) => EvexOperandPattern::BinaryRmReg,
@@ -5017,6 +5025,46 @@ mod tests {
         assert_eq!(result.instruction.operands.len(), 2);
         assert_eq!(result.instruction.operands[0].to_string(), "[rdi]");
         assert_eq!(result.instruction.operands[1].to_string(), "zmm0");
+    }
+
+    #[test]
+    fn test_evex_vmovntps_store_uses_two_operands() {
+        let disasm = X86_64Disassembler::new();
+        // 62 E1 7C 48 2B 07 = vmovntps [rdi], zmm16
+        let result = disasm
+            .decode_instruction(&[0x62, 0xe1, 0x7c, 0x48, 0x2b, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmovntps");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(result.instruction.operands[0].to_string(), "[rdi]");
+        assert_eq!(result.instruction.operands[1].to_string(), "zmm16");
+    }
+
+    #[test]
+    fn test_evex_vmovntdq_store_uses_two_operands() {
+        let disasm = X86_64Disassembler::new();
+        // 62 E1 7D 48 E7 07 = vmovntdq [rdi], zmm16
+        let result = disasm
+            .decode_instruction(&[0x62, 0xe1, 0x7d, 0x48, 0xe7, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmovntdq");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.instruction.operands.len(), 2);
+        assert_eq!(result.instruction.operands[0].to_string(), "[rdi]");
+        assert_eq!(result.instruction.operands[1].to_string(), "zmm16");
+    }
+
+    #[test]
+    fn test_evex_vmovntdq_disp8_scales_by_vector_width() {
+        let disasm = X86_64Disassembler::new();
+        // 62 E1 7D 48 E7 4F 01 = vmovntdq [rdi+0x40], zmm17
+        let result = disasm
+            .decode_instruction(&[0x62, 0xe1, 0x7d, 0x48, 0xe7, 0x4f, 0x01], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "vmovntdq");
+        assert_eq!(first_memory_displacement(&result.instruction), Some(0x40));
+        assert_eq!(result.instruction.operands[1].to_string(), "zmm17");
     }
 
     #[test]
