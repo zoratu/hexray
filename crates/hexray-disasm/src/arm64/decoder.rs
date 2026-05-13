@@ -1740,6 +1740,12 @@ impl Arm64Disassembler {
         let rn = ((insn >> 5) & 0x1F) as u16; // Base register
         let rt = (insn & 0x1F) as u16; // Data register
 
+        // CAS/CASA/CASL/CASAL share the exclusive-load/store major opcode, but
+        // use o2=1, o1=1 and a fixed Rt2 field instead of the pair-exclusive form.
+        if o2 == 1 && o1 == 1 && rt2 == 0b11111 {
+            return self.decode_compare_and_swap(insn, address, bytes);
+        }
+
         let is_pair = o1 == 1;
         let is_load = l == 1;
         let is_acquire_release = o0 == 1;
@@ -2039,16 +2045,14 @@ impl Arm64Disassembler {
         })
     }
 
-    /// Decode compare and swap instructions (CAS, CASP - ARMv8.1).
-    #[allow(dead_code)]
+    /// Decode compare-and-swap instructions (CAS* - ARMv8.1).
     fn decode_compare_and_swap(
         &self,
         insn: u32,
         address: u64,
         bytes: Vec<u8>,
     ) -> Result<DecodedInstruction, DecodeError> {
-        // CAS encoding: size[31:30], 0010001, L, 1, Rs, o0, 11111, Rn, Rt
-        // CASP encoding: 0, sz, 0010000, L, 1, Rs, o0, 11111, Rn, Rt
+        // CAS encoding: size[31:30], 001000, 1, L, 1, Rs, o0, 11111, Rn, Rt
         let size = (insn >> 30) & 0x3;
         let l = (insn >> 22) & 1; // 1=Acquire
         let rs = ((insn >> 16) & 0x1F) as u16; // Compare value register
@@ -3926,6 +3930,48 @@ mod tests {
         let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
         assert_eq!(result.instruction.mnemonic, "stlr");
         assert_eq!(result.instruction.operation, Operation::StoreExclusive);
+    }
+
+    #[test]
+    fn test_cas() {
+        let disasm = Arm64Disassembler::new();
+        // CAS X3, X4, [X5]: 0xC8A37CA4
+        let bytes = [0xA4, 0x7C, 0xA3, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "cas");
+        assert_eq!(result.instruction.operation, Operation::CompareAndSwap);
+        assert_eq!(result.instruction.operands.len(), 3);
+    }
+
+    #[test]
+    fn test_casa_32bit() {
+        let disasm = Arm64Disassembler::new();
+        // CASA W6, W7, [X8]: 0x88E67D07
+        let bytes = [0x07, 0x7D, 0xE6, 0x88];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "casa");
+        assert_eq!(result.instruction.operation, Operation::CompareAndSwap);
+    }
+
+    #[test]
+    fn test_casl_32bit() {
+        let disasm = Arm64Disassembler::new();
+        // CASL W10, W11, [X12]: 0x88AAFD8B
+        let bytes = [0x8B, 0xFD, 0xAA, 0x88];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "casl");
+        assert_eq!(result.instruction.operation, Operation::CompareAndSwap);
+    }
+
+    #[test]
+    fn test_casal() {
+        let disasm = Arm64Disassembler::new();
+        // CASAL X8, X1, [X2]: 0xC8E8FC41
+        let bytes = [0x41, 0xFC, 0xE8, 0xC8];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "casal");
+        assert_eq!(result.instruction.operation, Operation::CompareAndSwap);
+        assert_eq!(result.instruction.operands.len(), 3);
     }
 
     // Atomic memory operation tests (ARMv8.1)
