@@ -400,6 +400,8 @@ pub enum ParamType {
     SizeT,
     /// C `ptrdiff_t`.
     PtrDiffT,
+    /// Named type such as `size_t` or `struct clone_args`.
+    Named(String),
     /// Pointer type.
     Pointer,
     /// Typed pointer (e.g., int32_t*, uint8_t*).
@@ -439,6 +441,7 @@ impl ParamType {
             ParamType::UnsignedLongLong => "unsigned long long".to_string(),
             ParamType::SizeT => "size_t".to_string(),
             ParamType::PtrDiffT => "ptrdiff_t".to_string(),
+            ParamType::Named(name) => name.clone(),
             ParamType::Pointer => "void*".to_string(),
             ParamType::TypedPointer(inner) => format!("{}*", inner.to_c_string()),
             ParamType::Float(32) => "float".to_string(),
@@ -500,6 +503,12 @@ impl ParamType {
             ParamType::SignedInt(32) | ParamType::UnsignedInt(32) | ParamType::Float(32) => 4,
             ParamType::SignedInt(64) | ParamType::UnsignedInt(64) | ParamType::Float(64) => 8,
             ParamType::UnsignedLongLong | ParamType::SizeT | ParamType::PtrDiffT => 8,
+            ParamType::Named(name) => match name.as_str() {
+                "pid_t" | "uid_t" | "gid_t" | "qid_t" | "mode_t" | "clockid_t" => 4,
+                "size_t" | "ssize_t" | "ptrdiff_t" | "off_t" => 8,
+                _ if name.starts_with("struct ") || name.starts_with("union ") => 0,
+                _ => 8,
+            },
             ParamType::SignedInt(n) | ParamType::UnsignedInt(n) | ParamType::Float(n) => *n / 8,
             ParamType::SimdInt128 => 16,
             ParamType::SimdFloat(size) => *size,

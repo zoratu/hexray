@@ -3573,10 +3573,15 @@ impl PseudoCodeEmitter {
                         | ConstantCategory::MmapProt
                         | ConstantCategory::MmapFlags
                         | ConstantCategory::PollEvents
+                        | ConstantCategory::CloneFlags
                         | ConstantCategory::EpollCreateFlags
+                        | ConstantCategory::CloseRangeFlags
+                        | ConstantCategory::OpenHowResolveFlags
                         | ConstantCategory::SignalfdFlags
                         | ConstantCategory::EventfdFlags
-                        | ConstantCategory::TimerfdFlags => {
+                        | ConstantCategory::TimerfdFlags
+                        | ConstantCategory::LandlockAccessFs
+                        | ConstantCategory::MemfdSecretFlags => {
                             return const_db.format_flags(*value, category);
                         }
                         ConstantCategory::FileMode => {

@@ -46,6 +46,10 @@ pub enum ConstantCategory {
     EpollCreateFlags,
     /// *at() syscall flags (AT_FDCWD, AT_SYMLINK_NOFOLLOW, etc.)
     AtFlags,
+    /// close_range() flags
+    CloseRangeFlags,
+    /// openat2() RESOLVE_* flags
+    OpenHowResolveFlags,
     /// Signal handler values (SIG_IGN, SIG_DFL)
     SignalHandler,
     /// File permission modes (0644, 0755, etc.)
@@ -90,6 +94,10 @@ pub enum ConstantCategory {
     TimerfdFlags,
     /// clockid_t values
     ClockId,
+    /// landlock access-right bitmasks
+    LandlockAccessFs,
+    /// memfd_secret() flags
+    MemfdSecretFlags,
 }
 
 /// A named constant with its value and category.
@@ -830,6 +838,42 @@ pub fn load_posix_constants(db: &mut ConstantDatabase) {
         value: 0x200,
         category: AtFlags,
         description: Some("Use effective IDs for access check"),
+    });
+    db.add(NamedConstant {
+        name: "RESOLVE_NO_XDEV",
+        value: 0x1,
+        category: OpenHowResolveFlags,
+        description: Some("Disallow mountpoint crossings"),
+    });
+    db.add(NamedConstant {
+        name: "RESOLVE_NO_MAGICLINKS",
+        value: 0x2,
+        category: OpenHowResolveFlags,
+        description: Some("Disallow magic-link resolution"),
+    });
+    db.add(NamedConstant {
+        name: "RESOLVE_NO_SYMLINKS",
+        value: 0x4,
+        category: OpenHowResolveFlags,
+        description: Some("Disallow symbolic-link resolution"),
+    });
+    db.add(NamedConstant {
+        name: "RESOLVE_BENEATH",
+        value: 0x8,
+        category: OpenHowResolveFlags,
+        description: Some("Stay beneath the starting directory"),
+    });
+    db.add(NamedConstant {
+        name: "RESOLVE_IN_ROOT",
+        value: 0x10,
+        category: OpenHowResolveFlags,
+        description: Some("Treat dirfd as the process root"),
+    });
+    db.add(NamedConstant {
+        name: "RESOLVE_CACHED",
+        value: 0x20,
+        category: OpenHowResolveFlags,
+        description: Some("Only complete from cached path components"),
     });
 }
 
@@ -1858,6 +1902,12 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         description: Some("Share signal handlers"),
     });
     db.add(NamedConstant {
+        name: "CLONE_PIDFD",
+        value: 0x00001000,
+        category: CloneFlags,
+        description: Some("Store PID file descriptor"),
+    });
+    db.add(NamedConstant {
         name: "CLONE_PTRACE",
         value: 0x00002000,
         category: CloneFlags,
@@ -1916,6 +1966,12 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         value: 0x00400000,
         category: CloneFlags,
         description: Some("Unused (ignored)"),
+    });
+    db.add(NamedConstant {
+        name: "CLONE_UNTRACED",
+        value: 0x00800000,
+        category: CloneFlags,
+        description: Some("Do not force ptrace on child"),
     });
     db.add(NamedConstant {
         name: "CLONE_CHILD_SETTID",
@@ -2193,6 +2249,18 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         category: FdFlags,
         description: Some("Non-blocking I/O"),
     });
+    db.add(NamedConstant {
+        name: "CLOSE_RANGE_UNSHARE",
+        value: 0x2,
+        category: CloseRangeFlags,
+        description: Some("Unshare the file descriptor table first"),
+    });
+    db.add(NamedConstant {
+        name: "CLOSE_RANGE_CLOEXEC",
+        value: 0x4,
+        category: CloseRangeFlags,
+        description: Some("Set close-on-exec instead of closing"),
+    });
 
     // signalfd/eventfd/timerfd/epoll_create1 flags
     db.add(NamedConstant {
@@ -2298,6 +2366,90 @@ pub fn load_linux_constants(db: &mut ConstantDatabase) {
         value: 7,
         category: ClockId,
         description: Some("Monotonic clock including suspend time"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_EXECUTE",
+        value: 0x1,
+        category: LandlockAccessFs,
+        description: Some("Execute a file"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_WRITE_FILE",
+        value: 0x2,
+        category: LandlockAccessFs,
+        description: Some("Write to a file"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_READ_FILE",
+        value: 0x4,
+        category: LandlockAccessFs,
+        description: Some("Read a file"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_READ_DIR",
+        value: 0x8,
+        category: LandlockAccessFs,
+        description: Some("Read a directory"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_REMOVE_DIR",
+        value: 0x10,
+        category: LandlockAccessFs,
+        description: Some("Remove a directory"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_REMOVE_FILE",
+        value: 0x20,
+        category: LandlockAccessFs,
+        description: Some("Remove a file"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_MAKE_CHAR",
+        value: 0x40,
+        category: LandlockAccessFs,
+        description: Some("Create a character device"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_MAKE_DIR",
+        value: 0x80,
+        category: LandlockAccessFs,
+        description: Some("Create a directory"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_MAKE_REG",
+        value: 0x100,
+        category: LandlockAccessFs,
+        description: Some("Create a regular file"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_MAKE_SOCK",
+        value: 0x200,
+        category: LandlockAccessFs,
+        description: Some("Create a socket"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_MAKE_FIFO",
+        value: 0x400,
+        category: LandlockAccessFs,
+        description: Some("Create a FIFO"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_MAKE_BLOCK",
+        value: 0x800,
+        category: LandlockAccessFs,
+        description: Some("Create a block device"),
+    });
+    db.add(NamedConstant {
+        name: "LANDLOCK_ACCESS_FS_MAKE_SYM",
+        value: 0x1000,
+        category: LandlockAccessFs,
+        description: Some("Create a symbolic link"),
+    });
+    db.add(NamedConstant {
+        name: "FD_CLOEXEC",
+        value: 0x1,
+        category: MemfdSecretFlags,
+        description: Some("Close on exec"),
     });
 }
 
@@ -2545,18 +2697,19 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
             Some(ConstantCategory::EpollCreateFlags)
         }
         // *at() syscalls - first arg is directory fd (AT_FDCWD)
-        "openat" | "_openat" | "fstatat" | "_fstatat" | "fstatat64" | "_fstatat64" | "fchmodat"
-        | "_fchmodat" | "fchownat" | "_fchownat" | "linkat" | "_linkat" | "unlinkat"
-        | "_unlinkat" | "renameat" | "_renameat" | "symlinkat" | "_symlinkat" | "readlinkat"
-        | "_readlinkat" | "faccessat" | "_faccessat" | "mkdirat" | "_mkdirat" | "mknodat"
-        | "_mknodat" | "futimesat" | "_futimesat" | "utimensat" | "_utimensat"
+        "openat" | "_openat" | "openat2" | "_openat2" | "fstatat" | "_fstatat" | "fstatat64"
+        | "_fstatat64" | "fchmodat" | "_fchmodat" | "fchownat" | "_fchownat" | "linkat"
+        | "_linkat" | "unlinkat" | "_unlinkat" | "renameat" | "_renameat" | "symlinkat"
+        | "_symlinkat" | "readlinkat" | "_readlinkat" | "faccessat" | "_faccessat"
+        | "faccessat2" | "_faccessat2" | "mkdirat" | "_mkdirat" | "mknodat" | "_mknodat"
+        | "futimesat" | "_futimesat" | "utimensat" | "_utimensat"
             if arg_index == 0 =>
         {
             Some(ConstantCategory::AtFlags)
         }
         // Some *at() functions have flags as last argument
         "fchmodat" | "_fchmodat" | "fchownat" | "_fchownat" | "faccessat" | "_faccessat"
-        | "linkat" | "_linkat" | "unlinkat" | "_unlinkat"
+        | "faccessat2" | "_faccessat2" | "linkat" | "_linkat" | "unlinkat" | "_unlinkat"
             if arg_index == 3 =>
         {
             Some(ConstantCategory::AtFlags)
@@ -2579,12 +2732,11 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
         // seccomp
         "seccomp" | "_seccomp" if arg_index == 0 => Some(ConstantCategory::Seccomp),
         // clone
-        "clone" | "_clone" | "clone3" | "_clone3" if arg_index == 0 => {
-            Some(ConstantCategory::CloneFlags)
-        }
+        "clone" | "_clone" if arg_index == 0 => Some(ConstantCategory::CloneFlags),
         // access/faccessat - mode argument
         "access" | "_access" if arg_index == 1 => Some(ConstantCategory::AccessMode),
         "faccessat" | "_faccessat" if arg_index == 2 => Some(ConstantCategory::AccessMode),
+        "faccessat2" | "_faccessat2" if arg_index == 2 => Some(ConstantCategory::AccessMode),
         // shutdown
         "shutdown" | "_shutdown" if arg_index == 1 => Some(ConstantCategory::ShutdownHow),
         // flock
@@ -2628,6 +2780,11 @@ pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<Consta
         "pidfd_send_signal" | "_pidfd_send_signal" if arg_index == 1 => {
             Some(ConstantCategory::Signal)
         }
+        "close_range" | "_close_range" if arg_index == 2 => Some(ConstantCategory::CloseRangeFlags),
+        "memfd_secret" | "_memfd_secret" if arg_index == 0 => {
+            Some(ConstantCategory::MemfdSecretFlags)
+        }
+        "futex_waitv" | "_futex_waitv" if arg_index == 4 => Some(ConstantCategory::ClockId),
         _ => None,
     }
 }
@@ -2673,6 +2830,14 @@ mod tests {
         assert!(epoll_events.contains("EPOLLIN"));
         assert!(epoll_events.contains("EPOLLRDHUP"));
         assert!(epoll_events.contains("EPOLLONESHOT"));
+
+        let clone_flags = db.format_flags(0x10001000, ConstantCategory::CloneFlags);
+        assert!(clone_flags.contains("CLONE_NEWUSER"));
+        assert!(clone_flags.contains("CLONE_PIDFD"));
+
+        let resolve_flags = db.format_flags(0x18, ConstantCategory::OpenHowResolveFlags);
+        assert!(resolve_flags.contains("RESOLVE_BENEATH"));
+        assert!(resolve_flags.contains("RESOLVE_IN_ROOT"));
     }
 
     #[test]
@@ -2705,6 +2870,30 @@ mod tests {
             get_argument_category("signalfd4", 3),
             Some(ConstantCategory::SignalfdFlags)
         );
+        assert_eq!(
+            get_argument_category("close_range", 2),
+            Some(ConstantCategory::CloseRangeFlags)
+        );
+        assert_eq!(
+            get_argument_category("faccessat2", 0),
+            Some(ConstantCategory::AtFlags)
+        );
+        assert_eq!(
+            get_argument_category("faccessat2", 2),
+            Some(ConstantCategory::AccessMode)
+        );
+        assert_eq!(
+            get_argument_category("faccessat2", 3),
+            Some(ConstantCategory::AtFlags)
+        );
+        assert_eq!(
+            get_argument_category("memfd_secret", 0),
+            Some(ConstantCategory::MemfdSecretFlags)
+        );
+        assert_eq!(
+            get_argument_category("futex_waitv", 4),
+            Some(ConstantCategory::ClockId)
+        );
     }
 
     #[test]
@@ -2718,6 +2907,36 @@ mod tests {
         assert_eq!(
             db.lookup(7, Some(ConstantCategory::ClockId)),
             Some("CLOCK_BOOTTIME")
+        );
+    }
+
+    #[test]
+    fn test_linux_modern_constant_lookups() {
+        let db = ConstantDatabase::with_builtins();
+
+        assert_eq!(
+            db.lookup(0x1000, Some(ConstantCategory::CloneFlags)),
+            Some("CLONE_PIDFD")
+        );
+        assert_eq!(
+            db.lookup(0x800000, Some(ConstantCategory::CloneFlags)),
+            Some("CLONE_UNTRACED")
+        );
+        assert_eq!(
+            db.lookup(0x1, Some(ConstantCategory::OpenHowResolveFlags)),
+            Some("RESOLVE_NO_XDEV")
+        );
+        assert_eq!(
+            db.lookup(0x4, Some(ConstantCategory::CloseRangeFlags)),
+            Some("CLOSE_RANGE_CLOEXEC")
+        );
+        assert_eq!(
+            db.lookup(0x1, Some(ConstantCategory::MemfdSecretFlags)),
+            Some("FD_CLOEXEC")
+        );
+        assert_eq!(
+            db.lookup(0x1000, Some(ConstantCategory::LandlockAccessFs)),
+            Some("LANDLOCK_ACCESS_FS_MAKE_SYM")
         );
     }
 }

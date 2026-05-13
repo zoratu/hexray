@@ -332,6 +332,10 @@ impl SignatureRecovery {
                     if matches!(candidate, ParamType::Float(_)) {
                         self.float_return = true;
                     }
+                    if matches!(candidate, ParamType::Pointer | ParamType::TypedPointer(_)) {
+                        self.return_is_pointer = true;
+                        self.return_size = self.return_size.max(8);
+                    }
                     if matches!(candidate, ParamType::FunctionPointer { .. }) {
                         self.return_function_pointer = Some(candidate);
                     } else {
@@ -650,6 +654,9 @@ impl SignatureRecovery {
                         ParamType::UnsignedLongLong | ParamType::SizeT | ParamType::PtrDiffT => {
                             self.return_size = self.return_size.max(8);
                         }
+                        ParamType::Named(_) => {
+                            self.return_size = self.return_size.max(candidate.size().max(1));
+                        }
                         ParamType::SignedInt(bits) | ParamType::UnsignedInt(bits) => {
                             self.return_size = self.return_size.max((bits / 8).max(1));
                         }
@@ -889,7 +896,7 @@ impl SignatureRecovery {
                     self.tail_call_return_type = self.infer_tail_call_forwarded_return_type(expr);
                     if let ExprKind::Call { target, args } = &expr.kind {
                         if let Some(name) = self.extract_call_name(target) {
-                            if let Some(params) = get_known_function_params(&name) {
+                            if let Some(params) = Self::known_function_params(&name) {
                                 let mut resolved_args = Vec::with_capacity(args.len());
                                 let mut is_pure_prefix_wrapper =
                                     !args.is_empty() && args.len() <= params.len();
@@ -914,7 +921,7 @@ impl SignatureRecovery {
                                             .unwrap_or_else(|| param_type.clone());
                                         self.param_names
                                             .entry(param_idx)
-                                            .or_insert_with(|| (*param_name).to_string());
+                                            .or_insert_with(|| param_name.clone());
                                         self.param_type_overrides
                                             .entry(param_idx)
                                             .or_insert(wrapper_param_type);
@@ -926,12 +933,26 @@ impl SignatureRecovery {
                                         let Some(param_idx) = resolved_param_idx else {
                                             continue;
                                         };
-                                        let Some((param_name, _)) = params.get(arg_index) else {
+                                        let Some((param_name, param_type)) = params.get(arg_index)
+                                        else {
                                             continue;
                                         };
-                                        self.param_names
-                                            .entry(param_idx)
-                                            .or_insert_with(|| (*param_name).to_string());
+                                        if let Some(wrapper_param_type) =
+                                            ParameterUsageHints::callback_signature(
+                                                &name, arg_index,
+                                            )
+                                        {
+                                            self.param_names.insert(param_idx, param_name.clone());
+                                            self.param_type_overrides
+                                                .insert(param_idx, wrapper_param_type);
+                                        } else {
+                                            self.param_names
+                                                .entry(param_idx)
+                                                .or_insert_with(|| param_name.clone());
+                                            self.param_type_overrides
+                                                .entry(param_idx)
+                                                .or_insert_with(|| param_type.clone());
+                                        }
                                     }
                                 }
                             }
@@ -1716,17 +1737,43 @@ impl SignatureRecovery {
             .map(Self::param_type_from_summary)
     }
 
-    fn builtin_call_return_type(function_name: &str) -> Option<ParamType> {
+    fn builtin_signature_type_database() -> &'static TypeDatabase {
         static DB: OnceLock<TypeDatabase> = OnceLock::new();
-        let db = DB.get_or_init(|| {
+        DB.get_or_init(|| {
             let mut db = TypeDatabase::new();
             load_posix_types(&mut db);
             load_linux_types(&mut db);
             load_libc_functions(&mut db);
             db
-        });
+        })
+    }
+
+    fn builtin_function_params(function_name: &str) -> Option<Vec<(String, ParamType)>> {
         let clean = ParameterUsageHints::normalize_callback_name(function_name);
-        let proto = db.get_function(clean)?;
+        let proto = Self::builtin_signature_type_database().get_function(clean)?;
+        proto
+            .parameters
+            .iter()
+            .map(|(name, ty)| Some((name.clone(), Self::param_type_from_ctype(ty)?)))
+            .collect()
+    }
+
+    fn known_function_params(function_name: &str) -> Option<Vec<(String, ParamType)>> {
+        if let Some(params) = get_known_function_params(function_name) {
+            return Some(
+                params
+                    .iter()
+                    .map(|(name, ty)| ((*name).to_string(), ty.clone()))
+                    .collect(),
+            );
+        }
+
+        Self::builtin_function_params(function_name)
+    }
+
+    fn builtin_call_return_type(function_name: &str) -> Option<ParamType> {
+        let clean = ParameterUsageHints::normalize_callback_name(function_name);
+        let proto = Self::builtin_signature_type_database().get_function(clean)?;
         Self::param_type_from_ctype(&proto.return_type)
     }
 
@@ -1741,9 +1788,24 @@ impl SignatureRecovery {
             CType::Float(float_ty) => {
                 Some(ParamType::Float((float_ty.size as u8).saturating_mul(8)))
             }
-            CType::Pointer(_) | CType::Array(_) | CType::Struct(_) | CType::Union(_) => {
-                Some(ParamType::Pointer)
-            }
+            CType::Pointer(inner) => match Self::param_type_from_ctype(inner) {
+                Some(ParamType::Void) => Some(ParamType::Pointer),
+                Some(inner_ty) => Some(ParamType::TypedPointer(Box::new(inner_ty))),
+                None => Some(ParamType::Pointer),
+            },
+            CType::Array(array_ty) => match Self::param_type_from_ctype(&array_ty.element) {
+                Some(ParamType::Void) => Some(ParamType::Pointer),
+                Some(inner_ty) => Some(ParamType::TypedPointer(Box::new(inner_ty))),
+                None => Some(ParamType::Pointer),
+            },
+            CType::Struct(struct_ty) => struct_ty
+                .name
+                .as_ref()
+                .map(|name| ParamType::Named(format!("struct {name}"))),
+            CType::Union(union_ty) => union_ty
+                .name
+                .as_ref()
+                .map(|name| ParamType::Named(format!("union {name}"))),
             CType::Enum(enum_ty) => Some(ParamType::UnsignedInt(
                 (enum_ty.underlying_size as u8).saturating_mul(8),
             )),
@@ -1758,7 +1820,7 @@ impl SignatureRecovery {
                     .collect(),
             }),
             CType::Typedef(typedef_ty) => Self::param_type_from_ctype(&typedef_ty.target),
-            CType::Named(_) => None,
+            CType::Named(name) => Some(ParamType::Named(name.clone())),
         }
     }
 
@@ -1973,7 +2035,20 @@ impl SignatureRecovery {
     fn merge_param_types(a: &ParamType, b: &ParamType) -> ParamType {
         match (a, b) {
             (ParamType::Unknown, t) | (t, ParamType::Unknown) => t.clone(),
+            (ParamType::Pointer, ParamType::TypedPointer(inner))
+            | (ParamType::TypedPointer(inner), ParamType::Pointer) => {
+                ParamType::TypedPointer(inner.clone())
+            }
             (ParamType::Pointer, _) | (_, ParamType::Pointer) => ParamType::Pointer,
+            (ParamType::TypedPointer(inner_a), ParamType::TypedPointer(inner_b)) => {
+                let merged = Self::merge_param_types(inner_a, inner_b);
+                if matches!(merged, ParamType::Unknown) {
+                    ParamType::Pointer
+                } else {
+                    ParamType::TypedPointer(Box::new(merged))
+                }
+            }
+            (ParamType::Named(a), ParamType::Named(b)) if a == b => ParamType::Named(a.clone()),
             (ParamType::Float(sa), ParamType::Float(sb)) => ParamType::Float((*sa).max(*sb)),
             (ParamType::SimdInt128, ParamType::SimdInt128) => ParamType::SimdInt128,
             (ParamType::SimdFloat(sa), ParamType::SimdFloat(sb)) => {
@@ -3366,7 +3441,7 @@ impl SignatureRecovery {
         let known_params = self
             .current_func_name
             .as_ref()
-            .and_then(|name| get_known_function_params(name));
+            .and_then(|name| Self::known_function_params(name));
 
         // Determine which argument registers were used
         let int_regs = self.convention.integer_arg_registers();
@@ -3402,13 +3477,7 @@ impl SignatureRecovery {
                 used_args.push(idx);
             }
         }
-        if self.tail_call_min_arity.is_some()
-            && self
-                .current_func_name
-                .as_ref()
-                .and_then(|name| get_known_function_params(name))
-                .is_none()
-        {
+        if self.tail_call_min_arity.is_some() && known_params.is_none() {
             if let Some(min_arity) = self.tail_call_min_arity {
                 for idx in 0..min_arity.min(int_regs.len()) {
                     if !used_args.contains(&idx) {
@@ -3432,8 +3501,9 @@ impl SignatureRecovery {
 
             // Check if we have a known parameter name/type for this index
             let (known_name, known_type) = known_params
+                .as_ref()
                 .and_then(|params| params.get(idx))
-                .map(|(name, ty)| (Some(*name), Some(ty.clone())))
+                .map(|(name, ty)| (Some(name.clone()), Some(ty.clone())))
                 .unwrap_or((None, None));
 
             // Get usage hints for this parameter
@@ -3504,7 +3574,7 @@ impl SignatureRecovery {
             {
                 dwarf_name.clone()
             } else if let Some(known_nm) = known_name {
-                known_nm.to_string()
+                known_nm
             } else if let Some(custom_name) = self.param_names.get(&idx) {
                 custom_name.clone()
             } else if let Some(hints) = hints {
@@ -3619,6 +3689,31 @@ impl SignatureRecovery {
                 };
             } else if self.float_return {
                 sig.return_type = Self::float_param_type_for_size(self.return_size);
+            } else if let Some(tail_ty) = self.tail_call_return_type.as_ref() {
+                if !matches!(tail_ty, ParamType::Void | ParamType::Unknown) {
+                    sig.return_type = tail_ty.clone();
+                } else if self.return_is_pointer && self.return_size == 8 {
+                    sig.return_type = ParamType::Pointer;
+                } else if matches!(self.current_func_kind, Some(SymbolKind::IndirectFunction)) {
+                    sig.return_type = ParamType::Pointer;
+                    if !sig
+                        .return_provenance
+                        .iter()
+                        .any(|reason| reason == "IFUNC resolver default return type")
+                    {
+                        sig.return_provenance
+                            .push("IFUNC resolver default return type".to_string());
+                    }
+                    sig.return_confidence = sig.return_confidence.max(200);
+                } else {
+                    sig.return_type = match self.return_size {
+                        1 => ParamType::SignedInt(8),
+                        2 => ParamType::SignedInt(16),
+                        4 => ParamType::SignedInt(32),
+                        8 => ParamType::SignedInt(64),
+                        _ => ParamType::SignedInt(64),
+                    };
+                }
             } else if self.return_is_pointer && self.return_size == 8 {
                 // Return value is a pointer
                 sig.return_type = ParamType::Pointer;
@@ -3726,19 +3821,20 @@ impl SignatureRecovery {
             return;
         }
 
+        let known_params = Self::known_function_params(function_name);
         self.variadic_fixed_param_count = Some(
             self.variadic_fixed_param_count.unwrap_or(0).max(
                 (0..fixed_arg_count)
                     .filter_map(|arg_index| {
                         self.resolve_param_index_from_expr_precise(&args[arg_index])
                             .map(|param_idx| {
-                                if let Some((param_name, param_type)) =
-                                    get_known_function_params(function_name)
-                                        .and_then(|params| params.get(arg_index))
+                                if let Some((param_name, param_type)) = known_params
+                                    .as_ref()
+                                    .and_then(|params| params.get(arg_index))
                                 {
                                     self.param_names
                                         .entry(param_idx)
-                                        .or_insert_with(|| (*param_name).to_string());
+                                        .or_insert_with(|| param_name.clone());
                                     self.param_type_overrides
                                         .entry(param_idx)
                                         .or_insert_with(|| param_type.clone());
@@ -6460,6 +6556,36 @@ mod tests {
         assert_eq!(sig.parameters[1].name, "src");
         assert_eq!(sig.parameters[0].param_type, ParamType::Pointer);
         assert_eq!(sig.parameters[1].param_type, ParamType::Pointer);
+    }
+
+    #[test]
+    fn test_signature_recovery_uses_builtin_tail_call_param_type_for_clone3_wrapper() {
+        use hexray_core::BasicBlockId;
+
+        let call = Expr::call(
+            CallTarget::Named("clone3".to_string()),
+            vec![Expr::var(Variable::reg("rdi", 8)), Expr::int(88)],
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![call],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 1);
+        assert_eq!(sig.parameters[0].name, "args");
+        assert_eq!(
+            sig.parameters[0].param_type,
+            ParamType::TypedPointer(Box::new(ParamType::Named("struct clone_args".to_string())))
+        );
     }
 
     #[test]

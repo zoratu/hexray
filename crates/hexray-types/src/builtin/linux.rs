@@ -155,6 +155,7 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     db.add_type("struct utsname", CType::Struct(utsname));
 
     db.add_typedef("clockid_t", CType::int());
+    db.add_typedef("qid_t", CType::uint());
     db.add_typedef("sigset_t", CType::array(CType::ulong(), Some(16)));
     db.add_typedef("siginfo_t", CType::Named("struct siginfo".to_string()));
 
@@ -205,6 +206,54 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
     itimerspec.add_field("it_value".to_string(), timespec_ty.clone());
     itimerspec.finalize();
     db.add_type("struct itimerspec", CType::Struct(itimerspec));
+
+    let mut clone_args = StructType::new(Some("clone_args".to_string()));
+    clone_args.add_field("flags".to_string(), CType::ulonglong());
+    clone_args.add_field("pidfd".to_string(), CType::ulonglong());
+    clone_args.add_field("child_tid".to_string(), CType::ulonglong());
+    clone_args.add_field("parent_tid".to_string(), CType::ulonglong());
+    clone_args.add_field("exit_signal".to_string(), CType::ulonglong());
+    clone_args.add_field("stack".to_string(), CType::ulonglong());
+    clone_args.add_field("stack_size".to_string(), CType::ulonglong());
+    clone_args.add_field("tls".to_string(), CType::ulonglong());
+    clone_args.add_field("set_tid".to_string(), CType::ulonglong());
+    clone_args.add_field("set_tid_size".to_string(), CType::ulonglong());
+    clone_args.add_field("cgroup".to_string(), CType::ulonglong());
+    clone_args.finalize();
+    db.add_type("struct clone_args", CType::Struct(clone_args));
+
+    let mut open_how = StructType::new(Some("open_how".to_string()));
+    open_how.add_field("flags".to_string(), CType::ulonglong());
+    open_how.add_field("mode".to_string(), CType::ulonglong());
+    open_how.add_field("resolve".to_string(), CType::ulonglong());
+    open_how.finalize();
+    db.add_type("struct open_how", CType::Struct(open_how));
+
+    let mut mount_attr = StructType::new(Some("mount_attr".to_string()));
+    mount_attr.add_field("attr_set".to_string(), CType::ulonglong());
+    mount_attr.add_field("attr_clr".to_string(), CType::ulonglong());
+    mount_attr.add_field("propagation".to_string(), CType::ulonglong());
+    mount_attr.add_field("userns_fd".to_string(), CType::ulonglong());
+    mount_attr.finalize();
+    db.add_type("struct mount_attr", CType::Struct(mount_attr));
+
+    let mut landlock_ruleset_attr = StructType::new(Some("landlock_ruleset_attr".to_string()));
+    landlock_ruleset_attr.add_field("handled_access_fs".to_string(), CType::ulonglong());
+    landlock_ruleset_attr.finalize();
+    db.add_type(
+        "struct landlock_ruleset_attr",
+        CType::Struct(landlock_ruleset_attr),
+    );
+
+    let mut landlock_path_beneath_attr =
+        StructType::new(Some("landlock_path_beneath_attr".to_string()));
+    landlock_path_beneath_attr.add_field("allowed_access".to_string(), CType::ulonglong());
+    landlock_path_beneath_attr.add_field("parent_fd".to_string(), CType::int());
+    landlock_path_beneath_attr.finalize();
+    db.add_type(
+        "struct landlock_path_beneath_attr",
+        CType::Struct(landlock_path_beneath_attr),
+    );
 
     let mut epoll_data = UnionType::new(Some("epoll_data".to_string()));
     epoll_data.add_member("ptr".to_string(), CType::ptr(CType::void()));
@@ -518,6 +567,141 @@ pub fn load_linux_types(db: &mut TypeDatabase) {
             .param("flags", CType::uint())
             .doc("Send a signal via a pidfd"),
     );
+
+    db.add_function(
+        FunctionPrototype::new("clone3", CType::typedef_ref("pid_t"))
+            .param(
+                "args",
+                CType::ptr(CType::Named("struct clone_args".to_string())),
+            )
+            .param("size", CType::typedef_ref("size_t"))
+            .doc("Create a process using a struct-based clone ABI"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("close_range", CType::int())
+            .param("first", CType::uint())
+            .param("last", CType::uint())
+            .param("flags", CType::uint())
+            .doc("Close a range of file descriptors"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("openat2", CType::int())
+            .param("dirfd", CType::int())
+            .param("pathname", CType::ptr(CType::char()))
+            .param(
+                "how",
+                CType::ptr(CType::Named("struct open_how".to_string())),
+            )
+            .param("size", CType::typedef_ref("size_t"))
+            .doc("Open a path relative to a directory with extended resolution control"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("pidfd_getfd", CType::int())
+            .param("pidfd", CType::int())
+            .param("targetfd", CType::int())
+            .param("flags", CType::uint())
+            .doc("Duplicate a target process file descriptor via pidfd"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("faccessat2", CType::int())
+            .param("dirfd", CType::int())
+            .param("pathname", CType::ptr(CType::char()))
+            .param("mode", CType::int())
+            .param("flags", CType::int())
+            .doc("Check file accessibility relative to a directory"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("process_madvise", CType::typedef_ref("ssize_t"))
+            .param("pidfd", CType::int())
+            .param("iov", CType::ptr(CType::Named("struct iovec".to_string())))
+            .param("iovcnt", CType::typedef_ref("size_t"))
+            .param("advice", CType::int())
+            .param("flags", CType::uint())
+            .doc("Advise the kernel about another process's memory usage"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("mount_setattr", CType::int())
+            .param("dfd", CType::int())
+            .param("path", CType::ptr(CType::char()))
+            .param("flags", CType::uint())
+            .param(
+                "uattr",
+                CType::ptr(CType::Named("struct mount_attr".to_string())),
+            )
+            .param("usize", CType::typedef_ref("size_t"))
+            .doc("Change mount attributes"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("quotactl_fd", CType::int())
+            .param("fd", CType::uint())
+            .param("cmd", CType::uint())
+            .param("id", CType::typedef_ref("qid_t"))
+            .param("addr", CType::ptr(CType::void()))
+            .doc("Control filesystem quotas via file descriptor"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("landlock_create_ruleset", CType::int())
+            .param(
+                "attr",
+                CType::ptr(CType::Named("struct landlock_ruleset_attr".to_string())),
+            )
+            .param("size", CType::typedef_ref("size_t"))
+            .param("flags", CType::typedef_ref("uint32_t"))
+            .doc("Create a Landlock ruleset"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("landlock_add_rule", CType::int())
+            .param("ruleset_fd", CType::int())
+            .param("rule_type", CType::int())
+            .param("rule_attr", CType::ptr(CType::void()))
+            .param("flags", CType::typedef_ref("uint32_t"))
+            .doc("Add a rule to a Landlock ruleset"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("landlock_restrict_self", CType::int())
+            .param("ruleset_fd", CType::int())
+            .param("flags", CType::typedef_ref("uint32_t"))
+            .doc("Enforce a Landlock ruleset on the current task"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("memfd_secret", CType::int())
+            .param("flags", CType::uint())
+            .doc("Create a secret-memory file descriptor"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("process_mrelease", CType::int())
+            .param("pidfd", CType::int())
+            .param("flags", CType::uint())
+            .doc("Release memory resources owned by a dying process"),
+    );
+
+    db.add_function(
+        FunctionPrototype::new("futex_waitv", CType::int())
+            .param(
+                "waiters",
+                CType::ptr(CType::Named("struct futex_waitv".to_string())),
+            )
+            .param("nr_futexes", CType::uint())
+            .param("flags", CType::uint())
+            .param(
+                "timeout",
+                CType::ptr(CType::Named("struct timespec".to_string())),
+            )
+            .param("clockid", CType::typedef_ref("clockid_t"))
+            .doc("Wait on multiple futexes"),
+    );
 }
 
 #[cfg(test)]
@@ -536,12 +720,32 @@ mod tests {
         assert!(db.has_type("struct itimerspec"));
         assert!(db.has_type("struct signalfd_siginfo"));
         assert!(db.has_type("union epoll_data"));
+        assert!(db.has_type("struct clone_args"));
+        assert!(db.has_type("struct open_how"));
+        assert!(db.has_type("struct mount_attr"));
+        assert!(db.has_type("struct landlock_ruleset_attr"));
+        assert!(db.has_type("struct landlock_path_beneath_attr"));
+        assert!(db.has_type("qid_t"));
         assert!(db.has_function("mmap"));
         assert!(db.has_function("socket"));
         assert!(db.has_function("sigaction"));
         assert!(db.has_function("syscall"));
         assert!(db.has_function("timerfd_create"));
         assert!(db.has_function("signalfd4"));
+        assert!(db.has_function("clone3"));
+        assert!(db.has_function("close_range"));
+        assert!(db.has_function("openat2"));
+        assert!(db.has_function("pidfd_getfd"));
+        assert!(db.has_function("faccessat2"));
+        assert!(db.has_function("process_madvise"));
+        assert!(db.has_function("mount_setattr"));
+        assert!(db.has_function("quotactl_fd"));
+        assert!(db.has_function("landlock_create_ruleset"));
+        assert!(db.has_function("landlock_add_rule"));
+        assert!(db.has_function("landlock_restrict_self"));
+        assert!(db.has_function("memfd_secret"));
+        assert!(db.has_function("process_mrelease"));
+        assert!(db.has_function("futex_waitv"));
     }
 
     #[test]
@@ -603,5 +807,51 @@ mod tests {
             db.get_type("struct signalfd_siginfo").and_then(CType::size),
             Some(128)
         );
+    }
+
+    #[test]
+    fn test_linux_modern_syscall_struct_layouts() {
+        let mut db = TypeDatabase::new();
+        load_posix_types(&mut db);
+        load_linux_types(&mut db);
+
+        assert_eq!(
+            db.get_type("struct clone_args").and_then(CType::size),
+            Some(88)
+        );
+        assert_eq!(
+            db.get_type("struct open_how").and_then(CType::size),
+            Some(24)
+        );
+        assert_eq!(
+            db.get_type("struct mount_attr").and_then(CType::size),
+            Some(32)
+        );
+        assert_eq!(
+            db.get_type("struct landlock_ruleset_attr")
+                .and_then(CType::size),
+            Some(8)
+        );
+        assert_eq!(
+            db.get_type("struct landlock_path_beneath_attr")
+                .and_then(CType::size),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn test_clone3_signature_uses_struct_and_size() {
+        let mut db = TypeDatabase::new();
+        load_posix_types(&mut db);
+        load_linux_types(&mut db);
+
+        let clone3 = db.get_function("clone3").expect("clone3 prototype");
+        assert_eq!(clone3.return_type, CType::typedef_ref("pid_t"));
+        assert_eq!(clone3.parameters.len(), 2);
+        assert_eq!(
+            clone3.parameters[0].1,
+            CType::ptr(CType::Named("struct clone_args".to_string()))
+        );
+        assert_eq!(clone3.parameters[1].1, CType::typedef_ref("size_t"));
     }
 }
