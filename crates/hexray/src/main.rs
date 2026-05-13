@@ -2825,6 +2825,12 @@ fn format_instruction_for_output(
     relocations: &RelocationTable,
     instruction: &hexray_core::Instruction,
 ) -> String {
+    let (mnemonic, avx512_mask_decorator) =
+        split_x86_avx512_mask_decorator_for_output(&instruction.mnemonic).map_or_else(
+            || (instruction.mnemonic.as_str(), None),
+            |(base, decorator, suffix)| (base, Some((decorator, suffix))),
+        );
+
     let mut rendered = format!("{:#010x}:  ", instruction.address);
     for byte in &instruction.bytes {
         rendered.push_str(&format!("{:02x} ", byte));
@@ -2833,7 +2839,13 @@ fn format_instruction_for_output(
         rendered.push_str("   ");
     }
     rendered.push(' ');
-    rendered.push_str(&instruction.mnemonic);
+    rendered.push_str(mnemonic);
+    if let Some((_, suffix)) = avx512_mask_decorator {
+        if !suffix.is_empty() {
+            rendered.push(' ');
+            rendered.push_str(suffix);
+        }
+    }
     if let Some(operands) = format_arm64_crypto_operands_for_output(instruction) {
         rendered.push(' ');
         rendered.push_str(&operands);
@@ -2853,16 +2865,37 @@ fn format_instruction_for_output(
         rendered.push_str(&operands);
     } else if !instruction.operands.is_empty() {
         rendered.push(' ');
-        let operands: Vec<_> = instruction
+        let mut operands: Vec<_> = instruction
             .operands
             .iter()
             .map(|operand| {
                 format_disassembly_operand(fmt, project, symbols, relocations, instruction, operand)
             })
             .collect();
+        if let Some((decorator, _)) = avx512_mask_decorator {
+            if let Some(first) = operands.first_mut() {
+                first.push_str(decorator);
+            }
+        }
         rendered.push_str(&operands.join(", "));
     }
     rendered
+}
+
+fn split_x86_avx512_mask_decorator_for_output(mnemonic: &str) -> Option<(&str, &str, &str)> {
+    let split = mnemonic.find(" {k")?;
+    let base = mnemonic.get(..split)?;
+    let rest = mnemonic.get(split + 1..)?;
+    let first_end = rest.find('}')?;
+    let first = rest.get(..=first_end)?;
+    let mut decorator_len = first.len();
+    let tail = rest.get(decorator_len..).unwrap_or("");
+    if tail.starts_with("{z}") {
+        decorator_len = decorator_len.saturating_add(3);
+    }
+    let decorator = rest.get(..decorator_len)?;
+    let suffix = rest.get(decorator_len..).unwrap_or("");
+    Some((base, decorator, suffix))
 }
 
 fn disassemble_symbol(binary: &Binary, name: &str, max_count: usize) -> Result<()> {

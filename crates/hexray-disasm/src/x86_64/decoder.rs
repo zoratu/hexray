@@ -2,7 +2,7 @@
 
 use super::modrm::{
     decode_gpr, decode_modrm_reg, decode_modrm_reg_xmm, decode_modrm_rm, decode_modrm_rm_xmm,
-    decode_tmm, decode_xmm, ModRM,
+    decode_opmask, decode_tmm, decode_xmm, ModRM,
 };
 use super::opcodes::{
     lookup_sse_opcode, OperandEncoding, SseEncoding, GROUP1_OPS, GROUP3_OPS, GROUP5_OPS,
@@ -421,6 +421,11 @@ impl Disassembler for X86_64Disassembler {
             }
             // For VEX.mmmmm == 3 (0x0F 0x3A escape) - instructions with immediate
             if vex.mmmmm == 3 {
+                if let Some(decoded) =
+                    self.decode_vex_opmask_instruction(bytes, address, &prefixes, offset, opcode)?
+                {
+                    return Ok(Self::finalize_legacy_prefixes(&prefixes, decoded));
+                }
                 if let Some(entry) = super::opcodes_0f3a::OPCODE_TABLE_0F3A
                     .get(opcode as usize)
                     .and_then(|e| e.as_ref())
@@ -2116,6 +2121,12 @@ impl X86_64Disassembler {
         };
 
         if let Some(decoded) =
+            self.decode_vex_opmask_instruction(bytes, address, prefixes, offset, opcode)?
+        {
+            return Ok(Some(decoded));
+        }
+
+        if let Some(decoded) =
             self.decode_vector_shift_group(bytes, address, prefixes, offset, opcode)?
         {
             return Ok(Some(decoded));
@@ -2143,6 +2154,305 @@ impl X86_64Disassembler {
         }
 
         Ok(None)
+    }
+
+    fn decode_vex_opmask_instruction(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+        opcode: u8,
+    ) -> Result<Option<DecodedInstruction>, DecodeError> {
+        let Some(vex) = prefixes.vex else {
+            return Ok(None);
+        };
+
+        match vex.mmmmm {
+            1 if matches!(opcode, 0x30..=0x33) => return Ok(None),
+            1 => {}
+            3 if !matches!(opcode, 0x30..=0x33) => return Ok(None),
+            3 => {}
+            _ => return Ok(None),
+        }
+
+        let is_supported = matches!(
+            opcode,
+            0x30..=0x33
+                | 0x41
+                | 0x42
+                | 0x44..=0x47
+                | 0x4A
+                | 0x4B
+                | 0x90..=0x93
+                | 0x98
+                | 0x99
+        );
+        if !is_supported {
+            return Ok(None);
+        }
+
+        let remaining = bytes.get(offset..).unwrap_or(&[]);
+        if remaining.is_empty() {
+            return Err(DecodeError::truncated(
+                address,
+                offset.saturating_add(1),
+                bytes.len(),
+            ));
+        }
+
+        let effective_rex = prefixes.effective_rex();
+        let modrm = ModRM::parse(remaining.first().copied().unwrap_or(0), effective_rex);
+        offset = offset.saturating_add(1);
+
+        let kmask_width_suffix = || match (vex.w, vex.pp) {
+            (false, 1) => Some("b"),
+            (false, 0) => Some("w"),
+            (true, 1) => Some("d"),
+            (true, 0) => Some("q"),
+            _ => None,
+        };
+
+        let kmov_kmem_width = || match (vex.w, vex.pp) {
+            (false, 1) => Some(("b", 1u8)),
+            (false, 0) => Some(("w", 2u8)),
+            (true, 1) => Some(("d", 4u8)),
+            (true, 0) => Some(("q", 8u8)),
+            _ => None,
+        };
+
+        let kmov_gpr_width = || match (vex.w, vex.pp) {
+            (false, 1) => Some(("b", 32u16)),
+            (false, 0) => Some(("w", 32u16)),
+            (false, 3) => Some(("d", 32u16)),
+            (true, 3) => Some(("q", 64u16)),
+            _ => None,
+        };
+
+        let decode_kmask_rm = |rm: u8| Operand::Register(decode_opmask(rm));
+
+        let decode_kmov_gpr_rm = |rm: u8, gpr_size: u16| {
+            Operand::Register(decode_gpr(rm, gpr_size, prefixes.rex.is_some()))
+        };
+
+        let decode_kmov_mem_or_k = |rm_bytes: &[u8], mem_size: u8| {
+            if modrm.is_register() {
+                Some((decode_kmask_rm(modrm.rm), 0usize))
+            } else {
+                decode_modrm_rm(rm_bytes, modrm, prefixes, u16::from(mem_size))
+            }
+        };
+
+        let (mnemonic, operation, operands) = match opcode {
+            0x90 => {
+                let Some((suffix, mem_size)) = kmov_kmem_width() else {
+                    return Ok(None);
+                };
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
+                let (src, consumed) =
+                    decode_kmov_mem_or_k(rm_bytes, mem_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(consumed);
+                (
+                    format!("kmov{suffix}"),
+                    Operation::Move,
+                    vec![Operand::Register(decode_opmask(modrm.reg)), src],
+                )
+            }
+            0x91 => {
+                let Some((suffix, mem_size)) = kmov_kmem_width() else {
+                    return Ok(None);
+                };
+                let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
+                let (dst, consumed) =
+                    decode_kmov_mem_or_k(rm_bytes, mem_size).ok_or_else(|| {
+                        DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+                    })?;
+                offset = offset.saturating_add(consumed);
+                (
+                    format!("kmov{suffix}"),
+                    Operation::Move,
+                    vec![dst, Operand::Register(decode_opmask(modrm.reg))],
+                )
+            }
+            0x92 => {
+                let Some((suffix, gpr_size)) = kmov_gpr_width() else {
+                    return Ok(None);
+                };
+                if !modrm.is_register() {
+                    return Err(DecodeError::invalid_encoding(
+                        address,
+                        "KMOV k, gpr requires register r/m",
+                    ));
+                }
+                (
+                    format!("kmov{suffix}"),
+                    Operation::Move,
+                    vec![
+                        Operand::Register(decode_opmask(modrm.reg)),
+                        decode_kmov_gpr_rm(modrm.rm, gpr_size),
+                    ],
+                )
+            }
+            0x93 => {
+                let Some((suffix, gpr_size)) = kmov_gpr_width() else {
+                    return Ok(None);
+                };
+                if !modrm.is_register() {
+                    return Err(DecodeError::invalid_encoding(
+                        address,
+                        "KMOV gpr, k requires register r/m",
+                    ));
+                }
+                (
+                    format!("kmov{suffix}"),
+                    Operation::Move,
+                    vec![
+                        Operand::Register(decode_gpr(modrm.reg, gpr_size, prefixes.rex.is_some())),
+                        Operand::Register(decode_opmask(modrm.rm)),
+                    ],
+                )
+            }
+            0x98 | 0x99 | 0x44 => {
+                if !modrm.is_register() || vex.l {
+                    return Ok(None);
+                }
+                let Some(suffix) = kmask_width_suffix() else {
+                    return Ok(None);
+                };
+                let base = match opcode {
+                    0x98 => "kortest",
+                    0x99 => "ktest",
+                    0x44 => "knot",
+                    _ => unreachable!(),
+                };
+                let operation = match opcode {
+                    0x98 | 0x99 => Operation::Test,
+                    0x44 => Operation::Not,
+                    _ => unreachable!(),
+                };
+                (
+                    format!("{base}{suffix}"),
+                    operation,
+                    vec![
+                        Operand::Register(decode_opmask(modrm.reg)),
+                        decode_kmask_rm(modrm.rm),
+                    ],
+                )
+            }
+            0x30..=0x33 => {
+                if !modrm.is_register() || vex.l || vex.pp != 1 {
+                    return Ok(None);
+                }
+                let base = if opcode < 0x32 { "kshiftr" } else { "kshiftl" };
+                let suffix = match opcode {
+                    0x30 | 0x32 => {
+                        if vex.w {
+                            "w"
+                        } else {
+                            "b"
+                        }
+                    }
+                    0x31 | 0x33 => {
+                        if vex.w {
+                            "q"
+                        } else {
+                            "d"
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                let imm_bytes = bytes.get(offset..).unwrap_or(&[]);
+                if imm_bytes.is_empty() {
+                    return Err(DecodeError::truncated(
+                        address,
+                        offset.saturating_add(1),
+                        bytes.len(),
+                    ));
+                }
+                let imm = imm_bytes.first().copied().unwrap_or(0);
+                offset = offset.saturating_add(1);
+                (
+                    format!("{base}{suffix}"),
+                    if opcode < 0x32 {
+                        Operation::Shr
+                    } else {
+                        Operation::Shl
+                    },
+                    vec![
+                        Operand::Register(decode_opmask(modrm.reg)),
+                        decode_kmask_rm(modrm.rm),
+                        Operand::imm_unsigned(u64::from(imm), 8),
+                    ],
+                )
+            }
+            0x41 | 0x42 | 0x45..=0x47 | 0x4A => {
+                if !modrm.is_register() || !vex.l {
+                    return Ok(None);
+                }
+                let Some(suffix) = kmask_width_suffix() else {
+                    return Ok(None);
+                };
+                let (base, operation) = match opcode {
+                    0x41 => ("kand", Operation::And),
+                    0x42 => ("kandn", Operation::AndNot),
+                    0x45 => ("kor", Operation::Or),
+                    0x46 => ("kxnor", Operation::Other(0x46)),
+                    0x47 => ("kxor", Operation::Xor),
+                    0x4A => ("kadd", Operation::Add),
+                    _ => unreachable!(),
+                };
+                (
+                    format!("{base}{suffix}"),
+                    operation,
+                    vec![
+                        Operand::Register(decode_opmask(modrm.reg)),
+                        Operand::Register(decode_opmask(vex.vvvv)),
+                        decode_kmask_rm(modrm.rm),
+                    ],
+                )
+            }
+            0x4B => {
+                if !modrm.is_register() || !vex.l {
+                    return Ok(None);
+                }
+                let suffix = match (vex.w, vex.pp) {
+                    (false, 1) => "bw",
+                    (false, 0) => "wd",
+                    (true, 0) => "dq",
+                    _ => return Ok(None),
+                };
+                (
+                    format!("kunpck{suffix}"),
+                    Operation::Other(0x4B),
+                    vec![
+                        Operand::Register(decode_opmask(modrm.reg)),
+                        Operand::Register(decode_opmask(vex.vvvv)),
+                        decode_kmask_rm(modrm.rm),
+                    ],
+                )
+            }
+            _ => return Ok(None),
+        };
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+            operation,
+            mnemonic,
+            operands,
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+
+        Ok(Some(DecodedInstruction {
+            instruction,
+            size: offset,
+        }))
     }
 
     /// Decode SSE/AVX instructions.
@@ -5426,6 +5736,118 @@ mod tests {
         assert_eq!(result.instruction.operands.len(), 3);
     }
 
+    #[test]
+    fn test_kmovq_k_gpr() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe1, 0xfb, 0x92, 0xcf], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "kmovq");
+        assert_eq!(result.instruction.operation, Operation::Move);
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| operand.to_string())
+            .collect();
+        assert_eq!(operand_names, vec!["k1", "rdi"]);
+    }
+
+    #[test]
+    fn test_kmovq_gpr_k() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe1, 0xfb, 0x93, 0xc3], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "kmovq");
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| operand.to_string())
+            .collect();
+        assert_eq!(operand_names, vec!["rax", "k3"]);
+    }
+
+    #[test]
+    fn test_kandq_k_k_k() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe1, 0xf4, 0x41, 0xda], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "kandq");
+        assert_eq!(result.instruction.operation, Operation::And);
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| operand.to_string())
+            .collect();
+        assert_eq!(operand_names, vec!["k3", "k1", "k2"]);
+    }
+
+    #[test]
+    fn test_kortestq_k_k() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe1, 0xf8, 0x98, 0xdb], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "kortestq");
+        assert_eq!(result.instruction.operation, Operation::Test);
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| operand.to_string())
+            .collect();
+        assert_eq!(operand_names, vec!["k3", "k3"]);
+    }
+
+    #[test]
+    fn test_kxnorq_k_k_k() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe1, 0xf4, 0x46, 0xc9], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "kxnorq");
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| operand.to_string())
+            .collect();
+        assert_eq!(operand_names, vec!["k1", "k1", "k1"]);
+    }
+
+    #[test]
+    fn test_kshiftlb_k_k_imm8() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe3, 0x79, 0x32, 0xca, 0x07], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "kshiftlb");
+        assert_eq!(result.instruction.operation, Operation::Shl);
+        assert_eq!(result.instruction.operands[0].to_string(), "k1");
+        assert_eq!(result.instruction.operands[1].to_string(), "k2");
+        assert_eq!(result.instruction.operands[2], Operand::imm_unsigned(7, 8));
+    }
+
+    #[test]
+    fn test_kunpckdq_k_k_k() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xc4, 0xe1, 0xec, 0x4b, 0xcb], 0x1000)
+            .unwrap();
+        assert_eq!(result.instruction.mnemonic, "kunpckdq");
+        let operand_names: Vec<_> = result
+            .instruction
+            .operands
+            .iter()
+            .map(|operand| operand.to_string())
+            .collect();
+        assert_eq!(operand_names, vec!["k1", "k2", "k3"]);
+    }
+
     // ==========================================================================
     // EVEX (AVX-512) instruction tests
     // ==========================================================================
@@ -5506,6 +5928,7 @@ mod tests {
             .decode_instruction(&[0x62, 0xf1, 0x7c, 0x49, 0x28, 0xc1], 0x1000)
             .unwrap();
         assert!(result.instruction.mnemonic.contains("{k1}"));
+        assert!(format!("{}", result.instruction).contains("vmovaps zmm0{k1}, zmm1"));
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
     }
@@ -5521,8 +5944,18 @@ mod tests {
             .unwrap();
         assert!(result.instruction.mnemonic.contains("{k1}"));
         assert!(result.instruction.mnemonic.contains("{z}"));
+        assert!(format!("{}", result.instruction).contains("vmovaps zmm0{k1}{z}, zmm1"));
         assert_eq!(result.instruction.operation, Operation::Move);
         assert_eq!(result.size, 6);
+    }
+
+    #[test]
+    fn test_evex_masked_store_renders_mask_on_memory_operand() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x62, 0xf1, 0xfe, 0x4b, 0x7f, 0x0e], 0x1000)
+            .unwrap();
+        assert!(format!("{}", result.instruction).contains("vmovdqu64 [rsi]{k3}, zmm1"));
     }
 
     #[test]

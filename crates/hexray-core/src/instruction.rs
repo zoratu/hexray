@@ -880,8 +880,19 @@ impl std::fmt::Display for Instruction {
             write!(f, "   ")?;
         }
 
+        let (mnemonic, avx512_mask_decorator) = split_x86_avx512_mask_decorator(&self.mnemonic)
+            .map_or_else(
+                || (self.mnemonic.as_str(), None),
+                |(base, decorator, suffix)| (base, Some((decorator, suffix))),
+            );
+
         // Print mnemonic and operands
-        write!(f, " {}", self.mnemonic)?;
+        write!(f, " {}", mnemonic)?;
+        if let Some((_, suffix)) = avx512_mask_decorator {
+            if !suffix.is_empty() {
+                write!(f, " {}", suffix)?;
+            }
+        }
 
         if let Some(operands) = format_arm64_crypto_operands(self) {
             write!(f, " {}", operands)?;
@@ -896,11 +907,32 @@ impl std::fmt::Display for Instruction {
                     write!(f, ", ")?;
                 }
                 write!(f, "{}", op)?;
+                if i == 0 {
+                    if let Some((decorator, _)) = avx512_mask_decorator {
+                        write!(f, "{}", decorator)?;
+                    }
+                }
             }
         }
 
         Ok(())
     }
+}
+
+fn split_x86_avx512_mask_decorator(mnemonic: &str) -> Option<(&str, &str, &str)> {
+    let split = mnemonic.find(" {k")?;
+    let base = mnemonic.get(..split)?;
+    let rest = mnemonic.get(split + 1..)?;
+    let first_end = rest.find('}')?;
+    let first = rest.get(..=first_end)?;
+    let mut decorator_len = first.len();
+    let tail = rest.get(decorator_len..).unwrap_or("");
+    if tail.starts_with("{z}") {
+        decorator_len = decorator_len.saturating_add(3);
+    }
+    let decorator = rest.get(..decorator_len)?;
+    let suffix = rest.get(decorator_len..).unwrap_or("");
+    Some((base, decorator, suffix))
 }
 
 fn format_arm64_sve_operands(instruction: &Instruction) -> Option<String> {
