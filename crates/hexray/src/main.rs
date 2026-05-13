@@ -2505,6 +2505,74 @@ fn format_disassembly_operand(
     }
 }
 
+fn format_arm64_structure_ldst_operands_for_output(
+    fmt: &dyn BinaryFormat,
+    project: Option<&AnalysisProject>,
+    symbols: &[hexray_core::Symbol],
+    relocations: &RelocationTable,
+    instruction: &hexray_core::Instruction,
+) -> Option<String> {
+    if !(instruction.mnemonic.starts_with("ld1.") || instruction.mnemonic.starts_with("st1.")) {
+        return None;
+    }
+
+    let mem_index = instruction
+        .operands
+        .iter()
+        .position(|operand| matches!(operand, hexray_core::Operand::Memory(_)))?;
+    if mem_index == 0
+        || !instruction.operands[..mem_index]
+            .iter()
+            .all(|operand| matches!(operand, hexray_core::Operand::Register(_)))
+    {
+        return None;
+    }
+
+    let regs = instruction.operands[..mem_index]
+        .iter()
+        .map(|operand| match operand {
+            hexray_core::Operand::Register(reg)
+                if reg.arch == Architecture::Arm64
+                    && reg.id >= hexray_core::register::arm64::V0
+                    && reg.id < hexray_core::register::arm64::V0 + 32 =>
+            {
+                Some(format!("v{}", reg.id - hexray_core::register::arm64::V0))
+            }
+            hexray_core::Operand::Register(reg) => Some(reg.name().to_string()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut rendered = format!(
+        "{{ {} }}, {}",
+        regs.join(", "),
+        format_disassembly_operand(
+            fmt,
+            project,
+            symbols,
+            relocations,
+            instruction,
+            &instruction.operands[mem_index],
+        )
+    );
+
+    for operand in &instruction.operands[mem_index.saturating_add(1)..] {
+        rendered.push_str(", ");
+        match operand {
+            hexray_core::Operand::Immediate(imm) => rendered.push_str(&format!("#{}", imm.value)),
+            _ => rendered.push_str(&format_disassembly_operand(
+                fmt,
+                project,
+                symbols,
+                relocations,
+                instruction,
+                operand,
+            )),
+        }
+    }
+
+    Some(rendered)
+}
+
 fn format_instruction_for_output(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
@@ -2521,7 +2589,16 @@ fn format_instruction_for_output(
     }
     rendered.push(' ');
     rendered.push_str(&instruction.mnemonic);
-    if !instruction.operands.is_empty() {
+    if let Some(operands) = format_arm64_structure_ldst_operands_for_output(
+        fmt,
+        project,
+        symbols,
+        relocations,
+        instruction,
+    ) {
+        rendered.push(' ');
+        rendered.push_str(&operands);
+    } else if !instruction.operands.is_empty() {
         rendered.push(' ');
         let operands: Vec<_> = instruction
             .operands

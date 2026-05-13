@@ -1,6 +1,6 @@
 //! Architecture-agnostic instruction representation.
 
-use crate::{Operand, Register};
+use crate::{register::arm64, Operand, Register};
 
 /// A guard predicate attached to an instruction.
 ///
@@ -883,7 +883,9 @@ impl std::fmt::Display for Instruction {
         // Print mnemonic and operands
         write!(f, " {}", self.mnemonic)?;
 
-        if !self.operands.is_empty() {
+        if let Some(operands) = format_arm64_structure_ldst_operands(self) {
+            write!(f, " {}", operands)?;
+        } else if !self.operands.is_empty() {
             write!(f, " ")?;
             for (i, op) in self.operands.iter().enumerate() {
                 if i > 0 {
@@ -895,6 +897,54 @@ impl std::fmt::Display for Instruction {
 
         Ok(())
     }
+}
+
+fn format_arm64_structure_ldst_operands(instruction: &Instruction) -> Option<String> {
+    if !(instruction.mnemonic.starts_with("ld1.") || instruction.mnemonic.starts_with("st1.")) {
+        return None;
+    }
+
+    let mem_index = instruction
+        .operands
+        .iter()
+        .position(|operand| matches!(operand, Operand::Memory(_)))?;
+    if mem_index == 0
+        || !instruction.operands[..mem_index]
+            .iter()
+            .all(|operand| matches!(operand, Operand::Register(_)))
+    {
+        return None;
+    }
+
+    let regs = instruction.operands[..mem_index]
+        .iter()
+        .map(format_arm64_structure_reg)
+        .collect::<Option<Vec<_>>>()?;
+    let mut rendered = format!(
+        "{{ {} }}, {}",
+        regs.join(", "),
+        instruction.operands[mem_index]
+    );
+
+    for operand in &instruction.operands[mem_index.saturating_add(1)..] {
+        rendered.push_str(", ");
+        match operand {
+            Operand::Immediate(imm) => rendered.push_str(&format!("#{}", imm.value)),
+            _ => rendered.push_str(&operand.to_string()),
+        }
+    }
+
+    Some(rendered)
+}
+
+fn format_arm64_structure_reg(operand: &Operand) -> Option<String> {
+    let Operand::Register(reg) = operand else {
+        return None;
+    };
+    if reg.arch == crate::Architecture::Arm64 && reg.id >= arm64::V0 && reg.id < arm64::V0 + 32 {
+        return Some(format!("v{}", reg.id - arm64::V0));
+    }
+    Some(reg.name().to_string())
 }
 
 #[cfg(test)]

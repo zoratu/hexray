@@ -82,11 +82,37 @@ impl InstructionEffects {
 
         // Analyze operands based on instruction operation
         match inst.operation {
-            // Move/Load: dest = src
-            Operation::Move | Operation::Load | Operation::LoadEffectiveAddress => {
+            // Move: dest = src
+            Operation::Move | Operation::LoadEffectiveAddress => {
                 if inst.operands.len() >= 2 {
                     effects.add_def(&inst.operands[0]);
                     effects.add_use(&inst.operands[1]);
+                }
+            }
+
+            // Loads can define multiple registers before the memory operand
+            // (for example ARM64 LDP / LD1 structure loads) and can also carry
+            // trailing writeback operands.
+            Operation::Load => {
+                if let Some(mem_index) = inst
+                    .operands
+                    .iter()
+                    .position(|operand| matches!(operand, Operand::Memory(_)))
+                {
+                    for operand in &inst.operands[..mem_index] {
+                        effects.add_def(operand);
+                    }
+                    effects.add_use(&inst.operands[mem_index]);
+                    for operand in &inst.operands[mem_index.saturating_add(1)..] {
+                        effects.add_use(operand);
+                    }
+                } else if inst.operands.len() >= 2 {
+                    effects.add_def(&inst.operands[0]);
+                    effects.add_use(&inst.operands[1]);
+                }
+
+                for reg in &inst.writes {
+                    effects.defs.push(Location::from_register(reg));
                 }
             }
 
@@ -147,11 +173,28 @@ impl InstructionEffects {
 
             // Store: [mem] = src
             Operation::Store => {
-                if inst.operands.len() >= 2 {
+                if let Some(mem_index) = inst
+                    .operands
+                    .iter()
+                    .position(|operand| matches!(operand, Operand::Memory(_)))
+                {
+                    effects.add_memory_def(&inst.operands[mem_index]);
+                    effects.add_address_uses(&inst.operands[mem_index]);
+                    for operand in &inst.operands[..mem_index] {
+                        effects.add_use(operand);
+                    }
+                    for operand in &inst.operands[mem_index.saturating_add(1)..] {
+                        effects.add_use(operand);
+                    }
+                } else if inst.operands.len() >= 2 {
                     effects.add_memory_def(&inst.operands[1]);
                     effects.add_use(&inst.operands[0]);
                     // Also uses the address components
                     effects.add_address_uses(&inst.operands[1]);
+                }
+
+                for reg in &inst.writes {
+                    effects.defs.push(Location::from_register(reg));
                 }
             }
 
@@ -756,6 +799,53 @@ mod tests {
         let effects = InstructionEffects::from_instruction(&inst);
 
         assert!(effects.defs.contains(&Location::Register(0)));
+    }
+
+    #[test]
+    fn test_instruction_effects_multi_register_load() {
+        let base = make_register(2);
+        let mut inst = Instruction::new(0x1000, 4, vec![0; 4], "ld1.4s");
+        inst.operation = Operation::Load;
+        inst.operands = vec![
+            Operand::Register(make_register(10)),
+            Operand::Register(make_register(11)),
+            Operand::Memory(MemoryRef::base(base, 32)),
+            Operand::Immediate(Immediate {
+                value: 32,
+                size: 64,
+                signed: false,
+            }),
+        ];
+        inst.writes = vec![make_register(10), make_register(11), base];
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.defs.contains(&Location::Register(10)));
+        assert!(effects.defs.contains(&Location::Register(11)));
+        assert!(effects.defs.contains(&Location::Register(2)));
+        assert!(effects.uses.contains(&Location::Register(2)));
+    }
+
+    #[test]
+    fn test_instruction_effects_multi_register_store() {
+        let base = make_register(2);
+        let mut inst = Instruction::new(0x1000, 4, vec![0; 4], "st1.8b");
+        inst.operation = Operation::Store;
+        inst.operands = vec![
+            Operand::Register(make_register(10)),
+            Operand::Register(make_register(11)),
+            Operand::Memory(MemoryRef::base(base, 16)),
+            Operand::Register(make_register(3)),
+        ];
+        inst.writes = vec![base];
+
+        let effects = InstructionEffects::from_instruction(&inst);
+
+        assert!(effects.uses.contains(&Location::Register(10)));
+        assert!(effects.uses.contains(&Location::Register(11)));
+        assert!(effects.uses.contains(&Location::Register(2)));
+        assert!(effects.uses.contains(&Location::Register(3)));
+        assert!(effects.defs.contains(&Location::Register(2)));
     }
 
     #[test]

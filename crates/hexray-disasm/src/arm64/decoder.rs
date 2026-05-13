@@ -1061,6 +1061,12 @@ impl Arm64Disassembler {
         let op_25_23 = (insn >> 23) & 0x7;
         let op_21 = (insn >> 21) & 1;
         let op_11_10 = (insn >> 10) & 0x3;
+        let bits_29_24 = (insn >> 24) & 0x3F;
+
+        // Advanced SIMD load/store multiple structures (LD1/ST1 with 1/2/3/4 regs)
+        if bits_29_24 == 0b001100 {
+            return self.decode_asimd_ldst_mult(insn, address, bytes);
+        }
 
         // Load/store pair (bits 29-27 = 101)
         if op_29_27 == 0b101 {
@@ -1104,7 +1110,6 @@ impl Arm64Disassembler {
 
         // Load/store exclusive: bits 31-24 = xx001000
         // Pattern: size[31:30]=xx, 001000, o2, L, o1, Rs, o0, Rt2, Rn, Rt
-        let bits_29_24 = (insn >> 24) & 0x3F;
         if bits_29_24 == 0b001000 {
             return self.decode_ldst_exclusive(insn, address, bytes);
         }
@@ -1118,6 +1123,104 @@ impl Arm64Disassembler {
 
         // Load/store exclusive and atomic operations - fall through to unknown
         self.decode_unknown(insn, address, bytes)
+    }
+
+    /// Decode Advanced SIMD LD1/ST1 multiple-structure instructions.
+    fn decode_asimd_ldst_mult(
+        &self,
+        insn: u32,
+        address: u64,
+        bytes: Vec<u8>,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let q = (insn >> 30) & 1;
+        let is_load = (insn >> 22) & 1 == 1;
+        let post_indexed = (insn >> 23) & 1 == 1;
+        let rm = ((insn >> 16) & 0x1F) as u16;
+        let opcode = (insn >> 12) & 0xF;
+        let size = (insn >> 10) & 0x3;
+        let rn = ((insn >> 5) & 0x1F) as u16;
+        let rt = (insn & 0x1F) as u16;
+
+        let reg_count = match opcode {
+            0b0111 => 1u8,
+            0b1010 => 2,
+            0b0110 => 3,
+            0b0010 => 4,
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let arrangement = match (q, size) {
+            (0, 0) => "8b",
+            (1, 0) => "16b",
+            (0, 1) => "4h",
+            (1, 1) => "8h",
+            (0, 2) => "2s",
+            (1, 2) => "4s",
+            (0, 3) => "1d",
+            (1, 3) => "2d",
+            _ => return self.decode_unknown(insn, address, bytes),
+        };
+
+        let bytes_per_reg = if q == 1 { 16u8 } else { 8u8 };
+        let access_size = bytes_per_reg.saturating_mul(reg_count);
+        let base = Self::xreg_sp(rn);
+        let writeback_operand = if post_indexed {
+            if rm == 0x1F {
+                Some(Operand::imm_unsigned(u64::from(access_size), 64))
+            } else {
+                Some(Operand::reg(Self::xreg(rm)))
+            }
+        } else {
+            if rm != 0 {
+                return self.decode_unknown(insn, address, bytes);
+            }
+            None
+        };
+        let mut operands = Vec::with_capacity(usize::from(reg_count).saturating_add(2));
+        let mut regs = Vec::with_capacity(usize::from(reg_count));
+        let vec_bits = if q == 1 { 128 } else { 64 };
+
+        for offset in 0..reg_count {
+            let reg_id = rt.wrapping_add(u16::from(offset)) & 0x1F;
+            let reg = self.vreg(reg_id, vec_bits);
+            regs.push(reg);
+            operands.push(Operand::reg(reg));
+        }
+
+        operands.push(Operand::Memory(MemoryRef::base(base, access_size)));
+
+        let mut inst = Instruction::new(
+            address,
+            4,
+            bytes,
+            format!("{}.{}", if is_load { "ld1" } else { "st1" }, arrangement),
+        )
+        .with_operation(if is_load {
+            Operation::Load
+        } else {
+            Operation::Store
+        })
+        .with_operands(operands);
+
+        inst.reads.push(base);
+        if is_load {
+            inst.writes.extend(regs);
+        } else {
+            inst.reads.extend(regs);
+        }
+
+        if let Some(writeback_operand) = writeback_operand {
+            if let Operand::Register(index) = writeback_operand {
+                inst.reads.push(index);
+            }
+            inst.operands.push(writeback_operand);
+            inst.writes.push(base);
+        }
+
+        Ok(DecodedInstruction {
+            instruction: inst,
+            size: 4,
+        })
     }
 
     /// Decode LDUR/STUR (unscaled immediate).
@@ -3754,6 +3857,32 @@ mod tests {
         assert_eq!(result.instruction.mnemonic, "stp");
         assert_eq!(result.instruction.operation, Operation::Store);
         assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_ld1_mult_4s_post_imm() {
+        let disasm = Arm64Disassembler::new();
+        // LD1.4S { V0, V1, V2, V3 }, [X2], #64: 0x4CDF2840
+        let bytes = [0x40, 0x28, 0xDF, 0x4C];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "ld1.4s");
+        assert_eq!(result.instruction.operation, Operation::Load);
+        assert_eq!(result.instruction.operands.len(), 6);
+        assert_eq!(result.instruction.writes.len(), 5);
+        assert!(format!("{}", result.instruction).contains("ld1.4s { v0, v1, v2, v3 }, [x2], #64"));
+    }
+
+    #[test]
+    fn test_st1_mult_8b_post_reg() {
+        let disasm = Arm64Disassembler::new();
+        // ST1.8B { V0, V1 }, [X2], X3: 0x0C83A040
+        let bytes = [0x40, 0xA0, 0x83, 0x0C];
+        let result = disasm.decode_instruction(&bytes, 0x1000).unwrap();
+        assert_eq!(result.instruction.mnemonic, "st1.8b");
+        assert_eq!(result.instruction.operation, Operation::Store);
+        assert_eq!(result.instruction.operands.len(), 4);
+        assert_eq!(result.instruction.reads.len(), 4);
+        assert!(format!("{}", result.instruction).contains("st1.8b { v0, v1 }, [x2], x3"));
     }
 
     #[test]
