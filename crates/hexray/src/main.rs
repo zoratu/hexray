@@ -4411,7 +4411,7 @@ fn relocation_defined_target_addr(
             .address
             .checked_add_signed(addend.saturating_add(4))
             .unwrap_or(symbol.address),
-        hexray_formats::RelocationType::R32S => symbol
+        hexray_formats::RelocationType::R32 | hexray_formats::RelocationType::R32S => symbol
             .address
             .checked_add_signed(addend)
             .unwrap_or(symbol.address),
@@ -4522,7 +4522,9 @@ fn x86_64_relocation_candidate_rank(
                 0
             }
         }
-        hexray_formats::RelocationType::R32S | hexray_formats::RelocationType::R64 => {
+        hexray_formats::RelocationType::R32
+        | hexray_formats::RelocationType::R32S
+        | hexray_formats::RelocationType::R64 => {
             if has_immediate {
                 3
             } else if has_rip_relative_memory {
@@ -4945,8 +4947,8 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                     table.insert_call(call_addr, resolved_name, target_addr, is_external);
                 }
             }
-            // 32-bit signed immediate relocations (for mov reg, imm32)
-            RelocationType::R32S => {
+            // 32-bit absolute immediate relocations (for mov reg, imm32)
+            RelocationType::R32 | RelocationType::R32S => {
                 let Some(section) = elf.sections.get(reloc.section_index) else {
                     continue;
                 };
@@ -9857,9 +9859,10 @@ mod tests {
         ensure_distinct_export_paths, filter_ifunc_display_aliases, find_symbol_in_candidates,
         format_callgraph_text, infer_main_symbol_from_entry, parse_address_str,
         patch_affects_function, resolve_analysis_target, resolve_analysis_target_with_entry_main,
-        resolve_materialized_callback_targets, resolve_xref_source_label,
-        resolve_xref_target_addresses, string_tags, truncate_for_display, DiffPatchAddressSpace,
-        FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
+        resolve_materialized_callback_targets, resolve_relocation_symbol,
+        resolve_xref_source_label, resolve_xref_target_addresses, string_tags,
+        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
+        SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{
         CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
@@ -12254,5 +12257,36 @@ mod tests {
             panic!("expected immediate operand");
         };
         assert_eq!(imm.value, 0x3020);
+    }
+
+    #[test]
+    fn resolve_relocation_symbol_applies_addend_for_r32_section_targets() {
+        let section = Symbol {
+            name: ".bss".to_string(),
+            address: 0x200,
+            size: 0,
+            kind: SymbolKind::Section,
+            binding: SymbolBinding::Local,
+            section_index: Some(3),
+        };
+        let concrete = Symbol {
+            name: "g_key".to_string(),
+            address: 0x204,
+            size: 4,
+            kind: SymbolKind::Object,
+            binding: SymbolBinding::Local,
+            section_index: Some(3),
+        };
+
+        let (name, addr, is_external) = resolve_relocation_symbol(
+            &[section.clone(), concrete],
+            &section,
+            RelocationType::R32,
+            4,
+        );
+
+        assert_eq!(name, "g_key");
+        assert_eq!(addr, 0x204);
+        assert!(!is_external);
     }
 }
