@@ -151,11 +151,71 @@ impl X86_64Disassembler {
                 | "not"
                 | "xadd"
                 | "cmpxchg"
+                | "cmpxchg8b"
+                | "cmpxchg16b"
                 | "xchg"
                 | "bts"
                 | "btr"
                 | "btc"
         )
+    }
+
+    fn simple_instruction(
+        bytes: &[u8],
+        address: u64,
+        size: usize,
+        mnemonic: &str,
+        operation: Operation,
+    ) -> DecodedInstruction {
+        let instruction = Instruction {
+            address,
+            size,
+            bytes: bytes.get(..size).unwrap_or(&[]).to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands: vec![],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+
+        DecodedInstruction { instruction, size }
+    }
+
+    fn decode_0f01_register_special(modrm_byte: u8) -> Option<(&'static str, Operation)> {
+        match modrm_byte {
+            0xC0 => Some(("vmcall", Operation::Other(0x0F01))),
+            0xC1 => Some(("vmlaunch", Operation::Other(0x0F01))),
+            0xC2 => Some(("vmresume", Operation::Other(0x0F01))),
+            0xC3 => Some(("vmxoff", Operation::Other(0x0F01))),
+            0xC8 => Some(("monitor", Operation::Other(0x0F01))),
+            0xC9 => Some(("mwait", Operation::Other(0x0F01))),
+            0xCA => Some(("clac", Operation::Other(0x0F01))),
+            0xCB => Some(("stac", Operation::Other(0x0F01))),
+            0xCF => Some(("encls", Operation::Other(0x0F01))),
+            0xD0 => Some(("xgetbv", Operation::Other(0x0F01))),
+            0xD1 => Some(("xsetbv", Operation::Other(0x0F01))),
+            0xD4 => Some(("vmfunc", Operation::Other(0x0F01))),
+            0xD5 => Some(("xend", Operation::Other(0x0F01))),
+            0xD6 => Some(("xtest", Operation::Other(0x0F01))),
+            0xD8 => Some(("vmrun", Operation::Other(0x0F01))),
+            0xD9 => Some(("vmmcall", Operation::Other(0x0F01))),
+            0xDA => Some(("vmload", Operation::Other(0x0F01))),
+            0xDB => Some(("vmsave", Operation::Other(0x0F01))),
+            0xDC => Some(("stgi", Operation::Other(0x0F01))),
+            0xDD => Some(("clgi", Operation::Other(0x0F01))),
+            0xDE => Some(("skinit", Operation::Other(0x0F01))),
+            0xDF => Some(("invlpga", Operation::Other(0x0F01))),
+            0xE8 => Some(("serialize", Operation::Other(0x0F01))),
+            0xEE => Some(("rdpkru", Operation::Other(0x0F01))),
+            0xEF => Some(("wrpkru", Operation::Other(0x0F01))),
+            0xF8 => Some(("swapgs", Operation::Other(0x0F01))),
+            0xF9 => Some(("rdtscp", Operation::ReadTscP)),
+            0xFA => Some(("monitorx", Operation::Other(0x0F01))),
+            0xFB => Some(("mwaitx", Operation::Other(0x0F01))),
+            _ => None,
+        }
     }
 
     fn decode_vector_shift_group(
@@ -517,8 +577,8 @@ impl Disassembler for X86_64Disassembler {
                 if opcode == 0xC7 {
                     let remaining = bytes.get(offset..).unwrap_or(&[]);
                     if let Some(&modrm_byte) = remaining.first() {
-                        let modrm = ModRM::parse(modrm_byte, prefixes.rex);
-                        if (modrm.reg & 0x7) == 7 {
+                        let modrm = ModRM::parse(modrm_byte, prefixes.effective_rex());
+                        if modrm.is_register() && (modrm.reg & 0x7) == 7 {
                             offset = offset.saturating_add(1);
                             return self
                                 .decode_rdpid(bytes, address, &prefixes, offset, modrm)
@@ -528,43 +588,23 @@ impl Disassembler for X86_64Disassembler {
                 }
             }
 
-            // Fence instructions encoded via 0F AE /{5,6,7} with mod=11, rm=0.
-            if opcode == 0xAE {
-                let remaining = bytes.get(offset..).unwrap_or(&[]);
-                if let Some(&modrm_byte) = remaining.first() {
-                    let modrm = ModRM::parse(modrm_byte, prefixes.rex);
-                    if modrm.is_register() && modrm.rm == 0 {
-                        let mnemonic = match modrm.reg & 0x7 {
-                            5 => Some("lfence"),
-                            6 => Some("mfence"),
-                            7 => Some("sfence"),
-                            _ => None,
-                        };
-                        if let Some(mnemonic) = mnemonic {
-                            offset = offset.saturating_add(1);
-                            let instruction = Instruction {
-                                address,
-                                size: offset,
-                                bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
-                                operation: Operation::Other(0x0FAE),
-                                mnemonic: mnemonic.to_string(),
-                                operands: vec![],
-                                control_flow: ControlFlow::Sequential,
-                                reads: vec![],
-                                writes: vec![],
+            if prefixes.rep && opcode == 0x09 {
+                return Ok(Self::finalize_legacy_prefixes(
+                    &prefixes,
+                    Self::simple_instruction(
+                        bytes,
+                        address,
+                        offset,
+                        "wbnoinvd",
+                        Operation::Other(0x0F09),
+                    ),
+                ));
+            }
 
-                                guard: None,
-                            };
-                            return Ok(Self::finalize_legacy_prefixes(
-                                &prefixes,
-                                DecodedInstruction {
-                                    instruction,
-                                    size: offset,
-                                },
-                            ));
-                        }
-                    }
-                }
+            if opcode == 0xAE {
+                return self
+                    .decode_0fae_group(bytes, address, &prefixes, offset)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
             // Handle 0F 38 three-byte escape (SSSE3, SSE4.1, SSE4.2)
@@ -631,6 +671,12 @@ impl Disassembler for X86_64Disassembler {
             if opcode == 0x01 {
                 return self
                     .decode_0f01_group(bytes, address, &prefixes, offset)
+                    .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
+            }
+
+            if opcode == 0xC7 {
+                return self
+                    .decode_0fc7_group(bytes, address, &prefixes, offset)
                     .map(|decoded| Self::finalize_legacy_prefixes(&prefixes, decoded));
             }
 
@@ -1937,6 +1983,203 @@ impl X86_64Disassembler {
             reads: vec![],
             writes: vec![],
 
+            guard: None,
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    fn decode_0fae_group(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let modrm_byte = *bytes.get(offset).ok_or_else(|| {
+            DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+        })?;
+        let modrm = ModRM::parse(modrm_byte, prefixes.effective_rex());
+        offset = offset.saturating_add(1);
+
+        if modrm.is_register() {
+            if modrm.rm != 0 {
+                return Err(DecodeError::invalid_encoding(
+                    address,
+                    "0F AE register form requires rm=0",
+                ));
+            }
+
+            let mnemonic = match modrm.reg & 0x7 {
+                5 => "lfence",
+                6 => "mfence",
+                7 => "sfence",
+                _ => {
+                    return Err(DecodeError::invalid_encoding(
+                        address,
+                        "unsupported 0F AE register form",
+                    ))
+                }
+            };
+
+            return Ok(Self::simple_instruction(
+                bytes,
+                address,
+                offset,
+                mnemonic,
+                Operation::Other(0x0FAE),
+            ));
+        }
+
+        let (mnemonic, operand_size) = match modrm.reg & 0x7 {
+            0 => ("fxsave", 512),
+            1 => ("fxrstor", 512),
+            2 => ("ldmxcsr", 32),
+            3 => ("stmxcsr", 32),
+            4 => ("xsave", 0),
+            5 => ("xrstor", 0),
+            6 => {
+                if prefixes.operand_size {
+                    ("clwb", 8)
+                } else {
+                    ("xsaveopt", 0)
+                }
+            }
+            7 => {
+                if prefixes.operand_size {
+                    ("clflushopt", 8)
+                } else {
+                    ("clflush", 8)
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
+        let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+            operation: Operation::Other(0x0FAE),
+            mnemonic: mnemonic.to_string(),
+            operands: vec![rm_operand],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
+            guard: None,
+        };
+
+        Ok(DecodedInstruction {
+            instruction,
+            size: offset,
+        })
+    }
+
+    fn decode_0fc7_group(
+        &self,
+        bytes: &[u8],
+        address: u64,
+        prefixes: &Prefixes,
+        mut offset: usize,
+    ) -> Result<DecodedInstruction, DecodeError> {
+        let modrm_byte = *bytes.get(offset).ok_or_else(|| {
+            DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+        })?;
+        let modrm = ModRM::parse(modrm_byte, prefixes.effective_rex());
+        offset = offset.saturating_add(1);
+
+        if modrm.is_register() {
+            let mnemonic = match modrm.reg & 0x7 {
+                6 => "rdrand",
+                7 => "rdseed",
+                _ => {
+                    return Err(DecodeError::invalid_encoding(
+                        address,
+                        "unsupported 0F C7 register form",
+                    ))
+                }
+            };
+
+            let operand_size = prefixes.operand_size(false);
+            let instruction = Instruction {
+                address,
+                size: offset,
+                bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+                operation: Operation::Other(0x0FC7),
+                mnemonic: mnemonic.to_string(),
+                operands: vec![Operand::Register(decode_gpr(
+                    modrm.rm,
+                    operand_size,
+                    prefixes.effective_rex().is_some(),
+                ))],
+                control_flow: ControlFlow::Sequential,
+                reads: vec![],
+                writes: vec![],
+                guard: None,
+            };
+
+            return Ok(DecodedInstruction {
+                instruction,
+                size: offset,
+            });
+        }
+
+        let rex_w = prefixes.effective_rex().map(|rex| rex.w).unwrap_or(false);
+        let (mnemonic, operation, operand_size) = match modrm.reg & 0x7 {
+            1 => {
+                if rex_w {
+                    ("cmpxchg16b", Operation::Exchange, 128)
+                } else {
+                    ("cmpxchg8b", Operation::Exchange, 64)
+                }
+            }
+            3 => ("xrstors", Operation::Other(0x0FC7), 0),
+            4 => ("xsavec", Operation::Other(0x0FC7), 0),
+            5 => ("xsaves", Operation::Other(0x0FC7), 0),
+            6 => {
+                if prefixes.rep {
+                    ("vmxon", Operation::Other(0x0FC7), 64)
+                } else if prefixes.operand_size {
+                    ("vmclear", Operation::Other(0x0FC7), 64)
+                } else {
+                    ("vmptrld", Operation::Other(0x0FC7), 64)
+                }
+            }
+            7 => ("vmptrst", Operation::Other(0x0FC7), 64),
+            _ => {
+                return Err(DecodeError::invalid_encoding(
+                    address,
+                    format!("unsupported 0F C7 /{} memory form", modrm.reg & 0x7),
+                ))
+            }
+        };
+
+        let rm_bytes = bytes.get(offset..).unwrap_or(&[]);
+        let (rm_operand, rm_consumed) = decode_modrm_rm(rm_bytes, modrm, prefixes, operand_size)
+            .ok_or_else(|| {
+                DecodeError::truncated(address, offset.saturating_add(1), bytes.len())
+            })?;
+        offset = offset.saturating_add(rm_consumed);
+
+        let instruction = Instruction {
+            address,
+            size: offset,
+            bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
+            operation,
+            mnemonic: mnemonic.to_string(),
+            operands: vec![rm_operand],
+            control_flow: ControlFlow::Sequential,
+            reads: vec![],
+            writes: vec![],
             guard: None,
         };
 
@@ -3689,7 +3932,7 @@ impl X86_64Disassembler {
         })
     }
 
-    /// Decode 0F 01 group instructions (SGDT, SIDT, LGDT, LIDT, SMSW, LMSW, INVLPG, RDTSCP).
+    /// Decode 0F 01 group instructions (SGDT, SIDT, LGDT, LIDT, SMSW, LMSW, INVLPG, specials).
     ///
     /// These instructions use the ModRM.reg field (and sometimes ModRM.rm for register forms)
     /// to determine the specific operation:
@@ -3701,8 +3944,6 @@ impl X86_64Disassembler {
     /// - /6: LMSW r/m16 - Load Machine Status Word
     /// - /7: INVLPG m - Invalidate TLB Entry
     ///
-    /// Special register-form encodings (mod=11):
-    /// - 0F 01 F9: RDTSCP - Read Time Stamp Counter and Processor ID
     fn decode_0f01_group(
         &self,
         bytes: &[u8],
@@ -3720,29 +3961,15 @@ impl X86_64Disassembler {
         }
 
         let modrm_byte = remaining.first().copied().unwrap_or(0);
-        let modrm = ModRM::parse(modrm_byte, prefixes.rex);
+        let modrm = ModRM::parse(modrm_byte, prefixes.effective_rex());
         offset = offset.saturating_add(1);
 
-        // Check for special register-form encodings first
-        // RDTSCP: 0F 01 F9 (mod=11, reg=7, rm=1 => modrm_byte = 0xF9)
-        if modrm_byte == 0xF9 {
-            let instruction = Instruction {
-                address,
-                size: offset,
-                bytes: bytes.get(..offset).unwrap_or(&[]).to_vec(),
-                operation: Operation::ReadTscP,
-                mnemonic: "rdtscp".to_string(),
-                operands: vec![],
-                control_flow: ControlFlow::Sequential,
-                reads: vec![],
-                writes: vec![],
-
-                guard: None,
-            };
-            return Ok(DecodedInstruction {
-                instruction,
-                size: offset,
-            });
+        if modrm.is_register() {
+            if let Some((mnemonic, operation)) = Self::decode_0f01_register_special(modrm_byte) {
+                return Ok(Self::simple_instruction(
+                    bytes, address, offset, mnemonic, operation,
+                ));
+            }
         }
 
         // Determine instruction from reg field
@@ -4478,6 +4705,58 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_xsave() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0xae, 0x20], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xsave");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FAE));
+        assert_eq!(result.instruction.operands.len(), 1);
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_decode_xsaveopt() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0xae, 0x30], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xsaveopt");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FAE));
+        assert_eq!(result.instruction.operands.len(), 1);
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_decode_clwb() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x66, 0x0f, 0xae, 0x30], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "clwb");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FAE));
+        assert_eq!(result.instruction.operands.len(), 1);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
+    fn test_decode_clflushopt() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x66, 0x0f, 0xae, 0x38], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "clflushopt");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FAE));
+        assert_eq!(result.instruction.operands.len(), 1);
+        assert_eq!(result.size, 4);
+    }
+
+    #[test]
     fn test_movzx_keeps_wide_destination_register() {
         let disasm = X86_64Disassembler::new();
         let result = disasm
@@ -5069,6 +5348,19 @@ mod tests {
     }
 
     #[test]
+    fn test_xgetbv() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0x01, 0xd0], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xgetbv");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0F01));
+        assert_eq!(result.size, 3);
+        assert!(result.instruction.operands.is_empty());
+    }
+
+    #[test]
     fn test_rdpid_rax() {
         let disasm = X86_64Disassembler::new();
         // F3 0F C7 F8 = RDPID rax
@@ -5086,6 +5378,107 @@ mod tests {
             }
             other => panic!("expected register destination, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_rdrand_rax() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x48, 0x0f, 0xc7, 0xf0], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "rdrand");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FC7));
+        assert_eq!(result.size, 4);
+        match &result.instruction.operands[0] {
+            Operand::Register(reg) => {
+                assert_eq!(reg.id, x86::RAX);
+                assert_eq!(reg.size, 64);
+            }
+            other => panic!("expected register destination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rdseed_rax() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x48, 0x0f, 0xc7, 0xf8], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "rdseed");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FC7));
+        assert_eq!(result.size, 4);
+        match &result.instruction.operands[0] {
+            Operand::Register(reg) => {
+                assert_eq!(reg.id, x86::RAX);
+                assert_eq!(reg.size, 64);
+            }
+            other => panic!("expected register destination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_xsavec() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0xc7, 0x20], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xsavec");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FC7));
+        assert_eq!(result.instruction.operands.len(), 1);
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_xsaves() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0xc7, 0x28], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xsaves");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FC7));
+        assert_eq!(result.instruction.operands.len(), 1);
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_xrstors() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0x0f, 0xc7, 0x18], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "xrstors");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0FC7));
+        assert_eq!(result.instruction.operands.len(), 1);
+        assert_eq!(result.size, 3);
+    }
+
+    #[test]
+    fn test_invd() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm.decode_instruction(&[0x0f, 0x08], 0x1000).unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "invd");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0F08));
+        assert_eq!(result.size, 2);
+        assert!(result.instruction.operands.is_empty());
+    }
+
+    #[test]
+    fn test_wbnoinvd() {
+        let disasm = X86_64Disassembler::new();
+        let result = disasm
+            .decode_instruction(&[0xf3, 0x0f, 0x09], 0x1000)
+            .unwrap();
+
+        assert_eq!(result.instruction.mnemonic, "wbnoinvd");
+        assert_eq!(result.instruction.operation, Operation::Other(0x0F09));
+        assert_eq!(result.size, 3);
+        assert!(result.instruction.operands.is_empty());
     }
 
     #[test]

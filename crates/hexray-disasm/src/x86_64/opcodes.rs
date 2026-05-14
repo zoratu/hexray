@@ -688,6 +688,18 @@ pub static OPCODE_TABLE_0F: [Option<OpcodeEntry>; 256] = {
         OperandEncoding::None,
     ));
 
+    // INVD / WBINVD
+    table[0x08] = Some(OpcodeEntry::new(
+        "invd",
+        Operation::Other(0x0F08),
+        OperandEncoding::None,
+    ));
+    table[0x09] = Some(OpcodeEntry::new(
+        "wbinvd",
+        Operation::Other(0x0F09),
+        OperandEncoding::None,
+    ));
+
     // UD2 - Undefined instruction 2 (intentional invalid opcode exception)
     table[0x0B] = Some(OpcodeEntry::new(
         "ud2",
