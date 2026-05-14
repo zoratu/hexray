@@ -1463,8 +1463,16 @@ impl Expr {
         ))
     }
 
+    fn x86_mnemonic_matches(inst: &Instruction, mnemonic: &str) -> bool {
+        inst.mnemonic.eq_ignore_ascii_case(mnemonic)
+            || inst
+                .mnemonic
+                .strip_prefix("lock ")
+                .is_some_and(|inner| inner.eq_ignore_ascii_case(mnemonic))
+    }
+
     fn x86_atomic_xchg_expr(inst: &Instruction) -> Option<Self> {
-        if !inst.mnemonic.eq_ignore_ascii_case("xchg") {
+        if !Self::x86_mnemonic_matches(inst, "xchg") {
             return None;
         }
         let (mem, reg_index) = Self::x86_atomic_pair(&inst.operands)?;
@@ -1481,7 +1489,7 @@ impl Expr {
     }
 
     fn x86_atomic_xadd_expr(inst: &Instruction) -> Option<Self> {
-        if !inst.mnemonic.eq_ignore_ascii_case("xadd") {
+        if !Self::x86_mnemonic_matches(inst, "xadd") {
             return None;
         }
         let (mem, reg_index) = Self::x86_atomic_pair(&inst.operands)?;
@@ -1498,14 +1506,21 @@ impl Expr {
     }
 
     fn x86_atomic_cmpxchg_expr(inst: &Instruction) -> Option<Self> {
-        if !inst.mnemonic.eq_ignore_ascii_case("cmpxchg") {
+        if !Self::x86_mnemonic_matches(inst, "cmpxchg") {
             return None;
         }
         let (mem, reg_index) = Self::x86_atomic_pair(&inst.operands)?;
         let ptr = Self::from_memory_address_with_context(mem, inst);
         let desired = Self::from_operand_with_inst(&inst.operands[reg_index], inst);
         let expected_size = mem.size.max(1);
-        let expected = Self::address_of(Self::var(Variable::reg("rax", expected_size)));
+        let expected_reg = match expected_size {
+            1 => "al",
+            2 => "ax",
+            4 => "eax",
+            8 => "rax",
+            _ => return None,
+        };
+        let expected = Self::var(Variable::reg(expected_reg, expected_size));
 
         Some(Self::call(
             CallTarget::Named("atomic_compare_exchange_strong".to_string()),
@@ -6137,7 +6152,7 @@ mod tests {
             0x4011d6,
             8,
             vec![0xf0, 0x0f, 0xc1, 0x05, 0x4a, 0x2e, 0x00, 0x00],
-            "xadd",
+            "lock xadd",
         )
         .with_operation(Operation::Add)
         .with_operands(vec![
@@ -6157,7 +6172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_x86_cmpxchg_lifts_to_atomic_compare_exchange_strong() {
+    fn test_x86_lock_cmpxchg_lifts_to_atomic_compare_exchange_strong() {
         use hexray_core::{Architecture, MemoryRef, Operand, Operation, Register, RegisterClass};
 
         let rip = Register::new(Architecture::X86_64, RegisterClass::ProgramCounter, 16, 64);
@@ -6166,7 +6181,7 @@ mod tests {
             0x401276,
             8,
             vec![0xf0, 0x0f, 0xb1, 0x35, 0xaa, 0x2d, 0x00, 0x00],
-            "cmpxchg",
+            "lock cmpxchg",
         )
         .with_operation(Operation::Exchange)
         .with_operands(vec![
@@ -6183,7 +6198,7 @@ mod tests {
             CallTarget::Named(name) if name == "atomic_compare_exchange_strong"
         ));
         assert_eq!(args.len(), 3);
-        assert!(matches!(args[1].kind, ExprKind::AddressOf(_)));
+        assert!(matches!(args[1].kind, ExprKind::Var(ref v) if v.name == "eax"));
     }
 
     #[test]

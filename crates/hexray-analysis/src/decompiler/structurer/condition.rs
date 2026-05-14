@@ -96,7 +96,7 @@ pub(super) fn try_extract_arm64_branch_condition(
 /// Checks if an instruction sets CPU flags that can be used for conditional branches.
 /// Returns true for comparison instructions (CMP, TEST), arithmetic operations (ADD, SUB, INC, DEC),
 /// and logical operations (AND, OR, XOR) that affect condition codes.
-fn is_flag_setting_instruction(inst: &Instruction) -> bool {
+pub(super) fn is_flag_setting_instruction(inst: &Instruction) -> bool {
     match inst.operation {
         // Explicit comparison instructions
         Operation::Compare | Operation::Test => true,
@@ -117,12 +117,23 @@ fn is_flag_setting_instruction(inst: &Instruction) -> bool {
         // Shift operations that set flags
         Operation::Shl | Operation::Shr | Operation::Sar => true,
 
+        // CMPXCHG updates ZF to reflect CAS success/failure.
+        Operation::Exchange => is_cmpxchg_instruction(inst),
+
         _ => false,
     }
 }
 
 fn is_lock_prefixed(inst: &Instruction) -> bool {
     inst.bytes.first() == Some(&0xf0)
+}
+
+fn is_cmpxchg_instruction(inst: &Instruction) -> bool {
+    inst.mnemonic.eq_ignore_ascii_case("cmpxchg")
+        || inst
+            .mnemonic
+            .strip_prefix("lock ")
+            .is_some_and(|inner| inner.eq_ignore_ascii_case("cmpxchg"))
 }
 
 fn try_lift_lock_prefixed_zero_flag_condition(
@@ -135,10 +146,6 @@ fn try_lift_lock_prefixed_zero_flag_condition(
         Condition::NotEqual => BinOpKind::Ne,
         _ => return None,
     };
-    if !is_lock_prefixed(inst) {
-        return None;
-    }
-
     let (target_name, args) = match Expr::from_instruction(inst).kind {
         ExprKind::Call {
             target: CallTarget::Named(name),
@@ -154,6 +161,25 @@ fn try_lift_lock_prefixed_zero_flag_condition(
         _ => return None,
     };
 
+    let substituted_args: Vec<_> = args
+        .iter()
+        .cloned()
+        .map(|arg| substitute_register_in_expr(arg, reg_values))
+        .collect();
+
+    if target_name == "atomic_compare_exchange_strong" {
+        let call = Expr::call(CallTarget::Named(target_name), substituted_args);
+        return Some(match cond {
+            Condition::Equal => call,
+            Condition::NotEqual => Expr::unary(UnaryOpKind::LogicalNot, call).simplify(),
+            _ => unreachable!(),
+        });
+    }
+
+    if !is_lock_prefixed(inst) {
+        return None;
+    }
+
     let compare_rhs = match (target_name.as_str(), args.as_slice()) {
         ("atomic_fetch_sub", [_, value]) => substitute_register_in_expr(value.clone(), reg_values),
         ("atomic_fetch_add", [_, value]) => Expr::unary(
@@ -163,11 +189,6 @@ fn try_lift_lock_prefixed_zero_flag_condition(
         .simplify(),
         _ => return None,
     };
-
-    let substituted_args = args
-        .into_iter()
-        .map(|arg| substitute_register_in_expr(arg, reg_values))
-        .collect();
 
     Some(Expr::binop(
         cmp_op,
@@ -1559,6 +1580,86 @@ mod tests {
         assert!(
             rendered.contains("== 1"),
             "expected zero-flag compare to use the pre-decrement value, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_lifts_lock_cmpxchg_zero_flag_to_atomic_compare_exchange() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x3380);
+        block.instructions.push(
+            Instruction::new(0x3380, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x3385, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(ecx), Operand::imm_unsigned(1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x338a, 4, vec![0xf0, 0x0f, 0xb1, 0x0f], "lock cmpxchg")
+                .with_operation(Operation::Exchange)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rdi, 0, 4)),
+                    Operand::Register(ecx),
+                ]),
+        );
+
+        let expr = condition_to_expr_with_block(Condition::Equal, &block).simplify();
+        let rendered = format!("{expr}");
+        assert!(
+            rendered.contains("atomic_compare_exchange_strong"),
+            "expected cmpxchg success to lift as CAS, got {rendered}"
+        );
+        assert!(
+            rendered.contains(", 1, 1)"),
+            "expected expected/desired arguments to stay value-based, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_lift_setcc_uses_atomic_compare_exchange_after_lock_cmpxchg() {
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x3400);
+        block.instructions.push(
+            Instruction::new(0x3400, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x3405, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(ecx), Operand::imm_unsigned(1, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x340a, 4, vec![0xf0, 0x0f, 0xb1, 0x0f], "lock cmpxchg")
+                .with_operation(Operation::Exchange)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rdi, 0, 4)),
+                    Operand::Register(ecx),
+                ]),
+        );
+        let sete = Instruction::new(0x340e, 3, vec![], "sete")
+            .with_operation(Operation::SetConditional)
+            .with_operands(vec![Operand::Register(al)]);
+        block.instructions.push(sete.clone());
+
+        let rendered = format!("{}", lift_setcc_with_context(&sete, &block).simplify());
+        assert!(
+            rendered.contains("atomic_compare_exchange_strong"),
+            "expected sete to use the preceding cmpxchg CAS result, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("/* equal */"),
+            "expected no fallback flag comment, got {rendered}"
         );
     }
 

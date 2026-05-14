@@ -37,7 +37,8 @@ use condition::try_extract_arm64_branch_condition;
 use condition::{
     condition_to_expr_with_block, condition_to_expr_with_block_and_fallback,
     condition_to_expr_with_block_no_alu_updates_and_fallback, generate_writeback_expr,
-    lift_cmovcc_with_context, lift_setcc_with_context, negate_condition,
+    is_flag_setting_instruction, lift_cmovcc_with_context, lift_setcc_with_context,
+    negate_condition,
 };
 #[cfg(test)]
 use gotos::LoopContext;
@@ -643,6 +644,14 @@ struct Structurer<'a> {
     known_ubsan_targets: HashMap<u64, String>,
     /// Known cold-split helpers that ultimately throw or rethrow a C++ exception.
     known_throw_targets: HashMap<u64, String>,
+}
+
+fn is_cmpxchg_flag_instruction(inst: &Instruction) -> bool {
+    inst.mnemonic.eq_ignore_ascii_case("cmpxchg")
+        || inst
+            .mnemonic
+            .strip_prefix("lock ")
+            .is_some_and(|inner| inner.eq_ignore_ascii_case("cmpxchg"))
 }
 
 impl<'a> Structurer<'a> {
@@ -3397,6 +3406,39 @@ impl<'a> Structurer<'a> {
         } else {
             None
         };
+        let cmpxchg_branch_idx = if has_conditional_branch {
+            block
+                .instructions
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, inst)| {
+                    if inst.is_branch()
+                        && !inst.is_call()
+                        && inst.operation != Operation::Syscall
+                        && !matches!(inst.control_flow, ControlFlow::Halt)
+                    {
+                        return None;
+                    }
+                    if is_flag_setting_instruction(inst) {
+                        return is_cmpxchg_flag_instruction(inst).then_some(idx);
+                    }
+                    None
+                })
+        } else {
+            None
+        };
+        let cmpxchg_setcc_idxs: HashSet<_> = block
+            .instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, inst)| {
+                let next = block.instructions.get(idx + 1)?;
+                (is_cmpxchg_flag_instruction(inst)
+                    && matches!(next.operation, Operation::SetConditional))
+                .then_some(idx)
+            })
+            .collect();
 
         let probe_setup_end = match block.terminator {
             BlockTerminator::ConditionalBranch {
@@ -3456,6 +3498,14 @@ impl<'a> Structurer<'a> {
                     if *idx == cmp_idx {
                         return false;
                     }
+                }
+                if let Some(cmpxchg_idx) = cmpxchg_branch_idx {
+                    if *idx == cmpxchg_idx {
+                        return false;
+                    }
+                }
+                if cmpxchg_setcc_idxs.contains(idx) {
+                    return false;
                 }
                 true
             })
@@ -9737,6 +9787,66 @@ mod tests {
         assert!(
             rendered.contains("? 5 : 0"),
             "expected masked branchless idiom to lift into a conditional, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_block_to_statements_suppresses_cmpxchg_consumed_by_setcc() {
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let al = Register::new(Architecture::X86_64, RegisterClass::General, 0, 8);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1100);
+        bb0.instructions.push(
+            Instruction::new(0x1100, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(1, 32)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x1105, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(ecx), Operand::imm_unsigned(1, 32)]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x110a, 4, vec![0xf0, 0x0f, 0xb1, 0x0f], "lock cmpxchg")
+                .with_operation(Operation::Exchange)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rdi, 0, 4)),
+                    Operand::Register(ecx),
+                ]),
+        );
+        bb0.instructions.push(
+            Instruction::new(0x110e, 3, vec![], "sete")
+                .with_operation(Operation::SetConditional)
+                .with_operands(vec![Operand::Register(al)]),
+        );
+        bb0.terminator = BlockTerminator::Return;
+        cfg.add_block(bb0);
+
+        let structurer = Structurer::new(&cfg);
+        let rendered: Vec<_> = structurer
+            .block_to_statements(BasicBlockId::new(0))
+            .into_iter()
+            .map(|expr| format!("{expr}"))
+            .collect();
+
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|expr| expr.contains("atomic_compare_exchange_strong"))
+                .count(),
+            1,
+            "expected a single CAS lift, got {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|expr| expr.contains("= atomic_compare_exchange_strong")),
+            "expected SETcc to consume the cmpxchg result, got {rendered:?}"
         );
     }
 }
