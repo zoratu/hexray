@@ -392,9 +392,18 @@ impl<'a> Binary<'a> {
             Self::Pe(pe) => ExceptionExtractor::from_elf(pe).ok()?,
         };
 
+        let personalities = match self {
+            Self::Elf(elf) => summarize_elf_exception_personalities(elf, &extractor),
+            Self::MachO(_) | Self::Pe(_) => extractor
+                .personality_functions()
+                .into_iter()
+                .map(ExceptionPersonality::from_address)
+                .collect(),
+        };
+
         Some(ExceptionMetadataSummary {
             fde_count: extractor.fde_count(),
-            personalities: extractor.personality_functions(),
+            personalities,
             lsda_section_name: exception_lsda_section_name(self.as_format()),
         })
     }
@@ -449,16 +458,36 @@ fn demangle_exception_typeinfo_symbol_name(raw_name: &str) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 struct ExceptionMetadataSummary {
     fde_count: usize,
-    personalities: Vec<u64>,
+    personalities: Vec<ExceptionPersonality>,
     lsda_section_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExceptionPersonality {
+    addr: u64,
+    name: Option<String>,
+    resolved_via_relocation: bool,
+}
+
+impl ExceptionPersonality {
+    fn from_address(addr: u64) -> Self {
+        Self {
+            addr,
+            name: None,
+            resolved_via_relocation: false,
+        }
+    }
+}
+
+fn exception_section_matches_name(name: &str, expected: &str) -> bool {
+    name == expected || name.ends_with(expected)
 }
 
 fn exception_lsda_section_name(fmt: &dyn BinaryFormat) -> Option<String> {
     fmt.sections().find_map(|section| {
         let name = section.name();
-        if matches!(name, ".gcc_except_table" | "__gcc_except_tab")
-            || name.ends_with(".gcc_except_table")
-            || name.ends_with("__gcc_except_tab")
+        if exception_section_matches_name(name, ".gcc_except_table")
+            || exception_section_matches_name(name, "__gcc_except_tab")
         {
             Some(section.name().to_string())
         } else {
@@ -467,7 +496,78 @@ fn exception_lsda_section_name(fmt: &dyn BinaryFormat) -> Option<String> {
     })
 }
 
-fn format_exception_personality(binary: &Binary<'_>, addr: u64) -> String {
+fn resolve_relocatable_elf_personality(
+    symbols: &[hexray_core::Symbol],
+    eh_frame_section_index: Option<usize>,
+    relocations: &[hexray_formats::Relocation],
+    cie: &hexray_formats::dwarf::Cie,
+) -> Option<ExceptionPersonality> {
+    let eh_frame_section_index = eh_frame_section_index?;
+    let personality_pointer_offset = cie.personality_pointer_offset?;
+    let reloc = relocations.iter().find(|reloc| {
+        reloc.section_index == eh_frame_section_index && reloc.offset == personality_pointer_offset
+    })?;
+    let symbol = symbols.get(reloc.symbol_index as usize)?;
+    if symbol.name.is_empty() {
+        return None;
+    }
+
+    let (name, addr) = if symbol.section_index.is_some() {
+        let addr = relocation_defined_target_addr(symbol, reloc.r_type, reloc.addend);
+        (relocation_display_name(symbols, symbol, addr), addr)
+    } else {
+        (symbol.name.clone(), symbol.address)
+    };
+    Some(ExceptionPersonality {
+        addr,
+        name: Some(name),
+        resolved_via_relocation: true,
+    })
+}
+
+fn summarize_elf_exception_personalities(
+    elf: &Elf<'_>,
+    extractor: &ExceptionExtractor,
+) -> Vec<ExceptionPersonality> {
+    let eh_frame_section_index = elf.sections.iter().position(|section| {
+        exception_section_matches_name(section.name(), ".eh_frame")
+            || exception_section_matches_name(section.name(), "__eh_frame")
+    });
+    let symbols: Vec<_> = elf.symbols().cloned().collect();
+
+    let mut personalities: Vec<_> = extractor
+        .eh_frame()
+        .cies
+        .iter()
+        .filter_map(|cie| {
+            if elf.is_relocatable() {
+                resolve_relocatable_elf_personality(
+                    &symbols,
+                    eh_frame_section_index,
+                    &elf.relocations,
+                    cie,
+                )
+                .or_else(|| cie.personality.map(ExceptionPersonality::from_address))
+            } else {
+                cie.personality.map(ExceptionPersonality::from_address)
+            }
+        })
+        .collect();
+    personalities.sort_unstable();
+    personalities.dedup();
+    personalities
+}
+
+fn format_exception_personality(binary: &Binary<'_>, personality: &ExceptionPersonality) -> String {
+    if let Some(name) = personality.name.as_deref() {
+        if personality.resolved_via_relocation && personality.addr == 0 {
+            return demangle_or_original(name).to_string();
+        }
+
+        return format!("{} ({:#x})", demangle_or_original(name), personality.addr);
+    }
+
+    let addr = personality.addr;
     match binary.as_format().symbol_at(addr) {
         Some(symbol) if !symbol.name.is_empty() => {
             format!("{} ({:#x})", demangle_or_original(&symbol.name), addr)
@@ -487,7 +587,7 @@ fn append_exception_metadata(output: &mut String, binary: &Binary<'_>) {
         summary
             .personalities
             .iter()
-            .map(|addr| format_exception_personality(binary, *addr))
+            .map(|personality| format_exception_personality(binary, personality))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -8486,7 +8586,9 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                                 summary
                                     .personalities
                                     .iter()
-                                    .map(|addr| format_exception_personality(binary, *addr))
+                                    .map(|personality| {
+                                        format_exception_personality(binary, personality)
+                                    })
                                     .collect::<Vec<_>>()
                                     .join(", "),
                             )
@@ -9859,10 +9961,10 @@ mod tests {
         ensure_distinct_export_paths, filter_ifunc_display_aliases, find_symbol_in_candidates,
         format_callgraph_text, infer_main_symbol_from_entry, parse_address_str,
         patch_affects_function, resolve_analysis_target, resolve_analysis_target_with_entry_main,
-        resolve_materialized_callback_targets, resolve_relocation_symbol,
-        resolve_xref_source_label, resolve_xref_target_addresses, string_tags,
-        truncate_for_display, DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget,
-        SessionExportFormat, SymbolLookupMode,
+        resolve_materialized_callback_targets, resolve_relocatable_elf_personality,
+        resolve_relocation_symbol, resolve_xref_source_label, resolve_xref_target_addresses,
+        string_tags, truncate_for_display, DiffPatchAddressSpace, FileAddressRange,
+        ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
     };
     use hexray_analysis::{
         CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
@@ -9873,7 +9975,7 @@ mod tests {
         MemoryRef, Operand, Operation, Register, RegisterClass, Symbol, SymbolBinding, SymbolKind,
     };
     use hexray_disasm::X86_64Disassembler;
-    use hexray_formats::{BinaryFormat, BinaryType, RelocationType, Section};
+    use hexray_formats::{BinaryFormat, BinaryType, Relocation, RelocationType, Section};
     use std::fs;
 
     struct TestBinary {
@@ -12288,5 +12390,49 @@ mod tests {
         assert_eq!(name, "g_key");
         assert_eq!(addr, 0x204);
         assert!(!is_external);
+    }
+
+    #[test]
+    fn relocatable_personality_resolution_prefers_relocation_target_symbol() {
+        let zero_addr_function = Symbol {
+            name: "_ZdlPvm".to_string(),
+            address: 0,
+            size: 0,
+            kind: SymbolKind::Function,
+            binding: SymbolBinding::Global,
+            section_index: Some(1),
+        };
+        let personality = Symbol {
+            name: "__gxx_personality_v0".to_string(),
+            address: 0,
+            size: 0,
+            kind: SymbolKind::Function,
+            binding: SymbolBinding::Global,
+            section_index: None,
+        };
+        let cie = hexray_formats::dwarf::Cie {
+            personality: Some(0),
+            personality_pointer_offset: Some(0x24),
+            ..hexray_formats::dwarf::Cie::new(0)
+        };
+        let relocations = vec![Relocation {
+            offset: 0x24,
+            symbol_index: 1,
+            r_type: RelocationType::R64,
+            addend: 0,
+            section_index: 7,
+        }];
+
+        let resolved = resolve_relocatable_elf_personality(
+            &[zero_addr_function, personality],
+            Some(7),
+            &relocations,
+            &cie,
+        )
+        .expect("personality relocation should resolve");
+
+        assert_eq!(resolved.name.as_deref(), Some("__gxx_personality_v0"));
+        assert_eq!(resolved.addr, 0);
+        assert!(resolved.resolved_via_relocation);
     }
 }

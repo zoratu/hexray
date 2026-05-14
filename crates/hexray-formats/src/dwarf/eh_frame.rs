@@ -136,6 +136,8 @@ pub struct Cie {
     pub personality_encoding: Option<u8>,
     /// Personality function address (from 'P' augmentation).
     pub personality: Option<u64>,
+    /// Offset within `.eh_frame` of the encoded personality pointer slot.
+    pub personality_pointer_offset: Option<u64>,
     /// LSDA encoding (from 'L' augmentation).
     pub lsda_encoding: Option<u8>,
     /// Initial CFI instructions.
@@ -161,6 +163,7 @@ impl Cie {
             fde_pointer_encoding: None,
             personality_encoding: None,
             personality: None,
+            personality_pointer_offset: None,
             lsda_encoding: None,
             initial_instructions: Vec::new(),
             is_64bit: false,
@@ -561,6 +564,7 @@ impl<'a> EhFrameParser<'a> {
                             offset = offset.saturating_add(1);
 
                             // Read the personality pointer
+                            cie.personality_pointer_offset = Some(offset as u64);
                             let (ptr, bytes) = self.read_encoded_pointer(offset, encoding)?;
                             cie.personality = Some(ptr);
                             offset = offset.saturating_add(bytes);
@@ -1320,6 +1324,28 @@ mod tests {
         let cie = &eh_frame.cies[0];
         assert_eq!(cie.augmentation, "zR");
         assert_eq!(cie.fde_pointer_encoding, Some(0x1b));
+    }
+
+    #[test]
+    fn test_cie_records_personality_pointer_offset() {
+        let data: &[u8] = &[
+            0x15, 0x00, 0x00, 0x00, // Length: 21 bytes after this field
+            0x00, 0x00, 0x00, 0x00, // CIE ID: 0
+            0x01, // Version: 1
+            b'z', b'P', 0x00, // Augmentation: "zP"
+            0x01, // Code alignment: 1
+            0x78, // Data alignment: -8
+            0x10, // Return register: 16
+            0x09, // Augmentation length: 9 bytes
+            0x00, // Personality encoding: DW_EH_PE_absptr
+            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // Personality pointer
+        ];
+
+        let eh_frame = parse_eh_frame(data, 8, false, 0).unwrap();
+        let cie = &eh_frame.cies[0];
+
+        assert_eq!(cie.personality, Some(0x1122_3344_5566_7788));
+        assert_eq!(cie.personality_pointer_offset, Some(17));
     }
 
     #[test]
