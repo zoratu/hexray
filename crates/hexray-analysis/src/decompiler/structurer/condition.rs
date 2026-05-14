@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use hexray_core::{BasicBlock, Condition, IndexMode, Instruction, Operand, Operation};
 
 use super::super::abi::is_callee_saved_register;
-use super::super::expression::{BinOpKind, Expr};
+use super::super::expression::{BinOpKind, CallTarget, Expr, ExprKind, UnaryOpKind};
 
 /// Try to extract condition from ARM64 CBZ/CBNZ/TBZ/TBNZ instructions.
 ///
@@ -119,6 +119,61 @@ fn is_flag_setting_instruction(inst: &Instruction) -> bool {
 
         _ => false,
     }
+}
+
+fn is_lock_prefixed(inst: &Instruction) -> bool {
+    inst.bytes.first() == Some(&0xf0)
+}
+
+fn try_lift_lock_prefixed_zero_flag_condition(
+    cond: Condition,
+    inst: &Instruction,
+    reg_values: &HashMap<String, Expr>,
+) -> Option<Expr> {
+    let cmp_op = match cond {
+        Condition::Equal => BinOpKind::Eq,
+        Condition::NotEqual => BinOpKind::Ne,
+        _ => return None,
+    };
+    if !is_lock_prefixed(inst) {
+        return None;
+    }
+
+    let (target_name, args) = match Expr::from_instruction(inst).kind {
+        ExprKind::Call {
+            target: CallTarget::Named(name),
+            args,
+        } => (name, args),
+        ExprKind::Assign { rhs, .. } => match rhs.kind {
+            ExprKind::Call {
+                target: CallTarget::Named(name),
+                args,
+            } => (name, args),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let compare_rhs = match (target_name.as_str(), args.as_slice()) {
+        ("atomic_fetch_sub", [_, value]) => substitute_register_in_expr(value.clone(), reg_values),
+        ("atomic_fetch_add", [_, value]) => Expr::unary(
+            UnaryOpKind::Neg,
+            substitute_register_in_expr(value.clone(), reg_values),
+        )
+        .simplify(),
+        _ => return None,
+    };
+
+    let substituted_args = args
+        .into_iter()
+        .map(|arg| substitute_register_in_expr(arg, reg_values))
+        .collect();
+
+    Some(Expr::binop(
+        cmp_op,
+        Expr::call(CallTarget::Named(target_name), substituted_args),
+        compare_rhs,
+    ))
 }
 
 fn x86_float_compare_binop(cond: Condition, inst: &Instruction) -> Option<BinOpKind> {
@@ -325,6 +380,10 @@ fn condition_to_expr_before_address_with_fallback(
 
     let lift_condition_from_inst = |inst: &Instruction, reg_values: &HashMap<String, Expr>| {
         let cmp_op = x86_float_compare_binop(cond, inst).unwrap_or(op);
+
+        if let Some(expr) = try_lift_lock_prefixed_zero_flag_condition(cond, inst, reg_values) {
+            return Some(expr);
+        }
 
         if matches!(inst.operation, Operation::Neg) && !inst.operands.is_empty() {
             let operand = substitute_register_in_expr(
@@ -1474,6 +1533,32 @@ mod tests {
         assert!(
             !rendered.contains("rbp + -0x8"),
             "expected later register writes to be ignored for the TEST predicate, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_condition_lifts_lock_sub_zero_flag_to_atomic_fetch_sub_compare() {
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x3300);
+        block.instructions.push(
+            Instruction::new(0x3300, 4, vec![0xf0, 0x83, 0x2f, 0x01], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rdi, 0, 4)),
+                    Operand::imm_unsigned(1, 4),
+                ]),
+        );
+
+        let expr = condition_to_expr_with_block(Condition::Equal, &block);
+        let rendered = format!("{expr}");
+        assert!(
+            rendered.contains("atomic_fetch_sub"),
+            "expected lock-prefixed sub to survive as atomic_fetch_sub in the condition, got {rendered}"
+        );
+        assert!(
+            rendered.contains("== 1"),
+            "expected zero-flag compare to use the pre-decrement value, got {rendered}"
         );
     }
 

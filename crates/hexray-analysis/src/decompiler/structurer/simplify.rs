@@ -2331,6 +2331,9 @@ pub(super) fn remove_temp_assignments_in_node(
                             }
                             // Only remove temp assignments if the variable is NOT used elsewhere
                             if is_temp_register(&v.name) && !uses.contains(&v.name) {
+                                if expr_has_side_effects_from_assignment(stmt) {
+                                    return true; // Keep side-effecting temp captures (e.g. atomics)
+                                }
                                 return false; // Remove unused temp assignment
                             }
                         }
@@ -9895,6 +9898,28 @@ mod tests {
             format!("{}", statements[0]),
             "atomic_store(&g_counter, edi)"
         );
+    }
+
+    #[test]
+    fn test_simplify_statements_keeps_dead_atomic_fetch_sub_capture_side_effect() {
+        let nodes = vec![block(
+            0,
+            vec![Expr::assign(
+                reg("eax", 4),
+                Expr::call(
+                    CallTarget::Named("atomic_fetch_sub".to_string()),
+                    vec![reg("rdi", 8), Expr::int(1)],
+                ),
+            )],
+        )];
+
+        let simplified = simplify_statements(nodes);
+        let StructuredNode::Block { statements, .. } = &simplified[0] else {
+            panic!("expected block");
+        };
+
+        assert_eq!(statements.len(), 1);
+        assert_eq!(format!("{}", statements[0]), "atomic_fetch_sub(rdi, 1)");
     }
 
     #[test]
