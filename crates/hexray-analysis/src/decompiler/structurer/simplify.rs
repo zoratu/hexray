@@ -4894,7 +4894,7 @@ fn propagate_args_in_block_with_state(
                             }
                         }
                     }
-                    let rewritten_call = rewrite_known_linux_syscall_call(
+                    let rewritten_call = rewrite_known_runtime_wrapper_call(
                         substituted_target,
                         rewritten_args,
                         binary_data,
@@ -4910,7 +4910,7 @@ fn propagate_args_in_block_with_state(
                     result.push(Expr::assign(substituted_lhs, rewritten_call));
                     continue;
                 } else {
-                    let rewritten_call = rewrite_known_linux_syscall_call(
+                    let rewritten_call = rewrite_known_runtime_wrapper_call(
                         substituted_target,
                         substitute_call_args(target, args, &state.reg_values),
                         binary_data,
@@ -5041,7 +5041,7 @@ fn propagate_args_in_block_with_state(
                     for idx in used_stmt_indices {
                         to_remove.insert(idx);
                     }
-                    result.push(rewrite_known_linux_syscall_call(
+                    result.push(rewrite_known_runtime_wrapper_call(
                         substituted_target,
                         recovered_args,
                         binary_data,
@@ -5068,7 +5068,7 @@ fn propagate_args_in_block_with_state(
                     for idx in new_args.1 {
                         to_remove.insert(idx);
                     }
-                    result.push(rewrite_known_linux_syscall_call(
+                    result.push(rewrite_known_runtime_wrapper_call(
                         substituted_target,
                         new_args.0,
                         binary_data,
@@ -5093,7 +5093,7 @@ fn propagate_args_in_block_with_state(
                     for idx in fallback_args.1 {
                         to_remove.insert(idx);
                     }
-                    result.push(rewrite_known_linux_syscall_call(
+                    result.push(rewrite_known_runtime_wrapper_call(
                         substituted_target,
                         fallback_args.0,
                         binary_data,
@@ -5112,7 +5112,7 @@ fn propagate_args_in_block_with_state(
                         to_remove.insert(idx);
                     }
                     // Create a new call with arguments
-                    let new_call = rewrite_known_linux_syscall_call(
+                    let new_call = rewrite_known_runtime_wrapper_call(
                         substituted_target,
                         new_args.0,
                         binary_data,
@@ -5131,7 +5131,7 @@ fn propagate_args_in_block_with_state(
                     let passthrough_args =
                         synthesize_leading_passthrough_args_from_target(&excluded_arg_regs);
                     if !passthrough_args.is_empty() {
-                        result.push(rewrite_known_linux_syscall_call(
+                        result.push(rewrite_known_runtime_wrapper_call(
                             substituted_target,
                             passthrough_args,
                             binary_data,
@@ -5146,7 +5146,7 @@ fn propagate_args_in_block_with_state(
                     }
                 }
 
-                result.push(rewrite_known_linux_syscall_call(
+                result.push(rewrite_known_runtime_wrapper_call(
                     substituted_target,
                     substitute_call_args(target, args, &state.reg_values),
                     binary_data,
@@ -5177,7 +5177,7 @@ fn propagate_args_in_block_with_state(
                         &mut state.compound_updated_aliases,
                         &written_aliases,
                     );
-                    result.push(rewrite_known_linux_syscall_call(
+                    result.push(rewrite_known_runtime_wrapper_call(
                         substituted_target,
                         substituted_args,
                         binary_data,
@@ -6289,6 +6289,110 @@ enum KnownCallSignatureSource {
 fn normalize_known_call_name(name: &str) -> &str {
     let trimmed = name.trim_start_matches('_');
     trimmed.split('@').next().unwrap_or(trimmed)
+}
+
+fn rewrite_known_runtime_wrapper_call(
+    target: CallTarget,
+    args: Vec<Expr>,
+    binary_data: Option<&BinaryDataContext>,
+) -> Expr {
+    let (target, args) = rewrite_known_glibc_fortify_call(target, args, binary_data);
+    rewrite_known_linux_syscall_call(target, args, binary_data)
+}
+
+fn rewrite_known_glibc_fortify_call(
+    target: CallTarget,
+    args: Vec<Expr>,
+    binary_data: Option<&BinaryDataContext>,
+) -> (CallTarget, Vec<Expr>) {
+    let Some(name) = resolved_known_call_name(&target, binary_data) else {
+        return (target, args);
+    };
+
+    let (rewritten_name, rewritten_args) =
+        match rewrite_glibc_fortify_name_and_args(normalize_known_call_name(&name), args) {
+            Ok(rewritten) => rewritten,
+            Err(args) => return (target, args),
+        };
+
+    (
+        CallTarget::Named(rewritten_name.to_string()),
+        rewritten_args,
+    )
+}
+
+fn rewrite_glibc_fortify_name_and_args(
+    name: &str,
+    args: Vec<Expr>,
+) -> Result<(&'static str, Vec<Expr>), Vec<Expr>> {
+    match name {
+        "printf_chk" if args.len() >= 2 => Ok(("printf", args.into_iter().skip(1).collect())),
+        "fprintf_chk" if args.len() >= 3 => {
+            let mut iter = args.into_iter();
+            let stream = iter.next().expect("len checked");
+            iter.next();
+            let mut rewritten_args = vec![stream];
+            rewritten_args.extend(iter);
+            Ok(("fprintf", rewritten_args))
+        }
+        "vprintf_chk" if args.len() >= 2 => Ok(("vprintf", args.into_iter().skip(1).collect())),
+        "vfprintf_chk" if args.len() >= 3 => {
+            let mut iter = args.into_iter();
+            let stream = iter.next().expect("len checked");
+            iter.next();
+            let mut rewritten_args = vec![stream];
+            rewritten_args.extend(iter);
+            Ok(("vfprintf", rewritten_args))
+        }
+        "sprintf_chk" if args.len() >= 4 => {
+            let mut iter = args.into_iter();
+            let dst = iter.next().expect("len checked");
+            iter.next();
+            iter.next();
+            let mut rewritten_args = vec![dst];
+            rewritten_args.extend(iter);
+            Ok(("sprintf", rewritten_args))
+        }
+        "snprintf_chk" if args.len() >= 5 => {
+            let mut iter = args.into_iter();
+            let dst = iter.next().expect("len checked");
+            let len = iter.next().expect("len checked");
+            iter.next();
+            iter.next();
+            let mut rewritten_args = vec![dst, len];
+            rewritten_args.extend(iter);
+            Ok(("snprintf", rewritten_args))
+        }
+        "vsprintf_chk" if args.len() >= 4 => {
+            let mut iter = args.into_iter();
+            let dst = iter.next().expect("len checked");
+            iter.next();
+            iter.next();
+            let mut rewritten_args = vec![dst];
+            rewritten_args.extend(iter);
+            Ok(("vsprintf", rewritten_args))
+        }
+        "vsnprintf_chk" if args.len() >= 5 => {
+            let mut iter = args.into_iter();
+            let dst = iter.next().expect("len checked");
+            let len = iter.next().expect("len checked");
+            iter.next();
+            iter.next();
+            let mut rewritten_args = vec![dst, len];
+            rewritten_args.extend(iter);
+            Ok(("vsnprintf", rewritten_args))
+        }
+        "memcpy_chk" if args.len() >= 4 => Ok(("memcpy", args.into_iter().take(3).collect())),
+        "memmove_chk" if args.len() >= 4 => Ok(("memmove", args.into_iter().take(3).collect())),
+        "memset_chk" if args.len() >= 4 => Ok(("memset", args.into_iter().take(3).collect())),
+        "strcpy_chk" if args.len() >= 3 => Ok(("strcpy", args.into_iter().take(2).collect())),
+        "strncpy_chk" if args.len() >= 4 => Ok(("strncpy", args.into_iter().take(3).collect())),
+        "strcat_chk" if args.len() >= 3 => Ok(("strcat", args.into_iter().take(2).collect())),
+        "strncat_chk" if args.len() >= 4 => Ok(("strncat", args.into_iter().take(3).collect())),
+        "stpcpy_chk" if args.len() >= 3 => Ok(("stpcpy", args.into_iter().take(2).collect())),
+        "stpncpy_chk" if args.len() >= 4 => Ok(("stpncpy", args.into_iter().take(3).collect())),
+        _ => Err(args),
+    }
 }
 
 fn rewrite_known_linux_syscall_call(
@@ -10634,6 +10738,96 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_known_runtime_wrapper_call_normalizes_direct_fprintf_chk_import() {
+        let mut binary_data = BinaryDataContext::new();
+        binary_data.add_call_target_name_by_address(0x4010c0, "__fprintf_chk@GLIBC_2.3.4");
+
+        let rewritten = rewrite_known_runtime_wrapper_call(
+            CallTarget::Direct {
+                target: 0x4010c0,
+                call_site: 0x5000,
+            },
+            vec![
+                Expr::unknown("stderr"),
+                Expr::int(2),
+                Expr::unknown("fmt"),
+                Expr::unknown("arg0"),
+                Expr::unknown("arg1"),
+            ],
+            Some(&binary_data),
+        );
+
+        let ExprKind::Call { target, args } = &rewritten.kind else {
+            panic!("expected call expression");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "fprintf"),
+            other => panic!("expected fprintf target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["stderr", "fmt", "arg0", "arg1"]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_known_runtime_wrapper_call_normalizes_snprintf_chk() {
+        let rewritten = rewrite_known_runtime_wrapper_call(
+            CallTarget::Named("__snprintf_chk".to_string()),
+            vec![
+                Expr::unknown("dst"),
+                Expr::unknown("maxlen"),
+                Expr::int(2),
+                Expr::int(-1),
+                Expr::unknown("fmt"),
+                Expr::unknown("value"),
+            ],
+            None,
+        );
+
+        let ExprKind::Call { target, args } = &rewritten.kind else {
+            panic!("expected call expression");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "snprintf"),
+            other => panic!("expected snprintf target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["dst", "maxlen", "fmt", "value"]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_known_runtime_wrapper_call_normalizes_memcpy_chk() {
+        let rewritten = rewrite_known_runtime_wrapper_call(
+            CallTarget::Named("__memcpy_chk".to_string()),
+            vec![
+                Expr::unknown("dst"),
+                Expr::unknown("src"),
+                Expr::unknown("n"),
+                Expr::unknown("dst_len"),
+            ],
+            None,
+        );
+
+        let ExprKind::Call { target, args } = &rewritten.kind else {
+            panic!("expected call expression");
+        };
+
+        match target {
+            CallTarget::Named(name) => assert_eq!(name, "memcpy"),
+            other => panic!("expected memcpy target, got {other:?}"),
+        }
+        assert_eq!(
+            args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
+            ["dst", "src", "n"]
+        );
+    }
+
+    #[test]
     fn test_propagate_call_args_caps_sigaction_to_known_prototype() {
         let statements = vec![
             Expr::assign(reg("r8d", 4), reg("edi", 4)),
@@ -10908,7 +11102,7 @@ mod tests {
 
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
-            ["1", "0x5000", "x", "xmm0", "s"]
+            ["0x5000", "x", "xmm0", "s"]
         );
     }
 
@@ -10941,7 +11135,7 @@ mod tests {
 
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
-            ["1", "0x5100", "x", "xmm0", "s"]
+            ["0x5100", "x", "xmm0", "s"]
         );
     }
 
@@ -11291,7 +11485,7 @@ mod tests {
 
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
-            ["2", "0x6010", "sum", "value"]
+            ["0x6010", "sum", "value"]
         );
     }
 

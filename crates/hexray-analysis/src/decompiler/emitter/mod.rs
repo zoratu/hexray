@@ -4095,6 +4095,15 @@ impl PseudoCodeEmitter {
             .to_string()
     }
 
+    fn relocated_symbol_name(&self, instruction_address: u64, address: u64) -> Option<&str> {
+        let reloc_table = self.relocation_table.as_ref()?;
+        reloc_table
+            .get_got(instruction_address)
+            .or_else(|| reloc_table.get_data(instruction_address))
+            .or_else(|| reloc_table.get_got(address))
+            .or_else(|| reloc_table.get_data(address))
+    }
+
     fn libc_global_matches_candidate(&self, raw: &str, candidate: &str) -> bool {
         self.simplify_libc_global_name(raw) == Some(candidate)
             || self.simplify_libc_global_name(hexray_core::unversioned_symbol_name(raw))
@@ -4919,14 +4928,8 @@ impl PseudoCodeEmitter {
                 instruction_address,
                 ..
             } => {
-                if let Some(ref reloc_table) = self.relocation_table {
-                    if let Some(name) = reloc_table.get_got(*instruction_address) {
-                        self.simplify_libc_global_name(name)
-                    } else if let Some(name) = reloc_table.get_got(*address) {
-                        self.simplify_libc_global_name(name)
-                    } else {
-                        None
-                    }
+                if let Some(name) = self.relocated_symbol_name(*instruction_address, *address) {
+                    self.simplify_libc_global_name(name)
                 } else if let Some(ref sym_table) = self.symbol_table {
                     sym_table
                         .get(*address)
@@ -5073,20 +5076,12 @@ impl PseudoCodeEmitter {
                 is_deref,
                 ..
             } => {
-                // Try to resolve using instruction address first (for relocatable objects)
-                if let Some(ref reloc_table) = self.relocation_table {
-                    if let Some(name) = reloc_table.get_got(*instruction_address) {
-                        if let Some(alias) = self.simplify_libc_global_name(name) {
-                            return alias.to_string();
-                        }
-                        return name.to_string();
+                if let Some(name) = self.relocated_symbol_name(*instruction_address, *address) {
+                    let resolved = self.simplify_symbol_name(name);
+                    if *is_deref {
+                        return resolved;
                     }
-                    if let Some(name) = reloc_table.get_got(*address) {
-                        if let Some(alias) = self.simplify_libc_global_name(name) {
-                            return alias.to_string();
-                        }
-                        return name.to_string();
-                    }
+                    return format!("&{}", resolved);
                 }
                 if *is_deref {
                     if let Some(value) = self.format_global_value(*address, *size) {
@@ -5316,24 +5311,12 @@ impl PseudoCodeEmitter {
                 display_expr: _,
                 is_deref,
             } => {
-                // Try to resolve using instruction address first (for relocatable objects)
-                // This uses the relocation at the instruction to find the symbol
-                if let Some(ref reloc_table) = self.relocation_table {
-                    if let Some(name) = reloc_table.get_got(*instruction_address) {
-                        let resolved = self.simplify_symbol_name(name);
-                        if *is_deref {
-                            return resolved;
-                        }
-                        return format!("&{}", resolved);
+                if let Some(name) = self.relocated_symbol_name(*instruction_address, *address) {
+                    let resolved = self.simplify_symbol_name(name);
+                    if *is_deref {
+                        return resolved;
                     }
-                    // Fall back to computed address (for linked binaries)
-                    if let Some(name) = reloc_table.get_got(*address) {
-                        let resolved = self.simplify_symbol_name(name);
-                        if *is_deref {
-                            return resolved;
-                        }
-                        return format!("&{}", resolved);
-                    }
+                    return format!("&{}", resolved);
                 }
                 // Try symbol table
                 if *is_deref {
@@ -11942,6 +11925,18 @@ mod tests {
 
         let emitter = PseudoCodeEmitter::new("    ", false).with_symbol_table(Some(sym));
         let expr = Expr::got_ref(0x1000, 0, 8, Expr::unknown("rip_ref"));
+
+        assert_eq!(emitter.format_expr(&expr), "stderr");
+    }
+
+    #[test]
+    fn test_libc_global_gotref_uses_pc_relative_data_relocation_name() {
+        let mut relocations = RelocationTable::new();
+        relocations.insert_data(0x27, "stderr".to_string(), 0, true);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_relocation_table(Some(relocations));
+        let expr = Expr::got_ref(0x6e, 0x27, 8, Expr::unknown("rip_ref"));
 
         assert_eq!(emitter.format_expr(&expr), "stderr");
     }
