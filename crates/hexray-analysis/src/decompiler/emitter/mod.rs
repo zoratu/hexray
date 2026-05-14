@@ -743,6 +743,24 @@ impl PseudoCodeEmitter {
             Some(name.to_string())
         }
 
+        fn parse_stack_guard_assign(line: &str) -> Option<String> {
+            let trimmed = line.trim().strip_suffix(';')?;
+            let (lhs, rhs) = trimmed.split_once(" = ")?;
+            let lhs = lhs.trim();
+            let rhs = rhs.trim();
+            if rhs == "__stack_chk_guard" && is_simple_identifier(lhs) {
+                Some(lhs.to_string())
+            } else {
+                None
+            }
+        }
+
+        fn parse_simple_return_ident(line: &str) -> Option<String> {
+            let trimmed = line.trim().strip_suffix(';')?;
+            let ident = trimmed.strip_prefix("return ")?.trim();
+            is_simple_identifier(ident).then(|| ident.to_string())
+        }
+
         fn split_top_level_csv(input: &str) -> Option<Vec<String>> {
             let mut parts = Vec::new();
             let mut depth = 0i32;
@@ -763,6 +781,18 @@ impl PseudoCodeEmitter {
             }
             parts.push(input[start..].trim().to_string());
             Some(parts)
+        }
+
+        fn parse_call_first_arg(line: &str) -> Option<String> {
+            let trimmed = line.trim().strip_suffix(';')?;
+            let open = trimmed.find('(')?;
+            let close = trimmed.rfind(')')?;
+            if close <= open {
+                return None;
+            }
+            let args = split_top_level_csv(&trimmed[open + 1..close])?;
+            let first = args.first()?.trim();
+            is_simple_identifier(first).then(|| first.to_string())
         }
 
         fn parse_set_bits_call(line: &str) -> Option<(std::ops::Range<usize>, Vec<String>)> {
@@ -885,6 +915,49 @@ impl PseudoCodeEmitter {
                 continue;
             }
             idx += 1;
+        }
+
+        if let Some((guard_assign_idx, guard_local)) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(idx, line)| parse_stack_guard_assign(line).map(|name| (idx, name)))
+        {
+            if let Some(return_idx) = lines.iter().rposition(|line| {
+                parse_simple_return_ident(line).as_deref() == Some(guard_local.as_str())
+            }) {
+                if let Some(replacement) = lines[..return_idx]
+                    .iter()
+                    .rev()
+                    .find_map(|line| parse_call_first_arg(line))
+                {
+                    let indent = lines[return_idx]
+                        .chars()
+                        .take_while(|c| c.is_whitespace())
+                        .collect::<String>();
+                    lines[return_idx] = format!("{indent}return {replacement};");
+
+                    let guard_local_used_elsewhere = lines.iter().enumerate().any(|(idx, line)| {
+                        idx != guard_assign_idx
+                            && idx != return_idx
+                            && line_mentions_identifier(line, &guard_local)
+                    });
+                    if !guard_local_used_elsewhere {
+                        if let Some(decl_idx) = lines.iter().position(|line| {
+                            parse_simple_decl(line).as_deref() == Some(guard_local.as_str())
+                        }) {
+                            lines.remove(decl_idx);
+                            let adjusted_assign_idx = if decl_idx < guard_assign_idx {
+                                guard_assign_idx.saturating_sub(1)
+                            } else {
+                                guard_assign_idx
+                            };
+                            lines.remove(adjusted_assign_idx);
+                        } else {
+                            lines.remove(guard_assign_idx);
+                        }
+                    }
+                }
+            }
         }
 
         let is_int64_return = lines
@@ -10590,6 +10663,31 @@ mod tests {
         assert!(
             repaired.contains("return printf(\"%a\\n\", farg0);"),
             "Expected forwarding call to remain, got:\n{}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn test_repair_packed_small_aggregate_output_rewrites_stack_guard_return_to_helper_arg() {
+        let input = r#"int64_t make_one_alloc(int32_t arg0, int32_t arg1, int32_t arg2)
+{
+    int local_8;
+
+    local_8 = __stack_chk_guard;
+    helper(arg0, arg1, arg2);
+    return local_8;
+}"#;
+
+        let repaired = PseudoCodeEmitter::repair_packed_small_aggregate_output(input.to_string());
+        assert!(
+            repaired.contains("return arg0;"),
+            "expected repaired return to use helper sret arg, got:\n{}",
+            repaired
+        );
+        assert!(
+            !repaired.contains("local_8 = __stack_chk_guard;")
+                && !repaired.contains("int local_8;"),
+            "expected dead guard temp to be removed, got:\n{}",
             repaired
         );
     }

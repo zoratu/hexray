@@ -1338,6 +1338,13 @@ impl<'a> Structurer<'a> {
     }
 
     fn is_stack_canary_return_artifact(return_value: &Expr, condition_expr: &Expr) -> bool {
+        fn ignorable_frame_symbol(symbol: &str) -> bool {
+            matches!(
+                symbol.to_ascii_lowercase().as_str(),
+                "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp" | "x29" | "fp"
+            )
+        }
+
         if Self::expr_mentions_stack_canary_guard(return_value) {
             return true;
         }
@@ -1347,12 +1354,14 @@ impl<'a> Structurer<'a> {
 
         let mut return_symbols = HashSet::new();
         Self::collect_expr_symbol_names(return_value, &mut return_symbols);
+        return_symbols.retain(|symbol| !ignorable_frame_symbol(symbol));
         if return_symbols.is_empty() {
             return false;
         }
 
         let mut condition_symbols = HashSet::new();
         Self::collect_expr_symbol_names(condition_expr, &mut condition_symbols);
+        condition_symbols.retain(|symbol| !ignorable_frame_symbol(symbol));
 
         return_symbols
             .iter()
@@ -1977,19 +1986,34 @@ impl<'a> Structurer<'a> {
                         let mut merged_statements = statements.clone();
                         let mut normal_statements = self.block_to_statements(normal_target);
                         trim_trailing_epilogue_statements(&mut normal_statements);
+                        while matches!(
+                            normal_statements.last(),
+                            Some(Expr {
+                                kind: ExprKind::Unknown(name)
+                            }) if name.trim() == "/* nop */"
+                        ) {
+                            normal_statements.pop();
+                        }
+                        let checked_canary_slot = Self::stack_canary_checked_slot(block);
+                        let mut continuation_return_value = None;
+                        if matches!(normal_block.terminator, BlockTerminator::Return) {
+                            let (filtered_normal_statements, extracted_return) =
+                                extract_return_value(normal_statements);
+                            normal_statements = filtered_normal_statements;
+                            continuation_return_value = extracted_return;
+                        }
                         merged_statements.append(&mut normal_statements);
                         let condition_expr = substitute_prior_register_assignments(
                             condition_to_expr_with_block(*condition, block),
                             &merged_statements,
                         );
-                        let checked_canary_slot = Self::stack_canary_checked_slot(block);
                         let merged_range = (block.start, normal_block.end);
 
                         match &normal_block.terminator {
                             BlockTerminator::Return => {
                                 let (mut filtered_stmts, mut return_value) =
                                     extract_return_value(merged_statements);
-                                let canary_slot_return =
+                                let merged_canary_slot_return =
                                     checked_canary_slot.as_ref().is_some_and(|slot| {
                                         return_value
                                             .as_ref()
@@ -1997,11 +2021,26 @@ impl<'a> Structurer<'a> {
                                             .as_ref()
                                             == Some(slot)
                                     });
-                                let suppressed_canary_return = canary_slot_return
+                                let merged_canary_artifact = merged_canary_slot_return
                                     || return_value.as_ref().is_some_and(|expr| {
                                         Self::is_stack_canary_return_artifact(expr, &condition_expr)
                                     });
-                                if suppressed_canary_return {
+                                let continuation_canary_artifact =
+                                    checked_canary_slot.as_ref().is_some_and(|slot| {
+                                        continuation_return_value
+                                            .as_ref()
+                                            .and_then(Self::stack_slot_signature_from_expr)
+                                            .as_ref()
+                                            == Some(slot)
+                                    }) || continuation_return_value.as_ref().is_some_and(|expr| {
+                                        Self::is_stack_canary_return_artifact(expr, &condition_expr)
+                                    });
+                                if merged_canary_artifact && !continuation_canary_artifact {
+                                    return_value = continuation_return_value.clone();
+                                }
+                                let suppress_canary_scaffolding =
+                                    merged_canary_artifact || continuation_canary_artifact;
+                                if suppress_canary_scaffolding {
                                     return_value = None;
                                     filtered_stmts.retain(|stmt| {
                                         !Self::expr_mentions_stack_canary_guard(stmt)
@@ -2010,7 +2049,7 @@ impl<'a> Structurer<'a> {
                                             })
                                     });
                                 }
-                                let implicit_return = (!suppressed_canary_return
+                                let implicit_return = (!suppress_canary_scaffolding
                                     && return_value.is_none())
                                 .then(|| {
                                     self.implicit_return_register_expr_for_block(normal_target)
@@ -2029,12 +2068,19 @@ impl<'a> Structurer<'a> {
                                 ) {
                                     filtered_stmts.pop();
                                 }
-                                let return_value = return_value.or(implicit_return).map(|expr| {
-                                    self.substitute_predecessor_register_values_in_return_expr(
-                                        normal_target,
-                                        expr,
-                                    )
-                                });
+                                let return_value = return_value
+                                    .or(implicit_return)
+                                    .or_else(|| {
+                                        (!continuation_canary_artifact)
+                                            .then_some(continuation_return_value.clone())
+                                            .flatten()
+                                    })
+                                    .map(|expr| {
+                                        self.substitute_predecessor_register_values_in_return_expr(
+                                            normal_target,
+                                            expr,
+                                        )
+                                    });
 
                                 if !filtered_stmts.is_empty() {
                                     result.push(StructuredNode::Block {
@@ -2435,6 +2481,9 @@ impl<'a> Structurer<'a> {
         expr: Expr,
         visited: &mut HashSet<BasicBlockId>,
     ) -> Expr {
+        if !Self::expr_mentions_return_register(&expr) {
+            return expr;
+        }
         if !visited.insert(block_id) {
             return expr;
         }
@@ -2449,6 +2498,48 @@ impl<'a> Structurer<'a> {
         let substituted = substitute_prior_register_assignments(expr, &pred_statements);
 
         self.substitute_predecessor_register_values_in_return_expr_inner(pred, substituted, visited)
+    }
+
+    fn expr_mentions_return_register(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Var(var) => abi::is_return_register(&var.name.to_lowercase()),
+            ExprKind::Unknown(name) => abi::is_return_register(&name.to_lowercase()),
+            ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+                Self::expr_mentions_return_register(lhs) || Self::expr_mentions_return_register(rhs)
+            }
+            ExprKind::BinOp { left, right, .. } => {
+                Self::expr_mentions_return_register(left)
+                    || Self::expr_mentions_return_register(right)
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => {
+                Self::expr_mentions_return_register(operand)
+            }
+            ExprKind::ArrayAccess { base, index, .. } => {
+                Self::expr_mentions_return_register(base)
+                    || Self::expr_mentions_return_register(index)
+            }
+            ExprKind::FieldAccess { base, .. } => Self::expr_mentions_return_register(base),
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+                args.iter().any(Self::expr_mentions_return_register)
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_mentions_return_register(cond)
+                    || Self::expr_mentions_return_register(then_expr)
+                    || Self::expr_mentions_return_register(else_expr)
+            }
+            ExprKind::GotRef { display_expr, .. } => {
+                Self::expr_mentions_return_register(display_expr)
+            }
+            ExprKind::IntLit(_) => false,
+        }
     }
 
     fn last_safe_return_register_expr_in_statements(statements: &[Expr]) -> Option<Expr> {
@@ -7985,6 +8076,157 @@ mod tests {
         assert!(
             structurer.processed.contains(&BasicBlockId::new(1)),
             "stack canary fail block should be marked processed"
+        );
+    }
+
+    #[test]
+    fn test_structure_prefers_post_canary_return_reload_over_checked_canary_slot() {
+        use hexray_core::{Architecture, IndexMode, MemoryRef, Register, RegisterClass};
+
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rdi = Register::new(Architecture::X86_64, RegisterClass::General, 7, 64);
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let fs = Register::new(Architecture::X86_64, RegisterClass::Segment, x86::FS, 16);
+
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut entry = BasicBlock::new(BasicBlockId::new(0), 0x3000);
+        entry.instructions.push(
+            Instruction::new(0x3000, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x18, 8)),
+                    Operand::Register(rdi),
+                ]),
+        );
+        entry.instructions.push(
+            Instruction::new(0x3004, 9, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef {
+                        base: None,
+                        index: None,
+                        scale: 1,
+                        displacement: 0x28,
+                        size: 8,
+                        segment: Some(fs),
+                        broadcast: false,
+                        index_mode: IndexMode::None,
+                        space: hexray_core::MemorySpace::Generic,
+                    }),
+                ]),
+        );
+        entry.instructions.push(
+            Instruction::new(0x300d, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x8, 8)),
+                    Operand::Register(rax),
+                ]),
+        );
+        entry.instructions.push(
+            Instruction::new(0x3011, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x6000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x6000,
+                    return_addr: 0x3016,
+                }),
+        );
+        entry.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(entry);
+
+        let mut check = BasicBlock::new(BasicBlockId::new(1), 0x3020);
+        check.instructions.push(
+            Instruction::new(0x3020, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x8, 8)),
+                ]),
+        );
+        check.instructions.push(
+            Instruction::new(0x3024, 9, vec![], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef {
+                        base: None,
+                        index: None,
+                        scale: 1,
+                        displacement: 0x28,
+                        size: 8,
+                        segment: Some(fs),
+                        broadcast: false,
+                        index_mode: IndexMode::None,
+                        space: hexray_core::MemorySpace::Generic,
+                    }),
+                ]),
+        );
+        check.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(3),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(check);
+
+        let mut fail = BasicBlock::new(BasicBlockId::new(2), 0x3030);
+        fail.instructions.push(
+            Instruction::new(0x3030, 5, vec![], "call")
+                .with_operation(Operation::Call)
+                .with_operands(vec![Operand::pc_rel(0, 0x5000)])
+                .with_control_flow(ControlFlow::Call {
+                    target: 0x5000,
+                    return_addr: 0x3035,
+                }),
+        );
+        fail.terminator = BlockTerminator::Unreachable;
+        cfg.add_block(fail);
+
+        let mut cont = BasicBlock::new(BasicBlockId::new(3), 0x3040);
+        cont.instructions.push(
+            Instruction::new(0x3040, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x18, 8)),
+                ]),
+        );
+        cont.instructions
+            .push(Instruction::new(0x3044, 1, vec![], "leave"));
+        cont.instructions.push(
+            Instruction::new(0x3045, 1, vec![], "ret")
+                .with_operation(Operation::Return)
+                .with_control_flow(ControlFlow::Return),
+        );
+        cont.terminator = BlockTerminator::Return;
+        cfg.add_block(cont);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+
+        let mut structurer = Structurer::new_with_binary_data_annotations_and_known_targets(
+            &cfg,
+            None,
+            StructuringAnnotations::default(),
+            HashMap::from([(0x5000, "__stack_chk_fail@plt".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let structured = structurer.structure();
+
+        let Some(StructuredNode::Return(Some(expr))) = structured.last() else {
+            panic!("expected terminal return, got {structured:?}");
+        };
+
+        assert_eq!(
+            Structurer::stack_slot_signature_from_expr(expr),
+            Some(("rbp".to_string(), -0x18)),
+            "expected post-canary reload to win, got {structured:?}"
         );
     }
 
