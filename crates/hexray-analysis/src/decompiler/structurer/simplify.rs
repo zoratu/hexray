@@ -74,9 +74,12 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     {
                         reg_values.remove(&v.name);
                     } else {
-                        for alias in get_register_aliases(&v.name) {
-                            reg_values.insert(alias, substituted_rhs.clone());
-                        }
+                        record_register_substitution(
+                            &mut reg_values,
+                            &v.name,
+                            v.size,
+                            substituted_rhs,
+                        );
                     }
                 }
             }
@@ -236,9 +239,7 @@ pub(super) fn substitute_prior_register_assignments(expr: Expr, statements: &[Ex
                     continue;
                 }
 
-                for alias in get_register_aliases(&var.name) {
-                    reg_values.insert(alias, substituted_rhs.clone());
-                }
+                record_register_substitution(&mut reg_values, &var.name, var.size, substituted_rhs);
             }
             ExprKind::Call { target, .. } => {
                 if statement_contains_real_call(stmt) {
@@ -2706,9 +2707,12 @@ fn collect_temps_from_node(node: &StructuredNode, temps: &mut HashMap<String, Ex
                                 temps.remove(alias);
                             }
                             if !expr_requires_single_evaluation(&rhs_substituted) {
-                                for alias in aliases {
-                                    temps.insert(alias, rhs_substituted.clone());
-                                }
+                                record_register_substitution(
+                                    temps,
+                                    &v.name,
+                                    v.size,
+                                    rhs_substituted,
+                                );
                             }
                         }
                     }
@@ -2735,9 +2739,7 @@ fn collect_temps_from_node(node: &StructuredNode, temps: &mut HashMap<String, Ex
                                         temps.remove(&alias);
                                     }
                                 } else {
-                                    for alias in aliases {
-                                        temps.insert(alias, new_val.clone());
-                                    }
+                                    record_register_substitution(temps, &v.name, v.size, new_val);
                                 }
                             } else {
                                 for alias in aliases {
@@ -3727,9 +3729,12 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                     // Track this assignment for all aliased register names
                     // (e.g., w9 and x9 on ARM64, eax and rax on x86)
                     if !expr_requires_single_evaluation(&new_rhs) {
-                        for alias in get_register_aliases(&lhs_var.name) {
-                            reg_values.insert(alias, new_rhs.clone());
-                        }
+                        record_register_substitution(
+                            &mut reg_values,
+                            &lhs_var.name,
+                            lhs_var.size,
+                            new_rhs.clone(),
+                        );
                     }
                     if expr_uses_any_register_alias(&new_rhs, &written_aliases) {
                         compound_updated_aliases.extend(written_aliases.iter().cloned());
@@ -3979,6 +3984,68 @@ fn invalidate_clobbered_register_mappings(reg_values: &mut HashMap<String, Expr>
     reg_values.retain(|name, value| {
         !aliases.iter().any(|alias| alias == name) && !expr_uses_any_alias(value, &aliases)
     });
+}
+
+/// Record `substituted_rhs` for the registers that `var_name = ...` actually
+/// defines. Full-width writes (rax/eax/edi/etc.) propagate to every alias
+/// (rax/eax/ax/al on x86, xN/wN on ARM64) so later reads of any width recover
+/// the same value. Sub-register writes (al/ah/ax, bl/bh/bx, ...) only update
+/// the same-name slot — the wider aliases hold an untracked partial-merge
+/// value (`(rax_prior & ~mask) | (sub & mask)`) and the caller has already
+/// invalidated them. Propagating the sub-register expression into the wider
+/// alias caused exponential expression growth: when the same sub-register
+/// was assigned twice (e.g. `add al, al; add al, al`) and then read through
+/// the wider alias (e.g. `or [rax], al`), each subsequent simplification pass
+/// re-substituted through the alias map, doubling the expression on every
+/// pass. Cf. the 11-byte fuzz repro `64 00 c0 00 0f 00 c0 a3 08 00 5a`.
+fn record_register_substitution(
+    reg_values: &mut HashMap<String, Expr>,
+    var_name: &str,
+    var_size_bytes: u8,
+    substituted_rhs: Expr,
+) {
+    if !lifted_var_size_defines_full_alias(var_name, var_size_bytes) {
+        // Sub-register write (al/ah/ax/al-class). Wider aliases carry an
+        // untracked partial-merge value and must stay invalidated by the
+        // caller; propagating the sub-register expression into them caused
+        // exponential growth across simplification passes
+        // (cf. fuzz/artifacts/decompiler/oom-* repro).
+        return;
+    }
+    if compound_update_defines_full_alias_value(var_name) {
+        for alias in get_register_aliases(var_name) {
+            reg_values.insert(alias, substituted_rhs.clone());
+        }
+    } else {
+        reg_values.insert(var_name.to_string(), substituted_rhs);
+    }
+}
+
+/// Decides whether a register write at this width fully defines the
+/// canonical-name slot in the substitution map. Hexray normalizes
+/// x86-64 partial registers (`al`, `ax`, `eax`) to their 64-bit canonical
+/// name (`rax`) but keeps the original byte size on the `Variable`. The
+/// size is what tells us whether a write replaces the wider register's
+/// value (`mov eax, ...` zero-extends to rax) or only mutates a slice
+/// (`add al, al` leaves the upper 56 bits of rax untouched).
+fn lifted_var_size_defines_full_alias(var_name: &str, size_bytes: u8) -> bool {
+    if !matches!(
+        var_name,
+        // x86-64 64-bit canonical names that have sub-register variants.
+        "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi"
+            | "rbp" | "rsp"
+            | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15"
+            // ARM64 — `xN` may carry a 4-byte `wN` write.
+            | "x0" | "x1" | "x2" | "x3" | "x4" | "x5" | "x6" | "x7"
+            | "x8" | "x9" | "x10" | "x11" | "x12" | "x13" | "x14" | "x15"
+            | "x16" | "x17" | "x18" | "x29" | "x30"
+    ) {
+        return true;
+    }
+    // x86-64: 4-byte writes zero-extend the 64-bit reg; 8-byte writes
+    // fully define it. 1/2-byte writes leave upper bits intact.
+    // ARM64: 4-byte `wN` writes zero-extend `xN`; 8-byte writes do too.
+    matches!(size_bytes, 4 | 8)
 }
 
 fn compound_update_defines_full_alias_value(name: &str) -> bool {
@@ -4737,21 +4804,43 @@ fn propagate_args_in_block_with_state(
 
                 if is_temp_register(&v.name) {
                     let stabilized_temp_rhs = stabilize_saved_arg_registers(tracked_rhs.clone());
+                    // Sub-register writes (al, ah, ax, ...) must not propagate the
+                    // substituted RHS into wider aliases — the wider register holds
+                    // an untracked partial-merge value, and broadcasting the sub
+                    // expression causes exponential growth in later simplification
+                    // passes (cf. fuzz/artifacts/decompiler/oom-* repro).
+                    let propagate_aliases = lifted_var_size_defines_full_alias(&v.name, v.size)
+                        && compound_update_defines_full_alias_value(&v.name);
                     if !expr_requires_single_evaluation(&stabilized_temp_rhs) {
-                        for alias in &written_aliases {
+                        if propagate_aliases {
+                            for alias in &written_aliases {
+                                state
+                                    .reg_values
+                                    .insert(alias.clone(), stabilized_temp_rhs.clone());
+                                state
+                                    .call_target_values
+                                    .insert(alias.clone(), stabilized_temp_rhs.clone());
+                            }
+                        } else {
                             state
                                 .reg_values
-                                .insert(alias.clone(), stabilized_temp_rhs.clone());
+                                .insert(v.name.clone(), stabilized_temp_rhs.clone());
                             state
                                 .call_target_values
-                                .insert(alias.clone(), stabilized_temp_rhs.clone());
+                                .insert(v.name.clone(), stabilized_temp_rhs.clone());
                         }
                     }
                     if expr_is_saved_temp_arg_source(&stabilized_temp_rhs) {
-                        for alias in &written_aliases {
+                        if propagate_aliases {
+                            for alias in &written_aliases {
+                                state
+                                    .saved_temp_values
+                                    .insert(alias.clone(), stabilized_temp_rhs.clone());
+                            }
+                        } else {
                             state
                                 .saved_temp_values
-                                .insert(alias.clone(), stabilized_temp_rhs.clone());
+                                .insert(v.name.clone(), stabilized_temp_rhs.clone());
                         }
                     }
                     if expr_uses_any_register_alias(&stabilized_temp_rhs, &written_aliases) {
@@ -10178,6 +10267,70 @@ mod tests {
 
         assert_eq!(args.len(), 1);
         assert_eq!(format!("{}", args[0]), "n - 1");
+    }
+
+    #[test]
+    fn test_propagate_copies_does_not_explode_on_sub_register_self_update() {
+        // Regression for the 11-byte fuzz repro
+        // `64 00 c0 00 0f 00 c0 a3 08 00 5a` which disassembles to
+        //   add al, al
+        //   add [rdi], cl
+        //   add al, al
+        //   or  [rax], al
+        //   pop rdx
+        // The lifter normalizes `al` to the canonical name `"rax"` while
+        // preserving the original 1-byte size. Before the fix, each sub-
+        // register self-update was being propagated into every alias of
+        // `rax` (incl. the full 8-byte slot), so the next pass would
+        // substitute the wider read with the prior expression and the
+        // expression doubled on every simplification pass. This produced
+        // 600+ Add terms and a 2GB+ allocation churn that ASAN flagged as
+        // an OOM. We now refuse to broadcast sub-register expressions into
+        // the wider alias.
+        let al = || Expr::var(Variable::reg("rax", 1));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let cl = || Expr::var(Variable::reg("rcx", 1));
+        let rdi = || Expr::var(Variable::reg("rdi", 8));
+        let rdx = || Expr::var(Variable::reg("rdx", 8));
+
+        let statements = vec![
+            // add al, al
+            Expr::assign(al(), Expr::binop(BinOpKind::Add, al(), al())),
+            // add [rdi], cl
+            Expr::assign(
+                Expr::deref(rdi(), 1),
+                Expr::binop(BinOpKind::Add, Expr::deref(rdi(), 1), cl()),
+            ),
+            // add al, al
+            Expr::assign(al(), Expr::binop(BinOpKind::Add, al(), al())),
+            // or [rax], al  -> [rax] = [rax] | al
+            Expr::assign(
+                Expr::deref(rax(), 1),
+                Expr::binop(BinOpKind::Or, Expr::deref(rax(), 1), al()),
+            ),
+            // pop rdx
+            Expr::assign(
+                rdx(),
+                Expr::call(CallTarget::Named("pop".to_string()), vec![rdx()]),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+
+        // Sanity bound: the rendered output of any statement must stay
+        // O(N) in the input size, not exponential. A 4 KiB ceiling on
+        // per-statement text catches future regressions long before they
+        // can reach the libfuzzer 2 GiB RSS budget.
+        for (i, stmt) in propagated.iter().enumerate() {
+            let rendered = format!("{}", stmt);
+            assert!(
+                rendered.len() < 4096,
+                "stmt {} ballooned to {} bytes:\n{}",
+                i,
+                rendered.len(),
+                &rendered[..rendered.len().min(512)]
+            );
+        }
     }
 
     #[test]
