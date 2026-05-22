@@ -3780,6 +3780,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
                 );
                 if is_temp_register(&lhs_var.name)
                     && compound_update_defines_full_alias_value(&lhs_var.name)
+                    && lifted_var_size_defines_full_alias(&lhs_var.name, lhs_var.size)
                 {
                     if let Some(current) = prior_value {
                         if !expr_uses_any_alias(&current, &aliases) {
@@ -4804,43 +4805,29 @@ fn propagate_args_in_block_with_state(
 
                 if is_temp_register(&v.name) {
                     let stabilized_temp_rhs = stabilize_saved_arg_registers(tracked_rhs.clone());
-                    // Sub-register writes (al, ah, ax, ...) must not propagate the
-                    // substituted RHS into wider aliases — the wider register holds
-                    // an untracked partial-merge value, and broadcasting the sub
-                    // expression causes exponential growth in later simplification
-                    // passes (cf. fuzz/artifacts/decompiler/oom-* repro).
+                    // Sub-register writes (al, ah, ax, ...) must not propagate
+                    // the substituted RHS at all under the canonical-name slot
+                    // — `v.name` for `al` is `rax`, so storing here would let
+                    // later size=4/8 reads of rax pick up an al-only expression
+                    // and cascade-substitute on every pass (exponential growth,
+                    // cf. fuzz/artifacts/decompiler/oom-* repros).
                     let propagate_aliases = lifted_var_size_defines_full_alias(&v.name, v.size)
                         && compound_update_defines_full_alias_value(&v.name);
-                    if !expr_requires_single_evaluation(&stabilized_temp_rhs) {
-                        if propagate_aliases {
-                            for alias in &written_aliases {
-                                state
-                                    .reg_values
-                                    .insert(alias.clone(), stabilized_temp_rhs.clone());
-                                state
-                                    .call_target_values
-                                    .insert(alias.clone(), stabilized_temp_rhs.clone());
-                            }
-                        } else {
+                    if propagate_aliases && !expr_requires_single_evaluation(&stabilized_temp_rhs) {
+                        for alias in &written_aliases {
                             state
                                 .reg_values
-                                .insert(v.name.clone(), stabilized_temp_rhs.clone());
+                                .insert(alias.clone(), stabilized_temp_rhs.clone());
                             state
                                 .call_target_values
-                                .insert(v.name.clone(), stabilized_temp_rhs.clone());
+                                .insert(alias.clone(), stabilized_temp_rhs.clone());
                         }
                     }
-                    if expr_is_saved_temp_arg_source(&stabilized_temp_rhs) {
-                        if propagate_aliases {
-                            for alias in &written_aliases {
-                                state
-                                    .saved_temp_values
-                                    .insert(alias.clone(), stabilized_temp_rhs.clone());
-                            }
-                        } else {
+                    if propagate_aliases && expr_is_saved_temp_arg_source(&stabilized_temp_rhs) {
+                        for alias in &written_aliases {
                             state
                                 .saved_temp_values
-                                .insert(v.name.clone(), stabilized_temp_rhs.clone());
+                                .insert(alias.clone(), stabilized_temp_rhs.clone());
                         }
                     }
                     if expr_uses_any_register_alias(&stabilized_temp_rhs, &written_aliases) {
@@ -5074,7 +5061,10 @@ fn propagate_args_in_block_with_state(
                     state.stack_slot_values.clear();
                 }
 
-                if is_temp_register(&v.name) && compound_update_defines_full_alias_value(&v.name) {
+                if is_temp_register(&v.name)
+                    && compound_update_defines_full_alias_value(&v.name)
+                    && lifted_var_size_defines_full_alias(&v.name, v.size)
+                {
                     if let Some(current) = prior_value {
                         if !expr_uses_any_register_alias(&current, &written_aliases) {
                             let new_val = Expr::binop(*op, current, tracked_rhs.clone()).simplify();
@@ -10321,6 +10311,51 @@ mod tests {
         // O(N) in the input size, not exponential. A 4 KiB ceiling on
         // per-statement text catches future regressions long before they
         // can reach the libfuzzer 2 GiB RSS budget.
+        for (i, stmt) in propagated.iter().enumerate() {
+            let rendered = format!("{}", stmt);
+            assert!(
+                rendered.len() < 4096,
+                "stmt {} ballooned to {} bytes:\n{}",
+                i,
+                rendered.len(),
+                &rendered[..rendered.len().min(512)]
+            );
+        }
+    }
+
+    #[test]
+    fn test_propagate_copies_does_not_explode_on_long_sub_register_chain() {
+        // Regression for the second OOM repro
+        // `2f 00 c0 00 c0 00 c0 00 c0 00 08` (4 consecutive `add al, al`s
+        // before the memory-add through rax). The original 11-byte fix
+        // only blocked alias broadcast in `record_register_substitution`,
+        // but `propagate_copies` and `propagate_args_in_block` also
+        // broadcast/insert in their CompoundAssign and sub-register fall-
+        // back branches under the *canonical* `var.name` ("rax"). Because
+        // the lifter normalizes `al`/`ax`/`eax` to the canonical name and
+        // keeps the original byte size on `Variable`, those branches were
+        // still polluting `reg_values["rax"]` with the sub-register
+        // expression — and subsequent reads of `rax` (size=8) picked it
+        // up. With four chained `add al, al`s, the expression doubled
+        // four times: 98 KB of rendered output. We now gate every alias
+        // insert on `lifted_var_size_defines_full_alias`.
+        let al = || Expr::var(Variable::reg("rax", 1));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let cl = || Expr::var(Variable::reg("rcx", 1));
+
+        let mut statements = Vec::new();
+        // 4 × `add al, al`
+        for _ in 0..4 {
+            statements.push(Expr::assign(al(), Expr::binop(BinOpKind::Add, al(), al())));
+        }
+        // `add [rax], cl` — reads rax as memory base
+        statements.push(Expr::assign(
+            Expr::deref(rax(), 1),
+            Expr::binop(BinOpKind::Add, Expr::deref(rax(), 1), cl()),
+        ));
+
+        let propagated = propagate_copies(statements);
+
         for (i, stmt) in propagated.iter().enumerate() {
             let rendered = format!("{}", stmt);
             assert!(
