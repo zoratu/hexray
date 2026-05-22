@@ -1272,17 +1272,22 @@ pub(super) fn lift_cmovcc_with_context(
     // Try to parse condition from mnemonic
     if let Some(cond) = parse_condition_from_mnemonic(&inst.mnemonic) {
         let cond_expr = condition_to_expr_before_address(cond, block, Some(inst.address));
-        // Emit as conditional: dest = (cond) ? src : dest
-        Expr::assign(
-            dest.clone(),
-            Expr {
-                kind: super::super::expression::ExprKind::Conditional {
-                    cond: Box::new(cond_expr),
-                    then_expr: Box::new(src),
-                    else_expr: Box::new(dest),
-                },
+        // Emit as conditional: dest = (cond) ? src : dest.
+        // simplify() folds the `cond ? x : x` no-op (`cmovcc reg, reg`)
+        // back to `x` so a chain of self-cmovs does not cascade-substitute
+        // into an exponentially-nested Conditional under later passes
+        // (the fuzzer surfaced a 9-byte input — `0f 0f 4d c0 0f 4d c0 00 20`
+        // — that ballooned into 37 KB of pseudo-C through three chained
+        // `cmovge eax, eax` instructions).
+        let conditional = Expr {
+            kind: super::super::expression::ExprKind::Conditional {
+                cond: Box::new(cond_expr),
+                then_expr: Box::new(src),
+                else_expr: Box::new(dest.clone()),
             },
-        )
+        }
+        .simplify();
+        Expr::assign(dest, conditional)
     } else {
         // Fallback: emit as function call
         Expr::assign(

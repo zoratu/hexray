@@ -1028,6 +1028,17 @@ impl Expr {
                     }
                 }
 
+                // cond ? x : x → x. This shows up directly for `cmovcc reg, reg`
+                // where the same register is both source and destination (a no-op
+                // the compiler still emits as a hint or a side-effect-free guard).
+                // Without this fold, repeated self-cmovs cascade-substitute through
+                // simplification passes and double the expression on every step —
+                // the fuzzer surfaced an 11-byte input that ballooned into 37 KB of
+                // pseudo-C through three chained `cmovge eax, eax` instructions.
+                if exprs_structurally_equal(&then_expr, &else_expr) {
+                    return then_expr;
+                }
+
                 Self {
                     kind: ExprKind::Conditional {
                         cond: Box::new(cond),
@@ -4240,6 +4251,38 @@ mod tests {
         let expr = Expr::binop(BinOpKind::Div, x.clone(), Expr::int(1));
         let simplified = expr.simplify();
         assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+    }
+
+    #[test]
+    fn test_conditional_with_equal_branches_folds_to_branch() {
+        // `cond ? x : x` simplifies to `x`. Without this, a chain of
+        // `cmovcc reg, reg` self-conditionals doubles the expression on
+        // every simplification pass — the fuzzer surfaced a 9-byte input
+        // `0f 0f 4d c0 0f 4d c0 00 20` that produced 37 KB of pseudo-C
+        // through three chained `cmovge eax, eax` instructions.
+        let cond = Expr::unknown("cond");
+        let x = Expr::unknown("x");
+        let conditional = Expr {
+            kind: ExprKind::Conditional {
+                cond: Box::new(cond.clone()),
+                then_expr: Box::new(x.clone()),
+                else_expr: Box::new(x.clone()),
+            },
+        };
+        let simplified = conditional.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // Negative case: distinct branches stay as Conditional.
+        let y = Expr::unknown("y");
+        let conditional = Expr {
+            kind: ExprKind::Conditional {
+                cond: Box::new(cond.clone()),
+                then_expr: Box::new(x.clone()),
+                else_expr: Box::new(y.clone()),
+            },
+        };
+        let simplified = conditional.simplify();
+        assert!(matches!(simplified.kind, ExprKind::Conditional { .. }));
     }
 
     #[test]
