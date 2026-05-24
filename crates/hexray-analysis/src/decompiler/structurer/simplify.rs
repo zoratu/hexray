@@ -4013,6 +4013,19 @@ fn record_register_substitution(
         // (cf. fuzz/artifacts/decompiler/oom-* repro).
         return;
     }
+    if expr_node_count(&substituted_rhs) > SUBSTITUTION_VALUE_NODE_CAP {
+        // Defense in depth: refuse to memo any expression that has already
+        // grown larger than what a real-world decompile would produce.
+        // Specific cascade patterns (sub-register self-update, cmov on the
+        // same operand) have targeted fixes above, but the fuzz corpus
+        // showed many other adversarial-input shapes that doubled the
+        // expression across simplification passes (top sweep result was
+        // 127 MB of pseudo-C from an 11-byte input). Refusing to memo and
+        // refusing to substitute past this cap (see substitute_vars below)
+        // caps the worst case at O(cap) per statement regardless of the
+        // pattern.
+        return;
+    }
     if compound_update_defines_full_alias_value(var_name) {
         for alias in get_register_aliases(var_name) {
             reg_values.insert(alias, substituted_rhs.clone());
@@ -4156,6 +4169,80 @@ fn substitute_global_refs(expr: &Expr, global_refs: &HashMap<String, Expr>) -> E
     }
 }
 
+/// Upper bound on the size of a substitution value we are willing to memo or
+/// inline. Real decompiles produce expressions in the low tens of nodes; the
+/// fuzz corpus surfaced adversarial-input shapes (chained self-cmov, chained
+/// sub-register self-update through partial registers, etc.) that doubled
+/// expressions across every simplification pass and reached 127 MB of pseudo-C
+/// from an 11-byte input. Refusing to memo or substitute past this cap caps
+/// the worst-case per-statement output at O(cap) regardless of the cascade
+/// pattern. 256 leaves comfortable headroom over real-world expressions.
+const SUBSTITUTION_VALUE_NODE_CAP: usize = 256;
+
+/// Count the AST nodes in `expr`, short-circuiting once we exceed `limit + 1`
+/// so very large expressions don't waste time being fully traversed.
+fn expr_node_count_bounded(expr: &Expr, limit: usize) -> usize {
+    use super::super::expression::ExprKind;
+
+    fn walk(expr: &Expr, budget: &mut usize) {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        match &expr.kind {
+            ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => {}
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                walk(left, budget);
+                walk(right, budget);
+            }
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => walk(operand, budget),
+            ExprKind::ArrayAccess { base, index, .. } => {
+                walk(base, budget);
+                walk(index, budget);
+            }
+            ExprKind::FieldAccess { base, .. } => walk(base, budget),
+            ExprKind::Call { args, .. } | ExprKind::Phi(args) => {
+                for arg in args {
+                    walk(arg, budget);
+                }
+            }
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                walk(cond, budget);
+                walk(then_expr, budget);
+                walk(else_expr, budget);
+            }
+            ExprKind::GotRef { display_expr, .. } => walk(display_expr, budget),
+        }
+    }
+
+    let total = limit + 1;
+    let mut budget = total;
+    walk(expr, &mut budget);
+    total - budget
+}
+
+#[inline]
+fn expr_node_count(expr: &Expr) -> usize {
+    expr_node_count_bounded(expr, SUBSTITUTION_VALUE_NODE_CAP)
+}
+
 /// Substitute variable references with their known values and simplify.
 fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
     use super::super::expression::ExprKind;
@@ -4172,12 +4259,17 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
     let result = match &expr.kind {
         ExprKind::Var(v) => {
             if let Some(value) = lookup_named_substitution(reg_values, &v.name) {
-                value.clone()
+                if expr_node_count(value) > SUBSTITUTION_VALUE_NODE_CAP {
+                    expr.clone()
+                } else {
+                    value.clone()
+                }
             } else {
                 expr.clone()
             }
         }
         ExprKind::Unknown(name) => lookup_named_substitution(reg_values, name)
+            .filter(|value| expr_node_count(value) <= SUBSTITUTION_VALUE_NODE_CAP)
             .cloned()
             .unwrap_or_else(|| expr.clone()),
         ExprKind::BinOp { op, left, right } => Expr::binop(
@@ -4263,9 +4355,27 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
         },
         _ => expr.clone(),
     };
+    // Defense in depth: if the substitution result is much larger than the
+    // input, back out to the input. Several adversarial fuzz inputs put many
+    // refs to the same register inside one expression (e.g. a `Conditional`
+    // whose condition, then-branch, and else-branch each mention `rax`),
+    // where each leaf gets replaced with a near-cap-sized subtree and the
+    // result is N × cap nodes. Capping the result keeps the total bounded.
+    if expr_node_count_bounded(&result, SUBSTITUTION_RESULT_NODE_CAP)
+        > SUBSTITUTION_RESULT_NODE_CAP
+    {
+        return expr.clone();
+    }
     // Simplify after substitution to handle boolean patterns like (x == 1) != 1 → x != 1
     result.simplify()
 }
+
+/// Upper bound on the size of the *result* of [`substitute_vars`]. Even with
+/// the per-value cap, an input expression with N references to the same
+/// register can still produce roughly `N × SUBSTITUTION_VALUE_NODE_CAP` nodes.
+/// This caps the result regardless. Set generously: real-world post-
+/// substitution expressions stay in the low hundreds of nodes.
+const SUBSTITUTION_RESULT_NODE_CAP: usize = 1024;
 
 fn substitute_call_args(
     target: &CallTarget,
@@ -10366,6 +10476,60 @@ mod tests {
                 &rendered[..rendered.len().min(512)]
             );
         }
+    }
+
+    #[test]
+    fn test_substitution_node_cap_blocks_runaway_expression_growth() {
+        // Belt-and-suspenders for the broader class of expression-self-
+        // substitution cascades the fuzzer surfaced (top sweep result was
+        // 127 MB of pseudo-C from an 11-byte input). Synthesizes a value
+        // that exceeds SUBSTITUTION_VALUE_NODE_CAP, stores it in
+        // reg_values, and asserts substitute_vars refuses to inline it so
+        // downstream passes can't expand it further.
+        let mut reg_values: HashMap<String, Expr> = HashMap::new();
+
+        // Build a balanced Add tree until we cross the cap. Each leaf is a
+        // distinct unknown ("x") so the tree has SUBSTITUTION_VALUE_NODE_CAP
+        // + 1 nodes total.
+        fn balanced_add(leaves: usize) -> Expr {
+            if leaves <= 1 {
+                Expr::unknown("x")
+            } else {
+                Expr::binop(
+                    BinOpKind::Add,
+                    balanced_add(leaves / 2),
+                    balanced_add(leaves - leaves / 2),
+                )
+            }
+        }
+        let huge = balanced_add(SUBSTITUTION_VALUE_NODE_CAP * 2);
+        assert!(expr_node_count(&huge) > SUBSTITUTION_VALUE_NODE_CAP);
+        reg_values.insert("rax".to_string(), huge);
+
+        // A read of rax must not inline the cached huge expression — the
+        // result should still be a bare Var, not the huge BinOp tree.
+        let read = Expr::var(Variable::reg("rax", 8));
+        let substituted = substitute_vars(&read, &reg_values);
+        assert!(
+            matches!(substituted.kind, ExprKind::Var(_)),
+            "expected bare Var after cap-blocked substitute, got {:?}",
+            substituted.kind
+        );
+        assert!(expr_node_count(&substituted) <= 2);
+
+        // Walking a larger input that contains many rax references must also
+        // refuse to expand to N × cap nodes.
+        let big_input = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(BinOpKind::Add, read.clone(), read.clone()),
+            Expr::binop(BinOpKind::Add, read.clone(), read.clone()),
+        );
+        let big_substituted = substitute_vars(&big_input, &reg_values);
+        assert!(
+            expr_node_count(&big_substituted) <= SUBSTITUTION_RESULT_NODE_CAP,
+            "result must respect SUBSTITUTION_RESULT_NODE_CAP, got {}",
+            expr_node_count(&big_substituted)
+        );
     }
 
     #[test]
