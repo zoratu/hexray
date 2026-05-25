@@ -5,6 +5,116 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.8] - 2026-05-25
+
+### Instruction decoding
+
+x86-64:
+
+- **`0F 01` register-form group**: `xgetbv`, `xsetbv`, `swapgs`, `rdtscp`,
+  `monitor`/`mwait`, `clac`/`stac`, `serialize`, `rdpkru`/`wrpkru`, and the
+  VMX/SVM ops. These were previously routed through the memory-form
+  `lgdt`/`sidt` handler and misdecoded.
+- **`0F AE` group**: `xsave`/`xrstor`/`xsaveopt`, `fxsave`/`fxrstor`,
+  `ldmxcsr`/`stmxcsr`, `clflush`/`clflushopt`/`clwb`.
+- **`0F C7` group**: `rdrand`, `rdseed`, `xsavec`, `xsaves`, `xrstors`; and
+  `0F 08`/`0F 09` `invd`/`wbinvd`/`wbnoinvd`.
+- **AVX-512**: EVEX mask decorators now render on the masked operand; the
+  opmask k-register family (`kmov`/`kand`/`kor`/`kxor`/`kshift`/`kunpck`/`kadd`
+  in b/w/d/q widths); `vmovntdq`; VEX2 AVX `0F`; and the legacy SSE
+  shift-group opcodes.
+- **RDPID**, high-byte register decode, and lock-prefix preservation.
+
+ARM64:
+
+- **AdvSIMD SHA/AES crypto**: `sha256h`/`h2`/`su0`/`su1`, the `sha1*` family,
+  and `aese`/`aesd`/`aesmc`/`aesimc`.
+- **SVE / SVE2**: `ptrue`, the `whilelt` family, `dup`, `inc*`/`cnt*`, and
+  predicated FP arithmetic. Operand rendering preserves `{ z0.s }` vector
+  lists, `/z` and `/m` predicate modes, and indexed and VL-scaled addressing.
+- **LD1/ST1 multi-register structures**, **CAS/CASA/CASAL** atomics,
+  conditional-compare, and PAC/BTI aliases.
+
+### Linux builtin type and syscall tables
+
+- Modern syscalls are lifted to names with prototypes: clone3, close_range,
+  openat2, the pidfd family, faccessat2, landlock_*, memfd_secret,
+  futex_waitv, and the epoll/eventfd/timerfd family. Added the backing
+  structs (`clone_args`, `open_how`, `mount_attr`, `signalfd_siginfo`,
+  `itimerspec`, `epoll_event`/`epoll_data`, the landlock attrs) and flag
+  tables (`CLONE_*`, `RESOLVE_*`, `CLOSE_RANGE_*`, `LANDLOCK_ACCESS_FS_*`,
+  `SFD`/`EFD`/`TFD_*`, `EPOLL*`, `CLOCK_*`). Corrected the `O_CLOEXEC` value.
+- Fortify wrappers normalize to their base libc calls: `__printf_chk`,
+  `__fprintf_chk`, `__snprintf_chk`, and the `mem*`/`str*`/`stp*` `_chk`
+  family. `stdin`/`stdout`/`stderr` resolve to the stream names on
+  relocatable objects.
+- Signature recovery now consults builtin prototypes, not just the static
+  libc table.
+
+### Decompiler correctness
+
+- Bare-name symbol lookup prefers the default GNU version (`@@`), so
+  `decompile memcpy` lands on the IFUNC resolver rather than the compat leaf.
+- `R_X86_64_32` absolute relocations are handled alongside `R32S` and `R64`,
+  so relocatable-object call arguments surface `&global` or `func` instead
+  of a literal `0`.
+- Relocatable-ELF `.eh_frame` personality reporting resolves through the
+  relocation target instead of an address-zero symbol.
+- Lock-prefixed atomic read-modify-write side effects are preserved (no
+  longer dropped by dead-store elimination or condition lifting), and
+  `lock cmpxchg` lifts to `atomic_compare_exchange_strong`.
+- SysV variadic prefix recovery handles functions with several named
+  parameters, and hidden-sret returns are modeled correctly under stack
+  protectors rather than returning the canary slot.
+- noreturn list extended (exec family, longjmp, C++ throw helpers);
+  template-aware demangled-signature stripping; dead-store elimination of
+  ABI-argument self-updates.
+
+### Decompiler robustness — expression-growth bounds
+
+A fuzz soak of the decompiler found a class of inputs where repeated
+copy-propagation passes re-substitute an expression through its own output
+and double its size on each pass. Four changes bound it:
+
+- Sub-register self-updates no longer broadcast into the wider register
+  aliases. The check is width-based: the lifter normalizes `al`/`ax`/`eax`
+  to the canonical `rax` name but keeps the byte size, so the size is what
+  distinguishes a partial write from a full one.
+- The same width gate is applied to the compound-assign and
+  argument-propagation paths.
+- `cond ? x : x` (e.g. `cmovcc reg, reg`) folds to `x`.
+- A backstop cap in `substitute_vars`: it will not memo or inline a value
+  larger than 256 nodes, and it rolls back any substitution whose result
+  exceeds 1024 nodes. A sweep of all 291 fuzz-soak artifacts bounds the
+  worst-case output at 9 KB. Four corpus entries and unit tests cover it.
+
+### Deferred
+
+The bug-hunt surfaced several higher-level recovery gaps that are not
+addressed in this release. None affect instruction decoding or cause
+crashes; each shows up as lower-level pseudo-C on the affected pattern:
+
+- C++ exception handling: LSDA-driven multi-catch ladder reconstruction,
+  and `exception_ptr` / `nested_exception` typing.
+- C++ `std::optional` / `std::variant`: engaged-bit and active-index
+  recovery, and typed payload access.
+- C++ coroutines: state-machine recovery in `.actor` / `.destroy` clones.
+- Variadic functions: `va_arg` lifting and `va_list` / register-save-area
+  struct recovery; some `-O2` variadic consumers still collapse.
+- Stack-allocated struct reconstruction (`clone_args`, refcounted control
+  blocks, `epoll_event`) and smart-pointer (`shared_ptr` / `unique_ptr` /
+  `weak_ptr`) type binding.
+- `-O0` helper-call return-value threading, and cold-clone throw-path
+  inlining, in some C++ chains.
+- `cpuid` eax/ebx/ecx/edx fan-out, and `rdtsc`/`rdtscp` edx:eax to u64
+  pair lifting.
+
+### Notes
+
+- No public API or CLI changes; this is a coverage and correctness release.
+  Pseudo-C for some heavily-optimized or adversarial inputs is more verbose
+  than minimal, but it is bounded and correct.
+
 ## [1.3.7] - 2026-05-10
 
 ### Highlights — corrode.dev hardening, call-site migration
