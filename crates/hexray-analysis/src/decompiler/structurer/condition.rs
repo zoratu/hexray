@@ -1092,6 +1092,72 @@ pub(super) fn parse_arm64_condition(suffix: &str) -> Option<Condition> {
 /// - The writeback is: x8 = x8 + 1
 ///
 /// Returns None if no writeback is needed.
+/// Expand an x86 instruction that writes several registers implicitly into a
+/// sequence of register assignments. The single-`Expr`-per-instruction lifter
+/// in `Expr::from_instruction` can only model one output, so reading any of the
+/// other outputs (e.g. `edx` after `rdtsc`) would pick up an unmodeled, garbage
+/// register. Returns `None` for instructions this does not handle.
+///
+/// `rdtsc` / `rdtscp` write the 64-bit time-stamp counter as `edx:eax`. We
+/// materialize the read into a temp and split it so a consumer reassembling
+/// `(edx << 32) | eax` references the real value. `rdtscp` additionally writes
+/// the IA32_TSC_AUX value into `ecx`.
+pub(super) fn lift_x86_multi_output_intrinsic(
+    inst: &hexray_core::Instruction,
+) -> Option<Vec<Expr>> {
+    use super::super::expression::{BinOpKind, CallTarget, ExprKind, VarKind, Variable};
+
+    let (read_call, aux): (&str, Option<&str>) = match inst.operation {
+        Operation::ReadTsc => ("__rdtsc", None),
+        Operation::ReadTscP => ("__rdtscp", Some("__rdtscp_aux")),
+        _ => return None,
+    };
+
+    // A per-instruction temp holds the 64-bit counter so eax/edx reference one
+    // evaluation of the (side-effecting) read rather than calling it twice.
+    let tsc = Variable {
+        kind: VarKind::Temp(inst.address as u32),
+        name: format!("tsc_{:x}", inst.address),
+        size: 8,
+    };
+    let tsc_expr = Expr::var(tsc.clone());
+
+    let mut seq = vec![
+        // tsc = __rdtsc();
+        Expr::assign(
+            tsc_expr.clone(),
+            Expr {
+                kind: ExprKind::Call {
+                    target: CallTarget::Named(read_call.to_string()),
+                    args: Vec::new(),
+                },
+            },
+        ),
+        // eax = (low 32 of tsc)
+        Expr::assign(Expr::var(Variable::reg("eax", 4)), tsc_expr.clone()),
+        // edx = (high 32 of tsc)
+        Expr::assign(
+            Expr::var(Variable::reg("edx", 4)),
+            Expr::binop(BinOpKind::Shr, tsc_expr, Expr::int(32)),
+        ),
+    ];
+
+    if let Some(aux_call) = aux {
+        // ecx = IA32_TSC_AUX
+        seq.push(Expr::assign(
+            Expr::var(Variable::reg("ecx", 4)),
+            Expr {
+                kind: ExprKind::Call {
+                    target: CallTarget::Named(aux_call.to_string()),
+                    args: Vec::new(),
+                },
+            },
+        ));
+    }
+
+    Some(seq)
+}
+
 pub(super) fn generate_writeback_expr(inst: &hexray_core::Instruction) -> Option<Expr> {
     use super::super::expression::{ExprKind, VarKind, Variable};
 

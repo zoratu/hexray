@@ -670,6 +670,15 @@ impl Expr {
                         if exprs_structurally_equal(&left, &right) {
                             return left;
                         }
+                        // x | ((x >> n) << n) = x, and the commuted form. The
+                        // shift pair clears the low n bits, which the `| x`
+                        // restores, leaving x. This is the 64-bit reassembly
+                        // idiom emitted for edx:eax intrinsics like rdtsc:
+                        // `eax | (edx << 32)` where both halves come from one
+                        // value reduces to that value.
+                        if let Some(x) = match_low_bits_reassembly(&left, &right) {
+                            return x;
+                        }
                         // (cmp1) | (cmp2) → (cmp1) || (cmp2) for better readability
                         if is_comparison_expr(&left) && is_comparison_expr(&right) {
                             return Self::binop(BinOpKind::LogicalOr, left, right);
@@ -3095,6 +3104,57 @@ fn is_comparison_expr(expr: &Expr) -> bool {
     }
 }
 
+/// Matches the 64-bit reassembly idiom `x | ((x >> n) << n)` (in either
+/// operand order) and returns `x`. `(x >> n) << n` zeroes the low `n` bits,
+/// which `| x` restores, so the whole expression equals `x`. This shows up
+/// when an `edx:eax`-style split value (e.g. from `rdtsc`) is recombined with
+/// `eax | (edx << 32)` where both halves were derived from one value.
+fn match_low_bits_reassembly(left: &Expr, right: &Expr) -> Option<Expr> {
+    fn shift_pair_clears_low_bits(expr: &Expr) -> Option<(&Expr, i128)> {
+        // ((x >> n) << n) — outer Shl by n of an inner (Shr/Sar by the same n).
+        let ExprKind::BinOp {
+            op: BinOpKind::Shl,
+            left: shl_l,
+            right: shl_r,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        let ExprKind::IntLit(outer_n) = shl_r.kind else {
+            return None;
+        };
+        let ExprKind::BinOp {
+            op: BinOpKind::Shr | BinOpKind::Sar,
+            left: shr_l,
+            right: shr_r,
+        } = &shl_l.kind
+        else {
+            return None;
+        };
+        let ExprKind::IntLit(inner_n) = shr_r.kind else {
+            return None;
+        };
+        if outer_n == inner_n && outer_n > 0 {
+            Some((shr_l, outer_n))
+        } else {
+            None
+        }
+    }
+
+    // Try `x | ((x >> n) << n)` then the commuted `((x >> n) << n) | x`.
+    if let Some((inner, _)) = shift_pair_clears_low_bits(right) {
+        if exprs_structurally_equal(left, inner) {
+            return Some(left.clone());
+        }
+    }
+    if let Some((inner, _)) = shift_pair_clears_low_bits(left) {
+        if exprs_structurally_equal(right, inner) {
+            return Some(right.clone());
+        }
+    }
+    None
+}
+
 /// Checks if two expressions are structurally equal.
 /// Used for simplifications like `x - x = 0` and `x ^ x = 0`.
 fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
@@ -4283,6 +4343,39 @@ mod tests {
         };
         let simplified = conditional.simplify();
         assert!(matches!(simplified.kind, ExprKind::Conditional { .. }));
+    }
+
+    #[test]
+    fn test_low_bits_reassembly_folds_to_value() {
+        // `x | ((x >> 32) << 32)` == `x` — the edx:eax reassembly idiom
+        // emitted for rdtsc/rdtscp. Both operand orders fold.
+        let x = || Expr::unknown("x");
+        let shift_pair = || {
+            Expr::binop(
+                BinOpKind::Shl,
+                Expr::binop(BinOpKind::Shr, x(), Expr::int(32)),
+                Expr::int(32),
+            )
+        };
+
+        let reassembled = Expr::binop(BinOpKind::Or, x(), shift_pair()).simplify();
+        assert!(matches!(reassembled.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        let commuted = Expr::binop(BinOpKind::Or, shift_pair(), x()).simplify();
+        assert!(matches!(commuted.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // Negative: mismatched shift amounts must not fold.
+        let mismatched = Expr::binop(
+            BinOpKind::Or,
+            x(),
+            Expr::binop(
+                BinOpKind::Shl,
+                Expr::binop(BinOpKind::Shr, x(), Expr::int(32)),
+                Expr::int(16),
+            ),
+        )
+        .simplify();
+        assert!(matches!(mismatched.kind, ExprKind::BinOp { .. }));
     }
 
     #[test]

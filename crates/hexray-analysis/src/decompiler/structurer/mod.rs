@@ -38,7 +38,7 @@ use condition::{
     condition_to_expr_with_block, condition_to_expr_with_block_and_fallback,
     condition_to_expr_with_block_no_alu_updates_and_fallback, generate_writeback_expr,
     is_flag_setting_instruction, lift_cmovcc_with_context, lift_setcc_with_context,
-    negate_condition,
+    lift_x86_multi_output_intrinsic, negate_condition,
 };
 #[cfg(test)]
 use gotos::LoopContext;
@@ -3547,6 +3547,15 @@ impl<'a> Structurer<'a> {
             {
                 exprs.push(expr);
                 idx += consumed;
+                continue;
+            }
+
+            // Multi-output intrinsics (rdtsc/rdtscp write edx:eax) expand to a
+            // sequence of register assignments so consumers that reassemble the
+            // result read the real value instead of an unmodeled garbage reg.
+            if let Some(seq) = lift_x86_multi_output_intrinsic(inst) {
+                exprs.extend(seq);
+                idx += 1;
                 continue;
             }
 
