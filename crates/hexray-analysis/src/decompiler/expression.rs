@@ -1716,10 +1716,24 @@ impl Expr {
             }
             Operation::Store => {
                 if ops.len() >= 2 {
-                    Self::assign(
-                        Self::from_operand_with_inst(&ops[1], inst),
-                        Self::from_operand_with_inst(&ops[0], inst),
-                    )
+                    // A store writes to memory, so the memory operand is the
+                    // destination regardless of architecture operand order:
+                    // x86 SSE stores are destination-first (`[mem], xmm`), while
+                    // ARM64 STR is value-first (`reg, [mem]`). Pick the memory
+                    // operand as the lhs so both lift to `mem = value`.
+                    let (dst_idx, src_idx) = match (&ops[0], &ops[1]) {
+                        (Operand::Memory(_), _) => (0, 1),
+                        (_, Operand::Memory(_)) => (1, 0),
+                        // Neither operand is memory (e.g. reg-to-reg moves lifted
+                        // through Store): keep the historical value-first order.
+                        _ => (1, 0),
+                    };
+                    let lhs = if let Operand::Memory(mem) = &ops[dst_idx] {
+                        Self::from_memory_with_context(mem, inst, true)
+                    } else {
+                        Self::from_operand_with_inst(&ops[dst_idx], inst)
+                    };
+                    Self::assign(lhs, Self::from_operand_with_inst(&ops[src_idx], inst))
                 } else {
                     Self::unknown(&inst.mnemonic)
                 }
@@ -4230,6 +4244,44 @@ fn extract_scaled_index_from_expr(expr: &Expr) -> Option<(Expr, i128)> {
 mod tests {
     use super::*;
     use hexray_core::{Architecture, Instruction, Operand, Operation, Register, RegisterClass};
+
+    #[test]
+    fn test_x86_sse_store_writes_memory_destination() {
+        use hexray_core::MemoryRef;
+        // movsd %xmm0, -8(%rbp): x86 SSE store, destination(memory)-first order.
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, 64, 128);
+        let inst = Instruction::new(0x1000, 5, vec![], "movsd")
+            .with_operation(Operation::Store)
+            .with_operands(vec![
+                Operand::Memory(MemoryRef::base_disp(rbp, -8, 8)),
+                Operand::Register(xmm0),
+            ]);
+        let ExprKind::Assign { lhs, rhs } = Expr::from_instruction(&inst).kind else {
+            panic!("expected assignment");
+        };
+        // Must lift to `*(rbp-8) = xmm0`, not the reverse.
+        assert!(matches!(lhs.kind, ExprKind::Deref { .. }), "store dst must be memory");
+        assert!(matches!(&rhs.kind, ExprKind::Var(v) if v.name == "xmm0"));
+    }
+
+    #[test]
+    fn test_arm64_str_value_first_order_preserved() {
+        use hexray_core::MemoryRef;
+        // str x0, [sp, #8]: ARM64 store, value-first order — must still write memory.
+        let x0 = Register::new(Architecture::Arm64, RegisterClass::General, 0, 64);
+        let sp = Register::new(Architecture::Arm64, RegisterClass::General, 31, 64);
+        let inst = Instruction::new(0x1000, 4, vec![], "str")
+            .with_operation(Operation::Store)
+            .with_operands(vec![
+                Operand::Register(x0),
+                Operand::Memory(MemoryRef::base_disp(sp, 8, 8)),
+            ]);
+        let ExprKind::Assign { lhs, .. } = Expr::from_instruction(&inst).kind else {
+            panic!("expected assignment");
+        };
+        assert!(matches!(lhs.kind, ExprKind::Deref { .. }), "store dst must be memory");
+    }
 
     #[test]
     fn test_constant_folding_arithmetic() {
