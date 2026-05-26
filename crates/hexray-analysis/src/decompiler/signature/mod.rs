@@ -40,7 +40,7 @@
 use super::expression::{BinOpKind, Expr, ExprKind, VarKind, Variable};
 use super::structurer::{StructuredCfg, StructuredNode};
 use super::{BinaryDataContext, RelocationTable, SymbolTable};
-use hexray_core::SymbolKind;
+use hexray_core::{ControlFlowGraph, Operand, Operation, SymbolKind};
 use hexray_types::{
     builtin::{load_libc_functions, load_linux_types, load_posix_types},
     CType, TypeDatabase,
@@ -99,6 +99,11 @@ pub struct SignatureRecovery {
     float_abi_return_expr_observed: bool,
     /// Float ABI registers observed in expressions even if the value was rewritten before use.
     observed_float_arg_regs: HashSet<String>,
+    /// Float argument registers detected by scanning the raw instruction stream
+    /// (`(index, reg_name, size_bytes)`). Seeds the float-parameter recovery for
+    /// the `-O0` spill-only case where the xmm spill is pruned before structured
+    /// analysis runs. Set via [`with_float_arg_seeds`]; survives `analyze`'s reset.
+    float_arg_seeds: Vec<(usize, String, u8)>,
     /// Integer SSE/AVX-style opaque operations observed in the function body.
     integer_simd_ops_observed: bool,
     /// The final scalar result is extracted from a float ABI register into the integer return.
@@ -179,6 +184,81 @@ pub struct SignatureRecovery {
     variadic_fixed_param_count: Option<usize>,
 }
 
+/// Scan the raw instruction stream for floating-point argument registers.
+///
+/// Returns the contiguous `xmm0..xmmN` prefix that is read before being written,
+/// as `(index, reg_name, size_bytes)`. This recovers float parameters in the
+/// `-O0` spill-only case (`movsd %xmm0, -8(%rbp)`) where the spill store is
+/// pruned before the structured form that [`SignatureRecovery::analyze`] sees.
+///
+/// Detection is deliberately conservative — it only counts an xmm register used
+/// as the *source* operand (operand 1) before any write — so it cannot mistake a
+/// written-then-read temporary for an argument, and the contiguous-prefix rule
+/// mirrors the SysV rule that float arguments fill `xmm0, xmm1, …` in order.
+pub fn scan_float_arg_registers(
+    cfg: &ControlFlowGraph,
+    convention: CallingConvention,
+) -> Vec<(usize, String, u8)> {
+    // The xmm argument ABI is System V specific (Win64 shares the integer/float
+    // slot, AArch64/RISC-V use their own scan paths).
+    if !matches!(convention, CallingConvention::SystemV) {
+        return Vec::new();
+    }
+    let float_regs = convention.float_arg_registers();
+    let mut detected: Vec<Option<u8>> = vec![None; float_regs.len()];
+    let mut written: HashSet<String> = HashSet::new();
+
+    for block_id in cfg.block_ids() {
+        let Some(block) = cfg.block(block_id) else {
+            continue;
+        };
+        for inst in &block.instructions {
+            // An xmm register in the source position (operand 1) is read.
+            if let Some(Operand::Register(src)) = inst.operands.get(1) {
+                let name = src.name().to_lowercase();
+                if let Some(idx) = float_regs.iter().position(|r| r.eq_ignore_ascii_case(&name)) {
+                    if detected[idx].is_none() && !written.contains(&name) {
+                        detected[idx] = Some(scalar_float_operand_size(inst));
+                    }
+                }
+            }
+            // The destination (operand 0), if an xmm register, is written by
+            // anything but a pure comparison/test. Over-counting writes is safe:
+            // it only suppresses later (false) argument detections.
+            if let Some(Operand::Register(dst)) = inst.operands.first() {
+                let name = dst.name().to_lowercase();
+                if name.starts_with("xmm")
+                    && !matches!(inst.operation, Operation::Compare | Operation::Test)
+                {
+                    written.insert(name);
+                }
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    for (idx, reg) in float_regs.iter().enumerate() {
+        match detected[idx] {
+            Some(size) => result.push((idx, reg.to_lowercase(), size)),
+            // Float arguments are assigned contiguously; stop at the first gap.
+            None => break,
+        }
+    }
+    result
+}
+
+/// Scalar floating-point operand width from an instruction mnemonic: single
+/// (`*ss`) is 4 bytes, double (`*sd`) is 8. Defaults to 8 (double) — the common
+/// case — when the mnemonic is not a recognized scalar form.
+fn scalar_float_operand_size(inst: &hexray_core::Instruction) -> u8 {
+    let m = inst.mnemonic.to_ascii_lowercase();
+    if m.ends_with("ss") || m.contains("ss2") {
+        4
+    } else {
+        8
+    }
+}
+
 impl SignatureRecovery {
     /// Creates a new signature recovery engine with the given calling convention.
     pub fn new(convention: CallingConvention) -> Self {
@@ -202,6 +282,7 @@ impl SignatureRecovery {
             float_return: false,
             float_abi_return_expr_observed: false,
             observed_float_arg_regs: HashSet::new(),
+            float_arg_seeds: Vec::new(),
             integer_simd_ops_observed: false,
             return_from_integer_simd_lane: false,
             integer_simd_scalar_literal_return_size_hint: None,
@@ -250,6 +331,13 @@ impl SignatureRecovery {
     /// Sets the current function's symbol kind when known.
     pub fn with_current_function_kind(mut self, kind: Option<SymbolKind>) -> Self {
         self.current_func_kind = kind;
+        self
+    }
+
+    /// Seeds float-argument registers detected from the raw instruction stream.
+    /// Use [`scan_float_arg_registers`] to compute the argument from a CFG.
+    pub fn with_float_arg_seeds(mut self, seeds: Vec<(usize, String, u8)>) -> Self {
+        self.float_arg_seeds = seeds;
         self
     }
 
@@ -326,6 +414,18 @@ impl SignatureRecovery {
         self.sysv_va_list_pointer_slots.clear();
         self.sysv_va_start_seen = false;
         self.variadic_fixed_param_count = None;
+
+        // Seed float argument registers detected from the raw instruction stream
+        // (the `-O0` spill of an xmm arg is pruned before this structured form,
+        // so direct observation alone misses spill-only float parameters).
+        for (idx, reg, size) in self.float_arg_seeds.clone() {
+            self.observed_float_arg_regs.insert(reg.clone());
+            if size > 0 {
+                self.record_value_size_hint(&reg, size);
+                self.record_value_size_hint(&format!("xmm{idx}"), size);
+                self.record_value_size_hint(&format!("farg{idx}"), size);
+            }
+        }
 
         // Analyze the function body
         self.analyze_nodes(&cfg.body, false);
@@ -4382,6 +4482,109 @@ mod tests {
     use crate::decompiler::expression::{CallTarget, VarKind, Variable};
     use hexray_core::BasicBlockId;
     use std::sync::Arc;
+
+    fn xmm(idx: u16) -> hexray_core::Register {
+        use hexray_core::{Architecture, RegisterClass};
+        // x86 XMM0 == 64; the 128-bit form renders as "xmm{idx}".
+        hexray_core::Register::new(Architecture::X86_64, RegisterClass::Vector, 64 + idx, 128)
+    }
+
+    fn gpr(id: u16, bits: u16) -> hexray_core::Register {
+        use hexray_core::{Architecture, RegisterClass};
+        hexray_core::Register::new(Architecture::X86_64, RegisterClass::General, id, bits)
+    }
+
+    /// Build a one-block CFG from a list of (mnemonic, operation, operands).
+    fn single_block_cfg(
+        insts: Vec<(&str, Operation, Vec<Operand>)>,
+    ) -> ControlFlowGraph {
+        use hexray_core::{BasicBlock, BlockTerminator, Instruction};
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let mut addr = 0x1000u64;
+        for (mnemonic, op, operands) in insts {
+            block.instructions.push(
+                Instruction::new(addr, 4, vec![], mnemonic)
+                    .with_operation(op)
+                    .with_operands(operands),
+            );
+            addr += 4;
+        }
+        block.terminator = BlockTerminator::Return;
+        cfg.add_block(block);
+        cfg
+    }
+
+    fn mem(base: hexray_core::Register, disp: i64) -> Operand {
+        Operand::Memory(hexray_core::MemoryRef::base_disp(base, disp, 8))
+    }
+
+    #[test]
+    fn scan_detects_spilled_double_args() {
+        // movsd %xmm0,[rbp-8] ; movsd %xmm1,[rbp-16]  (the -O0 arg spill)
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![
+            ("movsd", Operation::Store, vec![mem(rbp, -8), Operand::Register(xmm(0))]),
+            ("movsd", Operation::Store, vec![mem(rbp, -16), Operand::Register(xmm(1))]),
+        ]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            found,
+            vec![(0, "xmm0".to_string(), 8), (1, "xmm1".to_string(), 8)]
+        );
+    }
+
+    #[test]
+    fn scan_detects_single_precision_size() {
+        // movss %xmm0,[rbp-4]  -> float (4 bytes)
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![(
+            "movss",
+            Operation::Store,
+            vec![mem(rbp, -4), Operand::Register(xmm(0))],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert_eq!(found, vec![(0, "xmm0".to_string(), 4)]);
+    }
+
+    #[test]
+    fn scan_requires_contiguous_prefix() {
+        // Only xmm1 used as a source (xmm0 untouched): no contiguous prefix.
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![(
+            "movsd",
+            Operation::Store,
+            vec![mem(rbp, -8), Operand::Register(xmm(1))],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert!(found.is_empty(), "non-prefix xmm1 must not be an argument");
+    }
+
+    #[test]
+    fn scan_ignores_written_before_read() {
+        // movsd [rbp-8],%xmm0 first writes xmm0, then a later read is not an arg.
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![
+            ("movsd", Operation::Move, vec![Operand::Register(xmm(0)), mem(rbp, -8)]),
+            ("movsd", Operation::Store, vec![mem(rbp, -16), Operand::Register(xmm(0))]),
+        ]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert!(found.is_empty(), "xmm0 written before read is not an argument");
+    }
+
+    #[test]
+    fn scan_integer_only_function_has_no_float_args() {
+        // mov [rbp-8],%rdi : integer arg spill, no xmm at all.
+        let rbp = gpr(5, 64);
+        let rdi = gpr(7, 64);
+        let cfg = single_block_cfg(vec![(
+            "mov",
+            Operation::Store,
+            vec![mem(rbp, -8), Operand::Register(rdi)],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert!(found.is_empty());
+    }
 
     #[test]
     fn test_calling_convention_registers() {
