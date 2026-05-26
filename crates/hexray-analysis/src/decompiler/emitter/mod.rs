@@ -6061,9 +6061,17 @@ impl PseudoCodeEmitter {
         let mut all_vars: Vec<String> = all_vars_set.into_iter().collect();
         all_vars.sort();
 
+        // A recovered SysV variadic function threads a `va_list ap` cursor
+        // through `va_start`/`va_arg`; declare it so the body reads as valid C.
+        let needs_va_list =
+            body_output.contains("va_start(ap") || body_output.contains("va_arg(ap");
+
         // Emit variable declarations at the top (C89 style)
-        if !all_vars.is_empty() {
+        if !all_vars.is_empty() || needs_va_list {
             let indent = &self.indent;
+            if needs_va_list {
+                writeln!(output, "{}va_list ap;", indent).unwrap();
+            }
             for var in &all_vars {
                 let var_type = inferred_assignment_types
                     .get(var)
@@ -6255,9 +6263,17 @@ impl PseudoCodeEmitter {
         let mut all_vars: Vec<String> = all_vars_set.into_iter().collect();
         all_vars.sort();
 
+        // A recovered SysV variadic function threads a `va_list ap` cursor
+        // through `va_start`/`va_arg`; declare it so the body reads as valid C.
+        let needs_va_list =
+            body_output.contains("va_start(ap") || body_output.contains("va_arg(ap");
+
         // Emit variable declarations at the top (C89 style)
-        if !all_vars.is_empty() {
+        if !all_vars.is_empty() || needs_va_list {
             let indent = &self.indent;
+            if needs_va_list {
+                writeln!(output, "{}va_list ap;", indent).unwrap();
+            }
             for var in &all_vars {
                 let var_type = inferred_assignment_types
                     .get(var)
@@ -6988,9 +7004,11 @@ impl PseudoCodeEmitter {
                 self.collect_vars_from_expr(base, vars);
             }
             ExprKind::Call { target, args } => {
-                // `va_arg(ap, T)` operands are rendered verbatim — the `ap`
-                // cursor and the type name are not declarable locals.
-                if matches!(target, CallTarget::Named(name) if name == "va_arg") {
+                // `va_arg(ap, T)` / `va_start(ap, last)` operands are rendered
+                // verbatim — the `ap` cursor, type name, and last-parameter name
+                // are not declarable locals.
+                if matches!(target, CallTarget::Named(name) if name == "va_arg" || name == "va_start")
+                {
                     return;
                 }
                 for arg in args {

@@ -38,17 +38,21 @@ use super::StructuredNode;
 /// for the common case.
 const VA_LIST_NAME: &str = "ap";
 
-/// Collapse SysV `va_arg` state machines into `va_arg(ap, T)` assignments.
+/// Collapse SysV `va_arg` state machines into `va_arg(ap, T)` assignments, then
+/// rewrite the now-dead `va_start` slot setup into a `va_start(ap, last)` call.
 pub(super) fn recover_va_arg(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
-    let mut nodes = recurse_children(nodes);
-    collapse_in_list(&mut nodes);
+    let mut nodes = collapse_tree(nodes);
+    if tree_contains_va_arg(&nodes) {
+        rewrite_va_start_init(&mut nodes);
+    }
     nodes
 }
 
-/// Recurse into every nested node body first (bottom-up) so the top-level scan
-/// sees already-recovered children.
-fn recurse_children(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
-    nodes.into_iter().map(recurse_node).collect()
+/// Recursively collapse every `va_arg` diamond in the tree (bottom-up).
+fn collapse_tree(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut nodes: Vec<_> = nodes.into_iter().map(recurse_node).collect();
+    collapse_in_list(&mut nodes);
+    nodes
 }
 
 fn recurse_node(node: StructuredNode) -> StructuredNode {
@@ -59,8 +63,8 @@ fn recurse_node(node: StructuredNode) -> StructuredNode {
             else_body,
         } => StructuredNode::If {
             condition,
-            then_body: recover_va_arg(then_body),
-            else_body: else_body.map(recover_va_arg),
+            then_body: collapse_tree(then_body),
+            else_body: else_body.map(collapse_tree),
         },
         StructuredNode::While {
             condition,
@@ -69,7 +73,7 @@ fn recurse_node(node: StructuredNode) -> StructuredNode {
             exit_block,
         } => StructuredNode::While {
             condition,
-            body: recover_va_arg(body),
+            body: collapse_tree(body),
             header,
             exit_block,
         },
@@ -79,7 +83,7 @@ fn recurse_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::DoWhile {
-            body: recover_va_arg(body),
+            body: collapse_tree(body),
             condition,
             header,
             exit_block,
@@ -95,7 +99,7 @@ fn recurse_node(node: StructuredNode) -> StructuredNode {
             init,
             condition,
             update,
-            body: recover_va_arg(body),
+            body: collapse_tree(body),
             header,
             exit_block,
         },
@@ -104,7 +108,7 @@ fn recurse_node(node: StructuredNode) -> StructuredNode {
             header,
             exit_block,
         } => StructuredNode::Loop {
-            body: recover_va_arg(body),
+            body: collapse_tree(body),
             header,
             exit_block,
         },
@@ -116,20 +120,20 @@ fn recurse_node(node: StructuredNode) -> StructuredNode {
             value,
             cases: cases
                 .into_iter()
-                .map(|(vals, body)| (vals, recover_va_arg(body)))
+                .map(|(vals, body)| (vals, collapse_tree(body)))
                 .collect(),
-            default: default.map(recover_va_arg),
+            default: default.map(collapse_tree),
         },
-        StructuredNode::Sequence(body) => StructuredNode::Sequence(recover_va_arg(body)),
+        StructuredNode::Sequence(body) => StructuredNode::Sequence(collapse_tree(body)),
         StructuredNode::TryCatch {
             try_body,
             catch_handlers,
         } => StructuredNode::TryCatch {
-            try_body: recover_va_arg(try_body),
+            try_body: collapse_tree(try_body),
             catch_handlers: catch_handlers
                 .into_iter()
                 .map(|mut h| {
-                    h.body = recover_va_arg(h.body);
+                    h.body = collapse_tree(h.body);
                     h
                 })
                 .collect(),
@@ -158,6 +162,287 @@ fn collapse_in_list(nodes: &mut Vec<StructuredNode>) {
         }
         i += 1;
     }
+}
+
+/// Rewrite the `va_start` slot initialization left over after collapsing the
+/// `va_arg` diamonds. The setup is four stores into the 24-byte `va_list`
+/// (`gp_offset`, `fp_offset`, `overflow_arg_area`, `reg_save_area`); once every
+/// `va_arg` that read them has been collapsed they are dead. The `gp_offset`
+/// store becomes a `va_start(ap, last)` call (its constant encodes the named
+/// integer parameter count) and the other three are dropped.
+///
+/// A store is only touched when its target slot is otherwise unreferenced in the
+/// whole function, so a partially recovered function (some diamond left intact)
+/// never loses setup that is still live.
+fn rewrite_va_start_init(nodes: &mut [StructuredNode]) {
+    // Phase 1: classify candidate stores in the top-level blocks, recording
+    // dead ones. Reference counts are taken over the (not-yet-mutated) tree.
+    let mut to_va_start: Vec<(usize, usize, usize)> = Vec::new(); // (block, stmt, named_count)
+    let mut to_remove: Vec<(usize, usize)> = Vec::new();
+    for (bi, node) in nodes.iter().enumerate() {
+        let StructuredNode::Block { statements, .. } = node else {
+            continue;
+        };
+        for (si, stmt) in statements.iter().enumerate() {
+            let Some((slot, kind)) = classify_va_start_store(stmt) else {
+                continue;
+            };
+            if count_slot_in_nodes(nodes, slot) != 1 {
+                continue; // still live — leave it alone
+            }
+            match kind {
+                VaStartStore::GpOffset(named_count) => to_va_start.push((bi, si, named_count)),
+                VaStartStore::Other => to_remove.push((bi, si)),
+            }
+        }
+    }
+
+    // Phase 2: apply. Replace the gp_offset store with the `va_start` call.
+    for (bi, si, named_count) in &to_va_start {
+        if let StructuredNode::Block { statements, .. } = &mut nodes[*bi] {
+            statements[*si] = make_va_start_call(*named_count);
+        }
+    }
+    // Drop the dead sibling stores, highest index first so earlier ones stay
+    // valid.
+    to_remove.sort_unstable();
+    for (bi, si) in to_remove.into_iter().rev() {
+        if let StructuredNode::Block { statements, .. } = &mut nodes[bi] {
+            statements.remove(si);
+        }
+    }
+}
+
+/// Classification of a `va_list` setup store.
+enum VaStartStore {
+    /// `gp_offset = 8 * named_int_params` — carries the fixed-parameter count.
+    GpOffset(usize),
+    /// `fp_offset = 48`, `overflow_arg_area = frame+k`, or `reg_save_area =
+    /// frame-k` — dropped once dead.
+    Other,
+}
+
+/// If `stmt` is a `va_list` slot initialization store, return its slot lvalue
+/// and classification.
+fn classify_va_start_store(stmt: &Expr) -> Option<(&Expr, VaStartStore)> {
+    let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+        return None;
+    };
+    if !is_frame_slot(lhs) {
+        return None;
+    }
+    match &strip_casts(rhs).kind {
+        // gp_offset starts at 8 * (named integer params), 1..=5 of them.
+        ExprKind::IntLit(v @ (8 | 16 | 24 | 32 | 40)) => {
+            let named_count = (*v / 8) as usize;
+            Some((lhs, VaStartStore::GpOffset(named_count)))
+        }
+        // fp_offset always starts at 48.
+        ExprKind::IntLit(48) => Some((lhs, VaStartStore::Other)),
+        // overflow_arg_area / reg_save_area are frame-pointer ± constant.
+        ExprKind::BinOp {
+            op: BinOpKind::Add | BinOpKind::Sub,
+            left,
+            right,
+        } if references_frame_pointer(strip_casts(left))
+            && matches!(strip_casts(right).kind, ExprKind::IntLit(_)) =>
+        {
+            Some((lhs, VaStartStore::Other))
+        }
+        _ => None,
+    }
+}
+
+/// `va_start(ap, arg{named_count - 1})` — names the last fixed parameter.
+fn make_va_start_call(named_count: usize) -> Expr {
+    let last_param = format!("arg{}", named_count.saturating_sub(1));
+    Expr::call(
+        CallTarget::Named("va_start".to_string()),
+        vec![token_expr(VA_LIST_NAME), token_expr(&last_param)],
+    )
+}
+
+/// Total number of structural occurrences of `slot` as a (sub)expression across
+/// the whole node tree.
+fn count_slot_in_nodes(nodes: &[StructuredNode], slot: &Expr) -> usize {
+    let mut count = 0;
+    walk_exprs_in_nodes(nodes, &mut |e| count += count_slot_in_expr(e, slot));
+    count
+}
+
+fn count_slot_in_expr(expr: &Expr, slot: &Expr) -> usize {
+    let mut count = usize::from(lvalue_eq(expr, slot));
+    let mut visit = |e: &Expr| count += count_slot_in_expr(e, slot);
+    match &expr.kind {
+        ExprKind::BinOp { left, right, .. } => {
+            visit(left);
+            visit(right);
+        }
+        ExprKind::UnaryOp { operand, .. } => visit(operand),
+        ExprKind::Deref { addr, .. } => visit(addr),
+        ExprKind::AddressOf(inner) => visit(inner),
+        ExprKind::Cast { expr, .. } => visit(expr),
+        ExprKind::BitField { expr, .. } => visit(expr),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            visit(base);
+            visit(index);
+        }
+        ExprKind::FieldAccess { base, .. } => visit(base),
+        ExprKind::Assign { lhs, rhs } => {
+            visit(lhs);
+            visit(rhs);
+        }
+        ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            visit(lhs);
+            visit(rhs);
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            visit(cond);
+            visit(then_expr);
+            visit(else_expr);
+        }
+        ExprKind::Call { args, .. } => args.iter().for_each(visit),
+        ExprKind::Phi(exprs) => exprs.iter().for_each(visit),
+        _ => {}
+    }
+    count
+}
+
+/// Visit every statement/condition expression in the node tree.
+fn walk_exprs_in_nodes(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr)) {
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for e in statements {
+                    f(e);
+                }
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                f(condition);
+                walk_exprs_in_nodes(then_body, f);
+                if let Some(eb) = else_body {
+                    walk_exprs_in_nodes(eb, f);
+                }
+            }
+            StructuredNode::While {
+                condition, body, ..
+            }
+            | StructuredNode::DoWhile {
+                condition, body, ..
+            } => {
+                f(condition);
+                walk_exprs_in_nodes(body, f);
+            }
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(i) = init {
+                    f(i);
+                }
+                f(condition);
+                if let Some(u) = update {
+                    f(u);
+                }
+                walk_exprs_in_nodes(body, f);
+            }
+            StructuredNode::Loop { body, .. } => walk_exprs_in_nodes(body, f),
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                f(value);
+                for (_, body) in cases {
+                    walk_exprs_in_nodes(body, f);
+                }
+                if let Some(d) = default {
+                    walk_exprs_in_nodes(d, f);
+                }
+            }
+            StructuredNode::Sequence(body) => walk_exprs_in_nodes(body, f),
+            StructuredNode::Return(Some(e)) | StructuredNode::Expr(e) => f(e),
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                walk_exprs_in_nodes(try_body, f);
+                for h in catch_handlers {
+                    walk_exprs_in_nodes(&h.body, f);
+                }
+            }
+            StructuredNode::Return(None)
+            | StructuredNode::Break
+            | StructuredNode::Continue
+            | StructuredNode::Goto(_)
+            | StructuredNode::Label(_) => {}
+        }
+    }
+}
+
+/// Whether any `va_arg(...)` call appears in the node tree.
+fn tree_contains_va_arg(nodes: &[StructuredNode]) -> bool {
+    let mut found = false;
+    walk_exprs_in_nodes(nodes, &mut |e| found |= expr_contains_va_arg(e));
+    found
+}
+
+fn expr_contains_va_arg(expr: &Expr) -> bool {
+    if let ExprKind::Call {
+        target: CallTarget::Named(name),
+        ..
+    } = &expr.kind
+    {
+        if name == "va_arg" {
+            return true;
+        }
+    }
+    let mut found = false;
+    let mut visit = |e: &Expr| found |= expr_contains_va_arg(e);
+    match &expr.kind {
+        ExprKind::BinOp { left, right, .. } => {
+            visit(left);
+            visit(right);
+        }
+        ExprKind::UnaryOp { operand, .. } => visit(operand),
+        ExprKind::Deref { addr, .. } => visit(addr),
+        ExprKind::AddressOf(inner) => visit(inner),
+        ExprKind::Cast { expr, .. } => visit(expr),
+        ExprKind::BitField { expr, .. } => visit(expr),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            visit(base);
+            visit(index);
+        }
+        ExprKind::FieldAccess { base, .. } => visit(base),
+        ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            visit(lhs);
+            visit(rhs);
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            visit(cond);
+            visit(then_expr);
+            visit(else_expr);
+        }
+        ExprKind::Call { args, .. } => args.iter().for_each(visit),
+        ExprKind::Phi(exprs) => exprs.iter().for_each(visit),
+        _ => {}
+    }
+    found
 }
 
 /// A matched `va_arg` diamond.
@@ -640,6 +925,85 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], StructuredNode::If { .. }));
         assert!(first_rhs_is_va_arg(&out[1]).is_none());
+    }
+
+    /// `fp_offset` slot at `rbp[-48]`.
+    fn fp_slot() -> Expr {
+        Expr::array_access(rbp(), Expr::int(-48), 4)
+    }
+
+    /// `reg_save_area` slot at `rbp[-24]`.
+    fn reg_save_slot() -> Expr {
+        Expr::array_access(rbp(), Expr::int(-24), 8)
+    }
+
+    /// A full variadic function: `va_start` slot setup, the `va_arg` diamond,
+    /// the load, and a return.
+    fn va_arg_function() -> Vec<StructuredNode> {
+        let init = block(
+            0,
+            vec![
+                Expr::assign(gp_slot(), Expr::int(8)),
+                Expr::assign(fp_slot(), Expr::int(48)),
+                Expr::assign(overflow_slot(), Expr::binop(BinOpKind::Add, rbp(), Expr::int(16))),
+                Expr::assign(reg_save_slot(), Expr::binop(BinOpKind::Add, rbp(), Expr::int(-176))),
+            ],
+        );
+        let mut nodes = vec![init];
+        nodes.extend(va_arg_diamond(4));
+        nodes.push(StructuredNode::Return(Some(rax(4))));
+        nodes
+    }
+
+    fn va_start_last_param(node: &StructuredNode) -> Option<String> {
+        let StructuredNode::Block { statements, .. } = node else {
+            return None;
+        };
+        statements.iter().find_map(|stmt| {
+            let ExprKind::Call { target, args } = &stmt.kind else {
+                return None;
+            };
+            let CallTarget::Named(name) = target else {
+                return None;
+            };
+            if name != "va_start" {
+                return None;
+            }
+            match &args[1].kind {
+                ExprKind::Unknown(p) => Some(p.clone()),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn rewrites_va_start_init_cluster() {
+        let out = recover_va_arg(va_arg_function());
+        // Setup block now holds only the va_start call (4 slot stores -> 1).
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected setup block");
+        };
+        assert_eq!(statements.len(), 1);
+        assert_eq!(va_start_last_param(&out[0]).as_deref(), Some("arg0"));
+        // The va_arg load survived the collapse.
+        assert!(first_rhs_is_va_arg(&out[1]).is_some());
+    }
+
+    #[test]
+    fn keeps_va_start_setup_when_slot_still_live() {
+        // An extra read of the gp_offset slot keeps it live, so the setup must
+        // not be rewritten away (guards against partial collapse).
+        let mut nodes = va_arg_function();
+        nodes.push(StructuredNode::Expr(Expr::assign(rax(4), gp_slot())));
+        let out = recover_va_arg(nodes);
+        // No va_start emitted; the raw gp_offset store is retained.
+        assert!(va_start_last_param(&out[0]).is_none());
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected setup block");
+        };
+        assert!(statements
+            .iter()
+            .any(|s| matches!(&s.kind, ExprKind::Assign { lhs, .. } if lvalue_eq(lhs, &gp_slot()))));
     }
 
     #[test]

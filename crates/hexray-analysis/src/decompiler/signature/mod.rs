@@ -170,6 +170,11 @@ pub struct SignatureRecovery {
     sysv_va_list_fp_offset_slots: HashSet<String>,
     /// SysV `va_list` pointer field slots initialized in the body.
     sysv_va_list_pointer_slots: HashSet<String>,
+    /// Set when a recovered `va_start(ap, last)` call is observed. The structurer
+    /// collapses the SysV `va_arg` state machine and rewrites the slot setup into
+    /// this call, which then stands in for the raw slot stores as the variadic
+    /// (`...`) materialization signal.
+    sysv_va_start_seen: bool,
     /// Fixed non-variadic prefix inferred for the current function.
     variadic_fixed_param_count: Option<usize>,
 }
@@ -231,6 +236,7 @@ impl SignatureRecovery {
             sysv_va_list_gp_offset_slots: HashSet::new(),
             sysv_va_list_fp_offset_slots: HashSet::new(),
             sysv_va_list_pointer_slots: HashSet::new(),
+            sysv_va_start_seen: false,
             variadic_fixed_param_count: None,
         }
     }
@@ -318,6 +324,7 @@ impl SignatureRecovery {
         self.sysv_va_list_gp_offset_slots.clear();
         self.sysv_va_list_fp_offset_slots.clear();
         self.sysv_va_list_pointer_slots.clear();
+        self.sysv_va_start_seen = false;
         self.variadic_fixed_param_count = None;
 
         // Analyze the function body
@@ -1366,6 +1373,7 @@ impl SignatureRecovery {
                 // Check if calling a string function
                 let func_name = self.extract_call_name(target);
                 if let Some(fn_name) = &func_name {
+                    self.observe_va_start_call(fn_name, args);
                     self.observe_variadic_forwarding_call(fn_name, args);
                     self.observe_printf_format_forwarding_call(fn_name, args);
                 }
@@ -3836,6 +3844,39 @@ impl SignatureRecovery {
         }
     }
 
+    /// Observe a recovered `va_start(ap, last)` call. This is the marker the
+    /// structurer leaves after collapsing the `va_arg` state machine and
+    /// scrubbing the raw va_list slot setup; it stands in for the slot stores as
+    /// the variadic materialization signal and carries the fixed-parameter count
+    /// (the position of the named `last` argument).
+    fn observe_va_start_call(&mut self, function_name: &str, args: &[Expr]) {
+        if !matches!(self.convention, CallingConvention::SystemV) {
+            return;
+        }
+        if ParameterUsageHints::normalize_callback_name(function_name) != "va_start" {
+            return;
+        }
+        self.sysv_va_start_seen = true;
+        if let Some(last) = args.get(1) {
+            if let Some(count) = Self::va_start_last_param_count(last) {
+                self.variadic_fixed_param_count =
+                    Some(self.variadic_fixed_param_count.unwrap_or(0).max(count));
+            }
+        }
+    }
+
+    /// Derive the fixed-parameter count from the named `last` argument of a
+    /// recovered `va_start(ap, argN)` call: `argN` means `N + 1` fixed params.
+    fn va_start_last_param_count(last: &Expr) -> Option<usize> {
+        let name = match &last.kind {
+            ExprKind::Unknown(name) => name.as_str(),
+            ExprKind::Var(var) => var.name.as_str(),
+            _ => return None,
+        };
+        let idx: usize = name.strip_prefix("arg")?.parse().ok()?;
+        Some(idx + 1)
+    }
+
     fn observe_variadic_forwarding_call(&mut self, function_name: &str, args: &[Expr]) {
         if !self.has_sysv_va_list_materialization() {
             return;
@@ -4142,8 +4183,16 @@ impl SignatureRecovery {
     }
 
     fn has_sysv_va_list_materialization(&self) -> bool {
-        matches!(self.convention, CallingConvention::SystemV)
-            && !self.sysv_va_list_gp_offset_slots.is_empty()
+        if !matches!(self.convention, CallingConvention::SystemV) {
+            return false;
+        }
+        // A recovered `va_start` call is on its own definitive: the structurer
+        // only emits it after matching the full va_arg state machine, having
+        // scrubbed the raw slot stores the checks below would otherwise see.
+        if self.sysv_va_start_seen {
+            return true;
+        }
+        !self.sysv_va_list_gp_offset_slots.is_empty()
             && self.sysv_va_list_pointer_slots.len() >= 2
             && (!self.sysv_va_list_fp_offset_slots.is_empty()
                 || self.has_observed_register_varargs_spills())
