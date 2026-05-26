@@ -6987,7 +6987,12 @@ impl PseudoCodeEmitter {
             ExprKind::FieldAccess { base, .. } => {
                 self.collect_vars_from_expr(base, vars);
             }
-            ExprKind::Call { args, .. } => {
+            ExprKind::Call { target, args } => {
+                // `va_arg(ap, T)` operands are rendered verbatim — the `ap`
+                // cursor and the type name are not declarable locals.
+                if matches!(target, CallTarget::Named(name) if name == "va_arg") {
+                    return;
+                }
                 for arg in args {
                     self.collect_vars_from_expr(arg, vars);
                 }

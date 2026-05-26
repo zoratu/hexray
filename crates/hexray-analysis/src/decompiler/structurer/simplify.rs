@@ -335,7 +335,12 @@ pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredN
     let nodes = prune_dead_register_artifacts(nodes);
 
     // Ninth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
-    nodes.into_iter().map(simplify_conditions_in_node).collect()
+    let nodes: Vec<_> = nodes.into_iter().map(simplify_conditions_in_node).collect();
+
+    // Tenth pass: collapse SysV `va_arg` register/overflow state machines into
+    // `va_arg(ap, T)` assignments. Runs last so the diamond's slot reads have
+    // already been folded to concrete frame offsets by copy propagation.
+    super::va_arg::recover_va_arg(nodes)
 }
 
 pub(super) fn prune_unreachable_nodes(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {

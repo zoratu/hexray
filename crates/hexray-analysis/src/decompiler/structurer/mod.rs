@@ -28,6 +28,7 @@ mod condition;
 mod gotos;
 mod simplify;
 mod switch;
+mod va_arg;
 pub use cleanup::{
     convert_cleanup_gotos, convert_gotos_to_early_returns, convert_multilevel_breaks,
     remove_orphan_gotos, remove_orphan_labels, structure_shared_exits,
