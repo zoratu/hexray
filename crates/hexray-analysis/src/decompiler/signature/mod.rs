@@ -104,6 +104,10 @@ pub struct SignatureRecovery {
     /// the `-O0` spill-only case where the xmm spill is pruned before structured
     /// analysis runs. Set via [`with_float_arg_seeds`]; survives `analyze`'s reset.
     float_arg_seeds: Vec<(usize, String, u8)>,
+    /// Float return size (bytes) detected from the raw instruction stream, for
+    /// the spill-only case where the `xmm0` result is pruned before structured
+    /// analysis. Set via [`with_float_return_seed`]; survives `analyze`'s reset.
+    float_return_seed: Option<u8>,
     /// Integer SSE/AVX-style opaque operations observed in the function body.
     integer_simd_ops_observed: bool,
     /// The final scalar result is extracted from a float ABI register into the integer return.
@@ -213,12 +217,19 @@ pub fn scan_float_arg_registers(
             continue;
         };
         for inst in &block.instructions {
-            // An xmm register in the source position (operand 1) is read.
-            if let Some(Operand::Register(src)) = inst.operands.get(1) {
-                let name = src.name().to_lowercase();
-                if let Some(idx) = float_regs.iter().position(|r| r.eq_ignore_ascii_case(&name)) {
-                    if detected[idx].is_none() && !written.contains(&name) {
-                        detected[idx] = Some(scalar_float_operand_size(inst));
+            // An xmm register in the source position (operand 1) is read — but
+            // the `pxor %xmm,%xmm` / `xorps`/`xorpd` self-xor is a zeroing idiom
+            // (`reg = 0`), not a read of an incoming argument.
+            let is_self_zero = matches!(inst.operation, Operation::Xor)
+                && operands_are_same_register(&inst.operands);
+            if !is_self_zero {
+                if let Some(Operand::Register(src)) = inst.operands.get(1) {
+                    let name = src.name().to_lowercase();
+                    if let Some(idx) = float_regs.iter().position(|r| r.eq_ignore_ascii_case(&name))
+                    {
+                        if detected[idx].is_none() && !written.contains(&name) {
+                            detected[idx] = Some(scalar_float_operand_size(inst));
+                        }
                     }
                 }
             }
@@ -247,6 +258,15 @@ pub fn scan_float_arg_registers(
     result
 }
 
+/// Whether operands 0 and 1 are the same register (the self-xor zeroing idiom).
+fn operands_are_same_register(operands: &[Operand]) -> bool {
+    matches!(
+        (operands.first(), operands.get(1)),
+        (Some(Operand::Register(a)), Some(Operand::Register(b)))
+            if a.name().eq_ignore_ascii_case(b.name())
+    )
+}
+
 /// Scalar floating-point operand width from an instruction mnemonic: single
 /// (`*ss`) is 4 bytes, double (`*sd`) is 8. Defaults to 8 (double) — the common
 /// case — when the mnemonic is not a recognized scalar form.
@@ -257,6 +277,114 @@ fn scalar_float_operand_size(inst: &hexray_core::Instruction) -> u8 {
     } else {
         8
     }
+}
+
+/// Detect a floating-point return value by scanning the raw instruction stream.
+///
+/// Returns `Some(size_bytes)` if the function returns a float/double in `xmm0`.
+/// Like [`scan_float_arg_registers`], this recovers the `-O0` spill-only case
+/// where the `xmm0` result is pruned before the structured form. It is
+/// conservative: any return path whose value is established in the integer
+/// return register (`rax`/`eax`) vetoes a float classification, and the epilogue
+/// stack-canary reload (`rax = *guard_slot`) is skipped so it does not look like
+/// an integer return.
+pub fn scan_float_return(cfg: &ControlFlowGraph, convention: CallingConvention) -> Option<u8> {
+    if !matches!(convention, CallingConvention::SystemV) {
+        return None;
+    }
+    let mut float_size: Option<u8> = None;
+    for block_id in cfg.block_ids() {
+        let Some(block) = cfg.block(block_id) else {
+            continue;
+        };
+        let is_return_block = matches!(block.terminator, hexray_core::BlockTerminator::Return)
+            || block
+                .instructions
+                .last()
+                .is_some_and(|i| matches!(i.operation, Operation::Return));
+        if !is_return_block {
+            continue;
+        }
+        // Walk the return block, then single-predecessor chain, until the
+        // return register is established (the `-O0` canary epilogue puts the
+        // value-producing write a block before the bare `leave; ret`).
+        let mut current = Some(block_id);
+        let mut visited = HashSet::new();
+        while let Some(bid) = current {
+            if !visited.insert(bid) {
+                break;
+            }
+            let Some(b) = cfg.block(bid) else { break };
+            match block_return_register_class(b) {
+                Some(ReturnRegClass::Float(size)) => {
+                    float_size = Some(float_size.map_or(size, |s| s.max(size)));
+                    break;
+                }
+                // A definite integer return anywhere vetoes float classification.
+                Some(ReturnRegClass::Integer) => return None,
+                None => {
+                    let preds = cfg.predecessors(bid);
+                    current = (preds.len() == 1).then(|| preds[0]);
+                }
+            }
+        }
+    }
+    float_size
+}
+
+enum ReturnRegClass {
+    Float(u8),
+    Integer,
+}
+
+/// Classify the return register established by a block: the last write to a
+/// return register (`xmm0` = float, `rax`/`eax` = integer), skipping the
+/// epilogue and the stack-canary reload/compare.
+fn block_return_register_class(block: &hexray_core::BasicBlock) -> Option<ReturnRegClass> {
+    let mut saw_guard = false;
+    for inst in block.instructions.iter().rev() {
+        // Skip epilogue scaffolding.
+        let m = inst.mnemonic.to_ascii_lowercase();
+        if matches!(
+            inst.operation,
+            Operation::Return | Operation::Push | Operation::Pop | Operation::Nop
+        ) || m == "leave"
+            || m.starts_with("nop")
+            || m.starts_with("endbr")
+        {
+            continue;
+        }
+        // The stack-canary guard compare (`cmp`/`sub` against %fs:0x28).
+        if instruction_references_stack_guard(inst) {
+            saw_guard = true;
+            continue;
+        }
+        let Some(Operand::Register(dst)) = inst.operands.first() else {
+            continue;
+        };
+        let name = dst.name().to_lowercase();
+        if name.starts_with("xmm") && name == "xmm0" {
+            return Some(ReturnRegClass::Float(scalar_float_operand_size(inst)));
+        }
+        if matches!(name.as_str(), "rax" | "eax" | "ax" | "al") {
+            // The reload feeding the canary check is not the return value.
+            if saw_guard {
+                saw_guard = false;
+                continue;
+            }
+            return Some(ReturnRegClass::Integer);
+        }
+    }
+    None
+}
+
+fn instruction_references_stack_guard(inst: &hexray_core::Instruction) -> bool {
+    use hexray_core::register::x86;
+    inst.operands.iter().any(|operand| {
+        matches!(operand, Operand::Memory(mem)
+            if mem.segment.as_ref().is_some_and(|seg| seg.id == x86::FS)
+                && mem.displacement == 0x28)
+    })
 }
 
 impl SignatureRecovery {
@@ -283,6 +411,7 @@ impl SignatureRecovery {
             float_abi_return_expr_observed: false,
             observed_float_arg_regs: HashSet::new(),
             float_arg_seeds: Vec::new(),
+            float_return_seed: None,
             integer_simd_ops_observed: false,
             return_from_integer_simd_lane: false,
             integer_simd_scalar_literal_return_size_hint: None,
@@ -338,6 +467,13 @@ impl SignatureRecovery {
     /// Use [`scan_float_arg_registers`] to compute the argument from a CFG.
     pub fn with_float_arg_seeds(mut self, seeds: Vec<(usize, String, u8)>) -> Self {
         self.float_arg_seeds = seeds;
+        self
+    }
+
+    /// Seeds a float return value (size in bytes) detected from the raw
+    /// instruction stream. Use [`scan_float_return`] to compute it from a CFG.
+    pub fn with_float_return_seed(mut self, size: Option<u8>) -> Self {
+        self.float_return_seed = size;
         self
     }
 
@@ -429,6 +565,28 @@ impl SignatureRecovery {
 
         // Analyze the function body
         self.analyze_nodes(&cfg.body, false);
+
+        // Seed a float return detected from the raw instruction stream when the
+        // structured analysis did not establish a (non-float) return — the
+        // `-O0` `xmm0` result spill is pruned before this form.
+        if let Some(size) = self.float_return_seed {
+            if !self.return_from_integer_simd_lane
+                && self.return_function_pointer.is_none()
+                && !self.return_is_pointer
+            {
+                self.return_value_set = true;
+                self.float_return = true;
+                self.return_size = size;
+                if !self
+                    .return_provenance
+                    .iter()
+                    .any(|r| r == "float return register (xmm0) from instruction scan")
+                {
+                    self.return_provenance
+                        .push("float return register (xmm0) from instruction scan".to_string());
+                }
+            }
+        }
 
         // Recover "return callee(...);" style wrappers where only a tail-position call is present.
         if !self.return_value_set {
@@ -4584,6 +4742,88 @@ mod tests {
         )]);
         let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn scan_excludes_pxor_self_zero() {
+        // pxor %xmm0,%xmm0 (zero a float accumulator) must not look like an
+        // xmm0 argument read.
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![
+            ("pxor", Operation::Xor, vec![Operand::Register(xmm(0)), Operand::Register(xmm(0))]),
+            ("movsd", Operation::Store, vec![mem(rbp, -8), Operand::Register(xmm(0))]),
+        ]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert!(found.is_empty(), "pxor self-zero is not an argument read");
+    }
+
+    /// `%fs:0x28` stack-guard memory operand.
+    fn guard_mem() -> Operand {
+        use hexray_core::{Architecture, IndexMode, MemoryRef, MemorySpace, RegisterClass};
+        let fs = hexray_core::Register::new(
+            Architecture::X86_64,
+            RegisterClass::Segment,
+            hexray_core::register::x86::FS,
+            16,
+        );
+        Operand::Memory(MemoryRef {
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0x28,
+            size: 8,
+            segment: Some(fs),
+            broadcast: false,
+            index_mode: IndexMode::None,
+            space: MemorySpace::Generic,
+        })
+    }
+
+    #[test]
+    fn scan_float_return_detects_double_and_single() {
+        let rbp = gpr(5, 64);
+        let dbl = single_block_cfg(vec![(
+            "movsd",
+            Operation::Move,
+            vec![Operand::Register(xmm(0)), mem(rbp, -8)],
+        )]);
+        assert_eq!(scan_float_return(&dbl, CallingConvention::SystemV), Some(8));
+
+        let single = single_block_cfg(vec![(
+            "movss",
+            Operation::Move,
+            vec![Operand::Register(xmm(0)), mem(rbp, -4)],
+        )]);
+        assert_eq!(scan_float_return(&single, CallingConvention::SystemV), Some(4));
+    }
+
+    #[test]
+    fn scan_float_return_vetoes_on_integer_return() {
+        // The float value lands in xmm0, but the function then converts it to
+        // an integer in eax — an integer return.
+        let rbp = gpr(5, 64);
+        let dbl = single_block_cfg(vec![
+            ("movsd", Operation::Move, vec![Operand::Register(xmm(0)), mem(rbp, -8)]),
+            (
+                "cvttsd2si",
+                Operation::Move,
+                vec![Operand::Register(gpr(0, 32)), Operand::Register(xmm(0))],
+            ),
+        ]);
+        assert_eq!(scan_float_return(&dbl, CallingConvention::SystemV), None);
+    }
+
+    #[test]
+    fn scan_float_return_skips_canary_reload() {
+        // movsd ...,%xmm0 ; mov ...,%rax ; sub %fs:0x28,%rax ; ret
+        // The rax canary reload must not mask the xmm0 float return.
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![
+            ("movsd", Operation::Move, vec![Operand::Register(xmm(0)), mem(rbp, -88)]),
+            ("mov", Operation::Move, vec![Operand::Register(gpr(0, 64)), mem(rbp, -8)]),
+            ("sub", Operation::Sub, vec![Operand::Register(gpr(0, 64)), guard_mem()]),
+        ]);
+        assert_eq!(scan_float_return(&cfg, CallingConvention::SystemV), Some(8));
     }
 
     #[test]

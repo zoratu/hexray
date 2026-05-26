@@ -1254,6 +1254,7 @@ impl Decompiler {
                     cfg,
                     self.calling_convention,
                 ))
+                .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention))
                 .analyze(&structured);
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else {
@@ -2132,7 +2133,8 @@ impl Decompiler {
             .with_float_arg_seeds(signature::scan_float_arg_registers(
                 cfg,
                 self.calling_convention,
-            ));
+            ))
+            .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention));
         recovery.analyze(&structured)
     }
 
