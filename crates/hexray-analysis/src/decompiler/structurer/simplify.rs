@@ -4976,6 +4976,9 @@ fn propagate_args_in_block_with_state(
 
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
+    // Registers written earlier in this block — they hold local temporaries, not
+    // the incoming argument, so they must not be canonicalized back to `argN`.
+    let mut clobbered_regs: HashSet<String> = HashSet::new();
 
     for (i, stmt) in statements.into_iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
@@ -5019,6 +5022,11 @@ fn propagate_args_in_block_with_state(
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
+                // Once written, this register is a local temporary for the rest
+                // of the block, not the incoming argument.
+                for alias in &written_aliases {
+                    clobbered_regs.insert(alias.to_lowercase());
+                }
                 invalidate_dependent_stabilized_register_values(
                     &mut state.reg_values,
                     &written_aliases,
@@ -5045,7 +5053,8 @@ fn propagate_args_in_block_with_state(
                 }
 
                 if is_temp_register(&v.name) {
-                    let stabilized_temp_rhs = stabilize_saved_arg_registers(tracked_rhs.clone());
+                    let stabilized_temp_rhs =
+                        stabilize_saved_arg_registers_excluding(tracked_rhs.clone(), &clobbered_regs);
                     // Sub-register writes (al, ah, ax, ...) must not propagate
                     // the substituted RHS at all under the canonical-name slot
                     // — `v.name` for `al` is `rax`, so storing here would let
@@ -5134,7 +5143,8 @@ fn propagate_args_in_block_with_state(
             }
 
             if let Some(slot_key) = stack_slot_key(&substituted_lhs) {
-                let stabilized_rhs = stabilize_saved_arg_registers(tracked_rhs);
+                let stabilized_rhs =
+                    stabilize_saved_arg_registers_excluding(tracked_rhs, &clobbered_regs);
                 state.stack_slot_values.remove(&slot_key);
                 if !expr_requires_single_evaluation(&stabilized_rhs) {
                     state
@@ -5881,11 +5891,24 @@ fn substitute_call_target_stack_slots(
 }
 
 fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
+    stabilize_saved_arg_registers_excluding(expr, &HashSet::new())
+}
+
+/// Canonicalize incoming argument registers to `argN`/`fargN`, but never rename
+/// a register listed in `excluded` — those have been written (clobbered) earlier
+/// in the block and so are local temporaries, not the incoming argument. (For
+/// example a loop index materialized as `rdx = i * 4` must stay `rdx`, not be
+/// rewritten to `arg2`, which would fabricate a parameter and a bogus
+/// `arr[arg2]` index.)
+fn stabilize_saved_arg_registers_excluding(expr: Expr, excluded: &HashSet<String>) -> Expr {
     use super::super::expression::ExprKind;
 
+    let rec = |e: Expr| stabilize_saved_arg_registers_excluding(e, excluded);
     match expr.kind {
         ExprKind::Var(v) => {
-            if let Some(index) = get_arg_register_index(&v.name) {
+            if excluded.contains(&v.name.to_lowercase()) {
+                Expr::var(v)
+            } else if let Some(index) = get_arg_register_index(&v.name) {
                 Expr::unknown(format!("arg{}", index))
             } else if let Some(index) = get_float_arg_register_index(&v.name) {
                 Expr::unknown(format!("farg{}", index))
@@ -5894,7 +5917,9 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             }
         }
         ExprKind::Unknown(name) => {
-            if let Some(index) = get_arg_register_index(&name) {
+            if excluded.contains(&name.to_lowercase()) {
+                Expr::unknown(name)
+            } else if let Some(index) = get_arg_register_index(&name) {
                 Expr::unknown(format!("arg{}", index))
             } else if let Some(index) = get_float_arg_register_index(&name) {
                 Expr::unknown(format!("farg{}", index))
@@ -5903,46 +5928,31 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             }
         }
         ExprKind::IntLit(_) => expr,
-        ExprKind::Deref { addr, size } => Expr::deref(stabilize_saved_arg_registers(*addr), size),
-        ExprKind::BinOp { op, left, right } => Expr::binop(
-            op,
-            stabilize_saved_arg_registers(*left),
-            stabilize_saved_arg_registers(*right),
-        ),
-        ExprKind::UnaryOp { op, operand } => {
-            Expr::unary(op, stabilize_saved_arg_registers(*operand))
-        }
-        ExprKind::Assign { lhs, rhs } => Expr::assign(
-            stabilize_saved_arg_registers(*lhs),
-            stabilize_saved_arg_registers(*rhs),
-        ),
+        ExprKind::Deref { addr, size } => Expr::deref(rec(*addr), size),
+        ExprKind::BinOp { op, left, right } => Expr::binop(op, rec(*left), rec(*right)),
+        ExprKind::UnaryOp { op, operand } => Expr::unary(op, rec(*operand)),
+        ExprKind::Assign { lhs, rhs } => Expr::assign(rec(*lhs), rec(*rhs)),
         ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
             kind: ExprKind::CompoundAssign {
                 op,
-                lhs: Box::new(stabilize_saved_arg_registers(*lhs)),
-                rhs: Box::new(stabilize_saved_arg_registers(*rhs)),
+                lhs: Box::new(rec(*lhs)),
+                rhs: Box::new(rec(*rhs)),
             },
         },
-        ExprKind::AddressOf(inner) => Expr::address_of(stabilize_saved_arg_registers(*inner)),
+        ExprKind::AddressOf(inner) => Expr::address_of(rec(*inner)),
         ExprKind::ArrayAccess {
             base,
             index,
             element_size,
-        } => Expr::array_access(
-            stabilize_saved_arg_registers(*base),
-            stabilize_saved_arg_registers(*index),
-            element_size,
-        ),
+        } => Expr::array_access(rec(*base), rec(*index), element_size),
         ExprKind::FieldAccess {
             base,
             field_name,
             offset,
-        } => Expr::field_access(stabilize_saved_arg_registers(*base), field_name, offset),
+        } => Expr::field_access(rec(*base), field_name, offset),
         ExprKind::Call { target, args } => Expr::call(
             stabilize_saved_arg_call_target(target),
-            args.into_iter()
-                .map(stabilize_saved_arg_registers)
-                .collect(),
+            args.into_iter().map(rec).collect(),
         ),
         ExprKind::Cast {
             expr: inner,
@@ -5950,7 +5960,7 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             signed,
         } => Expr {
             kind: ExprKind::Cast {
-                expr: Box::new(stabilize_saved_arg_registers(*inner)),
+                expr: Box::new(rec(*inner)),
                 to_size,
                 signed,
             },
@@ -5961,7 +5971,7 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             width,
         } => Expr {
             kind: ExprKind::BitField {
-                expr: Box::new(stabilize_saved_arg_registers(*inner)),
+                expr: Box::new(rec(*inner)),
                 start,
                 width,
             },
@@ -5972,17 +5982,13 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             else_expr,
         } => Expr {
             kind: ExprKind::Conditional {
-                cond: Box::new(stabilize_saved_arg_registers(*cond)),
-                then_expr: Box::new(stabilize_saved_arg_registers(*then_expr)),
-                else_expr: Box::new(stabilize_saved_arg_registers(*else_expr)),
+                cond: Box::new(rec(*cond)),
+                then_expr: Box::new(rec(*then_expr)),
+                else_expr: Box::new(rec(*else_expr)),
             },
         },
         ExprKind::Phi(args) => Expr {
-            kind: ExprKind::Phi(
-                args.into_iter()
-                    .map(stabilize_saved_arg_registers)
-                    .collect(),
-            ),
+            kind: ExprKind::Phi(args.into_iter().map(rec).collect()),
         },
         ExprKind::GotRef {
             address,
@@ -5995,7 +6001,7 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
                 address,
                 instruction_address,
                 size,
-                display_expr: Box::new(stabilize_saved_arg_registers(*display_expr)),
+                display_expr: Box::new(rec(*display_expr)),
                 is_deref,
             },
         },
@@ -10514,6 +10520,28 @@ mod tests {
             rhs.to_string().contains("rbp"),
             "loop-carried slot folded into the loop body: {}",
             rhs
+        );
+    }
+
+    #[test]
+    fn test_stabilize_excludes_clobbered_arg_register() {
+        // `rdx` (the arg2 register) reused as a temp must not be canonicalized
+        // back to `arg2` — that would fabricate a parameter and a bogus index.
+        let expr = || Expr::deref(Expr::binop(BinOpKind::Add, reg("arg0", 8), reg("rdx", 8)), 4);
+
+        let mut excluded = HashSet::new();
+        excluded.insert("rdx".to_string());
+        let kept = stabilize_saved_arg_registers_excluding(expr(), &excluded);
+        assert!(
+            kept.to_string().contains("rdx") && !kept.to_string().contains("arg2"),
+            "clobbered rdx must stay rdx: {kept}"
+        );
+
+        // Without exclusion an unwritten arg register is still canonicalized.
+        let canon = stabilize_saved_arg_registers_excluding(expr(), &HashSet::new());
+        assert!(
+            canon.to_string().contains("arg2"),
+            "an unclobbered arg register should canonicalize: {canon}"
         );
     }
 
