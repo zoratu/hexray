@@ -4553,6 +4553,124 @@ impl CallArgPropagationState {
             *stmt_idx = None;
         }
     }
+
+    /// Drop tracked values for any variable assigned inside `body` before
+    /// propagating into a loop. These variables are loop-carried — their value
+    /// at loop entry is not valid across iterations — so propagating a pre-loop
+    /// value (e.g. `i = 0`) into the body would corrupt the update
+    /// (`i = i + 1` folding to `i = 1`). Loop-invariant values survive and can
+    /// still propagate into calls inside the loop.
+    fn invalidate_loop_carried(&mut self, body: &[StructuredNode]) {
+        let mut regs: HashSet<String> = HashSet::new();
+        let mut slots: HashSet<String> = HashSet::new();
+        collect_loop_body_modifications(body, &mut regs, &mut slots);
+
+        for reg in &regs {
+            for alias in get_register_aliases(reg) {
+                let alias = alias.to_lowercase();
+                self.arg_values.remove(&alias);
+                self.reg_values.remove(&alias);
+                self.saved_temp_values.remove(&alias);
+                self.call_target_values.remove(&alias);
+                self.compound_updated_aliases.remove(&alias);
+            }
+            self.arg_values.remove(reg);
+            self.reg_values.remove(reg);
+            self.saved_temp_values.remove(reg);
+            self.call_target_values.remove(reg);
+            self.compound_updated_aliases.remove(reg);
+        }
+        for slot in &slots {
+            self.stack_slot_values.remove(slot);
+        }
+    }
+}
+
+/// Collect the register names and stack-slot keys assigned anywhere within a
+/// (loop) body, recursing into nested control flow.
+fn collect_loop_body_modifications(
+    nodes: &[StructuredNode],
+    regs: &mut HashSet<String>,
+    slots: &mut HashSet<String>,
+) {
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    collect_modified_lvalue(stmt, regs, slots);
+                }
+            }
+            StructuredNode::Expr(e) => collect_modified_lvalue(e, regs, slots),
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_loop_body_modifications(then_body, regs, slots);
+                if let Some(else_body) = else_body {
+                    collect_loop_body_modifications(else_body, regs, slots);
+                }
+            }
+            StructuredNode::While { body, .. }
+            | StructuredNode::DoWhile { body, .. }
+            | StructuredNode::Loop { body, .. } => {
+                collect_loop_body_modifications(body, regs, slots)
+            }
+            StructuredNode::For {
+                init,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(init) = init {
+                    collect_modified_lvalue(init, regs, slots);
+                }
+                if let Some(update) = update {
+                    collect_modified_lvalue(update, regs, slots);
+                }
+                collect_loop_body_modifications(body, regs, slots);
+            }
+            StructuredNode::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    collect_loop_body_modifications(body, regs, slots);
+                }
+                if let Some(default) = default {
+                    collect_loop_body_modifications(default, regs, slots);
+                }
+            }
+            StructuredNode::Sequence(body) => collect_loop_body_modifications(body, regs, slots),
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                collect_loop_body_modifications(try_body, regs, slots);
+                for handler in catch_handlers {
+                    collect_loop_body_modifications(&handler.body, regs, slots);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_modified_lvalue(
+    stmt: &Expr,
+    regs: &mut HashSet<String>,
+    slots: &mut HashSet<String>,
+) {
+    use super::super::expression::ExprKind;
+    let lhs = match &stmt.kind {
+        ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => lhs,
+        _ => return,
+    };
+    // A frame slot (Var(Stack)/Deref/ArrayAccess off the frame) is keyed the
+    // same way the propagation state tracks it; everything else with a Var lhs
+    // is a register.
+    if let Some(key) = stack_slot_key(lhs) {
+        slots.insert(key);
+    } else if let ExprKind::Var(v) = &lhs.kind {
+        regs.insert(v.name.to_lowercase());
+    }
 }
 
 fn body_definitely_terminates(nodes: &[StructuredNode]) -> bool {
@@ -4656,11 +4774,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::While {
@@ -4678,11 +4798,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::DoWhile {
@@ -4702,11 +4824,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::For {
@@ -4725,11 +4849,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::Loop {
@@ -10348,6 +10474,47 @@ mod tests {
         };
         assert_eq!(statements.len(), 1);
         assert_eq!(format!("{}", statements[0]), "abort()");
+    }
+
+    #[test]
+    fn test_propagate_call_args_does_not_fold_loop_carried_slot() {
+        // A loop counter initialized to 0 before the loop must not have that 0
+        // propagated into the loop body, which would corrupt `i = i + 1` into
+        // `i = 0 + 1`.
+        let slot = || Expr::deref(Expr::binop(BinOpKind::Add, reg("rbp", 8), Expr::int(-8)), 8);
+        let nodes = vec![
+            block(0, vec![Expr::assign(slot(), Expr::int(0))]),
+            StructuredNode::While {
+                condition: Expr::binop(BinOpKind::Lt, slot(), Expr::int(10)),
+                body: vec![block(
+                    1,
+                    vec![Expr::assign(
+                        slot(),
+                        Expr::binop(BinOpKind::Add, slot(), Expr::int(1)),
+                    )],
+                )],
+                header: None,
+                exit_block: None,
+            },
+        ];
+
+        let out = propagate_call_args(nodes);
+        let StructuredNode::While { body, .. } = &out[1] else {
+            panic!("expected while");
+        };
+        let StructuredNode::Block { statements, .. } = &body[0] else {
+            panic!("expected block");
+        };
+        let ExprKind::Assign { rhs, .. } = &statements[0].kind else {
+            panic!("expected assignment");
+        };
+        // The increment must still read the slot (`*(rbp-8) + 1`), not the
+        // pre-loop constant (`0 + 1`).
+        assert!(
+            rhs.to_string().contains("rbp"),
+            "loop-carried slot folded into the loop body: {}",
+            rhs
+        );
     }
 
     #[test]
