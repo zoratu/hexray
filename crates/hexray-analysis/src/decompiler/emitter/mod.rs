@@ -417,6 +417,13 @@ pub struct PseudoCodeEmitter {
     preserve_register_names: Cell<bool>,
     /// Emit raw register names for low-level register snapshot helpers such as __sigsetjmp.
     register_snapshot_mode: Cell<bool>,
+    /// Number of integer / floating-point argument-register *parameters* in the
+    /// current function. An argument register beyond this count is a local
+    /// temporary, not a parameter, so it must not be displayed as `argN`/`fargN`
+    /// (which would look like a phantom parameter, e.g. `arr[arg2]`). Defaults to
+    /// "no gating" until a signature is emitted.
+    integer_arg_param_count: Cell<usize>,
+    float_arg_param_count: Cell<usize>,
 }
 
 impl PseudoCodeEmitter {
@@ -650,6 +657,8 @@ impl PseudoCodeEmitter {
             summary_database: None,
             global_tracker: RefCell::new(GlobalAccessTracker::new()),
             param_name_overrides: RefCell::new(HashMap::new()),
+            integer_arg_param_count: Cell::new(usize::MAX),
+            float_arg_param_count: Cell::new(usize::MAX),
             return_fallback_expr: RefCell::new(None),
             preserve_register_names: Cell::new(false),
             register_snapshot_mode: Cell::new(false),
@@ -3217,6 +3226,11 @@ impl PseudoCodeEmitter {
                     .position(|reg| reg.eq_ignore_ascii_case(&lower))
             })
         {
+            // Only treat it as a parameter if the function actually has that
+            // many integer arguments; otherwise the register is a local temp.
+            if idx >= self.integer_arg_param_count.get() {
+                return None;
+            }
             return Some(match self.calling_convention {
                 CallingConvention::RiscV => format!("a{}", idx),
                 _ => format!("arg{}", idx),
@@ -3228,6 +3242,9 @@ impl PseudoCodeEmitter {
             .float_arg_registers()
             .iter()
             .position(|reg| reg.eq_ignore_ascii_case(&lower))?;
+        if idx >= self.float_arg_param_count.get() {
+            return None;
+        }
         Some(format!("farg{}", idx))
     }
 
@@ -6160,6 +6177,37 @@ impl PseudoCodeEmitter {
             self.set_param_name_override(source_name, rendered_name);
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
             self.set_lifted_param_slot_overrides(idx, rendered_name);
+        }
+
+        // Record how many argument registers are actual parameters, so a higher
+        // argument register used as a temporary is not displayed as `argN`. A
+        // variadic function may use argument registers for its varargs, so leave
+        // those ungated.
+        if signature.is_variadic {
+            self.integer_arg_param_count.set(usize::MAX);
+            self.float_arg_param_count.set(usize::MAX);
+        } else {
+            use super::signature::ParameterLocation;
+            let int_count = signature
+                .parameters
+                .iter()
+                .filter_map(|p| match p.location {
+                    ParameterLocation::IntegerRegister { index, .. } => Some(index + 1),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            let float_count = signature
+                .parameters
+                .iter()
+                .filter_map(|p| match p.location {
+                    ParameterLocation::FloatRegister { index, .. } => Some(index + 1),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            self.integer_arg_param_count.set(int_count);
+            self.float_arg_param_count.set(float_count);
         }
 
         // Use provided signature for header
@@ -9432,6 +9480,24 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn arg_register_display_gated_by_param_count() {
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_calling_convention(CallingConvention::SystemV);
+        // A function with two integer parameters: rdx (arg2) is a local temp.
+        emitter.integer_arg_param_count.set(2);
+        assert_eq!(emitter.arg_register_display_name("rdi").as_deref(), Some("arg0"));
+        assert_eq!(emitter.arg_register_display_name("rsi").as_deref(), Some("arg1"));
+        assert_eq!(
+            emitter.arg_register_display_name("rdx"),
+            None,
+            "rdx is not a parameter of a 2-arg function"
+        );
+        // With three parameters, rdx (arg2) is a genuine argument again.
+        emitter.integer_arg_param_count.set(3);
+        assert_eq!(emitter.arg_register_display_name("rdx").as_deref(), Some("arg2"));
+    }
 
     #[test]
     fn test_emit_if_else() {
