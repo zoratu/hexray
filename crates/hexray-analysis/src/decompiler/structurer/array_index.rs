@@ -209,10 +209,13 @@ fn rewrite_array_derefs(expr: Expr, values: &ValueMap) -> Expr {
         ExprKind::Deref { addr, size } => {
             let addr = rewrite_array_derefs(*addr, values);
             let resolved = resolve(&addr, values);
-            if let Some(array) = try_detect_array_in_deref(&resolved, size) {
-                array
-            } else {
-                Expr::deref(addr, size)
+            // Only reconstruct genuine variable-index array accesses. A constant
+            // index means a fixed offset — a stack slot or struct field, not an
+            // array — and resolving it here would turn a plain local store into a
+            // noisy `(sp - 32 + 16)[-1]` form. Leave those for the normal passes.
+            match try_detect_array_in_deref(&resolved, size) {
+                Some(array) if !array_access_has_constant_index(&array) => array,
+                _ => Expr::deref(addr, size),
             }
         }
         ExprKind::Assign { lhs, rhs } => Expr::assign(
@@ -252,6 +255,12 @@ fn rewrite_array_derefs(expr: Expr, values: &ValueMap) -> Expr {
         ),
         _ => expr,
     }
+}
+
+/// Whether a recovered array access has a constant (literal) index — i.e. a
+/// fixed offset that is really a stack slot or struct field, not an array index.
+fn array_access_has_constant_index(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::ArrayAccess { index, .. } if matches!(index.kind, ExprKind::IntLit(_)))
 }
 
 /// `cdqe`/`cltq`/`cwde`/`cwtl`/`cbw`/`cbtw`: accumulator sign-extension with no
