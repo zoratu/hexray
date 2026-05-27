@@ -23,6 +23,7 @@ use super::signature::known_function_param_count;
 use super::switch_recovery::SwitchRecovery;
 use super::{BinaryDataContext, ExceptionInfo};
 
+mod array_index;
 mod cleanup;
 mod condition;
 mod gotos;
@@ -434,6 +435,14 @@ impl StructuredCfg {
         // Strip profiling hooks before any value propagation so they cannot
         // poison parameter recovery or leak into emitted pseudo-C.
         body = elide_profiling_probe_calls(body, structurer.binary_data);
+
+        // Reconstruct array-index dereferences (`*(base + i*scale)` -> `base[i]`)
+        // from the raw register chain, before call-arg propagation substitutes a
+        // bare byte offset into the dereference and the unscaled-index pattern
+        // mis-recognizes it (`arr[rdx]` with rdx = i*scale). This resolves the
+        // whole chain — through the index memory load and the opaque `cdqe` — so
+        // the real element index is recovered.
+        body = array_index::reconstruct_array_index_derefs(body);
 
         // Materialize folded condition call results early so later call-argument
         // propagation can still see the producer when a branch body reuses the

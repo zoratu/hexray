@@ -4023,7 +4023,7 @@ fn is_valid_ptr_base(expr: &Expr) -> bool {
 /// - `base + (index << shift)` → `base\[index\]` (where 1 << shift == size)
 ///
 /// Returns `Some(Expr::ArrayAccess { ... })` if a pattern is detected.
-fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
+pub(crate) fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
     // Pattern 1: base + index * element_size
     if let ExprKind::BinOp {
         op: BinOpKind::Add,
