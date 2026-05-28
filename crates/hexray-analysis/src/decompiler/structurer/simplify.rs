@@ -4244,7 +4244,61 @@ fn expr_node_count(expr: &Expr) -> usize {
 }
 
 /// Substitute variable references with their known values and simplify.
+///
+/// Two phases: a simplify-free recursive substitution ([`substitute_vars_rec`])
+/// over the whole tree, then a single result-cap check plus one
+/// [`Expr::simplify`] pass. `Expr::simplify` already recurses bottom-up, so
+/// simplifying once at the top is equivalent to simplifying at every recursion
+/// level — but doing it per level (as this used to) also re-ran the result-cap
+/// node count at every level, making substitution O(N²) in expression size.
+/// A self-referential `idiv`/`xor` chain builds degenerate left-leaning trees,
+/// so an 11-byte fuzz input took 8–17 s and ballooned memory past the RSS
+/// limit. Substituting first and simplifying/capping once keeps it O(N).
+///
+/// The recursion also threads a shared node *budget* so it stops expanding once
+/// the output would exceed [`SUBSTITUTION_RESULT_NODE_CAP`], instead of building
+/// a giant intermediate only to discard it below — that build-then-discard was
+/// the residual cost (and peak RSS) after the per-level simplify was removed.
+/// Exhausting the budget backs out to the original input, so the observable
+/// result is identical to the post-build result-cap check, minus the wasted
+/// allocation.
 fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
+    // One past the cap, so the budget reaches 0 only when the output strictly
+    // exceeds the cap — matching the `> SUBSTITUTION_RESULT_NODE_CAP` check.
+    let mut budget = SUBSTITUTION_RESULT_NODE_CAP + 1;
+    let result = substitute_vars_rec(expr, reg_values, &mut budget);
+    // Defense in depth: if the substitution result is much larger than the
+    // input, back out to the input. Several adversarial fuzz inputs put many
+    // refs to the same register inside one expression (e.g. a `Conditional`
+    // whose condition, then-branch, and else-branch each mention `rax`),
+    // where each leaf gets replaced with a near-cap-sized subtree and the
+    // result is N × cap nodes. The budget normally trips first; the explicit
+    // count still guards paths it under-counts (call arguments).
+    if budget == 0
+        || expr_node_count_bounded(&result, SUBSTITUTION_RESULT_NODE_CAP)
+            > SUBSTITUTION_RESULT_NODE_CAP
+    {
+        return expr.clone();
+    }
+    // Simplify after substitution to handle boolean patterns like (x == 1) != 1 → x != 1
+    result.simplify()
+}
+
+/// Recursive substitution core for [`substitute_vars`]: replace variable
+/// references with their known values WITHOUT simplifying or size-capping at
+/// each level (the wrapper does both once over the final tree). Keeping the
+/// recursion simplify-free is what bounds the cost to O(N) rather than O(N²).
+///
+/// `budget` tracks how many more output nodes may be produced; each emitted
+/// node decrements it and a substituted value consumes its whole node count.
+/// When it reaches zero the recursion stops expanding (returning the original
+/// subtree) and the caller backs out — this bounds both time and peak memory
+/// to O(cap) regardless of how self-referential the input is.
+fn substitute_vars_rec(
+    expr: &Expr,
+    reg_values: &HashMap<String, Expr>,
+    budget: &mut usize,
+) -> Expr {
     use super::super::expression::ExprKind;
 
     fn lookup_named_substitution<'a>(
@@ -4256,41 +4310,64 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
             .or_else(|| reg_values.get(&name.to_lowercase()))
     }
 
-    let result = match &expr.kind {
+    if *budget == 0 {
+        return expr.clone();
+    }
+    // Account for this node; a substituted value charges its extra nodes below.
+    *budget -= 1;
+
+    match &expr.kind {
         ExprKind::Var(v) => {
             if let Some(value) = lookup_named_substitution(reg_values, &v.name) {
-                if expr_node_count(value) > SUBSTITUTION_VALUE_NODE_CAP {
+                let value_nodes = expr_node_count(value);
+                if value_nodes > SUBSTITUTION_VALUE_NODE_CAP {
                     expr.clone()
                 } else {
+                    *budget = budget.saturating_sub(value_nodes.saturating_sub(1));
                     value.clone()
                 }
             } else {
                 expr.clone()
             }
         }
-        ExprKind::Unknown(name) => lookup_named_substitution(reg_values, name)
-            .filter(|value| expr_node_count(value) <= SUBSTITUTION_VALUE_NODE_CAP)
-            .cloned()
-            .unwrap_or_else(|| expr.clone()),
+        ExprKind::Unknown(name) => {
+            if let Some(value) = lookup_named_substitution(reg_values, name) {
+                let value_nodes = expr_node_count(value);
+                if value_nodes > SUBSTITUTION_VALUE_NODE_CAP {
+                    expr.clone()
+                } else {
+                    *budget = budget.saturating_sub(value_nodes.saturating_sub(1));
+                    value.clone()
+                }
+            } else {
+                expr.clone()
+            }
+        }
         ExprKind::BinOp { op, left, right } => Expr::binop(
             *op,
-            substitute_vars(left, reg_values),
-            substitute_vars(right, reg_values),
+            substitute_vars_rec(left, reg_values, budget),
+            substitute_vars_rec(right, reg_values, budget),
         ),
-        ExprKind::UnaryOp { op, operand } => Expr::unary(*op, substitute_vars(operand, reg_values)),
+        ExprKind::UnaryOp { op, operand } => {
+            Expr::unary(*op, substitute_vars_rec(operand, reg_values, budget))
+        }
         ExprKind::Assign { lhs, rhs } => Expr::assign(
-            substitute_vars(lhs, reg_values),
-            substitute_vars(rhs, reg_values),
+            substitute_vars_rec(lhs, reg_values, budget),
+            substitute_vars_rec(rhs, reg_values, budget),
         ),
-        ExprKind::Deref { addr, size } => Expr::deref(substitute_vars(addr, reg_values), *size),
-        ExprKind::AddressOf(inner) => Expr::address_of(substitute_vars(inner, reg_values)),
+        ExprKind::Deref { addr, size } => {
+            Expr::deref(substitute_vars_rec(addr, reg_values, budget), *size)
+        }
+        ExprKind::AddressOf(inner) => {
+            Expr::address_of(substitute_vars_rec(inner, reg_values, budget))
+        }
         ExprKind::ArrayAccess {
             base,
             index,
             element_size,
         } => Expr::array_access(
-            substitute_vars(base, reg_values),
-            substitute_vars(index, reg_values),
+            substitute_vars_rec(base, reg_values, budget),
+            substitute_vars_rec(index, reg_values, budget),
             *element_size,
         ),
         ExprKind::FieldAccess {
@@ -4298,7 +4375,7 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
             field_name,
             offset,
         } => Expr::field_access(
-            substitute_vars(base, reg_values),
+            substitute_vars_rec(base, reg_values, budget),
             field_name.clone(),
             *offset,
         ),
@@ -4312,7 +4389,7 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
             signed,
         } => Expr {
             kind: ExprKind::Cast {
-                expr: Box::new(substitute_vars(inner, reg_values)),
+                expr: Box::new(substitute_vars_rec(inner, reg_values, budget)),
                 to_size: *to_size,
                 signed: *signed,
             },
@@ -4323,7 +4400,7 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
             width,
         } => Expr {
             kind: ExprKind::BitField {
-                expr: Box::new(substitute_vars(inner, reg_values)),
+                expr: Box::new(substitute_vars_rec(inner, reg_values, budget)),
                 start: *start,
                 width: *width,
             },
@@ -4334,40 +4411,27 @@ fn substitute_vars(expr: &Expr, reg_values: &HashMap<String, Expr>) -> Expr {
             else_expr,
         } => Expr {
             kind: ExprKind::Conditional {
-                cond: Box::new(substitute_vars(cond, reg_values)),
-                then_expr: Box::new(substitute_vars(then_expr, reg_values)),
-                else_expr: Box::new(substitute_vars(else_expr, reg_values)),
+                cond: Box::new(substitute_vars_rec(cond, reg_values, budget)),
+                then_expr: Box::new(substitute_vars_rec(then_expr, reg_values, budget)),
+                else_expr: Box::new(substitute_vars_rec(else_expr, reg_values, budget)),
             },
         },
         ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
             kind: ExprKind::CompoundAssign {
                 op: *op,
-                lhs: Box::new(substitute_vars(lhs, reg_values)),
-                rhs: Box::new(substitute_vars(rhs, reg_values)),
+                lhs: Box::new(substitute_vars_rec(lhs, reg_values, budget)),
+                rhs: Box::new(substitute_vars_rec(rhs, reg_values, budget)),
             },
         },
         ExprKind::Phi(args) => Expr {
             kind: ExprKind::Phi(
                 args.iter()
-                    .map(|arg| substitute_vars(arg, reg_values))
+                    .map(|arg| substitute_vars_rec(arg, reg_values, budget))
                     .collect(),
             ),
         },
         _ => expr.clone(),
-    };
-    // Defense in depth: if the substitution result is much larger than the
-    // input, back out to the input. Several adversarial fuzz inputs put many
-    // refs to the same register inside one expression (e.g. a `Conditional`
-    // whose condition, then-branch, and else-branch each mention `rax`),
-    // where each leaf gets replaced with a near-cap-sized subtree and the
-    // result is N × cap nodes. Capping the result keeps the total bounded.
-    if expr_node_count_bounded(&result, SUBSTITUTION_RESULT_NODE_CAP)
-        > SUBSTITUTION_RESULT_NODE_CAP
-    {
-        return expr.clone();
     }
-    // Simplify after substitution to handle boolean patterns like (x == 1) != 1 → x != 1
-    result.simplify()
 }
 
 /// Upper bound on the size of the *result* of [`substitute_vars`]. Even with
@@ -10529,6 +10593,63 @@ mod tests {
             expr_node_count(&big_substituted) <= SUBSTITUTION_RESULT_NODE_CAP,
             "result must respect SUBSTITUTION_RESULT_NODE_CAP, got {}",
             expr_node_count(&big_substituted)
+        );
+    }
+
+    #[test]
+    fn test_substitute_vars_still_folds_after_single_top_level_simplify() {
+        // substitute_vars was split into a simplify-free recursive core plus a
+        // single top-level Expr::simplify (the per-level simplify made it
+        // O(N²)). Expr::simplify recurses bottom-up, so the folding that used
+        // to happen at every level must still happen once at the top: a Mul-by-
+        // zero sub-expression produced *beneath* an Add by substitution still
+        // has to collapse.  (rax * 0) + rbx  with rax=2, rbx=3  ->  3.
+        let mut reg_values: HashMap<String, Expr> = HashMap::new();
+        reg_values.insert("rax".to_string(), Expr::int(2));
+        reg_values.insert("rbx".to_string(), Expr::int(3));
+
+        let input = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::var(Variable::reg("rax", 8)),
+                Expr::int(0),
+            ),
+            Expr::var(Variable::reg("rbx", 8)),
+        );
+        let out = substitute_vars(&input, &reg_values);
+        assert!(
+            matches!(out.kind, ExprKind::IntLit(3)),
+            "expected folded IntLit(3) after substitute + simplify, got {:?}",
+            out.kind
+        );
+    }
+
+    #[test]
+    fn test_substitute_vars_bounded_on_deep_self_referential_chain() {
+        // Regression for the O(N²) substitution cost a fuzz soak surfaced via a
+        // self-referential idiv/xor chain (8–17 s and >4 GB RSS from 11 bytes).
+        // A deep left-leaning chain that references the same register at every
+        // level must terminate and stay within the result cap rather than
+        // re-counting + re-simplifying a growing tree at every recursion level.
+        let mut reg_values: HashMap<String, Expr> = HashMap::new();
+        // A moderately large cached value (under the per-value cap of 256).
+        let mut value = Expr::unknown("y");
+        for _ in 0..120 {
+            value = Expr::binop(BinOpKind::Add, value, Expr::unknown("y"));
+        }
+        reg_values.insert("rax".to_string(), value);
+
+        let read = Expr::var(Variable::reg("rax", 8));
+        let mut input = read.clone();
+        for _ in 0..300 {
+            input = Expr::binop(BinOpKind::Add, input, read.clone());
+        }
+        let out = substitute_vars(&input, &reg_values);
+        assert!(
+            expr_node_count(&out) <= SUBSTITUTION_RESULT_NODE_CAP,
+            "deep self-referential substitution must stay within the result cap, got {}",
+            expr_node_count(&out)
         );
     }
 
