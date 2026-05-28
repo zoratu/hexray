@@ -761,8 +761,12 @@ fn eval_binop(op: BinOpKind, left: i128, right: i128) -> Option<i128> {
         BinOpKind::And => Some(left & right),
         BinOpKind::Or => Some(left | right),
         BinOpKind::Xor => Some(left ^ right),
-        BinOpKind::Shl => Some(left << (right as u32)),
-        BinOpKind::Shr => Some(left >> (right as u32)),
+        // Only fold shifts whose amount is a valid bit index for i128; a decoded
+        // shift count >= 128 (or negative) is not a foldable constant and would
+        // panic on `<<`/`>>` (overflow-checked builds). Out-of-range falls
+        // through to `None`. Mirrors the guard in expression.rs `eval_binop`.
+        BinOpKind::Shl if (0..128).contains(&right) => Some(left << (right as u32)),
+        BinOpKind::Shr if (0..128).contains(&right) => Some(left >> (right as u32)),
         BinOpKind::Eq => Some(if left == right { 1 } else { 0 }),
         BinOpKind::Ne => Some(if left != right { 1 } else { 0 }),
         BinOpKind::Lt => Some(if left < right { 1 } else { 0 }),
@@ -869,6 +873,21 @@ mod tests {
         let expr = Expr::binop(BinOpKind::Mul, Expr::int(10), Expr::int(5));
         let folded = prop.fold_expr(expr);
         assert!(matches!(folded.kind, ExprKind::IntLit(50)));
+    }
+
+    #[test]
+    fn test_eval_binop_oversized_shift_folds_to_none_without_panic() {
+        // Regression: a fuzz soak found `attempt to shift left with overflow`
+        // here from a decoded shift count >= 128 (or negative). Out-of-range
+        // shift amounts are not foldable constants and must return None (left
+        // symbolic) rather than panic; valid shift amounts still fold.
+        assert_eq!(eval_binop(BinOpKind::Shl, 1, 128), None);
+        assert_eq!(eval_binop(BinOpKind::Shl, 1, 200), None);
+        assert_eq!(eval_binop(BinOpKind::Shl, 1, -1), None);
+        assert_eq!(eval_binop(BinOpKind::Shr, 1, 128), None);
+        assert_eq!(eval_binop(BinOpKind::Shr, 1, i128::MAX), None);
+        assert_eq!(eval_binop(BinOpKind::Shl, 1, 4), Some(16));
+        assert_eq!(eval_binop(BinOpKind::Shr, 256, 2), Some(64));
     }
 
     #[test]
