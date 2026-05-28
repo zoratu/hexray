@@ -4055,7 +4055,14 @@ pub(crate) fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
 
         // Try shift patterns: base + (index << shift)
         if let Some((index, shift_amount)) = extract_shift_index(right) {
-            let element_size = 1i128 << shift_amount;
+            // Guard the shift: a fuzzed `index << N` can carry a huge or
+            // negative N that would overflow `1i128 << N`. Out-of-range shifts
+            // are never a valid element size, so fall through.
+            let element_size = if (0..i128::BITS as i128).contains(&shift_amount) {
+                1i128 << shift_amount
+            } else {
+                -1
+            };
             if element_size == size as i128 {
                 return Some(Expr::array_access(
                     (**left).clone(),
@@ -4066,7 +4073,14 @@ pub(crate) fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
         }
 
         if let Some((index, shift_amount)) = extract_shift_index(left) {
-            let element_size = 1i128 << shift_amount;
+            // Guard the shift: a fuzzed `index << N` can carry a huge or
+            // negative N that would overflow `1i128 << N`. Out-of-range shifts
+            // are never a valid element size, so fall through.
+            let element_size = if (0..i128::BITS as i128).contains(&shift_amount) {
+                1i128 << shift_amount
+            } else {
+                -1
+            };
             if element_size == size as i128 {
                 return Some(Expr::array_access(
                     (**right).clone(),
@@ -4244,6 +4258,34 @@ fn extract_scaled_index_from_expr(expr: &Expr) -> Option<(Expr, i128)> {
 mod tests {
     use super::*;
     use hexray_core::{Architecture, Instruction, Operand, Operation, Register, RegisterClass};
+
+    #[test]
+    fn array_detect_handles_oversized_shift_without_overflow() {
+        // A fuzzed `index << N` can carry N >= 128 (or negative). `1i128 << N`
+        // must not overflow-panic — the address simply isn't an array access.
+        for shift in [200i128, 128, -1, i128::MAX] {
+            let addr = Expr::binop(
+                BinOpKind::Add,
+                Expr::unknown("base"),
+                Expr::binop(BinOpKind::Shl, Expr::unknown("idx"), Expr::int(shift)),
+            );
+            // Must return (None or Some) without panicking.
+            let _ = try_detect_array_in_deref(&addr, 4);
+        }
+        // A valid shift still resolves: *(base + idx*4) via `idx << 2`.
+        let valid = Expr::binop(
+            BinOpKind::Add,
+            Expr::unknown("base"),
+            Expr::binop(BinOpKind::Shl, Expr::unknown("idx"), Expr::int(2)),
+        );
+        assert!(
+            matches!(
+                try_detect_array_in_deref(&valid, 4),
+                Some(Expr { kind: ExprKind::ArrayAccess { element_size: 4, .. } })
+            ),
+            "valid shift-by-2 with 4-byte deref should be an array access"
+        );
+    }
 
     #[test]
     fn test_x86_sse_store_writes_memory_destination() {
