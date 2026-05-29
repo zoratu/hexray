@@ -3700,6 +3700,10 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
     let mut compound_updated_aliases: HashSet<String> = HashSet::new();
     let mut stack_slot_values: HashMap<String, Expr> = HashMap::new();
+    // Registers written earlier in this block hold local temporaries, not the
+    // incoming argument, so a later spill of one must not be canonicalized back
+    // to `argN` (mirrors the def-aware exclusion in the propagate_call_args path).
+    let mut clobbered_regs: HashSet<String> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for stmt in statements.into_iter() {
@@ -3719,6 +3723,11 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&lhs_var.name).into_iter().collect();
+                // Once written, this register is a local temporary for the rest
+                // of the block, not the incoming argument.
+                for alias in &written_aliases {
+                    clobbered_regs.insert(alias.to_lowercase());
+                }
                 invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
                 invalidate_tracked_compound_updated_aliases(
                     &mut compound_updated_aliases,
@@ -3751,7 +3760,8 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             }
 
             if let Some(slot_key) = stack_slot_key(&new_lhs) {
-                let stabilized_rhs = stabilize_saved_arg_registers(new_rhs);
+                let stabilized_rhs =
+                    stabilize_saved_arg_registers_excluding(new_rhs, &clobbered_regs);
                 stack_slot_values.remove(&slot_key);
                 if !expr_requires_single_evaluation(&stabilized_rhs) {
                     stack_slot_values.insert(slot_key, stabilized_rhs.clone());
@@ -3848,7 +3858,138 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         result.push(stmt);
     }
 
-    collapse_single_use_call_result_copies(result)
+    let result = collapse_single_use_call_result_copies(result);
+    collapse_single_use_temp_loads(result)
+}
+
+/// Count how many times `name` occurs as a variable/unknown identifier in
+/// `expr`, in any position (read or write).
+fn count_identifier_occurrences(expr: &Expr, name: &str) -> usize {
+    use super::super::expression::{CallTarget, ExprKind};
+
+    let here = match &expr.kind {
+        ExprKind::Var(v) => (v.name == name) as usize,
+        ExprKind::Unknown(n) => (n == name) as usize,
+        _ => 0,
+    };
+    let children = match &expr.kind {
+        ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => 0,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => count_identifier_occurrences(left, name) + count_identifier_occurrences(right, name),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => count_identifier_occurrences(operand, name),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            count_identifier_occurrences(base, name) + count_identifier_occurrences(index, name)
+        }
+        ExprKind::FieldAccess { base, .. } => count_identifier_occurrences(base, name),
+        ExprKind::Call { target, args } => {
+            let target_count = match target {
+                CallTarget::Indirect(e) | CallTarget::IndirectGot { expr: e, .. } => {
+                    count_identifier_occurrences(e, name)
+                }
+                _ => 0,
+            };
+            target_count
+                + args
+                    .iter()
+                    .map(|a| count_identifier_occurrences(a, name))
+                    .sum::<usize>()
+        }
+        ExprKind::Phi(args) => args
+            .iter()
+            .map(|a| count_identifier_occurrences(a, name))
+            .sum(),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            count_identifier_occurrences(cond, name)
+                + count_identifier_occurrences(then_expr, name)
+                + count_identifier_occurrences(else_expr, name)
+        }
+        ExprKind::GotRef { display_expr, .. } => count_identifier_occurrences(display_expr, name),
+    };
+    here + children
+}
+
+/// Collapse a temp register holding a single-evaluation value (e.g. a memory
+/// load) into its sole, immediately-following use.
+///
+/// `propagate_copies` deliberately refuses to substitute
+/// `expr_requires_single_evaluation` values (loads, derefs) to avoid
+/// duplicating a load, so `ret = arr[i]; s += ret` is left split across two
+/// statements. But when the temp is read exactly once, in the *immediately
+/// following* statement, there is no duplication and — because the use is
+/// adjacent — no intervening clobber, store, or call can change the value's
+/// meaning. In that case the load can safely fold into the use:
+/// `s += arr[i]`. Anything less constrained (a non-adjacent use, multiple
+/// uses) is left alone.
+fn collapse_single_use_temp_loads(mut statements: Vec<Expr>) -> Vec<Expr> {
+    use super::super::expression::ExprKind;
+
+    let mut i = 0usize;
+    while i + 1 < statements.len() {
+        let ExprKind::Assign { lhs, rhs } = &statements[i].kind else {
+            i += 1;
+            continue;
+        };
+        let Some(temp) = expr_simple_identifier(lhs) else {
+            i += 1;
+            continue;
+        };
+        // Only fold temp registers holding a single-evaluation value (the case
+        // copy-prop skipped); pure values were already propagated. A real call
+        // result is handled by collapse_single_use_call_result_copies. The value
+        // must not reference the temp itself (`rax = *(rax + 4)`).
+        let is_real_call =
+            matches!(&rhs.kind, ExprKind::Call { target, .. } if is_real_function_call(target));
+        if !is_temp_register(temp)
+            || !expr_requires_single_evaluation(rhs)
+            || is_real_call
+            || count_identifier_occurrences(rhs, temp) > 0
+        {
+            i += 1;
+            continue;
+        }
+        let temp = temp.to_string();
+
+        // Exactly one read of the temp across the rest of the block, and it must
+        // be in the immediately following statement, which must not also write
+        // the temp. Adjacency is what makes the move sound.
+        let next_uses = count_identifier_occurrences(&statements[i + 1], &temp);
+        let later_uses: usize = statements[i + 2..]
+            .iter()
+            .map(|s| count_identifier_occurrences(s, &temp))
+            .sum();
+        if next_uses != 1 || later_uses != 0 || stmt_writes_identifier(&statements[i + 1], &temp) {
+            i += 1;
+            continue;
+        }
+
+        let value = match &statements[i].kind {
+            ExprKind::Assign { rhs, .. } => (**rhs).clone(),
+            _ => unreachable!(),
+        };
+        let substitutions = HashMap::from([(temp, value)]);
+        statements[i + 1] = substitute_vars(&statements[i + 1], &substitutions);
+        statements.remove(i);
+        // Stay at i: the folded statement may itself now be foldable, and the
+        // loop terminates because the vector shrank.
+    }
+
+    statements
 }
 
 fn expr_simple_identifier(expr: &Expr) -> Option<&str> {
@@ -12999,6 +13140,90 @@ mod tests {
         assert_eq!(propagated.len(), 2, "{rendered:?}");
         assert_eq!(rendered[0], "var_8 = foo()", "{rendered:?}");
         assert_eq!(rendered[1], "sum = var_8 + 1", "{rendered:?}");
+    }
+
+    #[test]
+    fn test_propagate_copies_folds_single_use_load_temp_into_next_use() {
+        // `s += arr[i]` is compiled as `eax = arr[i]; s += eax`. Copy-prop won't
+        // substitute the load (it must not be duplicated), but since the temp is
+        // read exactly once in the immediately following statement the load can
+        // fold into that use. (Index/param recovery polish, feature/float-abi.)
+        let statements = vec![
+            Expr::assign(
+                reg("eax", 4),
+                Expr::array_access(local("arr", 8), local("i", 4), 4),
+            ),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(local("s", 4)),
+                    rhs: Box::new(reg("eax", 4)),
+                },
+            },
+            Expr::assign(
+                local("i", 4),
+                Expr::binop(BinOpKind::Add, local("i", 4), Expr::int(1)),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(propagated.len(), 2, "{rendered:?}");
+        assert!(
+            !rendered.iter().any(|s| s.starts_with("eax =")),
+            "the temp load assignment should be gone: {rendered:?}"
+        );
+        assert_eq!(rendered[0], "s += arr[i]", "{rendered:?}");
+    }
+
+    #[test]
+    fn test_propagate_copies_keeps_multi_use_load_temp() {
+        // A load temp read more than once must NOT fold (that would duplicate
+        // the load); the assignment is kept.
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::deref(local("p", 8), 4)),
+            Expr::assign(local("x", 4), reg("eax", 4)),
+            Expr::assign(local("y", 4), reg("eax", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(propagated.len(), 3, "{rendered:?}");
+        assert!(
+            rendered.iter().any(|s| s.starts_with("eax =")),
+            "multi-use load temp must be preserved: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_propagate_copies_excludes_clobbered_arg_register_from_spill() {
+        // esi is the 2nd integer arg, but here it is overwritten with a local
+        // load before being spilled (with an intervening statement so the load
+        // is not adjacent-foldable). The spill must keep `esi`, not be
+        // canonicalized back to `arg1`.
+        let slot = Expr::deref(
+            Expr::binop(BinOpKind::Add, reg("rbp", 8), Expr::int(-0x10)),
+            4,
+        );
+        let statements = vec![
+            Expr::assign(reg("esi", 4), Expr::deref(reg("rdi", 8), 4)),
+            Expr::assign(reg("eax", 4), Expr::int(5)),
+            Expr::assign(slot, reg("esi", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert!(
+            rendered.iter().any(|s| s.contains("= esi")),
+            "clobbered esi spill must stay esi: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|s| s.contains("arg1")),
+            "clobbered esi must not be canonicalized to arg1: {rendered:?}"
+        );
     }
 
     #[test]
