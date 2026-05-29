@@ -33,6 +33,7 @@ pub mod quality_metrics;
 pub mod riscv_vector;
 mod short_circuit;
 mod signature;
+mod stack_struct_binding;
 mod string_patterns;
 mod struct_inference;
 mod structurer;
@@ -1152,6 +1153,13 @@ impl Decompiler {
         } else {
             structured
         };
+
+        // Step 2a: Collect stack-local-struct bindings from known-prototype
+        // call sites (deferral #3). Currently scaffolding — the bindings are
+        // analyzed but not yet consumed; the call-arg / field-store rewrite
+        // lands in a follow-up commit.
+        let _stack_struct_bindings =
+            stack_struct_binding::analyze_with_builtin_db(&structured.body);
 
         // Step 2b: Run expression-level type propagation
         let mut expr_type_propagation = type_propagation::ExpressionTypePropagation::with_libc()
