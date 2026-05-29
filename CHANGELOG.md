@@ -5,6 +5,48 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.9] - 2026-05-29
+
+### Decompiler — x86-64 SysV float ABI
+
+- Recover **float parameters** (`xmm0`–`xmm7`) and the **float return type**
+  (`xmm0`) from the raw instruction stream, including `-O0` spill-only params
+  whose `movsd %xmm0,-8(%rbp)` is pruned before the structured form.
+- Fix the **x86 SSE store direction**: `movsd`/`movss` reg→mem stores decode
+  destination-first, but were lifted value-first (ARM64 order), so a float
+  param's spill store was lost and never reached the body. `f(double x, double
+  y)` now recovers `return x + y` instead of dropping the parameters.
+
+### Decompiler — variadics
+
+- Collapse the SysV `va_arg` register-save/overflow state machine into
+  `va_arg(ap, T)` and render `va_start(ap, last)`.
+- Model `rdtsc`/`rdtscp` multi-register (`edx:eax`) output.
+
+### Decompiler — `-O0` recovery polish
+
+- Reconstruct array-index dereferences as `arr[i]` from the `-O0`
+  `index << scale` / `cdqe` address chains (variable index only).
+- Recover **`void` returns** instead of surfacing a leftover loop counter: a
+  counted-loop `void` function no longer decompiles as `int … return i`.
+- Fold single-use load temps into their use, so `eax = arr[i]; s += eax`
+  renders as `s += arr[i]`.
+- Stop propagating **loop-carried** values into loop bodies during call-arg
+  propagation (no longer corrupts `i++` / `sum += p[i]`).
+- Don't canonicalize **clobbered** argument registers to `argN` (removes
+  spurious trailing parameters), and don't display non-parameter argument
+  registers as `argN`.
+
+### Robustness / hardening (fuzz-found)
+
+- Make `substitute_vars` **O(N)** and bound its build with a node budget,
+  fixing an expression-growth blowup where a self-referential `idiv`/`xor`
+  chain ballooned from 11 bytes past the RSS limit (now ~ms / bounded memory).
+- Guard constant shift folding against **shift-left overflow** in both
+  `constant_propagation::eval_binop` and the array-index shift detection
+  (a decoded shift count `>= 128` no longer panics); committed corpus
+  regression seeds for each.
+
 ## [1.3.8] - 2026-05-25
 
 ### Instruction decoding
