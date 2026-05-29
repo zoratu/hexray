@@ -2439,17 +2439,35 @@ impl<'a> Structurer<'a> {
         let mut candidate: Option<Variable> = None;
         for &pred in self.cfg.predecessors(block_id) {
             let pred_statements = self.block_to_statements(pred);
-            if let Some(expr) = Self::last_safe_return_register_expr_in_statements(&pred_statements)
-            {
-                let ExprKind::Var(var) = expr.kind else {
+            // Only adopt a predecessor's return-register write as the implicit
+            // return value when that predecessor flows UNCONDITIONALLY into the
+            // return block. A conditional predecessor — most commonly a loop
+            // condition (`mov eax, i; cmp eax, n; jl ...`) that simply falls
+            // through to the epilogue — leaves the return register holding its
+            // comparison operand, not a return value. Adopting it invents a
+            // bogus `return i` (and a non-void return type) for a void function.
+            let pred_flows_unconditionally = self.cfg.block(pred).is_some_and(|b| {
+                matches!(
+                    b.terminator,
+                    BlockTerminator::Jump { target }
+                        | BlockTerminator::Fallthrough { target }
+                        if target == block_id
+                )
+            });
+            if pred_flows_unconditionally {
+                if let Some(expr) =
+                    Self::last_safe_return_register_expr_in_statements(&pred_statements)
+                {
+                    let ExprKind::Var(var) = expr.kind else {
+                        continue;
+                    };
+                    match &candidate {
+                        Some(existing) if existing != &var => return None,
+                        Some(_) => {}
+                        None => candidate = Some(var),
+                    }
                     continue;
-                };
-                match &candidate {
-                    Some(existing) if existing != &var => return None,
-                    Some(_) => {}
-                    None => candidate = Some(var),
                 }
-                continue;
             }
 
             let Some(pred_block) = self.cfg.block(pred) else {
@@ -5429,6 +5447,54 @@ mod tests {
         cfg
     }
 
+    fn make_loop_counter_void_cfg() -> ControlFlowGraph {
+        // Mirrors a void function with a counted loop: the loop-condition block
+        // writes the counter into eax (for the compare) and conditionally
+        // branches to the empty epilogue. eax reaching `ret` is a leftover
+        // comparison operand, not a return value — the function is void.
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+
+        let mut bb0 = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        bb0.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb0);
+
+        // Loop condition: eax = <counter>; conditional branch.
+        let mut bb1 = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        bb1.instructions.push(
+            Instruction::new(0x1010, 5, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(42, 32)]),
+        );
+        bb1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(bb1);
+
+        // Loop body -> back edge.
+        let mut bb2 = BasicBlock::new(BasicBlockId::new(2), 0x1020);
+        bb2.terminator = BlockTerminator::Jump {
+            target: BasicBlockId::new(1),
+        };
+        cfg.add_block(bb2);
+
+        // Empty epilogue / return block.
+        let mut bb3 = BasicBlock::new(BasicBlockId::new(3), 0x1030);
+        bb3.terminator = BlockTerminator::Return;
+        cfg.add_block(bb3);
+
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(1));
+
+        cfg
+    }
+
     fn make_dowhile_loop_cfg() -> ControlFlowGraph {
         // bb0 -> bb1 (loop body)
         //        bb1 -> bb2 (condition at bottom)
@@ -6829,6 +6895,22 @@ mod tests {
         assert!(
             has_while,
             "While loop CFG should produce while/for structure"
+        );
+    }
+
+    #[test]
+    fn test_structurer_recovers_void_when_return_register_is_loop_condition_leftover() {
+        // The return block is empty and its only predecessor is the conditional
+        // loop-condition block, which writes eax = 42 for its compare. That eax
+        // is a leftover comparison operand, not a return value, so the implicit
+        // return must not adopt it (which would invent `return 42`).
+        let cfg = make_loop_counter_void_cfg();
+        let structured = StructuredCfg::from_cfg(&cfg);
+
+        assert!(
+            !contains_return_literal(structured.body(), 42),
+            "loop-counter leftover in eax must not be recovered as a return value: {:?}",
+            structured.body()
         );
     }
 
