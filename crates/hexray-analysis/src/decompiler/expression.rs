@@ -670,6 +670,15 @@ impl Expr {
                         if exprs_structurally_equal(&left, &right) {
                             return left;
                         }
+                        // x | ((x >> n) << n) = x, and the commuted form. The
+                        // shift pair clears the low n bits, which the `| x`
+                        // restores, leaving x. This is the 64-bit reassembly
+                        // idiom emitted for edx:eax intrinsics like rdtsc:
+                        // `eax | (edx << 32)` where both halves come from one
+                        // value reduces to that value.
+                        if let Some(x) = match_low_bits_reassembly(&left, &right) {
+                            return x;
+                        }
                         // (cmp1) | (cmp2) → (cmp1) || (cmp2) for better readability
                         if is_comparison_expr(&left) && is_comparison_expr(&right) {
                             return Self::binop(BinOpKind::LogicalOr, left, right);
@@ -1707,10 +1716,24 @@ impl Expr {
             }
             Operation::Store => {
                 if ops.len() >= 2 {
-                    Self::assign(
-                        Self::from_operand_with_inst(&ops[1], inst),
-                        Self::from_operand_with_inst(&ops[0], inst),
-                    )
+                    // A store writes to memory, so the memory operand is the
+                    // destination regardless of architecture operand order:
+                    // x86 SSE stores are destination-first (`[mem], xmm`), while
+                    // ARM64 STR is value-first (`reg, [mem]`). Pick the memory
+                    // operand as the lhs so both lift to `mem = value`.
+                    let (dst_idx, src_idx) = match (&ops[0], &ops[1]) {
+                        (Operand::Memory(_), _) => (0, 1),
+                        (_, Operand::Memory(_)) => (1, 0),
+                        // Neither operand is memory (e.g. reg-to-reg moves lifted
+                        // through Store): keep the historical value-first order.
+                        _ => (1, 0),
+                    };
+                    let lhs = if let Operand::Memory(mem) = &ops[dst_idx] {
+                        Self::from_memory_with_context(mem, inst, true)
+                    } else {
+                        Self::from_operand_with_inst(&ops[dst_idx], inst)
+                    };
+                    Self::assign(lhs, Self::from_operand_with_inst(&ops[src_idx], inst))
                 } else {
                     Self::unknown(&inst.mnemonic)
                 }
@@ -3095,6 +3118,57 @@ fn is_comparison_expr(expr: &Expr) -> bool {
     }
 }
 
+/// Matches the 64-bit reassembly idiom `x | ((x >> n) << n)` (in either
+/// operand order) and returns `x`. `(x >> n) << n` zeroes the low `n` bits,
+/// which `| x` restores, so the whole expression equals `x`. This shows up
+/// when an `edx:eax`-style split value (e.g. from `rdtsc`) is recombined with
+/// `eax | (edx << 32)` where both halves were derived from one value.
+fn match_low_bits_reassembly(left: &Expr, right: &Expr) -> Option<Expr> {
+    fn shift_pair_clears_low_bits(expr: &Expr) -> Option<(&Expr, i128)> {
+        // ((x >> n) << n) — outer Shl by n of an inner (Shr/Sar by the same n).
+        let ExprKind::BinOp {
+            op: BinOpKind::Shl,
+            left: shl_l,
+            right: shl_r,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        let ExprKind::IntLit(outer_n) = shl_r.kind else {
+            return None;
+        };
+        let ExprKind::BinOp {
+            op: BinOpKind::Shr | BinOpKind::Sar,
+            left: shr_l,
+            right: shr_r,
+        } = &shl_l.kind
+        else {
+            return None;
+        };
+        let ExprKind::IntLit(inner_n) = shr_r.kind else {
+            return None;
+        };
+        if outer_n == inner_n && outer_n > 0 {
+            Some((shr_l, outer_n))
+        } else {
+            None
+        }
+    }
+
+    // Try `x | ((x >> n) << n)` then the commuted `((x >> n) << n) | x`.
+    if let Some((inner, _)) = shift_pair_clears_low_bits(right) {
+        if exprs_structurally_equal(left, inner) {
+            return Some(left.clone());
+        }
+    }
+    if let Some((inner, _)) = shift_pair_clears_low_bits(left) {
+        if exprs_structurally_equal(right, inner) {
+            return Some(right.clone());
+        }
+    }
+    None
+}
+
 /// Checks if two expressions are structurally equal.
 /// Used for simplifications like `x - x = 0` and `x ^ x = 0`.
 fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
@@ -3949,7 +4023,7 @@ fn is_valid_ptr_base(expr: &Expr) -> bool {
 /// - `base + (index << shift)` → `base\[index\]` (where 1 << shift == size)
 ///
 /// Returns `Some(Expr::ArrayAccess { ... })` if a pattern is detected.
-fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
+pub(crate) fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
     // Pattern 1: base + index * element_size
     if let ExprKind::BinOp {
         op: BinOpKind::Add,
@@ -3981,7 +4055,14 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
 
         // Try shift patterns: base + (index << shift)
         if let Some((index, shift_amount)) = extract_shift_index(right) {
-            let element_size = 1i128 << shift_amount;
+            // Guard the shift: a fuzzed `index << N` can carry a huge or
+            // negative N that would overflow `1i128 << N`. Out-of-range shifts
+            // are never a valid element size, so fall through.
+            let element_size = if (0..i128::BITS as i128).contains(&shift_amount) {
+                1i128 << shift_amount
+            } else {
+                -1
+            };
             if element_size == size as i128 {
                 return Some(Expr::array_access(
                     (**left).clone(),
@@ -3992,7 +4073,14 @@ fn try_detect_array_in_deref(addr: &Expr, size: u8) -> Option<Expr> {
         }
 
         if let Some((index, shift_amount)) = extract_shift_index(left) {
-            let element_size = 1i128 << shift_amount;
+            // Guard the shift: a fuzzed `index << N` can carry a huge or
+            // negative N that would overflow `1i128 << N`. Out-of-range shifts
+            // are never a valid element size, so fall through.
+            let element_size = if (0..i128::BITS as i128).contains(&shift_amount) {
+                1i128 << shift_amount
+            } else {
+                -1
+            };
             if element_size == size as i128 {
                 return Some(Expr::array_access(
                     (**right).clone(),
@@ -4172,6 +4260,72 @@ mod tests {
     use hexray_core::{Architecture, Instruction, Operand, Operation, Register, RegisterClass};
 
     #[test]
+    fn array_detect_handles_oversized_shift_without_overflow() {
+        // A fuzzed `index << N` can carry N >= 128 (or negative). `1i128 << N`
+        // must not overflow-panic — the address simply isn't an array access.
+        for shift in [200i128, 128, -1, i128::MAX] {
+            let addr = Expr::binop(
+                BinOpKind::Add,
+                Expr::unknown("base"),
+                Expr::binop(BinOpKind::Shl, Expr::unknown("idx"), Expr::int(shift)),
+            );
+            // Must return (None or Some) without panicking.
+            let _ = try_detect_array_in_deref(&addr, 4);
+        }
+        // A valid shift still resolves: *(base + idx*4) via `idx << 2`.
+        let valid = Expr::binop(
+            BinOpKind::Add,
+            Expr::unknown("base"),
+            Expr::binop(BinOpKind::Shl, Expr::unknown("idx"), Expr::int(2)),
+        );
+        assert!(
+            matches!(
+                try_detect_array_in_deref(&valid, 4),
+                Some(Expr { kind: ExprKind::ArrayAccess { element_size: 4, .. } })
+            ),
+            "valid shift-by-2 with 4-byte deref should be an array access"
+        );
+    }
+
+    #[test]
+    fn test_x86_sse_store_writes_memory_destination() {
+        use hexray_core::MemoryRef;
+        // movsd %xmm0, -8(%rbp): x86 SSE store, destination(memory)-first order.
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, 64, 128);
+        let inst = Instruction::new(0x1000, 5, vec![], "movsd")
+            .with_operation(Operation::Store)
+            .with_operands(vec![
+                Operand::Memory(MemoryRef::base_disp(rbp, -8, 8)),
+                Operand::Register(xmm0),
+            ]);
+        let ExprKind::Assign { lhs, rhs } = Expr::from_instruction(&inst).kind else {
+            panic!("expected assignment");
+        };
+        // Must lift to `*(rbp-8) = xmm0`, not the reverse.
+        assert!(matches!(lhs.kind, ExprKind::Deref { .. }), "store dst must be memory");
+        assert!(matches!(&rhs.kind, ExprKind::Var(v) if v.name == "xmm0"));
+    }
+
+    #[test]
+    fn test_arm64_str_value_first_order_preserved() {
+        use hexray_core::MemoryRef;
+        // str x0, [sp, #8]: ARM64 store, value-first order — must still write memory.
+        let x0 = Register::new(Architecture::Arm64, RegisterClass::General, 0, 64);
+        let sp = Register::new(Architecture::Arm64, RegisterClass::General, 31, 64);
+        let inst = Instruction::new(0x1000, 4, vec![], "str")
+            .with_operation(Operation::Store)
+            .with_operands(vec![
+                Operand::Register(x0),
+                Operand::Memory(MemoryRef::base_disp(sp, 8, 8)),
+            ]);
+        let ExprKind::Assign { lhs, .. } = Expr::from_instruction(&inst).kind else {
+            panic!("expected assignment");
+        };
+        assert!(matches!(lhs.kind, ExprKind::Deref { .. }), "store dst must be memory");
+    }
+
+    #[test]
     fn test_constant_folding_arithmetic() {
         // 5 + 3 = 8
         let expr = Expr::binop(BinOpKind::Add, Expr::int(5), Expr::int(3));
@@ -4283,6 +4437,39 @@ mod tests {
         };
         let simplified = conditional.simplify();
         assert!(matches!(simplified.kind, ExprKind::Conditional { .. }));
+    }
+
+    #[test]
+    fn test_low_bits_reassembly_folds_to_value() {
+        // `x | ((x >> 32) << 32)` == `x` — the edx:eax reassembly idiom
+        // emitted for rdtsc/rdtscp. Both operand orders fold.
+        let x = || Expr::unknown("x");
+        let shift_pair = || {
+            Expr::binop(
+                BinOpKind::Shl,
+                Expr::binop(BinOpKind::Shr, x(), Expr::int(32)),
+                Expr::int(32),
+            )
+        };
+
+        let reassembled = Expr::binop(BinOpKind::Or, x(), shift_pair()).simplify();
+        assert!(matches!(reassembled.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        let commuted = Expr::binop(BinOpKind::Or, shift_pair(), x()).simplify();
+        assert!(matches!(commuted.kind, ExprKind::Unknown(ref s) if s == "x"));
+
+        // Negative: mismatched shift amounts must not fold.
+        let mismatched = Expr::binop(
+            BinOpKind::Or,
+            x(),
+            Expr::binop(
+                BinOpKind::Shl,
+                Expr::binop(BinOpKind::Shr, x(), Expr::int(32)),
+                Expr::int(16),
+            ),
+        )
+        .simplify();
+        assert!(matches!(mismatched.kind, ExprKind::BinOp { .. }));
     }
 
     #[test]

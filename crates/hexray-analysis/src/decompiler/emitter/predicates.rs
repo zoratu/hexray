@@ -852,12 +852,16 @@ pub(super) fn try_extract_array_access(addr: &Expr, size: u8) -> Option<(Expr, E
         }
         // Also try shift patterns: base + (index << shift) where 1 << shift == size
         if let Some((index, shift_amount)) = extract_shift_left_by_constant(right) {
-            if (1i128 << shift_amount) == size as i128 {
+            if (0..i128::BITS as i128).contains(&shift_amount)
+                && (1i128 << shift_amount) == size as i128
+            {
                 return Some(((**left).clone(), index));
             }
         }
         if let Some((index, shift_amount)) = extract_shift_left_by_constant(left) {
-            if (1i128 << shift_amount) == size as i128 {
+            if (0..i128::BITS as i128).contains(&shift_amount)
+                && (1i128 << shift_amount) == size as i128
+            {
                 return Some(((**right).clone(), index));
             }
         }

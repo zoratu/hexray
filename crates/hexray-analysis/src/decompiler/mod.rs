@@ -1250,6 +1250,11 @@ impl Decompiler {
                 .with_dwarf_param_names(self.dwarf_param_names.clone())
                 .with_current_function_kind(self.current_function_kind)
                 .with_function_name(func_name)
+                .with_float_arg_seeds(signature::scan_float_arg_registers(
+                    cfg,
+                    self.calling_convention,
+                ))
+                .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention))
                 .analyze(&structured);
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else {
@@ -2124,7 +2129,12 @@ impl Decompiler {
             .with_symbol_table(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone())
-            .with_current_function_kind(self.current_function_kind);
+            .with_current_function_kind(self.current_function_kind)
+            .with_float_arg_seeds(signature::scan_float_arg_registers(
+                cfg,
+                self.calling_convention,
+            ))
+            .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention));
         recovery.analyze(&structured)
     }
 

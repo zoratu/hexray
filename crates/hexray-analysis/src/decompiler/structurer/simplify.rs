@@ -335,7 +335,12 @@ pub(super) fn simplify_statements(nodes: Vec<StructuredNode>) -> Vec<StructuredN
     let nodes = prune_dead_register_artifacts(nodes);
 
     // Ninth pass: simplify all conditions (convert | to ||, & to && for comparisons, etc.)
-    nodes.into_iter().map(simplify_conditions_in_node).collect()
+    let nodes: Vec<_> = nodes.into_iter().map(simplify_conditions_in_node).collect();
+
+    // Tenth pass: collapse SysV `va_arg` register/overflow state machines into
+    // `va_arg(ap, T)` assignments. Runs last so the diamond's slot reads have
+    // already been folded to concrete frame offsets by copy propagation.
+    super::va_arg::recover_va_arg(nodes)
 }
 
 pub(super) fn prune_unreachable_nodes(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
@@ -3695,6 +3700,10 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
     let mut reg_values: HashMap<String, Expr> = HashMap::new();
     let mut compound_updated_aliases: HashSet<String> = HashSet::new();
     let mut stack_slot_values: HashMap<String, Expr> = HashMap::new();
+    // Registers written earlier in this block hold local temporaries, not the
+    // incoming argument, so a later spill of one must not be canonicalized back
+    // to `argN` (mirrors the def-aware exclusion in the propagate_call_args path).
+    let mut clobbered_regs: HashSet<String> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
 
     for stmt in statements.into_iter() {
@@ -3714,6 +3723,11 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             if let ExprKind::Var(lhs_var) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&lhs_var.name).into_iter().collect();
+                // Once written, this register is a local temporary for the rest
+                // of the block, not the incoming argument.
+                for alias in &written_aliases {
+                    clobbered_regs.insert(alias.to_lowercase());
+                }
                 invalidate_clobbered_register_mappings(&mut reg_values, &lhs_var.name);
                 invalidate_tracked_compound_updated_aliases(
                     &mut compound_updated_aliases,
@@ -3746,7 +3760,8 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
             }
 
             if let Some(slot_key) = stack_slot_key(&new_lhs) {
-                let stabilized_rhs = stabilize_saved_arg_registers(new_rhs);
+                let stabilized_rhs =
+                    stabilize_saved_arg_registers_excluding(new_rhs, &clobbered_regs);
                 stack_slot_values.remove(&slot_key);
                 if !expr_requires_single_evaluation(&stabilized_rhs) {
                     stack_slot_values.insert(slot_key, stabilized_rhs.clone());
@@ -3843,7 +3858,138 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
         result.push(stmt);
     }
 
-    collapse_single_use_call_result_copies(result)
+    let result = collapse_single_use_call_result_copies(result);
+    collapse_single_use_temp_loads(result)
+}
+
+/// Count how many times `name` occurs as a variable/unknown identifier in
+/// `expr`, in any position (read or write).
+fn count_identifier_occurrences(expr: &Expr, name: &str) -> usize {
+    use super::super::expression::{CallTarget, ExprKind};
+
+    let here = match &expr.kind {
+        ExprKind::Var(v) => (v.name == name) as usize,
+        ExprKind::Unknown(n) => (n == name) as usize,
+        _ => 0,
+    };
+    let children = match &expr.kind {
+        ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => 0,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign {
+            lhs: left,
+            rhs: right,
+        }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => count_identifier_occurrences(left, name) + count_identifier_occurrences(right, name),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => count_identifier_occurrences(operand, name),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            count_identifier_occurrences(base, name) + count_identifier_occurrences(index, name)
+        }
+        ExprKind::FieldAccess { base, .. } => count_identifier_occurrences(base, name),
+        ExprKind::Call { target, args } => {
+            let target_count = match target {
+                CallTarget::Indirect(e) | CallTarget::IndirectGot { expr: e, .. } => {
+                    count_identifier_occurrences(e, name)
+                }
+                _ => 0,
+            };
+            target_count
+                + args
+                    .iter()
+                    .map(|a| count_identifier_occurrences(a, name))
+                    .sum::<usize>()
+        }
+        ExprKind::Phi(args) => args
+            .iter()
+            .map(|a| count_identifier_occurrences(a, name))
+            .sum(),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            count_identifier_occurrences(cond, name)
+                + count_identifier_occurrences(then_expr, name)
+                + count_identifier_occurrences(else_expr, name)
+        }
+        ExprKind::GotRef { display_expr, .. } => count_identifier_occurrences(display_expr, name),
+    };
+    here + children
+}
+
+/// Collapse a temp register holding a single-evaluation value (e.g. a memory
+/// load) into its sole, immediately-following use.
+///
+/// `propagate_copies` deliberately refuses to substitute
+/// `expr_requires_single_evaluation` values (loads, derefs) to avoid
+/// duplicating a load, so `ret = arr[i]; s += ret` is left split across two
+/// statements. But when the temp is read exactly once, in the *immediately
+/// following* statement, there is no duplication and — because the use is
+/// adjacent — no intervening clobber, store, or call can change the value's
+/// meaning. In that case the load can safely fold into the use:
+/// `s += arr[i]`. Anything less constrained (a non-adjacent use, multiple
+/// uses) is left alone.
+fn collapse_single_use_temp_loads(mut statements: Vec<Expr>) -> Vec<Expr> {
+    use super::super::expression::ExprKind;
+
+    let mut i = 0usize;
+    while i + 1 < statements.len() {
+        let ExprKind::Assign { lhs, rhs } = &statements[i].kind else {
+            i += 1;
+            continue;
+        };
+        let Some(temp) = expr_simple_identifier(lhs) else {
+            i += 1;
+            continue;
+        };
+        // Only fold temp registers holding a single-evaluation value (the case
+        // copy-prop skipped); pure values were already propagated. A real call
+        // result is handled by collapse_single_use_call_result_copies. The value
+        // must not reference the temp itself (`rax = *(rax + 4)`).
+        let is_real_call =
+            matches!(&rhs.kind, ExprKind::Call { target, .. } if is_real_function_call(target));
+        if !is_temp_register(temp)
+            || !expr_requires_single_evaluation(rhs)
+            || is_real_call
+            || count_identifier_occurrences(rhs, temp) > 0
+        {
+            i += 1;
+            continue;
+        }
+        let temp = temp.to_string();
+
+        // Exactly one read of the temp across the rest of the block, and it must
+        // be in the immediately following statement, which must not also write
+        // the temp. Adjacency is what makes the move sound.
+        let next_uses = count_identifier_occurrences(&statements[i + 1], &temp);
+        let later_uses: usize = statements[i + 2..]
+            .iter()
+            .map(|s| count_identifier_occurrences(s, &temp))
+            .sum();
+        if next_uses != 1 || later_uses != 0 || stmt_writes_identifier(&statements[i + 1], &temp) {
+            i += 1;
+            continue;
+        }
+
+        let value = match &statements[i].kind {
+            ExprKind::Assign { rhs, .. } => (**rhs).clone(),
+            _ => unreachable!(),
+        };
+        let substitutions = HashMap::from([(temp, value)]);
+        statements[i + 1] = substitute_vars(&statements[i + 1], &substitutions);
+        statements.remove(i);
+        // Stay at i: the folded statement may itself now be foldable, and the
+        // loop terminates because the vector shrank.
+    }
+
+    statements
 }
 
 fn expr_simple_identifier(expr: &Expr) -> Option<&str> {
@@ -4612,6 +4758,124 @@ impl CallArgPropagationState {
             *stmt_idx = None;
         }
     }
+
+    /// Drop tracked values for any variable assigned inside `body` before
+    /// propagating into a loop. These variables are loop-carried — their value
+    /// at loop entry is not valid across iterations — so propagating a pre-loop
+    /// value (e.g. `i = 0`) into the body would corrupt the update
+    /// (`i = i + 1` folding to `i = 1`). Loop-invariant values survive and can
+    /// still propagate into calls inside the loop.
+    fn invalidate_loop_carried(&mut self, body: &[StructuredNode]) {
+        let mut regs: HashSet<String> = HashSet::new();
+        let mut slots: HashSet<String> = HashSet::new();
+        collect_loop_body_modifications(body, &mut regs, &mut slots);
+
+        for reg in &regs {
+            for alias in get_register_aliases(reg) {
+                let alias = alias.to_lowercase();
+                self.arg_values.remove(&alias);
+                self.reg_values.remove(&alias);
+                self.saved_temp_values.remove(&alias);
+                self.call_target_values.remove(&alias);
+                self.compound_updated_aliases.remove(&alias);
+            }
+            self.arg_values.remove(reg);
+            self.reg_values.remove(reg);
+            self.saved_temp_values.remove(reg);
+            self.call_target_values.remove(reg);
+            self.compound_updated_aliases.remove(reg);
+        }
+        for slot in &slots {
+            self.stack_slot_values.remove(slot);
+        }
+    }
+}
+
+/// Collect the register names and stack-slot keys assigned anywhere within a
+/// (loop) body, recursing into nested control flow.
+fn collect_loop_body_modifications(
+    nodes: &[StructuredNode],
+    regs: &mut HashSet<String>,
+    slots: &mut HashSet<String>,
+) {
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    collect_modified_lvalue(stmt, regs, slots);
+                }
+            }
+            StructuredNode::Expr(e) => collect_modified_lvalue(e, regs, slots),
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_loop_body_modifications(then_body, regs, slots);
+                if let Some(else_body) = else_body {
+                    collect_loop_body_modifications(else_body, regs, slots);
+                }
+            }
+            StructuredNode::While { body, .. }
+            | StructuredNode::DoWhile { body, .. }
+            | StructuredNode::Loop { body, .. } => {
+                collect_loop_body_modifications(body, regs, slots)
+            }
+            StructuredNode::For {
+                init,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(init) = init {
+                    collect_modified_lvalue(init, regs, slots);
+                }
+                if let Some(update) = update {
+                    collect_modified_lvalue(update, regs, slots);
+                }
+                collect_loop_body_modifications(body, regs, slots);
+            }
+            StructuredNode::Switch { cases, default, .. } => {
+                for (_, body) in cases {
+                    collect_loop_body_modifications(body, regs, slots);
+                }
+                if let Some(default) = default {
+                    collect_loop_body_modifications(default, regs, slots);
+                }
+            }
+            StructuredNode::Sequence(body) => collect_loop_body_modifications(body, regs, slots),
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                collect_loop_body_modifications(try_body, regs, slots);
+                for handler in catch_handlers {
+                    collect_loop_body_modifications(&handler.body, regs, slots);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_modified_lvalue(
+    stmt: &Expr,
+    regs: &mut HashSet<String>,
+    slots: &mut HashSet<String>,
+) {
+    use super::super::expression::ExprKind;
+    let lhs = match &stmt.kind {
+        ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => lhs,
+        _ => return,
+    };
+    // A frame slot (Var(Stack)/Deref/ArrayAccess off the frame) is keyed the
+    // same way the propagation state tracks it; everything else with a Var lhs
+    // is a register.
+    if let Some(key) = stack_slot_key(lhs) {
+        slots.insert(key);
+    } else if let ExprKind::Var(v) = &lhs.kind {
+        regs.insert(v.name.to_lowercase());
+    }
 }
 
 fn body_definitely_terminates(nodes: &[StructuredNode]) -> bool {
@@ -4715,11 +4979,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::While {
@@ -4737,11 +5003,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::DoWhile {
@@ -4761,11 +5029,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::For {
@@ -4784,11 +5054,13 @@ fn propagate_call_args_node_with_state(
             header,
             exit_block,
         } => {
+            let mut state = incoming_state;
+            state.invalidate_loop_carried(&body);
             let (body, _) = propagate_call_args_node_sequence_with_state(
                 body,
                 binary_data,
                 preferred_family,
-                incoming_state,
+                state,
             );
             (
                 StructuredNode::Loop {
@@ -4909,6 +5181,9 @@ fn propagate_args_in_block_with_state(
 
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
+    // Registers written earlier in this block — they hold local temporaries, not
+    // the incoming argument, so they must not be canonicalized back to `argN`.
+    let mut clobbered_regs: HashSet<String> = HashSet::new();
 
     for (i, stmt) in statements.into_iter().enumerate() {
         if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
@@ -4952,6 +5227,11 @@ fn propagate_args_in_block_with_state(
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
+                // Once written, this register is a local temporary for the rest
+                // of the block, not the incoming argument.
+                for alias in &written_aliases {
+                    clobbered_regs.insert(alias.to_lowercase());
+                }
                 invalidate_dependent_stabilized_register_values(
                     &mut state.reg_values,
                     &written_aliases,
@@ -4978,7 +5258,8 @@ fn propagate_args_in_block_with_state(
                 }
 
                 if is_temp_register(&v.name) {
-                    let stabilized_temp_rhs = stabilize_saved_arg_registers(tracked_rhs.clone());
+                    let stabilized_temp_rhs =
+                        stabilize_saved_arg_registers_excluding(tracked_rhs.clone(), &clobbered_regs);
                     // Sub-register writes (al, ah, ax, ...) must not propagate
                     // the substituted RHS at all under the canonical-name slot
                     // — `v.name` for `al` is `rax`, so storing here would let
@@ -5067,7 +5348,8 @@ fn propagate_args_in_block_with_state(
             }
 
             if let Some(slot_key) = stack_slot_key(&substituted_lhs) {
-                let stabilized_rhs = stabilize_saved_arg_registers(tracked_rhs);
+                let stabilized_rhs =
+                    stabilize_saved_arg_registers_excluding(tracked_rhs, &clobbered_regs);
                 state.stack_slot_values.remove(&slot_key);
                 if !expr_requires_single_evaluation(&stabilized_rhs) {
                     state
@@ -5814,11 +6096,24 @@ fn substitute_call_target_stack_slots(
 }
 
 fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
+    stabilize_saved_arg_registers_excluding(expr, &HashSet::new())
+}
+
+/// Canonicalize incoming argument registers to `argN`/`fargN`, but never rename
+/// a register listed in `excluded` — those have been written (clobbered) earlier
+/// in the block and so are local temporaries, not the incoming argument. (For
+/// example a loop index materialized as `rdx = i * 4` must stay `rdx`, not be
+/// rewritten to `arg2`, which would fabricate a parameter and a bogus
+/// `arr[arg2]` index.)
+fn stabilize_saved_arg_registers_excluding(expr: Expr, excluded: &HashSet<String>) -> Expr {
     use super::super::expression::ExprKind;
 
+    let rec = |e: Expr| stabilize_saved_arg_registers_excluding(e, excluded);
     match expr.kind {
         ExprKind::Var(v) => {
-            if let Some(index) = get_arg_register_index(&v.name) {
+            if excluded.contains(&v.name.to_lowercase()) {
+                Expr::var(v)
+            } else if let Some(index) = get_arg_register_index(&v.name) {
                 Expr::unknown(format!("arg{}", index))
             } else if let Some(index) = get_float_arg_register_index(&v.name) {
                 Expr::unknown(format!("farg{}", index))
@@ -5827,7 +6122,9 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             }
         }
         ExprKind::Unknown(name) => {
-            if let Some(index) = get_arg_register_index(&name) {
+            if excluded.contains(&name.to_lowercase()) {
+                Expr::unknown(name)
+            } else if let Some(index) = get_arg_register_index(&name) {
                 Expr::unknown(format!("arg{}", index))
             } else if let Some(index) = get_float_arg_register_index(&name) {
                 Expr::unknown(format!("farg{}", index))
@@ -5836,46 +6133,31 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             }
         }
         ExprKind::IntLit(_) => expr,
-        ExprKind::Deref { addr, size } => Expr::deref(stabilize_saved_arg_registers(*addr), size),
-        ExprKind::BinOp { op, left, right } => Expr::binop(
-            op,
-            stabilize_saved_arg_registers(*left),
-            stabilize_saved_arg_registers(*right),
-        ),
-        ExprKind::UnaryOp { op, operand } => {
-            Expr::unary(op, stabilize_saved_arg_registers(*operand))
-        }
-        ExprKind::Assign { lhs, rhs } => Expr::assign(
-            stabilize_saved_arg_registers(*lhs),
-            stabilize_saved_arg_registers(*rhs),
-        ),
+        ExprKind::Deref { addr, size } => Expr::deref(rec(*addr), size),
+        ExprKind::BinOp { op, left, right } => Expr::binop(op, rec(*left), rec(*right)),
+        ExprKind::UnaryOp { op, operand } => Expr::unary(op, rec(*operand)),
+        ExprKind::Assign { lhs, rhs } => Expr::assign(rec(*lhs), rec(*rhs)),
         ExprKind::CompoundAssign { op, lhs, rhs } => Expr {
             kind: ExprKind::CompoundAssign {
                 op,
-                lhs: Box::new(stabilize_saved_arg_registers(*lhs)),
-                rhs: Box::new(stabilize_saved_arg_registers(*rhs)),
+                lhs: Box::new(rec(*lhs)),
+                rhs: Box::new(rec(*rhs)),
             },
         },
-        ExprKind::AddressOf(inner) => Expr::address_of(stabilize_saved_arg_registers(*inner)),
+        ExprKind::AddressOf(inner) => Expr::address_of(rec(*inner)),
         ExprKind::ArrayAccess {
             base,
             index,
             element_size,
-        } => Expr::array_access(
-            stabilize_saved_arg_registers(*base),
-            stabilize_saved_arg_registers(*index),
-            element_size,
-        ),
+        } => Expr::array_access(rec(*base), rec(*index), element_size),
         ExprKind::FieldAccess {
             base,
             field_name,
             offset,
-        } => Expr::field_access(stabilize_saved_arg_registers(*base), field_name, offset),
+        } => Expr::field_access(rec(*base), field_name, offset),
         ExprKind::Call { target, args } => Expr::call(
             stabilize_saved_arg_call_target(target),
-            args.into_iter()
-                .map(stabilize_saved_arg_registers)
-                .collect(),
+            args.into_iter().map(rec).collect(),
         ),
         ExprKind::Cast {
             expr: inner,
@@ -5883,7 +6165,7 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             signed,
         } => Expr {
             kind: ExprKind::Cast {
-                expr: Box::new(stabilize_saved_arg_registers(*inner)),
+                expr: Box::new(rec(*inner)),
                 to_size,
                 signed,
             },
@@ -5894,7 +6176,7 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             width,
         } => Expr {
             kind: ExprKind::BitField {
-                expr: Box::new(stabilize_saved_arg_registers(*inner)),
+                expr: Box::new(rec(*inner)),
                 start,
                 width,
             },
@@ -5905,17 +6187,13 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
             else_expr,
         } => Expr {
             kind: ExprKind::Conditional {
-                cond: Box::new(stabilize_saved_arg_registers(*cond)),
-                then_expr: Box::new(stabilize_saved_arg_registers(*then_expr)),
-                else_expr: Box::new(stabilize_saved_arg_registers(*else_expr)),
+                cond: Box::new(rec(*cond)),
+                then_expr: Box::new(rec(*then_expr)),
+                else_expr: Box::new(rec(*else_expr)),
             },
         },
         ExprKind::Phi(args) => Expr {
-            kind: ExprKind::Phi(
-                args.into_iter()
-                    .map(stabilize_saved_arg_registers)
-                    .collect(),
-            ),
+            kind: ExprKind::Phi(args.into_iter().map(rec).collect()),
         },
         ExprKind::GotRef {
             address,
@@ -5928,7 +6206,7 @@ fn stabilize_saved_arg_registers(expr: Expr) -> Expr {
                 address,
                 instruction_address,
                 size,
-                display_expr: Box::new(stabilize_saved_arg_registers(*display_expr)),
+                display_expr: Box::new(rec(*display_expr)),
                 is_deref,
             },
         },
@@ -10410,6 +10688,69 @@ mod tests {
     }
 
     #[test]
+    fn test_propagate_call_args_does_not_fold_loop_carried_slot() {
+        // A loop counter initialized to 0 before the loop must not have that 0
+        // propagated into the loop body, which would corrupt `i = i + 1` into
+        // `i = 0 + 1`.
+        let slot = || Expr::deref(Expr::binop(BinOpKind::Add, reg("rbp", 8), Expr::int(-8)), 8);
+        let nodes = vec![
+            block(0, vec![Expr::assign(slot(), Expr::int(0))]),
+            StructuredNode::While {
+                condition: Expr::binop(BinOpKind::Lt, slot(), Expr::int(10)),
+                body: vec![block(
+                    1,
+                    vec![Expr::assign(
+                        slot(),
+                        Expr::binop(BinOpKind::Add, slot(), Expr::int(1)),
+                    )],
+                )],
+                header: None,
+                exit_block: None,
+            },
+        ];
+
+        let out = propagate_call_args(nodes);
+        let StructuredNode::While { body, .. } = &out[1] else {
+            panic!("expected while");
+        };
+        let StructuredNode::Block { statements, .. } = &body[0] else {
+            panic!("expected block");
+        };
+        let ExprKind::Assign { rhs, .. } = &statements[0].kind else {
+            panic!("expected assignment");
+        };
+        // The increment must still read the slot (`*(rbp-8) + 1`), not the
+        // pre-loop constant (`0 + 1`).
+        assert!(
+            rhs.to_string().contains("rbp"),
+            "loop-carried slot folded into the loop body: {}",
+            rhs
+        );
+    }
+
+    #[test]
+    fn test_stabilize_excludes_clobbered_arg_register() {
+        // `rdx` (the arg2 register) reused as a temp must not be canonicalized
+        // back to `arg2` — that would fabricate a parameter and a bogus index.
+        let expr = || Expr::deref(Expr::binop(BinOpKind::Add, reg("arg0", 8), reg("rdx", 8)), 4);
+
+        let mut excluded = HashSet::new();
+        excluded.insert("rdx".to_string());
+        let kept = stabilize_saved_arg_registers_excluding(expr(), &excluded);
+        assert!(
+            kept.to_string().contains("rdx") && !kept.to_string().contains("arg2"),
+            "clobbered rdx must stay rdx: {kept}"
+        );
+
+        // Without exclusion an unwritten arg register is still canonicalized.
+        let canon = stabilize_saved_arg_registers_excluding(expr(), &HashSet::new());
+        assert!(
+            canon.to_string().contains("arg2"),
+            "an unclobbered arg register should canonicalize: {canon}"
+        );
+    }
+
+    #[test]
     fn test_propagate_call_args_substitutes_temp_rhs() {
         let statements = vec![
             Expr::assign(reg("eax", 4), Expr::unknown("n")),
@@ -12920,6 +13261,90 @@ mod tests {
         assert_eq!(propagated.len(), 2, "{rendered:?}");
         assert_eq!(rendered[0], "var_8 = foo()", "{rendered:?}");
         assert_eq!(rendered[1], "sum = var_8 + 1", "{rendered:?}");
+    }
+
+    #[test]
+    fn test_propagate_copies_folds_single_use_load_temp_into_next_use() {
+        // `s += arr[i]` is compiled as `eax = arr[i]; s += eax`. Copy-prop won't
+        // substitute the load (it must not be duplicated), but since the temp is
+        // read exactly once in the immediately following statement the load can
+        // fold into that use. (Index/param recovery polish, feature/float-abi.)
+        let statements = vec![
+            Expr::assign(
+                reg("eax", 4),
+                Expr::array_access(local("arr", 8), local("i", 4), 4),
+            ),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(local("s", 4)),
+                    rhs: Box::new(reg("eax", 4)),
+                },
+            },
+            Expr::assign(
+                local("i", 4),
+                Expr::binop(BinOpKind::Add, local("i", 4), Expr::int(1)),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(propagated.len(), 2, "{rendered:?}");
+        assert!(
+            !rendered.iter().any(|s| s.starts_with("eax =")),
+            "the temp load assignment should be gone: {rendered:?}"
+        );
+        assert_eq!(rendered[0], "s += arr[i]", "{rendered:?}");
+    }
+
+    #[test]
+    fn test_propagate_copies_keeps_multi_use_load_temp() {
+        // A load temp read more than once must NOT fold (that would duplicate
+        // the load); the assignment is kept.
+        let statements = vec![
+            Expr::assign(reg("eax", 4), Expr::deref(local("p", 8), 4)),
+            Expr::assign(local("x", 4), reg("eax", 4)),
+            Expr::assign(local("y", 4), reg("eax", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(propagated.len(), 3, "{rendered:?}");
+        assert!(
+            rendered.iter().any(|s| s.starts_with("eax =")),
+            "multi-use load temp must be preserved: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_propagate_copies_excludes_clobbered_arg_register_from_spill() {
+        // esi is the 2nd integer arg, but here it is overwritten with a local
+        // load before being spilled (with an intervening statement so the load
+        // is not adjacent-foldable). The spill must keep `esi`, not be
+        // canonicalized back to `arg1`.
+        let slot = Expr::deref(
+            Expr::binop(BinOpKind::Add, reg("rbp", 8), Expr::int(-0x10)),
+            4,
+        );
+        let statements = vec![
+            Expr::assign(reg("esi", 4), Expr::deref(reg("rdi", 8), 4)),
+            Expr::assign(reg("eax", 4), Expr::int(5)),
+            Expr::assign(slot, reg("esi", 4)),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert!(
+            rendered.iter().any(|s| s.contains("= esi")),
+            "clobbered esi spill must stay esi: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|s| s.contains("arg1")),
+            "clobbered esi must not be canonicalized to arg1: {rendered:?}"
+        );
     }
 
     #[test]
