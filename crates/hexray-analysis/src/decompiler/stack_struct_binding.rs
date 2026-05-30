@@ -626,12 +626,9 @@ fn transform_expr(
                 {
                     if let Some(binding) = bindings.containing(byte_off) {
                         let rel = (byte_off - binding.stack_offset) as usize;
-                        if let Some(field_expr) = field_access_for_struct_offset(
-                            binding,
-                            rel,
-                            *element_size as usize,
-                            db,
-                        ) {
+                        if let Some(field_expr) =
+                            field_access_for_struct_offset(binding, rel, *element_size, db)
+                        {
                             return field_expr;
                         }
                     }
