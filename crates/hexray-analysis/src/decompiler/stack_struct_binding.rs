@@ -31,8 +31,9 @@ use hexray_types::builtin::posix::load_posix_types;
 use hexray_types::database::TypeDatabase;
 use hexray_types::types::CType;
 
-use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
-use super::structurer::StructuredNode;
+use super::expression::{BinOpKind, CallTarget, Expr, ExprKind, VarKind, Variable};
+use super::structurer::{CatchHandler, StructuredNode};
+use super::BinaryDataContext;
 
 /// A stack region recognised as a typed struct via a known call prototype.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,10 +55,6 @@ pub struct StackStructBindings {
     by_offset: BTreeMap<i64, StackStructBinding>,
 }
 
-// `is_empty`/`len`/`get`/`iter` are the API the follow-up rewrite pass will
-// consume; tests already exercise them. Suppress the dead-code warning until
-// the transform commit lands.
-#[allow(dead_code)]
 impl StackStructBindings {
     pub fn new() -> Self {
         Self::default()
@@ -67,13 +64,22 @@ impl StackStructBindings {
         self.by_offset.is_empty()
     }
 
+    #[allow(dead_code)] // kept for API symmetry with `is_empty`
     pub fn len(&self) -> usize {
         self.by_offset.len()
     }
 
-    /// Look up the binding for a stack offset, if any.
+    /// Look up the binding whose base equals this stack offset, if any.
     pub fn get(&self, stack_offset: i64) -> Option<&StackStructBinding> {
         self.by_offset.get(&stack_offset)
+    }
+
+    /// Look up the binding whose region `[stack_offset, stack_offset + size)`
+    /// contains the given stack offset.
+    pub fn containing(&self, stack_offset: i64) -> Option<&StackStructBinding> {
+        self.by_offset.values().find(|b| {
+            stack_offset >= b.stack_offset && stack_offset < b.stack_offset + b.size as i64
+        })
     }
 
     /// Iterate the collected bindings in offset order.
@@ -83,19 +89,29 @@ impl StackStructBindings {
 
     /// Walk `nodes`, look up each `Call`'s prototype in `db`, and bind any
     /// stack-address argument whose matching prototype parameter is `T*` for a
-    /// known struct `T` in `db`.
-    pub fn analyze(&mut self, nodes: &[StructuredNode], db: &TypeDatabase) {
+    /// known struct `T` in `db`. `binary_data` (if provided) resolves
+    /// `CallTarget::Direct` addresses to names via the symbol/PLT table —
+    /// without it, only already-named call sites are considered.
+    pub fn analyze(
+        &mut self,
+        nodes: &[StructuredNode],
+        db: &TypeDatabase,
+        binary_data: Option<&BinaryDataContext>,
+    ) {
         for n in nodes {
-            visit_node(n, db, self);
+            visit_node(n, db, binary_data, self);
         }
     }
 }
 
 /// Run [`StackStructBindings::analyze`] against the built-in posix/linux/libc
 /// type database (cached after first use). The pipeline call site uses this.
-pub fn analyze_with_builtin_db(nodes: &[StructuredNode]) -> StackStructBindings {
+pub fn analyze_with_builtin_db(
+    nodes: &[StructuredNode],
+    binary_data: Option<&BinaryDataContext>,
+) -> StackStructBindings {
     let mut bindings = StackStructBindings::new();
-    bindings.analyze(nodes, builtin_db());
+    bindings.analyze(nodes, builtin_db(), binary_data);
     bindings
 }
 
@@ -110,12 +126,17 @@ fn builtin_db() -> &'static TypeDatabase {
     })
 }
 
-fn visit_node(node: &StructuredNode, db: &TypeDatabase, out: &mut StackStructBindings) {
+fn visit_node(
+    node: &StructuredNode,
+    db: &TypeDatabase,
+    binary_data: Option<&BinaryDataContext>,
+    out: &mut StackStructBindings,
+) {
     use StructuredNode as N;
     match node {
         N::Block { statements, .. } => {
             for s in statements {
-                visit_expr(s, db, out);
+                visit_expr(s, db, binary_data, out);
             }
         }
         N::If {
@@ -123,13 +144,13 @@ fn visit_node(node: &StructuredNode, db: &TypeDatabase, out: &mut StackStructBin
             then_body,
             else_body,
         } => {
-            visit_expr(condition, db, out);
+            visit_expr(condition, db, binary_data, out);
             for n in then_body {
-                visit_node(n, db, out);
+                visit_node(n, db, binary_data, out);
             }
             if let Some(eb) = else_body {
                 for n in eb {
-                    visit_node(n, db, out);
+                    visit_node(n, db, binary_data, out);
                 }
             }
         }
@@ -139,9 +160,9 @@ fn visit_node(node: &StructuredNode, db: &TypeDatabase, out: &mut StackStructBin
         | N::DoWhile {
             condition, body, ..
         } => {
-            visit_expr(condition, db, out);
+            visit_expr(condition, db, binary_data, out);
             for n in body {
-                visit_node(n, db, out);
+                visit_node(n, db, binary_data, out);
             }
         }
         N::For {
@@ -152,19 +173,19 @@ fn visit_node(node: &StructuredNode, db: &TypeDatabase, out: &mut StackStructBin
             ..
         } => {
             if let Some(e) = init {
-                visit_expr(e, db, out);
+                visit_expr(e, db, binary_data, out);
             }
-            visit_expr(condition, db, out);
+            visit_expr(condition, db, binary_data, out);
             if let Some(e) = update {
-                visit_expr(e, db, out);
+                visit_expr(e, db, binary_data, out);
             }
             for n in body {
-                visit_node(n, db, out);
+                visit_node(n, db, binary_data, out);
             }
         }
         N::Loop { body, .. } => {
             for n in body {
-                visit_node(n, db, out);
+                visit_node(n, db, binary_data, out);
             }
         }
         N::Switch {
@@ -172,21 +193,21 @@ fn visit_node(node: &StructuredNode, db: &TypeDatabase, out: &mut StackStructBin
             cases,
             default,
         } => {
-            visit_expr(value, db, out);
+            visit_expr(value, db, binary_data, out);
             for (_, body) in cases {
                 for n in body {
-                    visit_node(n, db, out);
+                    visit_node(n, db, binary_data, out);
                 }
             }
             if let Some(d) = default {
                 for n in d {
-                    visit_node(n, db, out);
+                    visit_node(n, db, binary_data, out);
                 }
             }
         }
         N::Sequence(body) => {
             for n in body {
-                visit_node(n, db, out);
+                visit_node(n, db, binary_data, out);
             }
         }
         N::TryCatch {
@@ -194,60 +215,70 @@ fn visit_node(node: &StructuredNode, db: &TypeDatabase, out: &mut StackStructBin
             catch_handlers,
         } => {
             for n in try_body {
-                visit_node(n, db, out);
+                visit_node(n, db, binary_data, out);
             }
             for h in catch_handlers {
                 for n in &h.body {
-                    visit_node(n, db, out);
+                    visit_node(n, db, binary_data, out);
                 }
             }
         }
-        N::Expr(e) | N::Return(Some(e)) => visit_expr(e, db, out),
+        N::Expr(e) | N::Return(Some(e)) => visit_expr(e, db, binary_data, out),
         _ => {}
     }
 }
 
-fn visit_expr(expr: &Expr, db: &TypeDatabase, out: &mut StackStructBindings) {
+fn visit_expr(
+    expr: &Expr,
+    db: &TypeDatabase,
+    binary_data: Option<&BinaryDataContext>,
+    out: &mut StackStructBindings,
+) {
     if let ExprKind::Call { target, args } = &expr.kind {
-        try_bind_call(target, args, db, out);
+        try_bind_call(target, args, db, binary_data, out);
     }
-    walk_children(expr, db, out);
+    walk_children(expr, db, binary_data, out);
 }
 
-fn walk_children(expr: &Expr, db: &TypeDatabase, out: &mut StackStructBindings) {
+fn walk_children(
+    expr: &Expr,
+    db: &TypeDatabase,
+    binary_data: Option<&BinaryDataContext>,
+    out: &mut StackStructBindings,
+) {
     use ExprKind as K;
     match &expr.kind {
         K::Call { args, .. } | K::Phi(args) => {
             for a in args {
-                visit_expr(a, db, out);
+                visit_expr(a, db, binary_data, out);
             }
         }
         K::Assign { lhs, rhs } | K::CompoundAssign { lhs, rhs, .. } => {
-            visit_expr(lhs, db, out);
-            visit_expr(rhs, db, out);
+            visit_expr(lhs, db, binary_data, out);
+            visit_expr(rhs, db, binary_data, out);
         }
         K::BinOp { left, right, .. } => {
-            visit_expr(left, db, out);
-            visit_expr(right, db, out);
+            visit_expr(left, db, binary_data, out);
+            visit_expr(right, db, binary_data, out);
         }
         K::UnaryOp { operand, .. }
         | K::Deref { addr: operand, .. }
         | K::AddressOf(operand)
         | K::Cast { expr: operand, .. }
-        | K::BitField { expr: operand, .. } => visit_expr(operand, db, out),
+        | K::BitField { expr: operand, .. } => visit_expr(operand, db, binary_data, out),
         K::ArrayAccess { base, index, .. } => {
-            visit_expr(base, db, out);
-            visit_expr(index, db, out);
+            visit_expr(base, db, binary_data, out);
+            visit_expr(index, db, binary_data, out);
         }
-        K::FieldAccess { base, .. } => visit_expr(base, db, out),
+        K::FieldAccess { base, .. } => visit_expr(base, db, binary_data, out),
         K::Conditional {
             cond,
             then_expr,
             else_expr,
         } => {
-            visit_expr(cond, db, out);
-            visit_expr(then_expr, db, out);
-            visit_expr(else_expr, db, out);
+            visit_expr(cond, db, binary_data, out);
+            visit_expr(then_expr, db, binary_data, out);
+            visit_expr(else_expr, db, binary_data, out);
         }
         _ => {}
     }
@@ -257,12 +288,13 @@ fn try_bind_call(
     target: &CallTarget,
     args: &[Expr],
     db: &TypeDatabase,
+    binary_data: Option<&BinaryDataContext>,
     out: &mut StackStructBindings,
 ) {
-    let CallTarget::Named(name) = target else {
+    let Some(name) = resolve_call_name(target, binary_data) else {
         return;
     };
-    let normalized = normalize_call_name(name);
+    let normalized = normalize_call_name(&name);
     let Some(proto) = db.get_function(normalized) else {
         return;
     };
@@ -288,6 +320,25 @@ fn try_bind_call(
                 type_name,
                 local_name,
             });
+    }
+}
+
+/// Resolve a `CallTarget` to a textual function name. `Named` is trivial;
+/// `Direct { target, call_site }` consults the binary's symbol/PLT table via
+/// `binary_data` (so e.g. `epoll_ctl@GLIBC_2.3.2` resolves correctly).
+/// `Indirect` / `IndirectGot` are not bound (no static name).
+fn resolve_call_name(
+    target: &CallTarget,
+    binary_data: Option<&BinaryDataContext>,
+) -> Option<String> {
+    match target {
+        CallTarget::Named(n) => Some(n.clone()),
+        CallTarget::Direct { target, call_site } => binary_data.and_then(|ctx| {
+            ctx.call_target_name_by_call_site(*call_site)
+                .or_else(|| ctx.call_target_name_by_address(*target))
+                .map(str::to_string)
+        }),
+        CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => None,
     }
 }
 
@@ -359,6 +410,405 @@ fn synthesize_local_name(type_name: &str, offset: i64) -> String {
     format!("{}_{:x}", short, offset.unsigned_abs())
 }
 
+// ----- Rewrite -----------------------------------------------------------
+//
+// `apply_bindings` consumes a structured body together with the
+// `StackStructBindings` collected by `analyze` and rewrites:
+//   - `Add(frame_reg, K)` for bound `K`         → `AddressOf(Var(<local>))`
+//   - `Var(local_<hex>)` whose decoded offset
+//     lands at a top-level struct field offset → `<local>.<field>`
+//
+// Stack stores at offsets that don't match an exact top-level field
+// (interior union/array bytes, padding) are intentionally left alone for
+// now — a follow-up commit can refine those once the basic shape works.
+
+/// Apply the collected bindings to the structured body.
+pub fn apply_bindings(
+    nodes: Vec<StructuredNode>,
+    bindings: &StackStructBindings,
+) -> Vec<StructuredNode> {
+    if bindings.is_empty() {
+        return nodes;
+    }
+    let db = builtin_db();
+    nodes
+        .iter()
+        .map(|n| transform_node(n, bindings, db))
+        .collect()
+}
+
+fn transform_node(
+    node: &StructuredNode,
+    bindings: &StackStructBindings,
+    db: &TypeDatabase,
+) -> StructuredNode {
+    use StructuredNode as N;
+    match node {
+        N::Block {
+            id,
+            statements,
+            address_range,
+        } => N::Block {
+            id: *id,
+            statements: statements
+                .iter()
+                .map(|e| transform_expr(e, bindings, db))
+                .collect(),
+            address_range: *address_range,
+        },
+        N::If {
+            condition,
+            then_body,
+            else_body,
+        } => N::If {
+            condition: transform_expr(condition, bindings, db),
+            then_body: then_body
+                .iter()
+                .map(|n| transform_node(n, bindings, db))
+                .collect(),
+            else_body: else_body
+                .as_ref()
+                .map(|b| b.iter().map(|n| transform_node(n, bindings, db)).collect()),
+        },
+        N::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => N::While {
+            condition: transform_expr(condition, bindings, db),
+            body: body
+                .iter()
+                .map(|n| transform_node(n, bindings, db))
+                .collect(),
+            header: *header,
+            exit_block: *exit_block,
+        },
+        N::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => N::DoWhile {
+            body: body
+                .iter()
+                .map(|n| transform_node(n, bindings, db))
+                .collect(),
+            condition: transform_expr(condition, bindings, db),
+            header: *header,
+            exit_block: *exit_block,
+        },
+        N::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => N::For {
+            init: init.as_ref().map(|e| transform_expr(e, bindings, db)),
+            condition: transform_expr(condition, bindings, db),
+            update: update.as_ref().map(|e| transform_expr(e, bindings, db)),
+            body: body
+                .iter()
+                .map(|n| transform_node(n, bindings, db))
+                .collect(),
+            header: *header,
+            exit_block: *exit_block,
+        },
+        N::Loop {
+            body,
+            header,
+            exit_block,
+        } => N::Loop {
+            body: body
+                .iter()
+                .map(|n| transform_node(n, bindings, db))
+                .collect(),
+            header: *header,
+            exit_block: *exit_block,
+        },
+        N::Switch {
+            value,
+            cases,
+            default,
+        } => N::Switch {
+            value: transform_expr(value, bindings, db),
+            cases: cases
+                .iter()
+                .map(|(vals, body)| {
+                    (
+                        vals.clone(),
+                        body.iter()
+                            .map(|n| transform_node(n, bindings, db))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            default: default
+                .as_ref()
+                .map(|b| b.iter().map(|n| transform_node(n, bindings, db)).collect()),
+        },
+        N::Sequence(body) => N::Sequence(
+            body.iter()
+                .map(|n| transform_node(n, bindings, db))
+                .collect(),
+        ),
+        N::TryCatch {
+            try_body,
+            catch_handlers,
+        } => N::TryCatch {
+            try_body: try_body
+                .iter()
+                .map(|n| transform_node(n, bindings, db))
+                .collect(),
+            catch_handlers: catch_handlers
+                .iter()
+                .map(|h| CatchHandler {
+                    exception_type: h.exception_type.clone(),
+                    variable_name: h.variable_name.clone(),
+                    body: h
+                        .body
+                        .iter()
+                        .map(|n| transform_node(n, bindings, db))
+                        .collect(),
+                    landing_pad: h.landing_pad,
+                })
+                .collect(),
+        },
+        N::Expr(e) => N::Expr(transform_expr(e, bindings, db)),
+        N::Return(opt) => {
+            N::Return(opt.as_ref().map(|e| transform_expr(e, bindings, db)))
+        }
+        other => other.clone(),
+    }
+}
+
+fn transform_expr(
+    expr: &Expr,
+    bindings: &StackStructBindings,
+    db: &TypeDatabase,
+) -> Expr {
+    use ExprKind as K;
+
+    // Case A: `Deref(Add(frame, K), size)` whose `K` lands inside a bound
+    // region and whose `size` matches an exact top-level field there →
+    // `<local>.<field>`. Covers `mov [rbp-K], …` lifts that came through as
+    // a Deref.
+    if let K::Deref { addr, size } = &expr.kind {
+        if let Some(addr_off) = stack_offset_of_address(addr) {
+            if let Some(binding) = bindings.containing(addr_off) {
+                let rel = (addr_off - binding.stack_offset) as usize;
+                if let Some(field_expr) =
+                    field_access_for_struct_offset(binding, rel, *size as usize, db)
+                {
+                    return field_expr;
+                }
+            }
+        }
+    }
+
+    // Case A2: `ArrayAccess(Var(frame), IntLit(index), element_size)` whose
+    // byte offset `index * element_size` lands at a bound field — the
+    // production shape for plain `mov [rbp-N], reg` lifts. Same field-match
+    // rule as Case A.
+    if let K::ArrayAccess {
+        base,
+        index,
+        element_size,
+    } = &expr.kind
+    {
+        if let (K::Var(v), K::IntLit(k)) = (&base.kind, &index.kind) {
+            if is_frame_register(&v.name) {
+                if let Some(byte_off) = (*k)
+                    .checked_mul(*element_size as i128)
+                    .and_then(|p| i64::try_from(p).ok())
+                {
+                    if let Some(binding) = bindings.containing(byte_off) {
+                        let rel = (byte_off - binding.stack_offset) as usize;
+                        if let Some(field_expr) = field_access_for_struct_offset(
+                            binding,
+                            rel,
+                            *element_size as usize,
+                            db,
+                        ) {
+                            return field_expr;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Case B: Bare bound stack address (call-arg form).
+    if let Some(off) = stack_offset_of_address(expr) {
+        if let Some(binding) = bindings.get(off) {
+            return Expr::address_of(struct_local_expr(binding));
+        }
+    }
+
+    // Case C: Bare `Var(local_<hex>)` that lands at an exact field offset.
+    // (Some pipelines hand us already-named stack slots — handle them too.)
+    if let K::Var(v) = &expr.kind {
+        if let Some(field_expr) = field_access_for_local_var(v, bindings, db) {
+            return field_expr;
+        }
+    }
+
+    // Case D: Recurse, transforming each subexpression.
+    let kind = match &expr.kind {
+        K::Var(_) | K::Unknown(_) | K::IntLit(_) => return expr.clone(),
+        K::BinOp { op, left, right } => K::BinOp {
+            op: *op,
+            left: Box::new(transform_expr(left, bindings, db)),
+            right: Box::new(transform_expr(right, bindings, db)),
+        },
+        K::UnaryOp { op, operand } => K::UnaryOp {
+            op: *op,
+            operand: Box::new(transform_expr(operand, bindings, db)),
+        },
+        K::Assign { lhs, rhs } => K::Assign {
+            lhs: Box::new(transform_expr(lhs, bindings, db)),
+            rhs: Box::new(transform_expr(rhs, bindings, db)),
+        },
+        K::CompoundAssign { op, lhs, rhs } => K::CompoundAssign {
+            op: *op,
+            lhs: Box::new(transform_expr(lhs, bindings, db)),
+            rhs: Box::new(transform_expr(rhs, bindings, db)),
+        },
+        K::Deref { addr, size } => K::Deref {
+            addr: Box::new(transform_expr(addr, bindings, db)),
+            size: *size,
+        },
+        K::AddressOf(inner) => K::AddressOf(Box::new(transform_expr(inner, bindings, db))),
+        K::Cast {
+            expr: inner,
+            to_size,
+            signed,
+        } => K::Cast {
+            expr: Box::new(transform_expr(inner, bindings, db)),
+            to_size: *to_size,
+            signed: *signed,
+        },
+        K::BitField {
+            expr: inner,
+            start,
+            width,
+        } => K::BitField {
+            expr: Box::new(transform_expr(inner, bindings, db)),
+            start: *start,
+            width: *width,
+        },
+        K::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => K::ArrayAccess {
+            base: Box::new(transform_expr(base, bindings, db)),
+            index: Box::new(transform_expr(index, bindings, db)),
+            element_size: *element_size,
+        },
+        K::FieldAccess {
+            base,
+            field_name,
+            offset,
+        } => K::FieldAccess {
+            base: Box::new(transform_expr(base, bindings, db)),
+            field_name: field_name.clone(),
+            offset: *offset,
+        },
+        K::Call { target, args } => K::Call {
+            target: target.clone(),
+            args: args
+                .iter()
+                .map(|a| transform_expr(a, bindings, db))
+                .collect(),
+        },
+        K::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => K::Conditional {
+            cond: Box::new(transform_expr(cond, bindings, db)),
+            then_expr: Box::new(transform_expr(then_expr, bindings, db)),
+            else_expr: Box::new(transform_expr(else_expr, bindings, db)),
+        },
+        K::Phi(args) => K::Phi(
+            args.iter()
+                .map(|a| transform_expr(a, bindings, db))
+                .collect(),
+        ),
+        _ => return expr.clone(),
+    };
+    Expr { kind }
+}
+
+/// Look up the top-level field of `binding`'s struct at the given relative
+/// offset and, if its declared size matches `access_size`, build the
+/// `<local>.<field>` expression. Returns None for interior offsets (union /
+/// array members), padding, or size mismatches.
+fn field_access_for_struct_offset(
+    binding: &StackStructBinding,
+    rel_offset: usize,
+    access_size: usize,
+    db: &TypeDatabase,
+) -> Option<Expr> {
+    let CType::Struct(s) = db.get_type(&binding.type_name)? else {
+        return None;
+    };
+    let field = s.fields.iter().find(|f| f.offset == rel_offset)?;
+    let field_size = field.field_type.size()?;
+    if access_size != field_size {
+        return None;
+    }
+    Some(Expr::field_access(
+        struct_local_expr(binding),
+        field.name.clone(),
+        rel_offset,
+    ))
+}
+
+/// If `var` is named `local_<hex>` and its decoded stack offset matches an
+/// exact top-level field of a bound struct (same offset, same size), return
+/// the `<local>.<field>` field-access expression. Otherwise None.
+fn field_access_for_local_var(
+    var: &Variable,
+    bindings: &StackStructBindings,
+    db: &TypeDatabase,
+) -> Option<Expr> {
+    let local_offset = parse_local_name_offset(&var.name)?;
+    let binding = bindings.containing(local_offset)?;
+    let rel = (local_offset - binding.stack_offset) as usize;
+    // Be tolerant if the var's size hasn't been recovered.
+    let access_size = if var.size == 0 {
+        let CType::Struct(s) = db.get_type(&binding.type_name)? else {
+            return None;
+        };
+        s.fields.iter().find(|f| f.offset == rel)?.field_type.size()?
+    } else {
+        var.size as usize
+    };
+    field_access_for_struct_offset(binding, rel, access_size, db)
+}
+
+/// Construct the `Var(<binding.local_name>)` expression for a binding.
+fn struct_local_expr(binding: &StackStructBinding) -> Expr {
+    let size = binding.size.min(u8::MAX as usize) as u8;
+    Expr::var(Variable {
+        kind: VarKind::Stack(binding.stack_offset),
+        name: binding.local_name.clone(),
+        size,
+    })
+}
+
+/// Decode the `local_<hex>` stack-slot naming convention back to a signed
+/// frame offset. `local_14` → `-0x14`. Names that don't match return None.
+fn parse_local_name_offset(name: &str) -> Option<i64> {
+    let hex = name.strip_prefix("local_")?;
+    let abs = i64::from_str_radix(hex, 16).ok()?;
+    Some(-abs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,7 +854,7 @@ mod tests {
         );
 
         let mut bindings = StackStructBindings::new();
-        bindings.analyze(&[block(vec![call])], &full_db());
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
 
         assert_eq!(bindings.len(), 1, "expected exactly one binding");
         let b = bindings.get(-20).expect("binding at -20");
@@ -426,7 +876,7 @@ mod tests {
             ],
         );
         let mut bindings = StackStructBindings::new();
-        bindings.analyze(&[block(vec![call])], &full_db());
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
         assert!(bindings.is_empty());
     }
 
@@ -438,7 +888,7 @@ mod tests {
             vec![rbp_plus(-20)],
         );
         let mut bindings = StackStructBindings::new();
-        bindings.analyze(&[block(vec![call])], &full_db());
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
         assert!(bindings.is_empty());
     }
 
@@ -451,7 +901,7 @@ mod tests {
             vec![rbp_plus(-20), Expr::int(0), Expr::int(12)],
         );
         let mut bindings = StackStructBindings::new();
-        bindings.analyze(&[block(vec![call])], &full_db());
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
         assert!(bindings.is_empty());
     }
 
@@ -467,5 +917,172 @@ mod tests {
         assert_eq!(synthesize_local_name("struct epoll_event", -20), "epoll_event_14");
         assert_eq!(synthesize_local_name("struct clone_args", -0x90), "clone_args_90");
         assert_eq!(synthesize_local_name("union epoll_data", -16), "epoll_data_10");
+    }
+
+    fn epoll_ctl_with_stack_arg() -> Expr {
+        Expr::call(
+            CallTarget::Named("epoll_ctl".to_string()),
+            vec![Expr::int(3), Expr::int(1), Expr::int(0), rbp_plus(-20)],
+        )
+    }
+
+    fn run_apply(body: Vec<StructuredNode>) -> Vec<StructuredNode> {
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&body, &full_db(), None);
+        apply_bindings(body, &bindings)
+    }
+
+    #[test]
+    fn apply_bindings_rewrites_stack_address_arg_to_address_of_struct_local() {
+        let body = vec![block(vec![epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Call { args, .. } = &statements[0].kind else {
+            panic!("expected call, got {:?}", statements[0].kind)
+        };
+        let ExprKind::AddressOf(inner) = &args.last().unwrap().kind else {
+            panic!("expected AddressOf, got {:?}", args.last().unwrap().kind)
+        };
+        let ExprKind::Var(v) = &inner.kind else {
+            panic!("expected Var inside AddressOf, got {:?}", inner.kind)
+        };
+        assert_eq!(v.name, "epoll_event_14");
+        assert!(matches!(v.kind, VarKind::Stack(-0x14)));
+    }
+
+    #[test]
+    fn apply_bindings_rewrites_field_offset_assignment_to_struct_field_access() {
+        // local_14 (stack offset -0x14, size 4) lands exactly at
+        // `epoll_event_14.events` (offset 0, u32).
+        let lhs = Expr::var(Variable {
+            kind: VarKind::Stack(-0x14),
+            name: "local_14".to_string(),
+            size: 4,
+        });
+        let store = Expr::assign(lhs, Expr::int(8193));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign, got {:?}", statements[0].kind)
+        };
+        let ExprKind::FieldAccess {
+            base, field_name, ..
+        } = &lhs.kind
+        else {
+            panic!("expected FieldAccess LHS, got {:?}", lhs.kind)
+        };
+        assert_eq!(field_name, "events");
+        let ExprKind::Var(v) = &base.kind else {
+            panic!("expected Var base, got {:?}", base.kind)
+        };
+        assert_eq!(v.name, "epoll_event_14");
+    }
+
+    #[test]
+    fn apply_bindings_leaves_interior_offset_store_untouched() {
+        // local_c (stack offset -0xc = struct offset 8) lands INSIDE the
+        // `data` union, not at any top-level field offset. Must stay as-is.
+        let lhs = Expr::var(Variable {
+            kind: VarKind::Stack(-0xc),
+            name: "local_c".to_string(),
+            size: 4,
+        });
+        let store = Expr::assign(lhs, Expr::int(0));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign")
+        };
+        let ExprKind::Var(v) = &lhs.kind else {
+            panic!("expected Var LHS (no rewrite), got {:?}", lhs.kind)
+        };
+        assert_eq!(v.name, "local_c");
+    }
+
+    #[test]
+    fn apply_bindings_leaves_unrelated_local_untouched() {
+        // local_1c is outside the bound region [-0x14, -0x14+12) = [-0x14, -0x8).
+        let lhs = Expr::var(Variable {
+            kind: VarKind::Stack(-0x1c),
+            name: "local_1c".to_string(),
+            size: 4,
+        });
+        let store = Expr::assign(lhs, Expr::int(7));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign")
+        };
+        let ExprKind::Var(v) = &lhs.kind else {
+            panic!("expected Var LHS (no rewrite)")
+        };
+        assert_eq!(v.name, "local_1c");
+    }
+
+    #[test]
+    fn apply_bindings_rewrites_deref_field_store() {
+        // The production shape `*(int*)(rbp - 20) = 8193` lifts as
+        // Deref(Add(rbp, -20), 4) = 8193 — Case A.
+        let lhs = Expr::deref(rbp_plus(-20), 4);
+        let store = Expr::assign(lhs, Expr::int(8193));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign")
+        };
+        let ExprKind::FieldAccess { field_name, .. } = &lhs.kind else {
+            panic!("expected FieldAccess LHS, got {:?}", lhs.kind)
+        };
+        assert_eq!(field_name, "events");
+    }
+
+    #[test]
+    fn apply_bindings_rewrites_array_access_field_store() {
+        // The production shape `mov [rbp - 20], imm32` lifts as
+        // ArrayAccess(rbp, IntLit(-5), 4) — Case A2. Byte offset = -5 * 4 = -20.
+        let lhs = Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(Expr::var(Variable::reg("rbp", 8))),
+                index: Box::new(Expr::int(-5)),
+                element_size: 4,
+            },
+        };
+        let store = Expr::assign(lhs, Expr::int(8193));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign")
+        };
+        let ExprKind::FieldAccess { field_name, .. } = &lhs.kind else {
+            panic!("expected FieldAccess LHS, got {:?}", lhs.kind)
+        };
+        assert_eq!(field_name, "events");
+    }
+
+    #[test]
+    fn parse_local_name_offset_handles_hex_widths() {
+        assert_eq!(parse_local_name_offset("local_14"), Some(-0x14));
+        assert_eq!(parse_local_name_offset("local_8"), Some(-0x8));
+        assert_eq!(parse_local_name_offset("local_90"), Some(-0x90));
+        assert_eq!(parse_local_name_offset("local_deadbeef"), Some(-0xdeadbeef));
+        assert_eq!(parse_local_name_offset("ret"), None);
+        assert_eq!(parse_local_name_offset("local_xyz"), None);
     }
 }

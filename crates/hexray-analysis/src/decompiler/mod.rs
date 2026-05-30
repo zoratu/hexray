@@ -1154,12 +1154,23 @@ impl Decompiler {
             structured
         };
 
-        // Step 2a: Collect stack-local-struct bindings from known-prototype
-        // call sites (deferral #3). Currently scaffolding — the bindings are
-        // analyzed but not yet consumed; the call-arg / field-store rewrite
-        // lands in a follow-up commit.
-        let _stack_struct_bindings =
-            stack_struct_binding::analyze_with_builtin_db(&structured.body);
+        // Step 2a: Reconstruct stack-local structs from known-prototype call
+        // sites (deferral #3). A `call(…, &<stack@K>)` whose prototype says the
+        // matching parameter is `struct T *` binds the stack region as a typed
+        // local; the rewrite then renders the call argument as `&<local>` and
+        // exact-field-offset stores as `<local>.<field> = …`. Interior
+        // union/array bytes are left untouched here — a refinement step.
+        let stack_struct_bindings = stack_struct_binding::analyze_with_builtin_db(
+            &structured.body,
+            self.binary_data.as_ref(),
+        );
+        for binding in stack_struct_bindings.iter() {
+            merged_types.insert(binding.local_name.clone(), binding.type_name.clone());
+        }
+        let structured = StructuredCfg {
+            body: stack_struct_binding::apply_bindings(structured.body, &stack_struct_bindings),
+            cfg_entry: structured.cfg_entry,
+        };
 
         // Step 2b: Run expression-level type propagation
         let mut expr_type_propagation = type_propagation::ExpressionTypePropagation::with_libc()

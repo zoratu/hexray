@@ -4021,6 +4021,31 @@ impl PseudoCodeEmitter {
         expr_str
     }
 
+    /// Returns true when a `FieldAccess(base, …)` should render as `base.field`
+    /// rather than `base->field`. The rule: `base` is a bare `Var` and the
+    /// emitter's `type_info` says its type is a struct/union value (a name
+    /// starting with `struct ` or `union `, NOT ending in `*`). Anything else
+    /// — a pointer, a `Deref`, a nested field, or an unknown type — keeps the
+    /// pointer-arrow rendering. Conservative: an unknown type defaults to
+    /// `->` so existing call-through-pointer outputs are unchanged.
+    fn field_access_uses_dot(
+        base: &Expr,
+        type_info: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        let ExprKind::Var(v) = &base.kind else {
+            return false;
+        };
+        let ty = type_info
+            .get(&v.name)
+            .or_else(|| type_info.get(&v.name.to_lowercase()));
+        let Some(ty) = ty else { return false };
+        let trimmed = ty.trim().trim_end_matches(';').trim();
+        if trimmed.ends_with('*') {
+            return false;
+        }
+        trimmed.starts_with("struct ") || trimmed.starts_with("union ")
+    }
+
     /// Formats an expression as the base of a postfix operation (array subscript, member access).
     /// Adds parentheses if the base is a binary operation, since [] and . bind tighter than any binary operator.
     fn format_postfix_base(&self, expr: &Expr, table: &StringTable) -> String {
@@ -5614,8 +5639,17 @@ impl PseudoCodeEmitter {
                         return format!("{}[{}]", base_str, idx);
                     }
                 }
-                // Use -> for pointer access when we have real struct field names
-                format!("{}->{}", base_str, field_name)
+                // Pick `.` vs `->` based on the base's declared type: a
+                // struct/union value uses `.`, a pointer (or anything we
+                // can't classify) uses `->`. This makes a stack-local
+                // `struct epoll_event ev; ev.events = …` render correctly
+                // instead of `ev->events = …`.
+                let op = if Self::field_access_uses_dot(base, &self.type_info) {
+                    "."
+                } else {
+                    "->"
+                };
+                format!("{}{}{}", base_str, op, field_name)
             }
             // Array access: check if this is a stack slot (sp[N] or x29[N])
             ExprKind::ArrayAccess {
