@@ -4021,18 +4021,24 @@ impl PseudoCodeEmitter {
         expr_str
     }
 
-    /// Returns true when a `FieldAccess(base, …)` should render as `base.field`
-    /// rather than `base->field`. The rule: `base` is a bare `Var` and the
-    /// emitter's `type_info` says its type is a struct/union value (a name
-    /// starting with `struct ` or `union `, NOT ending in `*`). Anything else
-    /// — a pointer, a `Deref`, a nested field, or an unknown type — keeps the
-    /// pointer-arrow rendering. Conservative: an unknown type defaults to
-    /// `->` so existing call-through-pointer outputs are unchanged.
+    /// Returns true when a `FieldAccess(base, …)` should render as
+    /// `base.field` rather than `base->field`. Walks down any nested
+    /// `FieldAccess` chain to find the root expression, then accepts when
+    /// that root is a bare `Var` whose `type_info` entry is a struct/union
+    /// value (a name starting with `struct ` or `union `, NOT ending in
+    /// `*`). All intermediate field accesses are then by-value (a struct
+    /// field through a struct value is itself a value), so `.` is correct
+    /// throughout the chain. Conservative: anything we can't classify
+    /// (pointer, `Deref`, unknown type) keeps the existing `->` rendering.
     fn field_access_uses_dot(
         base: &Expr,
         type_info: &std::collections::HashMap<String, String>,
     ) -> bool {
-        let ExprKind::Var(v) = &base.kind else {
+        let mut current = base;
+        while let ExprKind::FieldAccess { base, .. } = &current.kind {
+            current = base;
+        }
+        let ExprKind::Var(v) = &current.kind else {
             return false;
         };
         let ty = type_info

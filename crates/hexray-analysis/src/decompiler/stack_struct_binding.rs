@@ -740,52 +740,126 @@ fn transform_expr(
     Expr { kind }
 }
 
-/// Look up the top-level field of `binding`'s struct at the given relative
-/// offset and, if its declared size matches `access_size`, build the
-/// `<local>.<field>` expression. Returns None for interior offsets (union /
-/// array members), padding, or size mismatches.
+/// Build the `<base>.<field>[.<member>…]` expression for an access at
+/// `rel_offset` with `access_size` bytes within `ty`. Recurses through
+/// nested struct/union fields (and peels typedefs) so e.g.
+/// `epoll_event.data.fd` (union member at union-offset 0, size 4) is found
+/// even though `data` itself is an 8-byte union. Returns None when no exact
+/// `(offset, size)` match can be built — interior offsets inside a union
+/// (sub-offset > 0), partial-overlap accesses, padding bytes, etc. all fall
+/// through and are left as raw locals by the rewrite.
+fn field_access_at_offset(
+    base: Expr,
+    ty: &CType,
+    rel_offset: usize,
+    access_size: usize,
+) -> Option<Expr> {
+    match peel_typedef(ty) {
+        CType::Struct(s) => {
+            for field in &s.fields {
+                let field_size = field.field_type.size().unwrap_or(0);
+                if field_size == 0 {
+                    continue;
+                }
+                if rel_offset < field.offset || rel_offset >= field.offset + field_size {
+                    continue;
+                }
+                let sub_offset = rel_offset - field.offset;
+                // Exact direct match at this nesting level.
+                if sub_offset == 0 && field_size == access_size {
+                    return Some(Expr::field_access(
+                        base,
+                        field.name.clone(),
+                        field.offset,
+                    ));
+                }
+                // The access falls inside this field — recurse into nested
+                // struct/union (peeled through typedef).
+                let inner_base = Expr::field_access(base, field.name.clone(), field.offset);
+                return field_access_at_offset(
+                    inner_base,
+                    &field.field_type,
+                    sub_offset,
+                    access_size,
+                );
+            }
+            None
+        }
+        CType::Union(u) => {
+            // Members all share offset 0; accessing past offset 0 means
+            // reading into the *interior* of some union member (e.g. upper
+            // bytes of a `u64`) which doesn't map to a single named member.
+            if rel_offset != 0 {
+                return None;
+            }
+            // Prefer the first member whose declared size matches the access
+            // — mirrors typical source order (e.g. `epoll_data.fd` comes
+            // before `epoll_data.u32`, both at offset 0 size 4).
+            for member in &u.members {
+                let member_size = member.member_type.size().unwrap_or(0);
+                if member_size == access_size {
+                    return Some(Expr::field_access(base, member.name.clone(), 0));
+                }
+            }
+            // Otherwise try to recurse into nested struct/union members.
+            for member in &u.members {
+                if matches!(
+                    peel_typedef(&member.member_type),
+                    CType::Struct(_) | CType::Union(_)
+                ) {
+                    let inner_base =
+                        Expr::field_access(base.clone(), member.name.clone(), 0);
+                    if let Some(e) =
+                        field_access_at_offset(inner_base, &member.member_type, 0, access_size)
+                    {
+                        return Some(e);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn peel_typedef(ty: &CType) -> &CType {
+    let mut cur = ty;
+    while let CType::Typedef(t) = cur {
+        cur = &t.target;
+    }
+    cur
+}
+
+/// Look up `binding`'s struct in the database and build a field-access
+/// expression at the given relative offset and access size. Thin wrapper
+/// around [`field_access_at_offset`].
 fn field_access_for_struct_offset(
     binding: &StackStructBinding,
     rel_offset: usize,
     access_size: usize,
     db: &TypeDatabase,
 ) -> Option<Expr> {
-    let CType::Struct(s) = db.get_type(&binding.type_name)? else {
-        return None;
-    };
-    let field = s.fields.iter().find(|f| f.offset == rel_offset)?;
-    let field_size = field.field_type.size()?;
-    if access_size != field_size {
-        return None;
-    }
-    Some(Expr::field_access(
-        struct_local_expr(binding),
-        field.name.clone(),
-        rel_offset,
-    ))
+    let ty = db.get_type(&binding.type_name)?;
+    field_access_at_offset(struct_local_expr(binding), ty, rel_offset, access_size)
 }
 
-/// If `var` is named `local_<hex>` and its decoded stack offset matches an
-/// exact top-level field of a bound struct (same offset, same size), return
-/// the `<local>.<field>` field-access expression. Otherwise None.
+/// If `var` is named `local_<hex>` and its decoded stack offset lands at a
+/// nested field of a bound struct/union of the right size, return the
+/// corresponding `<local>.<field>[.<member>…]` expression. A size-zero var
+/// (recovery hasn't pinned the access width) is skipped — without it the
+/// match would be ambiguous, especially inside unions.
 fn field_access_for_local_var(
     var: &Variable,
     bindings: &StackStructBindings,
     db: &TypeDatabase,
 ) -> Option<Expr> {
+    if var.size == 0 {
+        return None;
+    }
     let local_offset = parse_local_name_offset(&var.name)?;
     let binding = bindings.containing(local_offset)?;
     let rel = (local_offset - binding.stack_offset) as usize;
-    // Be tolerant if the var's size hasn't been recovered.
-    let access_size = if var.size == 0 {
-        let CType::Struct(s) = db.get_type(&binding.type_name)? else {
-            return None;
-        };
-        s.fields.iter().find(|f| f.offset == rel)?.field_type.size()?
-    } else {
-        var.size as usize
-    };
-    field_access_for_struct_offset(binding, rel, access_size, db)
+    field_access_for_struct_offset(binding, rel, var.size as usize, db)
 }
 
 /// Construct the `Var(<binding.local_name>)` expression for a binding.
@@ -1071,6 +1145,75 @@ mod tests {
             panic!("expected FieldAccess LHS, got {:?}", lhs.kind)
         };
         assert_eq!(field_name, "events");
+    }
+
+    #[test]
+    fn apply_bindings_walks_into_union_member_for_data_fd_store() {
+        // ev.data.fd = fd at -O0 → `mov [rbp - 16], reg32`, lifted as
+        // ArrayAccess(rbp, IntLit(-4), 4). Byte offset = -16, struct offset 4
+        // (where the `data` union starts). Sub-offset 0 inside an 8-byte union
+        // → recurse and pick the size-4 member `fd`.
+        let lhs = Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(Expr::var(Variable::reg("rbp", 8))),
+                index: Box::new(Expr::int(-4)),
+                element_size: 4,
+            },
+        };
+        let store = Expr::assign(lhs, Expr::unknown("fd"));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign")
+        };
+        // LHS shape: FieldAccess(FieldAccess(<local>, "data", 4), "fd", 0).
+        let ExprKind::FieldAccess {
+            base, field_name, ..
+        } = &lhs.kind
+        else {
+            panic!("expected FieldAccess LHS, got {:?}", lhs.kind)
+        };
+        assert_eq!(field_name, "fd", "outer field should be the union member");
+        let ExprKind::FieldAccess {
+            field_name: outer, ..
+        } = &base.kind
+        else {
+            panic!("expected nested FieldAccess base, got {:?}", base.kind)
+        };
+        assert_eq!(outer, "data", "inner field should be the union itself");
+    }
+
+    #[test]
+    fn apply_bindings_leaves_interior_union_byte_store_untouched() {
+        // `mov dword [rbp - 12], 0` at struct offset 8 → inside the data union
+        // at union sub-offset 4. No top-level member starts at offset 4 in the
+        // union, so the rewrite intentionally bails (an upper-half-of-u64
+        // access has no clean C member name).
+        let lhs = Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(Expr::var(Variable::reg("rbp", 8))),
+                index: Box::new(Expr::int(-3)),
+                element_size: 4,
+            },
+        };
+        let store = Expr::assign(lhs, Expr::int(0));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign")
+        };
+        // Must remain an ArrayAccess — no FieldAccess rewrite for this offset.
+        assert!(
+            matches!(lhs.kind, ExprKind::ArrayAccess { .. }),
+            "expected ArrayAccess (no rewrite), got {:?}",
+            lhs.kind
+        );
     }
 
     #[test]
