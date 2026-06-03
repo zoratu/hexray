@@ -1258,10 +1258,15 @@ mod tests {
 
     #[test]
     fn apply_bindings_leaves_interior_union_byte_store_untouched() {
-        // `mov dword [rbp - 12], 0` at struct offset 8 → inside the data union
-        // at union sub-offset 4. No top-level member starts at offset 4 in the
-        // union, so the rewrite intentionally bails (an upper-half-of-u64
-        // access has no clean C member name).
+        // `mov dword [rbp - 12], 0x5a5a5a5a` at struct offset 8 → inside the
+        // data union at union sub-offset 4. No top-level member starts at
+        // offset 4 in the union, so the FieldAccess rewrite intentionally
+        // bails (an upper-half-of-u64 access has no clean C member name).
+        // A non-zero RHS is used here because zero stores at interior
+        // offsets get filtered out by the shadow-zero-init suppression
+        // (the `apply_bindings_drops_interior_shadow_zero_store` test
+        // covers that path); this test exercises the orthogonal "no field
+        // match at this offset, no rewrite" path.
         let lhs = Expr {
             kind: ExprKind::ArrayAccess {
                 base: Box::new(Expr::var(Variable::reg("rbp", 8))),
@@ -1269,7 +1274,7 @@ mod tests {
                 element_size: 4,
             },
         };
-        let store = Expr::assign(lhs, Expr::int(0));
+        let store = Expr::assign(lhs, Expr::int(0x5a5a5a5a));
         let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
         let out = run_apply(body);
         let StructuredNode::Block { statements, .. } = &out[0] else {
