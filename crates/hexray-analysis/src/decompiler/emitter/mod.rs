@@ -12,7 +12,9 @@ use super::structurer::{StructuredCfg, StructuredNode};
 use super::{RelocationTable, StringTable, SummaryDatabase, SymbolTable};
 use crate::symbol_names::strip_demangled_signature as strip_demangled_symbol_signature;
 use hexray_core::BasicBlockId;
-use hexray_types::{get_argument_category, ConstantCategory, ConstantDatabase, TypeDatabase};
+use hexray_types::{
+    get_argument_category, get_field_category, ConstantCategory, ConstantDatabase, TypeDatabase,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -3704,6 +3706,57 @@ impl PseudoCodeEmitter {
         )
     }
 
+    /// For an `Assign(FieldAccess(Var(struct_local), field, …), IntLit(N))`
+    /// expression, look up the field's [`ConstantCategory`] (e.g.
+    /// `struct epoll_event.events` → `PollEvents`) and, if found, return a
+    /// pre-formatted RHS string (`"EPOLLIN | EPOLLRDHUP"` or a single named
+    /// constant). This is the struct-field analogue of `format_call_arg`'s
+    /// category dispatch. Returns `None` when the LHS isn't a typed-struct
+    /// field access, the RHS isn't an integer literal, or the field has no
+    /// associated category.
+    fn try_format_field_categorical_rhs(
+        &self,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Option<String> {
+        let ExprKind::IntLit(value) = &rhs.kind else {
+            return None;
+        };
+        let const_db = self.constant_database.as_ref()?;
+        let ExprKind::FieldAccess {
+            base, field_name, ..
+        } = &lhs.kind
+        else {
+            return None;
+        };
+        let ExprKind::Var(v) = &base.kind else {
+            return None;
+        };
+        let struct_type = self
+            .type_info
+            .get(&v.name)
+            .or_else(|| self.type_info.get(&v.name.to_lowercase()))?;
+        let trimmed = struct_type.trim().trim_end_matches(';').trim();
+        let category = get_field_category(trimmed, field_name)?;
+        Some(match category {
+            ConstantCategory::OpenFlags
+            | ConstantCategory::FdFlags
+            | ConstantCategory::MmapProt
+            | ConstantCategory::MmapFlags
+            | ConstantCategory::PollEvents
+            | ConstantCategory::CloneFlags
+            | ConstantCategory::EpollCreateFlags
+            | ConstantCategory::CloseRangeFlags
+            | ConstantCategory::OpenHowResolveFlags
+            | ConstantCategory::SignalfdFlags
+            | ConstantCategory::EventfdFlags
+            | ConstantCategory::TimerfdFlags
+            | ConstantCategory::LandlockAccessFs
+            | ConstantCategory::MemfdSecretFlags => const_db.format_flags(*value, category),
+            _ => const_db.lookup(*value, Some(category))?.to_string(),
+        })
+    }
+
     /// Resolve a function pointer-like argument to a symbol name, when possible.
     fn resolve_function_pointer_arg(&self, arg: &Expr) -> Option<String> {
         let sym = self.symbol_table.as_ref()?;
@@ -5331,6 +5384,19 @@ impl PseudoCodeEmitter {
                         if let Some(compound_op) = op.compound_op_str() {
                             return format!("{} {}= {}", lhs_str, compound_op, rhs_str);
                         }
+                    }
+                }
+                // Field-category-aware RHS: e.g. `epoll_event_14.events =
+                // EPOLLIN | EPOLLRDHUP` instead of `… = 8193`. Mirrors the
+                // category dispatch used for call args.
+                if !preserve_snapshot_rhs {
+                    if let Some(categorical_rhs) = self.try_format_field_categorical_rhs(lhs, rhs) {
+                        let lhs_str = if preserve_snapshot_lhs {
+                            self.format_lvalue_preserving_register_names(lhs, table)
+                        } else {
+                            self.format_lvalue(lhs, table)
+                        };
+                        return format!("{} = {}", lhs_str, categorical_rhs);
                     }
                 }
                 format!(
