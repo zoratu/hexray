@@ -453,7 +453,12 @@ fn transform_node(
             statements: statements
                 .iter()
                 .filter(|s| !is_droppable_interior_zero_store(s, bindings))
-                .map(|e| transform_expr(e, bindings, db))
+                .map(|e| {
+                    if let Some(memset) = try_rewrite_base_zero_to_memset(e, bindings, db) {
+                        return memset;
+                    }
+                    transform_expr(e, bindings, db)
+                })
                 .collect(),
             address_range: *address_range,
         },
@@ -861,6 +866,73 @@ fn field_access_for_local_var(
     let binding = bindings.containing(local_offset)?;
     let rel = (local_offset - binding.stack_offset) as usize;
     field_access_for_struct_offset(binding, rel, var.size as usize, db)
+}
+
+/// Recognize the "base-of-region wide zero" — a zero store at the very start
+/// of a bound stack region whose access size doesn't line up with any single
+/// top-level field (so the regular rewrite can't produce `local.field = 0`).
+/// This is the leading part of an `-O0` zero-init for the whole struct, often
+/// emitted as `*(uint64_t*)&ev = 0` for the first 8 bytes of a 12-byte
+/// `epoll_event` (with the trailing 4 bytes coming through as the interior
+/// zeros that [`is_droppable_interior_zero_store`] silences).
+///
+/// Returns `Some(memset_call_expr)` for `memset(&<local>, 0, sizeof(<local>))`
+/// when the statement matches, otherwise `None`. The size we emit is the full
+/// struct size — representing the source-level intent of `T x = {0};` — rather
+/// than the partial access size, since the contiguous interior zeros are
+/// dropped before this runs and we know the full region was zero-initialised.
+fn try_rewrite_base_zero_to_memset(
+    stmt: &Expr,
+    bindings: &StackStructBindings,
+    db: &TypeDatabase,
+) -> Option<Expr> {
+    let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+        return None;
+    };
+    if !matches!(&rhs.kind, ExprKind::IntLit(0)) {
+        return None;
+    }
+    let (byte_off, access_size) = match &lhs.kind {
+        ExprKind::Deref { addr, size } => {
+            let off = stack_offset_of_address(addr)?;
+            (off, *size as usize)
+        }
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => {
+            let (ExprKind::Var(v), ExprKind::IntLit(k)) = (&base.kind, &index.kind) else {
+                return None;
+            };
+            if !is_frame_register(&v.name) {
+                return None;
+            }
+            let off = (*k)
+                .checked_mul(*element_size as i128)
+                .and_then(|p| i64::try_from(p).ok())?;
+            (off, *element_size)
+        }
+        _ => return None,
+    };
+    let binding = bindings.containing(byte_off)?;
+    // Must be the base of the bound region (rel == 0).
+    if byte_off != binding.stack_offset {
+        return None;
+    }
+    // If a top-level field at offset 0 cleanly matches the access size, the
+    // regular rewrite already produces `local.field = 0` — don't replace.
+    if field_access_for_struct_offset(binding, 0, access_size, db).is_some() {
+        return None;
+    }
+    Some(Expr::call(
+        CallTarget::Named("memset".to_string()),
+        vec![
+            Expr::address_of(struct_local_expr(binding)),
+            Expr::int(0),
+            Expr::int(binding.size as i128),
+        ],
+    ))
 }
 
 /// Recognize an "interior zero-init" store that doesn't line up with any
@@ -1315,25 +1387,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_bindings_keeps_base_of_region_zero_init_marker() {
-        // `*(uint64_t*)(rbp - 20) = 0` at the BASE of the bound region must be
-        // preserved as the zero-init marker (refinement #2 will fold this into
-        // a struct literal). Even though the size mismatches a top-level field,
-        // we keep the statement.
-        let lhs = Expr::deref(rbp_plus(-20), 8);
-        let store = Expr::assign(lhs, Expr::int(0));
-        let body = vec![block(vec![store.clone(), epoll_ctl_with_stack_arg()])];
-        let out = run_apply(body);
-        let StructuredNode::Block { statements, .. } = &out[0] else {
-            panic!("expected block")
-        };
-        assert_eq!(statements.len(), 2, "expected base-zero + call, got {statements:#?}");
-        // The base-zero store survives, but its `rbp + -20` address part is
-        // rewritten through Case B to `AddressOf(Var(<local>))`.
-        assert!(matches!(statements[0].kind, ExprKind::Assign { .. }));
-    }
-
-    #[test]
     fn apply_bindings_keeps_interior_nonzero_store_untouched() {
         // A NON-zero store at an interior offset is meaningful and must be
         // preserved (only zero-init noise is dropped).
@@ -1351,6 +1404,83 @@ mod tests {
             panic!("expected block")
         };
         assert_eq!(statements.len(), 2, "non-zero interior store must be kept");
+    }
+
+    #[test]
+    fn apply_bindings_rewrites_wide_base_zero_to_memset() {
+        // `*(uint64_t*)(rbp - 20) = 0` lifts as Deref(Add(rbp,-20), 8) = 0 at
+        // the base of the bound epoll_event_14 region (size 12). Size 8 ≠
+        // events field size (4), so no clean field rewrite → memset.
+        let lhs = Expr::deref(rbp_plus(-20), 8);
+        let store = Expr::assign(lhs, Expr::int(0));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Call { target, args } = &statements[0].kind else {
+            panic!("expected Call (memset), got {:?}", statements[0].kind)
+        };
+        let CallTarget::Named(name) = target else {
+            panic!("expected Named target")
+        };
+        assert_eq!(name, "memset");
+        assert_eq!(args.len(), 3);
+        let ExprKind::AddressOf(inner) = &args[0].kind else {
+            panic!("first memset arg should be AddressOf")
+        };
+        let ExprKind::Var(v) = &inner.kind else {
+            panic!("AddressOf inner should be Var")
+        };
+        assert_eq!(v.name, "epoll_event_14");
+        assert!(matches!(args[1].kind, ExprKind::IntLit(0)));
+        assert!(matches!(args[2].kind, ExprKind::IntLit(12)));
+    }
+
+    #[test]
+    fn apply_bindings_keeps_base_zero_with_exact_field_size_as_field_assign() {
+        // A 4-byte zero store at the base of the region lines up exactly with
+        // the `events` field (offset 0, size 4) → MUST become
+        // `epoll_event_14.events = 0`, NOT a memset.
+        let lhs = Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(Expr::var(Variable::reg("rbp", 8))),
+                index: Box::new(Expr::int(-5)),
+                element_size: 4,
+            },
+        };
+        let store = Expr::assign(lhs, Expr::int(0));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign, got {:?}", statements[0].kind)
+        };
+        let ExprKind::FieldAccess { field_name, .. } = &lhs.kind else {
+            panic!("expected FieldAccess LHS, got {:?}", lhs.kind)
+        };
+        assert_eq!(field_name, "events");
+    }
+
+    #[test]
+    fn apply_bindings_leaves_wide_base_nonzero_store_untouched() {
+        // A non-zero wide store at the base must NOT be rewritten — it's a
+        // legitimate write to that prefix of the struct, not a zero-init.
+        let lhs = Expr::deref(rbp_plus(-20), 8);
+        let store = Expr::assign(lhs, Expr::int(0xdeadbeef));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        // First stmt should still be the wide-store Assign (with the address
+        // rewritten through Case B from `rbp + -20` to `&epoll_event_14`).
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign, got {:?}", statements[0].kind)
+        };
+        assert!(matches!(lhs.kind, ExprKind::Deref { .. }));
     }
 
     #[test]
