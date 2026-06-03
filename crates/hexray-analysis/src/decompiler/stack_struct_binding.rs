@@ -452,6 +452,7 @@ fn transform_node(
             id: *id,
             statements: statements
                 .iter()
+                .filter(|s| !is_droppable_interior_zero_store(s, bindings))
                 .map(|e| transform_expr(e, bindings, db))
                 .collect(),
             address_range: *address_range,
@@ -862,6 +863,75 @@ fn field_access_for_local_var(
     field_access_for_struct_offset(binding, rel, var.size as usize, db)
 }
 
+/// Recognize an "interior zero-init" store that doesn't line up with any
+/// recognized field — i.e. the kind of `local_<hex> = 0` that the byte-by-byte
+/// `-O0` lift of `struct T x = {0}` leaves behind inside the bound region.
+/// Returning `true` drops the statement so the emitter doesn't see a `local_X`
+/// reference there and therefore doesn't declare an `int local_X;` overlapping
+/// the struct.
+///
+/// Gated narrowly:
+///   - LHS is a stack access (`Deref(Add(frame, K), size)` or
+///     `ArrayAccess(Var(frame), IntLit(idx), element_size)`).
+///   - The byte offset lands **inside** a bound region at a relative offset
+///     **> 0** (the base-of-region wide zero is preserved as a zero-init
+///     marker — refinement #2 will fold a contiguous run into a struct literal
+///     or `memset`).
+///   - RHS is the integer literal `0`.
+///   - No exact top-level field matches the access (otherwise the regular
+///     rewrite is already producing `local.field = 0`).
+fn is_droppable_interior_zero_store(
+    stmt: &Expr,
+    bindings: &StackStructBindings,
+) -> bool {
+    let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
+        return false;
+    };
+    if !matches!(&rhs.kind, ExprKind::IntLit(0)) {
+        return false;
+    }
+    let (byte_off, access_size) = match &lhs.kind {
+        ExprKind::Deref { addr, size } => {
+            let Some(off) = stack_offset_of_address(addr) else {
+                return false;
+            };
+            (off, *size as usize)
+        }
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => {
+            let (ExprKind::Var(v), ExprKind::IntLit(k)) = (&base.kind, &index.kind) else {
+                return false;
+            };
+            if !is_frame_register(&v.name) {
+                return false;
+            }
+            let Some(off) = (*k)
+                .checked_mul(*element_size as i128)
+                .and_then(|p| i64::try_from(p).ok())
+            else {
+                return false;
+            };
+            (off, *element_size)
+        }
+        _ => return false,
+    };
+    let Some(binding) = bindings.containing(byte_off) else {
+        return false;
+    };
+    let rel = byte_off - binding.stack_offset;
+    if rel <= 0 {
+        // Offset-0 base-of-region zero is the zero-init marker; keep it.
+        return false;
+    }
+    // If a top-level field exactly matches, the regular rewrite handles it
+    // cleanly as `local.field = 0`; don't drop the assignment.
+    let db = builtin_db();
+    field_access_for_struct_offset(binding, rel as usize, access_size, db).is_none()
+}
+
 /// Construct the `Var(<binding.local_name>)` expression for a binding.
 fn struct_local_expr(binding: &StackStructBinding) -> Expr {
     let size = binding.size.min(u8::MAX as usize) as u8;
@@ -1214,6 +1284,68 @@ mod tests {
             "expected ArrayAccess (no rewrite), got {:?}",
             lhs.kind
         );
+    }
+
+    #[test]
+    fn apply_bindings_drops_interior_shadow_zero_store() {
+        // `local_c = 0` lifts as ArrayAccess(rbp, -3, 4) = 0 at struct offset 8
+        // inside the data union (sub-offset 4) — no clean field match. The
+        // statement is dropped so the emitter doesn't declare `int local_c;`.
+        let lhs = Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(Expr::var(Variable::reg("rbp", 8))),
+                index: Box::new(Expr::int(-3)),
+                element_size: 4,
+            },
+        };
+        let store = Expr::assign(lhs, Expr::int(0));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        // Only the call should remain (the interior zero was dropped).
+        assert_eq!(statements.len(), 1, "expected only the call, got {statements:#?}");
+        assert!(matches!(statements[0].kind, ExprKind::Call { .. }));
+    }
+
+    #[test]
+    fn apply_bindings_keeps_base_of_region_zero_init_marker() {
+        // `*(uint64_t*)(rbp - 20) = 0` at the BASE of the bound region must be
+        // preserved as the zero-init marker (refinement #2 will fold this into
+        // a struct literal). Even though the size mismatches a top-level field,
+        // we keep the statement.
+        let lhs = Expr::deref(rbp_plus(-20), 8);
+        let store = Expr::assign(lhs, Expr::int(0));
+        let body = vec![block(vec![store.clone(), epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        assert_eq!(statements.len(), 2, "expected base-zero + call, got {statements:#?}");
+        // The base-zero store survives, but its `rbp + -20` address part is
+        // rewritten through Case B to `AddressOf(Var(<local>))`.
+        assert!(matches!(statements[0].kind, ExprKind::Assign { .. }));
+    }
+
+    #[test]
+    fn apply_bindings_keeps_interior_nonzero_store_untouched() {
+        // A NON-zero store at an interior offset is meaningful and must be
+        // preserved (only zero-init noise is dropped).
+        let lhs = Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(Expr::var(Variable::reg("rbp", 8))),
+                index: Box::new(Expr::int(-3)),
+                element_size: 4,
+            },
+        };
+        let store = Expr::assign(lhs, Expr::int(7));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        assert_eq!(statements.len(), 2, "non-zero interior store must be kept");
     }
 
     #[test]
