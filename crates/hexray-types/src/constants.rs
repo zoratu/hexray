@@ -2664,6 +2664,24 @@ pub fn load_macos_constants(db: &mut ConstantDatabase) {
 }
 
 /// Map function names to argument categories for context-aware constant lookup.
+/// Given a (`struct`-qualified) struct name and a field name, return the
+/// constant category for that field's integer values — the struct-field
+/// analogue of [`get_argument_category`]. Used by the emitter so that e.g.
+/// `epoll_event.events = 8193` renders as `… = EPOLLIN | EPOLLRDHUP`. The
+/// struct name should include the `struct ` / `union ` prefix as it appears
+/// in [`crate::TypeDatabase`] (e.g. `"struct epoll_event"`).
+pub fn get_field_category(struct_name: &str, field_name: &str) -> Option<ConstantCategory> {
+    match (struct_name, field_name) {
+        // poll(2) / epoll: events and revents bitmasks.
+        ("struct epoll_event", "events")
+        | ("struct pollfd", "events")
+        | ("struct pollfd", "revents") => Some(ConstantCategory::PollEvents),
+        // clone3 args: flags is a CLONE_* bitmask.
+        ("struct clone_args", "flags") => Some(ConstantCategory::CloneFlags),
+        _ => None,
+    }
+}
+
 pub fn get_argument_category(func_name: &str, arg_index: usize) -> Option<ConstantCategory> {
     match func_name {
         "ioctl" | "_ioctl" if arg_index == 1 => Some(ConstantCategory::Ioctl),
@@ -2938,5 +2956,43 @@ mod tests {
             db.lookup(0x1000, Some(ConstantCategory::LandlockAccessFs)),
             Some("LANDLOCK_ACCESS_FS_MAKE_SYM")
         );
+    }
+
+    #[test]
+    fn test_get_field_category() {
+        // epoll_event.events / pollfd.events|revents → PollEvents bitmask.
+        assert_eq!(
+            get_field_category("struct epoll_event", "events"),
+            Some(ConstantCategory::PollEvents)
+        );
+        assert_eq!(
+            get_field_category("struct pollfd", "events"),
+            Some(ConstantCategory::PollEvents)
+        );
+        assert_eq!(
+            get_field_category("struct pollfd", "revents"),
+            Some(ConstantCategory::PollEvents)
+        );
+        // clone3 args.flags → CloneFlags.
+        assert_eq!(
+            get_field_category("struct clone_args", "flags"),
+            Some(ConstantCategory::CloneFlags)
+        );
+        // Unknown struct / unknown field → None.
+        assert_eq!(get_field_category("struct epoll_event", "data"), None);
+        assert_eq!(get_field_category("struct unknown_t", "events"), None);
+        // Must use the qualified `struct ` prefix (matches TypeDatabase).
+        assert_eq!(get_field_category("epoll_event", "events"), None);
+    }
+
+    #[test]
+    fn test_format_field_events_as_flag_set() {
+        // The end-to-end smoke for refinement #3: 0x2001 = EPOLLIN |
+        // EPOLLRDHUP, both in the PollEvents category.
+        let db = ConstantDatabase::with_builtins();
+        let formatted =
+            db.format_flags(0x2001, get_field_category("struct epoll_event", "events").unwrap());
+        assert!(formatted.contains("EPOLLIN"), "got {formatted:?}");
+        assert!(formatted.contains("EPOLLRDHUP"), "got {formatted:?}");
     }
 }
