@@ -4074,35 +4074,108 @@ impl PseudoCodeEmitter {
         expr_str
     }
 
-    /// Returns true when a `FieldAccess(base, …)` should render as
-    /// `base.field` rather than `base->field`. Walks down any nested
-    /// `FieldAccess` chain to find the root expression, then accepts when
-    /// that root is a bare `Var` whose `type_info` entry is a struct/union
-    /// value (a name starting with `struct ` or `union `, NOT ending in
-    /// `*`). All intermediate field accesses are then by-value (a struct
-    /// field through a struct value is itself a value), so `.` is correct
-    /// throughout the chain. Conservative: anything we can't classify
-    /// (pointer, `Deref`, unknown type) keeps the existing `->` rendering.
-    fn field_access_uses_dot(
-        base: &Expr,
-        type_info: &std::collections::HashMap<String, String>,
-    ) -> bool {
-        let mut current = base;
-        while let ExprKind::FieldAccess { base, .. } = &current.kind {
-            current = base;
-        }
-        let ExprKind::Var(v) = &current.kind else {
+    /// Returns true when a `FieldAccess(base, field)` should render as
+    /// `base.field` rather than `base->field`. Resolves the type of `base`
+    /// per-level: when `base` is itself a `FieldAccess`, we look up the
+    /// containing struct/union (in the user type DB, falling back to the
+    /// posix/linux/libc builtin DB used by stack-struct binding), then ask
+    /// what type the named field has there. So `outer.inner.value` keeps
+    /// `.` when `inner` is a struct value, and `outer.next->id` correctly
+    /// flips to `->` when `next` is a pointer field — a one-shot walk to
+    /// the root would have missed that. Conservative on unknowns: anything
+    /// we can't classify keeps the existing `->` rendering.
+    fn field_access_uses_dot(&self, base: &Expr) -> bool {
+        let Some(ty) = self.expr_type_string(base) else {
             return false;
         };
-        let ty = type_info
-            .get(&v.name)
-            .or_else(|| type_info.get(&v.name.to_lowercase()));
-        let Some(ty) = ty else { return false };
+        Self::type_string_is_struct_value(&ty)
+    }
+
+    /// True when a C-syntax type string denotes a `struct` / `union` *value*
+    /// (not a pointer or array of one). `to_c_string` formats pointer types
+    /// with a `*` anywhere inside the string, so a single `contains('*')`
+    /// check is enough to reject `struct foo *`, `struct foo **`, etc.
+    fn type_string_is_struct_value(ty: &str) -> bool {
         let trimmed = ty.trim().trim_end_matches(';').trim();
-        if trimmed.ends_with('*') {
+        if trimmed.contains('*') || trimmed.contains("[]") {
             return false;
         }
         trimmed.starts_with("struct ") || trimmed.starts_with("union ")
+    }
+
+    /// Best-effort C-syntax type of `expr` for the dot/arrow walk. For a
+    /// `Var` we read [`type_info`](Self::type_info) directly; for a
+    /// `FieldAccess` we recursively determine the base's type, look up the
+    /// containing struct/union in the type DBs, and render the named field's
+    /// declared type via [`CType::to_c_string`]. Returns `None` when any
+    /// hop can't be classified (missing type entry, type not in any DB,
+    /// field name not found) so the caller falls back to `->`.
+    fn expr_type_string(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Var(v) => self
+                .type_info
+                .get(&v.name)
+                .or_else(|| self.type_info.get(&v.name.to_lowercase()))
+                .cloned(),
+            ExprKind::FieldAccess { base, field_name, .. } => {
+                let base_ty = self.expr_type_string(base)?;
+                // Resolve through a pointer hop: `(struct A *).field` looks
+                // up field on `struct A`. Multi-level pointers (`**`) don't
+                // appear in real C field-access chains, so a single strip
+                // is sufficient and we punt on anything weirder.
+                let cleaned = base_ty
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .trim_end_matches('*')
+                    .trim()
+                    .to_string();
+                let ty = self.lookup_type_in_dbs(&cleaned)?;
+                let field_ty = Self::field_ctype_in_aggregate(ty, field_name)?;
+                Some(field_ty.to_c_string(None))
+            }
+            _ => None,
+        }
+    }
+
+    /// Find a field/member named `field_name` inside a struct/union type
+    /// (peeling typedefs first). Returns `None` for non-aggregate types or
+    /// when no field by that name exists.
+    fn field_ctype_in_aggregate<'a>(
+        ty: &'a hexray_types::CType,
+        field_name: &str,
+    ) -> Option<&'a hexray_types::CType> {
+        use hexray_types::CType;
+        let mut cur = ty;
+        while let CType::Typedef(t) = cur {
+            cur = &t.target;
+        }
+        match cur {
+            CType::Struct(s) => s
+                .fields
+                .iter()
+                .find(|f| f.name == field_name)
+                .map(|f| &f.field_type),
+            CType::Union(u) => u
+                .members
+                .iter()
+                .find(|m| m.name == field_name)
+                .map(|m| &m.member_type),
+            _ => None,
+        }
+    }
+
+    /// Look up a type by name in the user-supplied DB (if any), falling back
+    /// to the builtin posix/linux/libc DB used by stack-struct binding so
+    /// that types introduced by that pass (e.g. `struct epoll_event`) are
+    /// always resolvable here even when the host hasn't wired a DB.
+    fn lookup_type_in_dbs<'a>(&'a self, name: &str) -> Option<&'a hexray_types::CType> {
+        if let Some(db) = self.type_database.as_ref() {
+            if let Some(ty) = db.get_type(name) {
+                return Some(ty);
+            }
+        }
+        crate::decompiler::stack_struct_binding::builtin_db().get_type(name)
     }
 
     /// Formats an expression as the base of a postfix operation (array subscript, member access).
@@ -5716,7 +5789,7 @@ impl PseudoCodeEmitter {
                 // can't classify) uses `->`. This makes a stack-local
                 // `struct epoll_event ev; ev.events = …` render correctly
                 // instead of `ev->events = …`.
-                let op = if Self::field_access_uses_dot(base, &self.type_info) {
+                let op = if self.field_access_uses_dot(base) {
                     "."
                 } else {
                     "->"
@@ -13254,6 +13327,79 @@ mod tests {
         assert!(
             output.contains("return arg0;"),
             "expected emitter to finish node-cycle restoration cleanup, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn field_access_uses_dot_flips_to_arrow_through_pointer_field() {
+        // Two-level chain `s.p->id` where `s: struct foo` is a value and
+        // `p: struct bar *` is a pointer field. The old root-only walk
+        // would have rendered `s.p.id`; the per-level walk must resolve
+        // `p`'s field type, see it's a pointer, and answer `false`
+        // (use `->`) for the outer `id` access.
+        use hexray_types::{CType, StructType};
+
+        let mut bar = StructType::new(Some("bar".to_string()));
+        bar.add_field("id".to_string(), CType::int());
+        bar.finalize();
+
+        let mut foo = StructType::new(Some("foo".to_string()));
+        foo.add_field(
+            "p".to_string(),
+            CType::ptr(CType::Named("struct bar".to_string())),
+        );
+        foo.finalize();
+
+        let mut db = TypeDatabase::new();
+        db.add_type("struct bar", CType::Struct(bar));
+        db.add_type("struct foo", CType::Struct(foo));
+
+        let mut type_info = HashMap::new();
+        type_info.insert("s".to_string(), "struct foo".to_string());
+
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_type_info(type_info)
+            .with_type_database(Arc::new(db));
+
+        // Outer field `id`: base is `s.p` (a struct-bar pointer) → `->`.
+        let s_dot_p = Expr::field_access(
+            Expr::var(super::super::expression::Variable::reg("s", 8)),
+            "p".to_string(),
+            0,
+        );
+        assert!(
+            !emitter.field_access_uses_dot(&s_dot_p),
+            "outer access through pointer field must render as '->', got '.'"
+        );
+
+        // Sanity: the inner `s.p` access (`s` is a struct value) must stay `.`.
+        let bare_s = Expr::var(super::super::expression::Variable::reg("s", 8));
+        assert!(
+            emitter.field_access_uses_dot(&bare_s),
+            "single-level access into a struct value must render as '.'"
+        );
+    }
+
+    #[test]
+    fn field_access_uses_dot_resolves_via_builtin_db_without_user_database() {
+        // A stack-struct binding inserts `("epoll_event_14", "struct
+        // epoll_event")` into type_info. The emitter has no user-supplied
+        // type DB, so it must fall through to the posix/linux/libc builtin
+        // DB to know that struct epoll_event exists and that `.events` is
+        // a `uint` (not a pointer), so the outer FieldAccess renders with
+        // `.`. Regression guard against silently breaking the
+        // stack-struct rendering path when no DB is wired.
+        let mut type_info = HashMap::new();
+        type_info.insert(
+            "epoll_event_14".to_string(),
+            "struct epoll_event".to_string(),
+        );
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
+        let base = Expr::var(super::super::expression::Variable::reg("epoll_event_14", 12));
+        assert!(
+            emitter.field_access_uses_dot(&base),
+            "stack-bound struct local must render with '.' even without a user TypeDatabase"
         );
     }
 }

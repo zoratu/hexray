@@ -115,7 +115,10 @@ pub fn analyze_with_builtin_db(
     bindings
 }
 
-fn builtin_db() -> &'static TypeDatabase {
+/// Shared posix + linux + libc type DB, initialised once. Sibling modules
+/// (notably the emitter) consult it to resolve field types of stack-bound
+/// structs that were never registered in any user-supplied `TypeDatabase`.
+pub(crate) fn builtin_db() -> &'static TypeDatabase {
     static DB: OnceLock<TypeDatabase> = OnceLock::new();
     DB.get_or_init(|| {
         let mut db = TypeDatabase::new();
@@ -361,17 +364,25 @@ fn pointed_struct_type_name(ty: &CType) -> Option<String> {
     }
 }
 
-/// Look up a struct's total size in the database.
+/// Look up a struct or union's total size in the database. Walks both kinds
+/// of indirection the DB uses to spell aliases: `CType::Typedef` wrappers
+/// (peeled in place) and `CType::Named` references (looked back up by name).
+/// A typical chain like `epoll_data_t → CType::Typedef(target =
+/// CType::Named("union epoll_data")) → CType::Union { size: 8 }` needs both
+/// hops to resolve. Recognises unions in addition to structs. Bounded loop
+/// guards against pathological self-referential aliases.
 fn struct_size_in_db(db: &TypeDatabase, type_name: &str) -> Option<usize> {
-    let ty = db.get_type(type_name)?;
-    match ty {
-        CType::Struct(s) => Some(s.size),
-        CType::Typedef(t) => match t.target.as_ref() {
-            CType::Struct(s) => Some(s.size),
-            _ => None,
-        },
-        _ => None,
+    let mut current = type_name.to_string();
+    for _ in 0..16 {
+        let ty = db.get_type(&current)?;
+        match peel_typedef(ty) {
+            CType::Struct(s) => return Some(s.size),
+            CType::Union(u) => return Some(u.size),
+            CType::Named(next) => current = next.clone(),
+            _ => return None,
+        }
     }
+    None
 }
 
 /// Match a stack-address expression `frame_reg + K` (or `K + frame_reg`) and
@@ -771,13 +782,21 @@ fn field_access_at_offset(
                     continue;
                 }
                 let sub_offset = rel_offset - field.offset;
-                // Exact direct match at this nesting level.
+                // Exact direct match at this nesting level. For an aggregate
+                // field we still need to descend — a bare `s.data = value`
+                // where `data` is a union (or sub-struct) isn't valid C, the
+                // store has to name a writable sub-member like `s.data.u64`.
+                // The recursion at offset 0 reuses the union member-by-size
+                // matching to pick that sub-member.
                 if sub_offset == 0 && field_size == access_size {
-                    return Some(Expr::field_access(
-                        base,
-                        field.name.clone(),
-                        field.offset,
-                    ));
+                    let peeled_field = peel_typedef(&field.field_type);
+                    if !matches!(peeled_field, CType::Struct(_) | CType::Union(_)) {
+                        return Some(Expr::field_access(
+                            base,
+                            field.name.clone(),
+                            field.offset,
+                        ));
+                    }
                 }
                 // The access falls inside this field — recurse into nested
                 // struct/union (peeled through typedef).
@@ -1326,6 +1345,72 @@ mod tests {
             panic!("expected nested FieldAccess base, got {:?}", base.kind)
         };
         assert_eq!(outer, "data", "inner field should be the union itself");
+    }
+
+    #[test]
+    fn apply_bindings_rewrites_wide_union_store_to_member_not_aggregate() {
+        // A whole 8-byte store to the `data` union of `struct epoll_event`
+        // (struct offset 4, access size 8) used to emit
+        // `epoll_event_14.data = value` — but `data` is a union, so naming
+        // the union by itself is not a valid C lvalue assignment from a
+        // scalar. The recogniser now descends into the union and picks the
+        // first member matching the access size; for the size-8 case that's
+        // the `u64` member.
+        let lhs = Expr {
+            kind: ExprKind::ArrayAccess {
+                base: Box::new(Expr::var(Variable::reg("rbp", 8))),
+                index: Box::new(Expr::int(-2)), // -2 * 8 = -16 → struct offset 4
+                element_size: 8,
+            },
+        };
+        let store = Expr::assign(lhs, Expr::unknown("data_u64"));
+        let body = vec![block(vec![store, epoll_ctl_with_stack_arg()])];
+        let out = run_apply(body);
+        let StructuredNode::Block { statements, .. } = &out[0] else {
+            panic!("expected block")
+        };
+        let ExprKind::Assign { lhs, .. } = &statements[0].kind else {
+            panic!("expected Assign")
+        };
+        // LHS shape must be FieldAccess(FieldAccess(<local>, "data", 4), "u64", 0)
+        // — never the bare FieldAccess(<local>, "data", 4) that previously
+        // surfaced as `.data = …`.
+        let ExprKind::FieldAccess {
+            base, field_name, ..
+        } = &lhs.kind
+        else {
+            panic!("expected nested FieldAccess LHS, got {:?}", lhs.kind)
+        };
+        // The union has `ptr` (8) / `fd` (4) / `u32` (4) / `u64` (8) in that
+        // declaration order; the recogniser picks the FIRST member matching
+        // access_size, so the canonical 8-byte rewrite resolves to `.data.ptr`
+        // (not `.data.u64`). Either is valid C — `ptr` mirrors source order.
+        assert_eq!(
+            field_name, "ptr",
+            "wide store must select the first size-matching union member"
+        );
+        let ExprKind::FieldAccess {
+            field_name: outer, ..
+        } = &base.kind
+        else {
+            panic!("expected union FieldAccess as base, got {:?}", base.kind)
+        };
+        assert_eq!(outer, "data", "outer hop should be the union container");
+    }
+
+    #[test]
+    fn struct_size_in_db_handles_unions_and_chained_typedefs() {
+        // `union epoll_data` is registered directly + via the typedef
+        // `epoll_data_t` → `CType::Named("union epoll_data")` → `Typedef`
+        // chain. The fixed helper recursively peels typedefs and accepts
+        // unions, so both names resolve to the underlying 8-byte size.
+        let db = full_db();
+        let direct = struct_size_in_db(&db, "union epoll_data")
+            .expect("union epoll_data must resolve");
+        let via_typedef =
+            struct_size_in_db(&db, "epoll_data_t").expect("epoll_data_t typedef must resolve");
+        assert_eq!(direct, 8, "union epoll_data is 8 bytes (largest member u64)");
+        assert_eq!(via_typedef, direct, "typedef must resolve to underlying size");
     }
 
     #[test]
