@@ -34,6 +34,7 @@ pub use cleanup::{
     convert_cleanup_gotos, convert_gotos_to_early_returns, convert_multilevel_breaks,
     remove_orphan_gotos, remove_orphan_labels, structure_shared_exits,
 };
+pub use simplify::recover_cxa_throw_pattern;
 #[cfg(test)]
 use condition::try_extract_arm64_branch_condition;
 use condition::{

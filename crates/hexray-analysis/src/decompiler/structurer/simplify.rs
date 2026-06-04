@@ -467,6 +467,365 @@ fn node_definitely_terminates(node: &StructuredNode) -> bool {
                     .all(|handler| body_terminates(&handler.body)))
 }
 
+/// Recognise the canonical Itanium C++ throw triple inside each block
+/// and collapse it to a single `throw VALUE` pseudo-statement. The
+/// triple gcc/clang emit for `throw 42` (and analogues for
+/// `throw 3.14`, `throw std::runtime_error("x")`, …) is:
+///
+/// ```ignore
+///     buf = __cxa_allocate_exception(sizeof(T));
+///     *(T *)buf = value;
+///     __cxa_throw(buf, &typeinfo for T, dtor);
+/// ```
+///
+/// `resolve(target_addr, call_site_addr)` is plumbed in from the
+/// decompiler so the pass can resolve `CallTarget::Direct{target,
+/// call_site}` against the symbol and relocation tables — at simplify
+/// time the lifter has only an address for many PLT calls, and the
+/// `__cxa_*` names only show up after symbol-table lookup. The caller
+/// is expected to mirror the emitter's name lookup chain (relocation
+/// table by call_site first, symbol table by target_addr second);
+/// codex review on PR #13 flagged that a target-only resolver missed
+/// relocation-backed PLT imports.
+///
+/// After this pass the three statements collapse to `throw value;` —
+/// `__cxa_throw` already has noreturn detection wired (see
+/// `noreturn.rs`), so the surrounding control-flow exit reasoning
+/// stays correct without further changes. The pattern is intentionally
+/// strict: any extra intervening side effect, a mismatch between the
+/// allocator return name and the throw's first argument, or a
+/// store-from-something-other-than-the-buffer all decline the rewrite.
+///
+/// Constructor-style throws (`throw std::runtime_error("x")`) emit a
+/// `__cxa_allocate_exception` + ctor-call + `__cxa_throw` triple
+/// instead of `*buf = value`. This pass currently only handles the
+/// scalar-value form (int/double/raw pointer); the ctor form needs
+/// type recovery beyond what we have here and stays a follow-up.
+pub fn recover_cxa_throw_pattern<F>(
+    nodes: Vec<StructuredNode>,
+    resolve: &F,
+) -> Vec<StructuredNode>
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    nodes
+        .into_iter()
+        .map(|n| recover_cxa_throw_pattern_in_node(n, resolve))
+        .collect()
+}
+
+fn recover_cxa_throw_pattern_in_node<F>(node: StructuredNode, resolve: &F) -> StructuredNode
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    match node {
+        StructuredNode::Block {
+            id,
+            statements,
+            address_range,
+        } => StructuredNode::Block {
+            id,
+            statements: recover_cxa_throw_in_statements(statements, resolve),
+            address_range,
+        },
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: recover_cxa_throw_pattern(then_body, resolve),
+            else_body: else_body.map(|b| recover_cxa_throw_pattern(b, resolve)),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition,
+            body: recover_cxa_throw_pattern(body, resolve),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            condition,
+            body: recover_cxa_throw_pattern(body, resolve),
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: recover_cxa_throw_pattern(body, resolve),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: recover_cxa_throw_pattern(body, resolve),
+            header,
+            exit_block,
+        },
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => StructuredNode::Switch {
+            value,
+            cases: cases
+                .into_iter()
+                .map(|(vals, body)| (vals, recover_cxa_throw_pattern(body, resolve)))
+                .collect(),
+            default: default.map(|d| recover_cxa_throw_pattern(d, resolve)),
+        },
+        StructuredNode::Sequence(inner) => {
+            StructuredNode::Sequence(recover_cxa_throw_pattern(inner, resolve))
+        }
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: recover_cxa_throw_pattern(try_body, resolve),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| super::CatchHandler {
+                    body: recover_cxa_throw_pattern(h.body, resolve),
+                    ..h
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn recover_cxa_throw_in_statements<F>(statements: Vec<Expr>, resolve: &F) -> Vec<Expr>
+where
+    F: Fn(u64, u64) -> Option<String>,
+{
+    use super::super::expression::{CallTarget, ExprKind};
+
+    /// Walk through trivial `Cast` wrappers (the lifter usually wraps
+    /// the buffer-pointer reload with `(T *)` casts) so the matcher can
+    /// reach the underlying `Var`.
+    fn strip_casts(expr: &Expr) -> &Expr {
+        let mut cur = expr;
+        while let ExprKind::Cast { expr: inner, .. } = &cur.kind {
+            cur = inner;
+        }
+        cur
+    }
+
+    fn call_canonical_name<G>(target: &CallTarget, resolve: &G) -> Option<String>
+    where
+        G: Fn(u64, u64) -> Option<String>,
+    {
+        match target {
+            CallTarget::Named(name) => {
+                Some(hexray_core::unversioned_symbol_name(name).to_string())
+            }
+            CallTarget::Direct {
+                target: addr,
+                call_site,
+            } => {
+                let raw = resolve(*addr, *call_site)?;
+                Some(hexray_core::unversioned_symbol_name(&raw).to_string())
+            }
+            _ => None,
+        }
+    }
+
+    let mut result: Vec<Expr> = Vec::with_capacity(statements.len());
+
+    for stmt in statements {
+        // Match `__cxa_throw(buf, &typeinfo, dtor)` against the trailing
+        // pair already in `result`. The pair we expect is, in order:
+        //   [N-2] buf = __cxa_allocate_exception(SIZE)
+        //   [N-1] *(T *)buf = value
+        let throw_args = match &stmt.kind {
+            ExprKind::Call { target, args }
+                if call_canonical_name(target, resolve).as_deref() == Some("__cxa_throw") =>
+            {
+                args.clone()
+            }
+            _ => {
+                result.push(stmt);
+                continue;
+            }
+        };
+
+        if result.len() < 2 {
+            result.push(stmt);
+            continue;
+        }
+        let buf_name = match throw_args.first().map(strip_casts).map(|e| &e.kind) {
+            Some(ExprKind::Var(v)) => v.name.clone(),
+            _ => {
+                result.push(stmt);
+                continue;
+            }
+        };
+
+        // `[N-2]` must be `<buf_name> = __cxa_allocate_exception(...)`.
+        let alloc_idx = result.len() - 2;
+        let alloc_ok = match &result[alloc_idx].kind {
+            ExprKind::Assign { lhs, rhs } => {
+                let lhs_matches = matches!(
+                    &strip_casts(lhs).kind,
+                    ExprKind::Var(v) if v.name == buf_name,
+                );
+                let rhs_is_alloc = match &strip_casts(rhs).kind {
+                    ExprKind::Call { target, .. } => {
+                        call_canonical_name(target, resolve).as_deref()
+                            == Some("__cxa_allocate_exception")
+                    }
+                    _ => false,
+                };
+                lhs_matches && rhs_is_alloc
+            }
+            _ => false,
+        };
+
+        if !alloc_ok {
+            result.push(stmt);
+            continue;
+        }
+
+        // `[N-1]` is one of two shapes the compiler emits for the
+        // exception buffer initialiser:
+        //
+        // * **Scalar form** — `*(T *)buf = value;` for `throw 42`,
+        //   `throw 3.14`, `throw some_ptr`. The deref's address is
+        //   the buffer (possibly wrapped in a typed pointer cast,
+        //   which we strip).
+        //
+        // * **Constructor form** — `TypeName::TypeName(buf, …args);`
+        //   for `throw std::runtime_error("x")` and friends. The
+        //   ctor's first argument is `buf`; we render the throw as
+        //   `throw TypeName::TypeName(args)` so the call shape stays
+        //   intact and the user-facing pseudo-C still reads like
+        //   real C++.
+        let store_idx = result.len() - 1;
+        let stored_value = match &result[store_idx].kind {
+            ExprKind::Assign { lhs, rhs } => {
+                let target_matches = match &lhs.kind {
+                    ExprKind::Deref { addr, .. } => matches!(
+                        &strip_casts(addr).kind,
+                        ExprKind::Var(v) if v.name == buf_name,
+                    ),
+                    _ => false,
+                };
+                if target_matches {
+                    Some(format!("{}", (**rhs).clone()))
+                } else {
+                    None
+                }
+            }
+            ExprKind::Call { target, args } => {
+                // Constructor form: first arg must be the buffer.
+                let first_is_buf = args
+                    .first()
+                    .map(strip_casts)
+                    .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name));
+                if !first_is_buf {
+                    None
+                } else {
+                    // Render `TypeName(remaining_args)` — drop the
+                    // implicit buf slot so the throw reads like the
+                    // source expression. Falls back to the resolved
+                    // call name when the target is `Direct`.
+                    fn canonicalise_ctor_name(raw: &str) -> String {
+                        // Strip glibc/PLT decorations, then the
+                        // `[base]`/`[complete]`/`[clone …]` disambiguator
+                        // labels, then the trailing `(args)` signature —
+                        // in that order, because each step exposes the
+                        // next one's tail. Mirrors the chain in
+                        // `PseudoCodeEmitter::format_call_target_name`
+                        // from deferral #5.
+                        let unversioned = hexray_core::unversioned_symbol_name(raw);
+                        let labels_stripped =
+                            crate::symbol_names::strip_demangler_disambiguator_labels(unversioned);
+                        crate::symbol_names::strip_demangled_signature(labels_stripped).to_string()
+                    }
+                    let target_name = match target {
+                        CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
+                        CallTarget::Direct {
+                            target: addr,
+                            call_site,
+                        } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
+                        _ => None,
+                    };
+                    let Some(target_name) = target_name else {
+                        result.push(stmt);
+                        continue;
+                    };
+                    // Trim `TypeName::TypeName` chains to just `TypeName(args)`
+                    // when the trailing component repeats the class name
+                    // (`std::runtime_error::runtime_error` → `std::runtime_error`).
+                    let prettified = collapse_ctor_pretty_name(&target_name);
+                    let rest_args: Vec<String> = args
+                        .iter()
+                        .skip(1)
+                        .map(|a| format!("{}", a))
+                        .collect();
+                    Some(format!("{}({})", prettified, rest_args.join(", ")))
+                }
+            }
+            _ => None,
+        };
+        let Some(value) = stored_value else {
+            result.push(stmt);
+            continue;
+        };
+
+        // All three matched — collapse to `throw <value>;`. The Unknown
+        // marker mirrors the cold-clone throw rendering shape from
+        // deferral #4 so downstream `body_ends_with_*` heuristics stay
+        // consistent.
+        let throw_text = format!("throw {}", value);
+        // Drop the allocate + store; replace with the throw pseudo-stmt.
+        result.truncate(alloc_idx);
+        result.push(Expr::unknown(throw_text));
+    }
+
+    result
+}
+
+/// Collapse `Namespace::Class::Class` ctor-symbol patterns down to
+/// `Namespace::Class` so a recovered `throw Class(args)` reads like
+/// source rather than the doubled-segment Itanium-ABI form. Leaves any
+/// non-matching name untouched.
+fn collapse_ctor_pretty_name(name: &str) -> String {
+    // Walk the `::`-separated chain from the right; if the last two
+    // segments are identical, drop the trailing one.
+    if let Some((head, tail)) = name.rsplit_once("::") {
+        // `head` might still end in another `::Class` we need to
+        // compare against. Look at the last segment of `head`.
+        if let Some(prev_tail) = head.rsplit("::").next() {
+            if prev_tail == tail {
+                return head.to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+
 fn suppress_asan_scaffolding(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     nodes
         .into_iter()
@@ -14218,6 +14577,182 @@ mod tests {
             signature.parameters.len(),
             1,
             "expected probe scaffolding to stop inventing extra parameters: {signature:?}"
+        );
+    }
+
+    fn cxa_throw_named(buf: &str, type_arg: &str) -> Expr {
+        Expr::call(
+            CallTarget::Named("__cxa_throw@CXXABI_1.3@plt".to_string()),
+            vec![
+                local(buf, 8),
+                Expr::unknown(type_arg),
+                Expr::int(0),
+            ],
+        )
+    }
+
+    #[test]
+    fn recover_cxa_throw_collapses_scalar_throw_triple() {
+        // gcc/clang lower `throw 42` to a three-statement triple. The
+        // recogniser must collapse it to a single `throw 42`
+        // pseudo-statement; downstream control-flow tracking already
+        // treats `__cxa_throw` as noreturn so no synthetic fallback
+        // return is appended.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(4)],
+                    ),
+                ),
+                Expr::assign(
+                    Expr::deref(local("ret_0", 8), 4),
+                    Expr::int(42),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for int"),
+            ],
+        )];
+
+        // No symbol-table needed — the calls here are already Named.
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        assert!(
+            matches!(
+                &statements[0].kind,
+                ExprKind::Unknown(text)
+                    if text == "throw 42" || text == "throw 0x2a"
+            ),
+            "expected single `throw 42` pseudo-stmt, got {:?}",
+            statements[0].kind
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_collapses_ctor_form() {
+        // `throw std::runtime_error("boom")` emits the ctor form: a
+        // ctor call replaces the value store between
+        // `__cxa_allocate_exception` and `__cxa_throw`. The recogniser
+        // canonicalises the ctor symbol (strips disambiguator labels +
+        // collapses the doubled `Class::Class` segment) and renders
+        // `throw Class(args)`.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(16)],
+                    ),
+                ),
+                Expr::call(
+                    CallTarget::Named(
+                        "std::runtime_error::runtime_error(char const*) [complete]".to_string(),
+                    ),
+                    vec![local("ret_0", 8), Expr::unknown("\"boom\"")],
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for std::runtime_error"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        let text = match &statements[0].kind {
+            ExprKind::Unknown(t) => t.as_str(),
+            other => panic!("expected Unknown, got {:?}", other),
+        };
+        assert!(
+            text.starts_with("throw std::runtime_error("),
+            "expected `throw std::runtime_error(...)`, got {text:?}"
+        );
+        assert!(
+            text.contains("\"boom\""),
+            "expected the boom argument preserved, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_leaves_unrelated_calls_alone() {
+        // The recogniser must decline when the three trailing
+        // statements don't match the canonical throw shape — e.g. a
+        // store to an unrelated buffer, or no preceding allocate.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(local("v", 4), Expr::int(7)),
+                Expr::call(
+                    CallTarget::Named("side_effect".to_string()),
+                    vec![Expr::int(1)],
+                ),
+                cxa_throw_named("v", "&typeinfo for int"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block");
+        };
+        assert_eq!(statements.len(), 3, "must not rewrite unrelated sequences");
+    }
+
+    #[test]
+    fn recover_cxa_throw_resolves_direct_call_via_symbol_table() {
+        // The lifter often emits PLT calls with `CallTarget::Direct`
+        // — only the address is known at simplify time. The
+        // recogniser must consult the `resolve` callback (symbol
+        // table) to recognise the allocator. Mirrors the
+        // dynamically-linked PR repro where
+        // `__cxa_allocate_exception` is at a stub address.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Direct {
+                            target: 0x4304,
+                            call_site: 0x4392,
+                        },
+                        vec![Expr::int(4)],
+                    ),
+                ),
+                Expr::assign(
+                    Expr::deref(local("ret_0", 8), 4),
+                    Expr::int(42),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for int"),
+            ],
+        )];
+
+        let resolve = |target_addr: u64, _call_site: u64| -> Option<String> {
+            (target_addr == 0x4304)
+                .then_some("__cxa_allocate_exception@CXXABI_1.3@plt".to_string())
+        };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block");
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        assert!(
+            matches!(
+                &statements[0].kind,
+                ExprKind::Unknown(text)
+                    if text == "throw 42" || text == "throw 0x2a"
+            ),
+            "expected resolved-Direct throw fold, got {:?}",
+            statements[0].kind
         );
     }
 }

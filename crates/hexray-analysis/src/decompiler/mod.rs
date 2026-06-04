@@ -1230,6 +1230,36 @@ impl Decompiler {
             structured
         };
 
+        // Step 3a: Recognise the canonical Itanium C++ throw triple
+        // (`__cxa_allocate_exception` + value store + `__cxa_throw`)
+        // and collapse it into a single `throw VALUE` pseudo-statement.
+        // Runs here (not inside `simplify_statements`) because PLT-call
+        // target names live in the symbol/relocation tables, which the
+        // simplify pipeline doesn't otherwise have access to.
+        let structured = {
+            // Mirror the emitter's call-target name resolution
+            // (`emitter/mod.rs:format_call_target_name` site): the
+            // relocation table is consulted FIRST by call_site (this
+            // is how PLT imports keep their `@plt` names visible), and
+            // the symbol table SECOND by the target address. Codex
+            // review on PR #13 flagged that the original symbol-only
+            // resolver missed relocation-backed `__cxa_*` calls.
+            let resolve = |target_addr: u64, call_site: u64| -> Option<String> {
+                if let Some(reloc) = self.relocation_table.as_ref() {
+                    if let Some(name) = reloc.get(call_site) {
+                        return Some(name.to_string());
+                    }
+                }
+                self.symbol_table
+                    .as_ref()
+                    .and_then(|st| st.get(target_addr).map(str::to_string))
+            };
+            StructuredCfg {
+                body: structurer::recover_cxa_throw_pattern(structured.body, &resolve),
+                cfg_entry: structured.cfg_entry,
+            }
+        };
+
         // Step 4: Generate C++ header if this is a special member
         let cpp_header = self.generate_cpp_header(func_name);
 

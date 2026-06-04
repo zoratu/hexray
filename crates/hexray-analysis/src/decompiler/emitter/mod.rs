@@ -8713,13 +8713,36 @@ impl PseudoCodeEmitter {
                     .is_some_and(|body| self.body_ends_with_control_exit(body));
                 then_exits && else_exits
             }
-            // Check for noreturn function calls
-            StructuredNode::Expr(expr) => Self::is_noreturn_call(expr),
-            StructuredNode::Block { statements, .. } => {
-                statements.last().is_some_and(Self::is_noreturn_call)
+            // Check for noreturn function calls or recovered throw markers.
+            StructuredNode::Expr(expr) => {
+                Self::is_noreturn_call(expr) || Self::is_throw_marker_expr(expr)
             }
+            StructuredNode::Block { statements, .. } => statements
+                .last()
+                .is_some_and(|s| Self::is_noreturn_call(s) || Self::is_throw_marker_expr(s)),
             _ => false,
         }
+    }
+
+    /// Recognise the recovered-throw `Expr::unknown` shapes (cold-clone
+    /// thunk marker from deferral #4 and the `__cxa_throw` triple
+    /// collapse marker from deferral #6) as control-flow exits. Codex
+    /// review on PR #13 flagged that without this check, the throw
+    /// marker inside a Block's tail statement didn't propagate up to
+    /// `body_ends_with_control_exit`, leaving a spurious `return 0;`
+    /// after `throw 42;` in non-void throw-only functions.
+    fn is_throw_marker_expr(expr: &Expr) -> bool {
+        let ExprKind::Unknown(text) = &expr.kind else {
+            return false;
+        };
+        let trimmed = text.trim_start();
+        if trimmed.starts_with("throw /* via ") && text.trim_end().ends_with("*/") {
+            return true;
+        }
+        if let Some(rest) = trimmed.strip_prefix("throw ") {
+            return !rest.is_empty();
+        }
+        false
     }
 
     fn body_ends_with_throw_thunk_call(body: &[StructuredNode]) -> bool {
@@ -8729,14 +8752,29 @@ impl PseudoCodeEmitter {
         let ExprKind::Unknown(text) = &last.kind else {
             return false;
         };
-        // Marker emitted by the structurer for an `ExternalJump` whose
-        // target is a known cold-clone throw thunk; see
-        // `crates/hexray-analysis/src/decompiler/structurer/mod.rs` near
-        // `BlockTerminator::ExternalJump`. The shape is one statement
-        // rendered as `throw /* via NAME() */;` — `body_ends_with_*`
-        // treats it as a control-flow exit so the emitter doesn't append
-        // a synthetic return or fall through.
-        text.trim_start().starts_with("throw /* via ") && text.trim_end().ends_with("*/")
+        // Two emitter-produced markers that have to be treated as
+        // control-flow exits so we don't append a synthetic fallback
+        // return or fall through:
+        //
+        // 1. The cold-clone throw thunk shape from deferral #4:
+        //    `throw /* via NAME() */`.
+        // 2. The collapsed `__cxa_throw` triple from deferral #6:
+        //    `throw VALUE` or `throw Class(args)`.
+        //
+        // Codex review on PR #13 flagged that shape (2) was missing
+        // here, which let non-void throw-only functions surface a
+        // bogus `return 0;` after the recovered throw.
+        let trimmed = text.trim_start();
+        if trimmed.starts_with("throw /* via ") && text.trim_end().ends_with("*/") {
+            return true;
+        }
+        // Any "throw <expr>" line is terminal. Constrain to a single
+        // statement so a stray identifier starting with "throw_" can't
+        // collide.
+        if let Some(rest) = trimmed.strip_prefix("throw ") {
+            return !rest.is_empty();
+        }
+        false
     }
 
     /// Checks if an expression is a call to a noreturn function.
@@ -13478,6 +13516,65 @@ mod tests {
                 "foo::baz() volatile noexcept &"
             ),
             "foo::baz()"
+        );
+    }
+
+    #[test]
+    fn body_ends_with_throw_marker_treats_recovered_throw_as_terminal() {
+        // Codex review on PR #13: the `__cxa_throw` recogniser replaces
+        // the three-statement throw triple with a single
+        // `Expr::unknown("throw VALUE")`. Without extending the
+        // control-flow exit detection, non-void throw-only functions
+        // got a synthetic `return 0;` appended after `throw 42;`.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+
+        // Both shapes — top-level Expr and inside-a-Block tail — must
+        // be recognised; production output puts the marker inside a
+        // Block (alongside the function-prologue push/pop/push), so
+        // the Block-tail check is what actually fires in real binaries.
+        let throw_expr = StructuredNode::Expr(Expr::unknown("throw 42".to_string()));
+        assert!(
+            emitter.is_control_exit(&throw_expr),
+            "top-level `throw 42` Expr must be a control-flow exit"
+        );
+
+        let block_with_throw = StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::call(CallTarget::Named("push".to_string()), vec![]),
+                Expr::unknown("throw 42".to_string()),
+            ],
+            address_range: (0x1000, 0x1010),
+        };
+        assert!(
+            emitter.is_control_exit(&block_with_throw),
+            "Block ending in throw marker must be a control-flow exit"
+        );
+
+        // Constructor-form throw also recognised.
+        let throw_ctor = StructuredNode::Expr(Expr::unknown(
+            "throw std::runtime_error(\"x\")".to_string(),
+        ));
+        assert!(
+            emitter.is_control_exit(&throw_ctor),
+            "constructor-form throw must be a control-flow exit"
+        );
+
+        // Sanity: identifiers that happen to start with `throw_` must
+        // NOT trigger the prefix match.
+        let not_throw = StructuredNode::Expr(Expr::unknown("throw_int(x)".to_string()));
+        assert!(
+            !emitter.is_control_exit(&not_throw),
+            "`throw_int(x)` must not be confused with a throw expression"
+        );
+
+        // And the cold-clone marker from PR #10 still matches.
+        let cold = StructuredNode::Expr(Expr::unknown(
+            "throw /* via may_throw(int) [clone .cold]() */".to_string(),
+        ));
+        assert!(
+            emitter.is_control_exit(&cold),
+            "cold-clone throw thunk marker must remain a control-flow exit"
         );
     }
 
