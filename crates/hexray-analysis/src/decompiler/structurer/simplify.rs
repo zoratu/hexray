@@ -478,11 +478,15 @@ fn node_definitely_terminates(node: &StructuredNode) -> bool {
 ///     __cxa_throw(buf, &typeinfo for T, dtor);
 /// ```
 ///
-/// `resolve_call_name(addr)` is plumbed in from the decompiler so the
-/// pass can resolve `CallTarget::Direct{target, …}` against the symbol
-/// and relocation tables — at simplify time the lifter has only an
-/// address for many PLT calls, and the `__cxa_*` names only show up after
-/// symbol-table lookup.
+/// `resolve(target_addr, call_site_addr)` is plumbed in from the
+/// decompiler so the pass can resolve `CallTarget::Direct{target,
+/// call_site}` against the symbol and relocation tables — at simplify
+/// time the lifter has only an address for many PLT calls, and the
+/// `__cxa_*` names only show up after symbol-table lookup. The caller
+/// is expected to mirror the emitter's name lookup chain (relocation
+/// table by call_site first, symbol table by target_addr second);
+/// codex review on PR #13 flagged that a target-only resolver missed
+/// relocation-backed PLT imports.
 ///
 /// After this pass the three statements collapse to `throw value;` —
 /// `__cxa_throw` already has noreturn detection wired (see
@@ -502,7 +506,7 @@ pub fn recover_cxa_throw_pattern<F>(
     resolve: &F,
 ) -> Vec<StructuredNode>
 where
-    F: Fn(u64) -> Option<String>,
+    F: Fn(u64, u64) -> Option<String>,
 {
     nodes
         .into_iter()
@@ -512,7 +516,7 @@ where
 
 fn recover_cxa_throw_pattern_in_node<F>(node: StructuredNode, resolve: &F) -> StructuredNode
 where
-    F: Fn(u64) -> Option<String>,
+    F: Fn(u64, u64) -> Option<String>,
 {
     match node {
         StructuredNode::Block {
@@ -613,7 +617,7 @@ where
 
 fn recover_cxa_throw_in_statements<F>(statements: Vec<Expr>, resolve: &F) -> Vec<Expr>
 where
-    F: Fn(u64) -> Option<String>,
+    F: Fn(u64, u64) -> Option<String>,
 {
     use super::super::expression::{CallTarget, ExprKind};
 
@@ -630,14 +634,17 @@ where
 
     fn call_canonical_name<G>(target: &CallTarget, resolve: &G) -> Option<String>
     where
-        G: Fn(u64) -> Option<String>,
+        G: Fn(u64, u64) -> Option<String>,
     {
         match target {
             CallTarget::Named(name) => {
                 Some(hexray_core::unversioned_symbol_name(name).to_string())
             }
-            CallTarget::Direct { target: addr, .. } => {
-                let raw = resolve(*addr)?;
+            CallTarget::Direct {
+                target: addr,
+                call_site,
+            } => {
+                let raw = resolve(*addr, *call_site)?;
                 Some(hexray_core::unversioned_symbol_name(&raw).to_string())
             }
             _ => None,
@@ -758,9 +765,10 @@ where
                     }
                     let target_name = match target {
                         CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
-                        CallTarget::Direct { target: addr, .. } => {
-                            resolve(*addr).map(|raw| canonicalise_ctor_name(&raw))
-                        }
+                        CallTarget::Direct {
+                            target: addr,
+                            call_site,
+                        } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
                         _ => None,
                     };
                     let Some(target_name) = target_name else {
@@ -14609,7 +14617,7 @@ mod tests {
         )];
 
         // No symbol-table needed — the calls here are already Named.
-        let resolve = |_: u64| -> Option<String> { None };
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
         let rewritten = recover_cxa_throw_pattern(body, &resolve);
         let StructuredNode::Block { statements, .. } = &rewritten[0] else {
             panic!("expected Block, got {:?}", rewritten[0]);
@@ -14654,7 +14662,7 @@ mod tests {
             ],
         )];
 
-        let resolve = |_: u64| -> Option<String> { None };
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
         let rewritten = recover_cxa_throw_pattern(body, &resolve);
         let StructuredNode::Block { statements, .. } = &rewritten[0] else {
             panic!("expected Block, got {:?}", rewritten[0]);
@@ -14691,7 +14699,7 @@ mod tests {
             ],
         )];
 
-        let resolve = |_: u64| -> Option<String> { None };
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
         let rewritten = recover_cxa_throw_pattern(body, &resolve);
         let StructuredNode::Block { statements, .. } = &rewritten[0] else {
             panic!("expected Block");
@@ -14728,8 +14736,8 @@ mod tests {
             ],
         )];
 
-        let resolve = |addr: u64| -> Option<String> {
-            (addr == 0x4304)
+        let resolve = |target_addr: u64, _call_site: u64| -> Option<String> {
+            (target_addr == 0x4304)
                 .then_some("__cxa_allocate_exception@CXXABI_1.3@plt".to_string())
         };
         let rewritten = recover_cxa_throw_pattern(body, &resolve);
