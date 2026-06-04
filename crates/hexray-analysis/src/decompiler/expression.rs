@@ -6310,10 +6310,7 @@ mod tests {
         let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
         let inst = Instruction::new(0x401020, 4, vec![0x66, 0x0f, 0xef, 0xc0], "pxor")
             .with_operation(Operation::Xor)
-            .with_operands(vec![
-                Operand::Register(xmm0.clone()),
-                Operand::Register(xmm0),
-            ]);
+            .with_operands(vec![Operand::Register(xmm0), Operand::Register(xmm0)]);
 
         let rendered = Expr::from_instruction(&inst).to_string();
 
@@ -6333,10 +6330,7 @@ mod tests {
         let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
         let inst = Instruction::new(0x401030, 3, vec![0x0f, 0x57, 0xc9], "xorps")
             .with_operation(Operation::Xor)
-            .with_operands(vec![
-                Operand::Register(xmm1.clone()),
-                Operand::Register(xmm1),
-            ]);
+            .with_operands(vec![Operand::Register(xmm1), Operand::Register(xmm1)]);
 
         let rendered = Expr::from_instruction(&inst).to_string();
 
