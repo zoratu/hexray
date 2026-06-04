@@ -480,7 +480,7 @@ fn node_definitely_terminates(node: &StructuredNode) -> bool {
 ///
 /// `resolve_call_name(addr)` is plumbed in from the decompiler so the
 /// pass can resolve `CallTarget::Direct{target, …}` against the symbol
-/// + relocation tables — at simplify time the lifter has only an
+/// and relocation tables — at simplify time the lifter has only an
 /// address for many PLT calls, and the `__cxa_*` names only show up after
 /// symbol-table lookup.
 ///
