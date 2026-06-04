@@ -4533,7 +4533,12 @@ impl PseudoCodeEmitter {
         // `bar() && noexcept`). Without this the trailing `(args)` we
         // append below produces awkward forms like `has_value() const(...)`.
         let qualifier_stripped = Self::strip_method_cvref_qualifiers(source);
-        Self::strip_demangled_signature(qualifier_stripped).to_string()
+        // Strip ctor/dtor / clone disambiguator labels (`Dog::Dog() [base]`,
+        // `foo() [clone .cold]`); without this the embedded `()` survives
+        // the next step and we end up with `Dog::Dog() [base](...)`.
+        let label_stripped =
+            crate::symbol_names::strip_demangler_disambiguator_labels(qualifier_stripped);
+        Self::strip_demangled_signature(label_stripped).to_string()
     }
 
     /// Repeatedly strip trailing C++ method qualifiers from a demangled
@@ -13473,6 +13478,39 @@ mod tests {
                 "foo::baz() volatile noexcept &"
             ),
             "foo::baz()"
+        );
+    }
+
+    #[test]
+    fn format_call_target_name_preserves_operator_call() {
+        // Codex review on PR #12: `_ZN3FooclEv` demangles to
+        // `Foo::operator()()` — the `()` IS the operator name and must
+        // survive the signature strip. The original front-walking
+        // stripper truncated at the first top-level `(` and emitted
+        // `Foo::operator`, losing the operator identity entirely.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(
+            emitter.format_call_target_name("_ZN3FooclEv"),
+            "Foo::operator()"
+        );
+    }
+
+    #[test]
+    fn format_call_target_name_strips_ctor_dtor_clone_labels() {
+        // Codex review on PR #12: `_ZN3DogC2Ev` demangles to
+        // `Dog::Dog() [base]`; the trailing `[base]` label blocks the
+        // signature stripper from seeing the embedded `()`, so the
+        // emitter ended up appending its own `(args)` and surfacing
+        // `Dog::Dog() [base](...)` — invalid-looking pseudo-C.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(
+            emitter.format_call_target_name("_ZN3DogC2Ev"),
+            "Dog::Dog"
+        );
+        // Cold-clone helper labels behave the same way.
+        assert_eq!(
+            emitter.format_call_target_name("foo(int) [clone .cold]"),
+            "foo"
         );
     }
 
