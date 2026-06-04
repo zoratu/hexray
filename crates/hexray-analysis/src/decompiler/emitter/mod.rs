@@ -4518,7 +4518,52 @@ impl PseudoCodeEmitter {
     }
 
     fn format_call_target_name(&self, name: &str) -> String {
-        Self::strip_demangled_signature(self.normalize_pseudo_c_symbol_name(name)).to_string()
+        let normalized = self.normalize_pseudo_c_symbol_name(name);
+        // Relocation tables hand the emitter the raw mangled symbol name
+        // (`_ZNRSt8optionalIiEdeEv`); the SymbolTable already pre-demangles
+        // at load time but relocation lookups bypass that path. Render call
+        // sites with the demangled form when the input is mangled so the
+        // pseudo-C reads `std::optional<int>::operator*()` instead of
+        // surfacing the raw Itanium-ABI string. Falls through unchanged
+        // when the name is already demangled or isn't mangled at all.
+        let demangled_owned = hexray_demangle::demangle(normalized);
+        let source: &str = demangled_owned.as_deref().unwrap_or(normalized);
+        // Strip cv- and ref-qualifiers that Itanium-ABI demangling appends
+        // to method names (`has_value() const`, `operator*() &`,
+        // `bar() && noexcept`). Without this the trailing `(args)` we
+        // append below produces awkward forms like `has_value() const(...)`.
+        let qualifier_stripped = Self::strip_method_cvref_qualifiers(source);
+        // Strip ctor/dtor / clone disambiguator labels (`Dog::Dog() [base]`,
+        // `foo() [clone .cold]`); without this the embedded `()` survives
+        // the next step and we end up with `Dog::Dog() [base](...)`.
+        let label_stripped =
+            crate::symbol_names::strip_demangler_disambiguator_labels(qualifier_stripped);
+        Self::strip_demangled_signature(label_stripped).to_string()
+    }
+
+    /// Repeatedly strip trailing C++ method qualifiers from a demangled
+    /// name so the leftover identifier is a clean
+    /// `Namespace::Class::method` chain. Itanium-ABI demangling emits
+    /// these in any combination (`const`, `volatile`, `&`, `&&`,
+    /// `noexcept`); the trimmer walks them off in any order. Operates on
+    /// the borrowed source so callers can keep the demangled string
+    /// allocated once and pass references around.
+    fn strip_method_cvref_qualifiers(name: &str) -> &str {
+        let mut s = name.trim_end();
+        loop {
+            let mut shrank = false;
+            for suffix in [" const", " volatile", " &&", " &", " noexcept"] {
+                if let Some(stripped) = s.strip_suffix(suffix) {
+                    s = stripped.trim_end();
+                    shrank = true;
+                    break;
+                }
+            }
+            if !shrank {
+                break;
+            }
+        }
+        s
     }
 
     fn format_indirect_got_call_target(&self, name: &str) -> String {
@@ -13395,5 +13440,87 @@ mod tests {
             emitter.field_access_uses_dot(&base),
             "stack-bound struct local must render with '.' even without a user TypeDatabase"
         );
+    }
+
+    #[test]
+    fn format_call_target_name_demangles_mangled_input() {
+        // Relocation tables in object files store the raw Itanium-ABI
+        // string. Before the demangle wire-up, call sites surfaced as
+        // `_ZNRSt8optionalIiEdeEv(...)` instead of the source-readable
+        // `std::optional<int>::operator*(...)`. Regression guard for the
+        // C++ optional/variant deferral remediation.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let formatted =
+            emitter.format_call_target_name("_ZNRSt8optionalIiEdeEv");
+        assert_eq!(formatted, "std::optional<int>::operator*");
+    }
+
+    #[test]
+    fn format_call_target_name_strips_method_cvref_qualifiers() {
+        // Method demanglings carry trailing `const`, `&`, `&&`,
+        // `volatile`, `noexcept` qualifiers; these aren't useful at a
+        // call site and would produce `has_value() const(args)` after
+        // the trailing-args append. The strip walks combinations in
+        // any order.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(
+            emitter.format_call_target_name("_ZNKSt8optionalIiE9has_valueEv"),
+            "std::optional<int>::has_value"
+        );
+        assert_eq!(
+            PseudoCodeEmitter::strip_method_cvref_qualifiers(
+                "foo::bar() const &&"
+            ),
+            "foo::bar()"
+        );
+        assert_eq!(
+            PseudoCodeEmitter::strip_method_cvref_qualifiers(
+                "foo::baz() volatile noexcept &"
+            ),
+            "foo::baz()"
+        );
+    }
+
+    #[test]
+    fn format_call_target_name_preserves_operator_call() {
+        // Codex review on PR #12: `_ZN3FooclEv` demangles to
+        // `Foo::operator()()` — the `()` IS the operator name and must
+        // survive the signature strip. The original front-walking
+        // stripper truncated at the first top-level `(` and emitted
+        // `Foo::operator`, losing the operator identity entirely.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(
+            emitter.format_call_target_name("_ZN3FooclEv"),
+            "Foo::operator()"
+        );
+    }
+
+    #[test]
+    fn format_call_target_name_strips_ctor_dtor_clone_labels() {
+        // Codex review on PR #12: `_ZN3DogC2Ev` demangles to
+        // `Dog::Dog() [base]`; the trailing `[base]` label blocks the
+        // signature stripper from seeing the embedded `()`, so the
+        // emitter ended up appending its own `(args)` and surfacing
+        // `Dog::Dog() [base](...)` — invalid-looking pseudo-C.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(
+            emitter.format_call_target_name("_ZN3DogC2Ev"),
+            "Dog::Dog"
+        );
+        // Cold-clone helper labels behave the same way.
+        assert_eq!(
+            emitter.format_call_target_name("foo(int) [clone .cold]"),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn format_call_target_name_leaves_already_demangled_input_alone() {
+        // Non-mangled C-style names must pass through unchanged so we
+        // don't accidentally rewrite `printf` or other already-readable
+        // call targets.
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(emitter.format_call_target_name("printf"), "printf");
+        assert_eq!(emitter.format_call_target_name("__cxa_throw"), "__cxa_throw");
     }
 }
