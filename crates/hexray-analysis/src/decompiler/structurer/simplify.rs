@@ -4195,6 +4195,16 @@ fn collapse_single_use_named_call_results(mut statements: Vec<Expr>) -> Vec<Expr
             i += 1;
             continue;
         }
+        // Don't fold a call into a consumer that itself contains another
+        // call: in C/C++, argument and operand evaluation order is
+        // unspecified, so substituting `tmp = foo(); out = bar(baz(),
+        // tmp);` into `out = bar(baz(), foo());` would change the
+        // *apparent* execution order between the two side-effecting
+        // calls. Keep the spill in that case.
+        if expr_contains_call(&statements[i + 1]) {
+            i += 1;
+            continue;
+        }
 
         let substitutions = HashMap::from([(name, call_expr)]);
         statements[i + 1] = substitute_vars(&statements[i + 1], &substitutions);
@@ -4204,6 +4214,47 @@ fn collapse_single_use_named_call_results(mut statements: Vec<Expr>) -> Vec<Expr
     }
 
     statements
+}
+
+/// Deep walk for any real-function `Call` node anywhere inside `expr`
+/// (operand of a `BinOp`, argument of another `Call`, condition of a
+/// `Conditional`, etc.). Used to guard the
+/// `collapse_single_use_named_call_results` fold from re-sequencing two
+/// side-effecting calls into one C expression where their order would
+/// become unspecified.
+fn expr_contains_call(expr: &Expr) -> bool {
+    use super::super::expression::{CallTarget, ExprKind};
+
+    match &expr.kind {
+        ExprKind::Call { target, args } => {
+            is_real_function_call(target)
+                || args.iter().any(expr_contains_call)
+                || matches!(target, CallTarget::Indirect(e) | CallTarget::IndirectGot { expr: e, .. } if expr_contains_call(e))
+        }
+        ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            expr_contains_call(lhs) || expr_contains_call(rhs)
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            expr_contains_call(left) || expr_contains_call(right)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_contains_call(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_contains_call(base) || expr_contains_call(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_contains_call(base),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => expr_contains_call(cond) || expr_contains_call(then_expr) || expr_contains_call(else_expr),
+        ExprKind::Phi(values) => values.iter().any(expr_contains_call),
+        ExprKind::GotRef { display_expr, .. } => expr_contains_call(display_expr),
+        ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => false,
+    }
 }
 
 fn invalidate_clobbered_register_mappings(reg_values: &mut HashMap<String, Expr>, written: &str) {
@@ -13384,6 +13435,41 @@ mod tests {
         assert_eq!(rendered[0], "var_8 = foo()", "{rendered:?}");
         assert_eq!(rendered[1], "a = var_8 + 1", "{rendered:?}");
         assert_eq!(rendered[2], "b = var_8 * 2", "{rendered:?}");
+    }
+
+    #[test]
+    fn test_propagate_copies_keeps_call_result_when_consumer_has_another_call() {
+        // Codex review on PR #10 flagged this: argument evaluation order in
+        // C/C++ is unspecified, so folding `tmp = foo(); out = bar(baz(),
+        // tmp);` into `out = bar(baz(), foo());` would change the *apparent*
+        // execution order between two side-effecting calls. The fold must
+        // decline when the consumer already contains another call.
+        let statements = vec![
+            Expr::assign(
+                local("tmp", 4),
+                Expr::call(CallTarget::Named("foo".to_string()), vec![]),
+            ),
+            Expr::assign(
+                local("out", 4),
+                Expr::call(
+                    CallTarget::Named("bar".to_string()),
+                    vec![
+                        Expr::call(CallTarget::Named("baz".to_string()), vec![]),
+                        local("tmp", 4),
+                    ],
+                ),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(propagated.len(), 2, "{rendered:?}");
+        assert_eq!(rendered[0], "tmp = foo()", "{rendered:?}");
+        assert!(
+            rendered[1].contains("tmp") && rendered[1].contains("baz()"),
+            "consumer must keep tmp + baz() spelt out: {rendered:?}"
+        );
     }
 
     #[test]
