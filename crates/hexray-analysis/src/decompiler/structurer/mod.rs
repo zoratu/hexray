@@ -1941,14 +1941,6 @@ impl<'a> Structurer<'a> {
 
                 BlockTerminator::ExternalJump { target } => {
                     let throw_thunk_name = self.known_throw_targets.get(target).cloned();
-                    let call_target = throw_thunk_name
-                        .as_ref()
-                        .map(|name| ExprCallTarget::Named(name.clone()))
-                        .unwrap_or(ExprCallTarget::Direct {
-                            target: *target,
-                            call_site: block.start,
-                        });
-                    let call = Expr::call(call_target, vec![]);
                     if !statements.is_empty() {
                         statements = propagate_args_in_block(statements);
                         result.push(StructuredNode::Block {
@@ -1958,12 +1950,25 @@ impl<'a> Structurer<'a> {
                         });
                     }
                     if let Some(name) = throw_thunk_name {
+                        // Inline the cold-clone throw path as a single
+                        // `throw; // via NAME()` pseudo-statement. We don't
+                        // have the exception's source type here (LSDA work
+                        // is the C++ exceptions deferral), so we keep the
+                        // thunk name as a tail comment for provenance. The
+                        // shape is recognised as a control-flow exit by
+                        // `body_ends_with_throw_thunk_call` in the emitter.
                         result.push(StructuredNode::Expr(Expr::unknown(format!(
-                            "/* throw via {}() */",
+                            "throw /* via {}() */",
                             name
                         ))));
-                        result.push(StructuredNode::Expr(call));
                     } else {
+                        let call = Expr::call(
+                            ExprCallTarget::Direct {
+                                target: *target,
+                                call_site: block.start,
+                            },
+                            vec![],
+                        );
                         result.push(StructuredNode::Return(Some(call)));
                     }
                     break;
@@ -6789,17 +6794,23 @@ mod tests {
             );
         let output = PseudoCodeEmitter::new("    ", false).emit(&structured, "may_throw");
 
+        // Cold-clone throw paths render as a single `throw; // via NAME()`
+        // pseudo-statement — both for readability (the source code did
+        // `throw` something, not call a synthetic helper) and so that the
+        // emitter's downstream control-flow tracking treats the line as a
+        // genuine exit. The thunk name is preserved as a tail comment so
+        // the analyst can still trace back to the cold clone.
         assert!(
-            output.contains("/* throw via may_throw(int) [clone .cold]() */"),
-            "expected throw-thunk comment, got:\n{output}"
+            output.contains("throw /* via may_throw(int) [clone .cold]() */"),
+            "expected single-line throw marker with thunk provenance, got:\n{output}"
         );
         assert!(
-            output.contains("may_throw(int) [clone .cold]();"),
-            "expected named cold thunk call, got:\n{output}"
+            !output.contains("may_throw(int) [clone .cold]();"),
+            "raw cold-thunk call must not be emitted alongside the throw marker:\n{output}"
         );
         assert!(
             !output.contains("return may_throw(int) [clone .cold]();"),
-            "throw thunk call should not be rendered as a synthetic return:\n{output}"
+            "cold-thunk path must not be rendered as a synthetic return:\n{output}"
         );
     }
 

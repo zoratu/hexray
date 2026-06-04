@@ -3859,6 +3859,7 @@ fn propagate_copies(statements: Vec<Expr>) -> Vec<Expr> {
     }
 
     let result = collapse_single_use_call_result_copies(result);
+    let result = collapse_single_use_named_call_results(result);
     collapse_single_use_temp_loads(result)
 }
 
@@ -4121,6 +4122,85 @@ fn collapse_single_use_call_result_copies(mut statements: Vec<Expr>) -> Vec<Expr
         }
         statements[i] = Expr::assign(copy_lhs, Expr::call(target, args));
         statements.remove(i + 1);
+    }
+
+    statements
+}
+
+/// Second-stage call-result fold: after `collapse_single_use_call_result_copies`
+/// renames the temp register to its slot (turning `ret_X = call(); var_Y =
+/// ret_X;` into `var_Y = call();`), the resulting `<named_local> = call();`
+/// is itself a candidate for single-use-adjacent folding into the very next
+/// statement. The existing `collapse_single_use_temp_loads` pass refuses
+/// real calls and only handles register-named temps, so this thread-through
+/// step is what turns `var_2c = sub_50(); return var_2c << 1;` into
+/// `return sub_50() << 1;`.
+///
+/// Safety mirrors the other single-use folds: the named local must be read
+/// exactly once across the rest of the block AND that single read must be in
+/// the immediately-following statement, which must not also write the name.
+/// Adjacency is what makes the move sound — no intervening side effect can
+/// change semantics. A call result is moved, not duplicated, so even
+/// side-effectful calls are preserved. Register-named temps are left to
+/// `collapse_single_use_temp_loads` (its existing call-exclusion is now
+/// redundant but harmless; this pass picks up the named-local case it
+/// declined).
+fn collapse_single_use_named_call_results(mut statements: Vec<Expr>) -> Vec<Expr> {
+    use super::super::expression::ExprKind;
+
+    let mut i = 0usize;
+    while i + 1 < statements.len() {
+        let (name, call_expr) = match &statements[i].kind {
+            ExprKind::Assign { lhs, rhs } => {
+                let Some(name) = expr_simple_identifier(lhs) else {
+                    i += 1;
+                    continue;
+                };
+                let ExprKind::Call { target, .. } = &rhs.kind else {
+                    i += 1;
+                    continue;
+                };
+                if !is_real_function_call(target) {
+                    i += 1;
+                    continue;
+                }
+                // Skip register temps — the existing temp-load pass owns
+                // those, and threading them here would mask the
+                // call-result-copies rename pattern earlier in the chain.
+                if is_temp_register(name) {
+                    i += 1;
+                    continue;
+                }
+                // Don't fold into a name that references itself in the call
+                // (`local_8 = f(local_8)`); that's a real use, not a
+                // throw-away temp.
+                if count_identifier_occurrences(rhs, name) > 0 {
+                    i += 1;
+                    continue;
+                }
+                (name.to_string(), (**rhs).clone())
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let next_uses = count_identifier_occurrences(&statements[i + 1], &name);
+        let later_uses: usize = statements[i + 2..]
+            .iter()
+            .map(|s| count_identifier_occurrences(s, &name))
+            .sum();
+        if next_uses != 1 || later_uses != 0 || stmt_writes_identifier(&statements[i + 1], &name) {
+            i += 1;
+            continue;
+        }
+
+        let substitutions = HashMap::from([(name, call_expr)]);
+        statements[i + 1] = substitute_vars(&statements[i + 1], &substitutions);
+        statements.remove(i);
+        // Stay at i: the folded statement may itself now be foldable, and the
+        // loop terminates because the vector shrank.
     }
 
     statements
@@ -13243,6 +13323,18 @@ mod tests {
 
     #[test]
     fn test_propagate_copies_collapses_single_use_call_result_copy() {
+        // Two-stage thread-through:
+        //   ret_0 = foo();           [stage 1 input]
+        //   var_8 = ret_0;
+        //   sum   = var_8 + 1;
+        // → var_8 = foo();           [stage 1: collapse_single_use_call_result_copies]
+        //   sum   = var_8 + 1;
+        // → sum   = foo() + 1;       [stage 2: collapse_single_use_named_call_results]
+        // The single-use-adjacent fold is the second stage that turns a
+        // helper call's return-value spill into an inline expression at
+        // the consuming use site (deferral #4, helper-call return-value
+        // threading). The named-local spill `var_8` is single-use,
+        // adjacent, with no later writes — safe to inline.
         let statements = vec![
             Expr::assign(
                 local("ret_0", 4),
@@ -13258,9 +13350,67 @@ mod tests {
         let propagated = propagate_copies(statements);
         let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
 
-        assert_eq!(propagated.len(), 2, "{rendered:?}");
+        assert_eq!(propagated.len(), 1, "{rendered:?}");
+        assert_eq!(rendered[0], "sum = foo() + 1", "{rendered:?}");
+    }
+
+    #[test]
+    fn test_propagate_copies_keeps_call_result_with_multiple_uses() {
+        // Two downstream uses of the named-local spill MUST NOT trigger the
+        // single-use-adjacent fold — folding would duplicate the call,
+        // changing semantics for any side-effecting helper.
+        let statements = vec![
+            Expr::assign(
+                local("ret_0", 4),
+                Expr::call(CallTarget::Named("foo".to_string()), vec![]),
+            ),
+            Expr::assign(local("var_8", 4), local("ret_0", 4)),
+            Expr::assign(
+                local("a", 4),
+                Expr::binop(BinOpKind::Add, local("var_8", 4), Expr::int(1)),
+            ),
+            Expr::assign(
+                local("b", 4),
+                Expr::binop(BinOpKind::Mul, local("var_8", 4), Expr::int(2)),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        // Stage 1 still collapses ret_0 → var_8; stage 2 must decline
+        // because var_8 has two later uses (a and b).
+        assert_eq!(propagated.len(), 3, "{rendered:?}");
         assert_eq!(rendered[0], "var_8 = foo()", "{rendered:?}");
-        assert_eq!(rendered[1], "sum = var_8 + 1", "{rendered:?}");
+        assert_eq!(rendered[1], "a = var_8 + 1", "{rendered:?}");
+        assert_eq!(rendered[2], "b = var_8 * 2", "{rendered:?}");
+    }
+
+    #[test]
+    fn test_propagate_copies_keeps_call_with_self_referencing_args() {
+        // A named local that the call itself reads (`local_8 = f(local_8)`)
+        // is a genuine in-place update, not a throw-away temp — the fold
+        // must decline so we don't silently rewrite the value.
+        let statements = vec![
+            Expr::assign(
+                local("var_8", 4),
+                Expr::call(
+                    CallTarget::Named("update".to_string()),
+                    vec![local("var_8", 4)],
+                ),
+            ),
+            Expr::assign(
+                local("out", 4),
+                Expr::binop(BinOpKind::Add, local("var_8", 4), Expr::int(1)),
+            ),
+        ];
+
+        let propagated = propagate_copies(statements);
+        let rendered: Vec<String> = propagated.iter().map(ToString::to_string).collect();
+
+        assert_eq!(propagated.len(), 2, "{rendered:?}");
+        assert_eq!(rendered[0], "var_8 = update(var_8)", "{rendered:?}");
+        assert_eq!(rendered[1], "out = var_8 + 1", "{rendered:?}");
     }
 
     #[test]

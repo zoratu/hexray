@@ -8678,24 +8678,20 @@ impl PseudoCodeEmitter {
     }
 
     fn body_ends_with_throw_thunk_call(body: &[StructuredNode]) -> bool {
-        let Some(StructuredNode::Expr(call)) = body.last() else {
+        let Some(StructuredNode::Expr(last)) = body.last() else {
             return false;
         };
-        let Some(StructuredNode::Expr(comment)) = body.get(body.len().saturating_sub(2)) else {
+        let ExprKind::Unknown(text) = &last.kind else {
             return false;
         };
-        let ExprKind::Unknown(comment_text) = &comment.kind else {
-            return false;
-        };
-        let ExprKind::Call {
-            target: CallTarget::Named(name),
-            ..
-        } = &call.kind
-        else {
-            return false;
-        };
-
-        comment_text.trim() == format!("/* throw via {}() */", name)
+        // Marker emitted by the structurer for an `ExternalJump` whose
+        // target is a known cold-clone throw thunk; see
+        // `crates/hexray-analysis/src/decompiler/structurer/mod.rs` near
+        // `BlockTerminator::ExternalJump`. The shape is one statement
+        // rendered as `throw /* via NAME() */;` — `body_ends_with_*`
+        // treats it as a control-flow exit so the emitter doesn't append
+        // a synthetic return or fall through.
+        text.trim_start().starts_with("throw /* via ") && text.trim_end().ends_with("*/")
     }
 
     /// Checks if an expression is a call to a noreturn function.
@@ -11828,13 +11824,7 @@ mod tests {
                     else_body: None,
                 },
                 StructuredNode::Expr(Expr::unknown(
-                    "/* throw via unwrap_or_throw(std::optional<int>) [clone .cold]() */",
-                )),
-                StructuredNode::Expr(Expr::call(
-                    CallTarget::Named(
-                        "unwrap_or_throw(std::optional<int>) [clone .cold]".to_string(),
-                    ),
-                    vec![],
+                    "throw /* via unwrap_or_throw(std::optional<int>) [clone .cold]() */",
                 )),
             ],
             cfg_entry: hexray_core::BasicBlockId::new(0),
@@ -11847,24 +11837,28 @@ mod tests {
 
         let emitter = PseudoCodeEmitter::new("    ", false);
         let output = emitter.emit_with_signature(&cfg, "unwrap_or_throw", &sig);
+        // Single-line throw marker keeps the thunk name as a tail comment for
+        // provenance; the raw cold-thunk call must not appear separately.
         assert!(
-            output.contains("/* throw via unwrap_or_throw(std::optional<int>) [clone .cold]() */"),
-            "throw thunk comment should be preserved:\n{}",
+            output.contains(
+                "throw /* via unwrap_or_throw(std::optional<int>) [clone .cold]() */"
+            ),
+            "throw marker should be preserved:\n{}",
             output
         );
         assert!(
-            output.contains("\n    unwrap_or_throw(std::optional<int>) [clone .cold]();\n"),
-            "throw thunk call should remain a statement:\n{}",
+            !output.contains("unwrap_or_throw(std::optional<int>) [clone .cold]();"),
+            "raw cold-thunk call must not be emitted alongside the throw marker:\n{}",
             output
         );
         assert!(
             !output.contains("return unwrap_or_throw(std::optional<int>) [clone .cold]();"),
-            "throw thunk call must not be folded into a return:\n{}",
+            "cold thunk path must not be folded into a synthetic return:\n{}",
             output
         );
         assert!(
             !output.contains("\n    return 0;\n"),
-            "terminal throw thunk call must suppress fallback return:\n{}",
+            "terminal throw marker must suppress fallback return:\n{}",
             output
         );
     }
