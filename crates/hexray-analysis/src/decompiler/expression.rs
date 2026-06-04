@@ -1636,6 +1636,63 @@ impl Expr {
         Self::unknown(format!("/* SSE: {} */", mnemonic.to_ascii_lowercase()))
     }
 
+    /// Recognise `pxor %xmmN,%xmmN` / `xorps %xmmN,%xmmN` / `xorpd
+    /// %xmmN,%xmmN` (and AVX-prefixed equivalents) as the canonical
+    /// "zero this SSE register" idiom that gcc/clang emit instead of
+    /// `movsd $0, %xmm`. Lift it as a direct assignment `xmmN = 0`
+    /// rather than the opaque `/* SSE: pxor */` comment. The IR doesn't
+    /// model a separate float literal, but `IntLit(0)` is bit-identical
+    /// to 0.0 / 0.0f and the downstream type-info plumbing already
+    /// renders it as `0.0` when the register is double-typed.
+    ///
+    /// The matched shape is two `Operand::Register`s pointing at the
+    /// same xmm/ymm/zmm register. Vex / Evex three-operand `vxorpd
+    /// %xmm0, %xmm0, %xmm0` is intentionally NOT folded here — that's
+    /// a destructive write through one specific source slot and any
+    /// genuine zeroing form a compiler emits already uses the
+    /// two-operand SSE encoding.
+    fn lift_sse_self_xor_zero(inst: &Instruction) -> Option<Self> {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        if !matches!(mnemonic.as_str(), "pxor" | "xorps" | "xorpd") {
+            return None;
+        }
+        let regs: Vec<&Register> = inst
+            .operands
+            .iter()
+            .filter_map(|o| match o {
+                Operand::Register(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        if regs.len() != 2 {
+            return None;
+        }
+        let dst_name = regs[0].name().to_ascii_lowercase();
+        let src_name = regs[1].name().to_ascii_lowercase();
+        if dst_name != src_name {
+            return None;
+        }
+        if !(dst_name.starts_with("xmm") || dst_name.starts_with("ymm") || dst_name.starts_with("zmm"))
+        {
+            return None;
+        }
+        // 16 bytes is right for xmm; ymm/zmm widen but the lowest 8 bytes
+        // are what matters for scalar float (where this idiom appears).
+        // Over-stating the size keeps emitter behaviour consistent with
+        // how full-xmm writes are tracked elsewhere.
+        let size = if dst_name.starts_with("zmm") {
+            64
+        } else if dst_name.starts_with("ymm") {
+            32
+        } else {
+            16
+        };
+        Some(Self::assign(
+            Self::var(Variable::reg(dst_name, size)),
+            Self::int(0),
+        ))
+    }
+
     fn should_lift_as_opaque_x86_integer_simd(inst: &Instruction) -> bool {
         let mnemonic = inst.mnemonic.to_ascii_lowercase();
         Self::looks_like_x86_integer_simd_mnemonic(&mnemonic)
@@ -1661,6 +1718,15 @@ impl Expr {
             return expr;
         }
 
+        // Self-xor on an SSE/AVX register is `reg = 0` — recognise it
+        // before the generic opaque-integer-SIMD fallback, otherwise
+        // `pxor %xmm0,%xmm0` (the `double s = 0.0` idiom in
+        // -fno-fast-math float code) would surface as
+        // `/* SSE: pxor */` and the surrounding type recovery loses the
+        // initial-value evidence.
+        if let Some(expr) = Self::lift_sse_self_xor_zero(inst) {
+            return expr;
+        }
         if Self::should_lift_as_opaque_x86_integer_simd(inst) {
             return Self::opaque_x86_integer_simd_comment(&inst.mnemonic);
         }
@@ -6226,6 +6292,76 @@ mod tests {
         let rendered = Expr::from_instruction(&inst).to_string();
 
         assert_eq!(rendered, "/* SSE: punpcklqdq */");
+    }
+
+    #[test]
+    fn test_pxor_self_zero_lifts_to_register_assignment_to_zero() {
+        // Canonical `double s = 0.0` idiom from gcc/clang: instead of
+        // emitting a movsd against a rodata-stored zero, the compiler
+        // self-xors the xmm. The opaque-integer-SIMD fallback used to
+        // surface this as `/* SSE: pxor */`, losing all evidence that the
+        // register now holds 0. The dedicated self-xor recogniser turns
+        // it into `xmm0 = 0` so downstream copy-prop, type recovery, and
+        // the return-value path see the zero initialisation.
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let inst = Instruction::new(0x401020, 4, vec![0x66, 0x0f, 0xef, 0xc0], "pxor")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![
+                Operand::Register(xmm0.clone()),
+                Operand::Register(xmm0),
+            ]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "xmm0 = 0");
+    }
+
+    #[test]
+    fn test_xorps_self_zero_lifts_to_register_assignment_to_zero() {
+        // Float-XOR self-zero, the `float s = 0.0f` analogue of the
+        // pxor case. Same target shape — the recogniser also accepts
+        // `xorps` / `xorpd` since gcc/clang both pick whichever matches
+        // the surrounding scalar width.
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
+        let inst = Instruction::new(0x401030, 3, vec![0x0f, 0x57, 0xc9], "xorps")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![
+                Operand::Register(xmm1.clone()),
+                Operand::Register(xmm1),
+            ]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "xmm1 = 0");
+    }
+
+    #[test]
+    fn test_pxor_distinct_xmm_registers_stays_opaque() {
+        // Only the self-xor (same source and destination) is a zero-init
+        // idiom. `pxor %xmm0, %xmm1` is a genuine integer-SIMD bitwise
+        // xor — it should keep the existing opaque-comment fallback so
+        // we don't silently drop semantic content.
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
+        let inst = Instruction::new(0x401040, 4, vec![0x66, 0x0f, 0xef, 0xc1], "pxor")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Register(xmm1)]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "/* SSE: pxor */");
     }
 
     #[test]
