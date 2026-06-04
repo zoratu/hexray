@@ -1636,48 +1636,63 @@ impl Expr {
         Self::unknown(format!("/* SSE: {} */", mnemonic.to_ascii_lowercase()))
     }
 
-    /// Recognise `pxor %xmmN,%xmmN` / `xorps %xmmN,%xmmN` / `xorpd
-    /// %xmmN,%xmmN` (and AVX-prefixed equivalents) as the canonical
-    /// "zero this SSE register" idiom that gcc/clang emit instead of
-    /// `movsd $0, %xmm`. Lift it as a direct assignment `xmmN = 0`
-    /// rather than the opaque `/* SSE: pxor */` comment. The IR doesn't
-    /// model a separate float literal, but `IntLit(0)` is bit-identical
-    /// to 0.0 / 0.0f and the downstream type-info plumbing already
-    /// renders it as `0.0` when the register is double-typed.
+    /// Recognise the canonical "zero this SSE/AVX register" idioms and
+    /// lift them as `xmmN = 0` rather than the opaque
+    /// `/* SSE: pxor */` comment. Compilers reach for self-xor instead
+    /// of `movsd $0, %xmm` because the result is `mov`-free and breaks
+    /// the false dependency on the previous value. The IR doesn't model
+    /// a separate float literal, but `IntLit(0)` is bit-identical to
+    /// 0.0 / 0.0f and the downstream type-info plumbing already renders
+    /// it as `0.0` when the register is double-typed.
     ///
-    /// The matched shape is two `Operand::Register`s pointing at the
-    /// same xmm/ymm/zmm register. Vex / Evex three-operand `vxorpd
-    /// %xmm0, %xmm0, %xmm0` is intentionally NOT folded here — that's
-    /// a destructive write through one specific source slot and any
-    /// genuine zeroing form a compiler emits already uses the
-    /// two-operand SSE encoding.
+    /// Two encodings:
+    ///   * **Legacy SSE 2-operand** — `pxor %xmmN,%xmmN`,
+    ///     `xorps %xmmN,%xmmN`, `xorpd %xmmN,%xmmN`. Both register
+    ///     operands name the same destination.
+    ///   * **AVX 3-operand VEX form** — `vpxor %xmmN,%xmmN,%xmmN`,
+    ///     `vxorps`, `vxorpd`. The VEX encoding lets the compiler write
+    ///     `dst = src1 ^ src2`; when all three operands are the same
+    ///     register the result is still 0 and gcc/clang routinely emit
+    ///     this on AVX-targeted builds. Codex review pass on PR #11
+    ///     flagged the original 2-operand-only matcher for missing this
+    ///     case — without it AVX float code keeps surfacing
+    ///     `/* SSE: vpxor */` for what is in fact a `double s = 0.0`.
     fn lift_sse_self_xor_zero(inst: &Instruction) -> Option<Self> {
         let mnemonic = inst.mnemonic.to_ascii_lowercase();
-        if !matches!(mnemonic.as_str(), "pxor" | "xorps" | "xorpd") {
+        if !matches!(
+            mnemonic.as_str(),
+            "pxor" | "xorps" | "xorpd" | "vpxor" | "vxorps" | "vxorpd"
+        ) {
             return None;
         }
-        let regs: Vec<&Register> = inst
+        let reg_names: Vec<String> = inst
             .operands
             .iter()
             .filter_map(|o| match o {
-                Operand::Register(r) => Some(r),
+                Operand::Register(r) => Some(r.name().to_ascii_lowercase()),
                 _ => None,
             })
             .collect();
-        if regs.len() != 2 {
+        // Accept exactly 2 (legacy SSE encoding) or exactly 3 (AVX VEX
+        // encoding) register operands; anything else (memory operand,
+        // VEX-128 against a memory source, etc.) is not the zero idiom.
+        let all_same = match reg_names.as_slice() {
+            [a, b] => a == b,
+            [a, b, c] => a == b && b == c,
+            _ => false,
+        };
+        if !all_same {
             return None;
         }
-        let dst_name = regs[0].name().to_ascii_lowercase();
-        let src_name = regs[1].name().to_ascii_lowercase();
-        if dst_name != src_name {
-            return None;
-        }
-        if !(dst_name.starts_with("xmm") || dst_name.starts_with("ymm") || dst_name.starts_with("zmm"))
+        let dst_name = &reg_names[0];
+        if !(dst_name.starts_with("xmm")
+            || dst_name.starts_with("ymm")
+            || dst_name.starts_with("zmm"))
         {
             return None;
         }
-        // 16 bytes is right for xmm; ymm/zmm widen but the lowest 8 bytes
-        // are what matters for scalar float (where this idiom appears).
+        // 16 bytes for xmm; ymm/zmm widen but the lowest 8 bytes are
+        // what matters for scalar float (where this idiom appears).
         // Over-stating the size keeps emitter behaviour consistent with
         // how full-xmm writes are tracked elsewhere.
         let size = if dst_name.starts_with("zmm") {
@@ -1688,7 +1703,7 @@ impl Expr {
             16
         };
         Some(Self::assign(
-            Self::var(Variable::reg(dst_name, size)),
+            Self::var(Variable::reg(dst_name.clone(), size)),
             Self::int(0),
         ))
     }
@@ -6335,6 +6350,65 @@ mod tests {
         let rendered = Expr::from_instruction(&inst).to_string();
 
         assert_eq!(rendered, "xmm1 = 0");
+    }
+
+    #[test]
+    fn test_vpxor_avx_three_operand_self_zero_lifts_to_zero() {
+        // AVX VEX encoding: `vpxor %xmmN, %xmmN, %xmmN` — `dst = src1 ^
+        // src2`, all three operands the same → 0. This is the canonical
+        // zeroing form on AVX-targeted builds (gcc -mavx, clang
+        // -mavx2/-mavx512f). Codex review on PR #11 flagged this gap
+        // (https://github.com/zoratu/hexray/pull/11) — the original
+        // 2-operand-only recogniser dropped the zero evidence on every
+        // AVX float function.
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let inst = Instruction::new(0x401050, 5, vec![0xc5, 0xf9, 0xef, 0xc0, 0x00], "vpxor")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![
+                Operand::Register(xmm0),
+                Operand::Register(xmm0),
+                Operand::Register(xmm0),
+            ]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        assert_eq!(rendered, "xmm0 = 0");
+    }
+
+    #[test]
+    fn test_vxorpd_avx_three_operand_distinct_stays_opaque() {
+        // VEX encoding with a NON-matching source slot is a genuine xor
+        // (`dst = src1 ^ src2`), not a zero idiom. The recogniser must
+        // decline when not all three names match so we don't silently
+        // drop a real bitwise xor.
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
+        let inst = Instruction::new(0x401060, 5, vec![0xc5, 0xf1, 0x57, 0xc0, 0x00], "vxorpd")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![
+                Operand::Register(xmm0),
+                Operand::Register(xmm1),
+                Operand::Register(xmm0),
+            ]);
+
+        let rendered = Expr::from_instruction(&inst).to_string();
+
+        // vxorpd isn't in `looks_like_x86_integer_simd_mnemonic`, so the
+        // generic xor lift takes over here — what matters for this
+        // regression is that the self-zero recogniser correctly *declines*
+        // the mismatched-operand case. Anything other than `xmm0 = 0` is
+        // an acceptable outcome; the assertion guards against the
+        // specific bug we'd reintroduce by stripping the all-three-match
+        // check.
+        assert_ne!(rendered, "xmm0 = 0");
     }
 
     #[test]
