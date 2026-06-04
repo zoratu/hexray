@@ -1230,6 +1230,24 @@ impl Decompiler {
             structured
         };
 
+        // Step 3a: Recognise the canonical Itanium C++ throw triple
+        // (`__cxa_allocate_exception` + value store + `__cxa_throw`)
+        // and collapse it into a single `throw VALUE` pseudo-statement.
+        // Runs here (not inside `simplify_statements`) because PLT-call
+        // target names live in the symbol/relocation tables, which the
+        // simplify pipeline doesn't otherwise have access to.
+        let structured = {
+            let resolve = |addr: u64| -> Option<String> {
+                self.symbol_table
+                    .as_ref()
+                    .and_then(|st| st.get(addr).map(str::to_string))
+            };
+            StructuredCfg {
+                body: structurer::recover_cxa_throw_pattern(structured.body, &resolve),
+                cfg_entry: structured.cfg_entry,
+            }
+        };
+
         // Step 4: Generate C++ header if this is a special member
         let cpp_header = self.generate_cpp_header(func_name);
 
