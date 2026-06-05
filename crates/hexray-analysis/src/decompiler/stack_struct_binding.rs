@@ -359,7 +359,9 @@ fn pointed_struct_type_name(ty: &CType) -> Option<String> {
     match inner.as_ref() {
         CType::Named(n) if n.starts_with("struct ") => Some(n.clone()),
         CType::Struct(s) => s.name.as_ref().map(|n| format!("struct {n}")),
-        CType::Typedef(t) => pointed_struct_type_name(&CType::Pointer(Box::new((*t.target).clone()))),
+        CType::Typedef(t) => {
+            pointed_struct_type_name(&CType::Pointer(Box::new((*t.target).clone())))
+        }
         _ => None,
     }
 }
@@ -594,18 +596,12 @@ fn transform_node(
                 .collect(),
         },
         N::Expr(e) => N::Expr(transform_expr(e, bindings, db)),
-        N::Return(opt) => {
-            N::Return(opt.as_ref().map(|e| transform_expr(e, bindings, db)))
-        }
+        N::Return(opt) => N::Return(opt.as_ref().map(|e| transform_expr(e, bindings, db))),
         other => other.clone(),
     }
 }
 
-fn transform_expr(
-    expr: &Expr,
-    bindings: &StackStructBindings,
-    db: &TypeDatabase,
-) -> Expr {
+fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase) -> Expr {
     use ExprKind as K;
 
     // Case A: `Deref(Add(frame, K), size)` whose `K` lands inside a bound
@@ -791,11 +787,7 @@ fn field_access_at_offset(
                 if sub_offset == 0 && field_size == access_size {
                     let peeled_field = peel_typedef(&field.field_type);
                     if !matches!(peeled_field, CType::Struct(_) | CType::Union(_)) {
-                        return Some(Expr::field_access(
-                            base,
-                            field.name.clone(),
-                            field.offset,
-                        ));
+                        return Some(Expr::field_access(base, field.name.clone(), field.offset));
                     }
                 }
                 // The access falls inside this field — recurse into nested
@@ -832,8 +824,7 @@ fn field_access_at_offset(
                     peel_typedef(&member.member_type),
                     CType::Struct(_) | CType::Union(_)
                 ) {
-                    let inner_base =
-                        Expr::field_access(base.clone(), member.name.clone(), 0);
+                    let inner_base = Expr::field_access(base.clone(), member.name.clone(), 0);
                     if let Some(e) =
                         field_access_at_offset(inner_base, &member.member_type, 0, access_size)
                     {
@@ -971,10 +962,7 @@ fn try_rewrite_base_zero_to_memset(
 ///   - RHS is the integer literal `0`.
 ///   - No exact top-level field matches the access (otherwise the regular
 ///     rewrite is already producing `local.field = 0`).
-fn is_droppable_interior_zero_store(
-    stmt: &Expr,
-    bindings: &StackStructBindings,
-) -> bool {
+fn is_droppable_interior_zero_store(stmt: &Expr, bindings: &StackStructBindings) -> bool {
     let ExprKind::Assign { lhs, rhs } = &stmt.kind else {
         return false;
     };
@@ -1045,8 +1033,8 @@ fn parse_local_name_offset(name: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use hexray_core::BasicBlockId;
-    use hexray_types::builtin::linux::load_linux_types;
     use hexray_types::builtin::libc::load_libc_functions;
+    use hexray_types::builtin::linux::load_linux_types;
     use hexray_types::builtin::posix::load_posix_types;
 
     use super::super::expression::{Expr, Variable};
@@ -1091,7 +1079,10 @@ mod tests {
         assert_eq!(bindings.len(), 1, "expected exactly one binding");
         let b = bindings.get(-20).expect("binding at -20");
         assert_eq!(b.type_name, "struct epoll_event");
-        assert_eq!(b.size, 12, "packed epoll_event = 4-byte events + 8-byte data");
+        assert_eq!(
+            b.size, 12,
+            "packed epoll_event = 4-byte events + 8-byte data"
+        );
         assert_eq!(b.local_name, "epoll_event_14");
     }
 
@@ -1146,9 +1137,18 @@ mod tests {
 
     #[test]
     fn synthesizes_short_local_name() {
-        assert_eq!(synthesize_local_name("struct epoll_event", -20), "epoll_event_14");
-        assert_eq!(synthesize_local_name("struct clone_args", -0x90), "clone_args_90");
-        assert_eq!(synthesize_local_name("union epoll_data", -16), "epoll_data_10");
+        assert_eq!(
+            synthesize_local_name("struct epoll_event", -20),
+            "epoll_event_14"
+        );
+        assert_eq!(
+            synthesize_local_name("struct clone_args", -0x90),
+            "clone_args_90"
+        );
+        assert_eq!(
+            synthesize_local_name("union epoll_data", -16),
+            "epoll_data_10"
+        );
     }
 
     fn epoll_ctl_with_stack_arg() -> Expr {
@@ -1405,12 +1405,18 @@ mod tests {
         // chain. The fixed helper recursively peels typedefs and accepts
         // unions, so both names resolve to the underlying 8-byte size.
         let db = full_db();
-        let direct = struct_size_in_db(&db, "union epoll_data")
-            .expect("union epoll_data must resolve");
+        let direct =
+            struct_size_in_db(&db, "union epoll_data").expect("union epoll_data must resolve");
         let via_typedef =
             struct_size_in_db(&db, "epoll_data_t").expect("epoll_data_t typedef must resolve");
-        assert_eq!(direct, 8, "union epoll_data is 8 bytes (largest member u64)");
-        assert_eq!(via_typedef, direct, "typedef must resolve to underlying size");
+        assert_eq!(
+            direct, 8,
+            "union epoll_data is 8 bytes (largest member u64)"
+        );
+        assert_eq!(
+            via_typedef, direct,
+            "typedef must resolve to underlying size"
+        );
     }
 
     #[test]
@@ -1467,7 +1473,11 @@ mod tests {
             panic!("expected block")
         };
         // Only the call should remain (the interior zero was dropped).
-        assert_eq!(statements.len(), 1, "expected only the call, got {statements:#?}");
+        assert_eq!(
+            statements.len(),
+            1,
+            "expected only the call, got {statements:#?}"
+        );
         assert!(matches!(statements[0].kind, ExprKind::Call { .. }));
     }
 

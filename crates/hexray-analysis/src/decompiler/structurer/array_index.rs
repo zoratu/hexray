@@ -179,11 +179,9 @@ fn resolve(expr: &Expr, values: &ValueMap) -> Expr {
             .get(&v.name.to_lowercase())
             .cloned()
             .unwrap_or_else(|| expr.clone()),
-        ExprKind::BinOp { op, left, right } => Expr::binop(
-            *op,
-            resolve(left, values),
-            resolve(right, values),
-        ),
+        ExprKind::BinOp { op, left, right } => {
+            Expr::binop(*op, resolve(left, values), resolve(right, values))
+        }
         ExprKind::UnaryOp { op, operand } => Expr::unary(*op, resolve(operand, values)),
         ExprKind::Cast {
             expr: inner,
@@ -234,7 +232,9 @@ fn rewrite_array_derefs(expr: Expr, values: &ValueMap) -> Expr {
             rewrite_array_derefs(*left, values),
             rewrite_array_derefs(*right, values),
         ),
-        ExprKind::UnaryOp { op, operand } => Expr::unary(op, rewrite_array_derefs(*operand, values)),
+        ExprKind::UnaryOp { op, operand } => {
+            Expr::unary(op, rewrite_array_derefs(*operand, values))
+        }
         ExprKind::AddressOf(inner) => Expr::address_of(rewrite_array_derefs(*inner, values)),
         ExprKind::Cast {
             expr: inner,
@@ -296,9 +296,7 @@ fn statement_writes_memory(stmt: &Expr) -> bool {
     };
     matches!(
         &lhs.kind,
-        ExprKind::Deref { .. }
-            | ExprKind::ArrayAccess { .. }
-            | ExprKind::FieldAccess { .. }
+        ExprKind::Deref { .. } | ExprKind::ArrayAccess { .. } | ExprKind::FieldAccess { .. }
     ) || matches!(&lhs.kind, ExprKind::Var(v) if matches!(v.kind, VarKind::Stack(_)))
 }
 
@@ -319,8 +317,8 @@ fn expr_reads_memory(expr: &Expr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::expression::{BinOpKind, Variable};
+    use super::*;
     use hexray_core::BasicBlockId;
 
     fn block(stmts: Vec<Expr>) -> StructuredNode {
@@ -397,7 +395,13 @@ mod tests {
             panic!("expected assignment");
         };
         assert!(
-            matches!(&lhs.kind, ExprKind::ArrayAccess { element_size: 8, .. }),
+            matches!(
+                &lhs.kind,
+                ExprKind::ArrayAccess {
+                    element_size: 8,
+                    ..
+                }
+            ),
             "store target should be an 8-byte ArrayAccess, got {lhs:?}"
         );
     }
@@ -416,6 +420,9 @@ mod tests {
         let ExprKind::Assign { rhs, .. } = &statements[0].kind else {
             panic!("expected assignment");
         };
-        assert!(matches!(&rhs.kind, ExprKind::Deref { .. }), "plain deref preserved");
+        assert!(
+            matches!(&rhs.kind, ExprKind::Deref { .. }),
+            "plain deref preserved"
+        );
     }
 }

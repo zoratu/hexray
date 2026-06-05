@@ -1366,18 +1366,11 @@ impl Decompiler {
             "//   This is the .{} partition ({}) emitted by the compiler",
             kind, friendly
         ));
+        lines.push("//   for a coroutine source function. Suspend/resume state lives".to_string());
         lines.push(
-            "//   for a coroutine source function. Suspend/resume state lives"
-                .to_string(),
+            "//   in the heap-allocated frame pointed to by the first parameter;".to_string(),
         );
-        lines.push(
-            "//   in the heap-allocated frame pointed to by the first parameter;"
-                .to_string(),
-        );
-        lines.push(
-            "//   full `co_await` / `co_yield` / `co_return` reconstruction is"
-                .to_string(),
-        );
+        lines.push("//   full `co_await` / `co_yield` / `co_return` reconstruction is".to_string());
         lines.push("//   deferred (deferral #7 of the v1.3.8 roadmap).".to_string());
         Some(lines.join("\n"))
     }
@@ -3246,9 +3239,8 @@ mod tests {
         assert!(destroy.contains(".destroy partition"));
         assert!(destroy.contains("frame destructor"));
 
-        let cleanup =
-            Decompiler::generate_coroutine_header("foo(foo()::Frame*) [clone .cleanup]")
-                .expect("cleanup header");
+        let cleanup = Decompiler::generate_coroutine_header("foo(foo()::Frame*) [clone .cleanup]")
+            .expect("cleanup header");
         assert!(cleanup.contains(".cleanup partition"));
         assert!(cleanup.contains("early-cleanup partition"));
 

@@ -34,7 +34,6 @@ pub use cleanup::{
     convert_cleanup_gotos, convert_gotos_to_early_returns, convert_multilevel_breaks,
     remove_orphan_gotos, remove_orphan_labels, structure_shared_exits,
 };
-pub use simplify::recover_cxa_throw_pattern;
 #[cfg(test)]
 use condition::try_extract_arm64_branch_condition;
 use condition::{
@@ -51,6 +50,7 @@ use gotos::{
 };
 #[cfg(test)]
 use simplify::capture_return_register_uses_in_block;
+pub use simplify::recover_cxa_throw_pattern;
 use simplify::{
     elide_profiling_probe_calls, elide_stack_clash_probe_scaffolding, extract_return_value,
     merge_return_value_captures, propagate_args_in_block,

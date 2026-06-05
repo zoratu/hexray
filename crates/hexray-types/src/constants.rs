@@ -2990,8 +2990,10 @@ mod tests {
         // The end-to-end smoke for refinement #3: 0x2001 = EPOLLIN |
         // EPOLLRDHUP, both in the PollEvents category.
         let db = ConstantDatabase::with_builtins();
-        let formatted =
-            db.format_flags(0x2001, get_field_category("struct epoll_event", "events").unwrap());
+        let formatted = db.format_flags(
+            0x2001,
+            get_field_category("struct epoll_event", "events").unwrap(),
+        );
         assert!(formatted.contains("EPOLLIN"), "got {formatted:?}");
         assert!(formatted.contains("EPOLLRDHUP"), "got {formatted:?}");
     }
