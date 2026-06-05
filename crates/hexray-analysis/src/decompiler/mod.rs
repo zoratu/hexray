@@ -1325,8 +1325,61 @@ impl Decompiler {
             output.push('\n');
         }
 
+        // Add C++20 coroutine-clone header if this function is a
+        // compiler-generated `.actor` / `.destroy` / `.cleanup`
+        // partition. Tells the user upfront that they're looking at a
+        // state-machine body rather than the source coroutine, and
+        // points at the deferral for the rest.
+        if let Some(coro_header) = Self::generate_coroutine_header(&display_name) {
+            output.push_str(&coro_header);
+            output.push('\n');
+        }
+
         output.push_str(&code);
         output
+    }
+
+    /// Render a per-function header for C++20 coroutine clones —
+    /// `.actor` (state-machine stepper), `.destroy` (frame
+    /// destructor), `.cleanup` (early-cleanup partition). When gcc /
+    /// clang lower `co_await` / `co_yield` / `co_return` they split
+    /// the function into these three clones; the surviving bodies
+    /// shuttle suspend/resume state through a heap-allocated frame
+    /// pointed to by the first parameter. Recovering the original
+    /// `co_await` chain is research-grade work (deferral #7 of the
+    /// post-v1.3.8 roadmap); for now the header simply makes the
+    /// shape explicit and points downstream readers at the deferral
+    /// so they don't mistake the state-machine body for the source.
+    fn generate_coroutine_header(display_name: &str) -> Option<String> {
+        let (kind, friendly) = if display_name.contains("[clone .actor]") {
+            ("actor", "state-machine stepper")
+        } else if display_name.contains("[clone .destroy]") {
+            ("destroy", "frame destructor")
+        } else if display_name.contains("[clone .cleanup]") {
+            ("cleanup", "early-cleanup partition")
+        } else {
+            return None;
+        };
+        let mut lines = Vec::new();
+        lines.push("// C++20 coroutine clone:".to_string());
+        lines.push(format!(
+            "//   This is the .{} partition ({}) emitted by the compiler",
+            kind, friendly
+        ));
+        lines.push(
+            "//   for a coroutine source function. Suspend/resume state lives"
+                .to_string(),
+        );
+        lines.push(
+            "//   in the heap-allocated frame pointed to by the first parameter;"
+                .to_string(),
+        );
+        lines.push(
+            "//   full `co_await` / `co_yield` / `co_return` reconstruction is"
+                .to_string(),
+        );
+        lines.push("//   deferred (deferral #7 of the v1.3.8 roadmap).".to_string());
+        Some(lines.join("\n"))
     }
 
     /// Generates exception handling header comments.
@@ -3168,5 +3221,46 @@ mod tests {
             .expect("containing symbol");
         assert_eq!(containing.address, 0x5000);
         assert_eq!(containing.name, "g_struct");
+    }
+
+    #[test]
+    fn coroutine_header_fires_for_known_clone_partitions() {
+        // gcc/clang lower C++20 coroutines into `.actor` / `.destroy` /
+        // `.cleanup` clones; the header just tells the user which
+        // partition they're looking at and that full co_await
+        // reconstruction is deferral #7. Each known suffix must be
+        // recognised; an unrelated function must produce no header at
+        // all.
+        let actor = Decompiler::generate_coroutine_header(
+            "simple_coro(simple_coro(int)::_Z11simple_coroi.Frame*) [clone .actor]",
+        )
+        .expect("actor header");
+        assert!(actor.contains(".actor partition"));
+        assert!(actor.contains("state-machine stepper"));
+        assert!(actor.contains("deferral #7"));
+
+        let destroy = Decompiler::generate_coroutine_header(
+            "simple_coro(simple_coro(int)::_Z11simple_coroi.Frame*) [clone .destroy]",
+        )
+        .expect("destroy header");
+        assert!(destroy.contains(".destroy partition"));
+        assert!(destroy.contains("frame destructor"));
+
+        let cleanup =
+            Decompiler::generate_coroutine_header("foo(foo()::Frame*) [clone .cleanup]")
+                .expect("cleanup header");
+        assert!(cleanup.contains(".cleanup partition"));
+        assert!(cleanup.contains("early-cleanup partition"));
+
+        assert!(
+            Decompiler::generate_coroutine_header("ordinary_function(int)").is_none(),
+            "non-coroutine names must not trigger the coroutine header"
+        );
+        // `[clone .cold]` is a gcc cold-clone partition (unrelated to
+        // coroutines) — must not match.
+        assert!(
+            Decompiler::generate_coroutine_header("foo(int) [clone .cold]").is_none(),
+            "the cold-clone partition is not a coroutine clone"
+        );
     }
 }
