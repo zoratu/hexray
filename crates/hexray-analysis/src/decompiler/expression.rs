@@ -4362,7 +4362,12 @@ mod tests {
         assert!(
             matches!(
                 try_detect_array_in_deref(&valid, 4),
-                Some(Expr { kind: ExprKind::ArrayAccess { element_size: 4, .. } })
+                Some(Expr {
+                    kind: ExprKind::ArrayAccess {
+                        element_size: 4,
+                        ..
+                    }
+                })
             ),
             "valid shift-by-2 with 4-byte deref should be an array access"
         );
@@ -4384,7 +4389,10 @@ mod tests {
             panic!("expected assignment");
         };
         // Must lift to `*(rbp-8) = xmm0`, not the reverse.
-        assert!(matches!(lhs.kind, ExprKind::Deref { .. }), "store dst must be memory");
+        assert!(
+            matches!(lhs.kind, ExprKind::Deref { .. }),
+            "store dst must be memory"
+        );
         assert!(matches!(&rhs.kind, ExprKind::Var(v) if v.name == "xmm0"));
     }
 
@@ -4403,7 +4411,10 @@ mod tests {
         let ExprKind::Assign { lhs, .. } = Expr::from_instruction(&inst).kind else {
             panic!("expected assignment");
         };
-        assert!(matches!(lhs.kind, ExprKind::Deref { .. }), "store dst must be memory");
+        assert!(
+            matches!(lhs.kind, ExprKind::Deref { .. }),
+            "store dst must be memory"
+        );
     }
 
     #[test]

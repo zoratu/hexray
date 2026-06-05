@@ -225,7 +225,9 @@ pub fn scan_float_arg_registers(
             if !is_self_zero {
                 if let Some(Operand::Register(src)) = inst.operands.get(1) {
                     let name = src.name().to_lowercase();
-                    if let Some(idx) = float_regs.iter().position(|r| r.eq_ignore_ascii_case(&name))
+                    if let Some(idx) = float_regs
+                        .iter()
+                        .position(|r| r.eq_ignore_ascii_case(&name))
                     {
                         if detected[idx].is_none() && !written.contains(&name) {
                             detected[idx] = Some(scalar_float_operand_size(inst));
@@ -4653,9 +4655,7 @@ mod tests {
     }
 
     /// Build a one-block CFG from a list of (mnemonic, operation, operands).
-    fn single_block_cfg(
-        insts: Vec<(&str, Operation, Vec<Operand>)>,
-    ) -> ControlFlowGraph {
+    fn single_block_cfg(insts: Vec<(&str, Operation, Vec<Operand>)>) -> ControlFlowGraph {
         use hexray_core::{BasicBlock, BlockTerminator, Instruction};
         let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
         let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
@@ -4682,8 +4682,16 @@ mod tests {
         // movsd %xmm0,[rbp-8] ; movsd %xmm1,[rbp-16]  (the -O0 arg spill)
         let rbp = gpr(5, 64);
         let cfg = single_block_cfg(vec![
-            ("movsd", Operation::Store, vec![mem(rbp, -8), Operand::Register(xmm(0))]),
-            ("movsd", Operation::Store, vec![mem(rbp, -16), Operand::Register(xmm(1))]),
+            (
+                "movsd",
+                Operation::Store,
+                vec![mem(rbp, -8), Operand::Register(xmm(0))],
+            ),
+            (
+                "movsd",
+                Operation::Store,
+                vec![mem(rbp, -16), Operand::Register(xmm(1))],
+            ),
         ]);
         let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
         assert_eq!(
@@ -4723,11 +4731,22 @@ mod tests {
         // movsd [rbp-8],%xmm0 first writes xmm0, then a later read is not an arg.
         let rbp = gpr(5, 64);
         let cfg = single_block_cfg(vec![
-            ("movsd", Operation::Move, vec![Operand::Register(xmm(0)), mem(rbp, -8)]),
-            ("movsd", Operation::Store, vec![mem(rbp, -16), Operand::Register(xmm(0))]),
+            (
+                "movsd",
+                Operation::Move,
+                vec![Operand::Register(xmm(0)), mem(rbp, -8)],
+            ),
+            (
+                "movsd",
+                Operation::Store,
+                vec![mem(rbp, -16), Operand::Register(xmm(0))],
+            ),
         ]);
         let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
-        assert!(found.is_empty(), "xmm0 written before read is not an argument");
+        assert!(
+            found.is_empty(),
+            "xmm0 written before read is not an argument"
+        );
     }
 
     #[test]
@@ -4750,8 +4769,16 @@ mod tests {
         // xmm0 argument read.
         let rbp = gpr(5, 64);
         let cfg = single_block_cfg(vec![
-            ("pxor", Operation::Xor, vec![Operand::Register(xmm(0)), Operand::Register(xmm(0))]),
-            ("movsd", Operation::Store, vec![mem(rbp, -8), Operand::Register(xmm(0))]),
+            (
+                "pxor",
+                Operation::Xor,
+                vec![Operand::Register(xmm(0)), Operand::Register(xmm(0))],
+            ),
+            (
+                "movsd",
+                Operation::Store,
+                vec![mem(rbp, -8), Operand::Register(xmm(0))],
+            ),
         ]);
         let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
         assert!(found.is_empty(), "pxor self-zero is not an argument read");
@@ -4794,7 +4821,10 @@ mod tests {
             Operation::Move,
             vec![Operand::Register(xmm(0)), mem(rbp, -4)],
         )]);
-        assert_eq!(scan_float_return(&single, CallingConvention::SystemV), Some(4));
+        assert_eq!(
+            scan_float_return(&single, CallingConvention::SystemV),
+            Some(4)
+        );
     }
 
     #[test]
@@ -4803,7 +4833,11 @@ mod tests {
         // an integer in eax — an integer return.
         let rbp = gpr(5, 64);
         let dbl = single_block_cfg(vec![
-            ("movsd", Operation::Move, vec![Operand::Register(xmm(0)), mem(rbp, -8)]),
+            (
+                "movsd",
+                Operation::Move,
+                vec![Operand::Register(xmm(0)), mem(rbp, -8)],
+            ),
             (
                 "cvttsd2si",
                 Operation::Move,
@@ -4819,9 +4853,21 @@ mod tests {
         // The rax canary reload must not mask the xmm0 float return.
         let rbp = gpr(5, 64);
         let cfg = single_block_cfg(vec![
-            ("movsd", Operation::Move, vec![Operand::Register(xmm(0)), mem(rbp, -88)]),
-            ("mov", Operation::Move, vec![Operand::Register(gpr(0, 64)), mem(rbp, -8)]),
-            ("sub", Operation::Sub, vec![Operand::Register(gpr(0, 64)), guard_mem()]),
+            (
+                "movsd",
+                Operation::Move,
+                vec![Operand::Register(xmm(0)), mem(rbp, -88)],
+            ),
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(gpr(0, 64)), mem(rbp, -8)],
+            ),
+            (
+                "sub",
+                Operation::Sub,
+                vec![Operand::Register(gpr(0, 64)), guard_mem()],
+            ),
         ]);
         assert_eq!(scan_float_return(&cfg, CallingConvention::SystemV), Some(8));
     }

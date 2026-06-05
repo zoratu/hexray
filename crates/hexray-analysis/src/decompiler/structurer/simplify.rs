@@ -501,10 +501,7 @@ fn node_definitely_terminates(node: &StructuredNode) -> bool {
 /// instead of `*buf = value`. This pass currently only handles the
 /// scalar-value form (int/double/raw pointer); the ctor form needs
 /// type recovery beyond what we have here and stays a follow-up.
-pub fn recover_cxa_throw_pattern<F>(
-    nodes: Vec<StructuredNode>,
-    resolve: &F,
-) -> Vec<StructuredNode>
+pub fn recover_cxa_throw_pattern<F>(nodes: Vec<StructuredNode>, resolve: &F) -> Vec<StructuredNode>
 where
     F: Fn(u64, u64) -> Option<String>,
 {
@@ -637,9 +634,7 @@ where
         G: Fn(u64, u64) -> Option<String>,
     {
         match target {
-            CallTarget::Named(name) => {
-                Some(hexray_core::unversioned_symbol_name(name).to_string())
-            }
+            CallTarget::Named(name) => Some(hexray_core::unversioned_symbol_name(name).to_string()),
             CallTarget::Direct {
                 target: addr,
                 call_site,
@@ -779,11 +774,8 @@ where
                     // when the trailing component repeats the class name
                     // (`std::runtime_error::runtime_error` → `std::runtime_error`).
                     let prettified = collapse_ctor_pretty_name(&target_name);
-                    let rest_args: Vec<String> = args
-                        .iter()
-                        .skip(1)
-                        .map(|a| format!("{}", a))
-                        .collect();
+                    let rest_args: Vec<String> =
+                        args.iter().skip(1).map(|a| format!("{}", a)).collect();
                     Some(format!("{}({})", prettified, rest_args.join(", ")))
                 }
             }
@@ -4609,7 +4601,11 @@ fn expr_contains_call(expr: &Expr) -> bool {
             cond,
             then_expr,
             else_expr,
-        } => expr_contains_call(cond) || expr_contains_call(then_expr) || expr_contains_call(else_expr),
+        } => {
+            expr_contains_call(cond)
+                || expr_contains_call(then_expr)
+                || expr_contains_call(else_expr)
+        }
         ExprKind::Phi(values) => values.iter().any(expr_contains_call),
         ExprKind::GotRef { display_expr, .. } => expr_contains_call(display_expr),
         ExprKind::Var(_) | ExprKind::Unknown(_) | ExprKind::IntLit(_) => false,
@@ -5312,10 +5308,7 @@ fn collect_loop_body_modifications(
                 collect_loop_body_modifications(body, regs, slots)
             }
             StructuredNode::For {
-                init,
-                update,
-                body,
-                ..
+                init, update, body, ..
             } => {
                 if let Some(init) = init {
                     collect_modified_lvalue(init, regs, slots);
@@ -5348,11 +5341,7 @@ fn collect_loop_body_modifications(
     }
 }
 
-fn collect_modified_lvalue(
-    stmt: &Expr,
-    regs: &mut HashSet<String>,
-    slots: &mut HashSet<String>,
-) {
+fn collect_modified_lvalue(stmt: &Expr, regs: &mut HashSet<String>, slots: &mut HashSet<String>) {
     use super::super::expression::ExprKind;
     let lhs = match &stmt.kind {
         ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => lhs,
@@ -5748,8 +5737,10 @@ fn propagate_args_in_block_with_state(
                 }
 
                 if is_temp_register(&v.name) {
-                    let stabilized_temp_rhs =
-                        stabilize_saved_arg_registers_excluding(tracked_rhs.clone(), &clobbered_regs);
+                    let stabilized_temp_rhs = stabilize_saved_arg_registers_excluding(
+                        tracked_rhs.clone(),
+                        &clobbered_regs,
+                    );
                     // Sub-register writes (al, ah, ax, ...) must not propagate
                     // the substituted RHS at all under the canonical-name slot
                     // — `v.name` for `al` is `rax`, so storing here would let
@@ -11222,7 +11213,12 @@ mod tests {
     fn test_stabilize_excludes_clobbered_arg_register() {
         // `rdx` (the arg2 register) reused as a temp must not be canonicalized
         // back to `arg2` — that would fabricate a parameter and a bogus index.
-        let expr = || Expr::deref(Expr::binop(BinOpKind::Add, reg("arg0", 8), reg("rdx", 8)), 4);
+        let expr = || {
+            Expr::deref(
+                Expr::binop(BinOpKind::Add, reg("arg0", 8), reg("rdx", 8)),
+                4,
+            )
+        };
 
         let mut excluded = HashSet::new();
         excluded.insert("rdx".to_string());
@@ -14583,11 +14579,7 @@ mod tests {
     fn cxa_throw_named(buf: &str, type_arg: &str) -> Expr {
         Expr::call(
             CallTarget::Named("__cxa_throw@CXXABI_1.3@plt".to_string()),
-            vec![
-                local(buf, 8),
-                Expr::unknown(type_arg),
-                Expr::int(0),
-            ],
+            vec![local(buf, 8), Expr::unknown(type_arg), Expr::int(0)],
         )
     }
 
@@ -14608,10 +14600,7 @@ mod tests {
                         vec![Expr::int(4)],
                     ),
                 ),
-                Expr::assign(
-                    Expr::deref(local("ret_0", 8), 4),
-                    Expr::int(42),
-                ),
+                Expr::assign(Expr::deref(local("ret_0", 8), 4), Expr::int(42)),
                 cxa_throw_named("ret_0", "&typeinfo for int"),
             ],
         )];
@@ -14728,17 +14717,13 @@ mod tests {
                         vec![Expr::int(4)],
                     ),
                 ),
-                Expr::assign(
-                    Expr::deref(local("ret_0", 8), 4),
-                    Expr::int(42),
-                ),
+                Expr::assign(Expr::deref(local("ret_0", 8), 4), Expr::int(42)),
                 cxa_throw_named("ret_0", "&typeinfo for int"),
             ],
         )];
 
         let resolve = |target_addr: u64, _call_site: u64| -> Option<String> {
-            (target_addr == 0x4304)
-                .then_some("__cxa_allocate_exception@CXXABI_1.3@plt".to_string())
+            (target_addr == 0x4304).then_some("__cxa_allocate_exception@CXXABI_1.3@plt".to_string())
         };
         let rewritten = recover_cxa_throw_pattern(body, &resolve);
         let StructuredNode::Block { statements, .. } = &rewritten[0] else {

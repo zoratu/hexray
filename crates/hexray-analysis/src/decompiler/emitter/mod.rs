@@ -3714,11 +3714,7 @@ impl PseudoCodeEmitter {
     /// category dispatch. Returns `None` when the LHS isn't a typed-struct
     /// field access, the RHS isn't an integer literal, or the field has no
     /// associated category.
-    fn try_format_field_categorical_rhs(
-        &self,
-        lhs: &Expr,
-        rhs: &Expr,
-    ) -> Option<String> {
+    fn try_format_field_categorical_rhs(&self, lhs: &Expr, rhs: &Expr) -> Option<String> {
         let ExprKind::IntLit(value) = &rhs.kind else {
             return None;
         };
@@ -4117,7 +4113,9 @@ impl PseudoCodeEmitter {
                 .get(&v.name)
                 .or_else(|| self.type_info.get(&v.name.to_lowercase()))
                 .cloned(),
-            ExprKind::FieldAccess { base, field_name, .. } => {
+            ExprKind::FieldAccess {
+                base, field_name, ..
+            } => {
                 let base_ty = self.expr_type_string(base)?;
                 // Resolve through a pointer hop: `(struct A *).field` looks
                 // up field on `struct A`. Multi-level pointers (`**`) don't
@@ -9741,12 +9739,18 @@ mod tests {
 
     #[test]
     fn arg_register_display_gated_by_param_count() {
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_calling_convention(CallingConvention::SystemV);
+        let emitter = PseudoCodeEmitter::new("    ", false)
+            .with_calling_convention(CallingConvention::SystemV);
         // A function with two integer parameters: rdx (arg2) is a local temp.
         emitter.integer_arg_param_count.set(2);
-        assert_eq!(emitter.arg_register_display_name("rdi").as_deref(), Some("arg0"));
-        assert_eq!(emitter.arg_register_display_name("rsi").as_deref(), Some("arg1"));
+        assert_eq!(
+            emitter.arg_register_display_name("rdi").as_deref(),
+            Some("arg0")
+        );
+        assert_eq!(
+            emitter.arg_register_display_name("rsi").as_deref(),
+            Some("arg1")
+        );
         assert_eq!(
             emitter.arg_register_display_name("rdx"),
             None,
@@ -9754,7 +9758,10 @@ mod tests {
         );
         // With three parameters, rdx (arg2) is a genuine argument again.
         emitter.integer_arg_param_count.set(3);
-        assert_eq!(emitter.arg_register_display_name("rdx").as_deref(), Some("arg2"));
+        assert_eq!(
+            emitter.arg_register_display_name("rdx").as_deref(),
+            Some("arg2")
+        );
     }
 
     #[test]
@@ -11923,9 +11930,7 @@ mod tests {
         // Single-line throw marker keeps the thunk name as a tail comment for
         // provenance; the raw cold-thunk call must not appear separately.
         assert!(
-            output.contains(
-                "throw /* via unwrap_or_throw(std::optional<int>) [clone .cold]() */"
-            ),
+            output.contains("throw /* via unwrap_or_throw(std::optional<int>) [clone .cold]() */"),
             "throw marker should be preserved:\n{}",
             output
         );
@@ -13473,7 +13478,10 @@ mod tests {
         );
 
         let emitter = PseudoCodeEmitter::new("    ", false).with_type_info(type_info);
-        let base = Expr::var(super::super::expression::Variable::reg("epoll_event_14", 12));
+        let base = Expr::var(super::super::expression::Variable::reg(
+            "epoll_event_14",
+            12,
+        ));
         assert!(
             emitter.field_access_uses_dot(&base),
             "stack-bound struct local must render with '.' even without a user TypeDatabase"
@@ -13488,8 +13496,7 @@ mod tests {
         // `std::optional<int>::operator*(...)`. Regression guard for the
         // C++ optional/variant deferral remediation.
         let emitter = PseudoCodeEmitter::new("    ", false);
-        let formatted =
-            emitter.format_call_target_name("_ZNRSt8optionalIiEdeEv");
+        let formatted = emitter.format_call_target_name("_ZNRSt8optionalIiEdeEv");
         assert_eq!(formatted, "std::optional<int>::operator*");
     }
 
@@ -13506,15 +13513,11 @@ mod tests {
             "std::optional<int>::has_value"
         );
         assert_eq!(
-            PseudoCodeEmitter::strip_method_cvref_qualifiers(
-                "foo::bar() const &&"
-            ),
+            PseudoCodeEmitter::strip_method_cvref_qualifiers("foo::bar() const &&"),
             "foo::bar()"
         );
         assert_eq!(
-            PseudoCodeEmitter::strip_method_cvref_qualifiers(
-                "foo::baz() volatile noexcept &"
-            ),
+            PseudoCodeEmitter::strip_method_cvref_qualifiers("foo::baz() volatile noexcept &"),
             "foo::baz()"
         );
     }
@@ -13552,9 +13555,8 @@ mod tests {
         );
 
         // Constructor-form throw also recognised.
-        let throw_ctor = StructuredNode::Expr(Expr::unknown(
-            "throw std::runtime_error(\"x\")".to_string(),
-        ));
+        let throw_ctor =
+            StructuredNode::Expr(Expr::unknown("throw std::runtime_error(\"x\")".to_string()));
         assert!(
             emitter.is_control_exit(&throw_ctor),
             "constructor-form throw must be a control-flow exit"
@@ -13600,10 +13602,7 @@ mod tests {
         // emitter ended up appending its own `(args)` and surfacing
         // `Dog::Dog() [base](...)` — invalid-looking pseudo-C.
         let emitter = PseudoCodeEmitter::new("    ", false);
-        assert_eq!(
-            emitter.format_call_target_name("_ZN3DogC2Ev"),
-            "Dog::Dog"
-        );
+        assert_eq!(emitter.format_call_target_name("_ZN3DogC2Ev"), "Dog::Dog");
         // Cold-clone helper labels behave the same way.
         assert_eq!(
             emitter.format_call_target_name("foo(int) [clone .cold]"),
@@ -13618,6 +13617,9 @@ mod tests {
         // call targets.
         let emitter = PseudoCodeEmitter::new("    ", false);
         assert_eq!(emitter.format_call_target_name("printf"), "printf");
-        assert_eq!(emitter.format_call_target_name("__cxa_throw"), "__cxa_throw");
+        assert_eq!(
+            emitter.format_call_target_name("__cxa_throw"),
+            "__cxa_throw"
+        );
     }
 }

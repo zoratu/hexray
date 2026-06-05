@@ -529,7 +529,9 @@ fn match_threshold_condition(condition: &Expr) -> Option<(Expr, bool)> {
 
     match op {
         // slot > / >= threshold: overflow path is taken (then), register is else.
-        BinOpKind::Gt | BinOpKind::Ge | BinOpKind::UGt | BinOpKind::UGe => Some((slot.clone(), true)),
+        BinOpKind::Gt | BinOpKind::Ge | BinOpKind::UGt | BinOpKind::UGe => {
+            Some((slot.clone(), true))
+        }
         // slot < / <= threshold: register path is taken (then), overflow is else.
         BinOpKind::Lt | BinOpKind::Le | BinOpKind::ULt | BinOpKind::ULe => {
             Some((slot.clone(), false))
@@ -727,16 +729,9 @@ fn lvalue_eq(a: &Expr, b: &Expr) -> bool {
                 element_size: s2,
             },
         ) => s1 == s2 && lvalue_eq(b1, b2) && lvalue_eq(i1, i2),
-        (
-            ExprKind::Deref {
-                addr: a1,
-                size: s1,
-            },
-            ExprKind::Deref {
-                addr: a2,
-                size: s2,
-            },
-        ) => s1 == s2 && lvalue_eq(a1, a2),
+        (ExprKind::Deref { addr: a1, size: s1 }, ExprKind::Deref { addr: a2, size: s2 }) => {
+            s1 == s2 && lvalue_eq(a1, a2)
+        }
         (
             ExprKind::FieldAccess {
                 base: b1,
@@ -945,8 +940,14 @@ mod tests {
             vec![
                 Expr::assign(gp_slot(), Expr::int(8)),
                 Expr::assign(fp_slot(), Expr::int(48)),
-                Expr::assign(overflow_slot(), Expr::binop(BinOpKind::Add, rbp(), Expr::int(16))),
-                Expr::assign(reg_save_slot(), Expr::binop(BinOpKind::Add, rbp(), Expr::int(-176))),
+                Expr::assign(
+                    overflow_slot(),
+                    Expr::binop(BinOpKind::Add, rbp(), Expr::int(16)),
+                ),
+                Expr::assign(
+                    reg_save_slot(),
+                    Expr::binop(BinOpKind::Add, rbp(), Expr::int(-176)),
+                ),
             ],
         );
         let mut nodes = vec![init];
@@ -1001,9 +1002,9 @@ mod tests {
         let StructuredNode::Block { statements, .. } = &out[0] else {
             panic!("expected setup block");
         };
-        assert!(statements
-            .iter()
-            .any(|s| matches!(&s.kind, ExprKind::Assign { lhs, .. } if lvalue_eq(lhs, &gp_slot()))));
+        assert!(statements.iter().any(
+            |s| matches!(&s.kind, ExprKind::Assign { lhs, .. } if lvalue_eq(lhs, &gp_slot()))
+        ));
     }
 
     #[test]

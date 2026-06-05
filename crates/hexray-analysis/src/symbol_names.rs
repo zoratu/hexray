@@ -53,10 +53,8 @@ pub(crate) fn strip_demangler_disambiguator_labels(name: &str) -> &str {
         // Only consume known disambiguators. `[base]` / `[complete]` /
         // `[allocating]` / `[deleting]` are ctor/dtor variants;
         // `[clone .…]` covers gcc cold-clone / isra / part-of-N partitions.
-        let recognised = matches!(
-            inside,
-            "base" | "complete" | "allocating" | "deleting"
-        ) || inside.starts_with("clone .")
+        let recognised = matches!(inside, "base" | "complete" | "allocating" | "deleting")
+            || inside.starts_with("clone .")
             || inside.starts_with("clone ");
         if !recognised {
             return s;
@@ -107,7 +105,10 @@ mod tests {
         // `name` ends in something other than `)`, so there's no
         // signature to strip.
         assert_eq!(strip_demangled_signature("printf"), "printf");
-        assert_eq!(strip_demangled_signature("std::vector<int>"), "std::vector<int>");
+        assert_eq!(
+            strip_demangled_signature("std::vector<int>"),
+            "std::vector<int>"
+        );
     }
 
     #[test]
@@ -115,7 +116,10 @@ mod tests {
         // `_ZN3DogC2Ev` demangles to `Dog::Dog() [base]`; the trailing
         // `[base]` keeps the signature stripper from seeing the embedded
         // `()` and produces stray `(args)(...)` at the emit site.
-        assert_eq!(strip_demangler_disambiguator_labels("Dog::Dog() [base]"), "Dog::Dog()");
+        assert_eq!(
+            strip_demangler_disambiguator_labels("Dog::Dog() [base]"),
+            "Dog::Dog()"
+        );
         assert_eq!(
             strip_demangler_disambiguator_labels("Dog::Dog() [complete]"),
             "Dog::Dog()"
