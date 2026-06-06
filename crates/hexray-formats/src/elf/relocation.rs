@@ -200,8 +200,16 @@ impl Relocation {
             return Ok(Vec::new());
         }
 
+        // Refuse `sh_entsize` strides smaller than the natural Rel size
+        // (8 bytes ELF32, 16 bytes ELF64). A 1-byte stride would let
+        // `sh_size` bytes spawn `sh_size` synthetic relocations, the
+        // same shape the soak found for symbol-table parsing.
         let entry_size = section.sh_entsize as usize;
-        if entry_size == 0 {
+        let min_entry_size = match class {
+            ElfClass::Elf32 => 8,
+            ElfClass::Elf64 => 16,
+        };
+        if entry_size < min_entry_size {
             return Ok(Vec::new());
         }
 
@@ -239,8 +247,15 @@ impl Relocation {
             return Ok(Vec::new());
         }
 
+        // Natural `Rela` is 12 (ELF32) / 24 (ELF64) bytes; reject any
+        // `sh_entsize` smaller than that for the same reason as
+        // [`parse_rel`].
         let entry_size = section.sh_entsize as usize;
-        if entry_size == 0 {
+        let min_entry_size = match class {
+            ElfClass::Elf32 => 12,
+            ElfClass::Elf64 => 24,
+        };
+        if entry_size < min_entry_size {
             return Ok(Vec::new());
         }
 

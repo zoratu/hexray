@@ -344,8 +344,21 @@ impl<'a> Elf<'a> {
                 continue;
             }
 
+            // Refuse symbol tables whose declared per-entry stride is
+            // smaller than the natural `SymbolEntry` size. With
+            // attacker-controlled `sh_entsize=1`, the inner loop
+            // advances one byte at a time but `SymbolEntry::parse`
+            // reads 16 (ELF32) / 24 (ELF64) bytes per call, so
+            // `sh_size` bytes yields `sh_size` synthetic symbols
+            // instead of `sh_size / entsize`. The soak found a
+            // 748-byte input that materialised 20.5 M symbols and
+            // 1.88 GB of RSS through this path.
             let entry_size = section.sh_entsize as usize;
-            if entry_size == 0 {
+            let min_entry_size = match header.class {
+                ElfClass::Elf32 => 16,
+                ElfClass::Elf64 => 24,
+            };
+            if entry_size < min_entry_size {
                 continue;
             }
 
@@ -488,18 +501,43 @@ impl<'a> Elf<'a> {
             }
             let strtab = StringTable::new(strtab_slice);
 
+            // Same `entsize >= natural-struct-size` guard as
+            // `parse_symbols` above — a corrupted `sh_entsize` smaller
+            // than the actual SymbolEntry size lets each byte of the
+            // dynsym be reinterpreted as a synthetic entry.
             let dynsym_start = dynsym.sh_offset as usize;
             let dynsym_end = dynsym_start.saturating_add(dynsym.sh_size as usize);
             let dynsym_entsize = dynsym.sh_entsize as usize;
-            if dynsym_end > data.len() || dynsym_end <= dynsym_start || dynsym_entsize == 0 {
+            let min_sym_entsize = match header.class {
+                ElfClass::Elf32 => 16,
+                ElfClass::Elf64 => 24,
+            };
+            if dynsym_end > data.len()
+                || dynsym_end <= dynsym_start
+                || dynsym_entsize < min_sym_entsize
+            {
                 continue;
             }
 
-            // Walk the relocation entries in order.
+            // Walk the relocation entries in order. SHT_RELA carries
+            // an addend so each entry is 12 (ELF32) / 24 (ELF64) bytes;
+            // SHT_REL drops the addend (8 / 16 bytes). A smaller
+            // `sh_entsize` would let a 1-byte stride spawn millions of
+            // synthetic PLT-stub symbols off a corrupted header.
             let rel_start = rel_section.sh_offset as usize;
             let rel_end = rel_start.saturating_add(rel_section.sh_size as usize);
             let rel_entsize = rel_section.sh_entsize as usize;
-            if rel_end > data.len() || rel_end <= rel_start || rel_entsize == 0 {
+            let min_rel_entsize = match (rel_section.sh_type, header.class) {
+                (section::SHT_RELA, ElfClass::Elf32) => 12,
+                (section::SHT_RELA, ElfClass::Elf64) => 24,
+                (section::SHT_REL, ElfClass::Elf32) => 8,
+                (section::SHT_REL, ElfClass::Elf64) => 16,
+                _ => 0,
+            };
+            if rel_end > data.len()
+                || rel_end <= rel_start
+                || rel_entsize < min_rel_entsize
+            {
                 continue;
             }
 
