@@ -52,8 +52,17 @@ impl CType {
             CType::Float(f) => Some(f.size),
             CType::Pointer(_) => Some(8), // Assuming 64-bit
             CType::Array(a) => {
+                // Soak finding 2026-06-07 (PR #17 follow-up): a fuzzed
+                // C source like `struct{… float[33333001157]; …}` lets
+                // `a.length` come straight from the header without
+                // bounds — `elem_size * a.length` then overflows usize
+                // and panics in `overflow-checks` builds (cargo-fuzz,
+                // miri, debug). Treat overflow the same as an unknown
+                // size and propagate `None`; the surrounding code
+                // already handles `size() == None` gracefully (see
+                // `CType::Named` / `CType::Function` arms).
                 let elem_size = a.element.size()?;
-                Some(elem_size * a.length?)
+                Some(elem_size.checked_mul(a.length?)?)
             }
             CType::Struct(s) => Some(s.size),
             CType::Union(u) => Some(u.size),
@@ -830,6 +839,31 @@ mod tests {
     fn test_ctype_size_array_unsized() {
         let arr = CType::Array(ArrayType::new(CType::int(), None));
         assert_eq!(arr.size(), None);
+    }
+
+    #[test]
+    fn test_ctype_size_array_length_overflow_returns_none() {
+        // Soak finding 2026-06-07: a fuzzed C source like
+        // `struct{… float[33333001157]; …}` triggers
+        // `elem_size * a.length` overflow in
+        // `overflow-checks` builds (cargo-fuzz, miri, debug).
+        // Six type_parser crashes collapsed to this single arithmetic
+        // overflow; the smallest 80-byte repro lives at
+        // `fuzz/corpus/type_parser/soak-2026-06-07-array-len-overflow`.
+        // The fix uses `checked_mul` and returns `None`, matching the
+        // existing "unknown size" handling for `CType::Named` /
+        // `CType::Function`.
+        let huge = ArrayType::new(CType::float(), Some(usize::MAX));
+        assert_eq!(CType::Array(huge).size(), None);
+
+        // 64-bit `float` × `usize::MAX/3` would overflow on 32- and
+        // 64-bit targets — must also return None rather than panic.
+        let near_max = ArrayType::new(CType::double(), Some(usize::MAX / 3));
+        assert_eq!(CType::Array(near_max).size(), None);
+
+        // Non-overflowing arrays still compute correctly.
+        let normal = ArrayType::new(CType::int(), Some(10));
+        assert_eq!(CType::Array(normal).size(), Some(40));
     }
 
     #[test]

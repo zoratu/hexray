@@ -534,10 +534,7 @@ impl<'a> Elf<'a> {
                 (section::SHT_REL, ElfClass::Elf64) => 16,
                 _ => 0,
             };
-            if rel_end > data.len()
-                || rel_end <= rel_start
-                || rel_entsize < min_rel_entsize
-            {
+            if rel_end > data.len() || rel_end <= rel_start || rel_entsize < min_rel_entsize {
                 continue;
             }
 
