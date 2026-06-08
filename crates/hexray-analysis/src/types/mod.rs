@@ -69,7 +69,7 @@ pub enum Type {
     /// C-string (null-terminated char*).
     CString,
 
-    /// Template instantiation (e.g., std::vector<int>).
+    /// Template instantiation (e.g., `std::vector<int>`).
     Template {
         /// The template name (e.g., "std::vector", "std::map").
         name: String,
@@ -181,7 +181,7 @@ impl Type {
         }
     }
 
-    /// Creates a common std::vector<T> type.
+    /// Creates a common `std::vector<T>` type.
     pub fn std_vector(element_type: Type) -> Self {
         Self::template(
             "std::vector",
@@ -208,7 +208,7 @@ impl Type {
         )
     }
 
-    /// Creates a common std::unique_ptr<T> type.
+    /// Creates a common `std::unique_ptr<T>` type.
     pub fn std_unique_ptr(pointee: Type) -> Self {
         Self::template(
             "std::unique_ptr",
@@ -216,7 +216,7 @@ impl Type {
         )
     }
 
-    /// Creates a common std::shared_ptr<T> type.
+    /// Creates a common `std::shared_ptr<T>` type.
     pub fn std_shared_ptr(pointee: Type) -> Self {
         Self::template(
             "std::shared_ptr",
