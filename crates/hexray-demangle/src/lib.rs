@@ -1266,6 +1266,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)] // cpp_demangle uses C++ FFI miri can't intercept; our pure-Rust itanium fallback returns the bare symbol without args/qualifiers.
     fn test_simple_cpp_demangle() {
         assert_eq!(demangle("_Z4main"), Some("main".to_string()));
         assert_eq!(demangle("_Z3foov"), Some("foo()".to_string()));
@@ -1320,6 +1321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // cpp_demangle uses C++ FFI miri can't intercept; our pure-Rust itanium fallback returns the bare symbol without args/qualifiers.
     fn test_operators() {
         // operator+: _ZN5ClassplERKS_ -> Class::operator+(Class const&)
         assert_eq!(demangle("_Zplii"), Some("operator+(int, int)".to_string()));
@@ -1330,6 +1332,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // cpp_demangle uses C++ FFI miri can't intercept; our pure-Rust itanium fallback returns the bare symbol without args/qualifiers.
     fn test_templates() {
         // The canonical demangler drops the synthesized return type here.
         let demangled = demangle("_Z3fooIiET_").expect("template symbol should demangle");
@@ -1343,6 +1346,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // cpp_demangle uses C++ FFI miri can't intercept; our pure-Rust itanium fallback returns the bare symbol without args/qualifiers.
     fn test_pointers_refs() {
         // _Z3fooPi -> foo(int*)
         assert_eq!(demangle("_Z3fooPi"), Some("foo(int*)".to_string()));
@@ -1355,6 +1359,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // cpp_demangle uses C++ FFI miri can't intercept; our pure-Rust itanium fallback returns the bare symbol without args/qualifiers.
     fn test_const_volatile() {
         // _Z3fooKi -> foo(int const)
         assert_eq!(demangle("_Z3fooKi"), Some("foo(int const)".to_string()));
@@ -1388,6 +1393,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // cpp_demangle uses C++ FFI miri can't intercept; our pure-Rust itanium fallback returns the bare symbol without args/qualifiers.
     fn test_cpp_demangle_preserves_complex_args_and_qualifiers() {
         assert_eq!(
             demangle("_Z14sum_with_throwRKSt6vectorIiSaIiEE"),
@@ -1413,6 +1419,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // cpp_demangle uses C++ FFI miri can't intercept; our pure-Rust itanium fallback returns the bare symbol without args/qualifiers.
     fn test_cpp_demangle_preserves_elf_symbol_suffixes() {
         assert_eq!(
             demangle("_ZSt21ios_base_library_initv@GLIBCXX_3.4.32"),
