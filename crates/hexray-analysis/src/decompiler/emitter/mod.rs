@@ -7462,7 +7462,7 @@ impl PseudoCodeEmitter {
                 if let Some(base_name) = self.try_get_assigned_var_name(base) {
                     let should_update = inferred
                         .get(&base_name)
-                        .map_or(true, |existing| !Self::is_pointer_like_type(existing));
+                        .is_none_or(|existing| !Self::is_pointer_like_type(existing));
                     if should_update {
                         if let Some(pointer_type) =
                             Self::pointer_type_for_element_size(*element_size)
@@ -8135,7 +8135,7 @@ impl PseudoCodeEmitter {
                 }
 
                 let then_empty = self.is_body_empty(then_body);
-                let else_empty = else_body.as_ref().map_or(true, |e| self.is_body_empty(e));
+                let else_empty = else_body.as_ref().is_none_or(|e| self.is_body_empty(e));
 
                 // Skip entirely if both bodies are empty
                 if then_empty && else_empty {
@@ -8314,7 +8314,7 @@ impl PseudoCodeEmitter {
                 }
 
                 let then_empty = self.is_body_empty(then_body);
-                let else_empty = else_body.as_ref().map_or(true, |e| self.is_body_empty(e));
+                let else_empty = else_body.as_ref().is_none_or(|e| self.is_body_empty(e));
 
                 // Skip entirely if both bodies are empty
                 if then_empty && else_empty {
@@ -8810,7 +8810,7 @@ impl PseudoCodeEmitter {
                 ..
             } => {
                 self.is_body_empty(then_body)
-                    && else_body.as_ref().map_or(true, |e| self.is_body_empty(e))
+                    && else_body.as_ref().is_none_or(|e| self.is_body_empty(e))
             }
             _ => false,
         })
@@ -9059,7 +9059,7 @@ impl PseudoCodeEmitter {
                 }
 
                 let then_empty = self.is_body_empty(then_body);
-                let else_empty = else_body.as_ref().map_or(true, |e| self.is_body_empty(e));
+                let else_empty = else_body.as_ref().is_none_or(|e| self.is_body_empty(e));
 
                 // If both bodies are empty, skip the if statement entirely
                 if then_empty && else_empty {

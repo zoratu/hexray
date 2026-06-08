@@ -757,7 +757,7 @@ pub(super) fn extract_assignment_lhs(line: &str) -> Option<&str> {
                 }
             }
 
-            if best.map_or(true, |(best_pos, _)| pos < best_pos) {
+            if best.is_none_or(|(best_pos, _)| pos < best_pos) {
                 best = Some((pos, op));
             }
         }

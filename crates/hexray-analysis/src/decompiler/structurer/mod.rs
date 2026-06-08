@@ -871,7 +871,7 @@ impl<'a> Structurer<'a> {
             let branch_return_is_safe = branch_return.is_some()
                 && filtered_statements
                     .last()
-                    .map_or(true, |stmt| !statement_contains_real_call(stmt));
+                    .is_none_or(|stmt| !statement_contains_real_call(stmt));
             if branch_return_is_safe {
                 *statements = filtered_statements;
                 return_value = branch_return;
@@ -2069,7 +2069,7 @@ impl<'a> Structurer<'a> {
                                     return_value = None;
                                     filtered_stmts.retain(|stmt| {
                                         !Self::expr_mentions_stack_canary_guard(stmt)
-                                            && checked_canary_slot.as_ref().map_or(true, |slot| {
+                                            && checked_canary_slot.as_ref().is_none_or(|slot| {
                                                 !Self::statement_writes_stack_slot(stmt, slot)
                                             })
                                     });
@@ -4790,7 +4790,7 @@ fn attach_shared_return_to_branch(
         let branch_return_is_safe = branch_return.is_some()
             && filtered_statements
                 .last()
-                .map_or(true, |stmt| !statement_contains_real_call(stmt));
+                .is_none_or(|stmt| !statement_contains_real_call(stmt));
         if branch_return_is_safe {
             *statements = filtered_statements;
             return_value = branch_return;

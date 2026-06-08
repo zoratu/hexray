@@ -64,9 +64,9 @@ impl RegisterSpan {
     pub fn is_aligned(&self) -> bool {
         match self.width {
             1 => true,
-            2 => self.base % 2 == 0,
-            4 => self.base % 4 == 0,
-            8 => self.base % 8 == 0,
+            2 => self.base.is_multiple_of(2),
+            4 => self.base.is_multiple_of(4),
+            8 => self.base.is_multiple_of(8),
             _ => false,
         }
     }

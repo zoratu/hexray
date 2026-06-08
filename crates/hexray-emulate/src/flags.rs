@@ -43,7 +43,7 @@ impl Flags {
             zf: Some(masked == 0),
             sf: Some((masked & sign_bit) != 0),
             of: None, // Overflow depends on the operation
-            pf: Some((masked as u8).count_ones() % 2 == 0),
+            pf: Some((masked as u8).count_ones().is_multiple_of(2)),
             af: None, // Auxiliary carry depends on the operation
         }
     }
@@ -78,7 +78,7 @@ impl Flags {
         self.of = Some((a_sign == b_sign) && (a_sign != r_sign));
 
         // Parity flag (low byte)
-        self.pf = Some((r_masked as u8).count_ones() % 2 == 0);
+        self.pf = Some((r_masked as u8).count_ones().is_multiple_of(2));
 
         // Auxiliary carry (carry from bit 3 to 4)
         self.af = Some(((a & 0xF) + (b & 0xF)) > 0xF);
@@ -114,7 +114,7 @@ impl Flags {
         self.of = Some((a_sign != b_sign) && (a_sign != r_sign));
 
         // Parity flag (low byte)
-        self.pf = Some((r_masked as u8).count_ones() % 2 == 0);
+        self.pf = Some((r_masked as u8).count_ones().is_multiple_of(2));
 
         // Auxiliary carry (borrow from bit 4)
         self.af = Some((a & 0xF) < (b & 0xF));
@@ -134,7 +134,7 @@ impl Flags {
         self.sf = Some((r_masked & sign_bit) != 0);
         self.cf = Some(false); // Logical ops clear CF
         self.of = Some(false); // Logical ops clear OF
-        self.pf = Some((r_masked as u8).count_ones() % 2 == 0);
+        self.pf = Some((r_masked as u8).count_ones().is_multiple_of(2));
         self.af = None; // AF is undefined for logical ops
     }
 
@@ -154,7 +154,7 @@ impl Flags {
         self.sf = Some((r_masked & sign_bit) != 0);
         // CF is not affected by INC
         self.of = Some(v_masked == (sign_bit - 1)); // Overflow if was max positive
-        self.pf = Some((r_masked as u8).count_ones() % 2 == 0);
+        self.pf = Some((r_masked as u8).count_ones().is_multiple_of(2));
         self.af = Some((v_masked & 0xF) == 0xF);
     }
 
@@ -174,7 +174,7 @@ impl Flags {
         self.sf = Some((r_masked & sign_bit) != 0);
         // CF is not affected by DEC
         self.of = Some(v_masked == sign_bit); // Overflow if was min negative
-        self.pf = Some((r_masked as u8).count_ones() % 2 == 0);
+        self.pf = Some((r_masked as u8).count_ones().is_multiple_of(2));
         self.af = Some((v_masked & 0xF) == 0);
     }
 

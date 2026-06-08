@@ -246,7 +246,7 @@ impl CubinBuilder {
         let mut user_offsets: Vec<u64> = Vec::with_capacity(n_user_sections);
         for s in &self.sections {
             // 8-byte align the start of each section's payload.
-            while data_blob.len() % 8 != 0 {
+            while !data_blob.len().is_multiple_of(8) {
                 data_blob.push(0);
             }
             let off = EHSIZE + data_blob.len();
@@ -254,22 +254,22 @@ impl CubinBuilder {
             data_blob.extend_from_slice(&s.data);
         }
 
-        while data_blob.len() % 8 != 0 {
+        while !data_blob.len().is_multiple_of(8) {
             data_blob.push(0);
         }
         let shstrtab_off = EHSIZE + data_blob.len();
         data_blob.extend_from_slice(&shstrtab);
-        while data_blob.len() % 8 != 0 {
+        while !data_blob.len().is_multiple_of(8) {
             data_blob.push(0);
         }
         let symtab_off = EHSIZE + data_blob.len();
         data_blob.extend_from_slice(&symtab);
-        while data_blob.len() % 8 != 0 {
+        while !data_blob.len().is_multiple_of(8) {
             data_blob.push(0);
         }
         let strtab_off = EHSIZE + data_blob.len();
         data_blob.extend_from_slice(&strtab);
-        while data_blob.len() % 8 != 0 {
+        while !data_blob.len().is_multiple_of(8) {
             data_blob.push(0);
         }
         let shoff = EHSIZE + data_blob.len();

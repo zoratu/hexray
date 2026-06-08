@@ -849,7 +849,7 @@ fn suppress_asan_scaffolding_in_node(node: StructuredNode) -> Option<StructuredN
         } => {
             let then_body = suppress_asan_scaffolding(then_body);
             let else_body = else_body.map(suppress_asan_scaffolding);
-            if then_body.is_empty() && else_body.as_ref().map_or(true, Vec::is_empty) {
+            if then_body.is_empty() && else_body.as_ref().is_none_or(Vec::is_empty) {
                 None
             } else {
                 Some(StructuredNode::If {
@@ -1254,7 +1254,7 @@ fn prune_dead_stack_clash_target_assignments_in_node(
                 .into_iter()
                 .filter(|stmt| {
                     stack_clash_probe_target_assignment_name(stmt)
-                        .map_or(true, |name| uses.contains(&name))
+                        .is_none_or(|name| uses.contains(&name))
                 })
                 .collect();
             if statements.is_empty() {

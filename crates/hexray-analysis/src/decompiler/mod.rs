@@ -1960,7 +1960,7 @@ impl Decompiler {
                             if Self::is_pointer_like_type(&rhs_type) {
                                 let should_update = merged_types
                                     .get(&lhs_name)
-                                    .map_or(true, |existing| !Self::is_pointer_like_type(existing));
+                                    .is_none_or(|existing| !Self::is_pointer_like_type(existing));
                                 if should_update {
                                     merged_types.insert(lhs_name, rhs_type);
                                     *changed = true;
