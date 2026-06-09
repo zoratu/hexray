@@ -77,17 +77,23 @@ impl ExceptionExtractor {
         };
         let big_endian = matches!(elf.endianness(), Endianness::Big);
 
-        // Find .eh_frame section
-        let (eh_frame_data, eh_frame_base) = Self::find_section(elf, &[".eh_frame", "__eh_frame"])
-            .ok_or_else(|| ExceptionError::MissingSection(".eh_frame".to_string()))?;
+        // Find .eh_frame section. For relocatable objects the FDE pointers
+        // are zero-filled in the raw bytes and the real targets live in
+        // .rela.eh_frame — relocated_section_data applies them so FDE
+        // pc_begin / pc_range / lsda land at the right values.
+        let (eh_frame_data, eh_frame_base) =
+            Self::find_section_relocated(elf, &[".eh_frame", "__eh_frame"])
+                .ok_or_else(|| ExceptionError::MissingSection(".eh_frame".to_string()))?;
 
         // Parse .eh_frame
         let eh_frame = parse_eh_frame(&eh_frame_data, pointer_size, big_endian, eh_frame_base)
             .map_err(|e| ExceptionError::ParseError(format!("eh_frame: {:?}", e)))?;
 
-        // Find LSDA data section (gcc_except_table on Linux, __gcc_except_tab on macOS)
+        // Find LSDA data section (gcc_except_table on Linux, __gcc_except_tab on macOS).
+        // Also goes through relocated_section_data so DW.ref typeinfo
+        // pointers / cleanup landing-pad offsets are resolved.
         let (lsda_data, lsda_base) =
-            Self::find_section(elf, &[".gcc_except_table", "__gcc_except_tab"])
+            Self::find_section_relocated(elf, &[".gcc_except_table", "__gcc_except_tab"])
                 .map(|(d, b)| (Some(d), b))
                 .unwrap_or((None, 0));
 
@@ -136,7 +142,9 @@ impl ExceptionExtractor {
         })
     }
 
-    /// Find a section by any of the given names.
+    /// Find a section by any of the given names, returning the raw bytes
+    /// unchanged. Kept for callers that explicitly want pre-relocation data.
+    #[allow(dead_code)]
     fn find_section<B: BinaryFormat>(binary: &B, names: &[&str]) -> Option<(Vec<u8>, u64)> {
         for section in binary.sections() {
             let name = section.name();
@@ -144,6 +152,23 @@ impl ExceptionExtractor {
                 let data = section.data().to_vec();
                 let base = section.virtual_address();
                 return Some((data, base));
+            }
+        }
+        None
+    }
+
+    /// Like [`Self::find_section`] but returns the data with any in-section
+    /// relocations applied. For relocatable `.o` files this is what makes
+    /// FDE pointers resolve at all — the raw bytes carry only the addend
+    /// (often zero), with the real symbol target encoded in the matching
+    /// `.rela.{name}` entry.
+    fn find_section_relocated<B: BinaryFormat>(
+        binary: &B,
+        names: &[&str],
+    ) -> Option<(Vec<u8>, u64)> {
+        for name in names {
+            if let Some(result) = binary.relocated_section_data(name) {
+                return Some(result);
             }
         }
         None
@@ -416,6 +441,54 @@ mod tests {
 
         assert_eq!(info.cleanup_handlers.len(), 1);
         assert_eq!(info.cleanup_handlers[0].landing_pad, 0x2200);
+    }
+
+    /// Relocatable `.o` files store FDE pointers as `R_*_PREL32` against a
+    /// zero raw value, with the real target encoded in `.rela.eh_frame`.
+    /// Without applying those relocations every FDE's `pc_begin` resolves to
+    /// zero (or a near-zero artifact) and `find_fde` never matches the real
+    /// function addresses the disassembler hands back to the decompiler —
+    /// exception_info silently falls through and try/catch reconstruction
+    /// never fires.
+    ///
+    /// This fixture is the canonical small repro: `g++ -O0 -c` on a function
+    /// containing `try { may_throw(); } catch (E1&) { ... } catch (E2&) {
+    /// ... } catch (...) { ... }`. The `caller` function lives at a non-zero
+    /// post-remap address; the test asserts we can both find its FDE and
+    /// pull at least one catch handler out of the LSDA — both of which fail
+    /// in pre-fix builds.
+    #[test]
+    fn test_relocated_eh_frame_recovers_fde_for_relocatable_object_caller() {
+        use hexray_formats::{BinaryFormat, Elf};
+
+        const FIXTURE: &[u8] =
+            include_bytes!("../../../tests/fixtures/cpp_exceptions_relocatable.o");
+
+        let elf = Elf::parse(FIXTURE).expect("parse cpp_exceptions_relocatable.o");
+        let extractor = ExceptionExtractor::from_elf(&elf).expect("from_elf");
+
+        let caller = elf
+            .symbols()
+            .find(|s| s.name == "caller(int)" || s.name == "_Z6calleri")
+            .cloned()
+            .expect("caller symbol present in fixture");
+
+        let info = extractor
+            .get_exception_info(caller.address, caller.address.saturating_add(caller.size))
+            .expect(
+                "FDE for `caller` was not found — `.rela.eh_frame` relocations \
+                 likely were not applied",
+            );
+
+        assert!(
+            !info.try_blocks.is_empty(),
+            "caller has a try/catch block but no try block was recovered: \
+             {info:?}"
+        );
+        assert!(
+            info.try_blocks.iter().any(|tb| !tb.handlers.is_empty()),
+            "no catch handlers attached to any try block: {info:?}"
+        );
     }
 
     #[test]
