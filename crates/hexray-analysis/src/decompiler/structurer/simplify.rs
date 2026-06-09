@@ -810,26 +810,116 @@ where
         let store_count = result.len() - store_run_start;
         let last_store_idx = result.len() - 1;
 
-        // Multi-store POD form: two or more stores into the buffer, each
-        // through a different offset. Render as `throw { rhs0, rhs1, …
-        // }` in store order. We DON'T sort by offset: the rare case where
-        // the compiler reorders stores between fields is conservatively
-        // declined (any out-of-order/duplicate store would be surprising
-        // here and we'd rather not assert a brace-literal that doesn't
-        // reflect source order).
+        // Multi-store POD form: two or more stores into the buffer.
+        // Per codex review on this PR, we MUST validate the store
+        // offsets we used to identify the run before discarding them
+        // — if the compiler reorders fields, repeats an offset, or
+        // interleaves something we don't model, rendering the stores
+        // in statement order would misrepresent the thrown value while
+        // deleting the address evidence the analyst needs.
+        //
+        // Conservative rule: extract each store's offset relative to
+        // `buf` (`*buf` = 0, `*(buf + K)` / `buf[K]` = K). All offsets
+        // must be present, strictly increasing, and distinct. Anything
+        // else declines the rewrite and falls back to the single-store
+        // / ctor-form path below — which itself handles only the
+        // last statement and won't fire for a multi-store run, so the
+        // raw alloc + stores + throw sequence is left intact.
+        fn store_offset_relative_to_buf(stmt: &Expr, buf: &str) -> Option<i128> {
+            let ExprKind::Assign { lhs, .. } = &stmt.kind else {
+                return None;
+            };
+            // For `*buf = v` the offset is 0; for `*(buf ± K) = v`
+            // it's ±K; for `buf[K] = v` it's K * element_size. The
+            // element-size form mirrors what `store_address_root_is`
+            // already accepts, so failures here decline the rewrite.
+            match &lhs.kind {
+                ExprKind::Deref { addr, .. } => {
+                    let stripped = strip_casts(addr);
+                    match &stripped.kind {
+                        ExprKind::Var(v) if v.name == buf => Some(0),
+                        ExprKind::BinOp {
+                            op: BinOpKind::Add,
+                            left,
+                            right,
+                        } => match (strip_casts(left), strip_casts(right)) {
+                            (
+                                Expr {
+                                    kind: ExprKind::Var(v),
+                                },
+                                Expr {
+                                    kind: ExprKind::IntLit(off),
+                                },
+                            ) if v.name == buf => Some(*off),
+                            (
+                                Expr {
+                                    kind: ExprKind::IntLit(off),
+                                },
+                                Expr {
+                                    kind: ExprKind::Var(v),
+                                },
+                            ) if v.name == buf => Some(*off),
+                            _ => None,
+                        },
+                        ExprKind::BinOp {
+                            op: BinOpKind::Sub,
+                            left,
+                            right,
+                        } => match (strip_casts(left), strip_casts(right)) {
+                            (
+                                Expr {
+                                    kind: ExprKind::Var(v),
+                                },
+                                Expr {
+                                    kind: ExprKind::IntLit(off),
+                                },
+                            ) if v.name == buf => Some(-off),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                ExprKind::ArrayAccess {
+                    base,
+                    index,
+                    element_size,
+                } => {
+                    let stripped_base = strip_casts(base);
+                    let ExprKind::Var(v) = &stripped_base.kind else {
+                        return None;
+                    };
+                    if v.name != buf {
+                        return None;
+                    }
+                    let ExprKind::IntLit(idx) = &strip_casts(index).kind else {
+                        return None;
+                    };
+                    Some(idx.saturating_mul(*element_size as i128))
+                }
+                _ => None,
+            }
+        }
+
         let multi_store_value: Option<String> = if store_count >= 2 {
+            let mut field_offsets: Vec<i128> = Vec::with_capacity(store_count);
             let mut fields: Vec<String> = Vec::with_capacity(store_count);
+            let mut offsets_ok = true;
             for stmt in &result[store_run_start..] {
-                let ExprKind::Assign { rhs, .. } = &stmt.kind else {
-                    fields.clear();
+                let Some(off) = store_offset_relative_to_buf(stmt, &buf_name) else {
+                    offsets_ok = false;
                     break;
                 };
+                let ExprKind::Assign { rhs, .. } = &stmt.kind else {
+                    offsets_ok = false;
+                    break;
+                };
+                field_offsets.push(off);
                 fields.push(format!("{}", **rhs));
             }
-            if fields.is_empty() {
-                None
-            } else {
+            if offsets_ok && field_offsets.windows(2).all(|w| w[0] < w[1]) {
                 Some(format!("{{ {} }}", fields.join(", ")))
+            } else {
+                None
             }
         } else {
             None
@@ -14845,6 +14935,99 @@ mod tests {
                 "expected field value {v} preserved in {text:?}"
             );
         }
+    }
+
+    /// Codex review on this PR flagged that the multi-store collapse
+    /// silently rendered out-of-order field stores in statement order
+    /// while deleting the address evidence (which is what tells the
+    /// analyst the true layout). Verify that a store run that walks
+    /// offsets non-monotonically (e.g. compiler-reordered field stores
+    /// or a duplicate offset before `__cxa_throw`) declines the
+    /// rewrite and leaves the raw alloc + stores + throw intact.
+    #[test]
+    fn recover_cxa_throw_declines_when_store_offsets_are_not_increasing() {
+        let buf = || local("ret_0", 8);
+        let store_at = |off: i128, value: i128| -> Expr {
+            Expr::assign(
+                Expr::deref(Expr::binop(BinOpKind::Add, buf(), Expr::int(off)), 4),
+                Expr::int(value),
+            )
+        };
+        // Out-of-order: writes to offset 8 before offset 0. A
+        // brace-literal-in-statement-order would render
+        // `{ value@8, value@0 }` and mislead the analyst.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    buf(),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(12)],
+                    ),
+                ),
+                store_at(8, 3),
+                store_at(0, 1),
+                cxa_throw_named("ret_0", "&typeinfo for Pod"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        // No collapse: all 4 statements survive (alloc, two stores in
+        // original order, throw call).
+        assert_eq!(
+            statements.len(),
+            4,
+            "expected non-monotonic offsets to decline rewrite: {statements:#?}"
+        );
+        assert!(matches!(
+            &statements.last().unwrap().kind,
+            ExprKind::Call { .. }
+        ));
+    }
+
+    /// Same concern, duplicate-offset variant: two writes to the same
+    /// field offset before the throw also decline the rewrite.
+    #[test]
+    fn recover_cxa_throw_declines_on_duplicate_store_offset() {
+        let buf = || local("ret_0", 8);
+        let store_at = |off: i128, value: i128| -> Expr {
+            Expr::assign(
+                Expr::deref(Expr::binop(BinOpKind::Add, buf(), Expr::int(off)), 4),
+                Expr::int(value),
+            )
+        };
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    buf(),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(8)],
+                    ),
+                ),
+                store_at(0, 1),
+                store_at(0, 99), // duplicate offset 0
+                store_at(4, 2),
+                cxa_throw_named("ret_0", "&typeinfo for Pod"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(
+            statements.len(),
+            5,
+            "expected duplicate offsets to decline rewrite: {statements:#?}"
+        );
     }
 
     /// A multi-store run interrupted by an unrelated store (one that is
