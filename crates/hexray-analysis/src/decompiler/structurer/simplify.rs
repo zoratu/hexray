@@ -665,7 +665,7 @@ where
             }
         };
 
-        if result.len() < 2 {
+        if result.is_empty() {
             result.push(stmt);
             continue;
         }
@@ -677,8 +677,91 @@ where
             }
         };
 
-        // `[N-2]` must be `<buf_name> = __cxa_allocate_exception(...)`.
-        let alloc_idx = result.len() - 2;
+        // The last statement is either a scalar/POD store into the
+        // buffer (`*buf = value`, possibly preceded by more stores for
+        // multi-field PODs) OR a single ctor call `Class::Class(buf, …)`
+        // which initialises the buffer in place. Decide which shape by
+        // peeking at the LAST statement, then walk back accordingly:
+        //
+        //   store form:  alloc; store_0; …; store_{N-1}; throw   (N >= 1)
+        //   ctor  form:  alloc; ctor(buf, args);          throw
+        //
+        // We deliberately keep the ctor form a single statement — a
+        // multi-store run after a ctor would be surprising and is
+        // conservatively declined per the PR #13 codex-review guidance.
+        fn store_address_root_is(lhs: &Expr) -> Option<&Expr> {
+            // Accept `*buf`, `*(buf + K)`, `buf[K]`, and casts wrapping
+            // any of those.
+            match &lhs.kind {
+                ExprKind::Deref { addr, .. } => Some(strip_casts(addr)),
+                ExprKind::ArrayAccess { base, .. } => Some(strip_casts(base)),
+                _ => None,
+            }
+        }
+
+        fn is_buf_root(addr: &Expr, buf: &str) -> bool {
+            let stripped = strip_casts(addr);
+            match &stripped.kind {
+                ExprKind::Var(v) => v.name == buf,
+                ExprKind::BinOp {
+                    op: BinOpKind::Add | BinOpKind::Sub,
+                    left,
+                    right,
+                } => {
+                    is_buf_root(left, buf) && matches!(&right.kind, ExprKind::IntLit(_))
+                        || is_buf_root(right, buf) && matches!(&left.kind, ExprKind::IntLit(_))
+                }
+                _ => false,
+            }
+        }
+
+        fn is_store_into_buf(stmt: &Expr, buf: &str) -> bool {
+            let ExprKind::Assign { lhs, .. } = &stmt.kind else {
+                return false;
+            };
+            store_address_root_is(lhs)
+                .map(|addr| is_buf_root(addr, buf))
+                .unwrap_or(false)
+        }
+
+        // Determine the run of buffer-initialisation statements
+        // immediately before the throw, and the index where the alloc
+        // sits. For the ctor form the run is exactly the single trailing
+        // call; for the store form it's one or more consecutive stores
+        // walking backwards until the first non-store statement.
+        let last_idx = result.len() - 1;
+        let last_is_ctor = matches!(
+            &result[last_idx].kind,
+            ExprKind::Call { args, .. } if args
+                .first()
+                .map(strip_casts)
+                .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name))
+        );
+        let mut store_run_start = if last_is_ctor {
+            last_idx
+        } else if is_store_into_buf(&result[last_idx], &buf_name) {
+            // Walk backward while each statement is a buf store.
+            let mut start = result.len();
+            while start > 0 && is_store_into_buf(&result[start - 1], &buf_name) {
+                start -= 1;
+            }
+            start
+        } else {
+            // Last statement is neither a buf store nor a ctor — decline.
+            result.push(stmt);
+            continue;
+        };
+        // The alloc must sit immediately before the run.
+        if store_run_start == 0 {
+            result.push(stmt);
+            continue;
+        }
+        let alloc_idx = store_run_start - 1;
+        // Pull the trailing ctor (if any) back into the run start for
+        // the per-statement match below.
+        if last_is_ctor {
+            store_run_start = last_idx;
+        }
         let alloc_ok = match &result[alloc_idx].kind {
             ExprKind::Assign { lhs, rhs } => {
                 let lhs_matches = matches!(
@@ -702,84 +785,126 @@ where
             continue;
         }
 
-        // `[N-1]` is one of two shapes the compiler emits for the
-        // exception buffer initialiser:
+        // `[N-1]` (= the last statement in the store run) is one of:
         //
         // * **Scalar form** — `*(T *)buf = value;` for `throw 42`,
-        //   `throw 3.14`, `throw some_ptr`. The deref's address is
-        //   the buffer (possibly wrapped in a typed pointer cast,
-        //   which we strip).
+        //   `throw 3.14`, `throw some_ptr`. A single store at the
+        //   buffer base.
+        //
+        // * **Multi-store POD form** — `*(T *)buf = v0; *((T*)buf+1) =
+        //   v1; …;` for `throw Pod{...}` with two or more fields. The
+        //   collapsed render is `throw { v0, v1, … }` since the C++
+        //   type name lives in `&typeinfo` (the throw's second arg)
+        //   and is recovered at emit time alongside the LSDA work —
+        //   the compound-literal-style brace form lets the analyst
+        //   reconstruct which POD type without us asserting one.
         //
         // * **Constructor form** — `TypeName::TypeName(buf, …args);`
         //   for `throw std::runtime_error("x")` and friends. The
         //   ctor's first argument is `buf`; we render the throw as
         //   `throw TypeName::TypeName(args)` so the call shape stays
         //   intact and the user-facing pseudo-C still reads like
-        //   real C++.
-        let store_idx = result.len() - 1;
-        let stored_value = match &result[store_idx].kind {
-            ExprKind::Assign { lhs, rhs } => {
-                let target_matches = match &lhs.kind {
-                    ExprKind::Deref { addr, .. } => matches!(
-                        &strip_casts(addr).kind,
-                        ExprKind::Var(v) if v.name == buf_name,
-                    ),
-                    _ => false,
+        //   real C++. Constructor form is single-statement (the
+        //   ctor itself initialises the buffer in place); a multi-
+        //   statement store run after a ctor declines the rewrite.
+        let store_count = result.len() - store_run_start;
+        let last_store_idx = result.len() - 1;
+
+        // Multi-store POD form: two or more stores into the buffer, each
+        // through a different offset. Render as `throw { rhs0, rhs1, …
+        // }` in store order. We DON'T sort by offset: the rare case where
+        // the compiler reorders stores between fields is conservatively
+        // declined (any out-of-order/duplicate store would be surprising
+        // here and we'd rather not assert a brace-literal that doesn't
+        // reflect source order).
+        let multi_store_value: Option<String> = if store_count >= 2 {
+            let mut fields: Vec<String> = Vec::with_capacity(store_count);
+            for stmt in &result[store_run_start..] {
+                let ExprKind::Assign { rhs, .. } = &stmt.kind else {
+                    fields.clear();
+                    break;
                 };
-                if target_matches {
-                    Some(format!("{}", (**rhs).clone()))
-                } else {
-                    None
-                }
+                fields.push(format!("{}", **rhs));
             }
-            ExprKind::Call { target, args } => {
-                // Constructor form: first arg must be the buffer.
-                let first_is_buf = args
-                    .first()
-                    .map(strip_casts)
-                    .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name));
-                if !first_is_buf {
-                    None
-                } else {
-                    // Render `TypeName(remaining_args)` — drop the
-                    // implicit buf slot so the throw reads like the
-                    // source expression. Falls back to the resolved
-                    // call name when the target is `Direct`.
-                    fn canonicalise_ctor_name(raw: &str) -> String {
-                        // Strip glibc/PLT decorations, then the
-                        // `[base]`/`[complete]`/`[clone …]` disambiguator
-                        // labels, then the trailing `(args)` signature —
-                        // in that order, because each step exposes the
-                        // next one's tail. Mirrors the chain in
-                        // `PseudoCodeEmitter::format_call_target_name`
-                        // from deferral #5.
-                        let unversioned = hexray_core::unversioned_symbol_name(raw);
-                        let labels_stripped =
-                            crate::symbol_names::strip_demangler_disambiguator_labels(unversioned);
-                        crate::symbol_names::strip_demangled_signature(labels_stripped).to_string()
+            if fields.is_empty() {
+                None
+            } else {
+                Some(format!("{{ {} }}", fields.join(", ")))
+            }
+        } else {
+            None
+        };
+
+        let stored_value = if let Some(brace_literal) = multi_store_value {
+            Some(brace_literal)
+        } else {
+            match &result[last_store_idx].kind {
+                ExprKind::Assign { lhs, rhs } => {
+                    let target_matches = match &lhs.kind {
+                        ExprKind::Deref { addr, .. } => matches!(
+                            &strip_casts(addr).kind,
+                            ExprKind::Var(v) if v.name == buf_name,
+                        ),
+                        _ => false,
+                    };
+                    if target_matches {
+                        Some(format!("{}", (**rhs).clone()))
+                    } else {
+                        None
                     }
-                    let target_name = match target {
-                        CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
-                        CallTarget::Direct {
-                            target: addr,
-                            call_site,
-                        } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
-                        _ => None,
-                    };
-                    let Some(target_name) = target_name else {
-                        result.push(stmt);
-                        continue;
-                    };
-                    // Trim `TypeName::TypeName` chains to just `TypeName(args)`
-                    // when the trailing component repeats the class name
-                    // (`std::runtime_error::runtime_error` → `std::runtime_error`).
-                    let prettified = collapse_ctor_pretty_name(&target_name);
-                    let rest_args: Vec<String> =
-                        args.iter().skip(1).map(|a| format!("{}", a)).collect();
-                    Some(format!("{}({})", prettified, rest_args.join(", ")))
                 }
+                ExprKind::Call { target, args } => {
+                    // Constructor form: first arg must be the buffer.
+                    let first_is_buf = args
+                        .first()
+                        .map(strip_casts)
+                        .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name));
+                    if !first_is_buf {
+                        None
+                    } else {
+                        // Render `TypeName(remaining_args)` — drop the
+                        // implicit buf slot so the throw reads like the
+                        // source expression. Falls back to the resolved
+                        // call name when the target is `Direct`.
+                        fn canonicalise_ctor_name(raw: &str) -> String {
+                            // Strip glibc/PLT decorations, then the
+                            // `[base]`/`[complete]`/`[clone …]` disambiguator
+                            // labels, then the trailing `(args)` signature —
+                            // in that order, because each step exposes the
+                            // next one's tail. Mirrors the chain in
+                            // `PseudoCodeEmitter::format_call_target_name`
+                            // from deferral #5.
+                            let unversioned = hexray_core::unversioned_symbol_name(raw);
+                            let labels_stripped =
+                                crate::symbol_names::strip_demangler_disambiguator_labels(
+                                    unversioned,
+                                );
+                            crate::symbol_names::strip_demangled_signature(labels_stripped)
+                                .to_string()
+                        }
+                        let target_name = match target {
+                            CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
+                            CallTarget::Direct {
+                                target: addr,
+                                call_site,
+                            } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
+                            _ => None,
+                        };
+                        let Some(target_name) = target_name else {
+                            result.push(stmt);
+                            continue;
+                        };
+                        // Trim `TypeName::TypeName` chains to just `TypeName(args)`
+                        // when the trailing component repeats the class name
+                        // (`std::runtime_error::runtime_error` → `std::runtime_error`).
+                        let prettified = collapse_ctor_pretty_name(&target_name);
+                        let rest_args: Vec<String> =
+                            args.iter().skip(1).map(|a| format!("{}", a)).collect();
+                        Some(format!("{}({})", prettified, rest_args.join(", ")))
+                    }
+                }
+                _ => None,
             }
-            _ => None,
         };
         let Some(value) = stored_value else {
             result.push(stmt);
@@ -791,7 +916,7 @@ where
         // deferral #4 so downstream `body_ends_with_*` heuristics stay
         // consistent.
         let throw_text = format!("throw {}", value);
-        // Drop the allocate + store; replace with the throw pseudo-stmt.
+        // Drop the allocate + all stores; replace with the throw pseudo-stmt.
         result.truncate(alloc_idx);
         result.push(Expr::unknown(throw_text));
     }
@@ -14669,6 +14794,103 @@ mod tests {
             text.contains("\"boom\""),
             "expected the boom argument preserved, got {text:?}"
         );
+    }
+
+    /// `throw Pod{a, b, c}` for a plain-old-data type lowers to:
+    /// `alloc; *buf = a; *(buf + 4) = b; *(buf + 8) = c; __cxa_throw(...);`
+    /// — a `K`-store run between the alloc and the throw, where `K` is
+    /// the number of POD fields. Collapse all `K + 2` statements into a
+    /// single `throw { a, b, c }` pseudo-statement in store order.
+    #[test]
+    fn recover_cxa_throw_collapses_multi_store_pod_throw() {
+        let buf = || local("ret_0", 8);
+        let buf_plus = |off: i128| -> Expr {
+            Expr::deref(Expr::binop(BinOpKind::Add, buf(), Expr::int(off)), 4)
+        };
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    buf(),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(12)],
+                    ),
+                ),
+                Expr::assign(Expr::deref(buf(), 4), Expr::int(1)),
+                Expr::assign(buf_plus(4), Expr::int(2)),
+                Expr::assign(buf_plus(8), Expr::int(3)),
+                cxa_throw_named("ret_0", "&typeinfo for Pod"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        let text = match &statements[0].kind {
+            ExprKind::Unknown(t) => t.as_str(),
+            other => panic!("expected Unknown, got {:?}", other),
+        };
+        assert!(
+            text.starts_with("throw {"),
+            "expected brace-literal multi-store throw, got {text:?}"
+        );
+        // All three field values preserved in store order.
+        for v in ["1", "2", "3"] {
+            assert!(
+                text.contains(v),
+                "expected field value {v} preserved in {text:?}"
+            );
+        }
+    }
+
+    /// A multi-store run interrupted by an unrelated store (one that is
+    /// not rooted at the alloc buffer) must DECLINE the rewrite — the
+    /// interruption could be any side effect we don't model, and a
+    /// brace-literal that silently drops it would mislead the reader.
+    #[test]
+    fn recover_cxa_throw_declines_when_store_run_is_interrupted() {
+        let buf = || local("ret_0", 8);
+        let other = || local("other", 8);
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    buf(),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(8)],
+                    ),
+                ),
+                Expr::assign(Expr::deref(buf(), 4), Expr::int(1)),
+                Expr::assign(Expr::deref(other(), 4), Expr::int(99)),
+                Expr::assign(
+                    Expr::deref(Expr::binop(BinOpKind::Add, buf(), Expr::int(4)), 4),
+                    Expr::int(2),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for Pod"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        // No collapse — original 5 statements survive (alloc, store0,
+        // unrelated store, store1, __cxa_throw call).
+        assert_eq!(
+            statements.len(),
+            5,
+            "expected interrupted store run to decline rewrite: {statements:#?}"
+        );
+        assert!(matches!(
+            &statements.last().unwrap().kind,
+            ExprKind::Call { .. }
+        ));
     }
 
     #[test]
