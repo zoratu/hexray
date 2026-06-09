@@ -827,13 +827,14 @@ pub struct ProjectStats {
 }
 
 /// Get current Unix timestamp.
+///
+/// See the matching `analysis_cache::current_timestamp` for why this
+/// returns a stable constant under miri rather than auto-incrementing.
+/// Both helpers used to share the same `fetch_add(1)` pattern which
+/// broke `is_expired` boundary assertions under miri's mock clock.
 #[cfg(miri)]
 fn current_timestamp() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static MIRI_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-
-    MIRI_TIMESTAMP.fetch_add(1, Ordering::Relaxed)
+    1_700_000_000
 }
 
 /// Get current Unix timestamp.

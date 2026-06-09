@@ -827,7 +827,7 @@ fn find_flag_setting_instruction(
         .instructions
         .iter()
         .rev()
-        .filter(|inst| before_addr.map_or(true, |addr| inst.address < addr))
+        .filter(|inst| before_addr.is_none_or(|addr| inst.address < addr))
         .find(|inst| is_flag_setting_instruction(inst))
 }
 

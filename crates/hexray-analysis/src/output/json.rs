@@ -118,11 +118,9 @@ impl CfgJsonExporter {
         };
 
         if self.pretty {
-            serde_json::to_writer_pretty(&mut writer, &json_cfg)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            serde_json::to_writer_pretty(&mut writer, &json_cfg).map_err(io::Error::other)?;
         } else {
-            serde_json::to_writer(&mut writer, &json_cfg)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            serde_json::to_writer(&mut writer, &json_cfg).map_err(io::Error::other)?;
         }
         writeln!(writer)?;
         Ok(())
@@ -253,11 +251,9 @@ impl CallGraphJsonExporter {
         };
 
         if self.pretty {
-            serde_json::to_writer_pretty(&mut writer, &json_callgraph)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            serde_json::to_writer_pretty(&mut writer, &json_callgraph).map_err(io::Error::other)?;
         } else {
-            serde_json::to_writer(&mut writer, &json_callgraph)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            serde_json::to_writer(&mut writer, &json_callgraph).map_err(io::Error::other)?;
         }
         writeln!(writer)?;
         Ok(())

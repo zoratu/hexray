@@ -32,7 +32,7 @@ fn detect_short_circuit_in_node(node: StructuredNode) -> StructuredNode {
 
             // Try to detect short-circuit AND: if (a) { if (b) { body } }
             // Allow combination when else_body is None OR empty
-            let else_is_empty = else_body.as_ref().map_or(true, |e| e.is_empty());
+            let else_is_empty = else_body.as_ref().is_none_or(|e| e.is_empty());
             if else_is_empty {
                 if let Some((combined_cond, inner_body, inner_else)) =
                     try_extract_and_chain(&condition, &then_body)
@@ -154,7 +154,7 @@ fn try_extract_and_chain(
 
     // Recursively try to extract more AND conditions from the inner body
     // Treat empty else as no else for recursion purposes
-    let inner_else_is_empty = inner_else.as_ref().map_or(true, |e| e.is_empty());
+    let inner_else_is_empty = inner_else.as_ref().is_none_or(|e| e.is_empty());
     let (final_cond, final_body, final_else) = if inner_else_is_empty {
         if let Some((nested_cond, nested_body, nested_else)) =
             try_extract_and_chain(&inner_cond, &inner_body)

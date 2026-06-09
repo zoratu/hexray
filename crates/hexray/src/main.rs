@@ -3487,7 +3487,7 @@ fn decompile_target_info_for_address(
             }
         })
         .unwrap_or(4096);
-    let stop_after_first_return = exact_symbol.map_or(true, |symbol| symbol.size == 0);
+    let stop_after_first_return = exact_symbol.is_none_or(|symbol| symbol.size == 0);
 
     DecompileTargetInfo {
         start_addr: addr,
@@ -5987,7 +5987,7 @@ fn resolve_materialized_callback_targets(
         hexray_core::Bitness::Bits32 => 4u64,
         hexray_core::Bitness::Bits64 => 8u64,
     };
-    if call.deref_offset % ptr_size != 0 {
+    if !call.deref_offset.is_multiple_of(ptr_size) {
         return Vec::new();
     }
 

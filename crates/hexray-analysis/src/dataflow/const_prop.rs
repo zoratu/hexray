@@ -162,7 +162,7 @@ impl ConstantPropagation {
 
                 // Check if entry state changed
                 let old_entry = analysis.block_entry.get(&block_id);
-                if old_entry.map_or(true, |old| !old.equals(&entry_state)) {
+                if old_entry.is_none_or(|old| !old.equals(&entry_state)) {
                     analysis.block_entry.insert(block_id, entry_state.clone());
                 }
 
@@ -175,7 +175,7 @@ impl ConstantPropagation {
 
                 // Check if exit state changed
                 let old_exit = analysis.block_exit.get(&block_id);
-                if old_exit.map_or(true, |old| !old.equals(&exit_state)) {
+                if old_exit.is_none_or(|old| !old.equals(&exit_state)) {
                     analysis.block_exit.insert(block_id, exit_state);
                     changed = true;
 

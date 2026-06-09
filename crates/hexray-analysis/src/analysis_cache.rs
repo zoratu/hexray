@@ -884,13 +884,21 @@ pub fn create_shared_cache(config: CacheConfig) -> SharedAnalysisCache {
 }
 
 /// Get current Unix timestamp.
+///
+/// Under miri (`-Zmiri-disable-isolation` or not), we can't call
+/// `SystemTime::now()` reliably — but we also can't use the auto-
+/// incrementing `fetch_add` we used previously: that made
+/// `current_timestamp()` return a NEW value on every call, which
+/// breaks tests that legitimately expect a freshly-created entry's
+/// `created_at` to still equal `now()` a few lines later (see the
+/// `test_entry_meta_expiration` assertion `!meta.is_expired(0)`).
+/// Returning a stable far-from-zero constant lets the boundary
+/// arithmetic in `is_expired` evaluate correctly AND keeps
+/// `saturating_sub(N)` working for "synthesize an older entry" test
+/// patterns. Soak finding 2026-06-08.
 #[cfg(miri)]
 fn current_timestamp() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static MIRI_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-
-    MIRI_TIMESTAMP.fetch_add(1, Ordering::Relaxed)
+    1_700_000_000
 }
 
 /// Get current Unix timestamp.

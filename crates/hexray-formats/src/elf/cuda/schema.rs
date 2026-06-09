@@ -327,7 +327,7 @@ mod tests {
     /// Build a TLV blob of length-aligned entries, matching how real
     /// `.nv.info` blobs are laid out on disk.
     fn pad4(mut v: Vec<u8>) -> Vec<u8> {
-        while v.len() % 4 != 0 {
+        while !v.len().is_multiple_of(4) {
             v.push(0);
         }
         v
