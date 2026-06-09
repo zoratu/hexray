@@ -281,15 +281,44 @@ impl<'a> Elf<'a> {
         let Some(symbol_value) = self.relocation_symbol_value(reloc.symbol_index) else {
             return;
         };
-        let sum = symbol_value.wrapping_add(reloc.addend as u64);
         let offset = reloc.offset as usize;
         let patch_pc = section_va.wrapping_add(reloc.offset);
         let endianness = self.header.endianness;
-        let pc_rel_32 = || sum.wrapping_sub(patch_pc) as u32;
+        // SHT_REL relocations carry their addend in the patch slot itself
+        // (the parser leaves `reloc.addend` zero for those), so we read
+        // the pre-existing bytes and fold them into the sum. SHT_RELA
+        // entries set the slot to zero per the GNU as convention, so
+        // the same read is a harmless no-op there. Per relocation kind:
+        //   * R64 → 8-byte little/big endian implicit
+        //   * R32 / R32S / Pc32 / Plt32 → 4-byte
+        let read_implicit_addend_u64 = || -> u64 {
+            let end = offset.saturating_add(8);
+            buf.get(offset..end)
+                .and_then(|slot| <[u8; 8]>::try_from(slot).ok())
+                .map(|arr| match endianness {
+                    Endianness::Little => u64::from_le_bytes(arr),
+                    Endianness::Big => u64::from_be_bytes(arr),
+                })
+                .unwrap_or(0)
+        };
+        let read_implicit_addend_u32 = || -> u32 {
+            let end = offset.saturating_add(4);
+            buf.get(offset..end)
+                .and_then(|slot| <[u8; 4]>::try_from(slot).ok())
+                .map(|arr| match endianness {
+                    Endianness::Little => u32::from_le_bytes(arr),
+                    Endianness::Big => u32::from_be_bytes(arr),
+                })
+                .unwrap_or(0)
+        };
         match reloc.r_type {
             RelocationType::R64 => {
                 let end = offset.saturating_add(8);
                 if end <= buf.len() {
+                    let implicit = read_implicit_addend_u64();
+                    let sum = symbol_value
+                        .wrapping_add(reloc.addend as u64)
+                        .wrapping_add(implicit);
                     let bytes = match endianness {
                         Endianness::Little => sum.to_le_bytes(),
                         Endianness::Big => sum.to_be_bytes(),
@@ -302,6 +331,10 @@ impl<'a> Elf<'a> {
             RelocationType::R32 | RelocationType::R32S => {
                 let end = offset.saturating_add(4);
                 if end <= buf.len() {
+                    let implicit = read_implicit_addend_u32() as u64;
+                    let sum = symbol_value
+                        .wrapping_add(reloc.addend as u64)
+                        .wrapping_add(implicit);
                     let value = sum as u32;
                     let bytes = match endianness {
                         Endianness::Little => value.to_le_bytes(),
@@ -315,7 +348,11 @@ impl<'a> Elf<'a> {
             RelocationType::Pc32 | RelocationType::Plt32 => {
                 let end = offset.saturating_add(4);
                 if end <= buf.len() {
-                    let value = pc_rel_32();
+                    let implicit = read_implicit_addend_u32() as i32 as i64;
+                    let sum = symbol_value
+                        .wrapping_add(reloc.addend as u64)
+                        .wrapping_add(implicit as u64);
+                    let value = sum.wrapping_sub(patch_pc) as u32;
                     let bytes = match endianness {
                         Endianness::Little => value.to_le_bytes(),
                         Endianness::Big => value.to_be_bytes(),
