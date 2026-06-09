@@ -138,6 +138,12 @@ pub struct SignatureRecovery {
     return_confidence: u8,
     /// Parameter names assigned from stack slot analysis.
     param_names: HashMap<usize, String>,
+    /// Stack offsets each argument register was spilled to in the prologue
+    /// (pattern `*(sp + offset) = argN` while the register is still unwritten).
+    /// Used to gate the `var_{offset}` parameter renaming so it only fires on
+    /// reloads of the actual home slot, not on later reuse of the register as
+    /// a scratch temp for an unrelated stack local (e.g. a loop counter).
+    arg_spill_offsets: HashMap<usize, HashSet<i128>>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -429,6 +435,7 @@ impl SignatureRecovery {
             return_provenance: Vec::new(),
             return_confidence: 0,
             param_names: HashMap::new(),
+            arg_spill_offsets: HashMap::new(),
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
@@ -539,6 +546,7 @@ impl SignatureRecovery {
         self.return_provenance.clear();
         self.return_confidence = 0;
         self.param_names.clear();
+        self.arg_spill_offsets.clear();
         self.param_type_overrides.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
@@ -1116,6 +1124,21 @@ impl SignatureRecovery {
                             rhs_size
                         };
                         self.record_arg_register_read(&rhs_name, copy_size);
+
+                        // Remember the stack slot this still-unwritten arg
+                        // register was spilled to so that a later reload of
+                        // the same slot into the same register can be
+                        // confidently named after that slot — and a reload of
+                        // an unrelated slot (the arg register being reused as
+                        // a scratch temp, e.g. for a loop counter) is not.
+                        if let Some(offset) = self.extract_stack_offset(lhs) {
+                            if let Some(idx) = self.arg_register_index(&rhs_name) {
+                                self.arg_spill_offsets
+                                    .entry(idx)
+                                    .or_default()
+                                    .insert(offset);
+                            }
+                        }
                     }
                 }
 
@@ -1256,16 +1279,24 @@ impl SignatureRecovery {
         let reg_lower = reg_name.to_lowercase();
         self.written_regs.insert(reg_lower.clone());
 
-        // If this is an argument register being assigned from a stack slot,
-        // it might be a parameter being saved.
+        // If this is an argument register being reloaded from its prologue
+        // spill slot, the slot is its home and naming the parameter after it
+        // helps the reader. Reloads from a different slot are the arg
+        // register being reused as a scratch temp (e.g. carrying a loop
+        // counter) and must not steal the parameter's name — otherwise the
+        // emitted parameter collides with that slot's stack-local name
+        // (`var_18` etc.) and cascades the confusion through every use.
         if self.is_arg_register(&reg_lower) {
             if let Some(offset) = self.extract_stack_offset(rhs) {
-                if !self.written_regs.contains(&reg_lower) {
-                    self.read_regs.insert(reg_lower.clone());
-                }
                 if let Some(idx) = self.arg_register_index(&reg_lower) {
-                    self.param_names
-                        .insert(idx, format!("var_{:x}", offset.unsigned_abs()));
+                    if self
+                        .arg_spill_offsets
+                        .get(&idx)
+                        .is_some_and(|slots| slots.contains(&offset))
+                    {
+                        self.param_names
+                            .insert(idx, format!("var_{:x}", offset.unsigned_abs()));
+                    }
                 }
             }
         }
@@ -5073,6 +5104,62 @@ mod tests {
         // Should detect 2 parameters
         assert_eq!(sig.parameters.len(), 2);
         assert_eq!(sig.parameters[0].name, "arg0");
+        assert_eq!(sig.parameters[1].name, "arg1");
+    }
+
+    /// Loading the arg register from a stack slot that is *not* its prologue
+    /// spill slot (e.g. the arg register being reused as a scratch temp for a
+    /// loop counter) must not rename the parameter after that slot. Doing so
+    /// would collide with the slot's own `var_{offset}` local name and turn
+    /// every downstream reference to the parameter into the loop counter — the
+    /// failure mode behind a whole class of garbled int/float loop output.
+    #[test]
+    fn test_signature_recovery_does_not_rename_param_after_unrelated_slot_reload() {
+        use hexray_core::BasicBlockId;
+
+        // void fn(int*, int): prologue spills rdi → rbp-8, rsi → rbp-12.
+        // Body then reloads rdi from a *different* slot (rbp-24, the loop
+        // counter's home) — exactly the shape gcc emits when arg0 is reused
+        // as the scratch register for `i` inside the loop.
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let rsi = Expr::var(Variable::reg("rsi", 8));
+
+        let slot = |off: i64| -> Expr {
+            Expr::deref(
+                Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(off as i128)),
+                8,
+            )
+        };
+
+        let spill_rdi = Expr::assign(slot(-8), rdi.clone());
+        let spill_rsi = Expr::assign(slot(-12), rsi);
+        let body_reload_rdi_from_counter_slot = Expr::assign(rdi.clone(), slot(-24));
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Block {
+                id: BasicBlockId::new(0),
+                statements: vec![spill_rdi, spill_rsi, body_reload_rdi_from_counter_slot],
+                address_range: (0x1000, 0x1018),
+            }],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        assert_eq!(sig.parameters.len(), 2, "params: {:?}", sig.parameters);
+        // arg0's home is rbp-8, so renaming it to "var_8" (its real spill
+        // slot) is acceptable; what is NOT acceptable is naming it "var_18"
+        // after the unrelated loop-counter slot that just happened to be
+        // loaded into rdi later.
+        assert_ne!(
+            sig.parameters[0].name, "var_18",
+            "param 0 was renamed after the loop counter's stack slot — {:?}",
+            sig.parameters
+        );
+        // Sanity: param 1 keeps its default since its register was never
+        // reloaded.
         assert_eq!(sig.parameters[1].name, "arg1");
     }
 
