@@ -4432,13 +4432,20 @@ fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
         // - .rdata (Windows read-only data)
         // - __DATA_CONST (Mach-O data constants)
         // - __text, .text (code sections - compilers often embed small jump tables here)
+        // Mach-O float-constant pools are named `__literal4`/`__literal8`/
+        // `__literal16` and don't contain "rodata"/"const", so they need an
+        // explicit allow path in the outer predicate too — otherwise the
+        // float-pool tagging below would never see them and the new SSE-2
+        // materialization would be silently disabled on Mach-O. Codex
+        // review on PR #26.
         if !section.data().is_empty()
             && (name.contains("rodata")
                 || name.contains("const")
                 || name == ".rdata"
                 || name == "rdata"
                 || name == "__text"
-                || name == ".text")
+                || name == ".text"
+                || is_float_constant_pool_section_name(&name))
         {
             let base = section.virtual_address();
             let len = section.data().len() as u64;
