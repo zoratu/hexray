@@ -487,16 +487,29 @@ fn parse_smart_pointer_kind_and_inner(name: &str) -> Option<(SmartPointerKind, S
         ("std::weak_ptr", SmartPointerKind::Weak),
         ("std::unique_ptr", SmartPointerKind::Unique),
     ];
-    // The prefix must start the name's class qualifier — not appear as
-    // a substring of a user type like `mystd::shared_ptr<Widget>` (the
-    // `find` would pick `std::shared_ptr` at offset 2 and bind the
-    // stack slot as a real std::shared_ptr). Codex review on PR #24
-    // (post-revert): accept the match only when it's at position 0 or
-    // immediately preceded by a non-identifier byte (whitespace, `(`,
-    // `<`, etc.).
+    // The prefix must start the name's class qualifier AND be in the
+    // called-method position (before the method's argument list).
+    // Two distinct codex P2 findings on PR #24 are addressed here:
+    //
+    //   1. Anchored-identifier: a user type like
+    //      `mystd::shared_ptr<Widget>` would otherwise match at offset
+    //      2 because `find` is unconstrained. Require the match
+    //      position to be 0 or immediately preceded by a non-
+    //      identifier byte.
+    //
+    //   2. Pre-argument-list: in a name like
+    //      `foo(std::shared_ptr<Widget>::element_type*)`, the prefix
+    //      occurs INSIDE the argument list of an unrelated function.
+    //      Require the match to be before the first `(` so we only
+    //      pick up the actual called method, not a smart-pointer
+    //      type nested inside someone else's signature.
     let is_identifier_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let arg_list_start = name.find('(').unwrap_or(name.len());
     let (kind, after_prefix) = candidates.iter().find_map(|(prefix, kind)| {
         let i = name.find(prefix)?;
+        if i >= arg_list_start {
+            return None;
+        }
         let prev_ok = i == 0
             || name
                 .as_bytes()
@@ -935,9 +948,26 @@ fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase
     }
 
     // Case B: Bare bound stack address (call-arg form).
+    //
+    // For C-struct bindings (epoll_event etc.) this rewrites
+    // `Add(frame, K)` to `&<local>`, so the call argument reads
+    // `epoll_ctl(epfd, ADD, fd, &event)` instead of the raw
+    // address. For C++ class-object bindings we DON'T rewrite —
+    // wrapping the address as `&Widget_shared_ptr_10` causes the
+    // emitter to render byte-level zero stores as `qword(&sp) = 0`
+    // when they recurse into a `Deref` lvalue (codex review on PR
+    // #24). Leaving class-object addresses raw keeps the zero
+    // stores as `*(rbp - 16) = 0` (readable, semantically correct),
+    // at the cost of call-arg sites showing `reset(rbp - 16)`
+    // instead of `reset(&sp)` — an acceptable trade for the
+    // simpler representation. The typed local is still declared
+    // at the top of the function so the reader can connect the
+    // raw address to the typed object.
     if let Some(off) = stack_offset_of_address(expr) {
         if let Some(binding) = bindings.get(off) {
-            return Expr::address_of(struct_local_expr(binding));
+            if !binding.class_object {
+                return Expr::address_of(struct_local_expr(binding));
+            }
         }
     }
 
@@ -2097,6 +2127,60 @@ mod tests {
         let b = bindings.get(-16).expect("binding at -16");
         assert_eq!(b.type_name, "std::shared_ptr<Widget>");
         assert_eq!(b.size, 16);
+    }
+
+    /// Codex review on PR #24: a non-member function whose demangled
+    /// parameter list contains a smart-pointer type as a nested
+    /// qualifier (e.g. `foo(std::shared_ptr<Widget>::element_type*)`)
+    /// would match — the parser only required `::` after the
+    /// template, which is satisfied by the `::element_type` suffix.
+    /// Require the match to be before the first `(` so we only pick
+    /// up the actually-called method.
+    #[test]
+    fn smart_pointer_parser_declines_match_inside_argument_list() {
+        assert!(
+            parse_smart_pointer_kind_and_inner("foo(std::shared_ptr<Widget>::element_type*)")
+                .is_none(),
+            "match inside an argument list must not bind: {:?}",
+            parse_smart_pointer_kind_and_inner("foo(std::shared_ptr<Widget>::element_type*)")
+        );
+        // Real method call still matches.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner("std::shared_ptr<Widget>::reset()"),
+            Some((SmartPointerKind::Shared, "Widget".to_string()))
+        );
+    }
+
+    /// Codex review on PR #24: when a class-object stack address is
+    /// rewritten via the Case-B `&<local>` rule, the surrounding
+    /// `Deref` of that address renders as `qword(&Widget_shared_ptr_10)
+    /// = 0` — semantically correct but visually confusing. For
+    /// class-object bindings the Case-B rewrite is suppressed so the
+    /// raw form `*(rbp - 16) = 0` flows through unchanged. Call-arg
+    /// sites show raw addresses too (`reset(rbp - 16)` not `reset(&sp)`)
+    /// — an acceptable trade for the simpler representation.
+    #[test]
+    fn transform_expr_leaves_class_object_addresses_raw() {
+        let binding = StackStructBinding {
+            stack_offset: -16,
+            size: 16,
+            type_name: "std::shared_ptr<Widget>".to_string(),
+            local_name: "Widget_shared_ptr_10".to_string(),
+            class_object: true,
+        };
+        let mut bindings = StackStructBindings::new();
+        bindings.by_offset.insert(binding.stack_offset, binding);
+
+        // `Add(rbp, -16)` lands at the class-object binding's base.
+        // For a C-struct binding this would rewrite to AddressOf, but
+        // for class_object we keep the raw arithmetic.
+        let addr = rbp_plus(-16);
+        let out = transform_expr(&addr, &bindings, &full_db());
+        // Must remain a BinOp(Add, rbp, -16), NOT AddressOf(local).
+        assert!(
+            matches!(&out.kind, ExprKind::BinOp { .. }),
+            "class-object address rewrite should leave the raw form: {out:?}"
+        );
     }
 
     /// Codex review on PR #24: the parser used an unconstrained
