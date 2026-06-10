@@ -230,22 +230,22 @@ pub fn scan_float_arg_registers(
         };
         for inst in &block.instructions {
             // Store ops (the `-O0` arg spill is the dominant case)
-            // have one register operand (the source value being
-            // stored) and one memory operand (the destination
-            // address). x86 movsd uses `[mem, register]` order;
-            // aarch64 STR uses `[register, mem]`. Pick whichever
-            // operand is the register and treat it as a source read
-            // — never as a destination write, regardless of position.
-            // Without this, aarch64 `STR Dn, [sp, #imm]` would mark
-            // Dn as written-first and the scanner would never
-            // recognise the corresponding incoming float arg.
+            // can carry one or more register operands, each a source
+            // value stored to memory. x86 movsd uses `[mem, reg]`
+            // order; aarch64 STR uses `[reg, mem]`; aarch64 STP uses
+            // `[reg, reg, mem]` so a prologue
+            // `stp d0, d1, [sp, #-16]!` carries BOTH float-arg
+            // registers as sources. Iterate ALL register operands
+            // and treat each as a source read — never as a
+            // destination write, regardless of position. Codex
+            // review on PR #25 flagged the find_map / single-op form
+            // as undercounting STP-spilled float args.
             let is_store = matches!(inst.operation, Operation::Store);
             if is_store {
-                let reg = inst.operands.iter().find_map(|o| match o {
-                    Operand::Register(r) => Some(r),
-                    _ => None,
-                });
-                if let Some(reg) = reg {
+                for operand in &inst.operands {
+                    let Operand::Register(reg) = operand else {
+                        continue;
+                    };
                     let name = reg.name().to_lowercase();
                     let abi_name = float_arg_abi_register(&name, convention);
                     if let Some(idx) = float_regs
@@ -4999,6 +4999,31 @@ mod tests {
         )]);
         let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
         assert_eq!(found, vec![(0, "d0".to_string(), 4)]);
+    }
+
+    /// Codex review on PR #25: aarch64 `stp d0, d1, [sp, #-16]!` is a
+    /// store-pair carrying two source register operands plus the
+    /// memory destination. The scanner has to count BOTH registers,
+    /// not just operand[0], otherwise float-arity recovery undercounts
+    /// for functions whose prologue spills the args as a pair.
+    #[test]
+    fn aarch64_scan_detects_both_args_in_stp_spill() {
+        // stp d0, d1, [sp, #-16]!
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "stp",
+            Operation::Store,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+                aarch64_mem(sp, -16),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)]
+        );
     }
 
     #[test]
