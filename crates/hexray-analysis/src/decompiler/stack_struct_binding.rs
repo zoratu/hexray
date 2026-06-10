@@ -47,6 +47,15 @@ pub struct StackStructBinding {
     /// Suggested local variable name for the rewritten output, e.g.
     /// `"epoll_event_14"` (struct name + abs(offset) in hex).
     pub local_name: String,
+    /// `true` when this binding represents a C++ class object whose
+    /// lifecycle is constructor / destructor driven (smart pointers
+    /// today; future C++ stack-locals later) rather than a plain C
+    /// struct. The struct-rewrite path treats them differently: a
+    /// zero-store into a C-struct local is a `memset` aggregate
+    /// initialisation, but a zero-store into a class object is the
+    /// in-place default constructor / move-from-nullptr — emitting
+    /// `memset(&shared_ptr, 0, 16)` would corrupt the meaning.
+    pub class_object: bool,
 }
 
 /// `stack_offset -> binding` map collected by [`Self::analyze`].
@@ -327,6 +336,7 @@ fn try_bind_call(
                 size,
                 type_name,
                 local_name,
+                class_object: false,
             });
     }
 }
@@ -388,6 +398,7 @@ fn try_bind_smart_pointer_method_call(
             size,
             type_name,
             local_name,
+            class_object: true,
         });
 }
 
@@ -1109,6 +1120,15 @@ fn try_rewrite_base_zero_to_memset(
         _ => return None,
     };
     let binding = bindings.containing(byte_off)?;
+    // C++ class objects (smart pointers today, more to come) don't
+    // memset-init: a zero store into a `std::shared_ptr<T>` slot is the
+    // default constructor / move-from-nullptr, not an aggregate
+    // initialisation. Rewriting it as `memset(&sp, 0, 16)` would
+    // misrepresent the object's lifecycle and surface bytes-level
+    // semantics for what is a class operation. Codex review on PR #24.
+    if binding.class_object {
+        return None;
+    }
     // Must be the base of the bound region (rel == 0).
     if byte_off != binding.stack_offset {
         return None;
@@ -1183,6 +1203,14 @@ fn is_droppable_interior_zero_store(stmt: &Expr, bindings: &StackStructBindings)
     let Some(binding) = bindings.containing(byte_off) else {
         return false;
     };
+    // C++ class objects (smart pointers and friends): an interior
+    // zero store inside the bound region is part of a real
+    // constructor / move-assignment sequence, not aggregate
+    // zero-init padding to be silenced. Dropping it would hide
+    // semantically-meaningful writes. Codex review on PR #24.
+    if binding.class_object {
+        return false;
+    }
     let rel = byte_off - binding.stack_offset;
     if rel <= 0 {
         // Offset-0 base-of-region zero is the zero-init marker; keep it.
@@ -1886,6 +1914,39 @@ mod tests {
             bindings.len(),
             0,
             "must not bind when this is not a stack address"
+        );
+    }
+
+    /// Codex review on PR #24: a smart-pointer binding sitting at the same
+    /// offset as a zero store must NOT trigger the C-struct memset/drop
+    /// rewrite — a zero into a `std::shared_ptr<T>` slot is the default
+    /// constructor or move-from-nullptr, not aggregate zero-init padding.
+    #[test]
+    fn class_object_binding_skips_struct_memset_rewrite() {
+        let binding = StackStructBinding {
+            stack_offset: -16,
+            size: 16,
+            type_name: "std::shared_ptr<Widget>".to_string(),
+            local_name: "Widget_shared_ptr_10".to_string(),
+            class_object: true,
+        };
+        let mut bindings = StackStructBindings::new();
+        bindings.by_offset.insert(binding.stack_offset, binding);
+
+        // A wide zero store at the base of the bound region — would be
+        // rewritten to memset for a regular struct, must be left alone here.
+        let stmt = Expr::assign(Expr::deref(rbp_plus(-16), 8), Expr::int(0));
+        assert!(
+            try_rewrite_base_zero_to_memset(&stmt, &bindings, &full_db()).is_none(),
+            "class_object binding must not trigger memset rewrite"
+        );
+
+        // An interior zero store inside the region — would be dropped for a
+        // regular struct, must be kept here.
+        let interior = Expr::assign(Expr::deref(rbp_plus(-8), 4), Expr::int(0));
+        assert!(
+            !is_droppable_interior_zero_store(&interior, &bindings),
+            "class_object binding must not silence interior zero stores"
         );
     }
 }
