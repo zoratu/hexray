@@ -5029,14 +5029,29 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                 };
                 let (resolved_name, target_addr, is_external) =
                     resolve_relocation_symbol(&symbols, symbol, reloc.r_type, reloc.addend);
-                let instruction = elf.section_data(section).and_then(|section_data| {
-                    find_x86_64_relocation_instruction(
-                        section,
-                        section_data,
-                        reloc.r_type,
-                        reloc.offset,
-                    )
-                });
+                // The x86 instruction-aware lookup is only correct on
+                // x86_64: it scans for a 5-byte E8/E9 call/jmp ending
+                // at `reloc.offset` and treats whatever it decodes as
+                // the call-site instruction. On AArch64 the BL/B
+                // bytes (or a few bytes upstream) can perfectly well
+                // happen to look like a valid x86 sequence and the
+                // scanner would silently mis-resolve the call site —
+                // gate it on the binary's machine type so Branch26
+                // always takes the direct `reloc.offset` fallback.
+                // Codex review on PR #23.
+                let instruction =
+                    if matches!(elf.header.machine, hexray_formats::elf::Machine::X86_64) {
+                        elf.section_data(section).and_then(|section_data| {
+                            find_x86_64_relocation_instruction(
+                                section,
+                                section_data,
+                                reloc.r_type,
+                                reloc.offset,
+                            )
+                        })
+                    } else {
+                        None
+                    };
                 if let Some(instruction) = instruction {
                     match instruction.control_flow {
                         hexray_core::ControlFlow::Call { .. }
