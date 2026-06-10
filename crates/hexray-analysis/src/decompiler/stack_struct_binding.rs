@@ -477,9 +477,25 @@ fn parse_smart_pointer_kind_and_inner(name: &str) -> Option<(SmartPointerKind, S
         ("std::weak_ptr", SmartPointerKind::Weak),
         ("std::unique_ptr", SmartPointerKind::Unique),
     ];
+    // The prefix must start the name's class qualifier — not appear as
+    // a substring of a user type like `mystd::shared_ptr<Widget>` (the
+    // `find` would pick `std::shared_ptr` at offset 2 and bind the
+    // stack slot as a real std::shared_ptr). Codex review on PR #24
+    // (post-revert): accept the match only when it's at position 0 or
+    // immediately preceded by a non-identifier byte (whitespace, `(`,
+    // `<`, etc.).
+    let is_identifier_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let (kind, after_prefix) = candidates.iter().find_map(|(prefix, kind)| {
-        name.find(prefix)
-            .map(|i| (*kind, &name[i + prefix.len()..]))
+        let i = name.find(prefix)?;
+        let prev_ok = i == 0
+            || name
+                .as_bytes()
+                .get(i.saturating_sub(1))
+                .is_none_or(|b| !is_identifier_byte(*b));
+        if !prev_ok {
+            return None;
+        }
+        Some((*kind, &name[i + prefix.len()..]))
     })?;
     let after_lt = after_prefix.strip_prefix('<')?;
     // Walk to the matching `>` honouring nested template brackets so we
@@ -2050,6 +2066,26 @@ mod tests {
                 "std::unique_ptr<Widget, std::default_delete<Widget>>::reset()"
             ),
             Some((SmartPointerKind::Unique, "Widget".to_string()))
+        );
+    }
+
+    /// Codex review on PR #24: the parser used an unconstrained
+    /// `name.find(prefix)`, so a user type like
+    /// `mystd::shared_ptr<Widget>` would match the embedded
+    /// `std::shared_ptr` substring at offset 2 and bind the stack slot
+    /// as a real `std::shared_ptr<Widget>`. The match must be anchored
+    /// at a class-qualifier boundary (position 0 or after a
+    /// non-identifier byte).
+    #[test]
+    fn smart_pointer_parser_does_not_match_substring_in_user_type() {
+        assert!(
+            parse_smart_pointer_kind_and_inner("mystd::shared_ptr<Widget>::reset()").is_none(),
+            "user type containing std::shared_ptr substring must not match"
+        );
+        // Sanity: the real std qualifier still matches.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner("std::shared_ptr<Widget>::reset()"),
+            Some((SmartPointerKind::Shared, "Widget".to_string()))
         );
     }
 
