@@ -2377,7 +2377,8 @@ impl Decompiler {
             .with_dwarf_param_names(self.dwarf_param_names.clone())
             .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
-            .with_signature_recovery(self.enable_signature_recovery);
+            .with_signature_recovery(self.enable_signature_recovery)
+            .with_binary_data(self.binary_data.clone());
         if let Some(ref db) = self.summary_database {
             emitter = emitter.with_summary_database(db.clone());
         }

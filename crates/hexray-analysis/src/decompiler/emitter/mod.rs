@@ -23,8 +23,9 @@ use std::sync::Arc;
 mod format;
 mod predicates;
 use format::{
-    escape_string, format_as_char_literal, format_integer, is_likely_character_constant,
-    is_printable_char_value, is_special_char_value, looks_like_char_context,
+    escape_string, format_as_char_literal, format_float_literal_f32, format_float_literal_f64,
+    format_integer, is_likely_character_constant, is_printable_char_value, is_special_char_value,
+    looks_like_char_context, looks_like_real_float_constant_f32, looks_like_real_float_constant_f64,
 };
 use predicates::{
     canonical_decl_var_name, collect_decl_identifiers_from_emitted_body, contains_identifier_token,
@@ -426,6 +427,13 @@ pub struct PseudoCodeEmitter {
     /// "no gating" until a signature is emitted.
     integer_arg_param_count: Cell<usize>,
     float_arg_param_count: Cell<usize>,
+    /// Read-only data sections from the binary, used to materialize
+    /// rip-relative float constants (e.g. `movsd xmm0, [rip + .L]`
+    /// where .L points into `.rodata.cst8`) as concrete float
+    /// literals (`3.14`) at format time, rather than as variable
+    /// references to a symbol/global. Populated by
+    /// [`Self::with_binary_data`].
+    binary_data: Option<super::BinaryDataContext>,
 }
 
 impl PseudoCodeEmitter {
@@ -664,6 +672,7 @@ impl PseudoCodeEmitter {
             return_fallback_expr: RefCell::new(None),
             preserve_register_names: Cell::new(false),
             register_snapshot_mode: Cell::new(false),
+            binary_data: None,
         }
     }
 
@@ -3325,6 +3334,14 @@ impl PseudoCodeEmitter {
         self
     }
 
+    /// Sets the binary data context used to materialize rip-relative
+    /// rodata float constants (`movsd xmm0, [rip + .Lconst]`) as
+    /// concrete float literals at format time.
+    pub fn with_binary_data(mut self, data: Option<super::BinaryDataContext>) -> Self {
+        self.binary_data = data;
+        self
+    }
+
     /// Sets type information for variables.
     /// Keys should be variable names (e.g., "var_8", "local_10"),
     /// values should be C type strings (e.g., "int", "char*", "float").
@@ -4331,6 +4348,49 @@ impl PseudoCodeEmitter {
         table
             .get_match(address)
             .map(|symbol| GlobalSymbolResolution::Exact(self.simplify_symbol_name(symbol.name)))
+    }
+
+    /// Tries to materialize a rip-relative rodata load as a concrete
+    /// float literal (`3.14` / `3.14f`).
+    ///
+    /// For example, `movsd xmm0, [rip + .Lconst]` where `.Lconst`
+    /// points into `.rodata.cst8` carrying the 8 bytes of `3.14`
+    /// becomes `3.14` instead of an opaque global-variable reference.
+    ///
+    /// Returns `None` when:
+    /// * No `binary_data` context is plumbed in.
+    /// * `size` isn't 4 or 8 (we only handle scalar float/double).
+    /// * `address` doesn't fall inside any rodata-style section.
+    /// * The bytes decode to a non-finite value (NaN / inf) — those
+    ///   wouldn't appear in compiler-emitted `.rodata.cst*` constant
+    ///   pools and matching them here risks materializing a misread
+    ///   pointer-sized integer as a bogus float.
+    fn try_format_rodata_float_constant(&self, address: u64, size: u8) -> Option<String> {
+        let binary_data = self.binary_data.as_ref()?;
+        if !matches!(size, 4 | 8) {
+            return None;
+        }
+        let (section, base) = binary_data.section_containing(address)?;
+        let offset = usize::try_from(address.checked_sub(base)?).ok()?;
+        let end = offset.checked_add(usize::from(size))?;
+        let bytes = section.get(offset..end)?;
+        match size {
+            4 => {
+                let value = f32::from_le_bytes(bytes.try_into().ok()?);
+                if !looks_like_real_float_constant_f32(value) {
+                    return None;
+                }
+                Some(format_float_literal_f32(value))
+            }
+            8 => {
+                let value = f64::from_le_bytes(bytes.try_into().ok()?);
+                if !looks_like_real_float_constant_f64(value) {
+                    return None;
+                }
+                Some(format_float_literal_f64(value))
+            }
+            _ => None,
+        }
     }
 
     fn format_global_address(&self, address: u64) -> Option<String> {
@@ -5541,6 +5601,23 @@ impl PseudoCodeEmitter {
                 display_expr: _,
                 is_deref,
             } => {
+                // Float-constant materialization: a rip-relative deref
+                // of size 4 or 8 whose target falls inside a rodata
+                // section becomes the concrete `3.14` / `3.14f`
+                // literal, instead of an opaque pointer to a
+                // compiler-generated `.LCPI*` symbol. Runs BEFORE
+                // relocated_symbol_name / format_global_value so the
+                // useful value (`3.14`) wins over the meaningless
+                // pool-slot symbol name (`.LCPI0_0`). Bounded to
+                // finite, non-denormal values to avoid materializing
+                // a misread integer or pointer as a bogus float.
+                if *is_deref {
+                    if let Some(literal) =
+                        self.try_format_rodata_float_constant(*address, *size)
+                    {
+                        return literal;
+                    }
+                }
                 if let Some(name) = self.relocated_symbol_name(*instruction_address, *address) {
                     let resolved = self.simplify_symbol_name(name);
                     if *is_deref {
