@@ -13176,8 +13176,7 @@ mod tests {
         ctx.add_section(0x1000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x1000, 0x1000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
         let table = StringTable::new();
 
         // GotRef as produced by lifting `movsd xmm0, [rip + .Lconst]`
@@ -13200,8 +13199,7 @@ mod tests {
         ctx.add_section(0x2000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x2000, 0x2000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
         let table = StringTable::new();
 
         let display = Expr::int(0x2000);
@@ -13227,8 +13225,7 @@ mod tests {
         ctx.add_section(0x3000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x3000, 0x3000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
         let table = StringTable::new();
 
         let display = Expr::int(0x3000);
@@ -13259,8 +13256,7 @@ mod tests {
         ctx.add_section(0x4000, bytes.to_vec());
         // NB: deliberately NOT calling add_float_constant_pool_range.
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
         let table = StringTable::new();
 
         let display = Expr::int(0x4000);
