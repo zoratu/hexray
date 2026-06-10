@@ -12421,6 +12421,8 @@ mod tests {
             r_type: RelocationType::R64,
             addend: 0,
             section_index: 7,
+            addend_in_slot: false,
+            linked_symtab_section: 0,
         }];
 
         let resolved = resolve_relocatable_elf_personality(
