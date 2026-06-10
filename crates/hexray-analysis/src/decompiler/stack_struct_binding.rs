@@ -239,6 +239,11 @@ fn visit_expr(
 ) {
     if let ExprKind::Call { target, args } = &expr.kind {
         try_bind_call(target, args, db, binary_data, out);
+        // Run alongside `try_bind_call`: smart-pointer method calls
+        // aren't in the TypeDatabase (their type comes from the C++
+        // class template, not a libc/POSIX prototype), so they need a
+        // separate name-pattern detection path.
+        try_bind_smart_pointer_method_call(target, args, binary_data, out);
     }
     walk_children(expr, db, binary_data, out);
 }
@@ -323,6 +328,184 @@ fn try_bind_call(
                 type_name,
                 local_name,
             });
+    }
+}
+
+/// Recognise a C++ smart-pointer method call (`std::shared_ptr<T>::reset(...)`,
+/// `std::unique_ptr<Widget>::get(...)`, etc.) whose `this` argument is the
+/// address of a stack region, and bind that region as `std::shared_ptr<T>` /
+/// `std::unique_ptr<T>` / `std::weak_ptr<T>` so the downstream rewriter can
+/// surface a typed local instead of a bare `rbp - K` argument.
+///
+/// We match the demangled-name pattern rather than going through the
+/// `TypeDatabase` because smart pointers are class templates that resolve
+/// per-instantiation; libstdc++ also emits an internal `std::__shared_ptr` /
+/// `std::__weak_ptr` base class which the matcher accepts too. The first
+/// comma-separated template argument is taken as the inner type `T`
+/// (`unique_ptr<T, Deleter>` and `__shared_ptr<T, std::allocator<…>>` both
+/// land on the right `T` this way).
+///
+/// Conservatively only the common ABI sizes are bound:
+/// * `unique_ptr<T>` → 8 (single pointer; stateless / default-deleter form).
+/// * `shared_ptr<T>` / `weak_ptr<T>` → 16 (data pointer + control block).
+///
+/// `unique_ptr<T, StatefulDeleter>` instances can be larger; the matcher
+/// still emits the 8-byte binding for them because the more common case is
+/// the stateless one. A stateful-deleter follow-up can refine the size from
+/// `_M_t`'s tuple layout once we have that recognised.
+fn try_bind_smart_pointer_method_call(
+    target: &CallTarget,
+    args: &[Expr],
+    binary_data: Option<&BinaryDataContext>,
+    out: &mut StackStructBindings,
+) {
+    let Some(name) = resolve_call_name(target, binary_data) else {
+        return;
+    };
+    let Some((kind, inner)) = parse_smart_pointer_kind_and_inner(&name) else {
+        return;
+    };
+    // Instance methods receive `this` as the first argument in the lifted
+    // call. Free functions like `std::make_shared<T>(...)` don't match the
+    // `::method` suffix so they never reach this point.
+    let Some(this_arg) = args.first() else {
+        return;
+    };
+    let Some(stack_offset) = stack_offset_of_address(this_arg) else {
+        return;
+    };
+    let (short, size) = match kind {
+        SmartPointerKind::Unique => ("unique_ptr", 8usize),
+        SmartPointerKind::Shared => ("shared_ptr", 16usize),
+        SmartPointerKind::Weak => ("weak_ptr", 16usize),
+    };
+    let type_name = format!("std::{short}<{inner}>");
+    let local_name = synthesize_smart_pointer_local_name(short, &inner, stack_offset);
+    out.by_offset
+        .entry(stack_offset)
+        .or_insert(StackStructBinding {
+            stack_offset,
+            size,
+            type_name,
+            local_name,
+        });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartPointerKind {
+    Unique,
+    Shared,
+    Weak,
+}
+
+/// Parse a demangled name and, if it looks like
+/// `std::<smart_ptr_name><...>::<method>(...)`, return the kind and the first
+/// template argument (the inner pointee type). Both the public class names
+/// (`shared_ptr`, `unique_ptr`, `weak_ptr`) and the libstdc++ internal base
+/// classes (`__shared_ptr`, `__weak_ptr`) are accepted. Returns `None` for
+/// anything else so the caller can decline the bind.
+fn parse_smart_pointer_kind_and_inner(name: &str) -> Option<(SmartPointerKind, String)> {
+    // Order matters: try the longer/more-specific names first so
+    // `__shared_ptr` doesn't get parsed as `shared_ptr` with a stray
+    // `__` prefix.
+    let candidates = [
+        ("std::__shared_ptr", SmartPointerKind::Shared),
+        ("std::shared_ptr", SmartPointerKind::Shared),
+        ("std::__weak_ptr", SmartPointerKind::Weak),
+        ("std::weak_ptr", SmartPointerKind::Weak),
+        ("std::unique_ptr", SmartPointerKind::Unique),
+    ];
+    let (kind, after_prefix) = candidates.iter().find_map(|(prefix, kind)| {
+        name.find(prefix)
+            .map(|i| (*kind, &name[i + prefix.len()..]))
+    })?;
+    let after_lt = after_prefix.strip_prefix('<')?;
+    // Walk to the matching `>` honouring nested template brackets so we
+    // extract the WHOLE argument list, not the first segment.
+    let mut depth = 1usize;
+    let mut end = None;
+    for (i, c) in after_lt.char_indices() {
+        match c {
+            '<' => depth = depth.saturating_add(1),
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let args = &after_lt[..end];
+    let after_args = after_lt.get(end + 1..)?;
+    // Must be a method call (`::method`), not a stray type mention.
+    if !after_args.starts_with("::") {
+        return None;
+    }
+    // Take the first top-level comma-separated argument as the inner type.
+    let inner = split_top_level_comma(args).into_iter().next()?;
+    Some((kind, inner.trim().to_string()))
+}
+
+/// Split a comma-separated list of template arguments at top level only,
+/// skipping commas nested inside `<…>` or `(…)`. Returns the trimmed
+/// segments in order.
+fn split_top_level_comma(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                if let Some(seg) = s.get(start..i) {
+                    parts.push(seg.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if let Some(rest) = s.get(start..) {
+        parts.push(rest.to_string());
+    }
+    parts
+}
+
+/// Build a deterministic local name for a smart-pointer binding. The inner
+/// type can contain `::`, `<>`, and spaces (`std::vector<int>` etc.); strip
+/// them down to a single short slug so the rendered name reads as a real
+/// identifier (`vector_int_8`, `widget_8`).
+fn synthesize_smart_pointer_local_name(short: &str, inner: &str, offset: i64) -> String {
+    let slug = inner
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => c,
+            _ => '_',
+        })
+        .collect::<String>();
+    // Collapse runs of `_` and strip leading/trailing.
+    let mut collapsed = String::with_capacity(slug.len());
+    let mut prev_underscore = false;
+    for c in slug.chars() {
+        if c == '_' {
+            if !prev_underscore {
+                collapsed.push('_');
+            }
+            prev_underscore = true;
+        } else {
+            collapsed.push(c);
+            prev_underscore = false;
+        }
+    }
+    let trimmed = collapsed.trim_matches('_');
+    if trimmed.is_empty() {
+        format!("{short}_{:x}", offset.unsigned_abs())
+    } else {
+        format!("{trimmed}_{short}_{:x}", offset.unsigned_abs())
     }
 }
 
@@ -1586,5 +1769,123 @@ mod tests {
         assert_eq!(parse_local_name_offset("local_deadbeef"), Some(-0xdeadbeef));
         assert_eq!(parse_local_name_offset("ret"), None);
         assert_eq!(parse_local_name_offset("local_xyz"), None);
+    }
+
+    // ----- Smart-pointer binding tests ---------------------------------
+
+    #[test]
+    fn smart_pointer_parser_recognises_shared_unique_weak() {
+        for (name, expected_kind, expected_inner) in [
+            (
+                "std::shared_ptr<Widget>::reset()",
+                SmartPointerKind::Shared,
+                "Widget",
+            ),
+            (
+                "std::unique_ptr<int>::get() const",
+                SmartPointerKind::Unique,
+                "int",
+            ),
+            (
+                "std::weak_ptr<Widget>::lock() const",
+                SmartPointerKind::Weak,
+                "Widget",
+            ),
+            // libstdc++ internal base class
+            (
+                "std::__shared_ptr<Widget, std::allocator<Widget>(int)>::reset()",
+                SmartPointerKind::Shared,
+                "Widget",
+            ),
+            (
+                "std::__weak_ptr<int, std::__atomic>::lock() const",
+                SmartPointerKind::Weak,
+                "int",
+            ),
+            // Stateful deleter on unique_ptr — still extract the first template
+            // argument as the inner type.
+            (
+                "std::unique_ptr<Widget, std::default_delete<Widget>>::operator->()",
+                SmartPointerKind::Unique,
+                "Widget",
+            ),
+            // Nested template type as the inner argument.
+            (
+                "std::shared_ptr<std::vector<int>>::operator*() const",
+                SmartPointerKind::Shared,
+                "std::vector<int>",
+            ),
+        ] {
+            let parsed = parse_smart_pointer_kind_and_inner(name)
+                .unwrap_or_else(|| panic!("parser declined valid smart-pointer name: {name}"));
+            assert_eq!(parsed.0, expected_kind, "kind mismatch on {name}");
+            assert_eq!(parsed.1, expected_inner, "inner mismatch on {name}");
+        }
+    }
+
+    #[test]
+    fn smart_pointer_parser_declines_unrelated_names() {
+        for name in [
+            "memcpy",
+            "std::vector<int>::push_back(int const&)",
+            "std::shared_ptr<Widget>", // type ref, not a ::method call
+            "std::make_shared<Widget>(int, int)", // free function
+            "MyClass::shared_ptr_helper", // unrelated suffix
+        ] {
+            assert!(
+                parse_smart_pointer_kind_and_inner(name).is_none(),
+                "parser accepted non-smart-pointer name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_stack_this_arg_for_shared_ptr_method_call() {
+        // `std::shared_ptr<Widget>::reset(this, …)` where `this` is a stack
+        // address binds [rbp-32, rbp-32+16) as `std::shared_ptr<Widget>`.
+        let call = Expr::call(
+            CallTarget::Named("std::shared_ptr<Widget>::reset()".to_string()),
+            vec![rbp_plus(-32)],
+        );
+
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+
+        assert_eq!(bindings.len(), 1, "expected one binding");
+        let b = bindings.get(-32).expect("binding at -32");
+        assert_eq!(b.type_name, "std::shared_ptr<Widget>");
+        assert_eq!(b.size, 16, "shared_ptr = ptr + control_block");
+        assert_eq!(b.local_name, "Widget_shared_ptr_20");
+    }
+
+    #[test]
+    fn binds_stack_this_arg_for_unique_ptr_method_call() {
+        let call = Expr::call(
+            CallTarget::Named("std::unique_ptr<int>::get() const".to_string()),
+            vec![rbp_plus(-8)],
+        );
+
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+
+        let b = bindings.get(-8).expect("binding at -8");
+        assert_eq!(b.type_name, "std::unique_ptr<int>");
+        assert_eq!(b.size, 8, "unique_ptr = bare data pointer");
+    }
+
+    #[test]
+    fn does_not_bind_smart_pointer_when_this_arg_is_not_stack_address() {
+        // First arg is a plain Var (a register-held pointer), not `rbp + K`.
+        let call = Expr::call(
+            CallTarget::Named("std::shared_ptr<Widget>::reset()".to_string()),
+            vec![Expr::var(Variable::reg("rdi", 8))],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(
+            bindings.len(),
+            0,
+            "must not bind when this is not a stack address"
+        );
     }
 }
