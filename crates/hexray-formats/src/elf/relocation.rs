@@ -184,6 +184,14 @@ pub struct Relocation {
     pub addend: i64,
     /// Section index this relocation applies to.
     pub section_index: usize,
+    /// `true` when the addend lives in the patch slot itself (SHT_REL —
+    /// `addend` above is left zero by the parser, and the bytes at
+    /// `offset` carry the implicit value). `false` when the addend
+    /// was already captured into `addend` from the relocation entry
+    /// (SHT_RELA — the patch slot is not part of the relocation
+    /// expression and must NOT be folded back in, even when its
+    /// contents are non-zero).
+    pub addend_in_slot: bool,
 }
 
 impl Relocation {
@@ -307,6 +315,7 @@ impl Relocation {
             r_type,
             addend: 0,
             section_index,
+            addend_in_slot: true,
         })
     }
 
@@ -337,6 +346,7 @@ impl Relocation {
             r_type,
             addend: 0,
             section_index,
+            addend_in_slot: true,
         })
     }
 
@@ -368,6 +378,7 @@ impl Relocation {
             r_type,
             addend: r_addend as i64,
             section_index,
+            addend_in_slot: false,
         })
     }
 
@@ -399,6 +410,7 @@ impl Relocation {
             r_type,
             addend: r_addend,
             section_index,
+            addend_in_slot: false,
         })
     }
 }

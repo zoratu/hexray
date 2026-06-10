@@ -285,13 +285,20 @@ impl<'a> Elf<'a> {
         let patch_pc = section_va.wrapping_add(reloc.offset);
         let endianness = self.header.endianness;
         // SHT_REL relocations carry their addend in the patch slot itself
-        // (the parser leaves `reloc.addend` zero for those), so we read
-        // the pre-existing bytes and fold them into the sum. SHT_RELA
-        // entries set the slot to zero per the GNU as convention, so
-        // the same read is a harmless no-op there. Per relocation kind:
-        //   * R64 → 8-byte little/big endian implicit
-        //   * R32 / R32S / Pc32 / Plt32 → 4-byte
+        // (the parser leaves `reloc.addend` zero for those), so we must
+        // read the pre-existing bytes and fold them into the sum. SHT_RELA
+        // entries have ALREADY captured the explicit addend into
+        // `reloc.addend` — their patch slot is *not* part of the
+        // relocation expression, and folding the slot bytes back in would
+        // double-count any non-zero placeholder. Gate the implicit-addend
+        // read on `reloc.addend_in_slot` so the two paths stay distinct.
+        // Codex review on this PR (re-review pass) flagged that the prior
+        // always-read approach over-relocated valid RELA inputs whose
+        // slot held a non-zero placeholder.
         let read_implicit_addend_u64 = || -> u64 {
+            if !reloc.addend_in_slot {
+                return 0;
+            }
             let end = offset.saturating_add(8);
             buf.get(offset..end)
                 .and_then(|slot| <[u8; 8]>::try_from(slot).ok())
@@ -302,6 +309,9 @@ impl<'a> Elf<'a> {
                 .unwrap_or(0)
         };
         let read_implicit_addend_u32 = || -> u32 {
+            if !reloc.addend_in_slot {
+                return 0;
+            }
             let end = offset.saturating_add(4);
             buf.get(offset..end)
                 .and_then(|slot| <[u8; 4]>::try_from(slot).ok())
