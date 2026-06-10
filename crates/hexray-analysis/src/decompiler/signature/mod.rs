@@ -470,8 +470,15 @@ fn block_return_register_class(
             // spill as a `d0 = ...` and mistakenly seed a float
             // return on integer/void leaf functions whose only float
             // reference is the incoming arg spill. Codex review on
-            // PR #25.
+            // PR #25 pass 2.
             | Operation::Store
+            // Compare/Test set flags, not the operand[0] register. On
+            // aarch64 `fcmp d0, d1` carries d0 as operand[0] purely as
+            // a source read, so without skipping these the return
+            // classifier would seed a double return on void functions
+            // that only compare FP args. Codex review on PR #25 pass 4.
+            | Operation::Compare
+            | Operation::Test
         ) || m == "leave"
             || m.starts_with("nop")
             || m.starts_with("endbr")
@@ -5072,6 +5079,29 @@ mod tests {
             found,
             vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)],
             "fadd d0, d0, d1 must register both arg reads"
+        );
+    }
+
+    /// Codex review on PR #25 pass 4: aarch64 `fcmp d0, d1` carries
+    /// `d0` as operand[0] but `Operation::Compare` doesn't write a
+    /// destination — it sets flags. Without skipping Compare/Test in
+    /// the return classifier, a void function that just compares its
+    /// FP args would seed a `double` return type.
+    #[test]
+    fn aarch64_return_scan_ignores_fcmp_compare() {
+        // fcmp d0, d1   ; ret
+        let cfg = aarch64_single_block_cfg(vec![(
+            "fcmp",
+            Operation::Compare,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+            ],
+        )]);
+        let result = scan_float_return(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            result, None,
+            "fcmp d0, d1 must not seed a float return (Compare doesn't write)"
         );
     }
 
