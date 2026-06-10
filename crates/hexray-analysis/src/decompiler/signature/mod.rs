@@ -209,9 +209,15 @@ pub fn scan_float_arg_registers(
     cfg: &ControlFlowGraph,
     convention: CallingConvention,
 ) -> Vec<(usize, String, u8)> {
-    // The xmm argument ABI is System V specific (Win64 shares the integer/float
-    // slot, AArch64/RISC-V use their own scan paths).
-    if !matches!(convention, CallingConvention::SystemV) {
+    // Float ABI scan is implemented for System V (xmm0-xmm7) and
+    // Aarch64 AAPCS (d0-d7 / s0-s7 / q0-q7 / v0-v7 — all aliases of
+    // the same vector-register file). Win64 shares the integer/float
+    // arg slot and uses the integer scan; RiscV would need its own
+    // scan if/when float-ABI work extends there.
+    if !matches!(
+        convention,
+        CallingConvention::SystemV | CallingConvention::Aarch64
+    ) {
         return Vec::new();
     }
     let float_regs = convention.float_arg_registers();
@@ -223,33 +229,155 @@ pub fn scan_float_arg_registers(
             continue;
         };
         for inst in &block.instructions {
-            // An xmm register in the source position (operand 1) is read — but
-            // the `pxor %xmm,%xmm` / `xorps`/`xorpd` self-xor is a zeroing idiom
-            // (`reg = 0`), not a read of an incoming argument.
+            // Classify the operand layout for this instruction. Three
+            // shapes matter for float-arg recovery:
+            //
+            // * MEMORY STORE (str/stp/movsd [mem],xmm0) — every register
+            //   operand is a source value being written to memory; no
+            //   destination register write. `stp d0, d1, [sp, #N]`
+            //   carries TWO float-arg sources.
+            // * REG-TO-REG STORE (movdqa xmm1, xmm0) — operand[0] is
+            //   the destination, operand[1..] are sources. Without
+            //   this distinction `movdqa xmm1, xmm0` (copy of the
+            //   single float arg) would falsely register xmm1 as a
+            //   2nd arg. Codex review on PR #25 pass 9.
+            // * LOAD (ldr/ldp/mov reg,[mem]) — every leading register
+            //   operand before any memory operand is a DESTINATION
+            //   write, no source register reads. Codex review on
+            //   PR #25 pass 7 fixed `ldp d0, d1, [sp, #N]`.
+            // * COMPARE/TEST (cmp/fcmp/test) — operand[0] is ALSO a
+            //   source read, not a destination. Skipping operand[0]
+            //   would miss `fcmp d0, d1` cases where the only use of
+            //   d0 in the function is the compare. Codex review on
+            //   PR #25 pass 9.
+            // * DEFAULT (add/mul/move-reg-reg/etc.) — operand[0] is
+            //   destination, operand[1..] are sources. Iterating all
+            //   `operand[1..]` covers 3-operand FP `fadd d0, d0, d1`
+            //   and x86 AVX VEX-encoded `vfmadd231sd xmm0,xmm1,xmm2`
+            //   (codex review on PR #25 pass 3).
+            let has_memory_operand = inst
+                .operands
+                .iter()
+                .any(|o| matches!(o, Operand::Memory(_)));
+            let is_memory_store = matches!(inst.operation, Operation::Store) && has_memory_operand;
+            let is_load = matches!(inst.operation, Operation::Load);
+            let is_compare_or_test = matches!(inst.operation, Operation::Compare | Operation::Test);
+
+            if is_load {
+                // Only aarch64 `ldp` writes two leading register
+                // operands. For every other Load (x86 mov reg,[mem];
+                // x86 VEX `vmaskmovps xmm2, xmm0, [rdi]` whose middle
+                // operand is a SOURCE/mask not a destination; aarch64
+                // ldr) operand[0] is the only destination — the
+                // remaining register operands before the memory are
+                // SOURCES that may carry argument reads. Codex review
+                // on PR #25 pass 10.
+                let mnemonic = inst.mnemonic.to_ascii_lowercase();
+                let multi_dest = mnemonic == "ldp" || mnemonic == "ldnp" || mnemonic == "ldpsw";
+                if multi_dest {
+                    for operand in &inst.operands {
+                        match operand {
+                            Operand::Register(reg) => {
+                                let name = reg.name().to_lowercase();
+                                let abi_name = float_arg_abi_register(&name, convention);
+                                written.insert(abi_name);
+                            }
+                            _ => break,
+                        }
+                    }
+                    continue;
+                }
+                // Single-destination load: mark operand[0] as written,
+                // then fall through so operand[1..] (before the memory
+                // operand) get scanned as source reads.
+                if let Some(Operand::Register(dst)) = inst.operands.first() {
+                    let name = dst.name().to_lowercase();
+                    let abi_name = float_arg_abi_register(&name, convention);
+                    written.insert(abi_name);
+                }
+                for operand in inst.operands.iter().skip(1) {
+                    let Operand::Register(src) = operand else {
+                        break;
+                    };
+                    let name = src.name().to_lowercase();
+                    let abi_name = float_arg_abi_register(&name, convention);
+                    if let Some(idx) = float_regs
+                        .iter()
+                        .position(|r| r.eq_ignore_ascii_case(&abi_name))
+                    {
+                        if detected[idx].is_none() && !written.contains(&abi_name) {
+                            detected[idx] = Some(scalar_float_operand_size_with_reg(inst, &name));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Source-operand slice for arg-read detection.
+            //   memory-store / compare-or-test → all operands are sources
+            //   default                         → operand[1..] are sources
+            let source_skip = if is_memory_store || is_compare_or_test {
+                0
+            } else {
+                1
+            };
+
             let is_self_zero = matches!(inst.operation, Operation::Xor)
                 && operands_are_same_register(&inst.operands);
             if !is_self_zero {
-                if let Some(Operand::Register(src)) = inst.operands.get(1) {
+                for operand in inst.operands.iter().skip(source_skip) {
+                    let Operand::Register(src) = operand else {
+                        continue;
+                    };
                     let name = src.name().to_lowercase();
+                    // Normalise across the aarch64 register-file aliases so a
+                    // `d0` use is recognised when the convention's arg list
+                    // is `d0..d7`. The aarch64 ABI reuses the same vector
+                    // register at different element widths (`s0`/`d0`/`q0`/`v0`
+                    // all alias bank 0); pick the matching ABI name.
+                    let abi_name = float_arg_abi_register(&name, convention);
                     if let Some(idx) = float_regs
                         .iter()
-                        .position(|r| r.eq_ignore_ascii_case(&name))
+                        .position(|r| r.eq_ignore_ascii_case(&abi_name))
                     {
-                        if detected[idx].is_none() && !written.contains(&name) {
-                            detected[idx] = Some(scalar_float_operand_size(inst));
+                        if detected[idx].is_none() && !written.contains(&abi_name) {
+                            detected[idx] = Some(scalar_float_operand_size_with_reg(inst, &name));
                         }
                     }
                 }
             }
-            // The destination (operand 0), if an xmm register, is written by
-            // anything but a pure comparison/test. Over-counting writes is safe:
-            // it only suppresses later (false) argument detections.
+            // Memory stores have no destination register write, and
+            // compare/test ops don't write the operand[0] register
+            // either. Only mark operand[0] as written for ops that
+            // genuinely write to it.
+            if is_memory_store || is_compare_or_test {
+                continue;
+            }
+            // The destination (operand 0), if a float-bank register, is
+            // written by anything but a pure comparison/test. Over-counting
+            // writes is safe: it only suppresses later (false) argument
+            // detections.
             if let Some(Operand::Register(dst)) = inst.operands.first() {
                 let name = dst.name().to_lowercase();
-                if name.starts_with("xmm")
-                    && !matches!(inst.operation, Operation::Compare | Operation::Test)
+                let abi_name = float_arg_abi_register(&name, convention);
+                let is_float_bank = match convention {
+                    CallingConvention::SystemV => name.starts_with("xmm"),
+                    CallingConvention::Aarch64 => {
+                        // Half-precision `h*` deliberately omitted: the
+                        // downstream `float_param_type_for_size` maps
+                        // sizes 0..=4 to `Float(32)`, so an h0 arg
+                        // would be wrongly recovered as 32-bit `float`
+                        // rather than `_Float16`. Until a 16-bit float
+                        // type lands, skip h*. Codex review on PR #25
+                        // pass 12.
+                        matches!(name.chars().next(), Some('s' | 'd' | 'q' | 'v'))
+                            && name[1..].chars().all(|c| c.is_ascii_digit())
+                    }
+                    _ => false,
+                };
+                if is_float_bank && !matches!(inst.operation, Operation::Compare | Operation::Test)
                 {
-                    written.insert(name);
+                    written.insert(abi_name);
                 }
             }
         }
@@ -264,6 +392,53 @@ pub fn scan_float_arg_registers(
         }
     }
     result
+}
+
+/// Map any float-bank register name (e.g. aarch64 `s3`, `d3`, `q3`, `v3`)
+/// to the ABI-arg-register name the convention's `float_arg_registers()`
+/// list uses (aarch64 → `d3`; System V passes through `xmm3`). Used to
+/// recognise float-arg reads regardless of access width.
+fn float_arg_abi_register(name: &str, convention: CallingConvention) -> String {
+    match convention {
+        CallingConvention::Aarch64 => {
+            if name.len() >= 2 {
+                let prefix = name.chars().next().unwrap();
+                let suffix: String = name[1..].chars().collect();
+                // `h*` (half-precision) intentionally NOT normalized:
+                // see is_float_bank above for the rationale. Codex
+                // review on PR #25 pass 12.
+                if matches!(prefix, 's' | 'd' | 'q' | 'v')
+                    && suffix.chars().all(|c| c.is_ascii_digit())
+                {
+                    return format!("d{suffix}");
+                }
+            }
+            name.to_string()
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// Operand width derived from the destination/source register's prefix
+/// (aarch64: `s*` = 4-byte single, `d*` = 8-byte double, `q*` = 16-byte
+/// vector). Falls back to [`scalar_float_operand_size`] for x86 mnemonics
+/// (`*ss` = single, `*sd` = double).
+fn scalar_float_operand_size_with_reg(inst: &hexray_core::Instruction, reg: &str) -> u8 {
+    if let Some(prefix) = reg.chars().next() {
+        match prefix {
+            's' => return 4,
+            'd' => return 8,
+            // Both `q*` (the 128-bit-register name) and `v*` (the
+            // 128-bit vector-form name) map to 16 bytes. The aarch64
+            // register renderer uses `v*` for the 128-bit form, not
+            // `q*`, so missing `v` here would silently round a vector
+            // arg/return down to 8 bytes (`double`). Codex review on
+            // PR #25 pass 5.
+            'q' | 'v' => return 16,
+            _ => {}
+        }
+    }
+    scalar_float_operand_size(inst)
 }
 
 /// Whether operands 0 and 1 are the same register (the self-xor zeroing idiom).
@@ -297,7 +472,10 @@ fn scalar_float_operand_size(inst: &hexray_core::Instruction) -> u8 {
 /// stack-canary reload (`rax = *guard_slot`) is skipped so it does not look like
 /// an integer return.
 pub fn scan_float_return(cfg: &ControlFlowGraph, convention: CallingConvention) -> Option<u8> {
-    if !matches!(convention, CallingConvention::SystemV) {
+    if !matches!(
+        convention,
+        CallingConvention::SystemV | CallingConvention::Aarch64
+    ) {
         return None;
     }
     let mut float_size: Option<u8> = None;
@@ -323,7 +501,7 @@ pub fn scan_float_return(cfg: &ControlFlowGraph, convention: CallingConvention) 
                 break;
             }
             let Some(b) = cfg.block(bid) else { break };
-            match block_return_register_class(b) {
+            match block_return_register_class(b, convention) {
                 Some(ReturnRegClass::Float(size)) => {
                     float_size = Some(float_size.map_or(size, |s| s.max(size)));
                     break;
@@ -340,6 +518,7 @@ pub fn scan_float_return(cfg: &ControlFlowGraph, convention: CallingConvention) 
     float_size
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ReturnRegClass {
     Float(u8),
     Integer,
@@ -348,39 +527,122 @@ enum ReturnRegClass {
 /// Classify the return register established by a block: the last write to a
 /// return register (`xmm0` = float, `rax`/`eax` = integer), skipping the
 /// epilogue and the stack-canary reload/compare.
-fn block_return_register_class(block: &hexray_core::BasicBlock) -> Option<ReturnRegClass> {
+fn block_return_register_class(
+    block: &hexray_core::BasicBlock,
+    convention: CallingConvention,
+) -> Option<ReturnRegClass> {
     let mut saw_guard = false;
     for inst in block.instructions.iter().rev() {
         // Skip epilogue scaffolding.
         let m = inst.mnemonic.to_ascii_lowercase();
-        if matches!(
-            inst.operation,
-            Operation::Return | Operation::Push | Operation::Pop | Operation::Nop
-        ) || m == "leave"
-            || m.starts_with("nop")
-            || m.starts_with("endbr")
-        {
-            continue;
-        }
-        // The stack-canary guard compare (`cmp`/`sub` against %fs:0x28).
+        // Stack-canary guard compare against %fs:0x28 has to be
+        // detected BEFORE the Compare/Test skip below, otherwise the
+        // pass-4 fix swallows it and the preceding canary reload into
+        // rax is misread as the integer return value. Codex review on
+        // PR #25 pass 8. The guard helper covers `cmp`/`sub` shapes.
         if instruction_references_stack_guard(inst) {
             saw_guard = true;
             continue;
+        }
+        if matches!(
+            inst.operation,
+            Operation::Return | Operation::Push | Operation::Pop | Operation::Nop
+            // Compare/Test set flags, not the operand[0] register. On
+            // aarch64 `fcmp d0, d1` carries d0 as operand[0] purely as
+            // a source read, so without skipping these the return
+            // classifier would seed a double return on void functions
+            // that only compare FP args. Codex review on PR #25 pass 4.
+            | Operation::Compare
+            | Operation::Test
+        ) || m == "leave"
+            || m.starts_with("nop")
+            || m.starts_with("endbr")
+            || m.starts_with("stp")
+        {
+            continue;
+        }
+        // Store ops with a memory destination: on aarch64
+        // `str d0, [sp, #N]` (an arg spill, common in the entry block
+        // when the return block happens to be the entry block too)
+        // carries d0 as operand[0] — the SOURCE being stored, not a
+        // destination write. Without skipping these stores the return
+        // classifier would treat the spill as a `d0 = ...` and
+        // mistakenly seed a float return on integer/void leaf
+        // functions whose only float reference is the incoming arg
+        // spill. Codex review on PR #25 pass 2.
+        //
+        // But the skip MUST be narrowed to memory-destination stores
+        // only: x86 `movd r32, xmm0` / `vmovd r32, xmm0` is classified
+        // as `Operation::Store` even though operand[0] is the integer
+        // DESTINATION (register-to-register move from the SSE bank).
+        // Skipping all stores would drop the eax write and let the
+        // classifier walk back to an earlier xmm0 write, falsely
+        // seeding a float return on integer-returning functions. Use
+        // the presence of a Memory operand to distinguish: only skip
+        // when there's a memory destination involved. Codex review on
+        // PR #25 pass 7.
+        if matches!(inst.operation, Operation::Store)
+            && inst
+                .operands
+                .iter()
+                .any(|o| matches!(o, Operand::Memory(_)))
+        {
+            continue;
+        }
+        // aarch64 epilogue restore `ldp x29, x30, [sp, #N]` isn't a
+        // value-producing write — but `ldp x0, x1, ...` or `ldp d0, d1,
+        // ...` immediately before `ret` IS a return-register load.
+        // Restrict the skip to frame-restore shape only (operand[0] is
+        // x29/fp), so non-frame ldp falls through to the classifier.
+        // Codex review on PR #25 pass 5.
+        if m == "ldp" {
+            if let Some(Operand::Register(first)) = inst.operands.first() {
+                let n = first.name().to_lowercase();
+                if n == "x29" || n == "fp" {
+                    continue;
+                }
+            }
         }
         let Some(Operand::Register(dst)) = inst.operands.first() else {
             continue;
         };
         let name = dst.name().to_lowercase();
-        if name.starts_with("xmm") && name == "xmm0" {
-            return Some(ReturnRegClass::Float(scalar_float_operand_size(inst)));
-        }
-        if matches!(name.as_str(), "rax" | "eax" | "ax" | "al") {
-            // The reload feeding the canary check is not the return value.
-            if saw_guard {
-                saw_guard = false;
-                continue;
+        match convention {
+            CallingConvention::SystemV | CallingConvention::Win64 => {
+                if name == "xmm0" {
+                    return Some(ReturnRegClass::Float(scalar_float_operand_size(inst)));
+                }
+                if matches!(name.as_str(), "rax" | "eax" | "ax" | "al") {
+                    if saw_guard {
+                        saw_guard = false;
+                        continue;
+                    }
+                    return Some(ReturnRegClass::Integer);
+                }
             }
-            return Some(ReturnRegClass::Integer);
+            CallingConvention::Aarch64 => {
+                // d0 / s0 / q0 / v0 — all aliases of the same float
+                // return register at different widths. Use the operand
+                // width for size; q0 (vector) defaults to 16 but we
+                // generally won't see that in scalar-double leaf fns.
+                if matches!(name.as_str(), "d0" | "s0" | "q0" | "v0") {
+                    return Some(ReturnRegClass::Float(scalar_float_operand_size_with_reg(
+                        inst, &name,
+                    )));
+                }
+                // x0 / w0 = integer return.
+                if matches!(name.as_str(), "x0" | "w0") {
+                    if saw_guard {
+                        saw_guard = false;
+                        continue;
+                    }
+                    return Some(ReturnRegClass::Integer);
+                }
+            }
+            CallingConvention::RiscV => {
+                // RiscV float-return scan would land here; left for a
+                // dedicated effort.
+            }
         }
     }
     None
@@ -4680,6 +4942,44 @@ mod tests {
         hexray_core::Register::new(Architecture::X86_64, RegisterClass::Vector, 64 + idx, 128)
     }
 
+    /// aarch64 vector register at idx 0..31. `bits` selects the
+    /// access width — 32 for `s*`, 64 for `d*`, 128 for `q*`/`v*`.
+    /// Arm64 vector register ID base in hexray-core is 64, so the
+    /// renderer uses `64 + idx`.
+    fn aarch64_v(idx: u16, bits: u16) -> hexray_core::Register {
+        use hexray_core::{Architecture, RegisterClass};
+        hexray_core::Register::new(Architecture::Arm64, RegisterClass::Vector, 64 + idx, bits)
+    }
+
+    fn aarch64_x(idx: u16, bits: u16) -> hexray_core::Register {
+        use hexray_core::{Architecture, RegisterClass};
+        hexray_core::Register::new(Architecture::Arm64, RegisterClass::General, idx, bits)
+    }
+
+    fn aarch64_mem(base: hexray_core::Register, disp: i64) -> Operand {
+        Operand::Memory(hexray_core::MemoryRef::base_disp(base, disp, 8))
+    }
+
+    /// Build a one-block aarch64 CFG (instead of the x86 helper) for
+    /// regression tests that need the Arm64 architecture stamp.
+    fn aarch64_single_block_cfg(insts: Vec<(&str, Operation, Vec<Operand>)>) -> ControlFlowGraph {
+        use hexray_core::{BasicBlock, BlockTerminator, Instruction};
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let mut addr = 0x1000u64;
+        for (mnemonic, op, operands) in insts {
+            block.instructions.push(
+                Instruction::new(addr, 4, vec![], mnemonic)
+                    .with_operation(op)
+                    .with_operands(operands),
+            );
+            addr += 4;
+        }
+        block.terminator = BlockTerminator::Return;
+        cfg.add_block(block);
+        cfg
+    }
+
     fn gpr(id: u16, bits: u16) -> hexray_core::Register {
         use hexray_core::{Architecture, RegisterClass};
         hexray_core::Register::new(Architecture::X86_64, RegisterClass::General, id, bits)
@@ -4794,6 +5094,388 @@ mod tests {
         assert!(found.is_empty());
     }
 
+    /// aarch64: `STR Dn, [sp, #imm]` is the -O0 float-arg spill. The
+    /// source register is operand[0] (opposite of x86 movsd which has
+    /// memory first). Without the position-agnostic Store handling,
+    /// the scanner would mark the float-bank register as written-
+    /// before-read and miss the arg.
+    #[test]
+    fn aarch64_scan_detects_d0_d1_args_from_str_spill() {
+        // str d0, [sp, #8]   ; str d1, [sp, #16]
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+            ),
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_v(1, 64)), aarch64_mem(sp, 16)],
+            ),
+        ]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)]
+        );
+    }
+
+    /// `STR Sn, [sp, #imm]` is the single-precision spill: width is
+    /// taken from the `s*` register prefix, NOT from a mnemonic
+    /// suffix (aarch64 has no `*ss`/`*sd` form).
+    #[test]
+    fn aarch64_scan_picks_single_precision_size_from_register() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 32)), aarch64_mem(sp, 4)],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(found, vec![(0, "d0".to_string(), 4)]);
+    }
+
+    /// Codex review on PR #25: aarch64 `stp d0, d1, [sp, #-16]!` is a
+    /// store-pair carrying two source register operands plus the
+    /// memory destination. The scanner has to count BOTH registers,
+    /// not just operand[0], otherwise float-arity recovery undercounts
+    /// for functions whose prologue spills the args as a pair.
+    #[test]
+    fn aarch64_scan_detects_both_args_in_stp_spill() {
+        // stp d0, d1, [sp, #-16]!
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "stp",
+            Operation::Store,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+                aarch64_mem(sp, -16),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)]
+        );
+    }
+
+    /// Codex review on PR #25: aarch64 FP instructions use a 3-operand
+    /// `dst, src1, src2` form (`fadd d0, d0, d1`). The scanner has to
+    /// look at every source operand past operand[0], not just
+    /// operand[1], otherwise a function whose body uses both args
+    /// directly (no spill at all — an optimised build) is reported
+    /// as taking only `d0`. The Xor self-zero idiom shortcut still
+    /// fires before this loop so `pxor xmm,xmm` doesn't accidentally
+    /// flag arg reads.
+    #[test]
+    fn aarch64_scan_detects_d1_in_fadd_third_operand() {
+        // fadd d0, d0, d1
+        let cfg = aarch64_single_block_cfg(vec![(
+            "fadd",
+            Operation::Add,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)],
+            "fadd d0, d0, d1 must register both arg reads"
+        );
+    }
+
+    /// Codex review on PR #25 pass 4: aarch64 `fcmp d0, d1` carries
+    /// `d0` as operand[0] but `Operation::Compare` doesn't write a
+    /// destination — it sets flags. Without skipping Compare/Test in
+    /// the return classifier, a void function that just compares its
+    /// FP args would seed a `double` return type.
+    #[test]
+    fn aarch64_return_scan_ignores_fcmp_compare() {
+        // fcmp d0, d1   ; ret
+        let cfg = aarch64_single_block_cfg(vec![(
+            "fcmp",
+            Operation::Compare,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+            ],
+        )]);
+        let result = scan_float_return(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            result, None,
+            "fcmp d0, d1 must not seed a float return (Compare doesn't write)"
+        );
+    }
+
+    /// Codex review on PR #25: a leaf function that takes a float
+    /// arg and returns void (or an integer through `x0`/`w0`) has
+    /// `str d0, [sp, #...]` as its arg spill at the top of the entry
+    /// block. If that entry block is also the return block (the
+    /// common single-block leaf case), the return-classifier
+    /// scanning backwards would otherwise see `d0` at operand[0] of
+    /// the STR and mistakenly classify the function as returning
+    /// `double`. `Operation::Store` must be skipped by the return
+    /// classifier.
+    #[test]
+    fn aarch64_return_scan_ignores_str_d0_arg_spill() {
+        // Body:
+        //   str d0, [sp, #8]    ; spill incoming float arg
+        //   ret
+        // No write to d0 as a destination; this is a void function
+        // (or one whose integer return is elsewhere). `scan_float_return`
+        // must return None.
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+        )]);
+        let result = scan_float_return(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            result, None,
+            "aarch64 STR d0 (arg spill) must not seed a float return"
+        );
+    }
+
+    /// Codex review on PR #25 pass 7: `ldp d0, d1, [sp, #N]` on
+    /// aarch64 LOADS d0 and d1 from memory — both register operands
+    /// are destinations, not sources. The arg scan must mark both
+    /// as written rather than treating operand[1] as a source read,
+    /// otherwise a function that loads two doubles from a local
+    /// would be reported as accepting `d1` as a 2nd float argument.
+    #[test]
+    fn aarch64_scan_does_not_treat_ldp_dest_as_arg_read() {
+        // ldp d0, d1, [sp, #16]   ; load two locals into d0/d1
+        // No prior write to d0 or d1, but they're both destinations
+        // here. Expected: NO detected float arguments.
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "ldp",
+            Operation::Load,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+                aarch64_mem(sp, 16),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert!(
+            found.is_empty(),
+            "ldp destinations must not be flagged as float arg reads, got {found:?}"
+        );
+    }
+
+    /// Codex review on PR #25 pass 7: x86 `movd r32, xmm0` /
+    /// `vmovd r32, xmm0` is classified as `Operation::Store` even
+    /// though operand[0] is the integer destination register. The
+    /// pass-2 store-skip in the return classifier was too broad and
+    /// would let the classifier walk back past the integer return
+    /// write to an earlier xmm0 write, falsely classifying an
+    /// integer-returning function as returning a float. Restrict the
+    /// skip to memory-destination stores so register-only `movd`
+    /// returns the integer classification.
+    #[test]
+    fn return_classifier_movd_eax_xmm0_classifies_as_integer() {
+        // movd eax, xmm0     ; integer extraction from SSE bank
+        // ret
+        let cfg = single_block_cfg(vec![(
+            "movd",
+            Operation::Store,
+            vec![Operand::Register(gpr(0, 32)), Operand::Register(xmm(0))],
+        )]);
+        let block = cfg.entry_block().unwrap();
+        let result = block_return_register_class(block, CallingConvention::SystemV);
+        assert_eq!(
+            result,
+            Some(ReturnRegClass::Integer),
+            "movd eax, xmm0 (reg→reg Store) must classify as integer return"
+        );
+    }
+
+    /// Codex review on PR #25 pass 10: x86 VEX-encoded loads such as
+    /// `vmaskmovps xmm2, xmm0, [rdi]` are `Operation::Load` with the
+    /// middle operand being a SOURCE (mask), not a destination. The
+    /// pass-7 ldp fix that marked every leading register operand of
+    /// a Load as written would also mark xmm0 (the incoming arg) as
+    /// written before any read, suppressing the arg detection.
+    /// Single-destination Loads must only mark operand[0] as written;
+    /// operand[1..] before the memory operand are source reads.
+    #[test]
+    fn scan_detects_vex_load_mask_register_as_arg_read() {
+        // vmaskmovps xmm2, xmm0, [rdi]
+        // operand[0] = xmm2 (dest)
+        // operand[1] = xmm0 (mask source — the incoming float arg)
+        // operand[2] = [rdi] (memory source)
+        let rdi = gpr(7, 64);
+        let cfg = single_block_cfg(vec![(
+            "vmaskmovps",
+            Operation::Load,
+            vec![
+                Operand::Register(xmm(2)),
+                Operand::Register(xmm(0)),
+                mem(rdi, 0),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            found,
+            vec![(0, "xmm0".to_string(), 8)],
+            "vmaskmovps mask (operand[1]) must register as a float arg read"
+        );
+    }
+
+    /// Codex review on PR #25 pass 9: aarch64 `fcmp d0, d1` carries
+    /// d0 in operand[0] as a SOURCE read (Compare doesn't write its
+    /// operand[0]). The previous `skip(1)` source-iteration would
+    /// miss d0 here, so a function whose only FP use was a compare
+    /// against d0 would recover NO float parameters. Verify d0 and
+    /// d1 are both detected as 8-byte float args.
+    #[test]
+    fn aarch64_scan_detects_d0_and_d1_in_fcmp() {
+        // fcmp d0, d1
+        let cfg = aarch64_single_block_cfg(vec![(
+            "fcmp",
+            Operation::Compare,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)],
+            "fcmp d0, d1 must mark BOTH d0 and d1 as arg reads"
+        );
+    }
+
+    /// Codex review on PR #25 pass 9: x86 `movdqa xmm1, xmm0` (a
+    /// reg-to-reg SSE store-form encoding) is classified as
+    /// `Operation::Store` even though operand[0] is the destination
+    /// register, not a source. Without distinguishing memory-store
+    /// from reg-to-reg-store, a function that just copies its
+    /// single float arg from xmm0 to xmm1 would be reported as
+    /// taking both xmm0 AND xmm1.
+    #[test]
+    fn scan_does_not_treat_reg_to_reg_store_dest_as_arg_read() {
+        // movdqa xmm1, xmm0   ; copy xmm0 → xmm1 (no memory operand)
+        let cfg = single_block_cfg(vec![(
+            "movdqa",
+            Operation::Store,
+            vec![Operand::Register(xmm(1)), Operand::Register(xmm(0))],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            found,
+            vec![(0, "xmm0".to_string(), 8)],
+            "movdqa xmm1, xmm0 reg-to-reg store: only xmm0 is an arg read"
+        );
+    }
+
+    /// Codex review on PR #25 pass 5: the aarch64 register renderer
+    /// uses `v*` (not `q*`) for the 128-bit SIMD/FP form. The width
+    /// helper must size a `v0` operand at 16 bytes; otherwise a
+    /// vector arg falls through to mnemonic-based sizing and ends up
+    /// recovered as 8-byte `double` instead of 16-byte SIMD.
+    #[test]
+    fn aarch64_scan_picks_quad_size_from_v_register() {
+        // str v0, [sp, #16]   ; 128-bit vector arg spill
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 128)), aarch64_mem(sp, 16)],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(found, vec![(0, "d0".to_string(), 16)]);
+    }
+
+    /// Codex review on PR #25 pass 12: half-precision `h*` is
+    /// deliberately NOT detected as a float arg. The downstream
+    /// `float_param_type_for_size(2)` would map it to `Float(32)`
+    /// (32-bit `float`), wrongly recovering an `_Float16` signature
+    /// as `float`. Until a 16-bit float type lands, the scanner
+    /// silently ignores h0 spills so the recovered signature
+    /// stays empty rather than mistyped.
+    #[test]
+    fn aarch64_scan_silently_ignores_half_precision_h_register() {
+        // str h0, [sp, #2]   ; spill of _Float16 arg
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 16)), aarch64_mem(sp, 2)],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert!(
+            found.is_empty(),
+            "h0 (half-precision) must not be detected until Float(16) is supported, got {found:?}"
+        );
+    }
+
+    /// Codex review on PR #25 pass 5: `ldp` isn't always an epilogue
+    /// frame restore — `ldp x0, x1, [sp, #N]` immediately before
+    /// `ret` is a legitimate return-register load. Globally skipping
+    /// `ldp` would miss the integer return write. Only the frame
+    /// restore shape (operand[0] == x29) should be skipped.
+    #[test]
+    fn aarch64_return_classifier_ldp_x0_is_integer_return() {
+        // ldp x0, x1, [sp, #16]   ; load return registers
+        // ret
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "ldp",
+            Operation::Load,
+            vec![
+                Operand::Register(aarch64_x(0, 64)),
+                Operand::Register(aarch64_x(1, 64)),
+                aarch64_mem(sp, 16),
+            ],
+        )]);
+        let block = cfg.entry_block().unwrap();
+        let result = block_return_register_class(block, CallingConvention::Aarch64);
+        assert_eq!(
+            result,
+            Some(ReturnRegClass::Integer),
+            "ldp x0, x1, ... must be classified as an integer return write"
+        );
+    }
+
+    /// Codex review on PR #25 pass 5 (companion): the frame-restore
+    /// shape `ldp x29, x30, [sp, #N]` still has to be skipped — it
+    /// isn't a return-register write, just an epilogue restore of
+    /// fp/lr. Without the targeted skip, x29 would never match the
+    /// return-register set and the classifier would silently keep
+    /// walking, but we encode the intent explicitly so a future
+    /// refactor of the match arms doesn't surface false positives.
+    #[test]
+    fn aarch64_return_classifier_ldp_x29_x30_is_skipped() {
+        // ldp x29, x30, [sp, #16]   ; epilogue frame restore
+        // ret
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "ldp",
+            Operation::Load,
+            vec![
+                Operand::Register(aarch64_x(29, 64)),
+                Operand::Register(aarch64_x(30, 64)),
+                aarch64_mem(sp, 16),
+            ],
+        )]);
+        let block = cfg.entry_block().unwrap();
+        let result = block_return_register_class(block, CallingConvention::Aarch64);
+        assert_eq!(
+            result, None,
+            "ldp x29, x30, ... is a frame restore, not a return write"
+        );
+    }
+
     #[test]
     fn scan_excludes_pxor_self_zero() {
         // pxor %xmm0,%xmm0 (zero a float accumulator) must not look like an
@@ -4901,6 +5583,47 @@ mod tests {
             ),
         ]);
         assert_eq!(scan_float_return(&cfg, CallingConvention::SystemV), Some(8));
+    }
+
+    /// Codex review on PR #25 pass 8: the pass-4 fix to skip
+    /// Compare/Test ops in the return classifier was too aggressive
+    /// — when a stack-protector epilogue uses `cmp` (instead of
+    /// `sub`) against the canary, the early skip swallowed the
+    /// guard reference before `instruction_references_stack_guard`
+    /// got a chance to set saw_guard. The preceding `mov rax,
+    /// [canary_slot]` then got mistakenly seeded as the integer
+    /// return value, vetoing the real float return in xmm0.
+    /// Verify a `cmp %fs:0x28, ...` guard check still sets saw_guard
+    /// so the xmm0 float return is preserved.
+    #[test]
+    fn scan_float_return_skips_canary_reload_when_guard_is_cmp() {
+        // movsd ...,%xmm0   ; real float return write
+        // mov ...,%rax      ; canary reload from stack slot
+        // cmp %fs:0x28,%rax ; guard compare (Operation::Compare)
+        // ret
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![
+            (
+                "movsd",
+                Operation::Move,
+                vec![Operand::Register(xmm(0)), mem(rbp, -88)],
+            ),
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(gpr(0, 64)), mem(rbp, -8)],
+            ),
+            (
+                "cmp",
+                Operation::Compare,
+                vec![Operand::Register(gpr(0, 64)), guard_mem()],
+            ),
+        ]);
+        assert_eq!(
+            scan_float_return(&cfg, CallingConvention::SystemV),
+            Some(8),
+            "cmp-form canary guard must not be skipped before guard detection"
+        );
     }
 
     #[test]
