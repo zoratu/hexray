@@ -3722,6 +3722,10 @@ fn decompile_function(
         },
         arch,
     );
+    let pointer_size = match fmt.bitness() {
+        hexray_core::Bitness::Bits32 => 4usize,
+        hexray_core::Bitness::Bits64 => 8usize,
+    };
 
     let mut binary_data_ctx = build_binary_data_context(fmt);
     seed_resolved_call_target_names(&mut binary_data_ctx, &symbol_table, &relocation_table);
@@ -3760,7 +3764,8 @@ fn decompile_function(
         .with_dwarf_scope_ranges(dwarf_names.local_scope_ranges)
         .with_constant_database(const_db)
         .with_struct_inference(true)
-        .with_calling_convention(calling_convention);
+        .with_calling_convention(calling_convention)
+        .with_pointer_size(pointer_size);
     decompiler = decompiler.analyze_cpp_special(&cfg, &instructions, Some(&name));
     if let Some(info) = binary.exception_info_for_function(start_addr, start_addr) {
         decompiler = decompiler.with_exception_info(info);

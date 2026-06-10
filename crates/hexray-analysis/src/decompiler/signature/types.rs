@@ -23,16 +23,6 @@ pub enum CallingConvention {
 }
 
 impl CallingConvention {
-    /// Returns the target pointer width in bytes for this calling
-    /// convention. All currently-modelled conventions are 64-bit; when
-    /// 32-bit variants are added the smart-pointer binder will pick up
-    /// the correct size automatically.
-    pub fn pointer_size(&self) -> usize {
-        match self {
-            Self::SystemV | Self::Win64 | Self::Aarch64 | Self::RiscV => 8,
-        }
-    }
-
     /// Detects the calling convention from architecture hints.
     pub fn from_architecture(arch: &str) -> Self {
         let arch_lower = arch.to_lowercase();
