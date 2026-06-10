@@ -359,7 +359,13 @@ fn scalar_float_operand_size_with_reg(inst: &hexray_core::Instruction, reg: &str
         match prefix {
             's' => return 4,
             'd' => return 8,
-            'q' => return 16,
+            // Both `q*` (the 128-bit-register name) and `v*` (the
+            // 128-bit vector-form name) map to 16 bytes. The aarch64
+            // register renderer uses `v*` for the 128-bit form, not
+            // `q*`, so missing `v` here would silently round a vector
+            // arg/return down to 8 bytes (`double`). Codex review on
+            // PR #25 pass 5.
+            'q' | 'v' => return 16,
             _ => {}
         }
     }
@@ -482,13 +488,23 @@ fn block_return_register_class(
         ) || m == "leave"
             || m.starts_with("nop")
             || m.starts_with("endbr")
-            // aarch64 epilogue: `ldp x29, x30, [sp, #N]` / `add sp, sp,
-            // #M` aren't the value-producing writes either; the actual
-            // return value sits in d0/v0 / x0 set earlier.
-            || m == "ldp"
             || m.starts_with("stp")
         {
             continue;
+        }
+        // aarch64 epilogue restore `ldp x29, x30, [sp, #N]` isn't a
+        // value-producing write — but `ldp x0, x1, ...` or `ldp d0, d1,
+        // ...` immediately before `ret` IS a return-register load.
+        // Restrict the skip to frame-restore shape only (operand[0] is
+        // x29/fp), so non-frame ldp falls through to the classifier.
+        // Codex review on PR #25 pass 5.
+        if m == "ldp" {
+            if let Some(Operand::Register(first)) = inst.operands.first() {
+                let n = first.name().to_lowercase();
+                if n == "x29" || n == "fp" {
+                    continue;
+                }
+            }
         }
         // The stack-canary guard compare (`cmp`/`sub` against %fs:0x28).
         if instruction_references_stack_guard(inst) {
@@ -5132,6 +5148,81 @@ mod tests {
         assert_eq!(
             result, None,
             "aarch64 STR d0 (arg spill) must not seed a float return"
+        );
+    }
+
+    /// Codex review on PR #25 pass 5: the aarch64 register renderer
+    /// uses `v*` (not `q*`) for the 128-bit SIMD/FP form. The width
+    /// helper must size a `v0` operand at 16 bytes; otherwise a
+    /// vector arg falls through to mnemonic-based sizing and ends up
+    /// recovered as 8-byte `double` instead of 16-byte SIMD.
+    #[test]
+    fn aarch64_scan_picks_quad_size_from_v_register() {
+        // str v0, [sp, #16]   ; 128-bit vector arg spill
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 128)), aarch64_mem(sp, 16)],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(found, vec![(0, "d0".to_string(), 16)]);
+    }
+
+    /// Codex review on PR #25 pass 5: `ldp` isn't always an epilogue
+    /// frame restore — `ldp x0, x1, [sp, #N]` immediately before
+    /// `ret` is a legitimate return-register load. Globally skipping
+    /// `ldp` would miss the integer return write. Only the frame
+    /// restore shape (operand[0] == x29) should be skipped.
+    #[test]
+    fn aarch64_return_classifier_ldp_x0_is_integer_return() {
+        // ldp x0, x1, [sp, #16]   ; load return registers
+        // ret
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "ldp",
+            Operation::Load,
+            vec![
+                Operand::Register(aarch64_x(0, 64)),
+                Operand::Register(aarch64_x(1, 64)),
+                aarch64_mem(sp, 16),
+            ],
+        )]);
+        let block = cfg.entry_block().unwrap();
+        let result = block_return_register_class(block, CallingConvention::Aarch64);
+        assert_eq!(
+            result,
+            Some(ReturnRegClass::Integer),
+            "ldp x0, x1, ... must be classified as an integer return write"
+        );
+    }
+
+    /// Codex review on PR #25 pass 5 (companion): the frame-restore
+    /// shape `ldp x29, x30, [sp, #N]` still has to be skipped — it
+    /// isn't a return-register write, just an epilogue restore of
+    /// fp/lr. Without the targeted skip, x29 would never match the
+    /// return-register set and the classifier would silently keep
+    /// walking, but we encode the intent explicitly so a future
+    /// refactor of the match arms doesn't surface false positives.
+    #[test]
+    fn aarch64_return_classifier_ldp_x29_x30_is_skipped() {
+        // ldp x29, x30, [sp, #16]   ; epilogue frame restore
+        // ret
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "ldp",
+            Operation::Load,
+            vec![
+                Operand::Register(aarch64_x(29, 64)),
+                Operand::Register(aarch64_x(30, 64)),
+                aarch64_mem(sp, 16),
+            ],
+        )]);
+        let block = cfg.entry_block().unwrap();
+        let result = block_return_register_class(block, CallingConvention::Aarch64);
+        assert_eq!(
+            result, None,
+            "ldp x29, x30, ... is a frame restore, not a return write"
         );
     }
 
