@@ -304,7 +304,7 @@ pub fn scan_float_arg_registers(
                 let is_float_bank = match convention {
                     CallingConvention::SystemV => name.starts_with("xmm"),
                     CallingConvention::Aarch64 => {
-                        matches!(name.chars().next(), Some('s' | 'd' | 'q' | 'v'))
+                        matches!(name.chars().next(), Some('h' | 's' | 'd' | 'q' | 'v'))
                             && name[1..].chars().all(|c| c.is_ascii_digit())
                     }
                     _ => false,
@@ -338,7 +338,7 @@ fn float_arg_abi_register(name: &str, convention: CallingConvention) -> String {
             if name.len() >= 2 {
                 let prefix = name.chars().next().unwrap();
                 let suffix: String = name[1..].chars().collect();
-                if matches!(prefix, 's' | 'd' | 'q' | 'v')
+                if matches!(prefix, 'h' | 's' | 'd' | 'q' | 'v')
                     && suffix.chars().all(|c| c.is_ascii_digit())
                 {
                     return format!("d{suffix}");
@@ -357,6 +357,9 @@ fn float_arg_abi_register(name: &str, convention: CallingConvention) -> String {
 fn scalar_float_operand_size_with_reg(inst: &hexray_core::Instruction, reg: &str) -> u8 {
     if let Some(prefix) = reg.chars().next() {
         match prefix {
+            // `h*` is the 16-bit half-precision (`_Float16`) form;
+            // codex review on PR #25 pass 6 caught this missing.
+            'h' => return 2,
             's' => return 4,
             'd' => return 8,
             // Both `q*` (the 128-bit-register name) and `v*` (the
@@ -534,7 +537,7 @@ fn block_return_register_class(
                 // return register at different widths. Use the operand
                 // width for size; q0 (vector) defaults to 16 but we
                 // generally won't see that in scalar-double leaf fns.
-                if matches!(name.as_str(), "d0" | "s0" | "q0" | "v0") {
+                if matches!(name.as_str(), "h0" | "d0" | "s0" | "q0" | "v0") {
                     return Some(ReturnRegClass::Float(scalar_float_operand_size_with_reg(
                         inst, &name,
                     )));
@@ -5168,6 +5171,23 @@ mod tests {
         )]);
         let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
         assert_eq!(found, vec![(0, "d0".to_string(), 16)]);
+    }
+
+    /// Codex review on PR #25 pass 6: aarch64 has a 16-bit
+    /// half-precision (`_Float16`) form rendered as `h0..h7`. The
+    /// normalization must accept the `h` prefix so half-precision args
+    /// and returns are not silently dropped. Width is 2 bytes.
+    #[test]
+    fn aarch64_scan_picks_half_precision_size_from_h_register() {
+        // str h0, [sp, #2]   ; spill of _Float16 arg
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 16)), aarch64_mem(sp, 2)],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(found, vec![(0, "d0".to_string(), 2)]);
     }
 
     /// Codex review on PR #25 pass 5: `ldp` isn't always an epilogue
