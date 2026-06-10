@@ -542,7 +542,11 @@ fn parse_smart_pointer_kind_and_inner(name: &str) -> Option<(SmartPointerKind, S
     let args = &after_lt[..end];
     let after_args = after_lt.get(end + 1..)?;
     // Must be a method call (`::method`), not a stray type mention.
-    if !after_args.starts_with("::") {
+    // Trim leading whitespace because the Itanium demangler emits a
+    // space before the qualifier for nested template closings like
+    // `unique_ptr<int, std::default_delete<int> >::get()`. Codex
+    // review on PR #24.
+    if !after_args.trim_start().starts_with("::") {
         return None;
     }
     // Take the first top-level comma-separated argument as the inner
@@ -2157,6 +2161,29 @@ mod tests {
         let b = bindings.get(-16).expect("binding at -16");
         assert_eq!(b.type_name, "std::shared_ptr<Widget>");
         assert_eq!(b.size, 16);
+    }
+
+    /// Codex review on PR #24: the Itanium demangler emits a space
+    /// before the qualifier for nested template closings
+    /// (`unique_ptr<int, std::default_delete<int> >::get()`,
+    /// `shared_ptr<std::vector<int> >::reset()`), so my
+    /// `starts_with("::")` check rejected the most common
+    /// default-deleter `unique_ptr` and nested-template shapes.
+    /// Trim leading whitespace before the qualifier check.
+    #[test]
+    fn smart_pointer_parser_handles_demangler_space_before_qualifier() {
+        // Default-deleter unique_ptr in the Itanium demangler form.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner(
+                "std::unique_ptr<int, std::default_delete<int> >::get()"
+            ),
+            Some((SmartPointerKind::Unique, "int".to_string())),
+        );
+        // shared_ptr of a nested template type.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner("std::shared_ptr<std::vector<int> >::reset()"),
+            Some((SmartPointerKind::Shared, "std::vector<int>".to_string())),
+        );
     }
 
     /// Codex review on PR #24: a non-member function whose demangled
