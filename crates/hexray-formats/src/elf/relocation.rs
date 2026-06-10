@@ -119,6 +119,14 @@ pub enum RelocationType {
     GotPcRelX,
     /// Relaxable GOT PC-relative with REX prefix
     RexGotPcRelX,
+    /// AArch64 26-bit branch (BL / B): `R_AARCH64_CALL26` (283) and
+    /// `R_AARCH64_JUMP26` (282). Functionally a PC-relative call to a
+    /// symbol, but the target-address rule differs from `Plt32` — the
+    /// 26-bit displacement is embedded inside the 4-byte branch
+    /// instruction whose PC is the relocation offset, so the
+    /// resolved target is `S + A` (no x86 PC32 +4 skew that
+    /// compensates for the typical -4 addend in `call rel32`).
+    Branch26,
     /// Unknown relocation type
     Unknown(u32),
 }
@@ -165,19 +173,20 @@ impl RelocationType {
             260 => Self::Pc64, // R_AARCH64_PREL64
             261 => Self::Pc32, // R_AARCH64_PREL32
             262 => Self::Pc16, // R_AARCH64_PREL16
-            // R_AARCH64_JUMP26 (B) / R_AARCH64_CALL26 (BL): 26-bit
-            // signed branch displacement encoded into the lower 26
-            // bits of the 4-byte branch instruction. For our
-            // "what symbol does this call target" purposes these
-            // are functionally PLT-style PC-relative calls — we
-            // alias them to `Plt32` so the relocation_table
-            // call-resolution path (`build_relocation_table` in
-            // the hexray bin) recognises them. Without this map,
-            // every PLT call in an aarch64 `.o` falls into
-            // `Unknown(282/283)` and emits as `sub_<addr>()`
-            // instead of e.g. `__cxa_throw`/`memset`.
-            282 => Self::Plt32, // R_AARCH64_JUMP26
-            283 => Self::Plt32, // R_AARCH64_CALL26
+            // R_AARCH64_JUMP26 (B) / R_AARCH64_CALL26 (BL): mapped
+            // to our `Branch26` variant. Branch26 shares the
+            // call-resolution path with `Plt32` in
+            // `build_relocation_table` (both register the call
+            // site → symbol mapping for external/PLT-bound
+            // symbols) but uses `S + A` instead of `S + A + 4`
+            // when resolving an intra-object defined target —
+            // aarch64 branches are measured from the start of the
+            // BL instruction, so the x86 `+4` PC32 skew (which
+            // compensates for gcc's typical -4 rel32 addend on
+            // x86) would land an aarch64 call four bytes past the
+            // real callee.
+            282 => Self::Branch26, // R_AARCH64_JUMP26
+            283 => Self::Branch26, // R_AARCH64_CALL26
             // Many more ARM64 relocations exist
             other => Self::Unknown(other),
         }
@@ -451,18 +460,19 @@ mod tests {
     use super::RelocationType;
 
     /// R_AARCH64_JUMP26 (282) / R_AARCH64_CALL26 (283) are the aarch64
-    /// `B` / `BL` branch relocations. Without mapping them here, every
-    /// PLT call in an aarch64 relocatable object falls into
+    /// `B` / `BL` branch relocations. Without mapping them, every PLT
+    /// call in an aarch64 relocatable object falls into
     /// `Unknown(283)` and the bin's `build_relocation_table` never
     /// inserts a name for the call site — `__cxa_throw`, `memset`,
     /// every external call shows as `sub_<addr>()` in the decompiled
-    /// output. They're functionally PC-relative PLT calls for our
-    /// "what symbol does this call target" purposes, so alias to
-    /// `Plt32`.
+    /// output. They map to the dedicated `Branch26` variant rather
+    /// than `Plt32` so the intra-object defined-target rule
+    /// (`S + A` for aarch64 BL, vs. `S + A + 4` for x86 PLT32) stays
+    /// distinct — see codex review feedback on PR #23.
     #[test]
-    fn arm64_call26_and_jump26_map_to_plt32() {
-        assert_eq!(RelocationType::from_arm64(283), RelocationType::Plt32);
-        assert_eq!(RelocationType::from_arm64(282), RelocationType::Plt32);
+    fn arm64_call26_and_jump26_map_to_branch26() {
+        assert_eq!(RelocationType::from_arm64(283), RelocationType::Branch26);
+        assert_eq!(RelocationType::from_arm64(282), RelocationType::Branch26);
         // Sanity check: existing mappings unaffected.
         assert_eq!(RelocationType::from_arm64(257), RelocationType::R64);
         assert_eq!(RelocationType::from_arm64(261), RelocationType::Pc32);

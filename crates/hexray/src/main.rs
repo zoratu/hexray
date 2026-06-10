@@ -4507,9 +4507,23 @@ fn relocation_defined_target_addr(
     addend: i64,
 ) -> u64 {
     match reloc_type {
+        // x86_64 Pc32 / Plt32: `S + A + 4` to undo gcc's typical
+        // `-4` addend on `call rel32` (the disp32 is measured
+        // from the end of the call instruction, which is 4
+        // bytes past the disp32 field's start).
         hexray_formats::RelocationType::Pc32 | hexray_formats::RelocationType::Plt32 => symbol
             .address
             .checked_add_signed(addend.saturating_add(4))
+            .unwrap_or(symbol.address),
+        // aarch64 BL / B (R_AARCH64_CALL26 / R_AARCH64_JUMP26): the
+        // 26-bit displacement is embedded in the 4-byte branch
+        // instruction whose PC is the relocation offset, so the
+        // resolved target is `S + A` with no x86-style +4 skew —
+        // adding 4 here would land intra-object calls 4 bytes past
+        // the real callee. Codex review on PR #23.
+        hexray_formats::RelocationType::Branch26 => symbol
+            .address
+            .checked_add_signed(addend)
             .unwrap_or(symbol.address),
         hexray_formats::RelocationType::R32 | hexray_formats::RelocationType::R32S => symbol
             .address
@@ -5003,8 +5017,13 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
             RelocationType::DtpOff64 => {
                 table.insert_tls_descriptor(reloc.offset.saturating_sub(8), symbol.name.clone());
             }
-            // PC-relative relocations (for calls/jumps in relocatable objects)
-            RelocationType::Pc32 | RelocationType::Plt32 => {
+            // PC-relative relocations (for calls/jumps in relocatable objects).
+            // Branch26 (aarch64 BL/B) shares this path with the x86 Pc32/Plt32
+            // variants — they all mean "this call site targets <symbol>" for
+            // the relocation_table's purposes; the relocated target_addr
+            // computation differs per arch and lives in
+            // `relocation_defined_target_addr`.
+            RelocationType::Pc32 | RelocationType::Plt32 | RelocationType::Branch26 => {
                 let Some(section) = elf.sections.get(reloc.section_index) else {
                     continue;
                 };
