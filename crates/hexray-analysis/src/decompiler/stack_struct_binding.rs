@@ -390,18 +390,28 @@ fn try_bind_smart_pointer_method_call(
     binary_data: Option<&BinaryDataContext>,
     out: &mut StackStructBindings,
 ) {
-    let Some(name) = resolve_call_name(target, binary_data) else {
+    let Some(raw_name) = resolve_call_name(target, binary_data) else {
         return;
     };
+    // Relocation-table lookups can hand us a raw Itanium-ABI mangled
+    // symbol (e.g. `_ZNSt10shared_ptrI6WidgetE5resetEv`); the symbol
+    // table pre-demangles, but the relocation map bypasses that path.
+    // The parser only recognises demangled `std::...` patterns, so
+    // demangle on entry and fall back to the raw form for already-
+    // demangled or non-mangled names. Codex review on PR #24: without
+    // this, smart-pointer bindings are silently missed on relocated
+    // C++ calls in `.o` files.
+    let demangled = hexray_demangle::demangle(&raw_name);
+    let name: &str = demangled.as_deref().unwrap_or(&raw_name);
     // Methods that return a non-trivial object by value pass a hidden
     // return-buffer pointer as the first call argument under the
     // SysV / Itanium ABI. Treating `args[0]` as `this` for those would
     // bind the destination's stack slot as the wrong type. Canonical
     // case: `weak_ptr<T>::lock()` returns `shared_ptr<T>` by value.
-    if smart_pointer_method_returns_by_value(&name) {
+    if smart_pointer_method_returns_by_value(name) {
         return;
     }
-    let Some((kind, inner)) = parse_smart_pointer_kind_and_inner(&name) else {
+    let Some((kind, inner)) = parse_smart_pointer_kind_and_inner(name) else {
         return;
     };
     // Instance methods receive `this` as the first argument in the lifted
@@ -2067,6 +2077,26 @@ mod tests {
             ),
             Some((SmartPointerKind::Unique, "Widget".to_string()))
         );
+    }
+
+    /// Codex review on PR #24: relocation-table lookups can hand the
+    /// binder a raw Itanium-ABI mangled symbol like
+    /// `_ZNSt10shared_ptrI6WidgetE5resetEv` (the symbol table
+    /// pre-demangles, but the relocation map doesn't), and the
+    /// parser only recognises demangled `std::...` shapes. Demangle
+    /// on entry so a relocated C++ call in a `.o` file still binds.
+    #[test]
+    fn binds_when_resolved_name_is_raw_mangled_itanium_symbol() {
+        // _ZNSt10shared_ptrI6WidgetE5resetEv ≡ std::shared_ptr<Widget>::reset()
+        let call = Expr::call(
+            CallTarget::Named("_ZNSt10shared_ptrI6WidgetE5resetEv".to_string()),
+            vec![rbp_plus(-16)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        let b = bindings.get(-16).expect("binding at -16");
+        assert_eq!(b.type_name, "std::shared_ptr<Widget>");
+        assert_eq!(b.size, 16);
     }
 
     /// Codex review on PR #24: the parser used an unconstrained
