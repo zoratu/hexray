@@ -5040,10 +5040,23 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                         }
                     }
                 } else {
-                    let call_addr = section
-                        .sh_offset
-                        .saturating_add(reloc.offset)
-                        .saturating_sub(1);
+                    // Fallback when the disassembler couldn't match the
+                    // call instruction by its rel32 offset (typical for
+                    // archs not covered by `find_x86_64_relocation_instruction`).
+                    // On x86_64, the rel32 disp lives 1 byte past the
+                    // `E8`/`E9` call/jmp opcode, so the instruction
+                    // address is `reloc.offset - 1` from the section
+                    // base. On aarch64 the 26-bit displacement is
+                    // embedded inside the 4-byte branch instruction
+                    // that starts AT `reloc.offset`, so the same
+                    // `-1` would land us mid-instruction and the
+                    // relocation lookup at decompile time would miss.
+                    let call_addr_offset_adjust =
+                        matches!(elf.header.machine, hexray_formats::elf::Machine::X86_64);
+                    let mut call_addr = section.sh_offset.saturating_add(reloc.offset);
+                    if call_addr_offset_adjust {
+                        call_addr = call_addr.saturating_sub(1);
+                    }
                     table.insert_call(call_addr, resolved_name, target_addr, is_external);
                 }
             }

@@ -165,6 +165,19 @@ impl RelocationType {
             260 => Self::Pc64, // R_AARCH64_PREL64
             261 => Self::Pc32, // R_AARCH64_PREL32
             262 => Self::Pc16, // R_AARCH64_PREL16
+            // R_AARCH64_JUMP26 (B) / R_AARCH64_CALL26 (BL): 26-bit
+            // signed branch displacement encoded into the lower 26
+            // bits of the 4-byte branch instruction. For our
+            // "what symbol does this call target" purposes these
+            // are functionally PLT-style PC-relative calls — we
+            // alias them to `Plt32` so the relocation_table
+            // call-resolution path (`build_relocation_table` in
+            // the hexray bin) recognises them. Without this map,
+            // every PLT call in an aarch64 `.o` falls into
+            // `Unknown(282/283)` and emits as `sub_<addr>()`
+            // instead of e.g. `__cxa_throw`/`memset`.
+            282 => Self::Plt32, // R_AARCH64_JUMP26
+            283 => Self::Plt32, // R_AARCH64_CALL26
             // Many more ARM64 relocations exist
             other => Self::Unknown(other),
         }
@@ -430,5 +443,28 @@ impl Relocation {
             linked_symtab_section: 0,
             addend_in_slot: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RelocationType;
+
+    /// R_AARCH64_JUMP26 (282) / R_AARCH64_CALL26 (283) are the aarch64
+    /// `B` / `BL` branch relocations. Without mapping them here, every
+    /// PLT call in an aarch64 relocatable object falls into
+    /// `Unknown(283)` and the bin's `build_relocation_table` never
+    /// inserts a name for the call site — `__cxa_throw`, `memset`,
+    /// every external call shows as `sub_<addr>()` in the decompiled
+    /// output. They're functionally PC-relative PLT calls for our
+    /// "what symbol does this call target" purposes, so alias to
+    /// `Plt32`.
+    #[test]
+    fn arm64_call26_and_jump26_map_to_plt32() {
+        assert_eq!(RelocationType::from_arm64(283), RelocationType::Plt32);
+        assert_eq!(RelocationType::from_arm64(282), RelocationType::Plt32);
+        // Sanity check: existing mappings unaffected.
+        assert_eq!(RelocationType::from_arm64(257), RelocationType::R64);
+        assert_eq!(RelocationType::from_arm64(261), RelocationType::Pc32);
     }
 }
