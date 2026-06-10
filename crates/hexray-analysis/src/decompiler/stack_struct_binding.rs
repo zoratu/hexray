@@ -252,7 +252,7 @@ fn visit_expr(
         // aren't in the TypeDatabase (their type comes from the C++
         // class template, not a libc/POSIX prototype), so they need a
         // separate name-pattern detection path.
-        try_bind_smart_pointer_method_call(target, args, binary_data, out);
+        try_bind_smart_pointer_method_call(target, args, db, binary_data, out);
     }
     walk_children(expr, db, binary_data, out);
 }
@@ -366,12 +366,21 @@ fn try_bind_call(
 fn try_bind_smart_pointer_method_call(
     target: &CallTarget,
     args: &[Expr],
+    db: &TypeDatabase,
     binary_data: Option<&BinaryDataContext>,
     out: &mut StackStructBindings,
 ) {
     let Some(name) = resolve_call_name(target, binary_data) else {
         return;
     };
+    // Methods that return a non-trivial object by value pass a hidden
+    // return-buffer pointer as the first call argument under the
+    // SysV / Itanium ABI. Treating `args[0]` as `this` for those would
+    // bind the destination's stack slot as the wrong type. Canonical
+    // case: `weak_ptr<T>::lock()` returns `shared_ptr<T>` by value.
+    if smart_pointer_method_returns_by_value(&name) {
+        return;
+    }
     let Some((kind, inner)) = parse_smart_pointer_kind_and_inner(&name) else {
         return;
     };
@@ -384,10 +393,15 @@ fn try_bind_smart_pointer_method_call(
     let Some(stack_offset) = stack_offset_of_address(this_arg) else {
         return;
     };
+    // Size depends on the target pointer width (4 on 32-bit, 8 on
+    // 64-bit). unique_ptr<T> = 1 * ptr_size (the data pointer);
+    // shared_ptr<T> / weak_ptr<T> = 2 * ptr_size (data + control
+    // block).
+    let ptr = db.arch().pointer_size;
     let (short, size) = match kind {
-        SmartPointerKind::Unique => ("unique_ptr", 8usize),
-        SmartPointerKind::Shared => ("shared_ptr", 16usize),
-        SmartPointerKind::Weak => ("weak_ptr", 16usize),
+        SmartPointerKind::Unique => ("unique_ptr", ptr),
+        SmartPointerKind::Shared => ("shared_ptr", ptr.saturating_mul(2)),
+        SmartPointerKind::Weak => ("weak_ptr", ptr.saturating_mul(2)),
     };
     let type_name = format!("std::{short}<{inner}>");
     let local_name = synthesize_smart_pointer_local_name(short, &inner, stack_offset);
@@ -400,6 +414,23 @@ fn try_bind_smart_pointer_method_call(
             local_name,
             class_object: true,
         });
+}
+
+/// Recognise the smart-pointer methods that return a non-trivial object
+/// by value (so the SysV / Itanium ABI uses `sret`, putting the
+/// destination's address in `args[0]` and the receiver in `args[1]`).
+/// Keep the list tight — only methods verified against libstdc++.
+/// Everything else falls through and the binder treats `args[0]` as
+/// `this` normally.
+fn smart_pointer_method_returns_by_value(name: &str) -> bool {
+    let method = match name.rsplit_once("::") {
+        Some((_, tail)) => tail
+            .split(|c: char| c == '(' || c.is_whitespace())
+            .next()
+            .unwrap_or(""),
+        None => return false,
+    };
+    matches!(method, "lock")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,9 +486,22 @@ fn parse_smart_pointer_kind_and_inner(name: &str) -> Option<(SmartPointerKind, S
     if !after_args.starts_with("::") {
         return None;
     }
-    // Take the first top-level comma-separated argument as the inner type.
-    let inner = split_top_level_comma(args).into_iter().next()?;
-    Some((kind, inner.trim().to_string()))
+    // Take the first top-level comma-separated argument as the inner
+    // type. For `unique_ptr<T, Deleter>` we also need to check the
+    // second argument so a stateful deleter can decline the bind:
+    // `std::unique_ptr<T, StatefulDeleter>` can be larger than one
+    // pointer once the deleter has state, and an 8-byte binding
+    // would absorb adjacent stack locals into the region.
+    let segments = split_top_level_comma(args);
+    let inner = segments.first()?.trim().to_string();
+    if matches!(kind, SmartPointerKind::Unique) && segments.len() > 1 {
+        let deleter = segments.get(1).map(|s| s.trim()).unwrap_or("");
+        let default = format!("std::default_delete<{inner}>");
+        if deleter != default {
+            return None;
+        }
+    }
+    Some((kind, inner))
 }
 
 /// Split a comma-separated list of template arguments at top level only,
@@ -1947,6 +1991,79 @@ mod tests {
         assert!(
             !is_droppable_interior_zero_store(&interior, &bindings),
             "class_object binding must not silence interior zero stores"
+        );
+    }
+
+    /// `weak_ptr<T>::lock()` returns `shared_ptr<T>` by value, so the
+    /// SysV / Itanium ABI passes the destination's address as `args[0]`
+    /// and the receiver as `args[1]`. The binder must decline rather
+    /// than bind the destination's stack region as the receiver type.
+    #[test]
+    fn does_not_bind_sret_returning_smart_pointer_method_call() {
+        let call = Expr::call(
+            CallTarget::Named("std::weak_ptr<Widget>::lock() const".to_string()),
+            vec![rbp_plus(-16), rbp_plus(-32)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(
+            bindings.len(),
+            0,
+            "must not bind for sret-returning methods: {:#?}",
+            bindings.iter().collect::<Vec<_>>()
+        );
+    }
+
+    /// `std::unique_ptr<T, StatefulDeleter>` can be larger than one
+    /// pointer when the deleter has state. A flat 8-byte binding
+    /// would absorb adjacent stack locals. Decline non-default
+    /// deleters; the canonical default (`std::default_delete<T>`,
+    /// EBO'd to 0 bytes) still binds normally.
+    #[test]
+    fn smart_pointer_parser_declines_stateful_unique_ptr_deleter() {
+        assert!(parse_smart_pointer_kind_and_inner(
+            "std::unique_ptr<Widget, MyStatefulDeleter>::reset()"
+        )
+        .is_none());
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner(
+                "std::unique_ptr<Widget, std::default_delete<Widget>>::reset()"
+            ),
+            Some((SmartPointerKind::Unique, "Widget".to_string()))
+        );
+    }
+
+    /// Binding size derives from the target's pointer width
+    /// (`db.arch().pointer_size`), not a hardcoded constant. On 32-bit
+    /// builds `unique_ptr<T>` is 4 bytes, `shared_ptr<T>` / `weak_ptr<T>`
+    /// are 8 — using the 64-bit value would absorb adjacent stack
+    /// locals.
+    #[test]
+    fn smart_pointer_binding_size_tracks_db_pointer_width() {
+        use hexray_types::database::ArchInfo;
+        let db32 = TypeDatabase::with_arch(ArchInfo::ilp32());
+        let call_shared = Expr::call(
+            CallTarget::Named("std::shared_ptr<Widget>::reset()".to_string()),
+            vec![rbp_plus(-16)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call_shared])], &db32, None);
+        assert_eq!(
+            bindings.get(-16).expect("binding").size,
+            8,
+            "shared_ptr on 32-bit = 2 * 4 bytes"
+        );
+
+        let call_unique = Expr::call(
+            CallTarget::Named("std::unique_ptr<int>::get() const".to_string()),
+            vec![rbp_plus(-8)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call_unique])], &db32, None);
+        assert_eq!(
+            bindings.get(-8).expect("binding").size,
+            4,
+            "unique_ptr on 32-bit = 1 * 4 bytes"
         );
     }
 }
