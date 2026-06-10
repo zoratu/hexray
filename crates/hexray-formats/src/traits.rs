@@ -36,6 +36,34 @@ pub trait BinaryFormat {
 
     /// Returns the section containing the given address.
     fn section_containing(&self, addr: u64) -> Option<&dyn Section>;
+
+    /// Returns the named section's data **with any in-place relocations
+    /// applied**, paired with its virtual address.
+    ///
+    /// For linked binaries (executables, shared objects) the bytes are
+    /// already in their final form; this returns a copy of the raw data
+    /// unchanged. For relocatable objects (`.o` files, kernel modules)
+    /// the raw bytes are zero where a relocation should fill in an
+    /// address; without applying those relocations, anything that reads
+    /// PC ranges or DWARF pointers out of the section (e.g. `.eh_frame`
+    /// FDE `pc_begin`/`pc_range`, `.gcc_except_table` LSDA targets)
+    /// resolves to the wrong addresses and no FDE matches any function.
+    ///
+    /// Default implementation returns the raw, **un-relocated** data —
+    /// formats that don't carry relocations (or for which we don't yet
+    /// model relocation application) keep working unchanged. ELF
+    /// overrides this and applies `.rela.{name}` / `.rel.{name}`
+    /// relocations into the returned copy.
+    fn relocated_section_data(&self, name: &str) -> Option<(Vec<u8>, u64)> {
+        self.sections().find_map(|s| {
+            let n = s.name();
+            if n == name || n.ends_with(name) {
+                Some((s.data().to_vec(), s.virtual_address()))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// A section in a binary.

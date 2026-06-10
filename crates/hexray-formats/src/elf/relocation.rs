@@ -184,6 +184,24 @@ pub struct Relocation {
     pub addend: i64,
     /// Section index this relocation applies to.
     pub section_index: usize,
+    /// `true` when the addend lives in the patch slot itself (SHT_REL —
+    /// `addend` above is left zero by the parser, and the bytes at
+    /// `offset` carry the implicit value). `false` when the addend
+    /// was already captured into `addend` from the relocation entry
+    /// (SHT_RELA — the patch slot is not part of the relocation
+    /// expression and must NOT be folded back in, even when its
+    /// contents are non-zero).
+    pub addend_in_slot: bool,
+    /// Section index of the symbol table this relocation's
+    /// `symbol_index` is scoped to (i.e. the `sh_link` of the
+    /// `.rela.*` / `.rel.*` section the entry came from). Needed
+    /// when an ELF file carries more than one symbol table
+    /// (`.symtab` AND `.dynsym`), because the flattened
+    /// `Elf::raw_symbols` interleaves them and a bare
+    /// `raw_symbols[symbol_index]` lookup would pull from the
+    /// wrong table for any relocation whose linked table isn't
+    /// the first one walked.
+    pub linked_symtab_section: u32,
 }
 
 impl Relocation {
@@ -196,6 +214,7 @@ impl Relocation {
         endianness: Endianness,
         is_x86_64: bool,
     ) -> Result<Vec<Self>, ParseError> {
+        let linked_symtab_section = section.sh_link;
         if section.sh_type != SHT_REL {
             return Ok(Vec::new());
         }
@@ -223,10 +242,11 @@ impl Relocation {
             let Some(slice) = data.get(offset..end) else {
                 break;
             };
-            let reloc = match class {
+            let mut reloc = match class {
                 ElfClass::Elf32 => Self::parse_rel32(slice, endianness, section_index, is_x86_64)?,
                 ElfClass::Elf64 => Self::parse_rel64(slice, endianness, section_index, is_x86_64)?,
             };
+            reloc.linked_symtab_section = linked_symtab_section;
             relocations.push(reloc);
             offset = end;
         }
@@ -243,6 +263,7 @@ impl Relocation {
         endianness: Endianness,
         is_x86_64: bool,
     ) -> Result<Vec<Self>, ParseError> {
+        let linked_symtab_section = section.sh_link;
         if section.sh_type != SHT_RELA {
             return Ok(Vec::new());
         }
@@ -269,10 +290,11 @@ impl Relocation {
             let Some(slice) = data.get(offset..end) else {
                 break;
             };
-            let reloc = match class {
+            let mut reloc = match class {
                 ElfClass::Elf32 => Self::parse_rela32(slice, endianness, section_index, is_x86_64)?,
                 ElfClass::Elf64 => Self::parse_rela64(slice, endianness, section_index, is_x86_64)?,
             };
+            reloc.linked_symtab_section = linked_symtab_section;
             relocations.push(reloc);
             offset = end;
         }
@@ -307,6 +329,8 @@ impl Relocation {
             r_type,
             addend: 0,
             section_index,
+            linked_symtab_section: 0,
+            addend_in_slot: true,
         })
     }
 
@@ -337,6 +361,8 @@ impl Relocation {
             r_type,
             addend: 0,
             section_index,
+            linked_symtab_section: 0,
+            addend_in_slot: true,
         })
     }
 
@@ -368,6 +394,8 @@ impl Relocation {
             r_type,
             addend: r_addend as i64,
             section_index,
+            linked_symtab_section: 0,
+            addend_in_slot: false,
         })
     }
 
@@ -399,6 +427,8 @@ impl Relocation {
             r_type,
             addend: r_addend,
             section_index,
+            linked_symtab_section: 0,
+            addend_in_slot: false,
         })
     }
 }

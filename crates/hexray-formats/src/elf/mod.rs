@@ -62,6 +62,13 @@ pub struct Elf<'a> {
     pub relocations: Vec<Relocation>,
     /// Kernel module info (if this is a .ko file).
     pub modinfo: Option<KernelModuleInfo>,
+    /// Maps each symbol-table section index (`SHT_SYMTAB` / `SHT_DYNSYM`)
+    /// to the offset where its entries begin within the flattened
+    /// [`Elf::raw_symbols`] vector. Used to resolve a relocation's
+    /// `symbol_index` (scoped to the linked symbol table) against
+    /// `raw_symbols` in ELF files that carry more than one symbol
+    /// table.
+    symtab_section_to_raw_base: std::collections::HashMap<u32, usize>,
 }
 
 /// Kernel module information parsed from .modinfo section.
@@ -191,7 +198,7 @@ impl<'a> Elf<'a> {
         // so downstream ELF-specific views (e.g. CUDA) can inspect fields
         // like `st_other` that the simplified form discards.
         let gnu_versions = GnuVersionTable::parse(data, &sections, header.endianness);
-        let (mut symbols, raw_symbols) =
+        let (mut symbols, raw_symbols, symtab_section_to_raw_base) =
             Self::parse_symbols(data, &sections, &header, &section_names, &gnu_versions)?;
 
         // Parse relocations for relocatable files and dynamic binaries
@@ -226,6 +233,7 @@ impl<'a> Elf<'a> {
             section_names,
             relocations,
             modinfo,
+            symtab_section_to_raw_base,
         })
     }
 
@@ -234,6 +242,167 @@ impl<'a> Elf<'a> {
     /// for the CUDA ELF view.
     pub(crate) fn raw_symbols(&self) -> &[SymbolEntry] {
         &self.raw_symbols
+    }
+
+    /// Resolve the runtime value of a relocation's target symbol, in the
+    /// same address space the rest of hexray uses for this binary.
+    ///
+    /// For executables and shared objects the address space is the vaddr
+    /// stamped on each segment; the symbol carries that vaddr directly.
+    /// For relocatable objects every section's "vaddr" is 0, so hexray
+    /// remaps function/section addresses to their file offsets
+    /// (`sh_offset + st_value`) so distinct sections do not collide on
+    /// address 0 — see the symbol-address remap in `parse_symbols`. Apply
+    /// the same remap here so that a `.rela.eh_frame` relocation pointing
+    /// at "`.text + n`" resolves to the very address the disassembler
+    /// just told the decompiler the function lives at, and `find_fde`
+    /// matches.
+    fn relocation_symbol_value(&self, reloc: &Relocation) -> Option<u64> {
+        if reloc.symbol_index == 0 {
+            return None;
+        }
+        // Translate the relocation's symbol_index from its linked
+        // symbol-table-scope into an absolute index in raw_symbols.
+        // For files with a single symbol table the base is 0 (or the
+        // relocation's `linked_symtab_section` is 0/unset, in which
+        // case we fall back to treating the index as already-absolute
+        // — older callers that hand-construct `Relocation` without
+        // going through parse_rel / parse_rela still work).
+        let base = if reloc.linked_symtab_section == 0 {
+            0
+        } else {
+            *self
+                .symtab_section_to_raw_base
+                .get(&reloc.linked_symtab_section)
+                .unwrap_or(&0)
+        };
+        let absolute_index = base.checked_add(reloc.symbol_index as usize)?;
+        let entry = self.raw_symbols.get(absolute_index)?;
+        let mut value = entry.st_value;
+        if let Some(section) = self.sections.get(entry.st_shndx as usize) {
+            // Mirror Elf::parse_symbols: relocatable files (sh_addr == 0)
+            // get the section's file offset folded in; pre-relocated files
+            // already carry the right vaddr so we leave them alone.
+            if section.sh_addr == 0 {
+                value = section.sh_offset.saturating_add(value);
+            }
+        }
+        Some(value)
+    }
+
+    /// Patch one relocation into `buf` (the in-memory copy of the target
+    /// section's data). `section_va` is the section's virtual address.
+    ///
+    /// Only the handful of relocation types that actually appear in
+    /// `.rela.eh_frame` / `.rela.gcc_except_table` for relocatable objects
+    /// on x86_64 and aarch64 are applied here: absolute 32/64-bit and PC-
+    /// relative 32-bit (including `R_X86_64_PLT32`, which behaves like
+    /// `R_X86_64_PC32` for our purposes — the addend already includes the
+    /// PLT distinction). Everything else is left untouched, matching the
+    /// pre-relocation behaviour and surfacing only for relocations we
+    /// haven't yet modelled.
+    fn apply_section_relocation(&self, buf: &mut [u8], reloc: &Relocation, section_va: u64) {
+        let Some(symbol_value) = self.relocation_symbol_value(reloc) else {
+            return;
+        };
+        let offset = reloc.offset as usize;
+        let patch_pc = section_va.wrapping_add(reloc.offset);
+        let endianness = self.header.endianness;
+        // SHT_REL relocations carry their addend in the patch slot itself
+        // (the parser leaves `reloc.addend` zero for those), so we must
+        // read the pre-existing bytes and fold them into the sum. SHT_RELA
+        // entries have ALREADY captured the explicit addend into
+        // `reloc.addend` — their patch slot is *not* part of the
+        // relocation expression, and folding the slot bytes back in would
+        // double-count any non-zero placeholder. Gate the implicit-addend
+        // read on `reloc.addend_in_slot` so the two paths stay distinct.
+        // Codex review on this PR (re-review pass) flagged that the prior
+        // always-read approach over-relocated valid RELA inputs whose
+        // slot held a non-zero placeholder.
+        let read_implicit_addend_u64 = || -> u64 {
+            if !reloc.addend_in_slot {
+                return 0;
+            }
+            let end = offset.saturating_add(8);
+            buf.get(offset..end)
+                .and_then(|slot| <[u8; 8]>::try_from(slot).ok())
+                .map(|arr| match endianness {
+                    Endianness::Little => u64::from_le_bytes(arr),
+                    Endianness::Big => u64::from_be_bytes(arr),
+                })
+                .unwrap_or(0)
+        };
+        let read_implicit_addend_u32 = || -> u32 {
+            if !reloc.addend_in_slot {
+                return 0;
+            }
+            let end = offset.saturating_add(4);
+            buf.get(offset..end)
+                .and_then(|slot| <[u8; 4]>::try_from(slot).ok())
+                .map(|arr| match endianness {
+                    Endianness::Little => u32::from_le_bytes(arr),
+                    Endianness::Big => u32::from_be_bytes(arr),
+                })
+                .unwrap_or(0)
+        };
+        match reloc.r_type {
+            RelocationType::R64 => {
+                let end = offset.saturating_add(8);
+                if end <= buf.len() {
+                    let implicit = read_implicit_addend_u64();
+                    let sum = symbol_value
+                        .wrapping_add(reloc.addend as u64)
+                        .wrapping_add(implicit);
+                    let bytes = match endianness {
+                        Endianness::Little => sum.to_le_bytes(),
+                        Endianness::Big => sum.to_be_bytes(),
+                    };
+                    if let Some(slot) = buf.get_mut(offset..end) {
+                        slot.copy_from_slice(&bytes);
+                    }
+                }
+            }
+            RelocationType::R32 | RelocationType::R32S => {
+                let end = offset.saturating_add(4);
+                if end <= buf.len() {
+                    let implicit = read_implicit_addend_u32() as u64;
+                    let sum = symbol_value
+                        .wrapping_add(reloc.addend as u64)
+                        .wrapping_add(implicit);
+                    let value = sum as u32;
+                    let bytes = match endianness {
+                        Endianness::Little => value.to_le_bytes(),
+                        Endianness::Big => value.to_be_bytes(),
+                    };
+                    if let Some(slot) = buf.get_mut(offset..end) {
+                        slot.copy_from_slice(&bytes);
+                    }
+                }
+            }
+            RelocationType::Pc32 | RelocationType::Plt32 => {
+                let end = offset.saturating_add(4);
+                if end <= buf.len() {
+                    let implicit = read_implicit_addend_u32() as i32 as i64;
+                    let sum = symbol_value
+                        .wrapping_add(reloc.addend as u64)
+                        .wrapping_add(implicit as u64);
+                    let value = sum.wrapping_sub(patch_pc) as u32;
+                    let bytes = match endianness {
+                        Endianness::Little => value.to_le_bytes(),
+                        Endianness::Big => value.to_be_bytes(),
+                    };
+                    if let Some(slot) = buf.get_mut(offset..end) {
+                        slot.copy_from_slice(&bytes);
+                    }
+                }
+            }
+            _ => {
+                // Unmodelled relocation type — leave the bytes as-is so we
+                // don't fabricate addresses for relocations we don't
+                // understand. Surfaces as "no FDE found" rather than a
+                // wrongly-resolved one.
+            }
+        }
     }
 
     /// Flattened symbol slice for indexed access from the CUDA view, which
@@ -302,15 +471,25 @@ impl<'a> Elf<'a> {
         Ok(segments)
     }
 
+    #[allow(clippy::type_complexity)]
     fn parse_symbols(
         data: &[u8],
         sections: &[SectionHeader],
         header: &ElfHeader,
         section_names: &StringTable,
         gnu_versions: &GnuVersionTable,
-    ) -> Result<(Vec<Symbol>, Vec<SymbolEntry>), ParseError> {
+    ) -> Result<
+        (
+            Vec<Symbol>,
+            Vec<SymbolEntry>,
+            std::collections::HashMap<u32, usize>,
+        ),
+        ParseError,
+    > {
         let mut symbols = Vec::new();
         let mut raw_symbols = Vec::new();
+        let mut symtab_section_to_raw_base: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
         // CUDA cubins also need section-base relocation — see the
         // matching comment at the top of `parse`.
         let is_relocatable =
@@ -321,6 +500,11 @@ impl<'a> Elf<'a> {
             if section.sh_type != section::SHT_SYMTAB && section.sh_type != section::SHT_DYNSYM {
                 continue;
             }
+            // Remember where this symbol table's entries begin in the
+            // flattened raw_symbols vector so a relocation whose
+            // `symbol_index` is scoped to this table can be resolved
+            // by adding this base.
+            symtab_section_to_raw_base.insert(section_index as u32, raw_symbols.len());
 
             // Get the associated string table
             let strtab_idx = section.sh_link as usize;
@@ -416,7 +600,7 @@ impl<'a> Elf<'a> {
             }
         }
 
-        Ok((symbols, raw_symbols))
+        Ok((symbols, raw_symbols, symtab_section_to_raw_base))
     }
 
     /// Synthesize `<dynsym>@plt` symbols at each PLT stub address.
@@ -924,6 +1108,26 @@ impl BinaryFormat for Elf<'_> {
                 addr >= start && addr < end
             })
             .map(|s| s as &dyn Section)
+    }
+
+    fn relocated_section_data(&self, name: &str) -> Option<(Vec<u8>, u64)> {
+        let (idx, section) = self.sections.iter().enumerate().find(|(_, s)| {
+            self.section_names
+                .get(s.sh_name as usize)
+                .map(|n| n == name || n.ends_with(name))
+                .unwrap_or(false)
+        })?;
+        let start = section.sh_offset as usize;
+        let end = start.saturating_add(section.sh_size as usize);
+        let mut buf = self.data.get(start..end)?.to_vec();
+        let section_va = section.virtual_address();
+        for reloc in &self.relocations {
+            if reloc.section_index != idx {
+                continue;
+            }
+            self.apply_section_relocation(&mut buf, reloc, section_va);
+        }
+        Some((buf, section_va))
     }
 }
 
