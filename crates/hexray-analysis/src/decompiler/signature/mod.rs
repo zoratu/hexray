@@ -229,45 +229,42 @@ pub fn scan_float_arg_registers(
             continue;
         };
         for inst in &block.instructions {
-            // Store ops (the `-O0` arg spill is the dominant case)
-            // can carry one or more register operands, each a source
-            // value stored to memory. x86 movsd uses `[mem, reg]`
-            // order; aarch64 STR uses `[reg, mem]`; aarch64 STP uses
-            // `[reg, reg, mem]` so a prologue
-            // `stp d0, d1, [sp, #-16]!` carries BOTH float-arg
-            // registers as sources. Iterate ALL register operands
-            // and treat each as a source read — never as a
-            // destination write, regardless of position. Codex
-            // review on PR #25 flagged the find_map / single-op form
-            // as undercounting STP-spilled float args.
-            let is_store = matches!(inst.operation, Operation::Store);
-            if is_store {
-                for operand in &inst.operands {
-                    let Operand::Register(reg) = operand else {
-                        continue;
-                    };
-                    let name = reg.name().to_lowercase();
-                    let abi_name = float_arg_abi_register(&name, convention);
-                    if let Some(idx) = float_regs
-                        .iter()
-                        .position(|r| r.eq_ignore_ascii_case(&abi_name))
-                    {
-                        if detected[idx].is_none() && !written.contains(&abi_name) {
-                            detected[idx] = Some(scalar_float_operand_size_with_reg(inst, &name));
-                        }
-                    }
-                }
-                continue;
-            }
-            // Load ops are duals of stores: the register operand(s)
-            // before the memory operand are DESTINATIONS, not sources.
-            // For aarch64 `ldp d0, d1, [sp, #N]` BOTH `d0` and `d1`
-            // are written, so iterating operand[1..] as source reads
-            // would mistakenly flag the second destination as an arg
-            // use. Mark all leading register operands as written and
-            // skip the source-iteration block. Codex review on PR #25
-            // pass 7.
-            if matches!(inst.operation, Operation::Load) {
+            // Classify the operand layout for this instruction. Three
+            // shapes matter for float-arg recovery:
+            //
+            // * MEMORY STORE (str/stp/movsd [mem],xmm0) — every register
+            //   operand is a source value being written to memory; no
+            //   destination register write. `stp d0, d1, [sp, #N]`
+            //   carries TWO float-arg sources.
+            // * REG-TO-REG STORE (movdqa xmm1, xmm0) — operand[0] is
+            //   the destination, operand[1..] are sources. Without
+            //   this distinction `movdqa xmm1, xmm0` (copy of the
+            //   single float arg) would falsely register xmm1 as a
+            //   2nd arg. Codex review on PR #25 pass 9.
+            // * LOAD (ldr/ldp/mov reg,[mem]) — every leading register
+            //   operand before any memory operand is a DESTINATION
+            //   write, no source register reads. Codex review on
+            //   PR #25 pass 7 fixed `ldp d0, d1, [sp, #N]`.
+            // * COMPARE/TEST (cmp/fcmp/test) — operand[0] is ALSO a
+            //   source read, not a destination. Skipping operand[0]
+            //   would miss `fcmp d0, d1` cases where the only use of
+            //   d0 in the function is the compare. Codex review on
+            //   PR #25 pass 9.
+            // * DEFAULT (add/mul/move-reg-reg/etc.) — operand[0] is
+            //   destination, operand[1..] are sources. Iterating all
+            //   `operand[1..]` covers 3-operand FP `fadd d0, d0, d1`
+            //   and x86 AVX VEX-encoded `vfmadd231sd xmm0,xmm1,xmm2`
+            //   (codex review on PR #25 pass 3).
+            let has_memory_operand = inst
+                .operands
+                .iter()
+                .any(|o| matches!(o, Operand::Memory(_)));
+            let is_memory_store = matches!(inst.operation, Operation::Store) && has_memory_operand;
+            let is_load = matches!(inst.operation, Operation::Load);
+            let is_compare_or_test =
+                matches!(inst.operation, Operation::Compare | Operation::Test);
+
+            if is_load {
                 for operand in &inst.operands {
                     match operand {
                         Operand::Register(reg) => {
@@ -280,21 +277,20 @@ pub fn scan_float_arg_registers(
                 }
                 continue;
             }
-            // Float-bank registers in any source position are reads —
-            // but the `pxor %xmm,%xmm` / `xorps`/`xorpd` self-xor is a
-            // zeroing idiom (`reg = 0`), not a read of an incoming
-            // argument. Iterate over operand[1..] so 3-operand
-            // instructions are fully covered: x86 AVX VEX-encoded
-            // `vfmadd231sd xmm0, xmm1, xmm2` and the aarch64
-            // 3-operand FP form `fadd d0, d0, d1` both carry sources
-            // past operand[1]. Codex review on PR #25 flagged the
-            // single-operand-1 form as undercounting aarch64 FP arg
-            // arity for any function that uses its args directly
-            // instead of spilling.
+
+            // Source-operand slice for arg-read detection.
+            //   memory-store / compare-or-test → all operands are sources
+            //   default                         → operand[1..] are sources
+            let source_skip = if is_memory_store || is_compare_or_test {
+                0
+            } else {
+                1
+            };
+
             let is_self_zero = matches!(inst.operation, Operation::Xor)
                 && operands_are_same_register(&inst.operands);
             if !is_self_zero {
-                for operand in inst.operands.iter().skip(1) {
+                for operand in inst.operands.iter().skip(source_skip) {
                     let Operand::Register(src) = operand else {
                         continue;
                     };
@@ -314,6 +310,13 @@ pub fn scan_float_arg_registers(
                         }
                     }
                 }
+            }
+            // Memory stores have no destination register write, and
+            // compare/test ops don't write the operand[0] register
+            // either. Only mark operand[0] as written for ops that
+            // genuinely write to it.
+            if is_memory_store || is_compare_or_test {
+                continue;
             }
             // The destination (operand 0), if a float-bank register, is
             // written by anything but a pure comparison/test. Over-counting
@@ -5253,6 +5256,54 @@ mod tests {
             result,
             Some(ReturnRegClass::Integer),
             "movd eax, xmm0 (reg→reg Store) must classify as integer return"
+        );
+    }
+
+    /// Codex review on PR #25 pass 9: aarch64 `fcmp d0, d1` carries
+    /// d0 in operand[0] as a SOURCE read (Compare doesn't write its
+    /// operand[0]). The previous `skip(1)` source-iteration would
+    /// miss d0 here, so a function whose only FP use was a compare
+    /// against d0 would recover NO float parameters. Verify d0 and
+    /// d1 are both detected as 8-byte float args.
+    #[test]
+    fn aarch64_scan_detects_d0_and_d1_in_fcmp() {
+        // fcmp d0, d1
+        let cfg = aarch64_single_block_cfg(vec![(
+            "fcmp",
+            Operation::Compare,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)],
+            "fcmp d0, d1 must mark BOTH d0 and d1 as arg reads"
+        );
+    }
+
+    /// Codex review on PR #25 pass 9: x86 `movdqa xmm1, xmm0` (a
+    /// reg-to-reg SSE store-form encoding) is classified as
+    /// `Operation::Store` even though operand[0] is the destination
+    /// register, not a source. Without distinguishing memory-store
+    /// from reg-to-reg-store, a function that just copies its
+    /// single float arg from xmm0 to xmm1 would be reported as
+    /// taking both xmm0 AND xmm1.
+    #[test]
+    fn scan_does_not_treat_reg_to_reg_store_dest_as_arg_read() {
+        // movdqa xmm1, xmm0   ; copy xmm0 → xmm1 (no memory operand)
+        let cfg = single_block_cfg(vec![(
+            "movdqa",
+            Operation::Store,
+            vec![Operand::Register(xmm(1)), Operand::Register(xmm(0))],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            found,
+            vec![(0, "xmm0".to_string(), 8)],
+            "movdqa xmm1, xmm0 reg-to-reg store: only xmm0 is an arg read"
         );
     }
 
