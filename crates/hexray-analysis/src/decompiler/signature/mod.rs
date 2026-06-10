@@ -449,6 +449,7 @@ pub fn scan_float_return(cfg: &ControlFlowGraph, convention: CallingConvention) 
     float_size
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ReturnRegClass {
     Float(u8),
     Integer,
