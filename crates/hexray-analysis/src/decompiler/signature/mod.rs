@@ -451,6 +451,16 @@ fn block_return_register_class(
         if matches!(
             inst.operation,
             Operation::Return | Operation::Push | Operation::Pop | Operation::Nop
+            // Store ops: on aarch64 `str d0, [sp, #N]` (an arg spill,
+            // common in the entry block when the return block happens
+            // to be the entry block too) carries d0 as operand[0] —
+            // the SOURCE being stored, not a destination write. Without
+            // skipping Store the return classifier would treat the
+            // spill as a `d0 = ...` and mistakenly seed a float
+            // return on integer/void leaf functions whose only float
+            // reference is the incoming arg spill. Codex review on
+            // PR #25.
+            | Operation::Store
         ) || m == "leave"
             || m.starts_with("nop")
             || m.starts_with("endbr")
@@ -5023,6 +5033,36 @@ mod tests {
         assert_eq!(
             found,
             vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)]
+        );
+    }
+
+    /// Codex review on PR #25: a leaf function that takes a float
+    /// arg and returns void (or an integer through `x0`/`w0`) has
+    /// `str d0, [sp, #...]` as its arg spill at the top of the entry
+    /// block. If that entry block is also the return block (the
+    /// common single-block leaf case), the return-classifier
+    /// scanning backwards would otherwise see `d0` at operand[0] of
+    /// the STR and mistakenly classify the function as returning
+    /// `double`. `Operation::Store` must be skipped by the return
+    /// classifier.
+    #[test]
+    fn aarch64_return_scan_ignores_str_d0_arg_spill() {
+        // Body:
+        //   str d0, [sp, #8]    ; spill incoming float arg
+        //   ret
+        // No write to d0 as a destination; this is a void function
+        // (or one whose integer return is elsewhere). `scan_float_return`
+        // must return None.
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+        )]);
+        let result = scan_float_return(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            result, None,
+            "aarch64 STR d0 (arg spill) must not seed a float return"
         );
     }
 
