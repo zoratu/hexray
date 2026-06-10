@@ -259,6 +259,27 @@ pub fn scan_float_arg_registers(
                 }
                 continue;
             }
+            // Load ops are duals of stores: the register operand(s)
+            // before the memory operand are DESTINATIONS, not sources.
+            // For aarch64 `ldp d0, d1, [sp, #N]` BOTH `d0` and `d1`
+            // are written, so iterating operand[1..] as source reads
+            // would mistakenly flag the second destination as an arg
+            // use. Mark all leading register operands as written and
+            // skip the source-iteration block. Codex review on PR #25
+            // pass 7.
+            if matches!(inst.operation, Operation::Load) {
+                for operand in &inst.operands {
+                    match operand {
+                        Operand::Register(reg) => {
+                            let name = reg.name().to_lowercase();
+                            let abi_name = float_arg_abi_register(&name, convention);
+                            written.insert(abi_name);
+                        }
+                        _ => break,
+                    }
+                }
+                continue;
+            }
             // Float-bank registers in any source position are reads —
             // but the `pxor %xmm,%xmm` / `xorps`/`xorpd` self-xor is a
             // zeroing idiom (`reg = 0`), not a read of an incoming
@@ -472,16 +493,6 @@ fn block_return_register_class(
         if matches!(
             inst.operation,
             Operation::Return | Operation::Push | Operation::Pop | Operation::Nop
-            // Store ops: on aarch64 `str d0, [sp, #N]` (an arg spill,
-            // common in the entry block when the return block happens
-            // to be the entry block too) carries d0 as operand[0] —
-            // the SOURCE being stored, not a destination write. Without
-            // skipping Store the return classifier would treat the
-            // spill as a `d0 = ...` and mistakenly seed a float
-            // return on integer/void leaf functions whose only float
-            // reference is the incoming arg spill. Codex review on
-            // PR #25 pass 2.
-            | Operation::Store
             // Compare/Test set flags, not the operand[0] register. On
             // aarch64 `fcmp d0, d1` carries d0 as operand[0] purely as
             // a source read, so without skipping these the return
@@ -493,6 +504,34 @@ fn block_return_register_class(
             || m.starts_with("nop")
             || m.starts_with("endbr")
             || m.starts_with("stp")
+        {
+            continue;
+        }
+        // Store ops with a memory destination: on aarch64
+        // `str d0, [sp, #N]` (an arg spill, common in the entry block
+        // when the return block happens to be the entry block too)
+        // carries d0 as operand[0] — the SOURCE being stored, not a
+        // destination write. Without skipping these stores the return
+        // classifier would treat the spill as a `d0 = ...` and
+        // mistakenly seed a float return on integer/void leaf
+        // functions whose only float reference is the incoming arg
+        // spill. Codex review on PR #25 pass 2.
+        //
+        // But the skip MUST be narrowed to memory-destination stores
+        // only: x86 `movd r32, xmm0` / `vmovd r32, xmm0` is classified
+        // as `Operation::Store` even though operand[0] is the integer
+        // DESTINATION (register-to-register move from the SSE bank).
+        // Skipping all stores would drop the eax write and let the
+        // classifier walk back to an earlier xmm0 write, falsely
+        // seeding a float return on integer-returning functions. Use
+        // the presence of a Memory operand to distinguish: only skip
+        // when there's a memory destination involved. Codex review on
+        // PR #25 pass 7.
+        if matches!(inst.operation, Operation::Store)
+            && inst
+                .operands
+                .iter()
+                .any(|o| matches!(o, Operand::Memory(_)))
         {
             continue;
         }
@@ -5152,6 +5191,64 @@ mod tests {
         assert_eq!(
             result, None,
             "aarch64 STR d0 (arg spill) must not seed a float return"
+        );
+    }
+
+    /// Codex review on PR #25 pass 7: `ldp d0, d1, [sp, #N]` on
+    /// aarch64 LOADS d0 and d1 from memory — both register operands
+    /// are destinations, not sources. The arg scan must mark both
+    /// as written rather than treating operand[1] as a source read,
+    /// otherwise a function that loads two doubles from a local
+    /// would be reported as accepting `d1` as a 2nd float argument.
+    #[test]
+    fn aarch64_scan_does_not_treat_ldp_dest_as_arg_read() {
+        // ldp d0, d1, [sp, #16]   ; load two locals into d0/d1
+        // No prior write to d0 or d1, but they're both destinations
+        // here. Expected: NO detected float arguments.
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "ldp",
+            Operation::Load,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+                aarch64_mem(sp, 16),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert!(
+            found.is_empty(),
+            "ldp destinations must not be flagged as float arg reads, got {found:?}"
+        );
+    }
+
+    /// Codex review on PR #25 pass 7: x86 `movd r32, xmm0` /
+    /// `vmovd r32, xmm0` is classified as `Operation::Store` even
+    /// though operand[0] is the integer destination register. The
+    /// pass-2 store-skip in the return classifier was too broad and
+    /// would let the classifier walk back past the integer return
+    /// write to an earlier xmm0 write, falsely classifying an
+    /// integer-returning function as returning a float. Restrict the
+    /// skip to memory-destination stores so register-only `movd`
+    /// returns the integer classification.
+    #[test]
+    fn return_classifier_movd_eax_xmm0_classifies_as_integer() {
+        // movd eax, xmm0     ; integer extraction from SSE bank
+        // ret
+        let cfg = single_block_cfg(vec![(
+            "movd",
+            Operation::Store,
+            vec![
+                Operand::Register(gpr(0, 32)),
+                Operand::Register(xmm(0)),
+            ],
+        )]);
+        let block = cfg.entry_block().unwrap();
+        let result = block_return_register_class(block, CallingConvention::SystemV);
+        assert_eq!(
+            result,
+            Some(ReturnRegClass::Integer),
+            "movd eax, xmm0 (reg→reg Store) must classify as integer return"
         );
     }
 
