@@ -947,27 +947,18 @@ fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase
         }
     }
 
-    // Case B: Bare bound stack address (call-arg form).
-    //
-    // For C-struct bindings (epoll_event etc.) this rewrites
-    // `Add(frame, K)` to `&<local>`, so the call argument reads
-    // `epoll_ctl(epfd, ADD, fd, &event)` instead of the raw
-    // address. For C++ class-object bindings we DON'T rewrite —
-    // wrapping the address as `&Widget_shared_ptr_10` causes the
-    // emitter to render byte-level zero stores as `qword(&sp) = 0`
-    // when they recurse into a `Deref` lvalue (codex review on PR
-    // #24). Leaving class-object addresses raw keeps the zero
-    // stores as `*(rbp - 16) = 0` (readable, semantically correct),
-    // at the cost of call-arg sites showing `reset(rbp - 16)`
-    // instead of `reset(&sp)` — an acceptable trade for the
-    // simpler representation. The typed local is still declared
-    // at the top of the function so the reader can connect the
-    // raw address to the typed object.
+    // Case B: Bare bound stack address (call-arg form). Rewrites
+    // `Add(frame, K)` to `&<local>` so a method call site like
+    // `epoll_ctl(epfd, ADD, fd, &event)` or
+    // `std::shared_ptr<Widget>::reset(&sp)` reads as a typed
+    // reference. The local's emitted name comes from `binding.local_name`
+    // — the typed-local declaration only renders when at least one
+    // expression references it, so keeping this rewrite is what makes
+    // the smart-pointer binding observable in the output (codex
+    // review on PR #24).
     if let Some(off) = stack_offset_of_address(expr) {
         if let Some(binding) = bindings.get(off) {
-            if !binding.class_object {
-                return Expr::address_of(struct_local_expr(binding));
-            }
+            return Expr::address_of(struct_local_expr(binding));
         }
     }
 
@@ -1000,10 +991,29 @@ fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase
             lhs: Box::new(transform_expr(lhs, bindings, db)),
             rhs: Box::new(transform_expr(rhs, bindings, db)),
         },
-        K::Deref { addr, size } => K::Deref {
-            addr: Box::new(transform_expr(addr, bindings, db)),
-            size: *size,
-        },
+        K::Deref { addr, size } => {
+            // For a Deref into a class-object region (typically the
+            // default-constructor byte-zero stores at function entry,
+            // `*(rbp - 16) = 0`), recursing into the `addr` would let
+            // Case B rewrite it to `&<local>`, and the emitter would
+            // render the whole thing as the visually-confusing
+            // `qword(&sp) = 0`. Leaving the inner address raw keeps
+            // the readable byte view. The typed local declaration is
+            // still emitted because Case B fires elsewhere — call-arg
+            // sites like `reset(&sp)` reference it. Codex review on
+            // PR #24.
+            if let Some(off) = stack_offset_of_address(addr) {
+                if let Some(binding) = bindings.containing(off) {
+                    if binding.class_object {
+                        return expr.clone();
+                    }
+                }
+            }
+            K::Deref {
+                addr: Box::new(transform_expr(addr, bindings, db)),
+                size: *size,
+            }
+        }
         K::AddressOf(inner) => K::AddressOf(Box::new(transform_expr(inner, bindings, db))),
         K::Cast {
             expr: inner,
@@ -1027,11 +1037,31 @@ fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase
             base,
             index,
             element_size,
-        } => K::ArrayAccess {
-            base: Box::new(transform_expr(base, bindings, db)),
-            index: Box::new(transform_expr(index, bindings, db)),
-            element_size: *element_size,
-        },
+        } => {
+            // Same class-object protection as the Deref case: a
+            // `frame[idx]` access landing inside a class-object
+            // binding stays raw so the byte view survives. Codex
+            // review on PR #24.
+            if let (K::Var(v), K::IntLit(k)) = (&base.kind, &index.kind) {
+                if is_frame_register(&v.name) {
+                    if let Some(byte_off) = (*k)
+                        .checked_mul(*element_size as i128)
+                        .and_then(|p| i64::try_from(p).ok())
+                    {
+                        if let Some(binding) = bindings.containing(byte_off) {
+                            if binding.class_object {
+                                return expr.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            K::ArrayAccess {
+                base: Box::new(transform_expr(base, bindings, db)),
+                index: Box::new(transform_expr(index, bindings, db)),
+                element_size: *element_size,
+            }
+        }
         K::FieldAccess {
             base,
             field_name,
@@ -2151,16 +2181,16 @@ mod tests {
         );
     }
 
-    /// Codex review on PR #24: when a class-object stack address is
-    /// rewritten via the Case-B `&<local>` rule, the surrounding
-    /// `Deref` of that address renders as `qword(&Widget_shared_ptr_10)
-    /// = 0` — semantically correct but visually confusing. For
-    /// class-object bindings the Case-B rewrite is suppressed so the
-    /// raw form `*(rbp - 16) = 0` flows through unchanged. Call-arg
-    /// sites show raw addresses too (`reset(rbp - 16)` not `reset(&sp)`)
-    /// — an acceptable trade for the simpler representation.
+    /// Codex review on PR #24: a Deref of a class-object stack address
+    /// (`*(rbp - 16) = 0`, byte-level ctor zero) must NOT be rewritten
+    /// through `AddressOf(local)`, because the emitter would render it
+    /// as the visually-confusing `qword(&sp) = 0`. Stay-raw so the
+    /// byte view survives. Bare addresses outside a Deref context
+    /// (call-arg form like `reset(rbp + -16)`) DO rewrite to
+    /// `&<local>` so the typed local is actually referenced and the
+    /// emitter declaration pass keeps it.
     #[test]
-    fn transform_expr_leaves_class_object_addresses_raw() {
+    fn transform_expr_leaves_class_object_deref_lvalues_raw() {
         let binding = StackStructBinding {
             stack_offset: -16,
             size: 16,
@@ -2171,16 +2201,29 @@ mod tests {
         let mut bindings = StackStructBindings::new();
         bindings.by_offset.insert(binding.stack_offset, binding);
 
-        // `Add(rbp, -16)` lands at the class-object binding's base.
-        // For a C-struct binding this would rewrite to AddressOf, but
-        // for class_object we keep the raw arithmetic.
-        let addr = rbp_plus(-16);
-        let out = transform_expr(&addr, &bindings, &full_db());
-        // Must remain a BinOp(Add, rbp, -16), NOT AddressOf(local).
+        // 1. A bare address `Add(rbp, -16)` (call-arg form) DOES
+        //    rewrite — the typed local needs at least one reference
+        //    for the emitter to keep its declaration.
+        let bare = rbp_plus(-16);
+        let bare_out = transform_expr(&bare, &bindings, &full_db());
         assert!(
-            matches!(&out.kind, ExprKind::BinOp { .. }),
-            "class-object address rewrite should leave the raw form: {out:?}"
+            matches!(&bare_out.kind, ExprKind::AddressOf(_)),
+            "bare class-object address (call-arg form) should rewrite to &<local>: {bare_out:?}"
         );
+
+        // 2. A Deref of that address (`*(rbp - 16)`) stays raw so the
+        //    byte view doesn't show as `qword(&sp)`.
+        let deref = Expr::deref(rbp_plus(-16), 8);
+        let deref_out = transform_expr(&deref, &bindings, &full_db());
+        match &deref_out.kind {
+            ExprKind::Deref { addr, .. } => {
+                assert!(
+                    matches!(&addr.kind, ExprKind::BinOp { .. }),
+                    "Deref's address should stay raw, got {addr:?}"
+                );
+            }
+            other => panic!("expected Deref to survive: got {other:?}"),
+        }
     }
 
     /// Codex review on PR #24: the parser used an unconstrained
