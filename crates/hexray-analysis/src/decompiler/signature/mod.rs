@@ -259,13 +259,24 @@ pub fn scan_float_arg_registers(
                 }
                 continue;
             }
-            // An xmm register in the source position (operand 1) is read — but
-            // the `pxor %xmm,%xmm` / `xorps`/`xorpd` self-xor is a zeroing idiom
-            // (`reg = 0`), not a read of an incoming argument.
+            // Float-bank registers in any source position are reads —
+            // but the `pxor %xmm,%xmm` / `xorps`/`xorpd` self-xor is a
+            // zeroing idiom (`reg = 0`), not a read of an incoming
+            // argument. Iterate over operand[1..] so 3-operand
+            // instructions are fully covered: x86 AVX VEX-encoded
+            // `vfmadd231sd xmm0, xmm1, xmm2` and the aarch64
+            // 3-operand FP form `fadd d0, d0, d1` both carry sources
+            // past operand[1]. Codex review on PR #25 flagged the
+            // single-operand-1 form as undercounting aarch64 FP arg
+            // arity for any function that uses its args directly
+            // instead of spilling.
             let is_self_zero = matches!(inst.operation, Operation::Xor)
                 && operands_are_same_register(&inst.operands);
             if !is_self_zero {
-                if let Some(Operand::Register(src)) = inst.operands.get(1) {
+                for operand in inst.operands.iter().skip(1) {
+                    let Operand::Register(src) = operand else {
+                        continue;
+                    };
                     let name = src.name().to_lowercase();
                     // Normalise across the aarch64 register-file aliases so a
                     // `d0` use is recognised when the convention's arg list
@@ -5033,6 +5044,34 @@ mod tests {
         assert_eq!(
             found,
             vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)]
+        );
+    }
+
+    /// Codex review on PR #25: aarch64 FP instructions use a 3-operand
+    /// `dst, src1, src2` form (`fadd d0, d0, d1`). The scanner has to
+    /// look at every source operand past operand[0], not just
+    /// operand[1], otherwise a function whose body uses both args
+    /// directly (no spill at all — an optimised build) is reported
+    /// as taking only `d0`. The Xor self-zero idiom shortcut still
+    /// fires before this loop so `pxor xmm,xmm` doesn't accidentally
+    /// flag arg reads.
+    #[test]
+    fn aarch64_scan_detects_d1_in_fadd_third_operand() {
+        // fadd d0, d0, d1
+        let cfg = aarch64_single_block_cfg(vec![(
+            "fadd",
+            Operation::Add,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)],
+            "fadd d0, d0, d1 must register both arg reads"
         );
     }
 
