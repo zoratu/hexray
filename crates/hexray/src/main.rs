@@ -4507,9 +4507,23 @@ fn relocation_defined_target_addr(
     addend: i64,
 ) -> u64 {
     match reloc_type {
+        // x86_64 Pc32 / Plt32: `S + A + 4` to undo gcc's typical
+        // `-4` addend on `call rel32` (the disp32 is measured
+        // from the end of the call instruction, which is 4
+        // bytes past the disp32 field's start).
         hexray_formats::RelocationType::Pc32 | hexray_formats::RelocationType::Plt32 => symbol
             .address
             .checked_add_signed(addend.saturating_add(4))
+            .unwrap_or(symbol.address),
+        // aarch64 BL / B (R_AARCH64_CALL26 / R_AARCH64_JUMP26): the
+        // 26-bit displacement is embedded in the 4-byte branch
+        // instruction whose PC is the relocation offset, so the
+        // resolved target is `S + A` with no x86-style +4 skew —
+        // adding 4 here would land intra-object calls 4 bytes past
+        // the real callee. Codex review on PR #23.
+        hexray_formats::RelocationType::Branch26 => symbol
+            .address
+            .checked_add_signed(addend)
             .unwrap_or(symbol.address),
         hexray_formats::RelocationType::R32 | hexray_formats::RelocationType::R32S => symbol
             .address
@@ -5003,21 +5017,41 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
             RelocationType::DtpOff64 => {
                 table.insert_tls_descriptor(reloc.offset.saturating_sub(8), symbol.name.clone());
             }
-            // PC-relative relocations (for calls/jumps in relocatable objects)
-            RelocationType::Pc32 | RelocationType::Plt32 => {
+            // PC-relative relocations (for calls/jumps in relocatable objects).
+            // Branch26 (aarch64 BL/B) shares this path with the x86 Pc32/Plt32
+            // variants — they all mean "this call site targets <symbol>" for
+            // the relocation_table's purposes; the relocated target_addr
+            // computation differs per arch and lives in
+            // `relocation_defined_target_addr`.
+            RelocationType::Pc32 | RelocationType::Plt32 | RelocationType::Branch26 => {
                 let Some(section) = elf.sections.get(reloc.section_index) else {
                     continue;
                 };
                 let (resolved_name, target_addr, is_external) =
                     resolve_relocation_symbol(&symbols, symbol, reloc.r_type, reloc.addend);
-                let instruction = elf.section_data(section).and_then(|section_data| {
-                    find_x86_64_relocation_instruction(
-                        section,
-                        section_data,
-                        reloc.r_type,
-                        reloc.offset,
-                    )
-                });
+                // The x86 instruction-aware lookup is only correct on
+                // x86_64: it scans for a 5-byte E8/E9 call/jmp ending
+                // at `reloc.offset` and treats whatever it decodes as
+                // the call-site instruction. On AArch64 the BL/B
+                // bytes (or a few bytes upstream) can perfectly well
+                // happen to look like a valid x86 sequence and the
+                // scanner would silently mis-resolve the call site —
+                // gate it on the binary's machine type so Branch26
+                // always takes the direct `reloc.offset` fallback.
+                // Codex review on PR #23.
+                let instruction =
+                    if matches!(elf.header.machine, hexray_formats::elf::Machine::X86_64) {
+                        elf.section_data(section).and_then(|section_data| {
+                            find_x86_64_relocation_instruction(
+                                section,
+                                section_data,
+                                reloc.r_type,
+                                reloc.offset,
+                            )
+                        })
+                    } else {
+                        None
+                    };
                 if let Some(instruction) = instruction {
                     match instruction.control_flow {
                         hexray_core::ControlFlow::Call { .. }
@@ -5040,10 +5074,23 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
                         }
                     }
                 } else {
-                    let call_addr = section
-                        .sh_offset
-                        .saturating_add(reloc.offset)
-                        .saturating_sub(1);
+                    // Fallback when the disassembler couldn't match the
+                    // call instruction by its rel32 offset (typical for
+                    // archs not covered by `find_x86_64_relocation_instruction`).
+                    // On x86_64, the rel32 disp lives 1 byte past the
+                    // `E8`/`E9` call/jmp opcode, so the instruction
+                    // address is `reloc.offset - 1` from the section
+                    // base. On aarch64 the 26-bit displacement is
+                    // embedded inside the 4-byte branch instruction
+                    // that starts AT `reloc.offset`, so the same
+                    // `-1` would land us mid-instruction and the
+                    // relocation lookup at decompile time would miss.
+                    let call_addr_offset_adjust =
+                        matches!(elf.header.machine, hexray_formats::elf::Machine::X86_64);
+                    let mut call_addr = section.sh_offset.saturating_add(reloc.offset);
+                    if call_addr_offset_adjust {
+                        call_addr = call_addr.saturating_sub(1);
+                    }
                     table.insert_call(call_addr, resolved_name, target_addr, is_external);
                 }
             }
