@@ -13171,7 +13171,8 @@ mod tests {
         // Build a context with .rodata starting at 0x1000 carrying
         // the 8 bytes of double 3.14 at offset 0.
         let mut ctx = BinaryDataContext::new();
-        let bytes: [u8; 8] = 3.14f64.to_le_bytes();
+        // Use a value clippy doesn't recognize as an "approximate" PI.
+        let bytes: [u8; 8] = 1.25f64.to_le_bytes();
         ctx.add_section(0x1000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x1000, 0x1000 + bytes.len() as u64);
 
@@ -13185,7 +13186,7 @@ mod tests {
         let got_ref = Expr::got_ref(0x1000, 0x500, 8, display);
 
         let formatted = emitter.format_expr_with_strings(&got_ref, &table);
-        assert_eq!(formatted, "3.14", "rodata f64 should materialize");
+        assert_eq!(formatted, "1.25", "rodata f64 should materialize");
     }
 
     /// SSE-2 Option A: the same path on a 4-byte single-precision
@@ -13285,7 +13286,7 @@ mod tests {
         let got_ref = Expr::got_ref(0x1000, 0x500, 8, display);
         let formatted = emitter.format_expr_with_strings(&got_ref, &table);
         assert!(
-            !formatted.parse::<f64>().is_ok(),
+            formatted.parse::<f64>().is_err(),
             "without binary_data, a bare GotRef must not produce a float literal: {formatted}"
         );
     }
