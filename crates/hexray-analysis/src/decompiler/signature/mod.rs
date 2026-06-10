@@ -490,6 +490,15 @@ fn block_return_register_class(
     for inst in block.instructions.iter().rev() {
         // Skip epilogue scaffolding.
         let m = inst.mnemonic.to_ascii_lowercase();
+        // Stack-canary guard compare against %fs:0x28 has to be
+        // detected BEFORE the Compare/Test skip below, otherwise the
+        // pass-4 fix swallows it and the preceding canary reload into
+        // rax is misread as the integer return value. Codex review on
+        // PR #25 pass 8. The guard helper covers `cmp`/`sub` shapes.
+        if instruction_references_stack_guard(inst) {
+            saw_guard = true;
+            continue;
+        }
         if matches!(
             inst.operation,
             Operation::Return | Operation::Push | Operation::Pop | Operation::Nop
@@ -548,11 +557,6 @@ fn block_return_register_class(
                     continue;
                 }
             }
-        }
-        // The stack-canary guard compare (`cmp`/`sub` against %fs:0x28).
-        if instruction_references_stack_guard(inst) {
-            saw_guard = true;
-            continue;
         }
         let Some(Operand::Register(dst)) = inst.operands.first() else {
             continue;
@@ -5451,6 +5455,47 @@ mod tests {
             ),
         ]);
         assert_eq!(scan_float_return(&cfg, CallingConvention::SystemV), Some(8));
+    }
+
+    /// Codex review on PR #25 pass 8: the pass-4 fix to skip
+    /// Compare/Test ops in the return classifier was too aggressive
+    /// — when a stack-protector epilogue uses `cmp` (instead of
+    /// `sub`) against the canary, the early skip swallowed the
+    /// guard reference before `instruction_references_stack_guard`
+    /// got a chance to set saw_guard. The preceding `mov rax,
+    /// [canary_slot]` then got mistakenly seeded as the integer
+    /// return value, vetoing the real float return in xmm0.
+    /// Verify a `cmp %fs:0x28, ...` guard check still sets saw_guard
+    /// so the xmm0 float return is preserved.
+    #[test]
+    fn scan_float_return_skips_canary_reload_when_guard_is_cmp() {
+        // movsd ...,%xmm0   ; real float return write
+        // mov ...,%rax      ; canary reload from stack slot
+        // cmp %fs:0x28,%rax ; guard compare (Operation::Compare)
+        // ret
+        let rbp = gpr(5, 64);
+        let cfg = single_block_cfg(vec![
+            (
+                "movsd",
+                Operation::Move,
+                vec![Operand::Register(xmm(0)), mem(rbp, -88)],
+            ),
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(gpr(0, 64)), mem(rbp, -8)],
+            ),
+            (
+                "cmp",
+                Operation::Compare,
+                vec![Operand::Register(gpr(0, 64)), guard_mem()],
+            ),
+        ]);
+        assert_eq!(
+            scan_float_return(&cfg, CallingConvention::SystemV),
+            Some(8),
+            "cmp-form canary guard must not be skipped before guard detection"
+        );
     }
 
     #[test]
