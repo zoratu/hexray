@@ -62,6 +62,13 @@ pub struct Elf<'a> {
     pub relocations: Vec<Relocation>,
     /// Kernel module info (if this is a .ko file).
     pub modinfo: Option<KernelModuleInfo>,
+    /// Maps each symbol-table section index (`SHT_SYMTAB` / `SHT_DYNSYM`)
+    /// to the offset where its entries begin within the flattened
+    /// [`Elf::raw_symbols`] vector. Used to resolve a relocation's
+    /// `symbol_index` (scoped to the linked symbol table) against
+    /// `raw_symbols` in ELF files that carry more than one symbol
+    /// table.
+    symtab_section_to_raw_base: std::collections::HashMap<u32, usize>,
 }
 
 /// Kernel module information parsed from .modinfo section.
@@ -191,7 +198,7 @@ impl<'a> Elf<'a> {
         // so downstream ELF-specific views (e.g. CUDA) can inspect fields
         // like `st_other` that the simplified form discards.
         let gnu_versions = GnuVersionTable::parse(data, &sections, header.endianness);
-        let (mut symbols, raw_symbols) =
+        let (mut symbols, raw_symbols, symtab_section_to_raw_base) =
             Self::parse_symbols(data, &sections, &header, &section_names, &gnu_versions)?;
 
         // Parse relocations for relocatable files and dynamic binaries
@@ -226,6 +233,7 @@ impl<'a> Elf<'a> {
             section_names,
             relocations,
             modinfo,
+            symtab_section_to_raw_base,
         })
     }
 
@@ -249,11 +257,27 @@ impl<'a> Elf<'a> {
     /// at "`.text + n`" resolves to the very address the disassembler
     /// just told the decompiler the function lives at, and `find_fde`
     /// matches.
-    fn relocation_symbol_value(&self, symbol_index: u32) -> Option<u64> {
-        if symbol_index == 0 {
+    fn relocation_symbol_value(&self, reloc: &Relocation) -> Option<u64> {
+        if reloc.symbol_index == 0 {
             return None;
         }
-        let entry = self.raw_symbols.get(symbol_index as usize)?;
+        // Translate the relocation's symbol_index from its linked
+        // symbol-table-scope into an absolute index in raw_symbols.
+        // For files with a single symbol table the base is 0 (or the
+        // relocation's `linked_symtab_section` is 0/unset, in which
+        // case we fall back to treating the index as already-absolute
+        // — older callers that hand-construct `Relocation` without
+        // going through parse_rel / parse_rela still work).
+        let base = if reloc.linked_symtab_section == 0 {
+            0
+        } else {
+            *self
+                .symtab_section_to_raw_base
+                .get(&reloc.linked_symtab_section)
+                .unwrap_or(&0)
+        };
+        let absolute_index = base.checked_add(reloc.symbol_index as usize)?;
+        let entry = self.raw_symbols.get(absolute_index)?;
         let mut value = entry.st_value;
         if let Some(section) = self.sections.get(entry.st_shndx as usize) {
             // Mirror Elf::parse_symbols: relocatable files (sh_addr == 0)
@@ -278,7 +302,7 @@ impl<'a> Elf<'a> {
     /// pre-relocation behaviour and surfacing only for relocations we
     /// haven't yet modelled.
     fn apply_section_relocation(&self, buf: &mut [u8], reloc: &Relocation, section_va: u64) {
-        let Some(symbol_value) = self.relocation_symbol_value(reloc.symbol_index) else {
+        let Some(symbol_value) = self.relocation_symbol_value(reloc) else {
             return;
         };
         let offset = reloc.offset as usize;
@@ -447,15 +471,25 @@ impl<'a> Elf<'a> {
         Ok(segments)
     }
 
+    #[allow(clippy::type_complexity)]
     fn parse_symbols(
         data: &[u8],
         sections: &[SectionHeader],
         header: &ElfHeader,
         section_names: &StringTable,
         gnu_versions: &GnuVersionTable,
-    ) -> Result<(Vec<Symbol>, Vec<SymbolEntry>), ParseError> {
+    ) -> Result<
+        (
+            Vec<Symbol>,
+            Vec<SymbolEntry>,
+            std::collections::HashMap<u32, usize>,
+        ),
+        ParseError,
+    > {
         let mut symbols = Vec::new();
         let mut raw_symbols = Vec::new();
+        let mut symtab_section_to_raw_base: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
         // CUDA cubins also need section-base relocation — see the
         // matching comment at the top of `parse`.
         let is_relocatable =
@@ -466,6 +500,11 @@ impl<'a> Elf<'a> {
             if section.sh_type != section::SHT_SYMTAB && section.sh_type != section::SHT_DYNSYM {
                 continue;
             }
+            // Remember where this symbol table's entries begin in the
+            // flattened raw_symbols vector so a relocation whose
+            // `symbol_index` is scoped to this table can be resolved
+            // by adding this base.
+            symtab_section_to_raw_base.insert(section_index as u32, raw_symbols.len());
 
             // Get the associated string table
             let strtab_idx = section.sh_link as usize;
@@ -561,7 +600,7 @@ impl<'a> Elf<'a> {
             }
         }
 
-        Ok((symbols, raw_symbols))
+        Ok((symbols, raw_symbols, symtab_section_to_raw_base))
     }
 
     /// Synthesize `<dynsym>@plt` symbols at each PLT stub address.
