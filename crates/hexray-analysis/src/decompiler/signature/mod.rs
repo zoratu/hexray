@@ -265,14 +265,50 @@ pub fn scan_float_arg_registers(
                 matches!(inst.operation, Operation::Compare | Operation::Test);
 
             if is_load {
-                for operand in &inst.operands {
-                    match operand {
-                        Operand::Register(reg) => {
-                            let name = reg.name().to_lowercase();
-                            let abi_name = float_arg_abi_register(&name, convention);
-                            written.insert(abi_name);
+                // Only aarch64 `ldp` writes two leading register
+                // operands. For every other Load (x86 mov reg,[mem];
+                // x86 VEX `vmaskmovps xmm2, xmm0, [rdi]` whose middle
+                // operand is a SOURCE/mask not a destination; aarch64
+                // ldr) operand[0] is the only destination — the
+                // remaining register operands before the memory are
+                // SOURCES that may carry argument reads. Codex review
+                // on PR #25 pass 10.
+                let mnemonic = inst.mnemonic.to_ascii_lowercase();
+                let multi_dest = mnemonic == "ldp" || mnemonic == "ldnp" || mnemonic == "ldpsw";
+                if multi_dest {
+                    for operand in &inst.operands {
+                        match operand {
+                            Operand::Register(reg) => {
+                                let name = reg.name().to_lowercase();
+                                let abi_name = float_arg_abi_register(&name, convention);
+                                written.insert(abi_name);
+                            }
+                            _ => break,
                         }
-                        _ => break,
+                    }
+                    continue;
+                }
+                // Single-destination load: mark operand[0] as written,
+                // then fall through so operand[1..] (before the memory
+                // operand) get scanned as source reads.
+                if let Some(Operand::Register(dst)) = inst.operands.first() {
+                    let name = dst.name().to_lowercase();
+                    let abi_name = float_arg_abi_register(&name, convention);
+                    written.insert(abi_name);
+                }
+                for operand in inst.operands.iter().skip(1) {
+                    let Operand::Register(src) = operand else {
+                        break;
+                    };
+                    let name = src.name().to_lowercase();
+                    let abi_name = float_arg_abi_register(&name, convention);
+                    if let Some(idx) = float_regs
+                        .iter()
+                        .position(|r| r.eq_ignore_ascii_case(&abi_name))
+                    {
+                        if detected[idx].is_none() && !written.contains(&abi_name) {
+                            detected[idx] = Some(scalar_float_operand_size_with_reg(inst, &name));
+                        }
                     }
                 }
                 continue;
@@ -5256,6 +5292,38 @@ mod tests {
             result,
             Some(ReturnRegClass::Integer),
             "movd eax, xmm0 (reg→reg Store) must classify as integer return"
+        );
+    }
+
+    /// Codex review on PR #25 pass 10: x86 VEX-encoded loads such as
+    /// `vmaskmovps xmm2, xmm0, [rdi]` are `Operation::Load` with the
+    /// middle operand being a SOURCE (mask), not a destination. The
+    /// pass-7 ldp fix that marked every leading register operand of
+    /// a Load as written would also mark xmm0 (the incoming arg) as
+    /// written before any read, suppressing the arg detection.
+    /// Single-destination Loads must only mark operand[0] as written;
+    /// operand[1..] before the memory operand are source reads.
+    #[test]
+    fn scan_detects_vex_load_mask_register_as_arg_read() {
+        // vmaskmovps xmm2, xmm0, [rdi]
+        // operand[0] = xmm2 (dest)
+        // operand[1] = xmm0 (mask source — the incoming float arg)
+        // operand[2] = [rdi] (memory source)
+        let rdi = gpr(7, 64);
+        let cfg = single_block_cfg(vec![(
+            "vmaskmovps",
+            Operation::Load,
+            vec![
+                Operand::Register(xmm(2)),
+                Operand::Register(xmm(0)),
+                mem(rdi, 0),
+            ],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            found,
+            vec![(0, "xmm0".to_string(), 8)],
+            "vmaskmovps mask (operand[1]) must register as a float arg read"
         );
     }
 
