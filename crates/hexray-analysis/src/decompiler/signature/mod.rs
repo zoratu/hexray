@@ -209,9 +209,15 @@ pub fn scan_float_arg_registers(
     cfg: &ControlFlowGraph,
     convention: CallingConvention,
 ) -> Vec<(usize, String, u8)> {
-    // The xmm argument ABI is System V specific (Win64 shares the integer/float
-    // slot, AArch64/RISC-V use their own scan paths).
-    if !matches!(convention, CallingConvention::SystemV) {
+    // Float ABI scan is implemented for System V (xmm0-xmm7) and
+    // Aarch64 AAPCS (d0-d7 / s0-s7 / q0-q7 / v0-v7 — all aliases of
+    // the same vector-register file). Win64 shares the integer/float
+    // arg slot and uses the integer scan; RiscV would need its own
+    // scan if/when float-ABI work extends there.
+    if !matches!(
+        convention,
+        CallingConvention::SystemV | CallingConvention::Aarch64
+    ) {
         return Vec::new();
     }
     let float_regs = convention.float_arg_registers();
@@ -223,6 +229,36 @@ pub fn scan_float_arg_registers(
             continue;
         };
         for inst in &block.instructions {
+            // Store ops (the `-O0` arg spill is the dominant case)
+            // have one register operand (the source value being
+            // stored) and one memory operand (the destination
+            // address). x86 movsd uses `[mem, register]` order;
+            // aarch64 STR uses `[register, mem]`. Pick whichever
+            // operand is the register and treat it as a source read
+            // — never as a destination write, regardless of position.
+            // Without this, aarch64 `STR Dn, [sp, #imm]` would mark
+            // Dn as written-first and the scanner would never
+            // recognise the corresponding incoming float arg.
+            let is_store = matches!(inst.operation, Operation::Store);
+            if is_store {
+                let reg = inst.operands.iter().find_map(|o| match o {
+                    Operand::Register(r) => Some(r),
+                    _ => None,
+                });
+                if let Some(reg) = reg {
+                    let name = reg.name().to_lowercase();
+                    let abi_name = float_arg_abi_register(&name, convention);
+                    if let Some(idx) = float_regs
+                        .iter()
+                        .position(|r| r.eq_ignore_ascii_case(&abi_name))
+                    {
+                        if detected[idx].is_none() && !written.contains(&abi_name) {
+                            detected[idx] = Some(scalar_float_operand_size_with_reg(inst, &name));
+                        }
+                    }
+                }
+                continue;
+            }
             // An xmm register in the source position (operand 1) is read — but
             // the `pxor %xmm,%xmm` / `xorps`/`xorpd` self-xor is a zeroing idiom
             // (`reg = 0`), not a read of an incoming argument.
@@ -231,25 +267,40 @@ pub fn scan_float_arg_registers(
             if !is_self_zero {
                 if let Some(Operand::Register(src)) = inst.operands.get(1) {
                     let name = src.name().to_lowercase();
+                    // Normalise across the aarch64 register-file aliases so a
+                    // `d0` use is recognised when the convention's arg list
+                    // is `d0..d7`. The aarch64 ABI reuses the same vector
+                    // register at different element widths (`s0`/`d0`/`q0`/`v0`
+                    // all alias bank 0); pick the matching ABI name.
+                    let abi_name = float_arg_abi_register(&name, convention);
                     if let Some(idx) = float_regs
                         .iter()
-                        .position(|r| r.eq_ignore_ascii_case(&name))
+                        .position(|r| r.eq_ignore_ascii_case(&abi_name))
                     {
-                        if detected[idx].is_none() && !written.contains(&name) {
-                            detected[idx] = Some(scalar_float_operand_size(inst));
+                        if detected[idx].is_none() && !written.contains(&abi_name) {
+                            detected[idx] = Some(scalar_float_operand_size_with_reg(inst, &name));
                         }
                     }
                 }
             }
-            // The destination (operand 0), if an xmm register, is written by
-            // anything but a pure comparison/test. Over-counting writes is safe:
-            // it only suppresses later (false) argument detections.
+            // The destination (operand 0), if a float-bank register, is
+            // written by anything but a pure comparison/test. Over-counting
+            // writes is safe: it only suppresses later (false) argument
+            // detections.
             if let Some(Operand::Register(dst)) = inst.operands.first() {
                 let name = dst.name().to_lowercase();
-                if name.starts_with("xmm")
-                    && !matches!(inst.operation, Operation::Compare | Operation::Test)
+                let abi_name = float_arg_abi_register(&name, convention);
+                let is_float_bank = match convention {
+                    CallingConvention::SystemV => name.starts_with("xmm"),
+                    CallingConvention::Aarch64 => {
+                        matches!(name.chars().next(), Some('s' | 'd' | 'q' | 'v'))
+                            && name[1..].chars().all(|c| c.is_ascii_digit())
+                    }
+                    _ => false,
+                };
+                if is_float_bank && !matches!(inst.operation, Operation::Compare | Operation::Test)
                 {
-                    written.insert(name);
+                    written.insert(abi_name);
                 }
             }
         }
@@ -264,6 +315,44 @@ pub fn scan_float_arg_registers(
         }
     }
     result
+}
+
+/// Map any float-bank register name (e.g. aarch64 `s3`, `d3`, `q3`, `v3`)
+/// to the ABI-arg-register name the convention's `float_arg_registers()`
+/// list uses (aarch64 → `d3`; System V passes through `xmm3`). Used to
+/// recognise float-arg reads regardless of access width.
+fn float_arg_abi_register(name: &str, convention: CallingConvention) -> String {
+    match convention {
+        CallingConvention::Aarch64 => {
+            if name.len() >= 2 {
+                let prefix = name.chars().next().unwrap();
+                let suffix: String = name[1..].chars().collect();
+                if matches!(prefix, 's' | 'd' | 'q' | 'v')
+                    && suffix.chars().all(|c| c.is_ascii_digit())
+                {
+                    return format!("d{suffix}");
+                }
+            }
+            name.to_string()
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// Operand width derived from the destination/source register's prefix
+/// (aarch64: `s*` = 4-byte single, `d*` = 8-byte double, `q*` = 16-byte
+/// vector). Falls back to [`scalar_float_operand_size`] for x86 mnemonics
+/// (`*ss` = single, `*sd` = double).
+fn scalar_float_operand_size_with_reg(inst: &hexray_core::Instruction, reg: &str) -> u8 {
+    if let Some(prefix) = reg.chars().next() {
+        match prefix {
+            's' => return 4,
+            'd' => return 8,
+            'q' => return 16,
+            _ => {}
+        }
+    }
+    scalar_float_operand_size(inst)
 }
 
 /// Whether operands 0 and 1 are the same register (the self-xor zeroing idiom).
@@ -297,7 +386,10 @@ fn scalar_float_operand_size(inst: &hexray_core::Instruction) -> u8 {
 /// stack-canary reload (`rax = *guard_slot`) is skipped so it does not look like
 /// an integer return.
 pub fn scan_float_return(cfg: &ControlFlowGraph, convention: CallingConvention) -> Option<u8> {
-    if !matches!(convention, CallingConvention::SystemV) {
+    if !matches!(
+        convention,
+        CallingConvention::SystemV | CallingConvention::Aarch64
+    ) {
         return None;
     }
     let mut float_size: Option<u8> = None;
@@ -323,7 +415,7 @@ pub fn scan_float_return(cfg: &ControlFlowGraph, convention: CallingConvention) 
                 break;
             }
             let Some(b) = cfg.block(bid) else { break };
-            match block_return_register_class(b) {
+            match block_return_register_class(b, convention) {
                 Some(ReturnRegClass::Float(size)) => {
                     float_size = Some(float_size.map_or(size, |s| s.max(size)));
                     break;
@@ -348,7 +440,10 @@ enum ReturnRegClass {
 /// Classify the return register established by a block: the last write to a
 /// return register (`xmm0` = float, `rax`/`eax` = integer), skipping the
 /// epilogue and the stack-canary reload/compare.
-fn block_return_register_class(block: &hexray_core::BasicBlock) -> Option<ReturnRegClass> {
+fn block_return_register_class(
+    block: &hexray_core::BasicBlock,
+    convention: CallingConvention,
+) -> Option<ReturnRegClass> {
     let mut saw_guard = false;
     for inst in block.instructions.iter().rev() {
         // Skip epilogue scaffolding.
@@ -359,6 +454,11 @@ fn block_return_register_class(block: &hexray_core::BasicBlock) -> Option<Return
         ) || m == "leave"
             || m.starts_with("nop")
             || m.starts_with("endbr")
+            // aarch64 epilogue: `ldp x29, x30, [sp, #N]` / `add sp, sp,
+            // #M` aren't the value-producing writes either; the actual
+            // return value sits in d0/v0 / x0 set earlier.
+            || m == "ldp"
+            || m.starts_with("stp")
         {
             continue;
         }
@@ -371,16 +471,42 @@ fn block_return_register_class(block: &hexray_core::BasicBlock) -> Option<Return
             continue;
         };
         let name = dst.name().to_lowercase();
-        if name.starts_with("xmm") && name == "xmm0" {
-            return Some(ReturnRegClass::Float(scalar_float_operand_size(inst)));
-        }
-        if matches!(name.as_str(), "rax" | "eax" | "ax" | "al") {
-            // The reload feeding the canary check is not the return value.
-            if saw_guard {
-                saw_guard = false;
-                continue;
+        match convention {
+            CallingConvention::SystemV | CallingConvention::Win64 => {
+                if name == "xmm0" {
+                    return Some(ReturnRegClass::Float(scalar_float_operand_size(inst)));
+                }
+                if matches!(name.as_str(), "rax" | "eax" | "ax" | "al") {
+                    if saw_guard {
+                        saw_guard = false;
+                        continue;
+                    }
+                    return Some(ReturnRegClass::Integer);
+                }
             }
-            return Some(ReturnRegClass::Integer);
+            CallingConvention::Aarch64 => {
+                // d0 / s0 / q0 / v0 — all aliases of the same float
+                // return register at different widths. Use the operand
+                // width for size; q0 (vector) defaults to 16 but we
+                // generally won't see that in scalar-double leaf fns.
+                if matches!(name.as_str(), "d0" | "s0" | "q0" | "v0") {
+                    return Some(ReturnRegClass::Float(scalar_float_operand_size_with_reg(
+                        inst, &name,
+                    )));
+                }
+                // x0 / w0 = integer return.
+                if matches!(name.as_str(), "x0" | "w0") {
+                    if saw_guard {
+                        saw_guard = false;
+                        continue;
+                    }
+                    return Some(ReturnRegClass::Integer);
+                }
+            }
+            CallingConvention::RiscV => {
+                // RiscV float-return scan would land here; left for a
+                // dedicated effort.
+            }
         }
     }
     None
@@ -4680,6 +4806,44 @@ mod tests {
         hexray_core::Register::new(Architecture::X86_64, RegisterClass::Vector, 64 + idx, 128)
     }
 
+    /// aarch64 vector register at idx 0..31. `bits` selects the
+    /// access width — 32 for `s*`, 64 for `d*`, 128 for `q*`/`v*`.
+    /// Arm64 vector register ID base in hexray-core is 64, so the
+    /// renderer uses `64 + idx`.
+    fn aarch64_v(idx: u16, bits: u16) -> hexray_core::Register {
+        use hexray_core::{Architecture, RegisterClass};
+        hexray_core::Register::new(Architecture::Arm64, RegisterClass::Vector, 64 + idx, bits)
+    }
+
+    fn aarch64_x(idx: u16, bits: u16) -> hexray_core::Register {
+        use hexray_core::{Architecture, RegisterClass};
+        hexray_core::Register::new(Architecture::Arm64, RegisterClass::General, idx, bits)
+    }
+
+    fn aarch64_mem(base: hexray_core::Register, disp: i64) -> Operand {
+        Operand::Memory(hexray_core::MemoryRef::base_disp(base, disp, 8))
+    }
+
+    /// Build a one-block aarch64 CFG (instead of the x86 helper) for
+    /// regression tests that need the Arm64 architecture stamp.
+    fn aarch64_single_block_cfg(insts: Vec<(&str, Operation, Vec<Operand>)>) -> ControlFlowGraph {
+        use hexray_core::{BasicBlock, BlockTerminator, Instruction};
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let mut addr = 0x1000u64;
+        for (mnemonic, op, operands) in insts {
+            block.instructions.push(
+                Instruction::new(addr, 4, vec![], mnemonic)
+                    .with_operation(op)
+                    .with_operands(operands),
+            );
+            addr += 4;
+        }
+        block.terminator = BlockTerminator::Return;
+        cfg.add_block(block);
+        cfg
+    }
+
     fn gpr(id: u16, bits: u16) -> hexray_core::Register {
         use hexray_core::{Architecture, RegisterClass};
         hexray_core::Register::new(Architecture::X86_64, RegisterClass::General, id, bits)
@@ -4792,6 +4956,49 @@ mod tests {
         )]);
         let found = scan_float_arg_registers(&cfg, CallingConvention::SystemV);
         assert!(found.is_empty());
+    }
+
+    /// aarch64: `STR Dn, [sp, #imm]` is the -O0 float-arg spill. The
+    /// source register is operand[0] (opposite of x86 movsd which has
+    /// memory first). Without the position-agnostic Store handling,
+    /// the scanner would mark the float-bank register as written-
+    /// before-read and miss the arg.
+    #[test]
+    fn aarch64_scan_detects_d0_d1_args_from_str_spill() {
+        // str d0, [sp, #8]   ; str d1, [sp, #16]
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+            ),
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_v(1, 64)), aarch64_mem(sp, 16)],
+            ),
+        ]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            found,
+            vec![(0, "d0".to_string(), 8), (1, "d1".to_string(), 8)]
+        );
+    }
+
+    /// `STR Sn, [sp, #imm]` is the single-precision spill: width is
+    /// taken from the `s*` register prefix, NOT from a mnemonic
+    /// suffix (aarch64 has no `*ss`/`*sd` form).
+    #[test]
+    fn aarch64_scan_picks_single_precision_size_from_register() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 32)), aarch64_mem(sp, 4)],
+        )]);
+        let found = scan_float_arg_registers(&cfg, CallingConvention::Aarch64);
+        assert_eq!(found, vec![(0, "d0".to_string(), 4)]);
     }
 
     #[test]
