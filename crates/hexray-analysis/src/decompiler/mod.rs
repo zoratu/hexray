@@ -813,6 +813,13 @@ pub struct Decompiler {
     pub enable_struct_inference: bool,
     /// Calling convention for function signature recovery.
     pub calling_convention: CallingConvention,
+    /// Target pointer width in bytes (4 on ILP32, 8 on LP64). Used to
+    /// size class layouts whose width depends on the ABI's word size
+    /// — notably C++ smart pointers, where `shared_ptr<T>` is
+    /// `2 * pointer_size` bytes. Sourced from `BinaryFormat::bitness`
+    /// at the CLI; defaults to 8 (the dominant target) for callers
+    /// that don't set it.
+    pub pointer_size: usize,
     /// Whether to enable signature recovery (default: true).
     pub enable_signature_recovery: bool,
     /// Type database for struct field access and function prototypes.
@@ -859,6 +866,7 @@ impl Default for Decompiler {
             dwarf_scope_ranges: HashMap::new(),
             enable_struct_inference: false,
             calling_convention: CallingConvention::default(),
+            pointer_size: 8,
             enable_signature_recovery: true,
             type_database: None,
             rtti_database: None,
@@ -978,6 +986,14 @@ impl Decompiler {
     /// - `RiscV`: RISC-V (a0-a7)
     pub fn with_calling_convention(mut self, convention: CallingConvention) -> Self {
         self.calling_convention = convention;
+        self
+    }
+
+    /// Sets the target pointer width in bytes (4 on ILP32, 8 on
+    /// LP64). The CLI sources this from `BinaryFormat::bitness`; library
+    /// callers that know their target can pass it directly.
+    pub fn with_pointer_size(mut self, pointer_size: usize) -> Self {
+        self.pointer_size = pointer_size;
         self
     }
 
@@ -1163,6 +1179,7 @@ impl Decompiler {
         let stack_struct_bindings = stack_struct_binding::analyze_with_builtin_db(
             &structured.body,
             self.binary_data.as_ref(),
+            self.pointer_size,
         );
         for binding in stack_struct_bindings.iter() {
             merged_types.insert(binding.local_name.clone(), binding.type_name.clone());

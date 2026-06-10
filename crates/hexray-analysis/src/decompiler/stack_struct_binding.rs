@@ -47,6 +47,15 @@ pub struct StackStructBinding {
     /// Suggested local variable name for the rewritten output, e.g.
     /// `"epoll_event_14"` (struct name + abs(offset) in hex).
     pub local_name: String,
+    /// `true` when this binding represents a C++ class object whose
+    /// lifecycle is constructor / destructor driven (smart pointers
+    /// today; future C++ stack-locals later) rather than a plain C
+    /// struct. The struct-rewrite path treats them differently: a
+    /// zero-store into a C-struct local is a `memset` aggregate
+    /// initialisation, but a zero-store into a class object is the
+    /// in-place default constructor / move-from-nullptr — emitting
+    /// `memset(&shared_ptr, 0, 16)` would corrupt the meaning.
+    pub class_object: bool,
 }
 
 /// `stack_offset -> binding` map collected by [`Self::analyze`].
@@ -106,12 +115,32 @@ impl StackStructBindings {
 
 /// Run [`StackStructBindings::analyze`] against the built-in posix/linux/libc
 /// type database (cached after first use). The pipeline call site uses this.
+///
+/// `pointer_size` overrides the cached DB's pointer width (which defaults to
+/// LP64) so smart-pointer bindings size their stack regions correctly on
+/// 32-bit targets. Pass `db.arch().pointer_size` if you have a custom DB;
+/// at the decompiler's call site this comes from
+/// [`CallingConvention::pointer_size`].
 pub fn analyze_with_builtin_db(
     nodes: &[StructuredNode],
     binary_data: Option<&BinaryDataContext>,
+    pointer_size: usize,
 ) -> StackStructBindings {
+    use hexray_types::database::ArchInfo;
+    // Clone the cached posix/linux/libc DB and override its arch with
+    // the caller's pointer width. The clone is cheap relative to
+    // re-building the type library and is the simplest way to keep
+    // the smart-pointer size derivation (which reads
+    // `db.arch().pointer_size`) in sync with the binary's actual
+    // word size on 32-bit targets.
+    let mut db = builtin_db().clone();
+    db.set_arch(ArchInfo {
+        pointer_size,
+        long_size: pointer_size,
+        big_endian: false,
+    });
     let mut bindings = StackStructBindings::new();
-    bindings.analyze(nodes, builtin_db(), binary_data);
+    bindings.analyze(nodes, &db, binary_data);
     bindings
 }
 
@@ -239,6 +268,11 @@ fn visit_expr(
 ) {
     if let ExprKind::Call { target, args } = &expr.kind {
         try_bind_call(target, args, db, binary_data, out);
+        // Run alongside `try_bind_call`: smart-pointer method calls
+        // aren't in the TypeDatabase (their type comes from the C++
+        // class template, not a libc/POSIX prototype), so they need a
+        // separate name-pattern detection path.
+        try_bind_smart_pointer_method_call(target, args, db, binary_data, out);
     }
     walk_children(expr, db, binary_data, out);
 }
@@ -322,7 +356,274 @@ fn try_bind_call(
                 size,
                 type_name,
                 local_name,
+                class_object: false,
             });
+    }
+}
+
+/// Recognise a C++ smart-pointer method call (`std::shared_ptr<T>::reset(...)`,
+/// `std::unique_ptr<Widget>::get(...)`, etc.) whose `this` argument is the
+/// address of a stack region, and bind that region as `std::shared_ptr<T>` /
+/// `std::unique_ptr<T>` / `std::weak_ptr<T>` so the downstream rewriter can
+/// surface a typed local instead of a bare `rbp - K` argument.
+///
+/// We match the demangled-name pattern rather than going through the
+/// `TypeDatabase` because smart pointers are class templates that resolve
+/// per-instantiation; libstdc++ also emits an internal `std::__shared_ptr` /
+/// `std::__weak_ptr` base class which the matcher accepts too. The first
+/// comma-separated template argument is taken as the inner type `T`
+/// (`unique_ptr<T, Deleter>` and `__shared_ptr<T, std::allocator<…>>` both
+/// land on the right `T` this way).
+///
+/// Conservatively only the common ABI sizes are bound:
+/// * `unique_ptr<T>` → 8 (single pointer; stateless / default-deleter form).
+/// * `shared_ptr<T>` / `weak_ptr<T>` → 16 (data pointer + control block).
+///
+/// `unique_ptr<T, StatefulDeleter>` instances can be larger; the matcher
+/// still emits the 8-byte binding for them because the more common case is
+/// the stateless one. A stateful-deleter follow-up can refine the size from
+/// `_M_t`'s tuple layout once we have that recognised.
+fn try_bind_smart_pointer_method_call(
+    target: &CallTarget,
+    args: &[Expr],
+    db: &TypeDatabase,
+    binary_data: Option<&BinaryDataContext>,
+    out: &mut StackStructBindings,
+) {
+    let Some(raw_name) = resolve_call_name(target, binary_data) else {
+        return;
+    };
+    // Relocation-table lookups can hand us a raw Itanium-ABI mangled
+    // symbol (e.g. `_ZNSt10shared_ptrI6WidgetE5resetEv`); the symbol
+    // table pre-demangles, but the relocation map bypasses that path.
+    // The parser only recognises demangled `std::...` patterns, so
+    // demangle on entry and fall back to the raw form for already-
+    // demangled or non-mangled names. Codex review on PR #24: without
+    // this, smart-pointer bindings are silently missed on relocated
+    // C++ calls in `.o` files.
+    let demangled = hexray_demangle::demangle(&raw_name);
+    let name: &str = demangled.as_deref().unwrap_or(&raw_name);
+    // Methods that return a non-trivial object by value pass a hidden
+    // return-buffer pointer as the first call argument under the
+    // SysV / Itanium ABI. Treating `args[0]` as `this` for those would
+    // bind the destination's stack slot as the wrong type. Canonical
+    // case: `weak_ptr<T>::lock()` returns `shared_ptr<T>` by value.
+    if smart_pointer_method_returns_by_value(name) {
+        return;
+    }
+    let Some((kind, inner)) = parse_smart_pointer_kind_and_inner(name) else {
+        return;
+    };
+    // Instance methods receive `this` as the first argument in the lifted
+    // call. Free functions like `std::make_shared<T>(...)` don't match the
+    // `::method` suffix so they never reach this point.
+    let Some(this_arg) = args.first() else {
+        return;
+    };
+    let Some(stack_offset) = stack_offset_of_address(this_arg) else {
+        return;
+    };
+    // Size depends on the target pointer width (4 on 32-bit, 8 on
+    // 64-bit). unique_ptr<T> = 1 * ptr_size (the data pointer);
+    // shared_ptr<T> / weak_ptr<T> = 2 * ptr_size (data + control
+    // block).
+    let ptr = db.arch().pointer_size;
+    let (short, size) = match kind {
+        SmartPointerKind::Unique => ("unique_ptr", ptr),
+        SmartPointerKind::Shared => ("shared_ptr", ptr.saturating_mul(2)),
+        SmartPointerKind::Weak => ("weak_ptr", ptr.saturating_mul(2)),
+    };
+    let type_name = format!("std::{short}<{inner}>");
+    let local_name = synthesize_smart_pointer_local_name(short, &inner, stack_offset);
+    out.by_offset
+        .entry(stack_offset)
+        .or_insert(StackStructBinding {
+            stack_offset,
+            size,
+            type_name,
+            local_name,
+            class_object: true,
+        });
+}
+
+/// Recognise the smart-pointer methods that return a non-trivial object
+/// by value (so the SysV / Itanium ABI uses `sret`, putting the
+/// destination's address in `args[0]` and the receiver in `args[1]`).
+/// Keep the list tight — only methods verified against libstdc++.
+/// Everything else falls through and the binder treats `args[0]` as
+/// `this` normally.
+fn smart_pointer_method_returns_by_value(name: &str) -> bool {
+    let method = match name.rsplit_once("::") {
+        Some((_, tail)) => tail
+            .split(|c: char| c == '(' || c.is_whitespace())
+            .next()
+            .unwrap_or(""),
+        None => return false,
+    };
+    matches!(method, "lock")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartPointerKind {
+    Unique,
+    Shared,
+    Weak,
+}
+
+/// Parse a demangled name and, if it looks like
+/// `std::<smart_ptr_name><...>::<method>(...)`, return the kind and the first
+/// template argument (the inner pointee type). Both the public class names
+/// (`shared_ptr`, `unique_ptr`, `weak_ptr`) and the libstdc++ internal base
+/// classes (`__shared_ptr`, `__weak_ptr`) are accepted. Returns `None` for
+/// anything else so the caller can decline the bind.
+fn parse_smart_pointer_kind_and_inner(name: &str) -> Option<(SmartPointerKind, String)> {
+    // Order matters: try the longer/more-specific names first so
+    // `__shared_ptr` doesn't get parsed as `shared_ptr` with a stray
+    // `__` prefix.
+    let candidates = [
+        ("std::__shared_ptr", SmartPointerKind::Shared),
+        ("std::shared_ptr", SmartPointerKind::Shared),
+        ("std::__weak_ptr", SmartPointerKind::Weak),
+        ("std::weak_ptr", SmartPointerKind::Weak),
+        ("std::unique_ptr", SmartPointerKind::Unique),
+    ];
+    // The prefix must start the name's class qualifier AND be in the
+    // called-method position (before the method's argument list).
+    // Two distinct codex P2 findings on PR #24 are addressed here:
+    //
+    //   1. Anchored-identifier: a user type like
+    //      `mystd::shared_ptr<Widget>` would otherwise match at offset
+    //      2 because `find` is unconstrained. Require the match
+    //      position to be 0 or immediately preceded by a non-
+    //      identifier byte.
+    //
+    //   2. Pre-argument-list: in a name like
+    //      `foo(std::shared_ptr<Widget>::element_type*)`, the prefix
+    //      occurs INSIDE the argument list of an unrelated function.
+    //      Require the match to be before the first `(` so we only
+    //      pick up the actual called method, not a smart-pointer
+    //      type nested inside someone else's signature.
+    let is_identifier_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let arg_list_start = name.find('(').unwrap_or(name.len());
+    let (kind, after_prefix) = candidates.iter().find_map(|(prefix, kind)| {
+        let i = name.find(prefix)?;
+        if i >= arg_list_start {
+            return None;
+        }
+        let prev_ok = i == 0
+            || name
+                .as_bytes()
+                .get(i.saturating_sub(1))
+                .is_none_or(|b| !is_identifier_byte(*b));
+        if !prev_ok {
+            return None;
+        }
+        Some((*kind, &name[i + prefix.len()..]))
+    })?;
+    let after_lt = after_prefix.strip_prefix('<')?;
+    // Walk to the matching `>` honouring nested template brackets so we
+    // extract the WHOLE argument list, not the first segment.
+    let mut depth = 1usize;
+    let mut end = None;
+    for (i, c) in after_lt.char_indices() {
+        match c {
+            '<' => depth = depth.saturating_add(1),
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let args = &after_lt[..end];
+    let after_args = after_lt.get(end + 1..)?;
+    // Must be a method call (`::method`), not a stray type mention.
+    // Trim leading whitespace because the Itanium demangler emits a
+    // space before the qualifier for nested template closings like
+    // `unique_ptr<int, std::default_delete<int> >::get()`. Codex
+    // review on PR #24.
+    if !after_args.trim_start().starts_with("::") {
+        return None;
+    }
+    // Take the first top-level comma-separated argument as the inner
+    // type. For `unique_ptr<T, Deleter>` we also need to check the
+    // second argument so a stateful deleter can decline the bind:
+    // `std::unique_ptr<T, StatefulDeleter>` can be larger than one
+    // pointer once the deleter has state, and an 8-byte binding
+    // would absorb adjacent stack locals into the region.
+    let segments = split_top_level_comma(args);
+    let inner = segments.first()?.trim().to_string();
+    if matches!(kind, SmartPointerKind::Unique) && segments.len() > 1 {
+        let deleter = segments.get(1).map(|s| s.trim()).unwrap_or("");
+        let default = format!("std::default_delete<{inner}>");
+        if deleter != default {
+            return None;
+        }
+    }
+    Some((kind, inner))
+}
+
+/// Split a comma-separated list of template arguments at top level only,
+/// skipping commas nested inside `<…>` or `(…)`. Returns the trimmed
+/// segments in order.
+fn split_top_level_comma(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                if let Some(seg) = s.get(start..i) {
+                    parts.push(seg.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if let Some(rest) = s.get(start..) {
+        parts.push(rest.to_string());
+    }
+    parts
+}
+
+/// Build a deterministic local name for a smart-pointer binding. The inner
+/// type can contain `::`, `<>`, and spaces (`std::vector<int>` etc.); strip
+/// them down to a single short slug so the rendered name reads as a real
+/// identifier (`vector_int_8`, `widget_8`).
+fn synthesize_smart_pointer_local_name(short: &str, inner: &str, offset: i64) -> String {
+    let slug = inner
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => c,
+            _ => '_',
+        })
+        .collect::<String>();
+    // Collapse runs of `_` and strip leading/trailing.
+    let mut collapsed = String::with_capacity(slug.len());
+    let mut prev_underscore = false;
+    for c in slug.chars() {
+        if c == '_' {
+            if !prev_underscore {
+                collapsed.push('_');
+            }
+            prev_underscore = true;
+        } else {
+            collapsed.push(c);
+            prev_underscore = false;
+        }
+    }
+    let trimmed = collapsed.trim_matches('_');
+    if trimmed.is_empty() {
+        format!("{short}_{:x}", offset.unsigned_abs())
+    } else {
+        format!("{trimmed}_{short}_{:x}", offset.unsigned_abs())
     }
 }
 
@@ -650,7 +951,15 @@ fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase
         }
     }
 
-    // Case B: Bare bound stack address (call-arg form).
+    // Case B: Bare bound stack address (call-arg form). Rewrites
+    // `Add(frame, K)` to `&<local>` so a method call site like
+    // `epoll_ctl(epfd, ADD, fd, &event)` or
+    // `std::shared_ptr<Widget>::reset(&sp)` reads as a typed
+    // reference. The local's emitted name comes from `binding.local_name`
+    // — the typed-local declaration only renders when at least one
+    // expression references it, so keeping this rewrite is what makes
+    // the smart-pointer binding observable in the output (codex
+    // review on PR #24).
     if let Some(off) = stack_offset_of_address(expr) {
         if let Some(binding) = bindings.get(off) {
             return Expr::address_of(struct_local_expr(binding));
@@ -686,10 +995,29 @@ fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase
             lhs: Box::new(transform_expr(lhs, bindings, db)),
             rhs: Box::new(transform_expr(rhs, bindings, db)),
         },
-        K::Deref { addr, size } => K::Deref {
-            addr: Box::new(transform_expr(addr, bindings, db)),
-            size: *size,
-        },
+        K::Deref { addr, size } => {
+            // For a Deref into a class-object region (typically the
+            // default-constructor byte-zero stores at function entry,
+            // `*(rbp - 16) = 0`), recursing into the `addr` would let
+            // Case B rewrite it to `&<local>`, and the emitter would
+            // render the whole thing as the visually-confusing
+            // `qword(&sp) = 0`. Leaving the inner address raw keeps
+            // the readable byte view. The typed local declaration is
+            // still emitted because Case B fires elsewhere — call-arg
+            // sites like `reset(&sp)` reference it. Codex review on
+            // PR #24.
+            if let Some(off) = stack_offset_of_address(addr) {
+                if let Some(binding) = bindings.containing(off) {
+                    if binding.class_object {
+                        return expr.clone();
+                    }
+                }
+            }
+            K::Deref {
+                addr: Box::new(transform_expr(addr, bindings, db)),
+                size: *size,
+            }
+        }
         K::AddressOf(inner) => K::AddressOf(Box::new(transform_expr(inner, bindings, db))),
         K::Cast {
             expr: inner,
@@ -713,11 +1041,31 @@ fn transform_expr(expr: &Expr, bindings: &StackStructBindings, db: &TypeDatabase
             base,
             index,
             element_size,
-        } => K::ArrayAccess {
-            base: Box::new(transform_expr(base, bindings, db)),
-            index: Box::new(transform_expr(index, bindings, db)),
-            element_size: *element_size,
-        },
+        } => {
+            // Same class-object protection as the Deref case: a
+            // `frame[idx]` access landing inside a class-object
+            // binding stays raw so the byte view survives. Codex
+            // review on PR #24.
+            if let (K::Var(v), K::IntLit(k)) = (&base.kind, &index.kind) {
+                if is_frame_register(&v.name) {
+                    if let Some(byte_off) = (*k)
+                        .checked_mul(*element_size as i128)
+                        .and_then(|p| i64::try_from(p).ok())
+                    {
+                        if let Some(binding) = bindings.containing(byte_off) {
+                            if binding.class_object {
+                                return expr.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            K::ArrayAccess {
+                base: Box::new(transform_expr(base, bindings, db)),
+                index: Box::new(transform_expr(index, bindings, db)),
+                element_size: *element_size,
+            }
+        }
         K::FieldAccess {
             base,
             field_name,
@@ -926,6 +1274,15 @@ fn try_rewrite_base_zero_to_memset(
         _ => return None,
     };
     let binding = bindings.containing(byte_off)?;
+    // C++ class objects (smart pointers today, more to come) don't
+    // memset-init: a zero store into a `std::shared_ptr<T>` slot is the
+    // default constructor / move-from-nullptr, not an aggregate
+    // initialisation. Rewriting it as `memset(&sp, 0, 16)` would
+    // misrepresent the object's lifecycle and surface bytes-level
+    // semantics for what is a class operation. Codex review on PR #24.
+    if binding.class_object {
+        return None;
+    }
     // Must be the base of the bound region (rel == 0).
     if byte_off != binding.stack_offset {
         return None;
@@ -1000,6 +1357,14 @@ fn is_droppable_interior_zero_store(stmt: &Expr, bindings: &StackStructBindings)
     let Some(binding) = bindings.containing(byte_off) else {
         return false;
     };
+    // C++ class objects (smart pointers and friends): an interior
+    // zero store inside the bound region is part of a real
+    // constructor / move-assignment sequence, not aggregate
+    // zero-init padding to be silenced. Dropping it would hide
+    // semantically-meaningful writes. Codex review on PR #24.
+    if binding.class_object {
+        return false;
+    }
     let rel = byte_off - binding.stack_offset;
     if rel <= 0 {
         // Offset-0 base-of-region zero is the zero-init marker; keep it.
@@ -1586,5 +1951,359 @@ mod tests {
         assert_eq!(parse_local_name_offset("local_deadbeef"), Some(-0xdeadbeef));
         assert_eq!(parse_local_name_offset("ret"), None);
         assert_eq!(parse_local_name_offset("local_xyz"), None);
+    }
+
+    // ----- Smart-pointer binding tests ---------------------------------
+
+    #[test]
+    fn smart_pointer_parser_recognises_shared_unique_weak() {
+        for (name, expected_kind, expected_inner) in [
+            (
+                "std::shared_ptr<Widget>::reset()",
+                SmartPointerKind::Shared,
+                "Widget",
+            ),
+            (
+                "std::unique_ptr<int>::get() const",
+                SmartPointerKind::Unique,
+                "int",
+            ),
+            (
+                "std::weak_ptr<Widget>::lock() const",
+                SmartPointerKind::Weak,
+                "Widget",
+            ),
+            // libstdc++ internal base class
+            (
+                "std::__shared_ptr<Widget, std::allocator<Widget>(int)>::reset()",
+                SmartPointerKind::Shared,
+                "Widget",
+            ),
+            (
+                "std::__weak_ptr<int, std::__atomic>::lock() const",
+                SmartPointerKind::Weak,
+                "int",
+            ),
+            // Stateful deleter on unique_ptr — still extract the first template
+            // argument as the inner type.
+            (
+                "std::unique_ptr<Widget, std::default_delete<Widget>>::operator->()",
+                SmartPointerKind::Unique,
+                "Widget",
+            ),
+            // Nested template type as the inner argument.
+            (
+                "std::shared_ptr<std::vector<int>>::operator*() const",
+                SmartPointerKind::Shared,
+                "std::vector<int>",
+            ),
+        ] {
+            let parsed = parse_smart_pointer_kind_and_inner(name)
+                .unwrap_or_else(|| panic!("parser declined valid smart-pointer name: {name}"));
+            assert_eq!(parsed.0, expected_kind, "kind mismatch on {name}");
+            assert_eq!(parsed.1, expected_inner, "inner mismatch on {name}");
+        }
+    }
+
+    #[test]
+    fn smart_pointer_parser_declines_unrelated_names() {
+        for name in [
+            "memcpy",
+            "std::vector<int>::push_back(int const&)",
+            "std::shared_ptr<Widget>", // type ref, not a ::method call
+            "std::make_shared<Widget>(int, int)", // free function
+            "MyClass::shared_ptr_helper", // unrelated suffix
+        ] {
+            assert!(
+                parse_smart_pointer_kind_and_inner(name).is_none(),
+                "parser accepted non-smart-pointer name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_stack_this_arg_for_shared_ptr_method_call() {
+        // `std::shared_ptr<Widget>::reset(this, …)` where `this` is a stack
+        // address binds [rbp-32, rbp-32+16) as `std::shared_ptr<Widget>`.
+        let call = Expr::call(
+            CallTarget::Named("std::shared_ptr<Widget>::reset()".to_string()),
+            vec![rbp_plus(-32)],
+        );
+
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+
+        assert_eq!(bindings.len(), 1, "expected one binding");
+        let b = bindings.get(-32).expect("binding at -32");
+        assert_eq!(b.type_name, "std::shared_ptr<Widget>");
+        assert_eq!(b.size, 16, "shared_ptr = ptr + control_block");
+        assert_eq!(b.local_name, "Widget_shared_ptr_20");
+    }
+
+    #[test]
+    fn binds_stack_this_arg_for_unique_ptr_method_call() {
+        let call = Expr::call(
+            CallTarget::Named("std::unique_ptr<int>::get() const".to_string()),
+            vec![rbp_plus(-8)],
+        );
+
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+
+        let b = bindings.get(-8).expect("binding at -8");
+        assert_eq!(b.type_name, "std::unique_ptr<int>");
+        assert_eq!(b.size, 8, "unique_ptr = bare data pointer");
+    }
+
+    #[test]
+    fn does_not_bind_smart_pointer_when_this_arg_is_not_stack_address() {
+        // First arg is a plain Var (a register-held pointer), not `rbp + K`.
+        let call = Expr::call(
+            CallTarget::Named("std::shared_ptr<Widget>::reset()".to_string()),
+            vec![Expr::var(Variable::reg("rdi", 8))],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(
+            bindings.len(),
+            0,
+            "must not bind when this is not a stack address"
+        );
+    }
+
+    /// Codex review on PR #24: a smart-pointer binding sitting at the same
+    /// offset as a zero store must NOT trigger the C-struct memset/drop
+    /// rewrite — a zero into a `std::shared_ptr<T>` slot is the default
+    /// constructor or move-from-nullptr, not aggregate zero-init padding.
+    #[test]
+    fn class_object_binding_skips_struct_memset_rewrite() {
+        let binding = StackStructBinding {
+            stack_offset: -16,
+            size: 16,
+            type_name: "std::shared_ptr<Widget>".to_string(),
+            local_name: "Widget_shared_ptr_10".to_string(),
+            class_object: true,
+        };
+        let mut bindings = StackStructBindings::new();
+        bindings.by_offset.insert(binding.stack_offset, binding);
+
+        // A wide zero store at the base of the bound region — would be
+        // rewritten to memset for a regular struct, must be left alone here.
+        let stmt = Expr::assign(Expr::deref(rbp_plus(-16), 8), Expr::int(0));
+        assert!(
+            try_rewrite_base_zero_to_memset(&stmt, &bindings, &full_db()).is_none(),
+            "class_object binding must not trigger memset rewrite"
+        );
+
+        // An interior zero store inside the region — would be dropped for a
+        // regular struct, must be kept here.
+        let interior = Expr::assign(Expr::deref(rbp_plus(-8), 4), Expr::int(0));
+        assert!(
+            !is_droppable_interior_zero_store(&interior, &bindings),
+            "class_object binding must not silence interior zero stores"
+        );
+    }
+
+    /// `weak_ptr<T>::lock()` returns `shared_ptr<T>` by value, so the
+    /// SysV / Itanium ABI passes the destination's address as `args[0]`
+    /// and the receiver as `args[1]`. The binder must decline rather
+    /// than bind the destination's stack region as the receiver type.
+    #[test]
+    fn does_not_bind_sret_returning_smart_pointer_method_call() {
+        let call = Expr::call(
+            CallTarget::Named("std::weak_ptr<Widget>::lock() const".to_string()),
+            vec![rbp_plus(-16), rbp_plus(-32)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(
+            bindings.len(),
+            0,
+            "must not bind for sret-returning methods: {:#?}",
+            bindings.iter().collect::<Vec<_>>()
+        );
+    }
+
+    /// `std::unique_ptr<T, StatefulDeleter>` can be larger than one
+    /// pointer when the deleter has state. A flat 8-byte binding
+    /// would absorb adjacent stack locals. Decline non-default
+    /// deleters; the canonical default (`std::default_delete<T>`,
+    /// EBO'd to 0 bytes) still binds normally.
+    #[test]
+    fn smart_pointer_parser_declines_stateful_unique_ptr_deleter() {
+        assert!(parse_smart_pointer_kind_and_inner(
+            "std::unique_ptr<Widget, MyStatefulDeleter>::reset()"
+        )
+        .is_none());
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner(
+                "std::unique_ptr<Widget, std::default_delete<Widget>>::reset()"
+            ),
+            Some((SmartPointerKind::Unique, "Widget".to_string()))
+        );
+    }
+
+    /// Codex review on PR #24: relocation-table lookups can hand the
+    /// binder a raw Itanium-ABI mangled symbol like
+    /// `_ZNSt10shared_ptrI6WidgetE5resetEv` (the symbol table
+    /// pre-demangles, but the relocation map doesn't), and the
+    /// parser only recognises demangled `std::...` shapes. Demangle
+    /// on entry so a relocated C++ call in a `.o` file still binds.
+    #[test]
+    fn binds_when_resolved_name_is_raw_mangled_itanium_symbol() {
+        // _ZNSt10shared_ptrI6WidgetE5resetEv ≡ std::shared_ptr<Widget>::reset()
+        let call = Expr::call(
+            CallTarget::Named("_ZNSt10shared_ptrI6WidgetE5resetEv".to_string()),
+            vec![rbp_plus(-16)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        let b = bindings.get(-16).expect("binding at -16");
+        assert_eq!(b.type_name, "std::shared_ptr<Widget>");
+        assert_eq!(b.size, 16);
+    }
+
+    /// Codex review on PR #24: the Itanium demangler emits a space
+    /// before the qualifier for nested template closings
+    /// (`unique_ptr<int, std::default_delete<int> >::get()`,
+    /// `shared_ptr<std::vector<int> >::reset()`), so my
+    /// `starts_with("::")` check rejected the most common
+    /// default-deleter `unique_ptr` and nested-template shapes.
+    /// Trim leading whitespace before the qualifier check.
+    #[test]
+    fn smart_pointer_parser_handles_demangler_space_before_qualifier() {
+        // Default-deleter unique_ptr in the Itanium demangler form.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner(
+                "std::unique_ptr<int, std::default_delete<int> >::get()"
+            ),
+            Some((SmartPointerKind::Unique, "int".to_string())),
+        );
+        // shared_ptr of a nested template type.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner("std::shared_ptr<std::vector<int> >::reset()"),
+            Some((SmartPointerKind::Shared, "std::vector<int>".to_string())),
+        );
+    }
+
+    /// Codex review on PR #24: a non-member function whose demangled
+    /// parameter list contains a smart-pointer type as a nested
+    /// qualifier (e.g. `foo(std::shared_ptr<Widget>::element_type*)`)
+    /// would match — the parser only required `::` after the
+    /// template, which is satisfied by the `::element_type` suffix.
+    /// Require the match to be before the first `(` so we only pick
+    /// up the actually-called method.
+    #[test]
+    fn smart_pointer_parser_declines_match_inside_argument_list() {
+        assert!(
+            parse_smart_pointer_kind_and_inner("foo(std::shared_ptr<Widget>::element_type*)")
+                .is_none(),
+            "match inside an argument list must not bind: {:?}",
+            parse_smart_pointer_kind_and_inner("foo(std::shared_ptr<Widget>::element_type*)")
+        );
+        // Real method call still matches.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner("std::shared_ptr<Widget>::reset()"),
+            Some((SmartPointerKind::Shared, "Widget".to_string()))
+        );
+    }
+
+    /// Codex review on PR #24: a Deref of a class-object stack address
+    /// (`*(rbp - 16) = 0`, byte-level ctor zero) must NOT be rewritten
+    /// through `AddressOf(local)`, because the emitter would render it
+    /// as the visually-confusing `qword(&sp) = 0`. Stay-raw so the
+    /// byte view survives. Bare addresses outside a Deref context
+    /// (call-arg form like `reset(rbp + -16)`) DO rewrite to
+    /// `&<local>` so the typed local is actually referenced and the
+    /// emitter declaration pass keeps it.
+    #[test]
+    fn transform_expr_leaves_class_object_deref_lvalues_raw() {
+        let binding = StackStructBinding {
+            stack_offset: -16,
+            size: 16,
+            type_name: "std::shared_ptr<Widget>".to_string(),
+            local_name: "Widget_shared_ptr_10".to_string(),
+            class_object: true,
+        };
+        let mut bindings = StackStructBindings::new();
+        bindings.by_offset.insert(binding.stack_offset, binding);
+
+        // 1. A bare address `Add(rbp, -16)` (call-arg form) DOES
+        //    rewrite — the typed local needs at least one reference
+        //    for the emitter to keep its declaration.
+        let bare = rbp_plus(-16);
+        let bare_out = transform_expr(&bare, &bindings, &full_db());
+        assert!(
+            matches!(&bare_out.kind, ExprKind::AddressOf(_)),
+            "bare class-object address (call-arg form) should rewrite to &<local>: {bare_out:?}"
+        );
+
+        // 2. A Deref of that address (`*(rbp - 16)`) stays raw so the
+        //    byte view doesn't show as `qword(&sp)`.
+        let deref = Expr::deref(rbp_plus(-16), 8);
+        let deref_out = transform_expr(&deref, &bindings, &full_db());
+        match &deref_out.kind {
+            ExprKind::Deref { addr, .. } => {
+                assert!(
+                    matches!(&addr.kind, ExprKind::BinOp { .. }),
+                    "Deref's address should stay raw, got {addr:?}"
+                );
+            }
+            other => panic!("expected Deref to survive: got {other:?}"),
+        }
+    }
+
+    /// Codex review on PR #24: the parser used an unconstrained
+    /// `name.find(prefix)`, so a user type like
+    /// `mystd::shared_ptr<Widget>` would match the embedded
+    /// `std::shared_ptr` substring at offset 2 and bind the stack slot
+    /// as a real `std::shared_ptr<Widget>`. The match must be anchored
+    /// at a class-qualifier boundary (position 0 or after a
+    /// non-identifier byte).
+    #[test]
+    fn smart_pointer_parser_does_not_match_substring_in_user_type() {
+        assert!(
+            parse_smart_pointer_kind_and_inner("mystd::shared_ptr<Widget>::reset()").is_none(),
+            "user type containing std::shared_ptr substring must not match"
+        );
+        // Sanity: the real std qualifier still matches.
+        assert_eq!(
+            parse_smart_pointer_kind_and_inner("std::shared_ptr<Widget>::reset()"),
+            Some((SmartPointerKind::Shared, "Widget".to_string()))
+        );
+    }
+
+    /// Binding size derives from the target's pointer width
+    /// (`db.arch().pointer_size`), not a hardcoded constant. On 32-bit
+    /// builds `unique_ptr<T>` is 4 bytes, `shared_ptr<T>` / `weak_ptr<T>`
+    /// are 8 — using the 64-bit value would absorb adjacent stack
+    /// locals.
+    #[test]
+    fn smart_pointer_binding_size_tracks_db_pointer_width() {
+        use hexray_types::database::ArchInfo;
+        let db32 = TypeDatabase::with_arch(ArchInfo::ilp32());
+        let call_shared = Expr::call(
+            CallTarget::Named("std::shared_ptr<Widget>::reset()".to_string()),
+            vec![rbp_plus(-16)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call_shared])], &db32, None);
+        assert_eq!(
+            bindings.get(-16).expect("binding").size,
+            8,
+            "shared_ptr on 32-bit = 2 * 4 bytes"
+        );
+
+        let call_unique = Expr::call(
+            CallTarget::Named("std::unique_ptr<int>::get() const".to_string()),
+            vec![rbp_plus(-8)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call_unique])], &db32, None);
+        assert_eq!(
+            bindings.get(-8).expect("binding").size,
+            4,
+            "unique_ptr on 32-bit = 1 * 4 bytes"
+        );
     }
 }
