@@ -261,8 +261,7 @@ pub fn scan_float_arg_registers(
                 .any(|o| matches!(o, Operand::Memory(_)));
             let is_memory_store = matches!(inst.operation, Operation::Store) && has_memory_operand;
             let is_load = matches!(inst.operation, Operation::Load);
-            let is_compare_or_test =
-                matches!(inst.operation, Operation::Compare | Operation::Test);
+            let is_compare_or_test = matches!(inst.operation, Operation::Compare | Operation::Test);
 
             if is_load {
                 // Only aarch64 `ldp` writes two leading register
@@ -5281,10 +5280,7 @@ mod tests {
         let cfg = single_block_cfg(vec![(
             "movd",
             Operation::Store,
-            vec![
-                Operand::Register(gpr(0, 32)),
-                Operand::Register(xmm(0)),
-            ],
+            vec![Operand::Register(gpr(0, 32)), Operand::Register(xmm(0))],
         )]);
         let block = cfg.entry_block().unwrap();
         let result = block_return_register_class(block, CallingConvention::SystemV);
