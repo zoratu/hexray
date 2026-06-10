@@ -1163,6 +1163,7 @@ impl Decompiler {
         let stack_struct_bindings = stack_struct_binding::analyze_with_builtin_db(
             &structured.body,
             self.binary_data.as_ref(),
+            self.calling_convention.pointer_size(),
         );
         for binding in stack_struct_bindings.iter() {
             merged_types.insert(binding.local_name.clone(), binding.type_name.clone());

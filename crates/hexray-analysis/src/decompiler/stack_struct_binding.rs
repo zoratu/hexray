@@ -115,12 +115,32 @@ impl StackStructBindings {
 
 /// Run [`StackStructBindings::analyze`] against the built-in posix/linux/libc
 /// type database (cached after first use). The pipeline call site uses this.
+///
+/// `pointer_size` overrides the cached DB's pointer width (which defaults to
+/// LP64) so smart-pointer bindings size their stack regions correctly on
+/// 32-bit targets. Pass `db.arch().pointer_size` if you have a custom DB;
+/// at the decompiler's call site this comes from
+/// [`CallingConvention::pointer_size`].
 pub fn analyze_with_builtin_db(
     nodes: &[StructuredNode],
     binary_data: Option<&BinaryDataContext>,
+    pointer_size: usize,
 ) -> StackStructBindings {
+    use hexray_types::database::ArchInfo;
+    // Clone the cached posix/linux/libc DB and override its arch with
+    // the caller's pointer width. The clone is cheap relative to
+    // re-building the type library and is the simplest way to keep
+    // the smart-pointer size derivation (which reads
+    // `db.arch().pointer_size`) in sync with the binary's actual
+    // word size on 32-bit targets.
+    let mut db = builtin_db().clone();
+    db.set_arch(ArchInfo {
+        pointer_size,
+        long_size: pointer_size,
+        big_endian: false,
+    });
     let mut bindings = StackStructBindings::new();
-    bindings.analyze(nodes, builtin_db(), binary_data);
+    bindings.analyze(nodes, &db, binary_data);
     bindings
 }
 
