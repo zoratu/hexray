@@ -13137,6 +13137,101 @@ mod tests {
         );
     }
 
+    /// SSE-2 Option A: when the emitter has a `BinaryDataContext`
+    /// containing rodata bytes, a rip-relative deref of size 8
+    /// whose target falls in a rodata section is rendered as the
+    /// concrete `double` literal — `3.14` here — rather than as an
+    /// opaque pointer-to-global.
+    #[test]
+    fn rodata_double_constant_materializes_as_literal() {
+        use super::super::BinaryDataContext;
+        // Build a context with .rodata starting at 0x1000 carrying
+        // the 8 bytes of double 3.14 at offset 0.
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 8] = 3.14f64.to_le_bytes();
+        ctx.add_section(0x1000, bytes.to_vec());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let table = StringTable::new();
+
+        // GotRef as produced by lifting `movsd xmm0, [rip + .Lconst]`
+        // where rip+offset resolves to 0x1000.
+        let display = Expr::int(0x1000);
+        let got_ref = Expr::got_ref(0x1000, 0x500, 8, display);
+
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert_eq!(formatted, "3.14", "rodata f64 should materialize");
+    }
+
+    /// SSE-2 Option A: the same path on a 4-byte single-precision
+    /// constant emits the `f` suffix so the recovered literal
+    /// preserves precision (`3.14f` not `3.14`).
+    #[test]
+    fn rodata_float_constant_materializes_with_f_suffix() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 4] = 2.5f32.to_le_bytes();
+        ctx.add_section(0x2000, bytes.to_vec());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let table = StringTable::new();
+
+        let display = Expr::int(0x2000);
+        let got_ref = Expr::got_ref(0x2000, 0x500, 4, display);
+
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert_eq!(formatted, "2.5f", "rodata f32 should materialize with f");
+    }
+
+    /// SSE-2 Option A safety: a rodata slot that happens to decode
+    /// to a denormal or sub-`1e-300` value (the shape of a misread
+    /// integer / pointer landing in rodata) must NOT be
+    /// materialized as a float — that would silently rename an int
+    /// constant as a meaningless `2e-322` style literal. Fall
+    /// through to the normal global-symbol path instead.
+    #[test]
+    fn rodata_misread_integer_does_not_materialize_as_float() {
+        use super::super::BinaryDataContext;
+        // Bytes for `uint64_t x = 42` (which as f64 is a denormal
+        // ~2.07e-322).
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 8] = 42u64.to_le_bytes();
+        ctx.add_section(0x3000, bytes.to_vec());
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let table = StringTable::new();
+
+        let display = Expr::int(0x3000);
+        let got_ref = Expr::got_ref(0x3000, 0x500, 8, display);
+
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert!(
+            !formatted.contains("e-3") && !formatted.contains("e-30"),
+            "misread integer must not materialize as denormal float: {formatted}"
+        );
+    }
+
+    /// SSE-2 Option A: without a `BinaryDataContext` the
+    /// materialization is a no-op and the existing global-name path
+    /// fires unchanged. Locked in so the new field doesn't
+    /// accidentally short-circuit the legacy flow for callers that
+    /// don't plumb the context.
+    #[test]
+    fn rodata_materialization_skipped_without_binary_data() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let table = StringTable::new();
+        let display = Expr::int(0x1000);
+        let got_ref = Expr::got_ref(0x1000, 0x500, 8, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert!(
+            !formatted.parse::<f64>().is_ok(),
+            "without binary_data, a bare GotRef must not produce a float literal: {formatted}"
+        );
+    }
+
     #[test]
     fn test_rip_relative_deref_in_compound_assignment() {
         use super::super::expression::{VarKind, Variable};
