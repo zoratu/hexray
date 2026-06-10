@@ -130,6 +130,18 @@ pub struct BinaryDataContext {
     call_target_names_by_address: HashMap<u64, String>,
     /// Resolved direct-call target names keyed by call-site address.
     call_target_names_by_call_site: HashMap<u64, String>,
+    /// Address ranges `[start, end)` of sections known to be
+    /// compiler-emitted float-constant pools — `.rodata.cst4`,
+    /// `.rodata.cst8`, `.rodata.cst16` on ELF and `__literal4`,
+    /// `__literal8`, `__literal16` on Mach-O. The emitter uses these
+    /// ranges to gate rip-relative float-literal materialization so
+    /// generic `.rodata` bytes (a `uint32_t` constant whose bit
+    /// pattern happens to equal `1.0f`) are NOT silently rewritten as
+    /// `1.0f`. Limitation: a static linker may merge `.rodata.cst*`
+    /// into a plain `.rodata`, in which case this range is empty for
+    /// the linked binary — that's a known follow-up for full IR-level
+    /// float-context tracking.
+    float_constant_pool_ranges: Vec<(u64, u64)>,
 }
 
 impl BinaryDataContext {
@@ -143,12 +155,31 @@ impl BinaryDataContext {
             call_signatures_by_address: HashMap::new(),
             call_target_names_by_address: HashMap::new(),
             call_target_names_by_call_site: HashMap::new(),
+            float_constant_pool_ranges: Vec::new(),
         }
     }
 
     /// Adds a data section.
     pub fn add_section(&mut self, base: u64, data: Vec<u8>) {
         self.sections.push((base, data));
+    }
+
+    /// Records that an address range belongs to a compiler-emitted
+    /// float-constant pool (`.rodata.cst{4,8,16}` on ELF;
+    /// `__literal{4,8,16}` on Mach-O). The emitter uses this to
+    /// gate rip-relative float-literal materialization.
+    pub fn add_float_constant_pool_range(&mut self, start: u64, end: u64) {
+        if end > start {
+            self.float_constant_pool_ranges.push((start, end));
+        }
+    }
+
+    /// True if the address sits inside any recorded float-constant
+    /// pool range.
+    pub fn is_float_constant_pool_address(&self, addr: u64) -> bool {
+        self.float_constant_pool_ranges
+            .iter()
+            .any(|(start, end)| addr >= *start && addr < *end)
     }
 
     /// Returns the section containing the given address.

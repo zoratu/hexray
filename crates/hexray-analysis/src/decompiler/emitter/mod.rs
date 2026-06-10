@@ -4370,6 +4370,14 @@ impl PseudoCodeEmitter {
         if !matches!(size, 4 | 8) {
             return None;
         }
+        // Gate strictly on float-constant-pool sections (`.rodata.cst*`
+        // / `__literal*`). Without this, a `uint32_t` constant in
+        // generic `.rodata` whose bit pattern equals a plausible
+        // float (e.g. `0x3f800000` = `1.0f`) would be silently
+        // rewritten as `1.0f`. Codex review on PR #26.
+        if !binary_data.is_float_constant_pool_address(address) {
+            return None;
+        }
         let (section, base) = binary_data.section_containing(address)?;
         let offset = usize::try_from(address.checked_sub(base)?).ok()?;
         let end = offset.checked_add(usize::from(size))?;
@@ -13150,6 +13158,7 @@ mod tests {
         let mut ctx = BinaryDataContext::new();
         let bytes: [u8; 8] = 3.14f64.to_le_bytes();
         ctx.add_section(0x1000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x1000, 0x1000 + bytes.len() as u64);
 
         let emitter =
             PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
@@ -13173,6 +13182,7 @@ mod tests {
         let mut ctx = BinaryDataContext::new();
         let bytes: [u8; 4] = 2.5f32.to_le_bytes();
         ctx.add_section(0x2000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x2000, 0x2000 + bytes.len() as u64);
 
         let emitter =
             PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
@@ -13199,6 +13209,7 @@ mod tests {
         let mut ctx = BinaryDataContext::new();
         let bytes: [u8; 8] = 42u64.to_le_bytes();
         ctx.add_section(0x3000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x3000, 0x3000 + bytes.len() as u64);
 
         let emitter =
             PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
@@ -13211,6 +13222,38 @@ mod tests {
         assert!(
             !formatted.contains("e-3") && !formatted.contains("e-30"),
             "misread integer must not materialize as denormal float: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26: the materialization MUST be gated on
+    /// the float-constant-pool flag, otherwise a `uint32_t` constant
+    /// in generic `.rodata` (which happens to have the bit pattern
+    /// of `1.0f` = `0x3f800000`) would be silently rewritten as
+    /// `1.0f`. With the section NOT registered as a float pool, the
+    /// materializer must skip even when bytes decode to a plausible
+    /// float.
+    #[test]
+    fn rodata_materialization_gated_on_float_constant_pool_flag() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        // The bit pattern of `1.0f` lives in generic `.rodata`, NOT a
+        // `.rodata.cst4` float-pool section. Without the pool flag,
+        // we must not rewrite this as `1.0f`.
+        let bytes: [u8; 4] = 1.0f32.to_le_bytes(); // 0x3f800000
+        ctx.add_section(0x4000, bytes.to_vec());
+        // NB: deliberately NOT calling add_float_constant_pool_range.
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let table = StringTable::new();
+
+        let display = Expr::int(0x4000);
+        let got_ref = Expr::got_ref(0x4000, 0x500, 4, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert!(
+            !formatted.contains("1.0f") && !formatted.contains("1.0"),
+            "generic-rodata bytes must not be materialized as a float: {formatted}"
         );
     }
 

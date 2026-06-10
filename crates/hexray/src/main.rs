@@ -4440,11 +4440,31 @@ fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
                 || name == "__text"
                 || name == ".text")
         {
-            ctx.add_section(section.virtual_address(), section.data().to_vec());
+            let base = section.virtual_address();
+            let len = section.data().len() as u64;
+            ctx.add_section(base, section.data().to_vec());
+            // Tag known float-constant-pool sections so the emitter
+            // can safely materialize their bytes as float literals
+            // without confusing a generic-rodata integer with a
+            // float. Names: `.rodata.cst{4,8,16}` (ELF) and
+            // `__literal{4,8,16}` (Mach-O).
+            if is_float_constant_pool_section_name(&name) {
+                ctx.add_float_constant_pool_range(base, base + len);
+            }
         }
     }
 
     ctx
+}
+
+fn is_float_constant_pool_section_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("rodata.cst4")
+        || lower.contains("rodata.cst8")
+        || lower.contains("rodata.cst16")
+        || lower.contains("__literal4")
+        || lower.contains("__literal8")
+        || lower.contains("__literal16")
 }
 
 fn seed_resolved_call_target_names(
