@@ -87,6 +87,20 @@ pub(super) fn format_float_literal_f32(value: f32) -> String {
     s
 }
 
+/// Returns true when `name` looks like a compiler-generated local
+/// pool label rather than a user-defined global. These show up as
+/// `.LCPI0_0`/`.LCPI1_0` (clang/LLVM), `.LC0`/`.LC1` (GCC), and
+/// similar `.L`-prefixed local labels. Such names are not meaningful
+/// to a human reader; when one of them is the only "symbol" at a
+/// rip-relative float load, materializing the literal `3.14` is more
+/// useful than the opaque label.
+pub(super) fn is_compiler_local_pool_label(name: &str) -> bool {
+    // ELF locals universally start with `.L`. Mach-O uses `L` (no dot)
+    // but Mach-O constant-pool emitters typically name slots like
+    // `lCPI0_0` — accept that too.
+    name.starts_with(".L") || name.starts_with("LCPI") || name.starts_with("lCPI")
+}
+
 /// Heuristic: do these `f64` bytes look like a real compiler-emitted
 /// float constant, as opposed to a misread integer / pointer / zeroed
 /// rodata slot?

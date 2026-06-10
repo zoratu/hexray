@@ -24,8 +24,9 @@ mod format;
 mod predicates;
 use format::{
     escape_string, format_as_char_literal, format_float_literal_f32, format_float_literal_f64,
-    format_integer, is_likely_character_constant, is_printable_char_value, is_special_char_value,
-    looks_like_char_context, looks_like_real_float_constant_f32, looks_like_real_float_constant_f64,
+    format_integer, is_compiler_local_pool_label, is_likely_character_constant,
+    is_printable_char_value, is_special_char_value, looks_like_char_context,
+    looks_like_real_float_constant_f32, looks_like_real_float_constant_f64,
 };
 use predicates::{
     canonical_decl_var_name, collect_decl_identifiers_from_emitted_body, contains_identifier_token,
@@ -5610,36 +5611,50 @@ impl PseudoCodeEmitter {
                 is_deref,
             } => {
                 // Float-constant materialization: a rip-relative deref
-                // of size 4 or 8 whose target falls inside a rodata
-                // section becomes the concrete `3.14` / `3.14f`
-                // literal, instead of an opaque pointer to a
-                // compiler-generated `.LCPI*` symbol. Runs BEFORE
-                // relocated_symbol_name / format_global_value so the
-                // useful value (`3.14`) wins over the meaningless
-                // pool-slot symbol name (`.LCPI0_0`). Bounded to
-                // finite, non-denormal values to avoid materializing
-                // a misread integer or pointer as a bogus float.
-                if *is_deref {
-                    if let Some(literal) =
-                        self.try_format_rodata_float_constant(*address, *size)
-                    {
-                        return literal;
-                    }
-                }
+                // of size 4 or 8 whose target falls inside a tagged
+                // `.rodata.cst*` / `__literal*` float-pool section
+                // becomes the concrete `3.14` / `3.14f` literal. We
+                // run materialization AFTER trying relocation /
+                // symbol resolution so that user-named globals win
+                // — but if the resolved name is a compiler-generated
+                // local pool label (`.LCPI*`, `.LC*`), the
+                // materialized literal is more useful than the
+                // opaque label and wins. Codex review on PR #26.
+                let materialized = if *is_deref {
+                    self.try_format_rodata_float_constant(*address, *size)
+                } else {
+                    None
+                };
                 if let Some(name) = self.relocated_symbol_name(*instruction_address, *address) {
+                    if is_compiler_local_pool_label(name) {
+                        if let Some(literal) = materialized {
+                            return literal;
+                        }
+                    }
                     let resolved = self.simplify_symbol_name(name);
                     if *is_deref {
                         return resolved;
                     }
                     return format!("&{}", resolved);
                 }
-                // Try symbol table
+                // Try symbol table — same rule applies: user-named globals
+                // win, but materialize when the only symbol is a pool label.
                 if *is_deref {
                     if let Some(value) = self.format_global_value(*address, *size) {
+                        if is_compiler_local_pool_label(&value) {
+                            if let Some(literal) = materialized {
+                                return literal;
+                            }
+                        }
                         return value;
                     }
                 } else if let Some(address_text) = self.format_global_address(*address) {
                     return address_text;
+                }
+                // No named symbol at all — anonymous compiler-emitted
+                // pool slot. Safe to materialize.
+                if let Some(literal) = materialized {
+                    return literal;
                 }
                 // Try string table
                 if let Some(s) = table.get(*address) {
