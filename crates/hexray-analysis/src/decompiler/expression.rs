@@ -2802,6 +2802,19 @@ fn instruction_loads_float_constant(inst: &Instruction) -> bool {
     };
     let name = reg.name().to_lowercase();
     let mnemonic = inst.mnemonic.to_ascii_lowercase();
+    let m = mnemonic.trim_start_matches('v'); // strip VEX `v` prefix
+
+    // x86 scalar FP→integer conversions: `cvttsd2si`/`cvtsd2si`/
+    // `cvttss2si`/`cvtss2si` write a GPR but the memory source is
+    // still a scalar float. The destination is NOT in the SSE bank
+    // here, so the register check below would miss them. Codex
+    // review on PR #26 pass 12.
+    if matches!(
+        m,
+        "cvttsd2si" | "cvtsd2si" | "cvttss2si" | "cvtss2si" | "cvttsd2siq" | "cvtsd2siq"
+    ) {
+        return true;
+    }
 
     // x86 SSE/AVX: float context requires a SCALAR float mnemonic
     // suffix (`ss` or `sd`). `movq`/`movd`/`movdqa`/`pinsrq`/`paddq`
@@ -2815,7 +2828,6 @@ fn instruction_loads_float_constant(inst: &Instruction) -> bool {
     // packed value. A future vector-literal representation could
     // re-enable packed support. Codex review on PR #26 pass 11.
     if name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm") {
-        let m = mnemonic.trim_start_matches('v'); // strip VEX `v` prefix
         return m.ends_with("ss") || m.ends_with("sd");
     }
 

@@ -13297,6 +13297,34 @@ mod tests {
         );
     }
 
+    /// Codex review on PR #26 pass 12: `-0.0` is a real compiler-
+    /// emitted float-pool constant — the xor-zero idiom can't
+    /// reproduce negative zero. The byte-level filter must accept
+    /// zero (positive and negative) when the address is in a
+    /// tagged float pool. The pool gate prevents generic-rodata
+    /// zeros from being misrendered.
+    #[test]
+    fn rodata_negative_zero_constant_materializes() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        // -0.0 = 0x8000_0000_0000_0000
+        let bytes: [u8; 8] = (-0.0f64).to_le_bytes();
+        ctx.add_section(0x9000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x9000, 0x9000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x9000);
+        let got_ref = Expr::got_ref_with_context(0x9000, 0x500, 8, display, true);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        // Rust formats negative zero as "-0".
+        assert!(
+            formatted.starts_with("-0"),
+            "-0.0 from a tagged float pool must materialize as a literal: {formatted}"
+        );
+    }
+
     /// Codex review on PR #26 pass 11: packed-float mnemonics
     /// (`movlps`/`movhps`/`addps`/`mulps`/etc.) load MULTIPLE
     /// single-precision lanes per access, not a scalar double.

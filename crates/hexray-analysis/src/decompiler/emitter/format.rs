@@ -123,8 +123,18 @@ pub(super) fn is_compiler_local_pool_label(name: &str) -> bool {
 /// values produced by reinterpreting `uint64_t x = 42` as a double
 /// (which becomes ~2e-322) are all excluded.
 pub(super) fn looks_like_real_float_constant_f64(value: f64) -> bool {
-    if !value.is_finite() || value == 0.0 || value.is_subnormal() {
+    if !value.is_finite() || value.is_subnormal() {
         return false;
+    }
+    // Zero is a legitimate `.rodata.cst*` constant — a compiler
+    // emits `+0.0` and especially `-0.0` (bit pattern
+    // `0x8000_0000_0000_0000`) into the constant pool because the
+    // `xor self-zero` idiom can't reproduce negative zero. The
+    // float-pool gate already prevents generic-rodata zeros from
+    // being materialized, so accepting zero here is safe. Codex
+    // review on PR #26 pass 12.
+    if value == 0.0 {
+        return true;
     }
     let abs = value.abs();
     // 1e-300..1e300 covers everything from sub-picometer physics
@@ -141,8 +151,14 @@ pub(super) fn looks_like_real_float_constant_f64(value: f64) -> bool {
 /// float constant? Same idea as the f64 variant; range scaled for the
 /// narrower exponent.
 pub(super) fn looks_like_real_float_constant_f32(value: f32) -> bool {
-    if !value.is_finite() || value == 0.0 || value.is_subnormal() {
+    if !value.is_finite() || value.is_subnormal() {
         return false;
+    }
+    // Zero allowed for the same reason as the f64 variant — `-0.0f`
+    // is a real `.rodata.cst4` constant the xor-zero idiom can't
+    // reproduce. Codex review on PR #26 pass 12.
+    if value == 0.0 {
+        return true;
     }
     let abs = value.abs();
     (1e-30..=1e30).contains(&abs)
