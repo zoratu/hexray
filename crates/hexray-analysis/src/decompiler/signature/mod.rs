@@ -355,7 +355,18 @@ fn is_frame_base_memory(mem: &hexray_core::MemoryRef) -> bool {
     mem.base
         .as_ref()
         .map(|r| r.name().to_lowercase())
-        .is_some_and(|n| matches!(n.as_str(), "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp"))
+        .is_some_and(|n| {
+            matches!(
+                n.as_str(),
+                // x86_64 / x86
+                "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp"
+                // aarch64: x29/fp is the frame pointer, x31 = sp.
+                // `-O0` spills land at `[x29, #N]` after the
+                // `mov x29, sp` setup. Codex review on PR #27
+                // pass 5.
+                | "x29" | "fp" | "x31"
+            )
+        })
 }
 
 /// Quick check for the standard x86_64 prologue setup instructions
@@ -5412,6 +5423,29 @@ mod tests {
     // stores after them would pollute observations). The new
     // `scan_param_spill_order_terminates_on_reg_reg_move` test
     // covers the corrected behavior.
+
+    /// Codex review on PR #27 pass 5: aarch64 `-O0` typically
+    /// spills parameters relative to `x29` (frame pointer) after
+    /// `mov x29, sp` — `str d0, [x29, #-8]`. The frame-base check
+    /// must accept x29/fp/x31 in addition to the x86 rbp/rsp set.
+    #[test]
+    fn scan_param_spill_order_accepts_x29_relative_spills() {
+        let x29 = aarch64_x(29, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(x29, -8)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: -8,
+            }],
+            "x29-relative spill must be recognized"
+        );
+    }
 
     /// Codex review on PR #27 pass 4: aarch64 single-precision
     /// spills use the `s0`/`s1` register name. The scanner must
