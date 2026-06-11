@@ -4628,6 +4628,7 @@ fn rewrite_known_noreturn_calls_in_expr(
             size,
             display_expr,
             is_deref,
+            is_float_context,
         } => ExprKind::GotRef {
             address,
             instruction_address,
@@ -4637,6 +4638,7 @@ fn rewrite_known_noreturn_calls_in_expr(
                 known_noreturn_targets,
             )),
             is_deref,
+            is_float_context,
         },
         ExprKind::AddressOf(inner) => ExprKind::AddressOf(Box::new(
             rewrite_known_noreturn_calls_in_expr(*inner, known_noreturn_targets),

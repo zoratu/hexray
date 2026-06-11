@@ -6759,6 +6759,7 @@ fn substitute_stack_slot_values(expr: Expr, stack_slot_values: &HashMap<String, 
             size,
             display_expr,
             is_deref,
+            is_float_context,
         } => Expr {
             kind: ExprKind::GotRef {
                 address,
@@ -6769,6 +6770,7 @@ fn substitute_stack_slot_values(expr: Expr, stack_slot_values: &HashMap<String, 
                     stack_slot_values,
                 )),
                 is_deref,
+                is_float_context,
             },
         },
     }
@@ -6897,6 +6899,7 @@ fn stabilize_saved_arg_registers_excluding(expr: Expr, excluded: &HashSet<String
             size,
             display_expr,
             is_deref,
+            is_float_context,
         } => Expr {
             kind: ExprKind::GotRef {
                 address,
@@ -6904,6 +6907,7 @@ fn stabilize_saved_arg_registers_excluding(expr: Expr, excluded: &HashSet<String
                 size,
                 display_expr: Box::new(rec(*display_expr)),
                 is_deref,
+                is_float_context,
             },
         },
     }
@@ -10719,6 +10723,7 @@ fn substitute_loaded_return_value_uses(
                 size,
                 display_expr,
                 is_deref,
+                is_float_context,
             } => Expr {
                 kind: ExprKind::GotRef {
                     address,
@@ -10732,6 +10737,7 @@ fn substitute_loaded_return_value_uses(
                         false,
                     )),
                     is_deref,
+                    is_float_context,
                 },
             },
         }
@@ -10875,6 +10881,7 @@ pub(super) fn substitute_return_register_uses(
                 size,
                 display_expr,
                 is_deref,
+                is_float_context,
             } => Expr {
                 kind: ExprKind::GotRef {
                     address,
@@ -10882,6 +10889,7 @@ pub(super) fn substitute_return_register_uses(
                     size,
                     display_expr: Box::new(sub(*display_expr, aliases, replacement, false)),
                     is_deref,
+                    is_float_context,
                 },
             },
         }

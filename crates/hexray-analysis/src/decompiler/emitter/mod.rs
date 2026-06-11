@@ -2190,6 +2190,7 @@ impl PseudoCodeEmitter {
                 size,
                 display_expr,
                 is_deref,
+                is_float_context,
             } => Expr {
                 kind: ExprKind::GotRef {
                     address,
@@ -2201,6 +2202,7 @@ impl PseudoCodeEmitter {
                         true,
                     )),
                     is_deref,
+                    is_float_context,
                 },
             },
             ExprKind::AddressOf(inner) => {
