@@ -278,59 +278,42 @@ pub fn scan_param_spill_order(
         //   x86 `mov [mem], reg`:    [Memory(dst), Register(src)]
         //   aarch64 `str reg, [mem]`: [Register(src), Memory(dst)]
         //   aarch64 `stp r1, r2, [mem]`: [Reg, Reg, Memory] (pair)
-        // Sniff the layout from operand[0] and route to the right
-        // (mem_offset, src_register) extraction. Codex review on
-        // PR #27 pass 3.
+        // Convention disambiguates: a reg→mem ordering on x86 is
+        // actually a RELOAD (`mov edi, [rbp-12]`), not a spill, so
+        // we'd misread it as an aarch64 STR if we accepted both
+        // forms unconditionally. Codex review on PR #27 pass 3.
+        let is_aarch64 = matches!(convention, CallingConvention::Aarch64);
         let observations = match (inst.operands.first(), inst.operands.get(1)) {
-            (Some(Operand::Memory(mem)), Some(Operand::Register(src))) => {
-                // x86 store form. Validate memory base is the
-                // frame.
+            (Some(Operand::Memory(mem)), Some(Operand::Register(src))) if !is_aarch64 => {
                 if !is_frame_base_memory(mem) {
-                    // Operand[0] is memory but not the frame —
-                    // body store to a heap/global, NOT a prologue
-                    // spill. Stop scanning: any later store can
-                    // pollute observations. Codex review on PR
-                    // #27 pass 3.
+                    // Body store to a heap/global — stop scanning.
                     break;
                 }
                 vec![(mem.displacement, src.name().to_lowercase())]
             }
-            (Some(Operand::Register(src)), Some(Operand::Memory(mem))) => {
-                // aarch64 STR form (single register source).
+            (Some(Operand::Register(src)), Some(Operand::Memory(mem))) if is_aarch64 => {
+                // aarch64 STR form.
                 if !is_frame_base_memory(mem) {
                     break;
                 }
                 vec![(mem.displacement, src.name().to_lowercase())]
             }
-            (Some(Operand::Register(src1)), Some(Operand::Register(src2))) => {
-                // Two register operands: either aarch64 STP (third
-                // operand is memory) or x86 reg-reg `mov rax, rdi`
-                // (body work — stop scanning). Codex review on
-                // PR #27 pass 3.
+            (Some(Operand::Register(src1)), Some(Operand::Register(src2))) if is_aarch64 => {
+                // aarch64 STP — third operand is the memory dest.
                 match inst.operands.get(2) {
                     Some(Operand::Memory(mem)) if is_frame_base_memory(mem) => {
                         let base = mem.displacement;
-                        // STP packs both registers contiguously.
-                        // The displacement of the second register
-                        // is base + 8 (assuming 64-bit slots).
                         vec![
                             (base, src1.name().to_lowercase()),
                             (base + 8, src2.name().to_lowercase()),
                         ]
                     }
-                    _ => {
-                        // Reg-reg move with no memory — body work.
-                        break;
-                    }
+                    _ => break,
                 }
             }
-            (Some(Operand::Register(_)), _) => {
-                // Single register operand or register + immediate
-                // — body work. Stop scanning. Codex review on PR
-                // #27 pass 3.
-                break;
-            }
-            _ => continue,
+            // Everything else (x86 reload `mov reg, [mem]`, x86
+            // reg-reg, aarch64 reg-imm, etc.) is body work — stop.
+            _ => break,
         };
 
         for (offset, reg_name) in observations {
@@ -5402,35 +5385,12 @@ mod tests {
         );
     }
 
-    /// SSE-1: the same scanner must NOT record reg-to-reg moves
-    /// (`mov rax, rbp`) as spills — those don't have a memory
-    /// operand and don't pin down a source-declaration position.
-    #[test]
-    fn scan_param_spill_order_ignores_reg_to_reg_moves() {
-        let rbp = gpr(5, 64);
-        let rax = gpr(0, 64);
-        let edi = gpr(7, 32);
-        let cfg = single_block_cfg(vec![
-            (
-                "mov",
-                Operation::Move,
-                vec![Operand::Register(rax), Operand::Register(rbp)],
-            ),
-            (
-                "mov",
-                Operation::Move,
-                vec![mem(rbp, -12), Operand::Register(edi)],
-            ),
-        ]);
-        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
-        assert_eq!(
-            order,
-            vec![ParamSpillObservation {
-                register: "edi".to_string(),
-                offset: -12,
-            }]
-        );
-    }
+    // Removed `scan_param_spill_order_ignores_reg_to_reg_moves`:
+    // pass-3 strengthening means reg-reg moves correctly TERMINATE
+    // the scan rather than being silently skipped (otherwise body
+    // stores after them would pollute observations). The new
+    // `scan_param_spill_order_terminates_on_reg_reg_move` test
+    // covers the corrected behavior.
 
     /// Codex review on PR #27 pass 3: aarch64 `str d0, [sp, #8]`
     /// has operand[0] = register (source), operand[1] = memory
