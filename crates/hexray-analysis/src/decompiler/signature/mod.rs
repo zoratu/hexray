@@ -261,15 +261,19 @@ pub fn scan_param_spill_order(
             || mnemonic.starts_with("endbr")
             || is_frame_setup_or_sp_adjust(inst);
 
+        // Frame setup (`mov rbp, rsp`) and stack adjust both look
+        // like `Operation::Move` with two register operands or
+        // a register + immediate — we must skip them BEFORE the
+        // operand-layout check (which would treat reg-reg as a
+        // body-work break).
+        if is_prologue_scaffold {
+            continue;
+        }
+
         let is_potential_spill = matches!(inst.operation, Operation::Store | Operation::Move);
         if !is_potential_spill {
-            if is_prologue_scaffold {
-                continue;
-            }
-            // Hit non-prologue body — stop scanning. Anything after
-            // this point is function-body work, not the
-            // source-order spill sequence. Codex review on PR #27
-            // pass 1.
+            // Hit non-prologue body — stop scanning. Codex review
+            // on PR #27 pass 1.
             break;
         }
 
@@ -4524,12 +4528,6 @@ impl SignatureRecovery {
     /// the end in their existing relative order — a stable
     /// fallback that preserves the leaf-case heuristic. SSE-1.
     fn reorder_params_by_spill_offset(&self, sig: &mut FunctionSignature) {
-        eprintln!(
-            "[reorder2] func={:?} params={} spills={:?}",
-            self.current_func_name,
-            sig.parameters.len(),
-            self.param_spill_order
-        );
         if sig.parameters.len() < 2 || self.param_spill_order.is_empty() {
             return;
         }
