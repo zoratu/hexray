@@ -2803,14 +2803,20 @@ fn instruction_loads_float_constant(inst: &Instruction) -> bool {
     let name = reg.name().to_lowercase();
     let mnemonic = inst.mnemonic.to_ascii_lowercase();
 
-    // x86 SSE/AVX: float context requires a scalar/packed FP
-    // mnemonic suffix (`ss`/`sd`/`ps`/`pd`). `movq`/`movd`/`movdqa`/
-    // `pinsrq`/`paddq`/... all write to xmm/ymm/zmm too but are
-    // integer-SIMD or generic bit moves — they must NOT trigger
-    // float materialization.
+    // x86 SSE/AVX: float context requires a SCALAR float mnemonic
+    // suffix (`ss` or `sd`). `movq`/`movd`/`movdqa`/`pinsrq`/`paddq`
+    // all write to xmm/ymm/zmm but are integer-SIMD or generic bit
+    // moves — they must NOT trigger float materialization.
+    //
+    // Packed mnemonics (`ps`/`pd`) are intentionally EXCLUDED:
+    // `movlps xmm0, [rip + .LC]` loads two `f32` lanes into the
+    // low quadword, so the 8 bytes are NOT a scalar `f64` and
+    // materializing them as one double would mis-recover the
+    // packed value. A future vector-literal representation could
+    // re-enable packed support. Codex review on PR #26 pass 11.
     if name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm") {
         let m = mnemonic.trim_start_matches('v'); // strip VEX `v` prefix
-        return m.ends_with("ss") || m.ends_with("sd") || m.ends_with("ps") || m.ends_with("pd");
+        return m.ends_with("ss") || m.ends_with("sd");
     }
 
     // aarch64 vector/FP register-file aliases at any width. On

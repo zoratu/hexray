@@ -13297,6 +13297,45 @@ mod tests {
         );
     }
 
+    /// Codex review on PR #26 pass 11: packed-float mnemonics
+    /// (`movlps`/`movhps`/`addps`/`mulps`/etc.) load MULTIPLE
+    /// single-precision lanes per access, not a scalar double.
+    /// `movlps xmm0, [rip + .LC]` reads 8 bytes = two `f32` values.
+    /// Treating those 8 bytes as one `f64` would mis-decode the
+    /// packed value. The lift must NOT tag packed-suffix opcodes
+    /// with is_float_context. Verify a GotRef produced without that
+    /// flag (as `movlps` would be) doesn't materialize.
+    #[test]
+    fn rodata_materialization_skipped_for_packed_float_opcode() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        // Two packed f32 lanes — a plausible `.rodata.cst8` payload
+        // for movlps.
+        let mut bytes = [0u8; 8];
+        bytes[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&2.0f32.to_le_bytes());
+        ctx.add_section(0x8000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x8000, 0x8000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x8000);
+        // GotRef WITHOUT float context — as produced by lifting
+        // `movlps xmm0, [rip + .LC]` (packed-singles load).
+        let got_ref = Expr::got_ref(0x8000, 0x500, 8, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        // The 8 bytes happen to decode as a finite f64; the materializer
+        // must NOT fire because is_float_context is false for packed ops.
+        // The fallback format is `*(uint64_t*)(&g_<addr>)` — an opaque
+        // global deref, not a parseable float literal.
+        assert!(
+            formatted.contains("g_") || formatted.contains("(&"),
+            "packed-float bytes must fall through to global-deref form: {formatted}"
+        );
+    }
+
     /// Codex review on PR #26 pass 9: when a scalar float load
     /// targets an offset inside a larger pool symbol (the second
     /// double in a `.rodata.cst16` slot), `format_global_value`
