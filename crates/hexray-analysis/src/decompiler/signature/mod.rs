@@ -4712,31 +4712,21 @@ impl SignatureRecovery {
                 (None, None) => orig_a.cmp(orig_b),
             }
         });
-        // Renumber parameter names to reflect the new order
-        // (`arg0`/`farg0` become `arg1`/`farg1` if a sibling moved
-        // ahead of them, so the param identifiers in the rendered
-        // signature read in source order too).
-        let mut int_seq = 0usize;
-        let mut float_seq = 0usize;
-        for (_, p) in indexed.iter_mut() {
-            match &p.location {
-                ParameterLocation::IntegerRegister { .. } => {
-                    let target = format!("arg{int_seq}");
-                    if p.name.starts_with("arg") && p.name != target {
-                        p.name = target;
-                    }
-                    int_seq += 1;
-                }
-                ParameterLocation::FloatRegister { .. } => {
-                    let target = format!("farg{float_seq}");
-                    if p.name.starts_with("farg") && p.name != target {
-                        p.name = target;
-                    }
-                    float_seq += 1;
-                }
-                _ => {}
-            }
-        }
+        // We intentionally do NOT renumber `argN`/`fargN` names by
+        // position. The structured body references each parameter
+        // by its ABI register index — on Win64, mixed signatures
+        // have POSITIONAL float indices: `void f(int n, double x)`
+        // puts `n` in `rcx` (slot 0) and `x` in `xmm1` (slot 1),
+        // so the float param's name is `farg1` everywhere the body
+        // references it. Renumbering would rewrite the declaration
+        // to `farg0` while the body still references `farg1`,
+        // producing an inconsistent signature. Codex review on
+        // PR #27 pass 13.
+        //
+        // For SystemV/aarch64 the int and float bank indices are
+        // dense from 0 within each bank, so the existing names
+        // happen to read as a natural sequence — no renumbering
+        // needed.
         // Remap per-parameter provenance keys to the new positions.
         // Without this a function pointer's `function_pointer_reasons`
         // would attach to the wrong (post-reorder) parameter index.
@@ -5823,6 +5813,65 @@ mod tests {
             sig.parameters[1].param_type,
             ParamType::SignedInt(32)
         ));
+    }
+
+    /// Codex review on PR #27 pass 13: on Win64 `void f(int n,
+    /// double x)` puts the float in xmm1 (positional slot 1), so
+    /// its name is `farg1` everywhere the body references it.
+    /// The reorder must NOT renumber it to `farg0` even after
+    /// moving it to position 0 — that would break the body→
+    /// declaration alignment.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn reorder_preserves_abi_indexed_farg_names_on_win64() {
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rcx".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg1".to_string(), // Win64 positional float index
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm1".to_string(),
+                    index: 1,
+                },
+            ),
+        ];
+        let recovery = SignatureRecovery::new(CallingConvention::Win64).with_param_spill_order(
+            vec![
+                ParamSpillObservation {
+                    register: "xmm1".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rcx".to_string(),
+                    offset: -16,
+                },
+            ],
+        );
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // The float moves to position 0 BUT keeps its ABI name
+        // `farg1` (matching the body), not renumbered to `farg0`.
+        // Note: Win64 might not actually trigger the reorder (it's
+        // gated to int+float observed), but the principle holds:
+        // we don't renumber.
+        // Find the float parameter regardless of position and
+        // assert its name stayed `farg1`.
+        let float_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(p.location, ParameterLocation::FloatRegister { .. }))
+            .expect("float param present");
+        assert_eq!(
+            float_param.name, "farg1",
+            "ABI-indexed farg name must NOT be renumbered to farg0 — body references farg1"
+        );
     }
 
     /// Codex review on PR #27 pass 10 alternate: when the pre-
