@@ -1390,6 +1390,10 @@ impl Decompiler {
                     self.calling_convention,
                 ))
                 .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention))
+                .with_param_spill_order(signature::scan_param_spill_order(
+                    cfg,
+                    self.calling_convention,
+                ))
                 .analyze(&structured);
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else {
@@ -2315,7 +2319,11 @@ impl Decompiler {
                 cfg,
                 self.calling_convention,
             ))
-            .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention));
+            .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention))
+            .with_param_spill_order(signature::scan_param_spill_order(
+                cfg,
+                self.calling_convention,
+            ));
         recovery.analyze(&structured)
     }
 

@@ -156,6 +156,11 @@ pub struct SignatureRecovery {
     /// params before all float params, which is wrong whenever
     /// source order interleaves the two.
     float_arg_spill_offsets: HashMap<usize, HashSet<i128>>,
+    /// Prologue spill observations from the raw CFG, used to recover
+    /// the mixed int/float source declaration order. Seeded via
+    /// [`Self::with_param_spill_order`] before [`Self::analyze`] runs.
+    /// See [`scan_param_spill_order`] for the producer.
+    param_spill_order: Vec<ParamSpillObservation>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -204,6 +209,105 @@ pub struct SignatureRecovery {
     sysv_va_start_seen: bool,
     /// Fixed non-variadic prefix inferred for the current function.
     variadic_fixed_param_count: Option<usize>,
+}
+
+/// One observation of an argument register being spilled to a
+/// stack slot in the function prologue. The vector returned by
+/// [`scan_param_spill_order`] preserves instruction order, so the
+/// FIRST entry is the FIRST source parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamSpillObservation {
+    /// Lowercase register name (`xmm0`, `rdi`, `edi`, `d0`, ...).
+    pub register: String,
+    /// Frame-relative stack offset where the spill landed.
+    pub offset: i64,
+}
+
+/// Scan the raw instruction stream for parameter-register spills
+/// in the function prologue.
+///
+/// At `-O0`, the compiler emits one spill per parameter register in
+/// source-declaration order. By returning the spill observations in
+/// instruction order, callers can reconstruct the mixed int/float
+/// source order — `double scale_sum(double x, int n)` produces
+/// `[(xmm0, -8), (edi, -16)]`, indicating the float arg was
+/// source-first even though both `xmm0` (float bank index 0) and
+/// `edi` (int bank index 0) would otherwise look interchangeable.
+///
+/// Conservative: stops scanning as soon as a non-spill, non-prologue
+/// instruction is seen, so loop bodies don't pollute the ordering.
+pub fn scan_param_spill_order(
+    cfg: &ControlFlowGraph,
+    convention: CallingConvention,
+) -> Vec<ParamSpillObservation> {
+    let mut result = Vec::new();
+    let int_regs: HashSet<String> = convention
+        .integer_arg_registers()
+        .iter()
+        .chain(convention.integer_arg_registers_32().iter())
+        .map(|r| r.to_lowercase())
+        .collect();
+    let float_regs: HashSet<String> = convention
+        .float_arg_registers()
+        .iter()
+        .map(|r| r.to_lowercase())
+        .collect();
+    let Some(entry) = cfg.entry_block() else {
+        return result;
+    };
+    let mut seen_regs: HashSet<String> = HashSet::new();
+    for inst in &entry.instructions {
+        if !matches!(inst.operation, Operation::Store) {
+            // Non-store: keep scanning past push/mov-reg-reg/sub-rsp
+            // prologue scaffolding. A reg-reg move that copies an
+            // arg register elsewhere doesn't disturb the spill
+            // sequence; only a STORE produces a spill observation.
+            continue;
+        }
+        // Find the (memory-destination, register-source) pair.
+        let mut mem_offset: Option<i64> = None;
+        let mut src_reg: Option<String> = None;
+        for operand in &inst.operands {
+            match operand {
+                Operand::Memory(mem) => {
+                    if mem_offset.is_some() {
+                        continue;
+                    }
+                    if mem.index.is_some() {
+                        continue;
+                    }
+                    let base_name = mem.base.as_ref().map(|r| r.name().to_lowercase());
+                    if let Some(name) = base_name {
+                        if matches!(name.as_str(), "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp") {
+                            mem_offset = Some(mem.displacement);
+                        }
+                    }
+                }
+                Operand::Register(reg) => {
+                    if src_reg.is_some() {
+                        continue;
+                    }
+                    let name = reg.name().to_lowercase();
+                    if int_regs.contains(&name) || float_regs.contains(&name) {
+                        src_reg = Some(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(offset), Some(reg)) = (mem_offset, src_reg) {
+            // De-dup: a reg spilled to multiple slots only counts
+            // once (the FIRST observation, which is the prologue
+            // spill).
+            if seen_regs.insert(reg.clone()) {
+                result.push(ParamSpillObservation {
+                    register: reg,
+                    offset,
+                });
+            }
+        }
+    }
+    result
 }
 
 /// Scan the raw instruction stream for floating-point argument registers.
@@ -711,6 +815,7 @@ impl SignatureRecovery {
             param_names: HashMap::new(),
             arg_spill_offsets: HashMap::new(),
             float_arg_spill_offsets: HashMap::new(),
+            param_spill_order: Vec::new(),
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
@@ -758,6 +863,14 @@ impl SignatureRecovery {
     /// instruction stream. Use [`scan_float_return`] to compute it from a CFG.
     pub fn with_float_return_seed(mut self, size: Option<u8>) -> Self {
         self.float_return_seed = size;
+        self
+    }
+
+    /// Seeds prologue parameter-spill observations from the raw CFG.
+    /// Use [`scan_param_spill_order`] to compute them. Carries the
+    /// source-declaration order across the int/float bank split.
+    pub fn with_param_spill_order(mut self, order: Vec<ParamSpillObservation>) -> Self {
+        self.param_spill_order = order;
         self
     }
 
@@ -4377,42 +4490,72 @@ impl SignatureRecovery {
     /// the end in their existing relative order — a stable
     /// fallback that preserves the leaf-case heuristic. SSE-1.
     fn reorder_params_by_spill_offset(&self, sig: &mut FunctionSignature) {
-        if sig.parameters.len() < 2 {
+        if sig.parameters.len() < 2 || self.param_spill_order.is_empty() {
             return;
         }
-        // Require observed spills from BOTH an int and a float
-        // parameter before reordering. The leaf-case heuristic
-        // already produces correct output for all-int or all-float
-        // signatures; reshuffling those by partial spill info would
-        // risk regressing them.
-        let any_int_observed = sig.parameters.iter().any(|p| match &p.location {
-            ParameterLocation::IntegerRegister { index, .. } => {
-                self.arg_spill_offsets.contains_key(index)
-            }
-            _ => false,
-        });
-        let any_float_observed = sig.parameters.iter().any(|p| match &p.location {
-            ParameterLocation::FloatRegister { index, .. } => {
-                self.float_arg_spill_offsets.contains_key(index)
-            }
-            _ => false,
-        });
-        if !(any_int_observed && any_float_observed) {
-            return;
-        }
-        let spill_offset_for = |p: &Parameter| -> Option<i128> {
+        // Build a register-name → spill-offset lookup from the raw
+        // prologue scan (already in instruction order, but we sort
+        // by offset for robustness). The bank-class mapping in each
+        // parameter's ParameterLocation tells us which spill to use.
+        let int_arg_regs: Vec<String> = self
+            .convention
+            .integer_arg_registers()
+            .iter()
+            .map(|r| r.to_lowercase())
+            .collect();
+        let int_arg_regs_32: Vec<String> = self
+            .convention
+            .integer_arg_registers_32()
+            .iter()
+            .map(|r| r.to_lowercase())
+            .collect();
+        let float_arg_regs: Vec<String> = self
+            .convention
+            .float_arg_registers()
+            .iter()
+            .map(|r| r.to_lowercase())
+            .collect();
+
+        let spill_offset_for = |p: &Parameter| -> Option<i64> {
             match &p.location {
-                ParameterLocation::IntegerRegister { index, .. } => self
-                    .arg_spill_offsets
-                    .get(index)
-                    .and_then(|s| s.iter().copied().min()),
-                ParameterLocation::FloatRegister { index, .. } => self
-                    .float_arg_spill_offsets
-                    .get(index)
-                    .and_then(|s| s.iter().copied().min()),
+                ParameterLocation::IntegerRegister { index, .. } => {
+                    let r64 = int_arg_regs.get(*index)?;
+                    let r32 = int_arg_regs_32.get(*index);
+                    self.param_spill_order
+                        .iter()
+                        .find(|obs| &obs.register == r64 || r32 == Some(&obs.register))
+                        .map(|obs| obs.offset)
+                }
+                ParameterLocation::FloatRegister { index, .. } => {
+                    let r = float_arg_regs.get(*index)?;
+                    self.param_spill_order
+                        .iter()
+                        .find(|obs| &obs.register == r)
+                        .map(|obs| obs.offset)
+                }
                 _ => None,
             }
         };
+
+        // Require observed spills from BOTH an int and a float
+        // parameter before reordering. All-int and all-float
+        // signatures already come out in source order from the
+        // existing leaf-case heuristic; reshuffling those by
+        // partial spill info would risk regressing them.
+        let any_int_observed = sig
+            .parameters
+            .iter()
+            .any(|p| matches!(p.location, ParameterLocation::IntegerRegister { .. })
+                && spill_offset_for(p).is_some());
+        let any_float_observed = sig
+            .parameters
+            .iter()
+            .any(|p| matches!(p.location, ParameterLocation::FloatRegister { .. })
+                && spill_offset_for(p).is_some());
+        if !(any_int_observed && any_float_observed) {
+            return;
+        }
+
         let mut indexed: Vec<(usize, Parameter)> =
             sig.parameters.drain(..).enumerate().collect();
         indexed.sort_by(|(orig_a, a), (orig_b, b)| {
@@ -4430,6 +4573,31 @@ impl SignatureRecovery {
                 (None, None) => orig_a.cmp(orig_b),
             }
         });
+        // Renumber parameter names to reflect the new order
+        // (`arg0`/`farg0` become `arg1`/`farg1` if a sibling moved
+        // ahead of them, so the param identifiers in the rendered
+        // signature read in source order too).
+        let mut int_seq = 0usize;
+        let mut float_seq = 0usize;
+        for (_, p) in indexed.iter_mut() {
+            match &p.location {
+                ParameterLocation::IntegerRegister { .. } => {
+                    let target = format!("arg{int_seq}");
+                    if p.name.starts_with("arg") && p.name != target {
+                        p.name = target;
+                    }
+                    int_seq += 1;
+                }
+                ParameterLocation::FloatRegister { .. } => {
+                    let target = format!("farg{float_seq}");
+                    if p.name.starts_with("farg") && p.name != target {
+                        p.name = target;
+                    }
+                    float_seq += 1;
+                }
+                _ => {}
+            }
+        }
         sig.parameters = indexed.into_iter().map(|(_, p)| p).collect();
     }
 
