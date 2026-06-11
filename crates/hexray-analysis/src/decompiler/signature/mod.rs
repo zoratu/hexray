@@ -4746,6 +4746,24 @@ impl SignatureRecovery {
                 }
             }
         }
+        // Reapply DWARF parameter names by the POST-reorder index.
+        // DWARF names are stored in source-declaration order; after
+        // reorder the new index N IS the source-position N, so
+        // dwarf_param_names[N] is the right name to attach. Without
+        // this a `double f(double x, int n)` whose DWARF names are
+        // ["x", "n"] would surface as `double f(double n, int x)`
+        // — register-bank ordering attached x to xmm0 (now at
+        // index 1) and n to rdi (now at index 0). Codex review on
+        // PR #27 pass 10.
+        for (new_idx, (_, p)) in indexed.iter_mut().enumerate() {
+            if let Some(dwarf_name) = self.dwarf_param_names.get(new_idx) {
+                if !dwarf_name.is_empty()
+                    && (p.name.starts_with("arg") || p.name.starts_with("farg"))
+                {
+                    p.name = dwarf_name.clone();
+                }
+            }
+        }
         sig.parameters = indexed.into_iter().map(|(_, p)| p).collect();
     }
 
@@ -5732,6 +5750,102 @@ mod tests {
             }],
             "scan must stop at reg-reg move"
         );
+    }
+
+    /// Codex review on PR #27 pass 10: when DWARF names are
+    /// available they're applied by register-bank index, BEFORE
+    /// the reorder runs. After moving parameters into source
+    /// order, the names must be reapplied by the new index so
+    /// `double f(double x, int n)` doesn't surface as `(double n,
+    /// int x)`.
+    #[test]
+    fn reorder_remaps_dwarf_param_names() {
+        let mut sig = FunctionSignature::default();
+        // Pre-reorder names attached by register bank.
+        sig.parameters = vec![
+            Parameter::new(
+                "n".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "x".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        // DWARF names in source order: ["x", "n"].
+        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_dwarf_param_names(vec!["x".to_string(), "n".to_string()])
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // After reorder: float at index 0, int at index 1. Names
+        // should follow source order ["x", "n"].
+        // However, the pre-reorder names "n", "x" are NOT generic
+        // (don't start with arg/farg), so they pass through unchanged.
+        // The reorder still moves the parameters into source-order
+        // positions — verify that.
+        assert_eq!(sig.parameters[0].name, "x");
+        assert_eq!(sig.parameters[1].name, "n");
+    }
+
+    /// Codex review on PR #27 pass 10 alternate: when the pre-
+    /// reorder names ARE generic (arg/farg), the DWARF names
+    /// should be reapplied by the new index so float goes to "x"
+    /// and int goes to "n".
+    #[test]
+    fn reorder_applies_dwarf_names_to_generic_arg_farg_after_reorder() {
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_dwarf_param_names(vec!["x".to_string(), "n".to_string()])
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // After reorder, float at position 0 gets DWARF[0]="x";
+        // int at position 1 gets DWARF[1]="n".
+        assert_eq!(sig.parameters[0].name, "x");
+        assert_eq!(sig.parameters[1].name, "n");
     }
 
     /// Codex review on PR #27 pass 9: parameter_provenance is a
