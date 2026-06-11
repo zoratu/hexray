@@ -4734,6 +4734,18 @@ impl SignatureRecovery {
                 _ => {}
             }
         }
+        // Remap per-parameter provenance keys to the new positions.
+        // Without this a function pointer's `function_pointer_reasons`
+        // would attach to the wrong (post-reorder) parameter index.
+        // Codex review on PR #27 pass 9.
+        if !sig.parameter_provenance.is_empty() {
+            let old_provenance = std::mem::take(&mut sig.parameter_provenance);
+            for (new_idx, (old_idx, _)) in indexed.iter().enumerate() {
+                if let Some(reasons) = old_provenance.get(old_idx) {
+                    sig.parameter_provenance.insert(new_idx, reasons.clone());
+                }
+            }
+        }
         sig.parameters = indexed.into_iter().map(|(_, p)| p).collect();
     }
 
@@ -5719,6 +5731,65 @@ mod tests {
                 offset: -8,
             }],
             "scan must stop at reg-reg move"
+        );
+    }
+
+    /// Codex review on PR #27 pass 9: parameter_provenance is a
+    /// `HashMap<usize, Vec<String>>` keyed by parameter index.
+    /// Reordering parameters without remapping these keys causes
+    /// e.g. function-pointer-callback reasons to attach to the
+    /// wrong (post-reorder) parameter. Verify provenance follows
+    /// the parameter as it moves.
+    #[test]
+    fn reorder_remaps_parameter_provenance() {
+        let mut sig = FunctionSignature::default();
+        // Pre-reorder: arg0 (int) at index 0 with provenance,
+        // farg0 (float) at index 1 without.
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        sig.parameter_provenance
+            .insert(0, vec!["callback hint".to_string()]);
+
+        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![
+                // Float observed first → moves to index 0.
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+
+        // Float now at index 0, int at index 1. Provenance should
+        // follow the int parameter to its new position (1).
+        assert!(
+            sig.parameter_provenance.get(&0).is_none(),
+            "provenance must not stay at old index 0"
+        );
+        assert_eq!(
+            sig.parameter_provenance.get(&1),
+            Some(&vec!["callback hint".to_string()]),
+            "provenance must follow the int param to its new index 1"
         );
     }
 
