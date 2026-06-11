@@ -433,8 +433,10 @@ pub struct PseudoCodeEmitter {
     /// where .L points into `.rodata.cst8`) as concrete float
     /// literals (`3.14`) at format time, rather than as variable
     /// references to a symbol/global. Populated by
-    /// [`Self::with_binary_data`].
-    binary_data: Option<super::BinaryDataContext>,
+    /// [`Self::with_binary_data`]. Wrapped in `Arc` so cloning the
+    /// emitter for each decompiled function is O(1) — section bytes
+    /// of a large binary are shared by reference, not copied.
+    binary_data: Option<Arc<super::BinaryDataContext>>,
 }
 
 impl PseudoCodeEmitter {
@@ -3337,8 +3339,11 @@ impl PseudoCodeEmitter {
 
     /// Sets the binary data context used to materialize rip-relative
     /// rodata float constants (`movsd xmm0, [rip + .Lconst]`) as
-    /// concrete float literals at format time.
-    pub fn with_binary_data(mut self, data: Option<super::BinaryDataContext>) -> Self {
+    /// concrete float literals at format time. Accepts either a
+    /// fresh `BinaryDataContext` (which gets wrapped here) or an
+    /// `Arc` for callers decompiling many functions from the same
+    /// binary who already share the context — Arc clones are O(1).
+    pub fn with_binary_data(mut self, data: Option<Arc<super::BinaryDataContext>>) -> Self {
         self.binary_data = data;
         self
     }
@@ -4383,16 +4388,30 @@ impl PseudoCodeEmitter {
         let offset = usize::try_from(address.checked_sub(base)?).ok()?;
         let end = offset.checked_add(usize::from(size))?;
         let bytes = section.get(offset..end)?;
+        // Decode using the source binary's byte order. Hard-coding
+        // little-endian would mis-render constants on big-endian
+        // ELF targets. Codex review on PR #26 pass 5.
+        let is_big_endian = matches!(binary_data.endianness(), hexray_core::Endianness::Big);
         match size {
             4 => {
-                let value = f32::from_le_bytes(bytes.try_into().ok()?);
+                let arr: [u8; 4] = bytes.try_into().ok()?;
+                let value = if is_big_endian {
+                    f32::from_be_bytes(arr)
+                } else {
+                    f32::from_le_bytes(arr)
+                };
                 if !looks_like_real_float_constant_f32(value) {
                     return None;
                 }
                 Some(format_float_literal_f32(value))
             }
             8 => {
-                let value = f64::from_le_bytes(bytes.try_into().ok()?);
+                let arr: [u8; 8] = bytes.try_into().ok()?;
+                let value = if is_big_endian {
+                    f64::from_be_bytes(arr)
+                } else {
+                    f64::from_le_bytes(arr)
+                };
                 if !looks_like_real_float_constant_f64(value) {
                     return None;
                 }
@@ -13176,7 +13195,7 @@ mod tests {
         ctx.add_section(0x1000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x1000, 0x1000 + bytes.len() as u64);
 
-        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
 
         // GotRef as produced by lifting `movsd xmm0, [rip + .Lconst]`
@@ -13199,7 +13218,7 @@ mod tests {
         ctx.add_section(0x2000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x2000, 0x2000 + bytes.len() as u64);
 
-        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
 
         let display = Expr::int(0x2000);
@@ -13225,7 +13244,7 @@ mod tests {
         ctx.add_section(0x3000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x3000, 0x3000 + bytes.len() as u64);
 
-        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
 
         let display = Expr::int(0x3000);
@@ -13256,7 +13275,7 @@ mod tests {
         ctx.add_section(0x4000, bytes.to_vec());
         // NB: deliberately NOT calling add_float_constant_pool_range.
 
-        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(ctx));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
 
         let display = Expr::int(0x4000);
@@ -13266,6 +13285,36 @@ mod tests {
         assert!(
             !formatted.contains("1.0f") && !formatted.contains("1.0"),
             "generic-rodata bytes must not be materialized as a float: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26 pass 5: a big-endian source binary
+    /// must decode rodata float bytes using the binary's byte order.
+    /// Hardcoding little-endian would misrender constants on
+    /// PowerPC / MIPS-BE / big-endian ARM ELF. The bytes for `1.25`
+    /// as a big-endian f64 (`0x3ff4000000000000`) must produce
+    /// `1.25`, NOT the little-endian misread (which would be a
+    /// finite-but-different value).
+    #[test]
+    fn rodata_double_constant_decodes_with_big_endian_byte_order() {
+        use super::super::BinaryDataContext;
+        let mut ctx =
+            BinaryDataContext::new().with_endianness(hexray_core::Endianness::Big);
+        // Big-endian bytes for 1.25 = 0x3ff4_0000_0000_0000.
+        let bytes: [u8; 8] = 1.25f64.to_be_bytes();
+        ctx.add_section(0x5000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x5000, 0x5000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x5000);
+        let got_ref = Expr::got_ref(0x5000, 0x500, 8, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert_eq!(
+            formatted, "1.25",
+            "big-endian rodata bytes must decode with the binary's byte order"
         );
     }
 

@@ -4422,7 +4422,11 @@ fn is_cxx_throw_symbol_name(name: &str) -> bool {
 
 /// Builds a binary data context from read-only data sections for jump table reconstruction.
 fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
-    let mut ctx = BinaryDataContext::new();
+    // Pass through the binary's endianness so the emitter decodes
+    // rodata float constants with the correct byte order on
+    // big-endian targets (PowerPC, MIPS-BE, big-endian ARM ELF).
+    // Codex review on PR #26 pass 5.
+    let mut ctx = BinaryDataContext::new().with_endianness(fmt.endianness());
 
     for section in fmt.sections() {
         let name = section.name().to_lowercase();
