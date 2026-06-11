@@ -127,8 +127,29 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                 }
 
                 if saw_stack_canary_after {
-                    indices_to_remove.push(i);
-                    continue;
+                    // Restrict drop to ACTUAL canary-pattern
+                    // assignments: the RHS mentions the canary
+                    // guard symbol, the RHS is a reload of the
+                    // already-known canary slot, or the LHS is a
+                    // canary-related stack slot. Plain body work
+                    // happening before the canary check (the SSE
+                    // arithmetic and result-slot store on float-
+                    // returning stack-protected functions) MUST
+                    // survive — without this gate the body
+                    // recovery would emit `return uninit_slot;`
+                    // having dropped the computation. SSE-5.
+                    let rhs_is_canary = expr_mentions_stack_canary_guard(rhs);
+                    let lhs_is_canary_slot = matches!(
+                        v.name.as_str(),
+                        "rax" | "eax" | "x0" | "w0" | "a0"
+                    ) && rhs_is_canary;
+                    if rhs_is_canary || lhs_is_canary_slot {
+                        indices_to_remove.push(i);
+                        continue;
+                    }
+                    // Otherwise leave the assignment in place —
+                    // it's likely real body work happening before
+                    // the canary check at the end of the block.
                 }
 
                 // ARM64 epilogue: frame pointer (x29) and link register (x30) restoration
