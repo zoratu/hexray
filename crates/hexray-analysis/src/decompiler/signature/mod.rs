@@ -257,11 +257,11 @@ pub fn scan_param_spill_order(
     };
     let mut seen_regs: HashSet<String> = HashSet::new();
     for inst in &entry.instructions {
-        if !matches!(inst.operation, Operation::Store) {
-            // Non-store: keep scanning past push/mov-reg-reg/sub-rsp
-            // prologue scaffolding. A reg-reg move that copies an
-            // arg register elsewhere doesn't disturb the spill
-            // sequence; only a STORE produces a spill observation.
+        // x86 plain `mov [mem], reg` is `Operation::Move`, while
+        // SSE `movsd [mem], xmm` is `Operation::Store`. Both
+        // produce a spill we care about, so accept either AND
+        // require a memory operand to filter out reg-reg moves.
+        if !matches!(inst.operation, Operation::Store | Operation::Move) {
             continue;
         }
         // Find the (memory-destination, register-source) pair.
