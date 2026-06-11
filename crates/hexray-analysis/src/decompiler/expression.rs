@@ -1383,7 +1383,7 @@ impl Expr {
             // emitter to safely materialize rip-relative rodata
             // constants as float literals only when the load actually
             // feeds an SSE/FP register. Codex review on PR #26 pass 7.
-            let is_float_context = instruction_writes_float_bank(inst);
+            let is_float_context = instruction_loads_float_constant(inst);
             Self::got_ref_with_context(
                 abs_addr,
                 inst.address,
@@ -2783,28 +2783,54 @@ impl Expr {
     }
 }
 
-/// Returns true when `inst` writes its first operand to a
-/// floating-point / SIMD register — x86 `xmm*`/`ymm*`/`zmm*` or
-/// aarch64 `s*`/`d*`/`q*`/`v*`/`h*`. Used at GotRef lift time to
-/// tag the destination's bank so the emitter can safely materialize
-/// rip-relative rodata bytes as float literals only in actual FP
-/// context. Codex review on PR #26 pass 7.
-fn instruction_writes_float_bank(inst: &Instruction) -> bool {
+/// Returns true when `inst` is a real floating-point load — both
+/// the destination register is in the FP/SIMD bank AND the opcode
+/// is a scalar/packed FP operation. Used at GotRef lift time to
+/// tag the destination so the emitter can safely materialize a
+/// rip-relative rodata byte pattern as a float literal only when
+/// the producing instruction actually treats it as a float.
+///
+/// The register-class check alone (codex review pass 7 fix) was
+/// not enough: integer-SIMD instructions such as
+/// `movq xmm0, [rip + .L]`, `movdqa`, `pinsrq`, `paddq` also
+/// write to the SSE bank but the bytes loaded are integer / packed
+/// non-float data. Materializing those as `1.0f` would change the
+/// recovered semantics. Codex review on PR #26 pass 8.
+fn instruction_loads_float_constant(inst: &Instruction) -> bool {
     let Some(Operand::Register(reg)) = inst.operands.first() else {
         return false;
     };
     let name = reg.name().to_lowercase();
-    // x86 SSE/AVX
+    let mnemonic = inst.mnemonic.to_ascii_lowercase();
+
+    // x86 SSE/AVX: float context requires a scalar/packed FP
+    // mnemonic suffix (`ss`/`sd`/`ps`/`pd`). `movq`/`movd`/`movdqa`/
+    // `pinsrq`/`paddq`/... all write to xmm/ymm/zmm too but are
+    // integer-SIMD or generic bit moves — they must NOT trigger
+    // float materialization.
     if name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm") {
-        return true;
+        let m = mnemonic.trim_start_matches('v'); // strip VEX `v` prefix
+        return m.ends_with("ss") || m.ends_with("sd") || m.ends_with("ps") || m.ends_with("pd");
     }
-    // aarch64 vector/FP register-file aliases at any width
+
+    // aarch64 vector/FP register-file aliases at any width. On
+    // aarch64, the FP load instructions are `ldr`/`ldur`/`ldnp`/
+    // `ldp` with a float register destination (`s*`/`d*`/`q*`/`v*`).
+    // Half-precision `h*` is excluded because the wider pipeline
+    // doesn't yet support `Float(16)`. Codex review on PR #26 pass
+    // 12 (PR #25 history) deferred h*.
     let Some(prefix) = name.chars().next() else {
         return false;
     };
-    if matches!(prefix, 'h' | 's' | 'd' | 'q' | 'v') && name[1..].chars().all(|c| c.is_ascii_digit())
-    {
-        return true;
+    if matches!(prefix, 's' | 'd' | 'q' | 'v') && name[1..].chars().all(|c| c.is_ascii_digit()) {
+        // Restrict to actual load mnemonics (also `fmov` from
+        // memory) so an integer-vector op writing to v0 (e.g.
+        // `add v0.4s, v1.4s, v2.4s`) isn't tagged as float-loading.
+        let is_load_mnemonic = matches!(
+            mnemonic.as_str(),
+            "ldr" | "ldur" | "ldnp" | "ldp" | "fmov" | "ld1" | "ld1r"
+        );
+        return is_load_mnemonic;
     }
     false
 }

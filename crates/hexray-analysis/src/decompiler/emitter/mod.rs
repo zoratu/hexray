@@ -13297,6 +13297,36 @@ mod tests {
         );
     }
 
+    /// Codex review on PR #26 pass 8: even with destination in the
+    /// SSE bank, integer-SIMD opcodes (`movq`/`movdqa`/`pinsrq`/`paddq`)
+    /// must NOT trigger float materialization — they move/use
+    /// raw bits, not floats. The lift only sets is_float_context=true
+    /// for opcodes ending in `ss`/`sd`/`ps`/`pd`. Verify a GotRef
+    /// produced without that flag (as `movq xmm0, [rip + .L]` would
+    /// be) doesn't materialize.
+    #[test]
+    fn rodata_materialization_skipped_for_integer_simd_opcode() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 8] = 1.25f64.to_le_bytes();
+        ctx.add_section(0x7000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x7000, 0x7000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x7000);
+        // GotRef WITHOUT float context — as produced by lifting
+        // `movq xmm0, [rip + .L]`.
+        let got_ref = Expr::got_ref(0x7000, 0x500, 8, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert!(
+            !formatted.contains("1.25"),
+            "integer-SIMD opcode must not materialize as float: {formatted}"
+        );
+    }
+
     /// Codex review on PR #26 pass 7: even when the address sits in
     /// a tagged float-pool section AND the bytes decode to a
     /// plausible float, the materializer MUST NOT fire when the
