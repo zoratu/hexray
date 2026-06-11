@@ -13210,7 +13210,7 @@ mod tests {
         // GotRef as produced by lifting `movsd xmm0, [rip + .Lconst]`
         // where rip+offset resolves to 0x1000.
         let display = Expr::int(0x1000);
-        let got_ref = Expr::got_ref(0x1000, 0x500, 8, display);
+        let got_ref = Expr::got_ref_with_context(0x1000, 0x500, 8, display, true);
 
         let formatted = emitter.format_expr_with_strings(&got_ref, &table);
         assert_eq!(formatted, "1.25", "rodata f64 should materialize");
@@ -13231,7 +13231,7 @@ mod tests {
         let table = StringTable::new();
 
         let display = Expr::int(0x2000);
-        let got_ref = Expr::got_ref(0x2000, 0x500, 4, display);
+        let got_ref = Expr::got_ref_with_context(0x2000, 0x500, 4, display, true);
 
         let formatted = emitter.format_expr_with_strings(&got_ref, &table);
         assert_eq!(formatted, "2.5f", "rodata f32 should materialize with f");
@@ -13257,7 +13257,7 @@ mod tests {
         let table = StringTable::new();
 
         let display = Expr::int(0x3000);
-        let got_ref = Expr::got_ref(0x3000, 0x500, 8, display);
+        let got_ref = Expr::got_ref_with_context(0x3000, 0x500, 8, display, true);
 
         let formatted = emitter.format_expr_with_strings(&got_ref, &table);
         assert!(
@@ -13297,6 +13297,37 @@ mod tests {
         );
     }
 
+    /// Codex review on PR #26 pass 7: even when the address sits in
+    /// a tagged float-pool section AND the bytes decode to a
+    /// plausible float, the materializer MUST NOT fire when the
+    /// producing instruction's destination is an integer register
+    /// (`is_float_context = false`). Without this gate, a real
+    /// `mov eax, [rip + .Lconst]` whose 4 bytes encode `1.0f`
+    /// (0x3f800000) would be silently rewritten as `1.0f`,
+    /// changing recovered semantics.
+    #[test]
+    fn rodata_materialization_gated_on_float_context_flag() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 4] = 1.0f32.to_le_bytes(); // 0x3f800000
+        ctx.add_section(0x6000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x6000, 0x6000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x6000);
+        // GotRef WITHOUT is_float_context — as produced by lifting
+        // `mov eax, [rip + .Lconst]`.
+        let got_ref = Expr::got_ref(0x6000, 0x500, 4, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert!(
+            !formatted.contains("1.0"),
+            "integer-context load must not be materialized as float: {formatted}"
+        );
+    }
+
     /// Codex review on PR #26 pass 5: a big-endian source binary
     /// must decode rodata float bytes using the binary's byte order.
     /// Hardcoding little-endian would misrender constants on
@@ -13318,7 +13349,7 @@ mod tests {
             PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
         let display = Expr::int(0x5000);
-        let got_ref = Expr::got_ref(0x5000, 0x500, 8, display);
+        let got_ref = Expr::got_ref_with_context(0x5000, 0x500, 8, display, true);
         let formatted = emitter.format_expr_with_strings(&got_ref, &table);
 
         assert_eq!(
@@ -13337,7 +13368,7 @@ mod tests {
         let emitter = PseudoCodeEmitter::new("    ", false);
         let table = StringTable::new();
         let display = Expr::int(0x1000);
-        let got_ref = Expr::got_ref(0x1000, 0x500, 8, display);
+        let got_ref = Expr::got_ref_with_context(0x1000, 0x500, 8, display, true);
         let formatted = emitter.format_expr_with_strings(&got_ref, &table);
         assert!(
             formatted.parse::<f64>().is_err(),
