@@ -144,6 +144,15 @@ pub struct SignatureRecovery {
     /// reloads of the actual home slot, not on later reuse of the register as
     /// a scratch temp for an unrelated stack local (e.g. a loop counter).
     arg_spill_offsets: HashMap<usize, HashSet<i128>>,
+    /// Prologue spill observations from the raw CFG, used to recover
+    /// the mixed int/float source declaration order — at `-O0` the
+    /// compiler spills every parameter register in source order, so
+    /// `double scale_sum(double x, int n)` puts xmm0 at `[rbp-8]`
+    /// (source-first) and edi at `[rbp-12]` (source-second), and
+    /// the recovered signature must follow. Seeded via
+    /// [`Self::with_param_spill_order`] before [`Self::analyze`].
+    /// See [`scan_param_spill_order`] for the producer.
+    param_spill_order: Vec<ParamSpillObservation>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -192,6 +201,250 @@ pub struct SignatureRecovery {
     sysv_va_start_seen: bool,
     /// Fixed non-variadic prefix inferred for the current function.
     variadic_fixed_param_count: Option<usize>,
+}
+
+/// One observation of an argument register being spilled to a
+/// stack slot in the function prologue. The vector returned by
+/// [`scan_param_spill_order`] preserves instruction order, so the
+/// FIRST entry is the FIRST source parameter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParamSpillObservation {
+    /// Lowercase register name (`xmm0`, `rdi`, `edi`, `d0`, ...).
+    pub register: String,
+    /// Frame-relative stack offset where the spill landed.
+    pub offset: i64,
+}
+
+/// Scan the raw instruction stream for parameter-register spills
+/// in the function prologue.
+///
+/// At `-O0`, the compiler emits one spill per parameter register in
+/// source-declaration order. By returning the spill observations in
+/// instruction order, callers can reconstruct the mixed int/float
+/// source order — `double scale_sum(double x, int n)` produces
+/// `[(xmm0, -8), (edi, -16)]`, indicating the float arg was
+/// source-first even though both `xmm0` (float bank index 0) and
+/// `edi` (int bank index 0) would otherwise look interchangeable.
+///
+/// Conservative: stops scanning as soon as a non-spill, non-prologue
+/// instruction is seen, so loop bodies don't pollute the ordering.
+pub fn scan_param_spill_order(
+    cfg: &ControlFlowGraph,
+    convention: CallingConvention,
+) -> Vec<ParamSpillObservation> {
+    let mut result = Vec::new();
+    let int_regs: HashSet<String> = convention
+        .integer_arg_registers()
+        .iter()
+        .chain(convention.integer_arg_registers_32().iter())
+        .map(|r| r.to_lowercase())
+        .collect();
+    let float_regs: HashSet<String> = convention
+        .float_arg_registers()
+        .iter()
+        .map(|r| r.to_lowercase())
+        .collect();
+    let Some(entry) = cfg.entry_block() else {
+        return result;
+    };
+    let mut seen_regs: HashSet<String> = HashSet::new();
+    for inst in &entry.instructions {
+        // Whitelist prologue scaffolding: push/pop, frame setup
+        // (`mov rbp, rsp`), and stack pointer adjust (`sub rsp,
+        // K`). These don't produce spill observations but they're
+        // the only things that can appear between spills.
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        let is_prologue_scaffold = matches!(
+            inst.operation,
+            Operation::Push | Operation::Pop | Operation::Nop
+        ) || mnemonic.starts_with("nop")
+            || mnemonic.starts_with("endbr")
+            || is_frame_setup_or_sp_adjust(inst);
+
+        // Frame setup (`mov rbp, rsp`) and stack adjust both look
+        // like `Operation::Move` with two register operands or
+        // a register + immediate — we must skip them BEFORE the
+        // operand-layout check (which would treat reg-reg as a
+        // body-work break).
+        if is_prologue_scaffold {
+            continue;
+        }
+
+        let is_potential_spill = matches!(inst.operation, Operation::Store | Operation::Move);
+        if !is_potential_spill {
+            // Hit non-prologue body — stop scanning. Codex review
+            // on PR #27 pass 1.
+            break;
+        }
+
+        // Spills emit one of two operand layouts depending on
+        // architecture:
+        //   x86 `mov [mem], reg`:    [Memory(dst), Register(src)]
+        //   aarch64 `str reg, [mem]`: [Register(src), Memory(dst)]
+        //   aarch64 `stp r1, r2, [mem]`: [Reg, Reg, Memory] (pair)
+        // Convention disambiguates: a reg→mem ordering on x86 is
+        // actually a RELOAD (`mov edi, [rbp-12]`), not a spill, so
+        // we'd misread it as an aarch64 STR if we accepted both
+        // forms unconditionally. Codex review on PR #27 pass 3.
+        let is_aarch64 = matches!(convention, CallingConvention::Aarch64);
+        let observations = match (inst.operands.first(), inst.operands.get(1)) {
+            (Some(Operand::Memory(mem)), Some(Operand::Register(src))) if !is_aarch64 => {
+                if !is_frame_base_memory(mem) {
+                    // Body store to a heap/global — stop scanning.
+                    break;
+                }
+                vec![(mem.displacement, src.name().to_lowercase())]
+            }
+            (Some(Operand::Register(src)), Some(Operand::Memory(mem))) if is_aarch64 => {
+                // aarch64 STR form.
+                if !is_frame_base_memory(mem) {
+                    break;
+                }
+                vec![(mem.displacement, src.name().to_lowercase())]
+            }
+            (Some(Operand::Register(src1)), Some(Operand::Register(src2))) if is_aarch64 => {
+                // aarch64 STP — third operand is the memory dest.
+                match inst.operands.get(2) {
+                    Some(Operand::Memory(mem)) if is_frame_base_memory(mem) => {
+                        let base = mem.displacement;
+                        vec![
+                            (base, src1.name().to_lowercase()),
+                            (base + 8, src2.name().to_lowercase()),
+                        ]
+                    }
+                    _ => break,
+                }
+            }
+            // Everything else (x86 reload `mov reg, [mem]`, x86
+            // reg-reg, aarch64 reg-imm, etc.) is body work — stop.
+            _ => break,
+        };
+
+        for (offset, raw_reg_name) in observations {
+            // Normalize register-file aliases to the ABI name:
+            //   aarch64 `s0`/`q0`/`v0` → `d0` (float bank)
+            //   x86_64  `dil`/`di`/`edi`/`rdi` → `rdi` (int bank
+            //                                  ABI name)
+            // Without normalization a `mov [rbp-8], dil` (narrow
+            // char spill) would be silently dropped because
+            // `dil` doesn't match any ABI argument-register name.
+            // Codex review on PR #27 pass 7.
+            let reg_name = if int_regs.contains(&raw_reg_name) || float_regs.contains(&raw_reg_name)
+            {
+                raw_reg_name
+            } else if let Some(canonical) = canonicalize_int_arg_register(&raw_reg_name) {
+                canonical
+            } else {
+                float_arg_abi_register(&raw_reg_name, convention)
+            };
+            if !int_regs.contains(&reg_name) && !float_regs.contains(&reg_name) {
+                continue;
+            }
+            // De-dup: a reg spilled to multiple slots only counts
+            // once (the FIRST observation, which is the prologue
+            // spill).
+            if seen_regs.insert(reg_name.clone()) {
+                result.push(ParamSpillObservation {
+                    register: reg_name,
+                    offset,
+                });
+            }
+        }
+    }
+    result
+}
+
+/// Whether `mem` is rbp/rsp/sp-relative (a frame-local stack slot,
+/// not an arbitrary heap/global address).
+fn is_frame_base_memory(mem: &hexray_core::MemoryRef) -> bool {
+    if mem.index.is_some() {
+        return false;
+    }
+    mem.base
+        .as_ref()
+        .map(|r| r.name().to_lowercase())
+        .is_some_and(|n| {
+            matches!(
+                n.as_str(),
+                // x86_64 / x86
+                "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp"
+                // aarch64: x29/fp is the frame pointer, x31 = sp.
+                // `-O0` spills land at `[x29, #N]` after the
+                // `mov x29, sp` setup. Codex review on PR #27
+                // pass 5.
+                | "x29" | "fp" | "x31"
+            )
+        })
+}
+
+/// Canonicalize an x86_64 integer argument register alias to its
+/// 64-bit ABI name. Returns `Some("rdi")` for any of
+/// `dil`/`di`/`edi`/`rdi`, and `None` for non-arg-register names.
+/// Codex review on PR #27 pass 7.
+fn canonicalize_int_arg_register(name: &str) -> Option<String> {
+    let canonical = match name {
+        "rdi" | "edi" | "di" | "dil" => "rdi",
+        "rsi" | "esi" | "si" | "sil" => "rsi",
+        "rdx" | "edx" | "dx" | "dl" => "rdx",
+        "rcx" | "ecx" | "cx" | "cl" => "rcx",
+        "r8" | "r8d" | "r8w" | "r8b" => "r8",
+        "r9" | "r9d" | "r9w" | "r9b" => "r9",
+        _ => return None,
+    };
+    Some(canonical.to_string())
+}
+
+/// Quick check for the standard x86_64 prologue setup instructions
+/// `mov rbp, rsp` and `sub rsp, K`. Used to distinguish prologue
+/// scaffolding from function-body work in [`scan_param_spill_order`].
+fn is_frame_setup_or_sp_adjust(inst: &hexray_core::Instruction) -> bool {
+    let mnemonic = inst.mnemonic.to_ascii_lowercase();
+    if mnemonic != "mov" && mnemonic != "sub" && mnemonic != "add" {
+        return false;
+    }
+    let Some(Operand::Register(dst)) = inst.operands.first() else {
+        return false;
+    };
+    let dst_name = dst.name().to_lowercase();
+    let is_frame_or_stack_dst = matches!(
+        dst_name.as_str(),
+        // x86_64 / x86 stack/frame
+        "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp"
+        // aarch64 stack/frame
+        | "x29" | "fp" | "x31" | "wsp"
+    );
+    if !is_frame_or_stack_dst {
+        return false;
+    }
+    // Verify the SOURCE is the stack pointer (for frame setup) or
+    // an immediate (for stack adjustment). Without this, body work
+    // like `mov rbp, rdi` (using rbp as a GPR under -fomit-frame-
+    // pointer) would be misread as scaffolding and the scanner
+    // would keep running into body stores. Codex review on PR #27
+    // pass 6.
+    match (
+        mnemonic.as_str(),
+        inst.operands.get(1),
+        inst.operands.get(2),
+    ) {
+        // `mov frame_reg, stack_reg` — frame-pointer setup.
+        ("mov", Some(Operand::Register(src)), _) => {
+            matches!(
+                src.name().to_lowercase().as_str(),
+                "rsp" | "esp" | "sp" | "x31" | "wsp" | "rbp" | "x29"
+            )
+        }
+        // `sub rsp, K` (x86 stack adjust, 2-operand).
+        ("sub" | "add", Some(Operand::Immediate(_)), _) => true,
+        // `add sp, sp, K` (aarch64 3-operand form).
+        ("sub" | "add", Some(Operand::Register(src1)), Some(Operand::Immediate(_))) => {
+            matches!(
+                src1.name().to_lowercase().as_str(),
+                "rsp" | "esp" | "sp" | "x31" | "wsp"
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Scan the raw instruction stream for floating-point argument registers.
@@ -698,6 +951,7 @@ impl SignatureRecovery {
             return_confidence: 0,
             param_names: HashMap::new(),
             arg_spill_offsets: HashMap::new(),
+            param_spill_order: Vec::new(),
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
@@ -745,6 +999,14 @@ impl SignatureRecovery {
     /// instruction stream. Use [`scan_float_return`] to compute it from a CFG.
     pub fn with_float_return_seed(mut self, size: Option<u8>) -> Self {
         self.float_return_seed = size;
+        self
+    }
+
+    /// Seeds prologue parameter-spill observations from the raw CFG.
+    /// Use [`scan_param_spill_order`] to compute them. Carries the
+    /// source-declaration order across the int/float bank split.
+    pub fn with_param_spill_order(mut self, order: Vec<ParamSpillObservation>) -> Self {
+        self.param_spill_order = order;
         self
     }
 
@@ -4309,6 +4571,11 @@ impl SignatureRecovery {
             sig.return_type = ParamType::Void;
         }
 
+        // Reorder mixed int/float parameters by observed source
+        // declaration order, derived from prologue spill offsets.
+        // Codex review on PR #25 / SSE-1.
+        self.reorder_params_by_spill_offset(&mut sig);
+
         if matches!(self.current_func_name.as_deref(), Some("main" | "_main")) {
             sig.has_return = true;
             sig.return_type = ParamType::SignedInt(32);
@@ -4324,6 +4591,178 @@ impl SignatureRecovery {
         }
 
         sig
+    }
+
+    /// Reorders the recovered parameter list by source-declaration
+    /// order recovered from prologue spill offsets.
+    ///
+    /// At `-O0` the compiler spills every parameter register to the
+    /// stack in source order — the first source parameter goes to
+    /// `[rbp-8]`, the second to `[rbp-16]`, etc., regardless of
+    /// whether each is integer-bank or float-bank. By tracking each
+    /// param register's smallest observed spill offset and sorting
+    /// DESCENDING (largest = closest to rbp = earliest spilled),
+    /// we recover the source order even when int and float params
+    /// are interleaved (the `double scale_sum(double x, int n)`
+    /// case that previously emitted as `(int32_t arg0, double farg0)`).
+    ///
+    /// Parameters without observed spill offsets (e.g. seeded from
+    /// raw float scanning without a structured spill site) sort to
+    /// the end in their existing relative order — a stable
+    /// fallback that preserves the leaf-case heuristic. SSE-1.
+    fn reorder_params_by_spill_offset(&self, sig: &mut FunctionSignature) {
+        if sig.parameters.len() < 2 || self.param_spill_order.is_empty() {
+            return;
+        }
+        // Build a register-name → spill-offset lookup from the raw
+        // prologue scan (already in instruction order, but we sort
+        // by offset for robustness). The bank-class mapping in each
+        // parameter's ParameterLocation tells us which spill to use.
+        let int_arg_regs: Vec<String> = self
+            .convention
+            .integer_arg_registers()
+            .iter()
+            .map(|r| r.to_lowercase())
+            .collect();
+        let int_arg_regs_32: Vec<String> = self
+            .convention
+            .integer_arg_registers_32()
+            .iter()
+            .map(|r| r.to_lowercase())
+            .collect();
+        let float_arg_regs: Vec<String> = self
+            .convention
+            .float_arg_registers()
+            .iter()
+            .map(|r| r.to_lowercase())
+            .collect();
+
+        // Use SPILL-INSTRUCTION ORDER rather than stack offset.
+        // aarch64 packs 4-byte integer slots and 8-byte FP slots
+        // with different alignment, so the offsets are not
+        // monotonic in source order (`int, double, int, double`
+        // can spill to `[sp,44], [sp,32], [sp,40], [sp,24]`).
+        // The scanner already records observations in instruction
+        // order — index into that order IS source order. Codex
+        // review on PR #27 pass 2.
+        let spill_index_for = |p: &Parameter| -> Option<usize> {
+            match &p.location {
+                ParameterLocation::IntegerRegister { index, .. } => {
+                    let r64 = int_arg_regs.get(*index)?;
+                    let r32 = int_arg_regs_32.get(*index);
+                    self.param_spill_order
+                        .iter()
+                        .position(|obs| &obs.register == r64 || r32 == Some(&obs.register))
+                }
+                ParameterLocation::FloatRegister { index, .. } => {
+                    let r = float_arg_regs.get(*index)?;
+                    self.param_spill_order
+                        .iter()
+                        .position(|obs| &obs.register == r)
+                }
+                _ => None,
+            }
+        };
+
+        // Require observed spills for EVERY recovered parameter
+        // before reordering, AND require at least one int and one
+        // float to be present (so all-int/all-float signatures
+        // keep the existing leaf-case heuristic). Without the
+        // all-observed gate, partial spill data would move some
+        // params ahead of others, inventing a wrong source order
+        // for cases like `(int a, int b, double x)` where only
+        // `a` and `xmm0` are homed at -O0 but `b` was kept in
+        // `esi` and never spilled. Codex review on PR #27 pass 8.
+        let mut has_int = false;
+        let mut has_float = false;
+        for p in &sig.parameters {
+            match &p.location {
+                ParameterLocation::IntegerRegister { .. } => has_int = true,
+                ParameterLocation::FloatRegister { .. } => has_float = true,
+                _ => {}
+            }
+            if matches!(
+                p.location,
+                ParameterLocation::IntegerRegister { .. } | ParameterLocation::FloatRegister { .. }
+            ) && spill_index_for(p).is_none()
+            {
+                // Some register parameter isn't observed — bail out
+                // entirely rather than introducing a spurious order.
+                return;
+            }
+        }
+        if !(has_int && has_float) {
+            return;
+        }
+
+        let mut indexed: Vec<(usize, Parameter)> = sig.parameters.drain(..).enumerate().collect();
+        indexed.sort_by(|(orig_a, a), (orig_b, b)| {
+            let idx_a = spill_index_for(a);
+            let idx_b = spill_index_for(b);
+            match (idx_a, idx_b) {
+                // Both observed — sort ASCENDING by observation
+                // index (= instruction order in the prologue =
+                // source-declaration order).
+                (Some(ia), Some(ib)) => ia.cmp(&ib),
+                // Observed beats not-observed (place observed
+                // params first; unobserved fall to the end).
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                // Neither observed — preserve original order.
+                (None, None) => orig_a.cmp(orig_b),
+            }
+        });
+        // We intentionally do NOT renumber `argN`/`fargN` names by
+        // position. The structured body references each parameter
+        // by its ABI register index — on Win64, mixed signatures
+        // have POSITIONAL float indices: `void f(int n, double x)`
+        // puts `n` in `rcx` (slot 0) and `x` in `xmm1` (slot 1),
+        // so the float param's name is `farg1` everywhere the body
+        // references it. Renumbering would rewrite the declaration
+        // to `farg0` while the body still references `farg1`,
+        // producing an inconsistent signature. Codex review on
+        // PR #27 pass 13.
+        //
+        // For SystemV/aarch64 the int and float bank indices are
+        // dense from 0 within each bank, so the existing names
+        // happen to read as a natural sequence — no renumbering
+        // needed.
+        // Remap per-parameter provenance keys to the new positions.
+        // Without this a function pointer's `function_pointer_reasons`
+        // would attach to the wrong (post-reorder) parameter index.
+        // Codex review on PR #27 pass 9.
+        if !sig.parameter_provenance.is_empty() {
+            let old_provenance = std::mem::take(&mut sig.parameter_provenance);
+            for (new_idx, (old_idx, _)) in indexed.iter().enumerate() {
+                if let Some(reasons) = old_provenance.get(old_idx) {
+                    sig.parameter_provenance.insert(new_idx, reasons.clone());
+                }
+            }
+        }
+        // Reapply DWARF parameter names by the POST-reorder index.
+        // DWARF names are stored in source-declaration order; after
+        // reorder the new index N IS the source-position N, so
+        // dwarf_param_names[N] is the right name to attach.
+        //
+        // We OVERWRITE existing names (not just generic
+        // `arg*`/`farg*`) because pre-reorder DWARF application
+        // attached names by register-bank index. For example a
+        // `double f(double x, int n)` whose DWARF names are
+        // ["x", "n"] gets pre-reorder names `n` (on rdi, int idx
+        // 0) and `x` (on xmm0, float idx 0). After moving float
+        // to position 0, we'd skip name reassignment because "n"
+        // is non-generic — but it's the WRONG name for the new
+        // float-first param. Codex review on PR #27 pass 11.
+        if !self.dwarf_param_names.is_empty() {
+            for (new_idx, (_, p)) in indexed.iter_mut().enumerate() {
+                if let Some(dwarf_name) = self.dwarf_param_names.get(new_idx) {
+                    if !dwarf_name.is_empty() {
+                        p.name = dwarf_name.clone();
+                    }
+                }
+            }
+        }
+        sig.parameters = indexed.into_iter().map(|(_, p)| p).collect();
     }
 
     fn observe_sysv_va_list_assignment(&mut self, lhs: &Expr, rhs: &Expr) {
@@ -5028,6 +5467,693 @@ mod tests {
         assert_eq!(
             found,
             vec![(0, "xmm0".to_string(), 8), (1, "xmm1".to_string(), 8)]
+        );
+    }
+
+    /// SSE-1: the prologue spill scanner must record the order in
+    /// which parameter registers are spilled to the stack. For
+    /// `double scale_sum(double x, int n)` clang emits
+    /// `movsd [rbp-8], xmm0; mov [rbp-12], edi` — xmm0 at -8 (the
+    /// first source param), edi at -12 (the second). Verify both
+    /// are captured in instruction order with the right offsets.
+    #[test]
+    fn scan_param_spill_order_captures_mixed_int_float_spills() {
+        let rbp = gpr(5, 64);
+        let edi = gpr(7, 32);
+        let cfg = single_block_cfg(vec![
+            (
+                "movsd",
+                Operation::Store,
+                vec![mem(rbp, -8), Operand::Register(xmm(0))],
+            ),
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -12), Operand::Register(edi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "edi".to_string(),
+                    offset: -12,
+                },
+            ]
+        );
+    }
+
+    // Removed `scan_param_spill_order_ignores_reg_to_reg_moves`:
+    // pass-3 strengthening means reg-reg moves correctly TERMINATE
+    // the scan rather than being silently skipped (otherwise body
+    // stores after them would pollute observations). The new
+    // `scan_param_spill_order_terminates_on_reg_reg_move` test
+    // covers the corrected behavior.
+
+    /// Codex review on PR #27 pass 7: a narrow integer arg like
+    /// `char c` is spilled as `dil` at `-O0`. The scanner must
+    /// canonicalize `dil` (and `di`, `r8b`, etc.) to the 64-bit
+    /// ABI name `rdi` so it's recognized as an arg-register spill.
+    #[test]
+    fn scan_param_spill_order_normalizes_narrow_int_aliases() {
+        let rbp = gpr(5, 64);
+        let dil = gpr(7, 8); // 8-bit form of rdi
+        let cfg = single_block_cfg(vec![(
+            "mov",
+            Operation::Move,
+            vec![mem(rbp, -4), Operand::Register(dil)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -4,
+            }],
+            "narrow int alias (dil) must normalize to ABI rdi"
+        );
+    }
+
+    /// Codex review on PR #27 pass 6: under -fomit-frame-pointer
+    /// rbp can be used as a general-purpose register: `mov rbp,
+    /// rdi` is body work, NOT frame setup. The scaffold detector
+    /// must require the SOURCE be the stack pointer (for `mov`) or
+    /// an immediate (for `add/sub`), not just look at the
+    /// destination. Verify body `mov rbp, rdi` breaks the scan so
+    /// a later body store isn't mistaken for a prologue spill.
+    #[test]
+    fn scan_param_spill_order_does_not_accept_body_mov_to_rbp() {
+        let rbp = gpr(5, 64);
+        let rdi = gpr(7, 64);
+        let esi = gpr(6, 32);
+        let cfg = single_block_cfg(vec![
+            // Body work: rbp = rdi (rbp used as GPR).
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(rbp), Operand::Register(rdi)],
+            ),
+            // Later body store — must NOT be recorded.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -20), Operand::Register(esi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert!(
+            order.is_empty(),
+            "`mov rbp, rdi` (body work) must break the scan, got {order:?}"
+        );
+    }
+
+    /// Codex review on PR #27 pass 5: aarch64 `-O0` typically
+    /// spills parameters relative to `x29` (frame pointer) after
+    /// `mov x29, sp` — `str d0, [x29, #-8]`. The frame-base check
+    /// must accept x29/fp/x31 in addition to the x86 rbp/rsp set.
+    #[test]
+    fn scan_param_spill_order_accepts_x29_relative_spills() {
+        let x29 = aarch64_x(29, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(x29, -8)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: -8,
+            }],
+            "x29-relative spill must be recognized"
+        );
+    }
+
+    /// Codex review on PR #27 pass 4: aarch64 single-precision
+    /// spills use the `s0`/`s1` register name. The scanner must
+    /// normalize them to the ABI name `d0`/`d1` so the float bank
+    /// recognizes them. Without this, a `float`-typed parameter
+    /// is silently dropped and mixed signatures don't reorder.
+    #[test]
+    fn scan_param_spill_order_normalizes_aarch64_s_register() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            // 32-bit width = `s0` (single-precision).
+            vec![Operand::Register(aarch64_v(0, 32)), aarch64_mem(sp, 4)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: 4,
+            }],
+            "aarch64 s0 must normalize to ABI name d0"
+        );
+    }
+
+    /// Codex review on PR #27 pass 4: aarch64 standard `-O0`
+    /// prologue is `stp x29, x30, [sp, #-16]!; mov x29, sp` —
+    /// the `mov x29, sp` is frame setup, not body work. The
+    /// scaffold detector must whitelist x29/fp as a destination
+    /// for `mov`-style instructions.
+    #[test]
+    fn scan_param_spill_order_treats_aarch64_x29_setup_as_scaffold() {
+        let sp = aarch64_x(31, 64);
+        let x29 = aarch64_x(29, 64);
+        let cfg = aarch64_single_block_cfg(vec![
+            // mov x29, sp  — frame-pointer setup (skip).
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(x29), Operand::Register(sp)],
+            ),
+            // str d0, [sp, #8]  — first param spill.
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: 8,
+            }],
+            "x29 frame setup must not break the scan"
+        );
+    }
+
+    /// Codex review on PR #27 pass 3: aarch64 `str d0, [sp, #8]`
+    /// has operand[0] = register (source), operand[1] = memory
+    /// (destination) — opposite of x86. The scanner must recognize
+    /// both layouts.
+    #[test]
+    fn scan_param_spill_order_handles_aarch64_str_layout() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: 8,
+            }],
+            "aarch64 STR must be detected (reg, mem layout)"
+        );
+    }
+
+    /// Codex review on PR #27 pass 3: aarch64 `stp d0, d1, [sp, #-16]!`
+    /// stores TWO registers as a pair. Both should be captured in
+    /// order with sequential offsets.
+    #[test]
+    fn scan_param_spill_order_handles_aarch64_stp_pair() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "stp",
+            Operation::Store,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+                aarch64_mem(sp, -16),
+            ],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![
+                ParamSpillObservation {
+                    register: "d0".to_string(),
+                    offset: -16,
+                },
+                ParamSpillObservation {
+                    register: "d1".to_string(),
+                    offset: -8,
+                },
+            ],
+            "aarch64 STP must record both registers as a pair"
+        );
+    }
+
+    /// Codex review on PR #27 pass 3: a reg-reg move like
+    /// `mov rax, rdi` is body work, not a prologue spill. It must
+    /// terminate the scan so later body stores don't pollute the
+    /// observation list.
+    #[test]
+    fn scan_param_spill_order_terminates_on_reg_reg_move() {
+        let rbp = gpr(5, 64);
+        let rax = gpr(0, 64);
+        let rdi = gpr(7, 64);
+        let esi = gpr(6, 32);
+        let cfg = single_block_cfg(vec![
+            // Real prologue spill.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -8), Operand::Register(rdi)],
+            ),
+            // Body reg-reg move — should STOP the scan.
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(rax), Operand::Register(rdi)],
+            ),
+            // Later body store — must NOT be picked up.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -20), Operand::Register(esi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }],
+            "scan must stop at reg-reg move"
+        );
+    }
+
+    /// Codex review on PR #27 passes 10 & 11: when DWARF names
+    /// are available they're applied by register-bank index BEFORE
+    /// the reorder runs — so an int param gets `dwarf_names[0]`
+    /// and a float param gets `dwarf_names[0]` too, leading to
+    /// duplicate or stale names after reorder. Verify the reorder
+    /// reapplies the source-order DWARF names to ALL parameters
+    /// regardless of their pre-reorder names. Pass 11 strengthened
+    /// the assertion to also catch the previously-passing case
+    /// where the pre-reorder name happened to be non-generic.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn reorder_overwrites_stale_dwarf_names_after_remap() {
+        let mut sig = FunctionSignature::default();
+        // Pre-reorder names attached by register bank — the
+        // dwarf-name-application step attached `x` (dwarf[0]) to
+        // the int param (rdi was index 0 in the int bank) and `n`
+        // (dwarf[1]? — but float bank index 0 → in our codebase
+        // the float assignment may attach a different name). In
+        // any case, after reorder the names should match
+        // source-order DWARF.
+        sig.parameters = vec![
+            Parameter::new(
+                "x".to_string(), // STALE — was attached to int by old bank order
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "n".to_string(), // STALE
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        // DWARF source order: ["x" (the double), "n" (the int)].
+        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_dwarf_param_names(vec!["x".to_string(), "n".to_string()])
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // Float (now at index 0) takes dwarf[0]="x"; int (index 1)
+        // takes dwarf[1]="n".
+        assert_eq!(sig.parameters[0].name, "x");
+        assert_eq!(sig.parameters[1].name, "n");
+        // And the types match their parameters: float param is
+        // double, int param is int.
+        assert!(matches!(sig.parameters[0].param_type, ParamType::Float(64)));
+        assert!(matches!(
+            sig.parameters[1].param_type,
+            ParamType::SignedInt(32)
+        ));
+    }
+
+    /// Codex review on PR #27 pass 13: on Win64 `void f(int n,
+    /// double x)` puts the float in xmm1 (positional slot 1), so
+    /// its name is `farg1` everywhere the body references it.
+    /// The reorder must NOT renumber it to `farg0` even after
+    /// moving it to position 0 — that would break the body→
+    /// declaration alignment.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn reorder_preserves_abi_indexed_farg_names_on_win64() {
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rcx".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg1".to_string(), // Win64 positional float index
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm1".to_string(),
+                    index: 1,
+                },
+            ),
+        ];
+        let recovery = SignatureRecovery::new(CallingConvention::Win64).with_param_spill_order(
+            vec![
+                ParamSpillObservation {
+                    register: "xmm1".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rcx".to_string(),
+                    offset: -16,
+                },
+            ],
+        );
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // The float moves to position 0 BUT keeps its ABI name
+        // `farg1` (matching the body), not renumbered to `farg0`.
+        // Note: Win64 might not actually trigger the reorder (it's
+        // gated to int+float observed), but the principle holds:
+        // we don't renumber.
+        // Find the float parameter regardless of position and
+        // assert its name stayed `farg1`.
+        let float_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(p.location, ParameterLocation::FloatRegister { .. }))
+            .expect("float param present");
+        assert_eq!(
+            float_param.name, "farg1",
+            "ABI-indexed farg name must NOT be renumbered to farg0 — body references farg1"
+        );
+    }
+
+    /// Codex review on PR #27 pass 10 alternate: when the pre-
+    /// reorder names ARE generic (arg/farg), the DWARF names
+    /// should be reapplied by the new index so float goes to "x"
+    /// and int goes to "n".
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn reorder_applies_dwarf_names_to_generic_arg_farg_after_reorder() {
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_dwarf_param_names(vec!["x".to_string(), "n".to_string()])
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // After reorder, float at position 0 gets DWARF[0]="x";
+        // int at position 1 gets DWARF[1]="n".
+        assert_eq!(sig.parameters[0].name, "x");
+        assert_eq!(sig.parameters[1].name, "n");
+    }
+
+    /// Codex review on PR #27 pass 9: parameter_provenance is a
+    /// `HashMap<usize, Vec<String>>` keyed by parameter index.
+    /// Reordering parameters without remapping these keys causes
+    /// e.g. function-pointer-callback reasons to attach to the
+    /// wrong (post-reorder) parameter. Verify provenance follows
+    /// the parameter as it moves.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn reorder_remaps_parameter_provenance() {
+        let mut sig = FunctionSignature::default();
+        // Pre-reorder: arg0 (int) at index 0 with provenance,
+        // farg0 (float) at index 1 without.
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        sig.parameter_provenance
+            .insert(0, vec!["callback hint".to_string()]);
+
+        let recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_param_spill_order(vec![
+                // Float observed first → moves to index 0.
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+
+        // Float now at index 0, int at index 1. Provenance should
+        // follow the int parameter to its new position (1).
+        assert!(
+            !sig.parameter_provenance.contains_key(&0),
+            "provenance must not stay at old index 0"
+        );
+        assert_eq!(
+            sig.parameter_provenance.get(&1),
+            Some(&vec!["callback hint".to_string()]),
+            "provenance must follow the int param to its new index 1"
+        );
+    }
+
+    /// Codex review on PR #27 pass 8: when only SOME params have
+    /// spill observations, the reorder must bail out entirely
+    /// rather than rearrange the partial set. For `(int a, int b,
+    /// double x)` where only `a` and `xmm0` were spilled (b lives
+    /// in `esi` and was never homed), reordering would invent the
+    /// wrong source order `(a, x, b)`.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn reorder_bails_when_some_params_have_no_spill_observation() {
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "arg1".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rsi".to_string(),
+                    index: 1,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        // Only rdi (arg0) and xmm0 (farg0) have spill observations
+        // — rsi (arg1) was not spilled. Reorder must NOT fire.
+        let recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -4,
+                },
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // Order must remain unchanged.
+        let names: Vec<&str> = sig.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["arg0", "arg1", "farg0"],
+            "must NOT reorder when arg1 has no spill observation"
+        );
+    }
+
+    /// Codex review on PR #27 pass 2: aarch64 packs int (4 bytes)
+    /// and float (8 bytes) spills with different alignment, so
+    /// spill offsets are NOT monotonic in source-declaration
+    /// order. Verify the reorder helper uses observation INDEX
+    /// (instruction order), not offset — a fake order list with
+    /// non-monotonic offsets but correct sequence should still
+    /// yield correct source ordering.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn reorder_uses_observation_index_not_offset() {
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        // Pretend rdi was spilled SECOND (at a HIGHER offset than
+        // xmm0) — offset alone would put rdi first by descending
+        // sort, but observation index says float was first.
+        let recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -32, // would lose by offset sort
+                },
+                ParamSpillObservation {
+                    register: "edi".to_string(),
+                    offset: -8, // would win by offset sort
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // Float must be first because it was observed first.
+        assert!(matches!(
+            sig.parameters[0].location,
+            ParameterLocation::FloatRegister { .. }
+        ));
+        assert!(matches!(
+            sig.parameters[1].location,
+            ParameterLocation::IntegerRegister { .. }
+        ));
+    }
+
+    /// Codex review on PR #27 pass 1: a reload like
+    /// `mov edi, [rbp-12]` MUST NOT be recorded as a spill of edi.
+    /// Operand direction matters — only `mov [mem], reg` (memory
+    /// dest, register source) is a spill.
+    #[test]
+    fn scan_param_spill_order_rejects_reload_pattern() {
+        let rbp = gpr(5, 64);
+        let edi = gpr(7, 32);
+        let cfg = single_block_cfg(vec![(
+            "mov",
+            Operation::Move,
+            // Reload: operand[0] = reg (dst), operand[1] = mem (src).
+            vec![Operand::Register(edi), mem(rbp, -12)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert!(
+            order.is_empty(),
+            "reload `mov reg, [mem]` must not be recorded as a spill, got {order:?}"
+        );
+    }
+
+    /// Codex review on PR #27 pass 1: the scanner stops at the
+    /// first non-prologue body instruction so later body stores
+    /// don't pollute the spill observations. Verify a body
+    /// `mov [rbp-20], esi` AFTER a non-prologue instruction
+    /// (`xor eax, eax` followed by `mov [rbp-20], esi`) isn't
+    /// captured. The non-prologue instruction breaks the scan.
+    #[test]
+    fn scan_param_spill_order_stops_at_first_body_instruction() {
+        let rbp = gpr(5, 64);
+        let edi = gpr(7, 32);
+        let esi = gpr(6, 32);
+        let eax = gpr(0, 32);
+        let cfg = single_block_cfg(vec![
+            // Real prologue spill.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -8), Operand::Register(edi)],
+            ),
+            // Body instruction — breaks the scan.
+            (
+                "xor",
+                Operation::Xor,
+                vec![Operand::Register(eax), Operand::Register(eax)],
+            ),
+            // Body store — must NOT be picked up.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -20), Operand::Register(esi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "edi".to_string(),
+                offset: -8,
+            }],
+            "scan must stop at first non-prologue instruction"
         );
     }
 
