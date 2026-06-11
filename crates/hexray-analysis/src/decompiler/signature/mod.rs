@@ -4490,12 +4490,6 @@ impl SignatureRecovery {
     /// the end in their existing relative order — a stable
     /// fallback that preserves the leaf-case heuristic. SSE-1.
     fn reorder_params_by_spill_offset(&self, sig: &mut FunctionSignature) {
-        eprintln!(
-            "[reorder] func={:?} param_count={} spill_obs={:?}",
-            self.current_func_name,
-            sig.parameters.len(),
-            self.param_spill_order
-        );
         if sig.parameters.len() < 2 || self.param_spill_order.is_empty() {
             return;
         }
