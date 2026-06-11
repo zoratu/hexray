@@ -5767,6 +5767,7 @@ mod tests {
     /// the assertion to also catch the previously-passing case
     /// where the pre-reorder name happened to be non-generic.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn reorder_overwrites_stale_dwarf_names_after_remap() {
         let mut sig = FunctionSignature::default();
         // Pre-reorder names attached by register bank — the
@@ -5829,6 +5830,7 @@ mod tests {
     /// should be reapplied by the new index so float goes to "x"
     /// and int goes to "n".
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn reorder_applies_dwarf_names_to_generic_arg_farg_after_reorder() {
         let mut sig = FunctionSignature::default();
         sig.parameters = vec![
@@ -5875,6 +5877,7 @@ mod tests {
     /// wrong (post-reorder) parameter. Verify provenance follows
     /// the parameter as it moves.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn reorder_remaps_parameter_provenance() {
         let mut sig = FunctionSignature::default();
         // Pre-reorder: arg0 (int) at index 0 with provenance,
@@ -5917,7 +5920,7 @@ mod tests {
         // Float now at index 0, int at index 1. Provenance should
         // follow the int parameter to its new position (1).
         assert!(
-            sig.parameter_provenance.get(&0).is_none(),
+            !sig.parameter_provenance.contains_key(&0),
             "provenance must not stay at old index 0"
         );
         assert_eq!(
@@ -5934,6 +5937,7 @@ mod tests {
     /// in `esi` and was never homed), reordering would invent the
     /// wrong source order `(a, x, b)`.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn reorder_bails_when_some_params_have_no_spill_observation() {
         let mut sig = FunctionSignature::default();
         sig.parameters = vec![
@@ -5993,6 +5997,7 @@ mod tests {
     /// non-monotonic offsets but correct sequence should still
     /// yield correct source ordering.
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn reorder_uses_observation_index_not_offset() {
         let mut sig = FunctionSignature::default();
         sig.parameters = vec![
