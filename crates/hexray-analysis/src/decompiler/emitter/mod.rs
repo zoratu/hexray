@@ -5628,6 +5628,7 @@ impl PseudoCodeEmitter {
                 size,
                 display_expr: _,
                 is_deref,
+                is_float_context,
             } => {
                 // Float-constant materialization: a rip-relative deref
                 // of size 4 or 8 whose target falls inside a tagged
@@ -5639,7 +5640,13 @@ impl PseudoCodeEmitter {
                 // local pool label (`.LCPI*`, `.LC*`), the
                 // materialized literal is more useful than the
                 // opaque label and wins. Codex review on PR #26.
-                let materialized = if *is_deref {
+                //
+                // Gated on `is_float_context` (set at lift time from
+                // the producing instruction's destination register
+                // bank): plain `mov eax, [rip + .L]` whose bytes
+                // happen to encode a plausible float must NOT be
+                // rewritten as `1.0f`. Codex review on PR #26 pass 7.
+                let materialized = if *is_deref && *is_float_context {
                     self.try_format_rodata_float_constant(*address, *size)
                 } else {
                     None

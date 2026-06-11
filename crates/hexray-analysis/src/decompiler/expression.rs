@@ -51,6 +51,15 @@ pub enum ExprKind {
         display_expr: Box<Expr>,
         /// True if this is a dereference (MOV), false if address-of (LEA).
         is_deref: bool,
+        /// True when the producing instruction writes to a floating-
+        /// point register (x86 xmm/ymm/zmm; aarch64 s/d/q/v). Set at
+        /// lift time from the destination operand's register class.
+        /// Used by the emitter to gate rip-relative rodata-constant
+        /// materialization on actual FP context — a plain
+        /// `mov eax, [rip + .L]` whose bytes happen to encode a
+        /// plausible float must NOT be rewritten as `1.0f`. Codex
+        /// review on PR #26 pass 7.
+        is_float_context: bool,
     },
 
     /// Address-of: &expr.
@@ -502,6 +511,20 @@ impl Expr {
     /// `address` is the computed target address (rip + inst_size + displacement).
     /// `instruction_address` is the address of the instruction for relocation lookup.
     pub fn got_ref(address: u64, instruction_address: u64, size: u8, display_expr: Expr) -> Self {
+        Self::got_ref_with_context(address, instruction_address, size, display_expr, false)
+    }
+
+    /// Same as [`Self::got_ref`] but with an explicit FP-context
+    /// flag. Lift sites use this to record whether the producing
+    /// instruction writes to a float-bank register, so the emitter
+    /// can safely materialize the bytes as a float literal.
+    pub fn got_ref_with_context(
+        address: u64,
+        instruction_address: u64,
+        size: u8,
+        display_expr: Expr,
+        is_float_context: bool,
+    ) -> Self {
         Self {
             kind: ExprKind::GotRef {
                 address,
@@ -509,6 +532,7 @@ impl Expr {
                 size,
                 display_expr: Box::new(display_expr),
                 is_deref: true,
+                is_float_context,
             },
         }
     }
@@ -524,6 +548,9 @@ impl Expr {
                 size: 0,
                 display_expr: Box::new(display_expr),
                 is_deref: false,
+                // LEA-style address materialization is never a float
+                // load — there are no bytes being decoded.
+                is_float_context: false,
             },
         }
     }
@@ -1351,12 +1378,19 @@ impl Expr {
             // Compute absolute address: inst.address + inst.size + displacement
             let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
             let display_expr = Self::from_memory_ref(mem);
-            if is_dest {
-                // For stores, we want to return a GotRef that can be assigned to
-                Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
-            } else {
-                Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
-            }
+            // Tag the GotRef with FP context derived from the
+            // instruction's destination register class. Used by the
+            // emitter to safely materialize rip-relative rodata
+            // constants as float literals only when the load actually
+            // feeds an SSE/FP register. Codex review on PR #26 pass 7.
+            let is_float_context = instruction_writes_float_bank(inst);
+            Self::got_ref_with_context(
+                abs_addr,
+                inst.address,
+                mem.size,
+                display_expr,
+                is_float_context,
+            )
         } else {
             Self::from_memory_ref(mem)
         }
@@ -2747,6 +2781,32 @@ impl Expr {
             Self::binop(BinOpKind::Div, quotient, divisor),
         ))
     }
+}
+
+/// Returns true when `inst` writes its first operand to a
+/// floating-point / SIMD register — x86 `xmm*`/`ymm*`/`zmm*` or
+/// aarch64 `s*`/`d*`/`q*`/`v*`/`h*`. Used at GotRef lift time to
+/// tag the destination's bank so the emitter can safely materialize
+/// rip-relative rodata bytes as float literals only in actual FP
+/// context. Codex review on PR #26 pass 7.
+fn instruction_writes_float_bank(inst: &Instruction) -> bool {
+    let Some(Operand::Register(reg)) = inst.operands.first() else {
+        return false;
+    };
+    let name = reg.name().to_lowercase();
+    // x86 SSE/AVX
+    if name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm") {
+        return true;
+    }
+    // aarch64 vector/FP register-file aliases at any width
+    let Some(prefix) = name.chars().next() else {
+        return false;
+    };
+    if matches!(prefix, 'h' | 's' | 'd' | 'q' | 'v') && name[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    false
 }
 
 /// Checks if an integer value should be displayed as a character literal.
