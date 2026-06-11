@@ -249,57 +249,89 @@ pub fn scan_param_spill_order(
     };
     let mut seen_regs: HashSet<String> = HashSet::new();
     for inst in &entry.instructions {
-        // x86 plain `mov [mem], reg` is `Operation::Move`, while
-        // SSE `movsd [mem], xmm` is `Operation::Store`. Both
-        // produce a spill we care about, so accept either AND
-        // require a memory operand to filter out reg-reg moves.
-        if !matches!(inst.operation, Operation::Store | Operation::Move) {
+        // Whitelist prologue scaffolding: push/pop, frame setup
+        // (`mov rbp, rsp`), and stack pointer adjust (`sub rsp,
+        // K`). These don't produce spill observations but they're
+        // the only things that can appear between spills.
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        let is_prologue_scaffold = matches!(
+            inst.operation,
+            Operation::Push | Operation::Pop | Operation::Nop
+        ) || mnemonic.starts_with("nop")
+            || mnemonic.starts_with("endbr")
+            || is_frame_setup_or_sp_adjust(inst);
+
+        let is_potential_spill = matches!(inst.operation, Operation::Store | Operation::Move);
+        if !is_potential_spill {
+            if is_prologue_scaffold {
+                continue;
+            }
+            // Hit non-prologue body — stop scanning. Anything after
+            // this point is function-body work, not the
+            // source-order spill sequence. Codex review on PR #27
+            // pass 1.
+            break;
+        }
+
+        // Verify the OPERAND DIRECTION: spills emit
+        // `mov [mem], reg` so operand[0] is the memory destination
+        // and operand[1] is the source register. Without this
+        // check, a reload like `mov edi, [rbp-12]` (operand[0] =
+        // reg, operand[1] = mem) would be wrongly counted as a
+        // spill of edi. Codex review on PR #27 pass 1.
+        let dst_is_memory = matches!(inst.operands.first(), Some(Operand::Memory(_)));
+        if !dst_is_memory {
+            // Operand[0] is not memory — this is a load/move into
+            // a register, NOT a spill. Continue scanning (the
+            // pattern `xor reg, reg; mov reg, val` is legal mid-
+            // prologue), but don't record an observation.
             continue;
         }
-        // Find the (memory-destination, register-source) pair.
-        let mut mem_offset: Option<i64> = None;
-        let mut src_reg: Option<String> = None;
-        for operand in &inst.operands {
-            match operand {
-                Operand::Memory(mem) => {
-                    if mem_offset.is_some() {
-                        continue;
-                    }
-                    if mem.index.is_some() {
-                        continue;
-                    }
-                    let base_name = mem.base.as_ref().map(|r| r.name().to_lowercase());
-                    if let Some(name) = base_name {
-                        if matches!(name.as_str(), "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp") {
-                            mem_offset = Some(mem.displacement);
-                        }
-                    }
-                }
-                Operand::Register(reg) => {
-                    if src_reg.is_some() {
-                        continue;
-                    }
-                    let name = reg.name().to_lowercase();
-                    if int_regs.contains(&name) || float_regs.contains(&name) {
-                        src_reg = Some(name);
-                    }
-                }
-                _ => {}
-            }
+        let Some(Operand::Memory(mem)) = inst.operands.first() else {
+            continue;
+        };
+        if mem.index.is_some() {
+            continue;
         }
-        if let (Some(offset), Some(reg)) = (mem_offset, src_reg) {
-            // De-dup: a reg spilled to multiple slots only counts
-            // once (the FIRST observation, which is the prologue
-            // spill).
-            if seen_regs.insert(reg.clone()) {
-                result.push(ParamSpillObservation {
-                    register: reg,
-                    offset,
-                });
-            }
+        let Some(base_name) = mem.base.as_ref().map(|r| r.name().to_lowercase()) else {
+            continue;
+        };
+        if !matches!(base_name.as_str(), "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp") {
+            continue;
+        }
+        let mem_offset = mem.displacement;
+        let Some(Operand::Register(src)) = inst.operands.get(1) else {
+            continue;
+        };
+        let reg_name = src.name().to_lowercase();
+        if !int_regs.contains(&reg_name) && !float_regs.contains(&reg_name) {
+            continue;
+        }
+        // De-dup: a reg spilled to multiple slots only counts
+        // once (the FIRST observation, which is the prologue
+        // spill).
+        if seen_regs.insert(reg_name.clone()) {
+            result.push(ParamSpillObservation {
+                register: reg_name,
+                offset: mem_offset,
+            });
         }
     }
     result
+}
+
+/// Quick check for the standard x86_64 prologue setup instructions
+/// `mov rbp, rsp` and `sub rsp, K`. Used to distinguish prologue
+/// scaffolding from function-body work in [`scan_param_spill_order`].
+fn is_frame_setup_or_sp_adjust(inst: &hexray_core::Instruction) -> bool {
+    let mnemonic = inst.mnemonic.to_ascii_lowercase();
+    if mnemonic != "mov" && mnemonic != "sub" && mnemonic != "add" {
+        return false;
+    }
+    let Some(Operand::Register(dst)) = inst.operands.first() else {
+        return false;
+    };
+    matches!(dst.name().to_lowercase().as_str(), "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp")
 }
 
 /// Scan the raw instruction stream for floating-point argument registers.
@@ -5347,6 +5379,70 @@ mod tests {
                 register: "edi".to_string(),
                 offset: -12,
             }]
+        );
+    }
+
+    /// Codex review on PR #27 pass 1: a reload like
+    /// `mov edi, [rbp-12]` MUST NOT be recorded as a spill of edi.
+    /// Operand direction matters — only `mov [mem], reg` (memory
+    /// dest, register source) is a spill.
+    #[test]
+    fn scan_param_spill_order_rejects_reload_pattern() {
+        let rbp = gpr(5, 64);
+        let edi = gpr(7, 32);
+        let cfg = single_block_cfg(vec![(
+            "mov",
+            Operation::Move,
+            // Reload: operand[0] = reg (dst), operand[1] = mem (src).
+            vec![Operand::Register(edi), mem(rbp, -12)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert!(
+            order.is_empty(),
+            "reload `mov reg, [mem]` must not be recorded as a spill, got {order:?}"
+        );
+    }
+
+    /// Codex review on PR #27 pass 1: the scanner stops at the
+    /// first non-prologue body instruction so later body stores
+    /// don't pollute the spill observations. Verify a body
+    /// `mov [rbp-20], esi` AFTER a non-prologue instruction
+    /// (`xor eax, eax` followed by `mov [rbp-20], esi`) isn't
+    /// captured. The non-prologue instruction breaks the scan.
+    #[test]
+    fn scan_param_spill_order_stops_at_first_body_instruction() {
+        let rbp = gpr(5, 64);
+        let edi = gpr(7, 32);
+        let esi = gpr(6, 32);
+        let eax = gpr(0, 32);
+        let cfg = single_block_cfg(vec![
+            // Real prologue spill.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -8), Operand::Register(edi)],
+            ),
+            // Body instruction — breaks the scan.
+            (
+                "xor",
+                Operation::Xor,
+                vec![Operand::Register(eax), Operand::Register(eax)],
+            ),
+            // Body store — must NOT be picked up.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -20), Operand::Register(esi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "edi".to_string(),
+                offset: -8,
+            }],
+            "scan must stop at first non-prologue instruction"
         );
     }
 
