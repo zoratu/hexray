@@ -90,12 +90,20 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     let mut indices_to_remove = Vec::new();
     let mut saw_real_call_after = false;
     let mut saw_stack_canary_after = false;
+    // Variables that participate in the canary check expression
+    // (the registers/slots that hold the reloaded canary on the
+    // check path). Used to scope the post-canary assignment-drop
+    // to ACTUAL canary scaffolding rather than the body work that
+    // precedes the canary check. SSE-5.
+    let mut canary_check_vars: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // Search backwards for an assignment to a return register, collecting epilogue statements
     for i in (0..statements.len()).rev() {
         let stmt = &statements[i];
         if expr_mentions_stack_canary_guard(stmt) {
             saw_stack_canary_after = true;
+            collect_var_names(stmt, &mut canary_check_vars);
         }
 
         // Check for return register assignment
@@ -128,22 +136,34 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
 
                 if saw_stack_canary_after {
                     // Restrict drop to ACTUAL canary-pattern
-                    // assignments: the RHS mentions the canary
-                    // guard symbol, the RHS is a reload of the
-                    // already-known canary slot, or the LHS is a
-                    // canary-related stack slot. Plain body work
-                    // happening before the canary check (the SSE
-                    // arithmetic and result-slot store on float-
-                    // returning stack-protected functions) MUST
-                    // survive — without this gate the body
-                    // recovery would emit `return uninit_slot;`
-                    // having dropped the computation. SSE-5.
+                    // assignments. Three accepted shapes:
+                    //  (a) RHS mentions `stack_chk_guard` (the
+                    //      canary reload itself).
+                    //  (b) LHS is a variable that participated in
+                    //      the canary check expression (e.g. the
+                    //      reload register used in the compare).
+                    //  (c) RHS is a reload of one of the
+                    //      already-seen canary check vars (e.g.
+                    //      `rcx = [rbp-8]` setting up the compare).
+                    // Plain body work happening before the canary
+                    // check (the SSE arithmetic and result-slot
+                    // store on float-returning stack-protected
+                    // functions) MUST survive — without this gate
+                    // the body recovery would emit
+                    // `return uninit_slot;` having dropped the
+                    // computation. SSE-5.
                     let rhs_is_canary = expr_mentions_stack_canary_guard(rhs);
-                    let lhs_is_canary_slot = matches!(
-                        v.name.as_str(),
-                        "rax" | "eax" | "x0" | "w0" | "a0"
-                    ) && rhs_is_canary;
-                    if rhs_is_canary || lhs_is_canary_slot {
+                    let lhs_is_check_var = canary_check_vars.contains(&v.name);
+                    let mut rhs_vars: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    collect_var_names(rhs, &mut rhs_vars);
+                    let rhs_uses_check_var =
+                        rhs_vars.iter().any(|n| canary_check_vars.contains(n));
+                    if rhs_is_canary || lhs_is_check_var || rhs_uses_check_var {
+                        // Propagate the var-tracking so chains of
+                        // canary setup statements all get dropped.
+                        canary_check_vars.insert(v.name.clone());
+                        canary_check_vars.extend(rhs_vars);
                         indices_to_remove.push(i);
                         continue;
                     }
@@ -274,6 +294,63 @@ pub(super) fn substitute_prior_register_assignments(expr: Expr, statements: &[Ex
     }
 
     substitute_vars(&expr, &reg_values)
+}
+
+/// Collect every `Var` name referenced inside `expr`. Used by the
+/// canary-aware return extraction to track which variables flow
+/// through the canary check expression. SSE-5.
+fn collect_var_names(expr: &Expr, names: &mut std::collections::HashSet<String>) {
+    use super::super::expression::ExprKind;
+    match &expr.kind {
+        ExprKind::Var(v) => {
+            names.insert(v.name.clone());
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            collect_var_names(left, names);
+            collect_var_names(right, names);
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. }
+        | ExprKind::AddressOf(operand) => {
+            collect_var_names(operand, names);
+        }
+        ExprKind::Deref { addr, .. } => collect_var_names(addr, names),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            collect_var_names(base, names);
+            collect_var_names(index, names);
+        }
+        ExprKind::FieldAccess { base, .. } => collect_var_names(base, names),
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_var_names(arg, names);
+            }
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_var_names(cond, names);
+            collect_var_names(then_expr, names);
+            collect_var_names(else_expr, names);
+        }
+        ExprKind::Assign { lhs, rhs } => {
+            collect_var_names(lhs, names);
+            collect_var_names(rhs, names);
+        }
+        ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            collect_var_names(lhs, names);
+            collect_var_names(rhs, names);
+        }
+        ExprKind::Phi(values) => {
+            for v in values {
+                collect_var_names(v, names);
+            }
+        }
+        ExprKind::GotRef { display_expr, .. } => collect_var_names(display_expr, names),
+        ExprKind::IntLit(_) | ExprKind::Unknown(_) => {}
+    }
 }
 
 fn expr_mentions_stack_canary_guard(expr: &Expr) -> bool {
