@@ -5306,6 +5306,74 @@ mod tests {
         );
     }
 
+    /// SSE-1: the prologue spill scanner must record the order in
+    /// which parameter registers are spilled to the stack. For
+    /// `double scale_sum(double x, int n)` clang emits
+    /// `movsd [rbp-8], xmm0; mov [rbp-12], edi` — xmm0 at -8 (the
+    /// first source param), edi at -12 (the second). Verify both
+    /// are captured in instruction order with the right offsets.
+    #[test]
+    fn scan_param_spill_order_captures_mixed_int_float_spills() {
+        let rbp = gpr(5, 64);
+        let edi = gpr(7, 32);
+        let cfg = single_block_cfg(vec![
+            (
+                "movsd",
+                Operation::Store,
+                vec![mem(rbp, -8), Operand::Register(xmm(0))],
+            ),
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -12), Operand::Register(edi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "edi".to_string(),
+                    offset: -12,
+                },
+            ]
+        );
+    }
+
+    /// SSE-1: the same scanner must NOT record reg-to-reg moves
+    /// (`mov rax, rbp`) as spills — those don't have a memory
+    /// operand and don't pin down a source-declaration position.
+    #[test]
+    fn scan_param_spill_order_ignores_reg_to_reg_moves() {
+        let rbp = gpr(5, 64);
+        let rax = gpr(0, 64);
+        let edi = gpr(7, 32);
+        let cfg = single_block_cfg(vec![
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(rax), Operand::Register(rbp)],
+            ),
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -12), Operand::Register(edi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "edi".to_string(),
+                offset: -12,
+            }]
+        );
+    }
+
     #[test]
     fn scan_detects_single_precision_size() {
         // movss %xmm0,[rbp-4]  -> float (4 bytes)
