@@ -144,21 +144,13 @@ pub struct SignatureRecovery {
     /// reloads of the actual home slot, not on later reuse of the register as
     /// a scratch temp for an unrelated stack local (e.g. a loop counter).
     arg_spill_offsets: HashMap<usize, HashSet<i128>>,
-    /// Stack-spill offsets observed for each SSE float-arg register
-    /// (`xmm0`..`xmm7` → index 0..7). Sibling to [`arg_spill_offsets`]
-    /// for the integer bank. At `-O0` the prologue spills every
-    /// parameter register in SOURCE-DECLARATION ORDER, so the
-    /// offsets here let us reconstruct the original mixed
-    /// int/float parameter order — `double scale_sum(double x, int n)`
-    /// puts xmm0 at -8 and edi at -16, so the float must be
-    /// listed first even though the integer-bank index is 0 too.
-    /// Without this the recovered signature emits all integer
-    /// params before all float params, which is wrong whenever
-    /// source order interleaves the two.
-    float_arg_spill_offsets: HashMap<usize, HashSet<i128>>,
     /// Prologue spill observations from the raw CFG, used to recover
-    /// the mixed int/float source declaration order. Seeded via
-    /// [`Self::with_param_spill_order`] before [`Self::analyze`] runs.
+    /// the mixed int/float source declaration order — at `-O0` the
+    /// compiler spills every parameter register in source order, so
+    /// `double scale_sum(double x, int n)` puts xmm0 at `[rbp-8]`
+    /// (source-first) and edi at `[rbp-12]` (source-second), and
+    /// the recovered signature must follow. Seeded via
+    /// [`Self::with_param_spill_order`] before [`Self::analyze`].
     /// See [`scan_param_spill_order`] for the producer.
     param_spill_order: Vec<ParamSpillObservation>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
@@ -814,7 +806,6 @@ impl SignatureRecovery {
             return_confidence: 0,
             param_names: HashMap::new(),
             arg_spill_offsets: HashMap::new(),
-            float_arg_spill_offsets: HashMap::new(),
             param_spill_order: Vec::new(),
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
@@ -935,7 +926,6 @@ impl SignatureRecovery {
         self.return_confidence = 0;
         self.param_names.clear();
         self.arg_spill_offsets.clear();
-        self.float_arg_spill_offsets.clear();
         self.param_type_overrides.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
@@ -1526,20 +1516,6 @@ impl SignatureRecovery {
                                     .entry(idx)
                                     .or_default()
                                     .insert(offset);
-                            }
-                            // Mirror tracking for SSE float-arg
-                            // registers — needed to recover the
-                            // source declaration order when both
-                            // int and float params are present.
-                            // Source order for SSE-1.
-                            let rhs_lower = rhs_name.to_lowercase();
-                            if let Some(idx) = Self::x86_simd_register_index(&rhs_lower) {
-                                if idx < self.convention.float_arg_registers().len() {
-                                    self.float_arg_spill_offsets
-                                        .entry(idx)
-                                        .or_default()
-                                        .insert(offset);
-                                }
                             }
                         }
                     }
