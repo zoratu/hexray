@@ -3088,13 +3088,26 @@ fn try_combine_adrp_ldr(exprs: &[Expr], i: usize) -> Option<Expr> {
 
     let combined_addr = page_addr.wrapping_add(ldr_offset as u64);
 
+    // Propagate FP context based on the LDR destination register
+    // name: `ldr d0, [...]` from a float-constant pool needs the
+    // FP-context flag so the emitter materializes the bytes as a
+    // literal. Codex review on PR #26 pass 9.
+    let dst_is_fp = {
+        let lower = dst_reg.to_lowercase();
+        lower
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, 's' | 'd' | 'q' | 'v'))
+            && lower.len() > 1
+            && lower[1..].chars().all(|c| c.is_ascii_digit())
+    };
     Some(Expr::assign(
         Expr::var(Variable {
             name: dst_reg,
             kind: VarKind::Register(0),
             size: 8,
         }),
-        Expr::got_ref(combined_addr, 0, ldr_size, exprs[i + 1].clone()),
+        Expr::got_ref_with_context(combined_addr, 0, ldr_size, exprs[i + 1].clone(), dst_is_fp),
     ))
 }
 

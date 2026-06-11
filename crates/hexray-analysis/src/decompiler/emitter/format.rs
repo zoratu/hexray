@@ -97,8 +97,20 @@ pub(super) fn format_float_literal_f32(value: f32) -> String {
 pub(super) fn is_compiler_local_pool_label(name: &str) -> bool {
     // ELF locals universally start with `.L`. Mach-O uses `L` (no dot)
     // but Mach-O constant-pool emitters typically name slots like
-    // `lCPI0_0` — accept that too.
-    name.starts_with(".L") || name.starts_with("LCPI") || name.starts_with("lCPI")
+    // `lCPI0_0` — accept that too. We also accept these labels
+    // appearing as an INTERIOR token: when a scalar load targets an
+    // offset inside a larger pool symbol, `format_global_value` can
+    // return something like `*(uint64_t*)(.LCPI0_0 + 8)`, where the
+    // leading character is `*` but the meaningful identifier is the
+    // embedded `.LCPI0_0`. Codex review on PR #26 pass 9.
+    if name.starts_with(".L") || name.starts_with("LCPI") || name.starts_with("lCPI") {
+        return true;
+    }
+    name.contains(".LCPI")
+        || name.contains(".LC")
+        || name.contains("(.L")
+        || name.contains("(LCPI")
+        || name.contains("(lCPI")
 }
 
 /// Heuristic: do these `f64` bytes look like a real compiler-emitted

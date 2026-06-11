@@ -13297,6 +13297,23 @@ mod tests {
         );
     }
 
+    /// Codex review on PR #26 pass 9: when a scalar float load
+    /// targets an offset inside a larger pool symbol (the second
+    /// double in a `.rodata.cst16` slot), `format_global_value`
+    /// returns `*(uint64_t*)(.LCPI0_0 + 8)` — the `.LCPI` label
+    /// appears as an INTERIOR token, not at the start. The
+    /// pool-label recognizer must accept embedded labels so the
+    /// concrete float wins over the opaque integer deref.
+    #[test]
+    fn pool_label_recognized_when_embedded_inside_global_deref() {
+        use super::format::is_compiler_local_pool_label;
+        assert!(is_compiler_local_pool_label("*(uint64_t*)(.LCPI0_0 + 8)"));
+        assert!(is_compiler_local_pool_label("*(uint64_t*)(.LC0 + 0)"));
+        assert!(is_compiler_local_pool_label("*(uint64_t*)(lCPI0_0 + 4)"));
+        // Genuine user-named global must NOT match.
+        assert!(!is_compiler_local_pool_label("*(uint64_t*)(&g_my_constants + 8)"));
+    }
+
     /// Codex review on PR #26 pass 8: even with destination in the
     /// SSE bank, integer-SIMD opcodes (`movq`/`movdqa`/`pinsrq`/`paddq`)
     /// must NOT trigger float materialization — they move/use
