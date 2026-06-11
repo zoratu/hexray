@@ -13312,8 +13312,7 @@ mod tests {
         ctx.add_section(0x9000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x9000, 0x9000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
         let display = Expr::int(0x9000);
         let got_ref = Expr::got_ref_with_context(0x9000, 0x500, 8, display, true);
@@ -13345,8 +13344,7 @@ mod tests {
         ctx.add_section(0x8000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x8000, 0x8000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
         let display = Expr::int(0x8000);
         // GotRef WITHOUT float context — as produced by lifting
@@ -13378,7 +13376,9 @@ mod tests {
         assert!(is_compiler_local_pool_label("*(uint64_t*)(.LC0 + 0)"));
         assert!(is_compiler_local_pool_label("*(uint64_t*)(lCPI0_0 + 4)"));
         // Genuine user-named global must NOT match.
-        assert!(!is_compiler_local_pool_label("*(uint64_t*)(&g_my_constants + 8)"));
+        assert!(!is_compiler_local_pool_label(
+            "*(uint64_t*)(&g_my_constants + 8)"
+        ));
     }
 
     /// Codex review on PR #26 pass 8: even with destination in the
@@ -13396,8 +13396,7 @@ mod tests {
         ctx.add_section(0x7000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x7000, 0x7000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
         let display = Expr::int(0x7000);
         // GotRef WITHOUT float context — as produced by lifting
@@ -13427,8 +13426,7 @@ mod tests {
         ctx.add_section(0x6000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x6000, 0x6000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
         let display = Expr::int(0x6000);
         // GotRef WITHOUT is_float_context — as produced by lifting
@@ -13452,15 +13450,13 @@ mod tests {
     #[test]
     fn rodata_double_constant_decodes_with_big_endian_byte_order() {
         use super::super::BinaryDataContext;
-        let mut ctx =
-            BinaryDataContext::new().with_endianness(hexray_core::Endianness::Big);
+        let mut ctx = BinaryDataContext::new().with_endianness(hexray_core::Endianness::Big);
         // Big-endian bytes for 1.25 = 0x3ff4_0000_0000_0000.
         let bytes: [u8; 8] = 1.25f64.to_be_bytes();
         ctx.add_section(0x5000, bytes.to_vec());
         ctx.add_float_constant_pool_range(0x5000, 0x5000 + bytes.len() as u64);
 
-        let emitter =
-            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
         let table = StringTable::new();
         let display = Expr::int(0x5000);
         let got_ref = Expr::got_ref_with_context(0x5000, 0x500, 8, display, true);

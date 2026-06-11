@@ -422,7 +422,11 @@ fn is_frame_setup_or_sp_adjust(inst: &hexray_core::Instruction) -> bool {
     // pointer) would be misread as scaffolding and the scanner
     // would keep running into body stores. Codex review on PR #27
     // pass 6.
-    match (mnemonic.as_str(), inst.operands.get(1), inst.operands.get(2)) {
+    match (
+        mnemonic.as_str(),
+        inst.operands.get(1),
+        inst.operands.get(2),
+    ) {
         // `mov frame_reg, stack_reg` — frame-pointer setup.
         ("mov", Some(Operand::Register(src)), _) => {
             matches!(
@@ -4691,8 +4695,7 @@ impl SignatureRecovery {
             return;
         }
 
-        let mut indexed: Vec<(usize, Parameter)> =
-            sig.parameters.drain(..).enumerate().collect();
+        let mut indexed: Vec<(usize, Parameter)> = sig.parameters.drain(..).enumerate().collect();
         indexed.sort_by(|(orig_a, a), (orig_b, b)| {
             let idx_a = spill_index_for(a);
             let idx_b = spill_index_for(b);
@@ -5815,10 +5818,7 @@ mod tests {
         assert_eq!(sig.parameters[1].name, "n");
         // And the types match their parameters: float param is
         // double, int param is int.
-        assert!(matches!(
-            sig.parameters[0].param_type,
-            ParamType::Float(64)
-        ));
+        assert!(matches!(sig.parameters[0].param_type, ParamType::Float(64)));
         assert!(matches!(
             sig.parameters[1].param_type,
             ParamType::SignedInt(32)
@@ -5903,8 +5903,8 @@ mod tests {
         sig.parameter_provenance
             .insert(0, vec!["callback hint".to_string()]);
 
-        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
-            .with_param_spill_order(vec![
+        let recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_param_spill_order(vec![
                 // Float observed first → moves to index 0.
                 ParamSpillObservation {
                     register: "xmm0".to_string(),
@@ -5968,8 +5968,8 @@ mod tests {
         ];
         // Only rdi (arg0) and xmm0 (farg0) have spill observations
         // — rsi (arg1) was not spilled. Reorder must NOT fire.
-        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
-            .with_param_spill_order(vec![
+        let recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_param_spill_order(vec![
                 ParamSpillObservation {
                     register: "rdi".to_string(),
                     offset: -4,
@@ -6021,8 +6021,8 @@ mod tests {
         // Pretend rdi was spilled SECOND (at a HIGHER offset than
         // xmm0) — offset alone would put rdi first by descending
         // sort, but observation index says float was first.
-        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
-            .with_param_spill_order(vec![
+        let recovery =
+            SignatureRecovery::new(CallingConvention::SystemV).with_param_spill_order(vec![
                 ParamSpillObservation {
                     register: "xmm0".to_string(),
                     offset: -32, // would lose by offset sort
