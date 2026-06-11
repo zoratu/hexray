@@ -144,6 +144,18 @@ pub struct SignatureRecovery {
     /// reloads of the actual home slot, not on later reuse of the register as
     /// a scratch temp for an unrelated stack local (e.g. a loop counter).
     arg_spill_offsets: HashMap<usize, HashSet<i128>>,
+    /// Stack-spill offsets observed for each SSE float-arg register
+    /// (`xmm0`..`xmm7` → index 0..7). Sibling to [`arg_spill_offsets`]
+    /// for the integer bank. At `-O0` the prologue spills every
+    /// parameter register in SOURCE-DECLARATION ORDER, so the
+    /// offsets here let us reconstruct the original mixed
+    /// int/float parameter order — `double scale_sum(double x, int n)`
+    /// puts xmm0 at -8 and edi at -16, so the float must be
+    /// listed first even though the integer-bank index is 0 too.
+    /// Without this the recovered signature emits all integer
+    /// params before all float params, which is wrong whenever
+    /// source order interleaves the two.
+    float_arg_spill_offsets: HashMap<usize, HashSet<i128>>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -698,6 +710,7 @@ impl SignatureRecovery {
             return_confidence: 0,
             param_names: HashMap::new(),
             arg_spill_offsets: HashMap::new(),
+            float_arg_spill_offsets: HashMap::new(),
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
@@ -809,6 +822,7 @@ impl SignatureRecovery {
         self.return_confidence = 0;
         self.param_names.clear();
         self.arg_spill_offsets.clear();
+        self.float_arg_spill_offsets.clear();
         self.param_type_overrides.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
@@ -1399,6 +1413,20 @@ impl SignatureRecovery {
                                     .entry(idx)
                                     .or_default()
                                     .insert(offset);
+                            }
+                            // Mirror tracking for SSE float-arg
+                            // registers — needed to recover the
+                            // source declaration order when both
+                            // int and float params are present.
+                            // Source order for SSE-1.
+                            let rhs_lower = rhs_name.to_lowercase();
+                            if let Some(idx) = Self::x86_simd_register_index(&rhs_lower) {
+                                if idx < self.convention.float_arg_registers().len() {
+                                    self.float_arg_spill_offsets
+                                        .entry(idx)
+                                        .or_default()
+                                        .insert(offset);
+                                }
                             }
                         }
                     }
@@ -4309,6 +4337,11 @@ impl SignatureRecovery {
             sig.return_type = ParamType::Void;
         }
 
+        // Reorder mixed int/float parameters by observed source
+        // declaration order, derived from prologue spill offsets.
+        // Codex review on PR #25 / SSE-1.
+        self.reorder_params_by_spill_offset(&mut sig);
+
         if matches!(self.current_func_name.as_deref(), Some("main" | "_main")) {
             sig.has_return = true;
             sig.return_type = ParamType::SignedInt(32);
@@ -4324,6 +4357,80 @@ impl SignatureRecovery {
         }
 
         sig
+    }
+
+    /// Reorders the recovered parameter list by source-declaration
+    /// order recovered from prologue spill offsets.
+    ///
+    /// At `-O0` the compiler spills every parameter register to the
+    /// stack in source order — the first source parameter goes to
+    /// `[rbp-8]`, the second to `[rbp-16]`, etc., regardless of
+    /// whether each is integer-bank or float-bank. By tracking each
+    /// param register's smallest observed spill offset and sorting
+    /// DESCENDING (largest = closest to rbp = earliest spilled),
+    /// we recover the source order even when int and float params
+    /// are interleaved (the `double scale_sum(double x, int n)`
+    /// case that previously emitted as `(int32_t arg0, double farg0)`).
+    ///
+    /// Parameters without observed spill offsets (e.g. seeded from
+    /// raw float scanning without a structured spill site) sort to
+    /// the end in their existing relative order — a stable
+    /// fallback that preserves the leaf-case heuristic. SSE-1.
+    fn reorder_params_by_spill_offset(&self, sig: &mut FunctionSignature) {
+        if sig.parameters.len() < 2 {
+            return;
+        }
+        // Require observed spills from BOTH an int and a float
+        // parameter before reordering. The leaf-case heuristic
+        // already produces correct output for all-int or all-float
+        // signatures; reshuffling those by partial spill info would
+        // risk regressing them.
+        let any_int_observed = sig.parameters.iter().any(|p| match &p.location {
+            ParameterLocation::IntegerRegister { index, .. } => {
+                self.arg_spill_offsets.contains_key(index)
+            }
+            _ => false,
+        });
+        let any_float_observed = sig.parameters.iter().any(|p| match &p.location {
+            ParameterLocation::FloatRegister { index, .. } => {
+                self.float_arg_spill_offsets.contains_key(index)
+            }
+            _ => false,
+        });
+        if !(any_int_observed && any_float_observed) {
+            return;
+        }
+        let spill_offset_for = |p: &Parameter| -> Option<i128> {
+            match &p.location {
+                ParameterLocation::IntegerRegister { index, .. } => self
+                    .arg_spill_offsets
+                    .get(index)
+                    .and_then(|s| s.iter().copied().min()),
+                ParameterLocation::FloatRegister { index, .. } => self
+                    .float_arg_spill_offsets
+                    .get(index)
+                    .and_then(|s| s.iter().copied().min()),
+                _ => None,
+            }
+        };
+        let mut indexed: Vec<(usize, Parameter)> =
+            sig.parameters.drain(..).enumerate().collect();
+        indexed.sort_by(|(orig_a, a), (orig_b, b)| {
+            let off_a = spill_offset_for(a);
+            let off_b = spill_offset_for(b);
+            match (off_a, off_b) {
+                // Both observed — sort DESCENDING (closer to rbp =
+                // earlier in source).
+                (Some(oa), Some(ob)) => ob.cmp(&oa),
+                // Observed beats not-observed (place observed
+                // params first; unobserved fall to the end).
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                // Neither observed — preserve original order.
+                (None, None) => orig_a.cmp(orig_b),
+            }
+        });
+        sig.parameters = indexed.into_iter().map(|(_, p)| p).collect();
     }
 
     fn observe_sysv_va_list_assignment(&mut self, lhs: &Expr, rhs: &Expr) {
