@@ -380,16 +380,42 @@ fn is_frame_setup_or_sp_adjust(inst: &hexray_core::Instruction) -> bool {
     let Some(Operand::Register(dst)) = inst.operands.first() else {
         return false;
     };
-    matches!(
-        dst.name().to_lowercase().as_str(),
-        // x86_64 / x86
+    let dst_name = dst.name().to_lowercase();
+    let is_frame_or_stack_dst = matches!(
+        dst_name.as_str(),
+        // x86_64 / x86 stack/frame
         "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp"
-        // aarch64: x29/fp is the frame pointer, x30/lr is the link
-        // register saved alongside fp in the standard
-        // `stp x29, x30, [sp, #-16]!; mov x29, sp` prologue. Codex
-        // review on PR #27 pass 4.
-        | "x29" | "fp" | "x30" | "lr" | "wsp"
-    )
+        // aarch64 stack/frame
+        | "x29" | "fp" | "x31" | "wsp"
+    );
+    if !is_frame_or_stack_dst {
+        return false;
+    }
+    // Verify the SOURCE is the stack pointer (for frame setup) or
+    // an immediate (for stack adjustment). Without this, body work
+    // like `mov rbp, rdi` (using rbp as a GPR under -fomit-frame-
+    // pointer) would be misread as scaffolding and the scanner
+    // would keep running into body stores. Codex review on PR #27
+    // pass 6.
+    match (mnemonic.as_str(), inst.operands.get(1), inst.operands.get(2)) {
+        // `mov frame_reg, stack_reg` — frame-pointer setup.
+        ("mov", Some(Operand::Register(src)), _) => {
+            matches!(
+                src.name().to_lowercase().as_str(),
+                "rsp" | "esp" | "sp" | "x31" | "wsp" | "rbp" | "x29"
+            )
+        }
+        // `sub rsp, K` (x86 stack adjust, 2-operand).
+        ("sub" | "add", Some(Operand::Immediate(_)), _) => true,
+        // `add sp, sp, K` (aarch64 3-operand form).
+        ("sub" | "add", Some(Operand::Register(src1)), Some(Operand::Immediate(_))) => {
+            matches!(
+                src1.name().to_lowercase().as_str(),
+                "rsp" | "esp" | "sp" | "x31" | "wsp"
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Scan the raw instruction stream for floating-point argument registers.
@@ -5423,6 +5449,39 @@ mod tests {
     // stores after them would pollute observations). The new
     // `scan_param_spill_order_terminates_on_reg_reg_move` test
     // covers the corrected behavior.
+
+    /// Codex review on PR #27 pass 6: under -fomit-frame-pointer
+    /// rbp can be used as a general-purpose register: `mov rbp,
+    /// rdi` is body work, NOT frame setup. The scaffold detector
+    /// must require the SOURCE be the stack pointer (for `mov`) or
+    /// an immediate (for `add/sub`), not just look at the
+    /// destination. Verify body `mov rbp, rdi` breaks the scan so
+    /// a later body store isn't mistaken for a prologue spill.
+    #[test]
+    fn scan_param_spill_order_does_not_accept_body_mov_to_rbp() {
+        let rbp = gpr(5, 64);
+        let rdi = gpr(7, 64);
+        let esi = gpr(6, 32);
+        let cfg = single_block_cfg(vec![
+            // Body work: rbp = rdi (rbp used as GPR).
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(rbp), Operand::Register(rdi)],
+            ),
+            // Later body store — must NOT be recorded.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -20), Operand::Register(esi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert!(
+            order.is_empty(),
+            "`mov rbp, rdi` (body work) must break the scan, got {order:?}"
+        );
+    }
 
     /// Codex review on PR #27 pass 5: aarch64 `-O0` typically
     /// spills parameters relative to `x29` (frame pointer) after
