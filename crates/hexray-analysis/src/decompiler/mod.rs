@@ -114,7 +114,7 @@ pub struct CleanupInfo {
 ///
 /// This provides access to read-only data sections needed for switch
 /// statement recovery (reading jump table entries from .rodata, __const, etc.)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BinaryDataContext {
     /// Pairs of (base_address, data) for each data section.
     sections: Vec<(u64, Vec<u8>)>,
@@ -147,6 +147,12 @@ pub struct BinaryDataContext {
     /// Used by the emitter to decode rip-relative rodata float
     /// constants with the correct byte order on big-endian targets.
     endianness: hexray_core::Endianness,
+}
+
+impl Default for BinaryDataContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BinaryDataContext {
