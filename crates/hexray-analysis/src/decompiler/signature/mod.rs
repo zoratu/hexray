@@ -320,7 +320,15 @@ pub fn scan_param_spill_order(
             _ => break,
         };
 
-        for (offset, reg_name) in observations {
+        for (offset, raw_reg_name) in observations {
+            // Normalize aarch64 register-file aliases to the ABI
+            // name (`s0`/`q0`/`v0` → `d0`) so single-precision
+            // float spills are recognized too. The integer bank
+            // doesn't have aliases we need to normalize on aarch64
+            // (`w0` already returns `w0`), so use the existing
+            // helper for the float side only. Codex review on PR
+            // #27 pass 4.
+            let reg_name = float_arg_abi_register(&raw_reg_name, convention);
             if !int_regs.contains(&reg_name) && !float_regs.contains(&reg_name) {
                 continue;
             }
@@ -361,7 +369,16 @@ fn is_frame_setup_or_sp_adjust(inst: &hexray_core::Instruction) -> bool {
     let Some(Operand::Register(dst)) = inst.operands.first() else {
         return false;
     };
-    matches!(dst.name().to_lowercase().as_str(), "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp")
+    matches!(
+        dst.name().to_lowercase().as_str(),
+        // x86_64 / x86
+        "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp"
+        // aarch64: x29/fp is the frame pointer, x30/lr is the link
+        // register saved alongside fp in the standard
+        // `stp x29, x30, [sp, #-16]!; mov x29, sp` prologue. Codex
+        // review on PR #27 pass 4.
+        | "x29" | "fp" | "x30" | "lr" | "wsp"
+    )
 }
 
 /// Scan the raw instruction stream for floating-point argument registers.
@@ -5395,6 +5412,65 @@ mod tests {
     // stores after them would pollute observations). The new
     // `scan_param_spill_order_terminates_on_reg_reg_move` test
     // covers the corrected behavior.
+
+    /// Codex review on PR #27 pass 4: aarch64 single-precision
+    /// spills use the `s0`/`s1` register name. The scanner must
+    /// normalize them to the ABI name `d0`/`d1` so the float bank
+    /// recognizes them. Without this, a `float`-typed parameter
+    /// is silently dropped and mixed signatures don't reorder.
+    #[test]
+    fn scan_param_spill_order_normalizes_aarch64_s_register() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            // 32-bit width = `s0` (single-precision).
+            vec![Operand::Register(aarch64_v(0, 32)), aarch64_mem(sp, 4)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: 4,
+            }],
+            "aarch64 s0 must normalize to ABI name d0"
+        );
+    }
+
+    /// Codex review on PR #27 pass 4: aarch64 standard `-O0`
+    /// prologue is `stp x29, x30, [sp, #-16]!; mov x29, sp` —
+    /// the `mov x29, sp` is frame setup, not body work. The
+    /// scaffold detector must whitelist x29/fp as a destination
+    /// for `mov`-style instructions.
+    #[test]
+    fn scan_param_spill_order_treats_aarch64_x29_setup_as_scaffold() {
+        let sp = aarch64_x(31, 64);
+        let x29 = aarch64_x(29, 64);
+        let cfg = aarch64_single_block_cfg(vec![
+            // mov x29, sp  — frame-pointer setup (skip).
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(x29), Operand::Register(sp)],
+            ),
+            // str d0, [sp, #8]  — first param spill.
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: 8,
+            }],
+            "x29 frame setup must not break the scan"
+        );
+    }
 
     /// Codex review on PR #27 pass 3: aarch64 `str d0, [sp, #8]`
     /// has operand[0] = register (source), operand[1] = memory
