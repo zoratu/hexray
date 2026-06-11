@@ -4524,22 +4524,28 @@ impl SignatureRecovery {
             .map(|r| r.to_lowercase())
             .collect();
 
-        let spill_offset_for = |p: &Parameter| -> Option<i64> {
+        // Use SPILL-INSTRUCTION ORDER rather than stack offset.
+        // aarch64 packs 4-byte integer slots and 8-byte FP slots
+        // with different alignment, so the offsets are not
+        // monotonic in source order (`int, double, int, double`
+        // can spill to `[sp,44], [sp,32], [sp,40], [sp,24]`).
+        // The scanner already records observations in instruction
+        // order — index into that order IS source order. Codex
+        // review on PR #27 pass 2.
+        let spill_index_for = |p: &Parameter| -> Option<usize> {
             match &p.location {
                 ParameterLocation::IntegerRegister { index, .. } => {
                     let r64 = int_arg_regs.get(*index)?;
                     let r32 = int_arg_regs_32.get(*index);
                     self.param_spill_order
                         .iter()
-                        .find(|obs| &obs.register == r64 || r32 == Some(&obs.register))
-                        .map(|obs| obs.offset)
+                        .position(|obs| &obs.register == r64 || r32 == Some(&obs.register))
                 }
                 ParameterLocation::FloatRegister { index, .. } => {
                     let r = float_arg_regs.get(*index)?;
                     self.param_spill_order
                         .iter()
-                        .find(|obs| &obs.register == r)
-                        .map(|obs| obs.offset)
+                        .position(|obs| &obs.register == r)
                 }
                 _ => None,
             }
@@ -4554,12 +4560,12 @@ impl SignatureRecovery {
             .parameters
             .iter()
             .any(|p| matches!(p.location, ParameterLocation::IntegerRegister { .. })
-                && spill_offset_for(p).is_some());
+                && spill_index_for(p).is_some());
         let any_float_observed = sig
             .parameters
             .iter()
             .any(|p| matches!(p.location, ParameterLocation::FloatRegister { .. })
-                && spill_offset_for(p).is_some());
+                && spill_index_for(p).is_some());
         if !(any_int_observed && any_float_observed) {
             return;
         }
@@ -4567,12 +4573,13 @@ impl SignatureRecovery {
         let mut indexed: Vec<(usize, Parameter)> =
             sig.parameters.drain(..).enumerate().collect();
         indexed.sort_by(|(orig_a, a), (orig_b, b)| {
-            let off_a = spill_offset_for(a);
-            let off_b = spill_offset_for(b);
-            match (off_a, off_b) {
-                // Both observed — sort DESCENDING (closer to rbp =
-                // earlier in source).
-                (Some(oa), Some(ob)) => ob.cmp(&oa),
+            let idx_a = spill_index_for(a);
+            let idx_b = spill_index_for(b);
+            match (idx_a, idx_b) {
+                // Both observed — sort ASCENDING by observation
+                // index (= instruction order in the prologue =
+                // source-declaration order).
+                (Some(ia), Some(ib)) => ia.cmp(&ib),
                 // Observed beats not-observed (place observed
                 // params first; unobserved fall to the end).
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -5380,6 +5387,61 @@ mod tests {
                 offset: -12,
             }]
         );
+    }
+
+    /// Codex review on PR #27 pass 2: aarch64 packs int (4 bytes)
+    /// and float (8 bytes) spills with different alignment, so
+    /// spill offsets are NOT monotonic in source-declaration
+    /// order. Verify the reorder helper uses observation INDEX
+    /// (instruction order), not offset — a fake order list with
+    /// non-monotonic offsets but correct sequence should still
+    /// yield correct source ordering.
+    #[test]
+    fn reorder_uses_observation_index_not_offset() {
+        use super::signature::Parameter;
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        // Pretend rdi was spilled SECOND (at a HIGHER offset than
+        // xmm0) — offset alone would put rdi first by descending
+        // sort, but observation index says float was first.
+        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -32, // would lose by offset sort
+                },
+                ParamSpillObservation {
+                    register: "edi".to_string(),
+                    offset: -8, // would win by offset sort
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // Float must be first because it was observed first.
+        assert!(matches!(
+            sig.parameters[0].location,
+            ParameterLocation::FloatRegister { .. }
+        ));
+        assert!(matches!(
+            sig.parameters[1].location,
+            ParameterLocation::IntegerRegister { .. }
+        ));
     }
 
     /// Codex review on PR #27 pass 1: a reload like
