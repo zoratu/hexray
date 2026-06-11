@@ -273,51 +273,94 @@ pub fn scan_param_spill_order(
             break;
         }
 
-        // Verify the OPERAND DIRECTION: spills emit
-        // `mov [mem], reg` so operand[0] is the memory destination
-        // and operand[1] is the source register. Without this
-        // check, a reload like `mov edi, [rbp-12]` (operand[0] =
-        // reg, operand[1] = mem) would be wrongly counted as a
-        // spill of edi. Codex review on PR #27 pass 1.
-        let dst_is_memory = matches!(inst.operands.first(), Some(Operand::Memory(_)));
-        if !dst_is_memory {
-            // Operand[0] is not memory — this is a load/move into
-            // a register, NOT a spill. Continue scanning (the
-            // pattern `xor reg, reg; mov reg, val` is legal mid-
-            // prologue), but don't record an observation.
-            continue;
-        }
-        let Some(Operand::Memory(mem)) = inst.operands.first() else {
-            continue;
+        // Spills emit one of two operand layouts depending on
+        // architecture:
+        //   x86 `mov [mem], reg`:    [Memory(dst), Register(src)]
+        //   aarch64 `str reg, [mem]`: [Register(src), Memory(dst)]
+        //   aarch64 `stp r1, r2, [mem]`: [Reg, Reg, Memory] (pair)
+        // Sniff the layout from operand[0] and route to the right
+        // (mem_offset, src_register) extraction. Codex review on
+        // PR #27 pass 3.
+        let observations = match (inst.operands.first(), inst.operands.get(1)) {
+            (Some(Operand::Memory(mem)), Some(Operand::Register(src))) => {
+                // x86 store form. Validate memory base is the
+                // frame.
+                if !is_frame_base_memory(mem) {
+                    // Operand[0] is memory but not the frame —
+                    // body store to a heap/global, NOT a prologue
+                    // spill. Stop scanning: any later store can
+                    // pollute observations. Codex review on PR
+                    // #27 pass 3.
+                    break;
+                }
+                vec![(mem.displacement, src.name().to_lowercase())]
+            }
+            (Some(Operand::Register(src)), Some(Operand::Memory(mem))) => {
+                // aarch64 STR form (single register source).
+                if !is_frame_base_memory(mem) {
+                    break;
+                }
+                vec![(mem.displacement, src.name().to_lowercase())]
+            }
+            (Some(Operand::Register(src1)), Some(Operand::Register(src2))) => {
+                // Two register operands: either aarch64 STP (third
+                // operand is memory) or x86 reg-reg `mov rax, rdi`
+                // (body work — stop scanning). Codex review on
+                // PR #27 pass 3.
+                match inst.operands.get(2) {
+                    Some(Operand::Memory(mem)) if is_frame_base_memory(mem) => {
+                        let base = mem.displacement;
+                        // STP packs both registers contiguously.
+                        // The displacement of the second register
+                        // is base + 8 (assuming 64-bit slots).
+                        vec![
+                            (base, src1.name().to_lowercase()),
+                            (base + 8, src2.name().to_lowercase()),
+                        ]
+                    }
+                    _ => {
+                        // Reg-reg move with no memory — body work.
+                        break;
+                    }
+                }
+            }
+            (Some(Operand::Register(_)), _) => {
+                // Single register operand or register + immediate
+                // — body work. Stop scanning. Codex review on PR
+                // #27 pass 3.
+                break;
+            }
+            _ => continue,
         };
-        if mem.index.is_some() {
-            continue;
-        }
-        let Some(base_name) = mem.base.as_ref().map(|r| r.name().to_lowercase()) else {
-            continue;
-        };
-        if !matches!(base_name.as_str(), "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp") {
-            continue;
-        }
-        let mem_offset = mem.displacement;
-        let Some(Operand::Register(src)) = inst.operands.get(1) else {
-            continue;
-        };
-        let reg_name = src.name().to_lowercase();
-        if !int_regs.contains(&reg_name) && !float_regs.contains(&reg_name) {
-            continue;
-        }
-        // De-dup: a reg spilled to multiple slots only counts
-        // once (the FIRST observation, which is the prologue
-        // spill).
-        if seen_regs.insert(reg_name.clone()) {
-            result.push(ParamSpillObservation {
-                register: reg_name,
-                offset: mem_offset,
-            });
+
+        for (offset, reg_name) in observations {
+            if !int_regs.contains(&reg_name) && !float_regs.contains(&reg_name) {
+                continue;
+            }
+            // De-dup: a reg spilled to multiple slots only counts
+            // once (the FIRST observation, which is the prologue
+            // spill).
+            if seen_regs.insert(reg_name.clone()) {
+                result.push(ParamSpillObservation {
+                    register: reg_name,
+                    offset,
+                });
+            }
         }
     }
     result
+}
+
+/// Whether `mem` is rbp/rsp/sp-relative (a frame-local stack slot,
+/// not an arbitrary heap/global address).
+fn is_frame_base_memory(mem: &hexray_core::MemoryRef) -> bool {
+    if mem.index.is_some() {
+        return false;
+    }
+    mem.base
+        .as_ref()
+        .map(|r| r.name().to_lowercase())
+        .is_some_and(|n| matches!(n.as_str(), "rbp" | "ebp" | "bp" | "rsp" | "esp" | "sp"))
 }
 
 /// Quick check for the standard x86_64 prologue setup instructions
@@ -5386,6 +5429,102 @@ mod tests {
                 register: "edi".to_string(),
                 offset: -12,
             }]
+        );
+    }
+
+    /// Codex review on PR #27 pass 3: aarch64 `str d0, [sp, #8]`
+    /// has operand[0] = register (source), operand[1] = memory
+    /// (destination) — opposite of x86. The scanner must recognize
+    /// both layouts.
+    #[test]
+    fn scan_param_spill_order_handles_aarch64_str_layout() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "str",
+            Operation::Store,
+            vec![Operand::Register(aarch64_v(0, 64)), aarch64_mem(sp, 8)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "d0".to_string(),
+                offset: 8,
+            }],
+            "aarch64 STR must be detected (reg, mem layout)"
+        );
+    }
+
+    /// Codex review on PR #27 pass 3: aarch64 `stp d0, d1, [sp, #-16]!`
+    /// stores TWO registers as a pair. Both should be captured in
+    /// order with sequential offsets.
+    #[test]
+    fn scan_param_spill_order_handles_aarch64_stp_pair() {
+        let sp = aarch64_x(31, 64);
+        let cfg = aarch64_single_block_cfg(vec![(
+            "stp",
+            Operation::Store,
+            vec![
+                Operand::Register(aarch64_v(0, 64)),
+                Operand::Register(aarch64_v(1, 64)),
+                aarch64_mem(sp, -16),
+            ],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::Aarch64);
+        assert_eq!(
+            order,
+            vec![
+                ParamSpillObservation {
+                    register: "d0".to_string(),
+                    offset: -16,
+                },
+                ParamSpillObservation {
+                    register: "d1".to_string(),
+                    offset: -8,
+                },
+            ],
+            "aarch64 STP must record both registers as a pair"
+        );
+    }
+
+    /// Codex review on PR #27 pass 3: a reg-reg move like
+    /// `mov rax, rdi` is body work, not a prologue spill. It must
+    /// terminate the scan so later body stores don't pollute the
+    /// observation list.
+    #[test]
+    fn scan_param_spill_order_terminates_on_reg_reg_move() {
+        let rbp = gpr(5, 64);
+        let rax = gpr(0, 64);
+        let rdi = gpr(7, 64);
+        let esi = gpr(6, 32);
+        let cfg = single_block_cfg(vec![
+            // Real prologue spill.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -8), Operand::Register(rdi)],
+            ),
+            // Body reg-reg move — should STOP the scan.
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(rax), Operand::Register(rdi)],
+            ),
+            // Later body store — must NOT be picked up.
+            (
+                "mov",
+                Operation::Move,
+                vec![mem(rbp, -20), Operand::Register(esi)],
+            ),
+        ]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }],
+            "scan must stop at reg-reg move"
         );
     }
 
