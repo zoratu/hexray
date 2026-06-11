@@ -321,14 +321,22 @@ pub fn scan_param_spill_order(
         };
 
         for (offset, raw_reg_name) in observations {
-            // Normalize aarch64 register-file aliases to the ABI
-            // name (`s0`/`q0`/`v0` → `d0`) so single-precision
-            // float spills are recognized too. The integer bank
-            // doesn't have aliases we need to normalize on aarch64
-            // (`w0` already returns `w0`), so use the existing
-            // helper for the float side only. Codex review on PR
-            // #27 pass 4.
-            let reg_name = float_arg_abi_register(&raw_reg_name, convention);
+            // Normalize register-file aliases to the ABI name:
+            //   aarch64 `s0`/`q0`/`v0` → `d0` (float bank)
+            //   x86_64  `dil`/`di`/`edi`/`rdi` → `rdi` (int bank
+            //                                  ABI name)
+            // Without normalization a `mov [rbp-8], dil` (narrow
+            // char spill) would be silently dropped because
+            // `dil` doesn't match any ABI argument-register name.
+            // Codex review on PR #27 pass 7.
+            let reg_name = if int_regs.contains(&raw_reg_name) || float_regs.contains(&raw_reg_name)
+            {
+                raw_reg_name
+            } else if let Some(canonical) = canonicalize_int_arg_register(&raw_reg_name) {
+                canonical
+            } else {
+                float_arg_abi_register(&raw_reg_name, convention)
+            };
             if !int_regs.contains(&reg_name) && !float_regs.contains(&reg_name) {
                 continue;
             }
@@ -367,6 +375,23 @@ fn is_frame_base_memory(mem: &hexray_core::MemoryRef) -> bool {
                 | "x29" | "fp" | "x31"
             )
         })
+}
+
+/// Canonicalize an x86_64 integer argument register alias to its
+/// 64-bit ABI name. Returns `Some("rdi")` for any of
+/// `dil`/`di`/`edi`/`rdi`, and `None` for non-arg-register names.
+/// Codex review on PR #27 pass 7.
+fn canonicalize_int_arg_register(name: &str) -> Option<String> {
+    let canonical = match name {
+        "rdi" | "edi" | "di" | "dil" => "rdi",
+        "rsi" | "esi" | "si" | "sil" => "rsi",
+        "rdx" | "edx" | "dx" | "dl" => "rdx",
+        "rcx" | "ecx" | "cx" | "cl" => "rcx",
+        "r8" | "r8d" | "r8w" | "r8b" => "r8",
+        "r9" | "r9d" | "r9w" | "r9b" => "r9",
+        _ => return None,
+    };
+    Some(canonical.to_string())
 }
 
 /// Quick check for the standard x86_64 prologue setup instructions
@@ -5449,6 +5474,30 @@ mod tests {
     // stores after them would pollute observations). The new
     // `scan_param_spill_order_terminates_on_reg_reg_move` test
     // covers the corrected behavior.
+
+    /// Codex review on PR #27 pass 7: a narrow integer arg like
+    /// `char c` is spilled as `dil` at `-O0`. The scanner must
+    /// canonicalize `dil` (and `di`, `r8b`, etc.) to the 64-bit
+    /// ABI name `rdi` so it's recognized as an arg-register spill.
+    #[test]
+    fn scan_param_spill_order_normalizes_narrow_int_aliases() {
+        let rbp = gpr(5, 64);
+        let dil = gpr(7, 8); // 8-bit form of rdi
+        let cfg = single_block_cfg(vec![(
+            "mov",
+            Operation::Move,
+            vec![mem(rbp, -4), Operand::Register(dil)],
+        )]);
+        let order = scan_param_spill_order(&cfg, CallingConvention::SystemV);
+        assert_eq!(
+            order,
+            vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -4,
+            }],
+            "narrow int alias (dil) must normalize to ABI rdi"
+        );
+    }
 
     /// Codex review on PR #27 pass 6: under -fomit-frame-pointer
     /// rbp can be used as a general-purpose register: `mov rbp,
