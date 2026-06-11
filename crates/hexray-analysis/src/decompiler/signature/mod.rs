@@ -4749,18 +4749,23 @@ impl SignatureRecovery {
         // Reapply DWARF parameter names by the POST-reorder index.
         // DWARF names are stored in source-declaration order; after
         // reorder the new index N IS the source-position N, so
-        // dwarf_param_names[N] is the right name to attach. Without
-        // this a `double f(double x, int n)` whose DWARF names are
-        // ["x", "n"] would surface as `double f(double n, int x)`
-        // — register-bank ordering attached x to xmm0 (now at
-        // index 1) and n to rdi (now at index 0). Codex review on
-        // PR #27 pass 10.
-        for (new_idx, (_, p)) in indexed.iter_mut().enumerate() {
-            if let Some(dwarf_name) = self.dwarf_param_names.get(new_idx) {
-                if !dwarf_name.is_empty()
-                    && (p.name.starts_with("arg") || p.name.starts_with("farg"))
-                {
-                    p.name = dwarf_name.clone();
+        // dwarf_param_names[N] is the right name to attach.
+        //
+        // We OVERWRITE existing names (not just generic
+        // `arg*`/`farg*`) because pre-reorder DWARF application
+        // attached names by register-bank index. For example a
+        // `double f(double x, int n)` whose DWARF names are
+        // ["x", "n"] gets pre-reorder names `n` (on rdi, int idx
+        // 0) and `x` (on xmm0, float idx 0). After moving float
+        // to position 0, we'd skip name reassignment because "n"
+        // is non-generic — but it's the WRONG name for the new
+        // float-first param. Codex review on PR #27 pass 11.
+        if !self.dwarf_param_names.is_empty() {
+            for (new_idx, (_, p)) in indexed.iter_mut().enumerate() {
+                if let Some(dwarf_name) = self.dwarf_param_names.get(new_idx) {
+                    if !dwarf_name.is_empty() {
+                        p.name = dwarf_name.clone();
+                    }
                 }
             }
         }
@@ -5752,19 +5757,28 @@ mod tests {
         );
     }
 
-    /// Codex review on PR #27 pass 10: when DWARF names are
-    /// available they're applied by register-bank index, BEFORE
-    /// the reorder runs. After moving parameters into source
-    /// order, the names must be reapplied by the new index so
-    /// `double f(double x, int n)` doesn't surface as `(double n,
-    /// int x)`.
+    /// Codex review on PR #27 passes 10 & 11: when DWARF names
+    /// are available they're applied by register-bank index BEFORE
+    /// the reorder runs — so an int param gets `dwarf_names[0]`
+    /// and a float param gets `dwarf_names[0]` too, leading to
+    /// duplicate or stale names after reorder. Verify the reorder
+    /// reapplies the source-order DWARF names to ALL parameters
+    /// regardless of their pre-reorder names. Pass 11 strengthened
+    /// the assertion to also catch the previously-passing case
+    /// where the pre-reorder name happened to be non-generic.
     #[test]
-    fn reorder_remaps_dwarf_param_names() {
+    fn reorder_overwrites_stale_dwarf_names_after_remap() {
         let mut sig = FunctionSignature::default();
-        // Pre-reorder names attached by register bank.
+        // Pre-reorder names attached by register bank — the
+        // dwarf-name-application step attached `x` (dwarf[0]) to
+        // the int param (rdi was index 0 in the int bank) and `n`
+        // (dwarf[1]? — but float bank index 0 → in our codebase
+        // the float assignment may attach a different name). In
+        // any case, after reorder the names should match
+        // source-order DWARF.
         sig.parameters = vec![
             Parameter::new(
-                "n".to_string(),
+                "x".to_string(), // STALE — was attached to int by old bank order
                 ParamType::SignedInt(32),
                 ParameterLocation::IntegerRegister {
                     name: "rdi".to_string(),
@@ -5772,7 +5786,7 @@ mod tests {
                 },
             ),
             Parameter::new(
-                "x".to_string(),
+                "n".to_string(), // STALE
                 ParamType::Float(64),
                 ParameterLocation::FloatRegister {
                     name: "xmm0".to_string(),
@@ -5780,7 +5794,7 @@ mod tests {
                 },
             ),
         ];
-        // DWARF names in source order: ["x", "n"].
+        // DWARF source order: ["x" (the double), "n" (the int)].
         let recovery = SignatureRecovery::new(CallingConvention::SystemV)
             .with_dwarf_param_names(vec!["x".to_string(), "n".to_string()])
             .with_param_spill_order(vec![
@@ -5794,14 +5808,20 @@ mod tests {
                 },
             ]);
         recovery.reorder_params_by_spill_offset(&mut sig);
-        // After reorder: float at index 0, int at index 1. Names
-        // should follow source order ["x", "n"].
-        // However, the pre-reorder names "n", "x" are NOT generic
-        // (don't start with arg/farg), so they pass through unchanged.
-        // The reorder still moves the parameters into source-order
-        // positions — verify that.
+        // Float (now at index 0) takes dwarf[0]="x"; int (index 1)
+        // takes dwarf[1]="n".
         assert_eq!(sig.parameters[0].name, "x");
         assert_eq!(sig.parameters[1].name, "n");
+        // And the types match their parameters: float param is
+        // double, int param is int.
+        assert!(matches!(
+            sig.parameters[0].param_type,
+            ParamType::Float(64)
+        ));
+        assert!(matches!(
+            sig.parameters[1].param_type,
+            ParamType::SignedInt(32)
+        ));
     }
 
     /// Codex review on PR #27 pass 10 alternate: when the pre-
