@@ -5398,7 +5398,6 @@ mod tests {
     /// yield correct source ordering.
     #[test]
     fn reorder_uses_observation_index_not_offset() {
-        use super::signature::Parameter;
         let mut sig = FunctionSignature::default();
         sig.parameters = vec![
             Parameter::new(
