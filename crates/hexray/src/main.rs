@@ -4422,7 +4422,11 @@ fn is_cxx_throw_symbol_name(name: &str) -> bool {
 
 /// Builds a binary data context from read-only data sections for jump table reconstruction.
 fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
-    let mut ctx = BinaryDataContext::new();
+    // Pass through the binary's endianness so the emitter decodes
+    // rodata float constants with the correct byte order on
+    // big-endian targets (PowerPC, MIPS-BE, big-endian ARM ELF).
+    // Codex review on PR #26 pass 5.
+    let mut ctx = BinaryDataContext::new().with_endianness(fmt.endianness());
 
     for section in fmt.sections() {
         let name = section.name().to_lowercase();
@@ -4432,19 +4436,46 @@ fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
         // - .rdata (Windows read-only data)
         // - __DATA_CONST (Mach-O data constants)
         // - __text, .text (code sections - compilers often embed small jump tables here)
+        // Mach-O float-constant pools are named `__literal4`/`__literal8`/
+        // `__literal16` and don't contain "rodata"/"const", so they need an
+        // explicit allow path in the outer predicate too — otherwise the
+        // float-pool tagging below would never see them and the new SSE-2
+        // materialization would be silently disabled on Mach-O. Codex
+        // review on PR #26.
         if !section.data().is_empty()
             && (name.contains("rodata")
                 || name.contains("const")
                 || name == ".rdata"
                 || name == "rdata"
                 || name == "__text"
-                || name == ".text")
+                || name == ".text"
+                || is_float_constant_pool_section_name(&name))
         {
-            ctx.add_section(section.virtual_address(), section.data().to_vec());
+            let base = section.virtual_address();
+            let len = section.data().len() as u64;
+            ctx.add_section(base, section.data().to_vec());
+            // Tag known float-constant-pool sections so the emitter
+            // can safely materialize their bytes as float literals
+            // without confusing a generic-rodata integer with a
+            // float. Names: `.rodata.cst{4,8,16}` (ELF) and
+            // `__literal{4,8,16}` (Mach-O).
+            if is_float_constant_pool_section_name(&name) {
+                ctx.add_float_constant_pool_range(base, base + len);
+            }
         }
     }
 
     ctx
+}
+
+fn is_float_constant_pool_section_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("rodata.cst4")
+        || lower.contains("rodata.cst8")
+        || lower.contains("rodata.cst16")
+        || lower.contains("__literal4")
+        || lower.contains("__literal8")
+        || lower.contains("__literal16")
 }
 
 fn seed_resolved_call_target_names(

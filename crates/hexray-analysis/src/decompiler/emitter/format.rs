@@ -61,6 +61,109 @@ pub(super) fn format_integer(n: i128) -> String {
     }
 }
 
+/// Formats an `f64` value as a C double literal — e.g. `3.14`,
+/// `-1.5`, `0.0`. Uses Rust's default `{}` formatting, which round-
+/// trips IEEE-754 doubles to the shortest decimal that parses back to
+/// the same bit pattern. Always ensures a `.` appears so the literal
+/// parses as a `double` in C rather than as an integer.
+pub(super) fn format_float_literal_f64(value: f64) -> String {
+    let mut s = format!("{value}");
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    s
+}
+
+/// Formats an `f32` value as a C float literal with an `f` suffix —
+/// e.g. `3.14f`, `-1.5f`, `0.0f`. The `f` suffix disambiguates from
+/// `double` so a recovered `float` constant doesn't get widened on
+/// rebuild.
+pub(super) fn format_float_literal_f32(value: f32) -> String {
+    let mut s = format!("{value}");
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        s.push_str(".0");
+    }
+    s.push('f');
+    s
+}
+
+/// Returns true when `name` looks like a compiler-generated local
+/// pool label rather than a user-defined global. These show up as
+/// `.LCPI0_0`/`.LCPI1_0` (clang/LLVM), `.LC0`/`.LC1` (GCC), and
+/// similar `.L`-prefixed local labels. Such names are not meaningful
+/// to a human reader; when one of them is the only "symbol" at a
+/// rip-relative float load, materializing the literal `3.14` is more
+/// useful than the opaque label.
+pub(super) fn is_compiler_local_pool_label(name: &str) -> bool {
+    // ELF locals universally start with `.L`. Mach-O uses `L` (no dot)
+    // but Mach-O constant-pool emitters typically name slots like
+    // `lCPI0_0` — accept that too. We also accept these labels
+    // appearing as an INTERIOR token: when a scalar load targets an
+    // offset inside a larger pool symbol, `format_global_value` can
+    // return something like `*(uint64_t*)(.LCPI0_0 + 8)`, where the
+    // leading character is `*` but the meaningful identifier is the
+    // embedded `.LCPI0_0`. Codex review on PR #26 pass 9.
+    if name.starts_with(".L") || name.starts_with("LCPI") || name.starts_with("lCPI") {
+        return true;
+    }
+    name.contains(".LCPI")
+        || name.contains(".LC")
+        || name.contains("(.L")
+        || name.contains("(LCPI")
+        || name.contains("(lCPI")
+}
+
+/// Heuristic: do these `f64` bytes look like a real compiler-emitted
+/// float constant, as opposed to a misread integer / pointer / zeroed
+/// rodata slot?
+///
+/// The screen is intentionally narrow: compiler-emitted `.rodata.cst8`
+/// entries are almost always normalized, finite, non-zero magnitudes
+/// in human-comprehensible ranges. Denormals, NaNs, infs, and tiny
+/// values produced by reinterpreting `uint64_t x = 42` as a double
+/// (which becomes ~2e-322) are all excluded.
+pub(super) fn looks_like_real_float_constant_f64(value: f64) -> bool {
+    if !value.is_finite() || value.is_subnormal() {
+        return false;
+    }
+    // Zero is a legitimate `.rodata.cst*` constant — a compiler
+    // emits `+0.0` and especially `-0.0` (bit pattern
+    // `0x8000_0000_0000_0000`) into the constant pool because the
+    // `xor self-zero` idiom can't reproduce negative zero. The
+    // float-pool gate already prevents generic-rodata zeros from
+    // being materialized, so accepting zero here is safe. Codex
+    // review on PR #26 pass 12.
+    if value == 0.0 {
+        return true;
+    }
+    let abs = value.abs();
+    // 1e-300..1e300 covers everything from sub-picometer physics
+    // constants to astronomical magnitudes — any normalized double a
+    // compiler would emit in a constant pool fits here. The lower
+    // bound also filters out misread pointers like 0x0000_0000_0000_002a,
+    // which as f64 ≈ 2.07e-322 (subnormal) is rejected above, but
+    // 0x3e00_0000_0000_0000 ≈ 3.18e-145 would otherwise sneak
+    // through.
+    (1e-300..=1e300).contains(&abs)
+}
+
+/// Heuristic: do these `f32` bytes look like a real compiler-emitted
+/// float constant? Same idea as the f64 variant; range scaled for the
+/// narrower exponent.
+pub(super) fn looks_like_real_float_constant_f32(value: f32) -> bool {
+    if !value.is_finite() || value.is_subnormal() {
+        return false;
+    }
+    // Zero allowed for the same reason as the f64 variant — `-0.0f`
+    // is a real `.rodata.cst4` constant the xor-zero idiom can't
+    // reproduce. Codex review on PR #26 pass 12.
+    if value == 0.0 {
+        return true;
+    }
+    let abs = value.abs();
+    (1e-30..=1e30).contains(&abs)
+}
+
 /// Heuristic: does this value look like a memory address?
 pub(super) fn looks_like_address(n: i128) -> bool {
     // Common address ranges for x86-64

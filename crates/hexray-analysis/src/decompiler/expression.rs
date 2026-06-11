@@ -51,6 +51,15 @@ pub enum ExprKind {
         display_expr: Box<Expr>,
         /// True if this is a dereference (MOV), false if address-of (LEA).
         is_deref: bool,
+        /// True when the producing instruction writes to a floating-
+        /// point register (x86 xmm/ymm/zmm; aarch64 s/d/q/v). Set at
+        /// lift time from the destination operand's register class.
+        /// Used by the emitter to gate rip-relative rodata-constant
+        /// materialization on actual FP context — a plain
+        /// `mov eax, [rip + .L]` whose bytes happen to encode a
+        /// plausible float must NOT be rewritten as `1.0f`. Codex
+        /// review on PR #26 pass 7.
+        is_float_context: bool,
     },
 
     /// Address-of: &expr.
@@ -502,6 +511,20 @@ impl Expr {
     /// `address` is the computed target address (rip + inst_size + displacement).
     /// `instruction_address` is the address of the instruction for relocation lookup.
     pub fn got_ref(address: u64, instruction_address: u64, size: u8, display_expr: Expr) -> Self {
+        Self::got_ref_with_context(address, instruction_address, size, display_expr, false)
+    }
+
+    /// Same as [`Self::got_ref`] but with an explicit FP-context
+    /// flag. Lift sites use this to record whether the producing
+    /// instruction writes to a float-bank register, so the emitter
+    /// can safely materialize the bytes as a float literal.
+    pub fn got_ref_with_context(
+        address: u64,
+        instruction_address: u64,
+        size: u8,
+        display_expr: Expr,
+        is_float_context: bool,
+    ) -> Self {
         Self {
             kind: ExprKind::GotRef {
                 address,
@@ -509,6 +532,7 @@ impl Expr {
                 size,
                 display_expr: Box::new(display_expr),
                 is_deref: true,
+                is_float_context,
             },
         }
     }
@@ -524,6 +548,9 @@ impl Expr {
                 size: 0,
                 display_expr: Box::new(display_expr),
                 is_deref: false,
+                // LEA-style address materialization is never a float
+                // load — there are no bytes being decoded.
+                is_float_context: false,
             },
         }
     }
@@ -1351,12 +1378,19 @@ impl Expr {
             // Compute absolute address: inst.address + inst.size + displacement
             let abs_addr = (inst.address as i64 + inst.size as i64 + mem.displacement) as u64;
             let display_expr = Self::from_memory_ref(mem);
-            if is_dest {
-                // For stores, we want to return a GotRef that can be assigned to
-                Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
-            } else {
-                Self::got_ref(abs_addr, inst.address, mem.size, display_expr)
-            }
+            // Tag the GotRef with FP context derived from the
+            // instruction's destination register class. Used by the
+            // emitter to safely materialize rip-relative rodata
+            // constants as float literals only when the load actually
+            // feeds an SSE/FP register. Codex review on PR #26 pass 7.
+            let is_float_context = instruction_loads_float_constant(inst);
+            Self::got_ref_with_context(
+                abs_addr,
+                inst.address,
+                mem.size,
+                display_expr,
+                is_float_context,
+            )
         } else {
             Self::from_memory_ref(mem)
         }
@@ -2749,6 +2783,85 @@ impl Expr {
     }
 }
 
+/// Returns true when `inst` is a real floating-point load — both
+/// the destination register is in the FP/SIMD bank AND the opcode
+/// is a scalar/packed FP operation. Used at GotRef lift time to
+/// tag the destination so the emitter can safely materialize a
+/// rip-relative rodata byte pattern as a float literal only when
+/// the producing instruction actually treats it as a float.
+///
+/// The register-class check alone (codex review pass 7 fix) was
+/// not enough: integer-SIMD instructions such as
+/// `movq xmm0, [rip + .L]`, `movdqa`, `pinsrq`, `paddq` also
+/// write to the SSE bank but the bytes loaded are integer / packed
+/// non-float data. Materializing those as `1.0f` would change the
+/// recovered semantics. Codex review on PR #26 pass 8.
+fn instruction_loads_float_constant(inst: &Instruction) -> bool {
+    let Some(Operand::Register(reg)) = inst.operands.first() else {
+        return false;
+    };
+    let name = reg.name().to_lowercase();
+    let mnemonic = inst.mnemonic.to_ascii_lowercase();
+    let m = mnemonic.trim_start_matches('v'); // strip VEX `v` prefix
+
+    // x86 scalar FP→integer conversions: `cvttsd2si`/`cvtsd2si`/
+    // `cvttss2si`/`cvtss2si` write a GPR but the memory source is
+    // still a scalar float. The destination is NOT in the SSE bank
+    // here, so the register check below would miss them. Codex
+    // review on PR #26 pass 12.
+    if matches!(
+        m,
+        "cvttsd2si" | "cvtsd2si" | "cvttss2si" | "cvtss2si" | "cvttsd2siq" | "cvtsd2siq"
+    ) {
+        return true;
+    }
+
+    // x86 SSE/AVX: float context requires a SCALAR float mnemonic
+    // suffix (`ss` or `sd`). `movq`/`movd`/`movdqa`/`pinsrq`/`paddq`
+    // all write to xmm/ymm/zmm but are integer-SIMD or generic bit
+    // moves — they must NOT trigger float materialization.
+    //
+    // Packed mnemonics (`ps`/`pd`) are intentionally EXCLUDED:
+    // `movlps xmm0, [rip + .LC]` loads two `f32` lanes into the
+    // low quadword, so the 8 bytes are NOT a scalar `f64` and
+    // materializing them as one double would mis-recover the
+    // packed value. A future vector-literal representation could
+    // re-enable packed support. Codex review on PR #26 pass 11.
+    //
+    // `cvtsi2ss`/`cvtsi2sd` (integer→FP convert) ALSO end in
+    // `ss`/`sd` but the memory source is an INTEGER, not a float.
+    // Materializing the integer bytes as a float would change the
+    // recovered semantics. Excluded explicitly. Codex review on
+    // PR #26 pass 13.
+    if name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm") {
+        if m.starts_with("cvtsi2") {
+            return false;
+        }
+        return m.ends_with("ss") || m.ends_with("sd");
+    }
+
+    // aarch64 vector/FP register-file aliases at any width. On
+    // aarch64, the FP load instructions are `ldr`/`ldur`/`ldnp`/
+    // `ldp` with a float register destination (`s*`/`d*`/`q*`/`v*`).
+    // Half-precision `h*` is excluded because the wider pipeline
+    // doesn't yet support `Float(16)`. Codex review on PR #26 pass
+    // 12 (PR #25 history) deferred h*.
+    let Some(prefix) = name.chars().next() else {
+        return false;
+    };
+    if matches!(prefix, 's' | 'd' | 'q' | 'v') && name[1..].chars().all(|c| c.is_ascii_digit()) {
+        // Restrict to actual load mnemonics (also `fmov` from
+        // memory) so an integer-vector op writing to v0 (e.g.
+        // `add v0.4s, v1.4s, v2.4s`) isn't tagged as float-loading.
+        let is_load_mnemonic = matches!(
+            mnemonic.as_str(),
+            "ldr" | "ldur" | "ldnp" | "ldp" | "fmov" | "ld1" | "ld1r"
+        );
+        return is_load_mnemonic;
+    }
+    false
+}
+
 /// Checks if an integer value should be displayed as a character literal.
 /// Returns Some(char) if it's a printable ASCII character or common escape sequence.
 fn as_char_literal(n: i128) -> Option<String> {
@@ -3002,13 +3115,26 @@ fn try_combine_adrp_ldr(exprs: &[Expr], i: usize) -> Option<Expr> {
 
     let combined_addr = page_addr.wrapping_add(ldr_offset as u64);
 
+    // Propagate FP context based on the LDR destination register
+    // name: `ldr d0, [...]` from a float-constant pool needs the
+    // FP-context flag so the emitter materializes the bytes as a
+    // literal. Codex review on PR #26 pass 9.
+    let dst_is_fp = {
+        let lower = dst_reg.to_lowercase();
+        lower
+            .chars()
+            .next()
+            .is_some_and(|c| matches!(c, 's' | 'd' | 'q' | 'v'))
+            && lower.len() > 1
+            && lower[1..].chars().all(|c| c.is_ascii_digit())
+    };
     Some(Expr::assign(
         Expr::var(Variable {
             name: dst_reg,
             kind: VarKind::Register(0),
             size: 8,
         }),
-        Expr::got_ref(combined_addr, 0, ldr_size, exprs[i + 1].clone()),
+        Expr::got_ref_with_context(combined_addr, 0, ldr_size, exprs[i + 1].clone(), dst_is_fp),
     ))
 }
 

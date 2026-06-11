@@ -23,8 +23,10 @@ use std::sync::Arc;
 mod format;
 mod predicates;
 use format::{
-    escape_string, format_as_char_literal, format_integer, is_likely_character_constant,
+    escape_string, format_as_char_literal, format_float_literal_f32, format_float_literal_f64,
+    format_integer, is_compiler_local_pool_label, is_likely_character_constant,
     is_printable_char_value, is_special_char_value, looks_like_char_context,
+    looks_like_real_float_constant_f32, looks_like_real_float_constant_f64,
 };
 use predicates::{
     canonical_decl_var_name, collect_decl_identifiers_from_emitted_body, contains_identifier_token,
@@ -426,6 +428,15 @@ pub struct PseudoCodeEmitter {
     /// "no gating" until a signature is emitted.
     integer_arg_param_count: Cell<usize>,
     float_arg_param_count: Cell<usize>,
+    /// Read-only data sections from the binary, used to materialize
+    /// rip-relative float constants (e.g. `movsd xmm0, [rip + .L]`
+    /// where .L points into `.rodata.cst8`) as concrete float
+    /// literals (`3.14`) at format time, rather than as variable
+    /// references to a symbol/global. Populated by
+    /// [`Self::with_binary_data`]. Wrapped in `Arc` so cloning the
+    /// emitter for each decompiled function is O(1) — section bytes
+    /// of a large binary are shared by reference, not copied.
+    binary_data: Option<Arc<super::BinaryDataContext>>,
 }
 
 impl PseudoCodeEmitter {
@@ -664,6 +675,7 @@ impl PseudoCodeEmitter {
             return_fallback_expr: RefCell::new(None),
             preserve_register_names: Cell::new(false),
             register_snapshot_mode: Cell::new(false),
+            binary_data: None,
         }
     }
 
@@ -2178,6 +2190,7 @@ impl PseudoCodeEmitter {
                 size,
                 display_expr,
                 is_deref,
+                is_float_context,
             } => Expr {
                 kind: ExprKind::GotRef {
                     address,
@@ -2189,6 +2202,7 @@ impl PseudoCodeEmitter {
                         true,
                     )),
                     is_deref,
+                    is_float_context,
                 },
             },
             ExprKind::AddressOf(inner) => {
@@ -3325,6 +3339,17 @@ impl PseudoCodeEmitter {
         self
     }
 
+    /// Sets the binary data context used to materialize rip-relative
+    /// rodata float constants (`movsd xmm0, [rip + .Lconst]`) as
+    /// concrete float literals at format time. Accepts either a
+    /// fresh `BinaryDataContext` (which gets wrapped here) or an
+    /// `Arc` for callers decompiling many functions from the same
+    /// binary who already share the context — Arc clones are O(1).
+    pub fn with_binary_data(mut self, data: Option<Arc<super::BinaryDataContext>>) -> Self {
+        self.binary_data = data;
+        self
+    }
+
     /// Sets type information for variables.
     /// Keys should be variable names (e.g., "var_8", "local_10"),
     /// values should be C type strings (e.g., "int", "char*", "float").
@@ -4331,6 +4356,71 @@ impl PseudoCodeEmitter {
         table
             .get_match(address)
             .map(|symbol| GlobalSymbolResolution::Exact(self.simplify_symbol_name(symbol.name)))
+    }
+
+    /// Tries to materialize a rip-relative rodata load as a concrete
+    /// float literal (`3.14` / `3.14f`).
+    ///
+    /// For example, `movsd xmm0, [rip + .Lconst]` where `.Lconst`
+    /// points into `.rodata.cst8` carrying the 8 bytes of `3.14`
+    /// becomes `3.14` instead of an opaque global-variable reference.
+    ///
+    /// Returns `None` when:
+    /// * No `binary_data` context is plumbed in.
+    /// * `size` isn't 4 or 8 (we only handle scalar float/double).
+    /// * `address` doesn't fall inside any rodata-style section.
+    /// * The bytes decode to a non-finite value (NaN / inf) — those
+    ///   wouldn't appear in compiler-emitted `.rodata.cst*` constant
+    ///   pools and matching them here risks materializing a misread
+    ///   pointer-sized integer as a bogus float.
+    fn try_format_rodata_float_constant(&self, address: u64, size: u8) -> Option<String> {
+        let binary_data = self.binary_data.as_ref()?;
+        if !matches!(size, 4 | 8) {
+            return None;
+        }
+        // Gate strictly on float-constant-pool sections (`.rodata.cst*`
+        // / `__literal*`). Without this, a `uint32_t` constant in
+        // generic `.rodata` whose bit pattern equals a plausible
+        // float (e.g. `0x3f800000` = `1.0f`) would be silently
+        // rewritten as `1.0f`. Codex review on PR #26.
+        if !binary_data.is_float_constant_pool_address(address) {
+            return None;
+        }
+        let (section, base) = binary_data.section_containing(address)?;
+        let offset = usize::try_from(address.checked_sub(base)?).ok()?;
+        let end = offset.checked_add(usize::from(size))?;
+        let bytes = section.get(offset..end)?;
+        // Decode using the source binary's byte order. Hard-coding
+        // little-endian would mis-render constants on big-endian
+        // ELF targets. Codex review on PR #26 pass 5.
+        let is_big_endian = matches!(binary_data.endianness(), hexray_core::Endianness::Big);
+        match size {
+            4 => {
+                let arr: [u8; 4] = bytes.try_into().ok()?;
+                let value = if is_big_endian {
+                    f32::from_be_bytes(arr)
+                } else {
+                    f32::from_le_bytes(arr)
+                };
+                if !looks_like_real_float_constant_f32(value) {
+                    return None;
+                }
+                Some(format_float_literal_f32(value))
+            }
+            8 => {
+                let arr: [u8; 8] = bytes.try_into().ok()?;
+                let value = if is_big_endian {
+                    f64::from_be_bytes(arr)
+                } else {
+                    f64::from_le_bytes(arr)
+                };
+                if !looks_like_real_float_constant_f64(value) {
+                    return None;
+                }
+                Some(format_float_literal_f64(value))
+            }
+            _ => None,
+        }
     }
 
     fn format_global_address(&self, address: u64) -> Option<String> {
@@ -5540,21 +5630,59 @@ impl PseudoCodeEmitter {
                 size,
                 display_expr: _,
                 is_deref,
+                is_float_context,
             } => {
+                // Float-constant materialization: a rip-relative deref
+                // of size 4 or 8 whose target falls inside a tagged
+                // `.rodata.cst*` / `__literal*` float-pool section
+                // becomes the concrete `3.14` / `3.14f` literal. We
+                // run materialization AFTER trying relocation /
+                // symbol resolution so that user-named globals win
+                // — but if the resolved name is a compiler-generated
+                // local pool label (`.LCPI*`, `.LC*`), the
+                // materialized literal is more useful than the
+                // opaque label and wins. Codex review on PR #26.
+                //
+                // Gated on `is_float_context` (set at lift time from
+                // the producing instruction's destination register
+                // bank): plain `mov eax, [rip + .L]` whose bytes
+                // happen to encode a plausible float must NOT be
+                // rewritten as `1.0f`. Codex review on PR #26 pass 7.
+                let materialized = if *is_deref && *is_float_context {
+                    self.try_format_rodata_float_constant(*address, *size)
+                } else {
+                    None
+                };
                 if let Some(name) = self.relocated_symbol_name(*instruction_address, *address) {
+                    if is_compiler_local_pool_label(name) {
+                        if let Some(literal) = materialized {
+                            return literal;
+                        }
+                    }
                     let resolved = self.simplify_symbol_name(name);
                     if *is_deref {
                         return resolved;
                     }
                     return format!("&{}", resolved);
                 }
-                // Try symbol table
+                // Try symbol table — same rule applies: user-named globals
+                // win, but materialize when the only symbol is a pool label.
                 if *is_deref {
                     if let Some(value) = self.format_global_value(*address, *size) {
+                        if is_compiler_local_pool_label(&value) {
+                            if let Some(literal) = materialized {
+                                return literal;
+                            }
+                        }
                         return value;
                     }
                 } else if let Some(address_text) = self.format_global_address(*address) {
                     return address_text;
+                }
+                // No named symbol at all — anonymous compiler-emitted
+                // pool slot. Safe to materialize.
+                if let Some(literal) = materialized {
+                    return literal;
                 }
                 // Try string table
                 if let Some(s) = table.get(*address) {
@@ -13057,6 +13185,308 @@ mod tests {
         assert_eq!(
             formatted2, "*(uint64_t*)(&g_1000)",
             "Should format as *(typeN*)(&g_<hex_offset>) for eip"
+        );
+    }
+
+    /// SSE-2 Option A: when the emitter has a `BinaryDataContext`
+    /// containing rodata bytes, a rip-relative deref of size 8
+    /// whose target falls in a rodata section is rendered as the
+    /// concrete `double` literal — `3.14` here — rather than as an
+    /// opaque pointer-to-global.
+    #[test]
+    fn rodata_double_constant_materializes_as_literal() {
+        use super::super::BinaryDataContext;
+        // Build a context with .rodata starting at 0x1000 carrying
+        // the 8 bytes of double 3.14 at offset 0.
+        let mut ctx = BinaryDataContext::new();
+        // Use a value clippy doesn't recognize as an "approximate" PI.
+        let bytes: [u8; 8] = 1.25f64.to_le_bytes();
+        ctx.add_section(0x1000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x1000, 0x1000 + bytes.len() as u64);
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+
+        // GotRef as produced by lifting `movsd xmm0, [rip + .Lconst]`
+        // where rip+offset resolves to 0x1000.
+        let display = Expr::int(0x1000);
+        let got_ref = Expr::got_ref_with_context(0x1000, 0x500, 8, display, true);
+
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert_eq!(formatted, "1.25", "rodata f64 should materialize");
+    }
+
+    /// SSE-2 Option A: the same path on a 4-byte single-precision
+    /// constant emits the `f` suffix so the recovered literal
+    /// preserves precision (`3.14f` not `3.14`).
+    #[test]
+    fn rodata_float_constant_materializes_with_f_suffix() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 4] = 2.5f32.to_le_bytes();
+        ctx.add_section(0x2000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x2000, 0x2000 + bytes.len() as u64);
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+
+        let display = Expr::int(0x2000);
+        let got_ref = Expr::got_ref_with_context(0x2000, 0x500, 4, display, true);
+
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert_eq!(formatted, "2.5f", "rodata f32 should materialize with f");
+    }
+
+    /// SSE-2 Option A safety: a rodata slot that happens to decode
+    /// to a denormal or sub-`1e-300` value (the shape of a misread
+    /// integer / pointer landing in rodata) must NOT be
+    /// materialized as a float — that would silently rename an int
+    /// constant as a meaningless `2e-322` style literal. Fall
+    /// through to the normal global-symbol path instead.
+    #[test]
+    fn rodata_misread_integer_does_not_materialize_as_float() {
+        use super::super::BinaryDataContext;
+        // Bytes for `uint64_t x = 42` (which as f64 is a denormal
+        // ~2.07e-322).
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 8] = 42u64.to_le_bytes();
+        ctx.add_section(0x3000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x3000, 0x3000 + bytes.len() as u64);
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+
+        let display = Expr::int(0x3000);
+        let got_ref = Expr::got_ref_with_context(0x3000, 0x500, 8, display, true);
+
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert!(
+            !formatted.contains("e-3") && !formatted.contains("e-30"),
+            "misread integer must not materialize as denormal float: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26: the materialization MUST be gated on
+    /// the float-constant-pool flag, otherwise a `uint32_t` constant
+    /// in generic `.rodata` (which happens to have the bit pattern
+    /// of `1.0f` = `0x3f800000`) would be silently rewritten as
+    /// `1.0f`. With the section NOT registered as a float pool, the
+    /// materializer must skip even when bytes decode to a plausible
+    /// float.
+    #[test]
+    fn rodata_materialization_gated_on_float_constant_pool_flag() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        // The bit pattern of `1.0f` lives in generic `.rodata`, NOT a
+        // `.rodata.cst4` float-pool section. Without the pool flag,
+        // we must not rewrite this as `1.0f`.
+        let bytes: [u8; 4] = 1.0f32.to_le_bytes(); // 0x3f800000
+        ctx.add_section(0x4000, bytes.to_vec());
+        // NB: deliberately NOT calling add_float_constant_pool_range.
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+
+        let display = Expr::int(0x4000);
+        let got_ref = Expr::got_ref(0x4000, 0x500, 4, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert!(
+            !formatted.contains("1.0f") && !formatted.contains("1.0"),
+            "generic-rodata bytes must not be materialized as a float: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26 pass 12: `-0.0` is a real compiler-
+    /// emitted float-pool constant — the xor-zero idiom can't
+    /// reproduce negative zero. The byte-level filter must accept
+    /// zero (positive and negative) when the address is in a
+    /// tagged float pool. The pool gate prevents generic-rodata
+    /// zeros from being misrendered.
+    #[test]
+    fn rodata_negative_zero_constant_materializes() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        // -0.0 = 0x8000_0000_0000_0000
+        let bytes: [u8; 8] = (-0.0f64).to_le_bytes();
+        ctx.add_section(0x9000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x9000, 0x9000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x9000);
+        let got_ref = Expr::got_ref_with_context(0x9000, 0x500, 8, display, true);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        // Rust formats negative zero as "-0".
+        assert!(
+            formatted.starts_with("-0"),
+            "-0.0 from a tagged float pool must materialize as a literal: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26 pass 11: packed-float mnemonics
+    /// (`movlps`/`movhps`/`addps`/`mulps`/etc.) load MULTIPLE
+    /// single-precision lanes per access, not a scalar double.
+    /// `movlps xmm0, [rip + .LC]` reads 8 bytes = two `f32` values.
+    /// Treating those 8 bytes as one `f64` would mis-decode the
+    /// packed value. The lift must NOT tag packed-suffix opcodes
+    /// with is_float_context. Verify a GotRef produced without that
+    /// flag (as `movlps` would be) doesn't materialize.
+    #[test]
+    fn rodata_materialization_skipped_for_packed_float_opcode() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        // Two packed f32 lanes — a plausible `.rodata.cst8` payload
+        // for movlps.
+        let mut bytes = [0u8; 8];
+        bytes[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&2.0f32.to_le_bytes());
+        ctx.add_section(0x8000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x8000, 0x8000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x8000);
+        // GotRef WITHOUT float context — as produced by lifting
+        // `movlps xmm0, [rip + .LC]` (packed-singles load).
+        let got_ref = Expr::got_ref(0x8000, 0x500, 8, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        // The 8 bytes happen to decode as a finite f64; the materializer
+        // must NOT fire because is_float_context is false for packed ops.
+        // The fallback format is `*(uint64_t*)(&g_<addr>)` — an opaque
+        // global deref, not a parseable float literal.
+        assert!(
+            formatted.contains("g_") || formatted.contains("(&"),
+            "packed-float bytes must fall through to global-deref form: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26 pass 9: when a scalar float load
+    /// targets an offset inside a larger pool symbol (the second
+    /// double in a `.rodata.cst16` slot), `format_global_value`
+    /// returns `*(uint64_t*)(.LCPI0_0 + 8)` — the `.LCPI` label
+    /// appears as an INTERIOR token, not at the start. The
+    /// pool-label recognizer must accept embedded labels so the
+    /// concrete float wins over the opaque integer deref.
+    #[test]
+    fn pool_label_recognized_when_embedded_inside_global_deref() {
+        use super::format::is_compiler_local_pool_label;
+        assert!(is_compiler_local_pool_label("*(uint64_t*)(.LCPI0_0 + 8)"));
+        assert!(is_compiler_local_pool_label("*(uint64_t*)(.LC0 + 0)"));
+        assert!(is_compiler_local_pool_label("*(uint64_t*)(lCPI0_0 + 4)"));
+        // Genuine user-named global must NOT match.
+        assert!(!is_compiler_local_pool_label("*(uint64_t*)(&g_my_constants + 8)"));
+    }
+
+    /// Codex review on PR #26 pass 8: even with destination in the
+    /// SSE bank, integer-SIMD opcodes (`movq`/`movdqa`/`pinsrq`/`paddq`)
+    /// must NOT trigger float materialization — they move/use
+    /// raw bits, not floats. The lift only sets is_float_context=true
+    /// for opcodes ending in `ss`/`sd`/`ps`/`pd`. Verify a GotRef
+    /// produced without that flag (as `movq xmm0, [rip + .L]` would
+    /// be) doesn't materialize.
+    #[test]
+    fn rodata_materialization_skipped_for_integer_simd_opcode() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 8] = 1.25f64.to_le_bytes();
+        ctx.add_section(0x7000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x7000, 0x7000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x7000);
+        // GotRef WITHOUT float context — as produced by lifting
+        // `movq xmm0, [rip + .L]`.
+        let got_ref = Expr::got_ref(0x7000, 0x500, 8, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert!(
+            !formatted.contains("1.25"),
+            "integer-SIMD opcode must not materialize as float: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26 pass 7: even when the address sits in
+    /// a tagged float-pool section AND the bytes decode to a
+    /// plausible float, the materializer MUST NOT fire when the
+    /// producing instruction's destination is an integer register
+    /// (`is_float_context = false`). Without this gate, a real
+    /// `mov eax, [rip + .Lconst]` whose 4 bytes encode `1.0f`
+    /// (0x3f800000) would be silently rewritten as `1.0f`,
+    /// changing recovered semantics.
+    #[test]
+    fn rodata_materialization_gated_on_float_context_flag() {
+        use super::super::BinaryDataContext;
+        let mut ctx = BinaryDataContext::new();
+        let bytes: [u8; 4] = 1.0f32.to_le_bytes(); // 0x3f800000
+        ctx.add_section(0x6000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x6000, 0x6000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x6000);
+        // GotRef WITHOUT is_float_context — as produced by lifting
+        // `mov eax, [rip + .Lconst]`.
+        let got_ref = Expr::got_ref(0x6000, 0x500, 4, display);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert!(
+            !formatted.contains("1.0"),
+            "integer-context load must not be materialized as float: {formatted}"
+        );
+    }
+
+    /// Codex review on PR #26 pass 5: a big-endian source binary
+    /// must decode rodata float bytes using the binary's byte order.
+    /// Hardcoding little-endian would misrender constants on
+    /// PowerPC / MIPS-BE / big-endian ARM ELF. The bytes for `1.25`
+    /// as a big-endian f64 (`0x3ff4000000000000`) must produce
+    /// `1.25`, NOT the little-endian misread (which would be a
+    /// finite-but-different value).
+    #[test]
+    fn rodata_double_constant_decodes_with_big_endian_byte_order() {
+        use super::super::BinaryDataContext;
+        let mut ctx =
+            BinaryDataContext::new().with_endianness(hexray_core::Endianness::Big);
+        // Big-endian bytes for 1.25 = 0x3ff4_0000_0000_0000.
+        let bytes: [u8; 8] = 1.25f64.to_be_bytes();
+        ctx.add_section(0x5000, bytes.to_vec());
+        ctx.add_float_constant_pool_range(0x5000, 0x5000 + bytes.len() as u64);
+
+        let emitter =
+            PseudoCodeEmitter::new("    ", false).with_binary_data(Some(Arc::new(ctx)));
+        let table = StringTable::new();
+        let display = Expr::int(0x5000);
+        let got_ref = Expr::got_ref_with_context(0x5000, 0x500, 8, display, true);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+
+        assert_eq!(
+            formatted, "1.25",
+            "big-endian rodata bytes must decode with the binary's byte order"
+        );
+    }
+
+    /// SSE-2 Option A: without a `BinaryDataContext` the
+    /// materialization is a no-op and the existing global-name path
+    /// fires unchanged. Locked in so the new field doesn't
+    /// accidentally short-circuit the legacy flow for callers that
+    /// don't plumb the context.
+    #[test]
+    fn rodata_materialization_skipped_without_binary_data() {
+        let emitter = PseudoCodeEmitter::new("    ", false);
+        let table = StringTable::new();
+        let display = Expr::int(0x1000);
+        let got_ref = Expr::got_ref_with_context(0x1000, 0x500, 8, display, true);
+        let formatted = emitter.format_expr_with_strings(&got_ref, &table);
+        assert!(
+            formatted.parse::<f64>().is_err(),
+            "without binary_data, a bare GotRef must not produce a float literal: {formatted}"
         );
     }
 

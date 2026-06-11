@@ -114,7 +114,7 @@ pub struct CleanupInfo {
 ///
 /// This provides access to read-only data sections needed for switch
 /// statement recovery (reading jump table entries from .rodata, __const, etc.)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BinaryDataContext {
     /// Pairs of (base_address, data) for each data section.
     sections: Vec<(u64, Vec<u8>)>,
@@ -130,6 +130,29 @@ pub struct BinaryDataContext {
     call_target_names_by_address: HashMap<u64, String>,
     /// Resolved direct-call target names keyed by call-site address.
     call_target_names_by_call_site: HashMap<u64, String>,
+    /// Address ranges `[start, end)` of sections known to be
+    /// compiler-emitted float-constant pools — `.rodata.cst4`,
+    /// `.rodata.cst8`, `.rodata.cst16` on ELF and `__literal4`,
+    /// `__literal8`, `__literal16` on Mach-O. The emitter uses these
+    /// ranges to gate rip-relative float-literal materialization so
+    /// generic `.rodata` bytes (a `uint32_t` constant whose bit
+    /// pattern happens to equal `1.0f`) are NOT silently rewritten as
+    /// `1.0f`. Limitation: a static linker may merge `.rodata.cst*`
+    /// into a plain `.rodata`, in which case this range is empty for
+    /// the linked binary — that's a known follow-up for full IR-level
+    /// float-context tracking.
+    float_constant_pool_ranges: Vec<(u64, u64)>,
+    /// Byte order of the source binary. Defaults to Little for
+    /// backwards compatibility with the dominant x86_64/aarch64 case.
+    /// Used by the emitter to decode rip-relative rodata float
+    /// constants with the correct byte order on big-endian targets.
+    endianness: hexray_core::Endianness,
+}
+
+impl Default for BinaryDataContext {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BinaryDataContext {
@@ -143,12 +166,44 @@ impl BinaryDataContext {
             call_signatures_by_address: HashMap::new(),
             call_target_names_by_address: HashMap::new(),
             call_target_names_by_call_site: HashMap::new(),
+            float_constant_pool_ranges: Vec::new(),
+            endianness: hexray_core::Endianness::Little,
         }
+    }
+
+    /// Sets the source binary's byte order. Required for correct
+    /// float-constant materialization on big-endian targets.
+    pub fn with_endianness(mut self, endianness: hexray_core::Endianness) -> Self {
+        self.endianness = endianness;
+        self
+    }
+
+    /// Returns the source binary's byte order.
+    pub fn endianness(&self) -> hexray_core::Endianness {
+        self.endianness
     }
 
     /// Adds a data section.
     pub fn add_section(&mut self, base: u64, data: Vec<u8>) {
         self.sections.push((base, data));
+    }
+
+    /// Records that an address range belongs to a compiler-emitted
+    /// float-constant pool (`.rodata.cst{4,8,16}` on ELF;
+    /// `__literal{4,8,16}` on Mach-O). The emitter uses this to
+    /// gate rip-relative float-literal materialization.
+    pub fn add_float_constant_pool_range(&mut self, start: u64, end: u64) {
+        if end > start {
+            self.float_constant_pool_ranges.push((start, end));
+        }
+    }
+
+    /// True if the address sits inside any recorded float-constant
+    /// pool range.
+    pub fn is_float_constant_pool_address(&self, addr: u64) -> bool {
+        self.float_constant_pool_ranges
+            .iter()
+            .any(|(start, end)| addr >= *start && addr < *end)
     }
 
     /// Returns the section containing the given address.
@@ -841,9 +896,13 @@ pub struct Decompiler {
     /// Database of inter-procedural function summaries.
     /// When set, provides type information from analyzed callees.
     pub summary_database: Option<Arc<SummaryDatabase>>,
-    /// Binary data context for jump table reconstruction.
-    /// When set, enables proper switch statement recovery by reading jump tables.
-    pub binary_data: Option<BinaryDataContext>,
+    /// Binary data context for jump table reconstruction and
+    /// rip-relative float-constant materialization. Wrapped in `Arc`
+    /// so cloning the context across many decompile() calls (e.g.
+    /// follow-mode, batch decompiles) is O(1) — section bytes of a
+    /// large binary are shared by reference, not copied. Codex
+    /// review on PR #26 pass 5.
+    pub binary_data: Option<Arc<BinaryDataContext>>,
     /// Split cold helper targets whose bodies end in C++ throw/rethrow machinery.
     pub throw_thunks: HashMap<u64, String>,
     /// Symbol kind for the current function when known.
@@ -1111,6 +1170,15 @@ impl Decompiler {
     /// to read-only data sections (.rodata, __const, .rdata) where jump
     /// tables are typically stored.
     pub fn with_binary_data(mut self, ctx: BinaryDataContext) -> Self {
+        self.binary_data = Some(Arc::new(ctx));
+        self
+    }
+
+    /// Same as [`Self::with_binary_data`] but accepts an existing
+    /// shared reference. Use when many decompilers share a single
+    /// context (e.g. follow-mode / batch decompiles) to avoid even
+    /// the one-time Arc allocation.
+    pub fn with_binary_data_arc(mut self, ctx: Arc<BinaryDataContext>) -> Self {
         self.binary_data = Some(ctx);
         self
     }
@@ -1178,7 +1246,7 @@ impl Decompiler {
         // union/array bytes are left untouched here — a refinement step.
         let stack_struct_bindings = stack_struct_binding::analyze_with_builtin_db(
             &structured.body,
-            self.binary_data.as_ref(),
+            self.binary_data.as_deref(),
             self.pointer_size,
         );
         for binding in stack_struct_bindings.iter() {
@@ -1191,7 +1259,7 @@ impl Decompiler {
 
         // Step 2b: Run expression-level type propagation
         let mut expr_type_propagation = type_propagation::ExpressionTypePropagation::with_libc()
-            .with_binary_data(self.binary_data.as_ref());
+            .with_binary_data(self.binary_data.as_deref());
         expr_type_propagation.analyze(&structured.body);
         let expr_types = expr_type_propagation.export_for_decompiler();
 
@@ -1294,7 +1362,8 @@ impl Decompiler {
             .with_dwarf_param_names(self.dwarf_param_names.clone())
             .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
-            .with_signature_recovery(self.enable_signature_recovery);
+            .with_signature_recovery(self.enable_signature_recovery)
+            .with_binary_data(self.binary_data.clone());
         if let Some(ref db) = self.summary_database {
             emitter = emitter.with_summary_database(db.clone());
         }
@@ -1309,7 +1378,7 @@ impl Decompiler {
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else if self.enable_signature_recovery {
             let signature = SignatureRecovery::new(self.calling_convention)
-                .with_binary_data(self.binary_data.as_ref())
+                .with_binary_data(self.binary_data.as_deref())
                 .with_relocation_table(self.relocation_table.clone())
                 .with_symbol_table(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone())
@@ -2236,7 +2305,7 @@ impl Decompiler {
     pub fn recover_signature(&self, cfg: &ControlFlowGraph) -> FunctionSignature {
         let structured = self.structure(cfg);
         let mut recovery = SignatureRecovery::new(self.calling_convention)
-            .with_binary_data(self.binary_data.as_ref())
+            .with_binary_data(self.binary_data.as_deref())
             .with_relocation_table(self.relocation_table.clone())
             .with_symbol_table(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone())
@@ -2262,7 +2331,7 @@ impl Decompiler {
             StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
                 cfg,
                 config,
-                self.binary_data.as_ref(),
+                self.binary_data.as_deref(),
                 self.exception_info.as_ref(),
                 &noreturn_targets,
                 &ubsan_targets,
@@ -2272,7 +2341,7 @@ impl Decompiler {
             StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
                 cfg,
                 &config::DecompilerConfig::default(),
-                self.binary_data.as_ref(),
+                self.binary_data.as_deref(),
                 self.exception_info.as_ref(),
                 &noreturn_targets,
                 &ubsan_targets,
@@ -2377,7 +2446,8 @@ impl Decompiler {
             .with_dwarf_param_names(self.dwarf_param_names.clone())
             .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
-            .with_signature_recovery(self.enable_signature_recovery);
+            .with_signature_recovery(self.enable_signature_recovery)
+            .with_binary_data(self.binary_data.clone());
         if let Some(ref db) = self.summary_database {
             emitter = emitter.with_summary_database(db.clone());
         }
