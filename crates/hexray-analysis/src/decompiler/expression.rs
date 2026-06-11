@@ -2827,7 +2827,16 @@ fn instruction_loads_float_constant(inst: &Instruction) -> bool {
     // materializing them as one double would mis-recover the
     // packed value. A future vector-literal representation could
     // re-enable packed support. Codex review on PR #26 pass 11.
+    //
+    // `cvtsi2ss`/`cvtsi2sd` (integer→FP convert) ALSO end in
+    // `ss`/`sd` but the memory source is an INTEGER, not a float.
+    // Materializing the integer bytes as a float would change the
+    // recovered semantics. Excluded explicitly. Codex review on
+    // PR #26 pass 13.
     if name.starts_with("xmm") || name.starts_with("ymm") || name.starts_with("zmm") {
+        if m.starts_with("cvtsi2") {
+            return false;
+        }
         return m.ends_with("ss") || m.ends_with("sd");
     }
 
