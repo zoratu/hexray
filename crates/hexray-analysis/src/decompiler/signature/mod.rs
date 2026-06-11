@@ -4660,22 +4660,34 @@ impl SignatureRecovery {
             }
         };
 
-        // Require observed spills from BOTH an int and a float
-        // parameter before reordering. All-int and all-float
-        // signatures already come out in source order from the
-        // existing leaf-case heuristic; reshuffling those by
-        // partial spill info would risk regressing them.
-        let any_int_observed = sig
-            .parameters
-            .iter()
-            .any(|p| matches!(p.location, ParameterLocation::IntegerRegister { .. })
-                && spill_index_for(p).is_some());
-        let any_float_observed = sig
-            .parameters
-            .iter()
-            .any(|p| matches!(p.location, ParameterLocation::FloatRegister { .. })
-                && spill_index_for(p).is_some());
-        if !(any_int_observed && any_float_observed) {
+        // Require observed spills for EVERY recovered parameter
+        // before reordering, AND require at least one int and one
+        // float to be present (so all-int/all-float signatures
+        // keep the existing leaf-case heuristic). Without the
+        // all-observed gate, partial spill data would move some
+        // params ahead of others, inventing a wrong source order
+        // for cases like `(int a, int b, double x)` where only
+        // `a` and `xmm0` are homed at -O0 but `b` was kept in
+        // `esi` and never spilled. Codex review on PR #27 pass 8.
+        let mut has_int = false;
+        let mut has_float = false;
+        for p in &sig.parameters {
+            match &p.location {
+                ParameterLocation::IntegerRegister { .. } => has_int = true,
+                ParameterLocation::FloatRegister { .. } => has_float = true,
+                _ => {}
+            }
+            if matches!(
+                p.location,
+                ParameterLocation::IntegerRegister { .. } | ParameterLocation::FloatRegister { .. }
+            ) && spill_index_for(p).is_none()
+            {
+                // Some register parameter isn't observed — bail out
+                // entirely rather than introducing a spurious order.
+                return;
+            }
+        }
+        if !(has_int && has_float) {
             return;
         }
 
@@ -5707,6 +5719,64 @@ mod tests {
                 offset: -8,
             }],
             "scan must stop at reg-reg move"
+        );
+    }
+
+    /// Codex review on PR #27 pass 8: when only SOME params have
+    /// spill observations, the reorder must bail out entirely
+    /// rather than rearrange the partial set. For `(int a, int b,
+    /// double x)` where only `a` and `xmm0` were spilled (b lives
+    /// in `esi` and was never homed), reordering would invent the
+    /// wrong source order `(a, x, b)`.
+    #[test]
+    fn reorder_bails_when_some_params_have_no_spill_observation() {
+        let mut sig = FunctionSignature::default();
+        sig.parameters = vec![
+            Parameter::new(
+                "arg0".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rdi".to_string(),
+                    index: 0,
+                },
+            ),
+            Parameter::new(
+                "arg1".to_string(),
+                ParamType::SignedInt(32),
+                ParameterLocation::IntegerRegister {
+                    name: "rsi".to_string(),
+                    index: 1,
+                },
+            ),
+            Parameter::new(
+                "farg0".to_string(),
+                ParamType::Float(64),
+                ParameterLocation::FloatRegister {
+                    name: "xmm0".to_string(),
+                    index: 0,
+                },
+            ),
+        ];
+        // Only rdi (arg0) and xmm0 (farg0) have spill observations
+        // — rsi (arg1) was not spilled. Reorder must NOT fire.
+        let recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -4,
+                },
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -16,
+                },
+            ]);
+        recovery.reorder_params_by_spill_offset(&mut sig);
+        // Order must remain unchanged.
+        let names: Vec<&str> = sig.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["arg0", "arg1", "farg0"],
+            "must NOT reorder when arg1 has no spill observation"
         );
     }
 
