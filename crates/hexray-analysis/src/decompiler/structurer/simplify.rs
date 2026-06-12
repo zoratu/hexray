@@ -183,12 +183,21 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                         .filter(|n| !drop_taint_var(n))
                         .any(|n| canary_check_vars.contains(n));
                     if rhs_is_canary || lhs_is_check_var || rhs_uses_check_var {
-                        // Propagate the var-tracking so chains of
-                        // canary setup statements all get dropped.
-                        // Stack-base registers stay out of the set.
-                        if !drop_taint_var(&v.name) {
-                            canary_check_vars.insert(v.name.clone());
-                        }
+                        // Walking backward, the redefinition kills
+                        // the taint for the LHS register: an
+                        // earlier `local_ret = rax` should be
+                        // preserved because that rax was the body
+                        // result, not the canary value the
+                        // overwrite later loaded. Remove the LHS
+                        // from the canary-check-vars set first.
+                        // Codex review on PR #28 pass 3.
+                        canary_check_vars.remove(&v.name);
+                        // Then propagate taint from RHS — chains
+                        // of canary setup (e.g. the saved-canary
+                        // slot reload, the guard memory ref) all
+                        // get pulled into the set so their earlier
+                        // defs also drop. Stack-base registers
+                        // stay out (codex pass 1).
                         for n in rhs_vars {
                             if !drop_taint_var(&n) {
                                 canary_check_vars.insert(n);
