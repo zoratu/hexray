@@ -5874,21 +5874,7 @@ impl PseudoCodeEmitter {
                     // RIP-relative access. Show as a placeholder to avoid confusing output.
                     "/* unresolved_pc_relative */".to_string()
                 } else {
-                    // Prefer VarKind::Stack(offset) over name-string
-                    // parsing when the Variable carries its kind: the
-                    // `var_NN` name string is ambiguous between
-                    // frame-relative -N (from `Expr::stack(-N)`) and
-                    // stack-pointer +N (from `generate_local_name`),
-                    // but the kind preserves the signed offset
-                    // unambiguously. SSE-5 follow-up + codex review
-                    // on PR #29 pass 1.
-                    let semantic_kind_name = Self::parse_var_kind_stack_offset(var)
-                        .and_then(|(offset, is_param)| {
-                            self.naming_ctx_semantic_name(offset, is_param)
-                        });
-                    if let Some(semantic_name) =
-                        semantic_kind_name.or_else(|| self.try_get_semantic_var_name(&var.name))
-                    {
+                    if let Some(semantic_name) = self.try_get_semantic_var_name(&var.name) {
                         // Apply parameter name overrides and normalization
                         let overridden = self.apply_param_name_override(&semantic_name);
                         normalize_variable_name(&overridden)
