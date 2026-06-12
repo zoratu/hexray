@@ -457,6 +457,58 @@ pub(super) fn get_known_function_params(
         ]),
         "freeaddrinfo" => Some(&[("res", ParamType::Pointer)]),
 
+        // math.h — the scalar functions are widely used in float code
+        // and the signature recovery needs to know their arg shape to
+        // surface meaningful `sqrt(x*x+y*y)` style call sites.
+        // Already registered in `interprocedural.rs` for summary
+        // analysis, but the signature recovery uses this separate
+        // table.
+        //
+        // Single-arg double.
+        "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh"
+        | "exp" | "exp2" | "expm1" | "log" | "log2" | "log10" | "log1p"
+        | "fabs" | "floor" | "ceil" | "trunc" | "round" | "rint" | "nearbyint"
+        | "cbrt" | "tgamma" | "lgamma" | "erf" | "erfc" | "j0" | "j1" | "y0" | "y1" => {
+            Some(&[("x", ParamType::Float(64))])
+        }
+        // Single-arg float (`f`-suffixed).
+        "sqrtf" | "sinf" | "cosf" | "tanf" | "asinf" | "acosf" | "atanf"
+        | "sinhf" | "coshf" | "tanhf" | "asinhf" | "acoshf" | "atanhf"
+        | "expf" | "exp2f" | "expm1f" | "logf" | "log2f" | "log10f" | "log1pf"
+        | "fabsf" | "floorf" | "ceilf" | "truncf" | "roundf" | "rintf" | "nearbyintf"
+        | "cbrtf" | "tgammaf" | "lgammaf" | "erff" | "erfcf" => {
+            Some(&[("x", ParamType::Float(32))])
+        }
+        // Two-arg double.
+        "pow" | "atan2" | "hypot" | "fmod" | "remainder" | "copysign"
+        | "fmin" | "fmax" | "fdim" | "nextafter" | "ldexp" => Some(&[
+            ("x", ParamType::Float(64)),
+            ("y", ParamType::Float(64)),
+        ]),
+        // Two-arg float.
+        "powf" | "atan2f" | "hypotf" | "fmodf" | "remainderf" | "copysignf"
+        | "fminf" | "fmaxf" | "fdimf" | "nextafterf" | "ldexpf" => Some(&[
+            ("x", ParamType::Float(32)),
+            ("y", ParamType::Float(32)),
+        ]),
+        // Three-arg double (fused mul-add).
+        "fma" => Some(&[
+            ("x", ParamType::Float(64)),
+            ("y", ParamType::Float(64)),
+            ("z", ParamType::Float(64)),
+        ]),
+        "fmaf" => Some(&[
+            ("x", ParamType::Float(32)),
+            ("y", ParamType::Float(32)),
+            ("z", ParamType::Float(32)),
+        ]),
+        // Long-double versions (80-bit on x86).
+        "sqrtl" | "sinl" | "cosl" | "tanl" | "asinl" | "acosl" | "atanl"
+        | "expl" | "logl" | "log10l" | "fabsl" | "floorl" | "ceill" => {
+            Some(&[("x", ParamType::Float(80))])
+        }
+
         _ => None,
     }
 }
