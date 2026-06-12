@@ -3287,9 +3287,22 @@ impl PseudoCodeEmitter {
     }
 
     fn parse_lifted_stack_offset(var_name: &str) -> Option<(i128, bool)> {
+        // Canonical convention (see `Expr::stack` in `expression.rs`):
+        //   var_NN   → stack offset -NN (frame-local, NN is positive hex)
+        //   arg_NN   → stack offset +NN (positional stack arg)
+        //   local_NN → stack offset -NN (synonym of var_NN used by the
+        //              fallback in NamingContext::generate_local_name)
+        //
+        // The previous implementation mapped `var_NN` to (+NN, is_param=true),
+        // which conflicted with the lifter — `[rbp-0x68]` lifted as
+        // `Var(var_68)` was then queried as if it were `[rbp+0x68]` and got
+        // a fresh `arg_68` name distinct from the `local_68`/`var_68` that
+        // an alternate code path produced. The SAME slot ended up with two
+        // identifiers (e.g. write `ptr2 = farg0;`, read `return local_68;`).
+        // SSE-5 slot-naming desync.
         if let Some(suffix) = var_name.strip_prefix("var_") {
-            let offset = i128::from_str_radix(suffix, 16).ok()?;
-            Some((offset, true))
+            let positive = i128::from_str_radix(suffix, 16).ok()?;
+            Some((-positive, false))
         } else if let Some(suffix) = var_name.strip_prefix("local_") {
             let positive = i128::from_str_radix(suffix, 16).ok()?;
             Some((-positive, false))
