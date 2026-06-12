@@ -447,6 +447,142 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("usec", CType::uint())
             .doc("Sleep for specified microseconds"),
     );
+
+    // math.h — scalar double-precision functions. Signature recovery
+    // looks up param classes here when reconstructing call-site
+    // arguments, so without these `sqrt(x*x + y*y)` surfaces as
+    // `sqrt()` (xmm0 is never captured as an arg).
+    let math_d1: &[&str] = &[
+        "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh",
+        "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "fabs", "floor",
+        "ceil", "trunc", "round", "rint", "nearbyint", "cbrt", "tgamma", "lgamma", "erf", "erfc",
+        "j0", "j1", "y0", "y1",
+    ];
+    for name in math_d1 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::double())
+                .param("x", CType::double())
+                .doc("math.h scalar double function"),
+        );
+    }
+    // `ldexp` and `ldexpf` are NOT in math_d2: their exponent is an
+    // `int`, not a float — `double ldexp(double x, int exp)`. Codex
+    // review on PR #30 pass 1.
+    let math_d2: &[&str] = &[
+        "pow",
+        "atan2",
+        "hypot",
+        "fmod",
+        "remainder",
+        "copysign",
+        "fmin",
+        "fmax",
+        "fdim",
+        "nextafter",
+    ];
+    for name in math_d2 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::double())
+                .param("x", CType::double())
+                .param("y", CType::double())
+                .doc("math.h scalar double 2-arg function"),
+        );
+    }
+    db.add_function(
+        FunctionPrototype::new("fma", CType::double())
+            .param("x", CType::double())
+            .param("y", CType::double())
+            .param("z", CType::double())
+            .doc("Fused multiply-add: x*y+z"),
+    );
+
+    // math.h single-precision counterparts.
+    let math_f1: &[&str] = &[
+        "sqrtf", "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "sinhf", "coshf", "tanhf",
+        "asinhf", "acoshf", "atanhf", "expf", "exp2f", "expm1f", "logf", "log2f", "log10f",
+        "log1pf", "fabsf", "floorf", "ceilf", "truncf", "roundf", "rintf", "nearbyintf", "cbrtf",
+        "tgammaf", "lgammaf", "erff", "erfcf",
+    ];
+    for name in math_f1 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::float())
+                .param("x", CType::float())
+                .doc("math.h scalar float function"),
+        );
+    }
+    let math_f2: &[&str] = &[
+        "powf",
+        "atan2f",
+        "hypotf",
+        "fmodf",
+        "remainderf",
+        "copysignf",
+        "fminf",
+        "fmaxf",
+        "fdimf",
+        "nextafterf",
+    ];
+    for name in math_f2 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::float())
+                .param("x", CType::float())
+                .param("y", CType::float())
+                .doc("math.h scalar float 2-arg function"),
+        );
+    }
+    db.add_function(
+        FunctionPrototype::new("fmaf", CType::float())
+            .param("x", CType::float())
+            .param("y", CType::float())
+            .param("z", CType::float())
+            .doc("Fused multiply-add (single-precision): x*y+z"),
+    );
+
+    // `ldexp(double x, int exp)` and `ldexpf(float x, int exp)` —
+    // mixed-class arguments: the value is in xmm0, the exponent
+    // in edi/rdi. Codex review on PR #30 pass 1.
+    db.add_function(
+        FunctionPrototype::new("ldexp", CType::double())
+            .param("x", CType::double())
+            .param("exp", CType::int())
+            .doc("x * 2^exp"),
+    );
+    db.add_function(
+        FunctionPrototype::new("ldexpf", CType::float())
+            .param("x", CType::float())
+            .param("exp", CType::int())
+            .doc("x * 2^exp (single-precision)"),
+    );
+
+    // `frexp(double x, int *exp)` — returns the mantissa, writes the
+    // exponent through a pointer.
+    db.add_function(
+        FunctionPrototype::new("frexp", CType::double())
+            .param("x", CType::double())
+            .param("exp", CType::ptr(CType::int()))
+            .doc("Split into mantissa and binary exponent"),
+    );
+    db.add_function(
+        FunctionPrototype::new("frexpf", CType::float())
+            .param("x", CType::float())
+            .param("exp", CType::ptr(CType::int()))
+            .doc("Split into mantissa and binary exponent (single-precision)"),
+    );
+
+    // `modf(double x, double *iptr)` — returns the fractional part,
+    // writes the integral part through a pointer.
+    db.add_function(
+        FunctionPrototype::new("modf", CType::double())
+            .param("x", CType::double())
+            .param("iptr", CType::ptr(CType::double()))
+            .doc("Decompose into fractional and integral parts"),
+    );
+    db.add_function(
+        FunctionPrototype::new("modff", CType::float())
+            .param("x", CType::float())
+            .param("iptr", CType::ptr(CType::float()))
+            .doc("Decompose into fractional and integral parts (single-precision)"),
+    );
 }
 
 #[cfg(test)]
@@ -473,5 +609,41 @@ mod tests {
         assert!(printf.variadic);
         assert_eq!(printf.parameters.len(), 1);
         assert_eq!(printf.parameters[0].0, "format");
+    }
+
+    /// Math.h scalar functions must be registered with the right
+    /// param types so the decompiler captures `xmm0` as the arg at
+    /// call sites. Without this, `return sqrt(x)` surfaces as
+    /// `return sqrt();`.
+    #[test]
+    fn test_math_h_double_functions_registered() {
+        let mut db = TypeDatabase::new();
+        load_libc_functions(&mut db);
+
+        for name in [
+            "sqrt", "sin", "cos", "tan", "exp", "log", "fabs", "floor", "ceil",
+        ] {
+            let proto = db
+                .get_function(name)
+                .unwrap_or_else(|| panic!("{name} should be registered"));
+            assert_eq!(proto.parameters.len(), 1, "{name} takes one arg");
+            assert!(
+                proto.parameters[0].1.is_float(),
+                "{name}'s arg must be a float type"
+            );
+            assert!(
+                proto.return_type.is_float(),
+                "{name}'s return must be a float type"
+            );
+        }
+
+        let pow = db.get_function("pow").expect("pow registered");
+        assert_eq!(pow.parameters.len(), 2);
+        let fma = db.get_function("fma").expect("fma registered");
+        assert_eq!(fma.parameters.len(), 3);
+
+        let sqrtf = db.get_function("sqrtf").expect("sqrtf registered");
+        assert_eq!(sqrtf.parameters.len(), 1);
+        assert!(sqrtf.parameters[0].1.is_float());
     }
 }
