@@ -3287,23 +3287,18 @@ impl PseudoCodeEmitter {
     }
 
     fn parse_lifted_stack_offset(var_name: &str) -> Option<(i128, bool)> {
-        // Canonical convention (see `Expr::stack` in `expression.rs`):
-        //   var_NN   → stack offset -NN (frame-local, NN is positive hex)
-        //   arg_NN   → stack offset +NN (positional stack arg)
-        //   local_NN → stack offset -NN (synonym of var_NN used by the
-        //              fallback in NamingContext::generate_local_name)
-        //
-        // The previous implementation mapped `var_NN` to (+NN, is_param=true),
-        // which conflicted with the lifter — `[rbp-0x68]` lifted as
-        // `Var(var_68)` was then queried as if it were `[rbp+0x68]` and got
-        // a fresh `arg_68` name distinct from the `local_68`/`var_68` that
-        // an alternate code path produced. The SAME slot ended up with two
-        // identifiers (e.g. write `ptr2 = farg0;`, read `return local_68;`).
-        // SSE-5 slot-naming desync.
-        if let Some(suffix) = var_name.strip_prefix("var_") {
-            let positive = i128::from_str_radix(suffix, 16).ok()?;
-            Some((-positive, false))
-        } else if let Some(suffix) = var_name.strip_prefix("local_") {
+        // `var_NN` is intentionally ambiguous: `Expr::stack(-N)` (frame-
+        // relative local) and `NamingContext::generate_local_name(+N)`
+        // (stack-pointer-relative positive offset) BOTH produce
+        // `var_N`. From the name alone we can't tell which is meant.
+        // The preferred path is `parse_var_kind_stack_offset` which
+        // consults `VarKind::Stack(offset)` directly when the caller
+        // still has the `Variable` struct. As a textual fallback only,
+        // we accept the unambiguous prefixes:
+        //   local_NN → (-NN, false)  (frame-local)
+        //   arg_NN   → (+NN, true)   (positional stack arg)
+        // Codex review on PR #29 pass 1.
+        if let Some(suffix) = var_name.strip_prefix("local_") {
             let positive = i128::from_str_radix(suffix, 16).ok()?;
             Some((-positive, false))
         } else if let Some(suffix) = var_name.strip_prefix("arg_") {
@@ -3311,6 +3306,22 @@ impl PseudoCodeEmitter {
             Some((offset, true))
         } else {
             None
+        }
+    }
+
+    /// Resolves a `Variable`'s stack offset directly from its
+    /// `VarKind::Stack(offset)` rather than parsing the (potentially
+    /// ambiguous) `var_NN`/`local_NN`/`arg_NN` name string. Returns
+    /// `Some((offset, is_param))` for stack-kind variables, where
+    /// `is_param` mirrors the same rule used elsewhere: positive
+    /// frame offsets denote stack-passed parameters. SSE-5 follow-up.
+    fn parse_var_kind_stack_offset(
+        var: &super::expression::Variable,
+    ) -> Option<(i128, bool)> {
+        use super::expression::VarKind;
+        match var.kind {
+            VarKind::Stack(off) => Some((i128::from(off), off > 0)),
+            _ => None,
         }
     }
 
@@ -5860,9 +5871,21 @@ impl PseudoCodeEmitter {
                     // RIP-relative access. Show as a placeholder to avoid confusing output.
                     "/* unresolved_pc_relative */".to_string()
                 } else {
-                    // Try to get a semantic name from NamingContext for stack variables
-                    // Check if this variable represents a stack offset (var_N format)
-                    if let Some(semantic_name) = self.try_get_semantic_var_name(&var.name) {
+                    // Prefer VarKind::Stack(offset) over name-string
+                    // parsing when the Variable carries its kind: the
+                    // `var_NN` name string is ambiguous between
+                    // frame-relative -N (from `Expr::stack(-N)`) and
+                    // stack-pointer +N (from `generate_local_name`),
+                    // but the kind preserves the signed offset
+                    // unambiguously. SSE-5 follow-up + codex review
+                    // on PR #29 pass 1.
+                    let semantic_kind_name = Self::parse_var_kind_stack_offset(var)
+                        .and_then(|(offset, is_param)| {
+                            self.naming_ctx_semantic_name(offset, is_param)
+                        });
+                    if let Some(semantic_name) =
+                        semantic_kind_name.or_else(|| self.try_get_semantic_var_name(&var.name))
+                    {
                         // Apply parameter name overrides and normalization
                         let overridden = self.apply_param_name_override(&semantic_name);
                         normalize_variable_name(&overridden)
@@ -9683,6 +9706,26 @@ impl PseudoCodeEmitter {
             }
             None
         })
+    }
+
+    /// Sibling to [`Self::try_get_semantic_var_name`] that takes the
+    /// resolved `(offset, is_param)` pair directly — used by the
+    /// `parse_var_kind_stack_offset` path which already has the
+    /// unambiguous offset from `VarKind::Stack(offset)`. SSE-5
+    /// follow-up.
+    fn naming_ctx_semantic_name(&self, offset: i128, is_param: bool) -> Option<String> {
+        if let Some(name) = self.get_dwarf_name(offset) {
+            return Some(name.to_string());
+        }
+        let semantic_name = self.naming_ctx.borrow_mut().get_name(offset, is_param);
+        if semantic_name.starts_with("var_")
+            || semantic_name.starts_with("local_")
+            || semantic_name.starts_with("arg_")
+        {
+            None
+        } else {
+            Some(semantic_name)
+        }
     }
 
     /// Try to get a semantic name for a variable using the NamingContext.
@@ -13587,31 +13630,29 @@ mod tests {
         assert!(result.is_none(), "Empty suffix should return None");
     }
 
-    /// SSE-5 follow-up: align `var_NN` parsing with the
-    /// `Expr::stack` canon — `Expr::stack(-N)` generates
-    /// `Var(name="var_N")` for negative frame offsets, so the
-    /// inverse parse MUST yield (-N, false), not (+N, true).
-    /// Before this fix the inverse mapping gave a different
-    /// NamingContext slot for the same physical address, causing
-    /// `[rbp-0x68]` to be looked up as both `(-0x68, false)`
-    /// (from the Deref path) and `(+0x68, true)` (from the Var
-    /// path) — yielding two distinct names for the same slot.
+    /// SSE-5 follow-up + codex review on PR #29 pass 1:
+    /// `var_NN` is intentionally ambiguous — it's produced by both
+    /// `Expr::stack(-N)` (frame-relative local at -N) and
+    /// `NamingContext::generate_local_name(+N)` (stack-pointer-
+    /// relative slot at +N). Earlier this PR tried to make the
+    /// parser always treat `var_NN` as negative, but that wrongly
+    /// folded the positive-offset stack-pointer case into the
+    /// frame-pointer cache. The principled resolution is to NOT
+    /// parse `var_NN` as a textual hint and rely on
+    /// `VarKind::Stack(offset)` (which preserves the signed
+    /// offset) at call sites that have it. Verify the parser
+    /// returns None for `var_NN`.
     #[test]
-    fn parse_lifted_stack_offset_var_is_negative() {
-        let (off, is_param) =
-            PseudoCodeEmitter::parse_lifted_stack_offset("var_68").expect("parses");
-        assert_eq!(off, -0x68_i128);
-        assert!(!is_param);
+    fn parse_lifted_stack_offset_var_returns_none() {
+        assert!(PseudoCodeEmitter::parse_lifted_stack_offset("var_68").is_none());
     }
 
     #[test]
-    fn parse_lifted_stack_offset_local_matches_var() {
-        let var = PseudoCodeEmitter::parse_lifted_stack_offset("var_68").expect("var");
-        let local = PseudoCodeEmitter::parse_lifted_stack_offset("local_68").expect("local");
-        assert_eq!(
-            var, local,
-            "var_NN and local_NN must parse to the same (offset, is_param) so they hit the same NamingContext slot"
-        );
+    fn parse_lifted_stack_offset_local_is_negative() {
+        let (off, is_param) =
+            PseudoCodeEmitter::parse_lifted_stack_offset("local_68").expect("parses");
+        assert_eq!(off, -0x68_i128);
+        assert!(!is_param);
     }
 
     #[test]
@@ -13619,6 +13660,38 @@ mod tests {
         let (off, is_param) =
             PseudoCodeEmitter::parse_lifted_stack_offset("arg_18").expect("parses");
         assert_eq!(off, 0x18_i128);
+        assert!(is_param);
+    }
+
+    /// SSE-5 follow-up: `parse_var_kind_stack_offset` consults
+    /// `VarKind::Stack(offset)` directly and faithfully reports
+    /// the signed offset along with `is_param` (positive frame
+    /// offsets are stack-passed parameters).
+    #[test]
+    fn parse_var_kind_stack_offset_negative_is_local() {
+        use super::super::expression::{VarKind, Variable};
+        let var = Variable {
+            kind: VarKind::Stack(-0x68),
+            name: "var_68".to_string(),
+            size: 8,
+        };
+        let (off, is_param) =
+            PseudoCodeEmitter::parse_var_kind_stack_offset(&var).expect("parses");
+        assert_eq!(off, -0x68);
+        assert!(!is_param);
+    }
+
+    #[test]
+    fn parse_var_kind_stack_offset_positive_is_param() {
+        use super::super::expression::{VarKind, Variable};
+        let var = Variable {
+            kind: VarKind::Stack(0x18),
+            name: "arg_18".to_string(),
+            size: 8,
+        };
+        let (off, is_param) =
+            PseudoCodeEmitter::parse_var_kind_stack_offset(&var).expect("parses");
+        assert_eq!(off, 0x18);
         assert!(is_param);
     }
 
