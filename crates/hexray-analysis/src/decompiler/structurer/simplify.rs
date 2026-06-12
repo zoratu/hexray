@@ -200,6 +200,13 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     // Otherwise leave the assignment in place —
                     // it's likely real body work happening before
                     // the canary check at the end of the block.
+                    // CONTINUE so the backward scan keeps walking
+                    // toward the earlier return-register assignment
+                    // (eax/xmm0/etc.). Falling through to the
+                    // generic break below would leave the block
+                    // without a recovered return value. Codex
+                    // review on PR #28 pass 2.
+                    continue;
                 }
 
                 // ARM64 epilogue: frame pointer (x29) and link register (x30) restoration
