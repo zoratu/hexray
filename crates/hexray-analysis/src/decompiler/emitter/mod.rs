@@ -5874,38 +5874,16 @@ impl PseudoCodeEmitter {
                     // RIP-relative access. Show as a placeholder to avoid confusing output.
                     "/* unresolved_pc_relative */".to_string()
                 } else {
-                    // Prefer `VarKind::Stack(offset)` over textual
-                    // parsing for default lifted names; the kind
-                    // preserves the signed offset unambiguously.
-                    // Synthesized names like `epoll_event_14` from
-                    // `stack_struct_binding` are NOT overridden
-                    // (pass 6). When the kind path is taken and
-                    // returns None, we MUST NOT fall back to the
-                    // textual parser — `try_get_semantic_var_name`
-                    // would reparse `var_68` as `+0x68` and
-                    // collide with the parameter slot at that
-                    // offset, reintroducing the ambiguity. Codex
-                    // review on PR #29 pass 7.
-                    let name_is_default_lifted = var.name.starts_with("var_")
-                        || var.name.starts_with("local_")
-                        || var.name.starts_with("arg_");
-                    let kind_path_taken =
-                        name_is_default_lifted && Self::parse_var_kind_stack_offset(var).is_some();
-                    let kind_semantic = if kind_path_taken {
-                        Self::parse_var_kind_stack_offset(var).and_then(
-                            |(offset, is_param)| {
-                                self.naming_ctx_semantic_name(offset, is_param)
-                            },
-                        )
-                    } else {
-                        None
-                    };
-                    let semantic_name_opt = if kind_path_taken {
-                        kind_semantic
-                    } else {
-                        self.try_get_semantic_var_name(&var.name)
-                    };
-                    if let Some(semantic_name) = semantic_name_opt {
+                    // NOTE: `parse_var_kind_stack_offset` is a tested
+                    // utility that resolves `VarKind::Stack(offset)`
+                    // directly. It's NOT wired into this formatting
+                    // path yet — a proper migration must also update
+                    // `NamingContext::analyze` to record hints by
+                    // the same signed offset, otherwise loop indices
+                    // / type hints collected via textual `var_N` →
+                    // `+N` parsing wouldn't be applied. SSE-5
+                    // follow-up — see project_sse_canary_return_typing.
+                    if let Some(semantic_name) = self.try_get_semantic_var_name(&var.name) {
                         // Apply parameter name overrides and normalization
                         let overridden = self.apply_param_name_override(&semantic_name);
                         normalize_variable_name(&overridden)
