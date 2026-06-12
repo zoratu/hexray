@@ -5875,24 +5875,26 @@ impl PseudoCodeEmitter {
                     "/* unresolved_pc_relative */".to_string()
                 } else {
                     // Prefer `VarKind::Stack(offset)` over textual
-                    // parsing: `var_NN` is overloaded between
-                    // frame-relative `-N` and stack-pointer-relative
-                    // `+N`, but the kind preserves the signed offset
-                    // unambiguously. The kind-based lookup goes
-                    // through `naming_ctx_semantic_name` which uses
-                    // the same NamingContext slot the LHS write site
-                    // also resolves, so any rename it produces (e.g.
-                    // `ptr8` for a Pointer-hinted slot) is consistent
-                    // between writes and reads. Declarations are
-                    // collected from the emitted body's LHS tokens
-                    // (`collect_decl_identifiers_from_emitted_body`),
-                    // so writes carry the rename into the
-                    // declaration scan automatically. SSE-5 desync
-                    // fix + codex review on PR #29 pass 5.
-                    let kind_semantic = Self::parse_var_kind_stack_offset(var)
-                        .and_then(|(offset, is_param)| {
-                            self.naming_ctx_semantic_name(offset, is_param)
-                        });
+                    // parsing, but ONLY when `var.name` is a default
+                    // lifted name (`var_NN`/`local_NN`/`arg_NN`).
+                    // Synthesized names like `epoll_event_14` from
+                    // `stack_struct_binding` already carry a
+                    // meaningful identifier the reader needs to see;
+                    // letting the NamingContext type hint override
+                    // them with `ptr`/`buf` would lose the recovered
+                    // struct object. Codex review on PR #29 pass 6.
+                    let name_is_default_lifted = var.name.starts_with("var_")
+                        || var.name.starts_with("local_")
+                        || var.name.starts_with("arg_");
+                    let kind_semantic = if name_is_default_lifted {
+                        Self::parse_var_kind_stack_offset(var).and_then(
+                            |(offset, is_param)| {
+                                self.naming_ctx_semantic_name(offset, is_param)
+                            },
+                        )
+                    } else {
+                        None
+                    };
                     if let Some(semantic_name) = kind_semantic
                         .or_else(|| self.try_get_semantic_var_name(&var.name))
                     {
