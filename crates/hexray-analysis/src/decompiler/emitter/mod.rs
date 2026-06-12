@@ -5875,18 +5875,23 @@ impl PseudoCodeEmitter {
                     "/* unresolved_pc_relative */".to_string()
                 } else {
                     // Prefer `VarKind::Stack(offset)` over textual
-                    // parsing, but ONLY when `var.name` is a default
-                    // lifted name (`var_NN`/`local_NN`/`arg_NN`).
+                    // parsing for default lifted names; the kind
+                    // preserves the signed offset unambiguously.
                     // Synthesized names like `epoll_event_14` from
-                    // `stack_struct_binding` already carry a
-                    // meaningful identifier the reader needs to see;
-                    // letting the NamingContext type hint override
-                    // them with `ptr`/`buf` would lose the recovered
-                    // struct object. Codex review on PR #29 pass 6.
+                    // `stack_struct_binding` are NOT overridden
+                    // (pass 6). When the kind path is taken and
+                    // returns None, we MUST NOT fall back to the
+                    // textual parser — `try_get_semantic_var_name`
+                    // would reparse `var_68` as `+0x68` and
+                    // collide with the parameter slot at that
+                    // offset, reintroducing the ambiguity. Codex
+                    // review on PR #29 pass 7.
                     let name_is_default_lifted = var.name.starts_with("var_")
                         || var.name.starts_with("local_")
                         || var.name.starts_with("arg_");
-                    let kind_semantic = if name_is_default_lifted {
+                    let kind_path_taken =
+                        name_is_default_lifted && Self::parse_var_kind_stack_offset(var).is_some();
+                    let kind_semantic = if kind_path_taken {
                         Self::parse_var_kind_stack_offset(var).and_then(
                             |(offset, is_param)| {
                                 self.naming_ctx_semantic_name(offset, is_param)
@@ -5895,9 +5900,12 @@ impl PseudoCodeEmitter {
                     } else {
                         None
                     };
-                    if let Some(semantic_name) = kind_semantic
-                        .or_else(|| self.try_get_semantic_var_name(&var.name))
-                    {
+                    let semantic_name_opt = if kind_path_taken {
+                        kind_semantic
+                    } else {
+                        self.try_get_semantic_var_name(&var.name)
+                    };
+                    if let Some(semantic_name) = semantic_name_opt {
                         // Apply parameter name overrides and normalization
                         let overridden = self.apply_param_name_override(&semantic_name);
                         normalize_variable_name(&overridden)
