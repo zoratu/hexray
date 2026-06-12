@@ -9756,7 +9756,6 @@ impl PseudoCodeEmitter {
                         // Use NamingContext for pattern-based naming (loop indices, type hints, etc.)
                         // This will return names like 'i', 'j', 'k' for loop counters
                         let is_param = is_frame_pointer && actual_offset > 0;
-                        eprintln!("[DBG try_format_stack_slot] op={op:?} offset={offset:?} actual_offset={actual_offset:?} is_frame_ptr={is_frame_pointer} is_param={is_param}");
                         let name = self
                             .naming_ctx
                             .borrow_mut()
@@ -13586,6 +13585,41 @@ mod tests {
         // Test that empty suffix returns None
         let result = emitter.try_get_semantic_var_name("var_");
         assert!(result.is_none(), "Empty suffix should return None");
+    }
+
+    /// SSE-5 follow-up: align `var_NN` parsing with the
+    /// `Expr::stack` canon — `Expr::stack(-N)` generates
+    /// `Var(name="var_N")` for negative frame offsets, so the
+    /// inverse parse MUST yield (-N, false), not (+N, true).
+    /// Before this fix the inverse mapping gave a different
+    /// NamingContext slot for the same physical address, causing
+    /// `[rbp-0x68]` to be looked up as both `(-0x68, false)`
+    /// (from the Deref path) and `(+0x68, true)` (from the Var
+    /// path) — yielding two distinct names for the same slot.
+    #[test]
+    fn parse_lifted_stack_offset_var_is_negative() {
+        let (off, is_param) =
+            PseudoCodeEmitter::parse_lifted_stack_offset("var_68").expect("parses");
+        assert_eq!(off, -0x68_i128);
+        assert!(!is_param);
+    }
+
+    #[test]
+    fn parse_lifted_stack_offset_local_matches_var() {
+        let var = PseudoCodeEmitter::parse_lifted_stack_offset("var_68").expect("var");
+        let local = PseudoCodeEmitter::parse_lifted_stack_offset("local_68").expect("local");
+        assert_eq!(
+            var, local,
+            "var_NN and local_NN must parse to the same (offset, is_param) so they hit the same NamingContext slot"
+        );
+    }
+
+    #[test]
+    fn parse_lifted_stack_offset_arg_is_positive() {
+        let (off, is_param) =
+            PseudoCodeEmitter::parse_lifted_stack_offset("arg_18").expect("parses");
+        assert_eq!(off, 0x18_i128);
+        assert!(is_param);
     }
 
     #[test]

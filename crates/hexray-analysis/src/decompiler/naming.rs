@@ -1267,24 +1267,20 @@ impl NamingContext {
     pub fn get_name(&mut self, offset: i128, is_parameter: bool) -> String {
         // Check for DWARF name first
         if let Some(name) = self.dwarf_names.get(&offset) {
-            eprintln!("[DBG get_name] off={offset:?} dwarf={name}");
             return name.clone();
         }
 
         // Check for already assigned name
         if let Some(name) = self.slot_names.get(&offset) {
-            eprintln!("[DBG get_name] off={offset:?} cached={name}");
             return name.clone();
         }
 
-        let hint = self.type_hints.get(&offset).copied();
         // Generate name based on context
         let name = if is_parameter {
             self.generate_param_name(offset)
         } else {
             self.generate_local_name(offset)
         };
-        eprintln!("[DBG get_name] off={offset:?} is_param={is_parameter} hint={hint:?} -> {name}");
 
         self.slot_names.insert(offset, name.clone());
         name
