@@ -3287,18 +3287,21 @@ impl PseudoCodeEmitter {
     }
 
     fn parse_lifted_stack_offset(var_name: &str) -> Option<(i128, bool)> {
-        // `var_NN` is intentionally ambiguous: `Expr::stack(-N)` (frame-
-        // relative local) and `NamingContext::generate_local_name(+N)`
-        // (stack-pointer-relative positive offset) BOTH produce
-        // `var_N`. From the name alone we can't tell which is meant.
-        // The preferred path is `parse_var_kind_stack_offset` which
-        // consults `VarKind::Stack(offset)` directly when the caller
-        // still has the `Variable` struct. As a textual fallback only,
-        // we accept the unambiguous prefixes:
-        //   local_NN → (-NN, false)  (frame-local)
-        //   arg_NN   → (+NN, true)   (positional stack arg)
-        // Codex review on PR #29 pass 1.
-        if let Some(suffix) = var_name.strip_prefix("local_") {
+        // `var_NN` is overloaded: `Expr::stack(-N)` produces it for
+        // frame-relative locals at `-N`, while
+        // `NamingContext::generate_local_name(+N)` produces it for
+        // stack-pointer-relative slots at `+N`. The textual parser
+        // CANNOT disambiguate; it preserves the historical positive
+        // interpretation here so the many name-only callers
+        // (`ExprKind::Unknown("var_8")`, packed-aggregate helpers,
+        // etc.) keep working. The principled disambiguation for
+        // `ExprKind::Var` uses `parse_var_kind_stack_offset` which
+        // consults `VarKind::Stack(offset)` directly and gives the
+        // correct signed offset. Codex review on PR #29 pass 2.
+        if let Some(suffix) = var_name.strip_prefix("var_") {
+            let offset = i128::from_str_radix(suffix, 16).ok()?;
+            Some((offset, true))
+        } else if let Some(suffix) = var_name.strip_prefix("local_") {
             let positive = i128::from_str_radix(suffix, 16).ok()?;
             Some((-positive, false))
         } else if let Some(suffix) = var_name.strip_prefix("arg_") {
@@ -13630,21 +13633,18 @@ mod tests {
         assert!(result.is_none(), "Empty suffix should return None");
     }
 
-    /// SSE-5 follow-up + codex review on PR #29 pass 1:
-    /// `var_NN` is intentionally ambiguous — it's produced by both
-    /// `Expr::stack(-N)` (frame-relative local at -N) and
-    /// `NamingContext::generate_local_name(+N)` (stack-pointer-
-    /// relative slot at +N). Earlier this PR tried to make the
-    /// parser always treat `var_NN` as negative, but that wrongly
-    /// folded the positive-offset stack-pointer case into the
-    /// frame-pointer cache. The principled resolution is to NOT
-    /// parse `var_NN` as a textual hint and rely on
-    /// `VarKind::Stack(offset)` (which preserves the signed
-    /// offset) at call sites that have it. Verify the parser
-    /// returns None for `var_NN`.
+    /// SSE-5 follow-up + codex pass 2: the textual `var_NN` parse
+    /// preserves the historical positive interpretation because
+    /// many name-only callers depend on it (Unknown, packed-
+    /// aggregate helpers, etc.). The principled disambiguation
+    /// lives in `parse_var_kind_stack_offset`, which uses
+    /// `VarKind::Stack(offset)` directly.
     #[test]
-    fn parse_lifted_stack_offset_var_returns_none() {
-        assert!(PseudoCodeEmitter::parse_lifted_stack_offset("var_68").is_none());
+    fn parse_lifted_stack_offset_var_stays_positive_for_name_only_callers() {
+        let (off, is_param) =
+            PseudoCodeEmitter::parse_lifted_stack_offset("var_68").expect("parses");
+        assert_eq!(off, 0x68);
+        assert!(is_param);
     }
 
     #[test]
