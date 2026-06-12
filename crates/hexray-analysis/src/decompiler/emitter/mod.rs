@@ -5874,7 +5874,28 @@ impl PseudoCodeEmitter {
                     // RIP-relative access. Show as a placeholder to avoid confusing output.
                     "/* unresolved_pc_relative */".to_string()
                 } else {
-                    if let Some(semantic_name) = self.try_get_semantic_var_name(&var.name) {
+                    // Prefer `VarKind::Stack(offset)` over textual
+                    // parsing: `var_NN` is overloaded between
+                    // frame-relative `-N` and stack-pointer-relative
+                    // `+N`, but the kind preserves the signed offset
+                    // unambiguously. The kind-based lookup goes
+                    // through `naming_ctx_semantic_name` which uses
+                    // the same NamingContext slot the LHS write site
+                    // also resolves, so any rename it produces (e.g.
+                    // `ptr8` for a Pointer-hinted slot) is consistent
+                    // between writes and reads. Declarations are
+                    // collected from the emitted body's LHS tokens
+                    // (`collect_decl_identifiers_from_emitted_body`),
+                    // so writes carry the rename into the
+                    // declaration scan automatically. SSE-5 desync
+                    // fix + codex review on PR #29 pass 5.
+                    let kind_semantic = Self::parse_var_kind_stack_offset(var)
+                        .and_then(|(offset, is_param)| {
+                            self.naming_ctx_semantic_name(offset, is_param)
+                        });
+                    if let Some(semantic_name) = kind_semantic
+                        .or_else(|| self.try_get_semantic_var_name(&var.name))
+                    {
                         // Apply parameter name overrides and normalization
                         let overridden = self.apply_param_name_override(&semantic_name);
                         normalize_variable_name(&overridden)
