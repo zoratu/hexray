@@ -90,11 +90,30 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     let mut indices_to_remove = Vec::new();
     let mut saw_real_call_after = false;
     let mut saw_stack_canary_after = false;
+    // Variables that participate in the canary check expression
+    // (the registers/slots that hold the reloaded canary on the
+    // check path). Used to scope the post-canary assignment-drop
+    // to ACTUAL canary scaffolding rather than the body work that
+    // precedes the canary check. SSE-5.
+    //
+    // PRE-COMPUTED by a forward-walking taint propagation pass:
+    // multi-register check shapes like
+    //   `rdx = local_canary; rcx = __stack_chk_guard; rdx = rdx - rcx`
+    // require knowing that `rcx` will become canary-tainted BEFORE
+    // we encounter the compare. The backward walk below can't see
+    // forward, so we precompute the full taint set here. Codex
+    // review on PR #28 pass 5.
+    let canary_check_vars = precompute_canary_check_vars(&statements);
+    // Working copy that the backward walk can adjust (kill on
+    // LHS redefinition per codex pass 3).
+    let mut canary_check_vars = canary_check_vars;
 
     // Search backwards for an assignment to a return register, collecting epilogue statements
     for i in (0..statements.len()).rev() {
         let stmt = &statements[i];
-        if expr_mentions_stack_canary_guard(stmt) {
+        // Flip saw_stack_canary_after when the precomputed taint
+        // says this statement participates in the canary check.
+        if !saw_stack_canary_after && stmt_is_canary(stmt, &canary_check_vars) {
             saw_stack_canary_after = true;
         }
 
@@ -127,7 +146,74 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                 }
 
                 if saw_stack_canary_after {
-                    indices_to_remove.push(i);
+                    // Restrict drop to ACTUAL canary-pattern
+                    // assignments. Three accepted shapes:
+                    //  (a) RHS mentions `stack_chk_guard` (the
+                    //      canary reload itself).
+                    //  (b) LHS is a variable that participated in
+                    //      the canary check expression (e.g. the
+                    //      reload register used in the compare).
+                    //  (c) RHS is a reload of one of the
+                    //      already-seen canary check vars (e.g.
+                    //      `rcx = [rbp-8]` setting up the compare).
+                    // Plain body work happening before the canary
+                    // check (the SSE arithmetic and result-slot
+                    // store on float-returning stack-protected
+                    // functions) MUST survive — without this gate
+                    // the body recovery would emit
+                    // `return uninit_slot;` having dropped the
+                    // computation. SSE-5.
+                    let rhs_is_canary = expr_mentions_stack_canary_guard(rhs);
+                    let lhs_is_check_var = canary_check_vars.contains(&v.name);
+                    let mut rhs_vars: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    collect_var_names(rhs, &mut rhs_vars);
+                    // Exclude stack-base registers (rbp/rsp/x29/sp)
+                    // from check-var tracking — they appear in every
+                    // frame-slot dereference (`rcx = *(rbp - 8)`),
+                    // so tainting them would poison every subsequent
+                    // `[rbp - N]` body access. Codex review on PR
+                    // #28 pass 1.
+                    let drop_taint_var = |name: &str| {
+                        matches!(name, "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp")
+                    };
+                    let rhs_uses_check_var = rhs_vars
+                        .iter()
+                        .filter(|n| !drop_taint_var(n))
+                        .any(|n| canary_check_vars.contains(n));
+                    if rhs_is_canary || lhs_is_check_var || rhs_uses_check_var {
+                        // Walking backward, the redefinition kills
+                        // the taint for the LHS register: an
+                        // earlier `local_ret = rax` should be
+                        // preserved because that rax was the body
+                        // result, not the canary value the
+                        // overwrite later loaded. Remove the LHS
+                        // from the canary-check-vars set first.
+                        // Codex review on PR #28 pass 3.
+                        canary_check_vars.remove(&v.name);
+                        // Then propagate taint from RHS — chains
+                        // of canary setup (e.g. the saved-canary
+                        // slot reload, the guard memory ref) all
+                        // get pulled into the set so their earlier
+                        // defs also drop. Stack-base registers
+                        // stay out (codex pass 1).
+                        for n in rhs_vars {
+                            if !drop_taint_var(&n) {
+                                canary_check_vars.insert(n);
+                            }
+                        }
+                        indices_to_remove.push(i);
+                        continue;
+                    }
+                    // Otherwise leave the assignment in place —
+                    // it's likely real body work happening before
+                    // the canary check at the end of the block.
+                    // CONTINUE so the backward scan keeps walking
+                    // toward the earlier return-register assignment
+                    // (eax/xmm0/etc.). Falling through to the
+                    // generic break below would leave the block
+                    // without a recovered return value. Codex
+                    // review on PR #28 pass 2.
                     continue;
                 }
 
@@ -253,6 +339,139 @@ pub(super) fn substitute_prior_register_assignments(expr: Expr, statements: &[Ex
     }
 
     substitute_vars(&expr, &reg_values)
+}
+
+/// Forward-walking taint propagation over a block's statement list
+/// to identify EVERY variable that holds canary-derived state.
+/// Walks once forward through the statements; whenever an Assign's
+/// RHS mentions `stack_chk_guard` or uses an already-tainted var,
+/// the LHS becomes tainted too. Stack-base registers (rbp/rsp/...)
+/// stay out of the set so frame-slot dereferences don't poison
+/// every body access.
+///
+/// The backward walk in `extract_return_value` consults this
+/// precomputed set so it can recognize multi-register canary
+/// patterns like
+///   `rdx = local_canary; rcx = stack_chk_guard; rdx = rdx - rcx`
+/// where the compare uses `rcx` before `rcx` is loaded — backward
+/// alone can't see that connection. Codex review on PR #28 pass 5.
+fn precompute_canary_check_vars(
+    statements: &[Expr],
+) -> std::collections::HashSet<String> {
+    use super::super::expression::ExprKind;
+    let mut tainted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let drop_taint_var =
+        |n: &str| matches!(n, "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp");
+    for stmt in statements {
+        if expr_mentions_stack_canary_guard(stmt) {
+            let mut vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+            collect_var_names(stmt, &mut vars);
+            for n in vars {
+                if !drop_taint_var(&n) {
+                    tainted.insert(n);
+                }
+            }
+        }
+        if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+            if let ExprKind::Var(v) = &lhs.kind {
+                let mut rhs_vars: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                collect_var_names(rhs, &mut rhs_vars);
+                let rhs_uses_tainted = rhs_vars
+                    .iter()
+                    .any(|n| !drop_taint_var(n) && tainted.contains(n));
+                if rhs_uses_tainted && !drop_taint_var(&v.name) {
+                    tainted.insert(v.name.clone());
+                }
+            }
+        }
+    }
+    tainted
+}
+
+/// True when `stmt` is part of the canary check chain: it either
+/// mentions `stack_chk_guard` directly, or its lhs/rhs participates
+/// in the precomputed taint set.
+fn stmt_is_canary(
+    stmt: &Expr,
+    tainted: &std::collections::HashSet<String>,
+) -> bool {
+    use super::super::expression::ExprKind;
+    if expr_mentions_stack_canary_guard(stmt) {
+        return true;
+    }
+    if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+        if let ExprKind::Var(v) = &lhs.kind {
+            if tainted.contains(&v.name) {
+                return true;
+            }
+        }
+        let mut rhs_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+        collect_var_names(rhs, &mut rhs_vars);
+        let drop_taint_var =
+            |n: &str| matches!(n, "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp");
+        if rhs_vars.iter().any(|n| !drop_taint_var(n) && tainted.contains(n)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Collect every `Var` name referenced inside `expr`. Used by the
+/// canary-aware return extraction to track which variables flow
+/// through the canary check expression. SSE-5.
+fn collect_var_names(expr: &Expr, names: &mut std::collections::HashSet<String>) {
+    use super::super::expression::ExprKind;
+    match &expr.kind {
+        ExprKind::Var(v) => {
+            names.insert(v.name.clone());
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            collect_var_names(left, names);
+            collect_var_names(right, names);
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. }
+        | ExprKind::AddressOf(operand) => {
+            collect_var_names(operand, names);
+        }
+        ExprKind::Deref { addr, .. } => collect_var_names(addr, names),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            collect_var_names(base, names);
+            collect_var_names(index, names);
+        }
+        ExprKind::FieldAccess { base, .. } => collect_var_names(base, names),
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                collect_var_names(arg, names);
+            }
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            collect_var_names(cond, names);
+            collect_var_names(then_expr, names);
+            collect_var_names(else_expr, names);
+        }
+        ExprKind::Assign { lhs, rhs } => {
+            collect_var_names(lhs, names);
+            collect_var_names(rhs, names);
+        }
+        ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            collect_var_names(lhs, names);
+            collect_var_names(rhs, names);
+        }
+        ExprKind::Phi(values) => {
+            for v in values {
+                collect_var_names(v, names);
+            }
+        }
+        ExprKind::GotRef { display_expr, .. } => collect_var_names(display_expr, names),
+        ExprKind::IntLit(_) | ExprKind::Unknown(_) => {}
+    }
 }
 
 fn expr_mentions_stack_canary_guard(expr: &Expr) -> bool {
