@@ -355,13 +355,10 @@ pub(super) fn substitute_prior_register_assignments(expr: Expr, statements: &[Ex
 ///   `rdx = local_canary; rcx = stack_chk_guard; rdx = rdx - rcx`
 /// where the compare uses `rcx` before `rcx` is loaded — backward
 /// alone can't see that connection. Codex review on PR #28 pass 5.
-fn precompute_canary_check_vars(
-    statements: &[Expr],
-) -> std::collections::HashSet<String> {
+fn precompute_canary_check_vars(statements: &[Expr]) -> std::collections::HashSet<String> {
     use super::super::expression::ExprKind;
     let mut tainted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let drop_taint_var =
-        |n: &str| matches!(n, "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp");
+    let drop_taint_var = |n: &str| matches!(n, "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp");
     for stmt in statements {
         if expr_mentions_stack_canary_guard(stmt) {
             let mut vars: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -392,10 +389,7 @@ fn precompute_canary_check_vars(
 /// True when `stmt` is part of the canary check chain: it either
 /// mentions `stack_chk_guard` directly, or its lhs/rhs participates
 /// in the precomputed taint set.
-fn stmt_is_canary(
-    stmt: &Expr,
-    tainted: &std::collections::HashSet<String>,
-) -> bool {
+fn stmt_is_canary(stmt: &Expr, tainted: &std::collections::HashSet<String>) -> bool {
     use super::super::expression::ExprKind;
     if expr_mentions_stack_canary_guard(stmt) {
         return true;
@@ -410,7 +404,10 @@ fn stmt_is_canary(
         collect_var_names(rhs, &mut rhs_vars);
         let drop_taint_var =
             |n: &str| matches!(n, "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp");
-        if rhs_vars.iter().any(|n| !drop_taint_var(n) && tainted.contains(n)) {
+        if rhs_vars
+            .iter()
+            .any(|n| !drop_taint_var(n) && tainted.contains(n))
+        {
             return true;
         }
     }
