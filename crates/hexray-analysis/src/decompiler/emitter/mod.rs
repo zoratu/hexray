@@ -9756,6 +9756,7 @@ impl PseudoCodeEmitter {
                         // Use NamingContext for pattern-based naming (loop indices, type hints, etc.)
                         // This will return names like 'i', 'j', 'k' for loop counters
                         let is_param = is_frame_pointer && actual_offset > 0;
+                        eprintln!("[DBG try_format_stack_slot] op={op:?} offset={offset:?} actual_offset={actual_offset:?} is_frame_ptr={is_frame_pointer} is_param={is_param}");
                         let name = self
                             .naming_ctx
                             .borrow_mut()
