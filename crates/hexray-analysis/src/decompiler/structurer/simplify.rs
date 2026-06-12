@@ -103,7 +103,19 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
         let stmt = &statements[i];
         if expr_mentions_stack_canary_guard(stmt) {
             saw_stack_canary_after = true;
-            collect_var_names(stmt, &mut canary_check_vars);
+            let mut stmt_vars: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            collect_var_names(stmt, &mut stmt_vars);
+            // Don't taint stack-base registers (they appear in every
+            // frame-slot dereference). Codex review on PR #28 pass 1.
+            for n in stmt_vars {
+                if !matches!(
+                    n.as_str(),
+                    "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp"
+                ) {
+                    canary_check_vars.insert(n);
+                }
+            }
         }
 
         // Check for return register assignment
@@ -157,13 +169,31 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
                     let mut rhs_vars: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     collect_var_names(rhs, &mut rhs_vars);
-                    let rhs_uses_check_var =
-                        rhs_vars.iter().any(|n| canary_check_vars.contains(n));
+                    // Exclude stack-base registers (rbp/rsp/x29/sp)
+                    // from check-var tracking — they appear in every
+                    // frame-slot dereference (`rcx = *(rbp - 8)`),
+                    // so tainting them would poison every subsequent
+                    // `[rbp - N]` body access. Codex review on PR
+                    // #28 pass 1.
+                    let drop_taint_var = |name: &str| {
+                        matches!(name, "rbp" | "ebp" | "rsp" | "esp" | "x29" | "fp" | "sp")
+                    };
+                    let rhs_uses_check_var = rhs_vars
+                        .iter()
+                        .filter(|n| !drop_taint_var(n))
+                        .any(|n| canary_check_vars.contains(n));
                     if rhs_is_canary || lhs_is_check_var || rhs_uses_check_var {
                         // Propagate the var-tracking so chains of
                         // canary setup statements all get dropped.
-                        canary_check_vars.insert(v.name.clone());
-                        canary_check_vars.extend(rhs_vars);
+                        // Stack-base registers stay out of the set.
+                        if !drop_taint_var(&v.name) {
+                            canary_check_vars.insert(v.name.clone());
+                        }
+                        for n in rhs_vars {
+                            if !drop_taint_var(&n) {
+                                canary_check_vars.insert(n);
+                            }
+                        }
                         indices_to_remove.push(i);
                         continue;
                     }
