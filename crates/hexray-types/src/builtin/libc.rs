@@ -554,4 +554,40 @@ mod tests {
         assert_eq!(printf.parameters.len(), 1);
         assert_eq!(printf.parameters[0].0, "format");
     }
+
+    /// Math.h scalar functions must be registered with the right
+    /// param types so the decompiler captures `xmm0` as the arg at
+    /// call sites. Without this, `return sqrt(x)` surfaces as
+    /// `return sqrt();`.
+    #[test]
+    fn test_math_h_double_functions_registered() {
+        let mut db = TypeDatabase::new();
+        load_libc_functions(&mut db);
+
+        for name in [
+            "sqrt", "sin", "cos", "tan", "exp", "log", "fabs", "floor", "ceil",
+        ] {
+            let proto = db
+                .get_function(name)
+                .unwrap_or_else(|| panic!("{name} should be registered"));
+            assert_eq!(proto.parameters.len(), 1, "{name} takes one arg");
+            assert!(
+                proto.parameters[0].1.is_float(),
+                "{name}'s arg must be a float type"
+            );
+            assert!(
+                proto.return_type.is_float(),
+                "{name}'s return must be a float type"
+            );
+        }
+
+        let pow = db.get_function("pow").expect("pow registered");
+        assert_eq!(pow.parameters.len(), 2);
+        let fma = db.get_function("fma").expect("fma registered");
+        assert_eq!(fma.parameters.len(), 3);
+
+        let sqrtf = db.get_function("sqrtf").expect("sqrtf registered");
+        assert_eq!(sqrtf.parameters.len(), 1);
+        assert!(sqrtf.parameters[0].1.is_float());
+    }
 }
