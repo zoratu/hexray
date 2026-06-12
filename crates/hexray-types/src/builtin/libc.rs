@@ -447,6 +447,86 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("usec", CType::uint())
             .doc("Sleep for specified microseconds"),
     );
+
+    // math.h — scalar double-precision functions. Signature recovery
+    // looks up param classes here when reconstructing call-site
+    // arguments, so without these `sqrt(x*x + y*y)` surfaces as
+    // `sqrt()` (xmm0 is never captured as an arg).
+    let math_d1: &[&str] = &[
+        "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh",
+        "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "fabs", "floor",
+        "ceil", "trunc", "round", "rint", "nearbyint", "cbrt", "tgamma", "lgamma", "erf", "erfc",
+        "j0", "j1", "y0", "y1",
+    ];
+    for name in math_d1 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::double())
+                .param("x", CType::double())
+                .doc("math.h scalar double function"),
+        );
+    }
+    let math_d2: &[&str] = &[
+        "pow", "atan2", "hypot", "fmod", "remainder", "copysign", "fmin", "fmax", "fdim",
+        "nextafter", "ldexp",
+    ];
+    for name in math_d2 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::double())
+                .param("x", CType::double())
+                .param("y", CType::double())
+                .doc("math.h scalar double 2-arg function"),
+        );
+    }
+    db.add_function(
+        FunctionPrototype::new("fma", CType::double())
+            .param("x", CType::double())
+            .param("y", CType::double())
+            .param("z", CType::double())
+            .doc("Fused multiply-add: x*y+z"),
+    );
+
+    // math.h single-precision counterparts.
+    let math_f1: &[&str] = &[
+        "sqrtf", "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "sinhf", "coshf", "tanhf",
+        "asinhf", "acoshf", "atanhf", "expf", "exp2f", "expm1f", "logf", "log2f", "log10f",
+        "log1pf", "fabsf", "floorf", "ceilf", "truncf", "roundf", "rintf", "nearbyintf", "cbrtf",
+        "tgammaf", "lgammaf", "erff", "erfcf",
+    ];
+    for name in math_f1 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::float())
+                .param("x", CType::float())
+                .doc("math.h scalar float function"),
+        );
+    }
+    let math_f2: &[&str] = &[
+        "powf",
+        "atan2f",
+        "hypotf",
+        "fmodf",
+        "remainderf",
+        "copysignf",
+        "fminf",
+        "fmaxf",
+        "fdimf",
+        "nextafterf",
+        "ldexpf",
+    ];
+    for name in math_f2 {
+        db.add_function(
+            FunctionPrototype::new(*name, CType::float())
+                .param("x", CType::float())
+                .param("y", CType::float())
+                .doc("math.h scalar float 2-arg function"),
+        );
+    }
+    db.add_function(
+        FunctionPrototype::new("fmaf", CType::float())
+            .param("x", CType::float())
+            .param("y", CType::float())
+            .param("z", CType::float())
+            .doc("Fused multiply-add (single-precision): x*y+z"),
+    );
 }
 
 #[cfg(test)]
