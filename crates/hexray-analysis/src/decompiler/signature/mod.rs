@@ -5843,8 +5843,8 @@ mod tests {
                 },
             ),
         ];
-        let recovery = SignatureRecovery::new(CallingConvention::Win64).with_param_spill_order(
-            vec![
+        let recovery =
+            SignatureRecovery::new(CallingConvention::Win64).with_param_spill_order(vec![
                 ParamSpillObservation {
                     register: "xmm1".to_string(),
                     offset: -8,
@@ -5853,8 +5853,7 @@ mod tests {
                     register: "rcx".to_string(),
                     offset: -16,
                 },
-            ],
-        );
+            ]);
         recovery.reorder_params_by_spill_offset(&mut sig);
         // The float moves to position 0 BUT keeps its ABI name
         // `farg1` (matching the body), not renumbered to `farg0`.

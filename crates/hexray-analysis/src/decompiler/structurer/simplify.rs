@@ -95,16 +95,14 @@ pub(super) fn extract_return_value(statements: Vec<Expr>) -> (Vec<Expr>, Option<
     // check path). Used to scope the post-canary assignment-drop
     // to ACTUAL canary scaffolding rather than the body work that
     // precedes the canary check. SSE-5.
-    let mut canary_check_vars: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut canary_check_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Search backwards for an assignment to a return register, collecting epilogue statements
     for i in (0..statements.len()).rev() {
         let stmt = &statements[i];
         if expr_mentions_stack_canary_guard(stmt) {
             saw_stack_canary_after = true;
-            let mut stmt_vars: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut stmt_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
             collect_var_names(stmt, &mut stmt_vars);
             // Don't taint stack-base registers (they appear in every
             // frame-slot dereference). Codex review on PR #28 pass 1.
