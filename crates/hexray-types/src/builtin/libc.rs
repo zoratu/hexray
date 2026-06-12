@@ -465,9 +465,20 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
                 .doc("math.h scalar double function"),
         );
     }
+    // `ldexp` and `ldexpf` are NOT in math_d2: their exponent is an
+    // `int`, not a float — `double ldexp(double x, int exp)`. Codex
+    // review on PR #30 pass 1.
     let math_d2: &[&str] = &[
-        "pow", "atan2", "hypot", "fmod", "remainder", "copysign", "fmin", "fmax", "fdim",
-        "nextafter", "ldexp",
+        "pow",
+        "atan2",
+        "hypot",
+        "fmod",
+        "remainder",
+        "copysign",
+        "fmin",
+        "fmax",
+        "fdim",
+        "nextafter",
     ];
     for name in math_d2 {
         db.add_function(
@@ -510,7 +521,6 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
         "fmaxf",
         "fdimf",
         "nextafterf",
-        "ldexpf",
     ];
     for name in math_f2 {
         db.add_function(
@@ -526,6 +536,52 @@ pub fn load_libc_functions(db: &mut TypeDatabase) {
             .param("y", CType::float())
             .param("z", CType::float())
             .doc("Fused multiply-add (single-precision): x*y+z"),
+    );
+
+    // `ldexp(double x, int exp)` and `ldexpf(float x, int exp)` —
+    // mixed-class arguments: the value is in xmm0, the exponent
+    // in edi/rdi. Codex review on PR #30 pass 1.
+    db.add_function(
+        FunctionPrototype::new("ldexp", CType::double())
+            .param("x", CType::double())
+            .param("exp", CType::int())
+            .doc("x * 2^exp"),
+    );
+    db.add_function(
+        FunctionPrototype::new("ldexpf", CType::float())
+            .param("x", CType::float())
+            .param("exp", CType::int())
+            .doc("x * 2^exp (single-precision)"),
+    );
+
+    // `frexp(double x, int *exp)` — returns the mantissa, writes the
+    // exponent through a pointer.
+    db.add_function(
+        FunctionPrototype::new("frexp", CType::double())
+            .param("x", CType::double())
+            .param("exp", CType::ptr(CType::int()))
+            .doc("Split into mantissa and binary exponent"),
+    );
+    db.add_function(
+        FunctionPrototype::new("frexpf", CType::float())
+            .param("x", CType::float())
+            .param("exp", CType::ptr(CType::int()))
+            .doc("Split into mantissa and binary exponent (single-precision)"),
+    );
+
+    // `modf(double x, double *iptr)` — returns the fractional part,
+    // writes the integral part through a pointer.
+    db.add_function(
+        FunctionPrototype::new("modf", CType::double())
+            .param("x", CType::double())
+            .param("iptr", CType::ptr(CType::double()))
+            .doc("Decompose into fractional and integral parts"),
+    );
+    db.add_function(
+        FunctionPrototype::new("modff", CType::float())
+            .param("x", CType::float())
+            .param("iptr", CType::ptr(CType::float()))
+            .doc("Decompose into fractional and integral parts (single-precision)"),
     );
 }
 

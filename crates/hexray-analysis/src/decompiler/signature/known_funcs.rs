@@ -480,17 +480,48 @@ pub(super) fn get_known_function_params(
         | "cbrtf" | "tgammaf" | "lgammaf" | "erff" | "erfcf" => {
             Some(&[("x", ParamType::Float(32))])
         }
-        // Two-arg double.
+        // Two-arg double (both floats — note ldexp is NOT here, its
+        // exponent is an `int`. Codex review on PR #30 pass 1.)
         "pow" | "atan2" | "hypot" | "fmod" | "remainder" | "copysign"
-        | "fmin" | "fmax" | "fdim" | "nextafter" | "ldexp" => Some(&[
+        | "fmin" | "fmax" | "fdim" | "nextafter" => Some(&[
             ("x", ParamType::Float(64)),
             ("y", ParamType::Float(64)),
         ]),
-        // Two-arg float.
+        // Two-arg float (both floats).
         "powf" | "atan2f" | "hypotf" | "fmodf" | "remainderf" | "copysignf"
-        | "fminf" | "fmaxf" | "fdimf" | "nextafterf" | "ldexpf" => Some(&[
+        | "fminf" | "fmaxf" | "fdimf" | "nextafterf" => Some(&[
             ("x", ParamType::Float(32)),
             ("y", ParamType::Float(32)),
+        ]),
+        // `ldexp(double, int)` and `ldexpf(float, int)` — mixed
+        // class. Codex review on PR #30 pass 1.
+        "ldexp" => Some(&[
+            ("x", ParamType::Float(64)),
+            ("exp", ParamType::SignedInt(32)),
+        ]),
+        "ldexpf" => Some(&[
+            ("x", ParamType::Float(32)),
+            ("exp", ParamType::SignedInt(32)),
+        ]),
+        // `frexp(double, int *)` and `frexpf(float, int *)` — value
+        // + pointer to int exponent.
+        "frexp" => Some(&[
+            ("x", ParamType::Float(64)),
+            ("exp", ParamType::Pointer),
+        ]),
+        "frexpf" => Some(&[
+            ("x", ParamType::Float(32)),
+            ("exp", ParamType::Pointer),
+        ]),
+        // `modf(double, double *)` and `modff(float, float *)` —
+        // value + pointer to value for integral part.
+        "modf" => Some(&[
+            ("x", ParamType::Float(64)),
+            ("iptr", ParamType::Pointer),
+        ]),
+        "modff" => Some(&[
+            ("x", ParamType::Float(32)),
+            ("iptr", ParamType::Pointer),
         ]),
         // Three-arg double (fused mul-add).
         "fma" => Some(&[
