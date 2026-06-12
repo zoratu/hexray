@@ -3318,9 +3318,7 @@ impl PseudoCodeEmitter {
     /// `Some((offset, is_param))` for stack-kind variables, where
     /// `is_param` mirrors the same rule used elsewhere: positive
     /// frame offsets denote stack-passed parameters. SSE-5 follow-up.
-    fn parse_var_kind_stack_offset(
-        var: &super::expression::Variable,
-    ) -> Option<(i128, bool)> {
+    fn parse_var_kind_stack_offset(var: &super::expression::Variable) -> Option<(i128, bool)> {
         use super::expression::VarKind;
         match var.kind {
             VarKind::Stack(off) => Some((i128::from(off), off > 0)),
@@ -13670,8 +13668,7 @@ mod tests {
             name: "var_68".to_string(),
             size: 8,
         };
-        let (off, is_param) =
-            PseudoCodeEmitter::parse_var_kind_stack_offset(&var).expect("parses");
+        let (off, is_param) = PseudoCodeEmitter::parse_var_kind_stack_offset(&var).expect("parses");
         assert_eq!(off, -0x68);
         assert!(!is_param);
     }
@@ -13684,8 +13681,7 @@ mod tests {
             name: "arg_18".to_string(),
             size: 8,
         };
-        let (off, is_param) =
-            PseudoCodeEmitter::parse_var_kind_stack_offset(&var).expect("parses");
+        let (off, is_param) = PseudoCodeEmitter::parse_var_kind_stack_offset(&var).expect("parses");
         assert_eq!(off, 0x18);
         assert!(is_param);
     }
