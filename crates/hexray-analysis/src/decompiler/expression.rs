@@ -1691,6 +1691,83 @@ impl Expr {
     ///     flagged the original 2-operand-only matcher for missing this
     ///     case — without it AVX float code keeps surfacing
     ///     `/* SSE: vpxor */` for what is in fact a `double s = 0.0`.
+    /// Lift `andps`/`andpd`/`pand`/`orps`/`orpd`/`por`/`xorps`/`xorpd`
+    /// /`pxor` instructions whose source is a memory operand
+    /// (typically the rip-relative load of a `.rodata.cst*` constant
+    /// pool entry) as a proper `BinOp` against the deref.
+    ///
+    /// Compilers reach for these as the canonical implementation of
+    /// `fabs(x)` (AND with `0x7FFF...FF`, clearing the sign bit) and
+    /// unary negation (XOR with `0x8000...00`, flipping it). Without
+    /// this lift the instruction collapses to the opaque
+    /// `/* SSE: pand */` comment and any record of writing to the
+    /// destination xmm register is lost. The proper BinOp lift lets
+    /// the existing rodata-constant materialization render the mask
+    /// as a concrete value, and a downstream simplifier pass can
+    /// recognize the AND-mask-clears-sign / XOR-mask-flips-sign
+    /// idioms and rewrite to `fabs(x)` / `-x`.
+    fn lift_sse_mem_bitwise(inst: &Instruction) -> Option<Self> {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        let op = match mnemonic.as_str() {
+            "andps" | "andpd" | "pand" | "vandps" | "vandpd" | "vpand" => BinOpKind::And,
+            "orps" | "orpd" | "por" | "vorps" | "vorpd" | "vpor" => BinOpKind::Or,
+            "xorps" | "xorpd" | "pxor" | "vxorps" | "vxorpd" | "vpxor" => BinOpKind::Xor,
+            _ => return None,
+        };
+        // Restrict to the memory-source shape. Reg-reg `pxor`/`pand`
+        // is genuine integer-SIMD bitwise work in many cases (e.g.
+        // mask computation in vectorized code), and the existing
+        // `test_pxor_distinct_xmm_registers_stays_opaque` test
+        // protects that the opaque comment is preserved. The
+        // memory-source form `pand xmm0, [rip + .LCPI]` is the
+        // unambiguous compiler-emitted constant-pool pattern.
+        //
+        // Two shapes:
+        //   * Legacy SSE 2-operand `op xmm_dst, mem` — semantics is
+        //     `dst = dst op mem`.
+        //   * AVX VEX-encoded 3-operand `vop xmm_dst, xmm_src1, mem`
+        //     — semantics is `dst = src1 op mem` (non-destructive,
+        //     src1 may differ from dst). Codex review on PR #31
+        //     pass 1 caught the previous always-use-dst form.
+        let (dst_reg, lhs_expr, mem) = match inst.operands.as_slice() {
+            [Operand::Register(d), Operand::Memory(m)] => {
+                let dst_size = Self::xmm_family_size(&d.name().to_ascii_lowercase());
+                let lhs = Self::var(Variable::reg(d.name().to_ascii_lowercase(), dst_size));
+                (d, lhs, m)
+            }
+            [Operand::Register(d), Operand::Register(s1), Operand::Memory(m)] => {
+                let s1_size = Self::xmm_family_size(&s1.name().to_ascii_lowercase());
+                let lhs = Self::var(Variable::reg(s1.name().to_ascii_lowercase(), s1_size));
+                (d, lhs, m)
+            }
+            _ => return None,
+        };
+        let src_expr = Self::from_memory_with_context(mem, inst, false);
+        let dst_name = dst_reg.name().to_ascii_lowercase();
+        if !(dst_name.starts_with("xmm")
+            || dst_name.starts_with("ymm")
+            || dst_name.starts_with("zmm"))
+        {
+            return None;
+        }
+        let dst_size = Self::xmm_family_size(&dst_name);
+        let dst_var = Self::var(Variable::reg(dst_name, dst_size));
+        Some(Self::assign(dst_var, Self::binop(op, lhs_expr, src_expr)))
+    }
+
+    /// Returns the byte size of an `xmm*`/`ymm*`/`zmm*` register
+    /// family. Falls back to 16 (xmm) for any other name — callers
+    /// guard the family check before invoking this.
+    fn xmm_family_size(name: &str) -> u8 {
+        if name.starts_with("zmm") {
+            64
+        } else if name.starts_with("ymm") {
+            32
+        } else {
+            16
+        }
+    }
+
     fn lift_sse_self_xor_zero(inst: &Instruction) -> Option<Self> {
         let mnemonic = inst.mnemonic.to_ascii_lowercase();
         if !matches!(
@@ -1774,6 +1851,19 @@ impl Expr {
         // `/* SSE: pxor */` and the surrounding type recovery loses the
         // initial-value evidence.
         if let Some(expr) = Self::lift_sse_self_xor_zero(inst) {
+            return expr;
+        }
+        // `andps`/`andpd`/`pand`/`orps`/`orpd`/`por`/`xorps`/`xorpd`
+        // /`pxor` against memory are commonly used by compilers to
+        // implement `fabs` (AND with `0x7FFF...FF` clearing the sign
+        // bit) and unary negation (XOR with `0x8000...00` flipping
+        // it). Lifting them as a proper `BinOp` against the memory
+        // deref lets the rodata-constant materialization surface the
+        // mask, and a downstream simplifier pass can recognize and
+        // rewrite to `fabs(x)` / `-x`. Without this they fall to the
+        // opaque `/* SSE: pand */` comment and the SSE-protected
+        // body loses any record of writing to xmm0.
+        if let Some(expr) = Self::lift_sse_mem_bitwise(inst) {
             return expr;
         }
         if Self::should_lift_as_opaque_x86_integer_simd(inst) {
@@ -6546,6 +6636,88 @@ mod tests {
         // specific bug we'd reintroduce by stripping the all-three-match
         // check.
         assert_ne!(rendered, "xmm0 = 0");
+    }
+
+    /// SSE bitwise op against a memory operand is the canonical
+    /// fabs/neg idiom (`andps xmm0, [rip + .LCPI_pos_mask]` clears
+    /// the sign bit, `xorps xmm0, [rip + .LCPI_neg_mask]` flips
+    /// it). Lift this as a proper `BinOp` so the destination
+    /// register's data flow is preserved — without this it falls
+    /// to the opaque `/* SSE: andps */` comment and any record of
+    /// writing to xmm0 is lost (the recovered body then defaults
+    /// to `return 0.0;`).
+    #[test]
+    fn test_andps_with_memory_lifts_as_bitand() {
+        use hexray_core::{
+            register::x86, Architecture, MemoryRef, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        // andps xmm0, [rip + 0x100]
+        let mem = MemoryRef::base_disp(rip, 0x100, 16);
+        let inst = Instruction::new(0x401040, 7, vec![0x0f, 0x54, 0x05, 0, 0, 0, 0], "andps")
+            .with_operation(Operation::And)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Memory(mem)]);
+        let rendered = Expr::from_instruction(&inst).to_string();
+        // Expect `xmm0 = xmm0 & ...` (the deref of the rip-relative
+        // address). The exact format of the rhs depends on rodata
+        // materialization context, but at minimum the lhs is xmm0
+        // and the operator is bitwise AND.
+        assert!(
+            rendered.starts_with("xmm0 = xmm0 & "),
+            "expected `xmm0 = xmm0 & ...`, got `{rendered}`"
+        );
+    }
+
+    /// Codex review on PR #31 pass 1: AVX VEX-encoded 3-operand
+    /// `vandps xmm0, xmm1, [mem]` is `dst = src1 op mem`, so when
+    /// `dst` and `src1` differ the lift must use `src1` as the LHS
+    /// of the BinOp, not `dst`. Building from `dst` (the previous
+    /// behavior) would emit `xmm0 = xmm0 & ...` instead of the
+    /// correct `xmm0 = xmm1 & ...`.
+    #[test]
+    fn test_vandps_three_operand_uses_src1_as_lhs() {
+        use hexray_core::{
+            register::x86, Architecture, MemoryRef, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        let mem = MemoryRef::base_disp(rip, 0x100, 16);
+        // vandps xmm0, xmm1, [rip + 0x100]
+        let inst = Instruction::new(0x401040, 8, vec![0xc5, 0xf0, 0x54, 0x05, 0, 0, 0, 0], "vandps")
+            .with_operation(Operation::And)
+            .with_operands(vec![
+                Operand::Register(xmm0),
+                Operand::Register(xmm1),
+                Operand::Memory(mem),
+            ]);
+        let rendered = Expr::from_instruction(&inst).to_string();
+        // LHS of the BinOp must be xmm1 (the AVX src1), NOT xmm0.
+        assert!(
+            rendered.starts_with("xmm0 = xmm1 & "),
+            "expected `xmm0 = xmm1 & ...` for non-destructive AVX form, got `{rendered}`"
+        );
+    }
+
+    /// XOR-with-memory should also lift (the unary-negate idiom is
+    /// `xorps xmm0, [rip + .LCPI_neg_mask]`).
+    #[test]
+    fn test_xorps_with_memory_lifts_as_bitxor() {
+        use hexray_core::{
+            register::x86, Architecture, MemoryRef, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        let mem = MemoryRef::base_disp(rip, 0x200, 16);
+        let inst = Instruction::new(0x401050, 7, vec![0x0f, 0x57, 0x05, 0, 0, 0, 0], "xorps")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Memory(mem)]);
+        let rendered = Expr::from_instruction(&inst).to_string();
+        assert!(
+            rendered.starts_with("xmm0 = xmm0 ^ "),
+            "expected `xmm0 = xmm0 ^ ...`, got `{rendered}`"
+        );
     }
 
     #[test]
