@@ -8198,17 +8198,22 @@ fn should_replace_existing_call_args(
         // statement was consumed by an earlier pass) and would
         // happily replace the good `[x*x + y*y]` with the partial
         // `[x*x]`. Refuse the replacement when every recovered arg
-        // is strictly smaller (or equal-size) than the corresponding
-        // existing arg AND the position count didn't grow. This
-        // keeps the additive-chain `hypot2` recovery intact across
-        // basic-block consolidation passes.
+        // is no LARGER than the corresponding existing arg (by node
+        // count) AND the position count didn't grow. Equal-size is
+        // INCLUDED in the gate — codex review on PR #34 pass 1
+        // pointed out that two equal-size BinOps could still be a
+        // stale-replaces-good case, and a same-size replacement
+        // has no information advantage worth the risk of losing
+        // the existing recovery. This keeps the additive-chain
+        // `hypot2` recovery intact across basic-block consolidation
+        // passes.
         if existing_args.len() == recovered_args.len()
             && !existing_args.is_empty()
             && existing_args
                 .iter()
                 .zip(recovered_args.iter())
                 .all(|(existing, recovered)| {
-                    expr_node_count(existing) > expr_node_count(recovered)
+                    expr_node_count(existing) >= expr_node_count(recovered)
                 })
         {
             return false;
@@ -12066,6 +12071,34 @@ mod tests {
         assert!(
             !should_replace_existing_call_args(&[big_arg], &[small_arg], &used_indices),
             "must NOT replace a richer existing arg with a smaller recovered arg",
+        );
+    }
+
+    /// Codex review on PR #34 pass 1: an equal-size stale recovered
+    /// arg must NOT replace an existing rich arg of the same size.
+    /// Both binary expressions of identical node count could be one
+    /// good (existing) and one stale (recovered) — without a deeper
+    /// equivalence check we can't distinguish, so we default to
+    /// keeping existing.
+    #[test]
+    fn should_replace_existing_call_args_keeps_equal_size_existing() {
+        // existing = farg0 + farg1  (3 nodes — the prior good pass)
+        let good = Expr::binop(
+            BinOpKind::Add,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg1"),
+        );
+        // recovered = farg0 - farg1  (3 nodes — a same-size stale)
+        let stale = Expr::binop(
+            BinOpKind::Sub,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg1"),
+        );
+        let used_indices = vec![7usize];
+
+        assert!(
+            !should_replace_existing_call_args(&[good], &[stale], &used_indices),
+            "equal-size existing must NOT be replaced by an equal-size recovered arg",
         );
     }
 
