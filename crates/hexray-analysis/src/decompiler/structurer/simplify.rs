@@ -5306,6 +5306,192 @@ fn expr_node_count(expr: &Expr) -> usize {
     expr_node_count_bounded(expr, SUBSTITUTION_VALUE_NODE_CAP)
 }
 
+/// Recursive structural equality on Exprs, sufficient for the
+/// call-argument replacement guard in
+/// [`should_replace_existing_call_args`].
+///
+/// `Display` cannot serve as a proxy because `Expr`'s formatter
+/// omits parentheses around nested BinOps with the same operator —
+/// `(a - b) - c` and `a - (b - c)` would print identically. Codex
+/// review on PR #34 pass 5 flagged this as defeating the equal-size
+/// stale-protection in exactly the case it was meant to protect.
+fn exprs_call_arg_structurally_equal(left: &Expr, right: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+    match (&left.kind, &right.kind) {
+        (ExprKind::Var(a), ExprKind::Var(b)) => a == b,
+        (ExprKind::IntLit(a), ExprKind::IntLit(b)) => a == b,
+        (ExprKind::Unknown(a), ExprKind::Unknown(b)) => a == b,
+        (
+            ExprKind::BinOp {
+                op: op_a,
+                left: la,
+                right: ra,
+            },
+            ExprKind::BinOp {
+                op: op_b,
+                left: lb,
+                right: rb,
+            },
+        ) => {
+            op_a == op_b
+                && exprs_call_arg_structurally_equal(la, lb)
+                && exprs_call_arg_structurally_equal(ra, rb)
+        }
+        (
+            ExprKind::UnaryOp {
+                op: op_a,
+                operand: a,
+            },
+            ExprKind::UnaryOp {
+                op: op_b,
+                operand: b,
+            },
+        ) => op_a == op_b && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::Deref {
+                addr: a,
+                size: size_a,
+            },
+            ExprKind::Deref {
+                addr: b,
+                size: size_b,
+            },
+        ) => size_a == size_b && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::ArrayAccess {
+                base: ba,
+                index: ia,
+                element_size: ea,
+            },
+            ExprKind::ArrayAccess {
+                base: bb,
+                index: ib,
+                element_size: eb,
+            },
+        ) => {
+            ea == eb
+                && exprs_call_arg_structurally_equal(ba, bb)
+                && exprs_call_arg_structurally_equal(ia, ib)
+        }
+        (
+            ExprKind::FieldAccess {
+                base: ba,
+                offset: oa,
+                field_name: fa,
+            },
+            ExprKind::FieldAccess {
+                base: bb,
+                offset: ob,
+                field_name: fb,
+            },
+        ) => oa == ob && fa == fb && exprs_call_arg_structurally_equal(ba, bb),
+        (ExprKind::AddressOf(a), ExprKind::AddressOf(b)) => {
+            exprs_call_arg_structurally_equal(a, b)
+        }
+        (
+            ExprKind::Cast {
+                expr: a,
+                to_size: sa,
+                signed: za,
+            },
+            ExprKind::Cast {
+                expr: b,
+                to_size: sb,
+                signed: zb,
+            },
+        ) => sa == sb && za == zb && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::BitField {
+                expr: a,
+                start: sa,
+                width: wa,
+            },
+            ExprKind::BitField {
+                expr: b,
+                start: sb,
+                width: wb,
+            },
+        ) => sa == sb && wa == wb && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::Assign { lhs: la, rhs: ra },
+            ExprKind::Assign { lhs: lb, rhs: rb },
+        ) => {
+            exprs_call_arg_structurally_equal(la, lb)
+                && exprs_call_arg_structurally_equal(ra, rb)
+        }
+        (
+            ExprKind::CompoundAssign {
+                op: op_a,
+                lhs: la,
+                rhs: ra,
+            },
+            ExprKind::CompoundAssign {
+                op: op_b,
+                lhs: lb,
+                rhs: rb,
+            },
+        ) => {
+            op_a == op_b
+                && exprs_call_arg_structurally_equal(la, lb)
+                && exprs_call_arg_structurally_equal(ra, rb)
+        }
+        (
+            ExprKind::Call {
+                target: ta,
+                args: aa,
+            },
+            ExprKind::Call {
+                target: tb,
+                args: ab,
+            },
+        ) => {
+            format!("{ta:?}") == format!("{tb:?}")
+                && aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab.iter())
+                    .all(|(a, b)| exprs_call_arg_structurally_equal(a, b))
+        }
+        (
+            ExprKind::Conditional {
+                cond: ca,
+                then_expr: ta,
+                else_expr: ea,
+            },
+            ExprKind::Conditional {
+                cond: cb,
+                then_expr: tb,
+                else_expr: eb,
+            },
+        ) => {
+            exprs_call_arg_structurally_equal(ca, cb)
+                && exprs_call_arg_structurally_equal(ta, tb)
+                && exprs_call_arg_structurally_equal(ea, eb)
+        }
+        (
+            ExprKind::GotRef {
+                address: aa,
+                size: sa,
+                is_deref: da,
+                ..
+            },
+            ExprKind::GotRef {
+                address: ab,
+                size: sb,
+                is_deref: db,
+                ..
+            },
+        ) => aa == ab && sa == sb && da == db,
+        (ExprKind::Phi(a), ExprKind::Phi(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| exprs_call_arg_structurally_equal(x, y))
+        }
+        _ => false,
+    }
+}
+
 /// Substitute variable references with their known values and simplify.
 ///
 /// Two phases: a simplify-free recursive substitution ([`substitute_vars_rec`])
@@ -8240,8 +8426,12 @@ fn should_replace_existing_call_args(
                     }
                     // Same node count: only veto when structurally
                     // different (potential stale-replaces-good).
+                    // Use a proper recursive comparison — `Display`
+                    // omits parentheses for nested BinOps so
+                    // `(a-b)-c` and `a-(b-c)` would compare equal
+                    // (codex review on PR #34 pass 5).
                     existing_nodes == recovered_nodes
-                        && format!("{existing}") != format!("{recovered}")
+                        && !exprs_call_arg_structurally_equal(existing, recovered)
                 })
         {
             return false;
@@ -12237,6 +12427,43 @@ mod tests {
                 &used_indices,
             ),
             "unchanged complex arg must NOT block sibling pass-through cleanup",
+        );
+    }
+
+    /// Codex review on PR #34 pass 5: `Display` is lossy because
+    /// the formatter omits parens for same-operator nested BinOps.
+    /// `(a - b) - c` and `a - (b - c)` print identically but are
+    /// structurally different and produce different results. The
+    /// guard now uses recursive structural equality so this case
+    /// is correctly recognized as "different" and the replacement
+    /// is refused.
+    #[test]
+    fn should_replace_existing_call_args_uses_structural_equality_not_display() {
+        // (a - b) - c
+        let left_assoc = Expr::binop(
+            BinOpKind::Sub,
+            Expr::binop(BinOpKind::Sub, Expr::unknown("a"), Expr::unknown("b")),
+            Expr::unknown("c"),
+        );
+        // a - (b - c) — same nodes, different structure.
+        let right_assoc = Expr::binop(
+            BinOpKind::Sub,
+            Expr::unknown("a"),
+            Expr::binop(BinOpKind::Sub, Expr::unknown("b"), Expr::unknown("c")),
+        );
+        assert_eq!(
+            format!("{left_assoc}"),
+            format!("{right_assoc}"),
+            "Display is lossy (this is the bug codex flagged)",
+        );
+        let used_indices = vec![5usize];
+        assert!(
+            !should_replace_existing_call_args(
+                &[left_assoc],
+                &[right_assoc],
+                &used_indices,
+            ),
+            "structurally different same-size args must NOT trigger replacement",
         );
     }
 
