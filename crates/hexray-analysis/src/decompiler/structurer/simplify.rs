@@ -8197,23 +8197,28 @@ fn should_replace_existing_call_args(
         // assignment (e.g. `xmm0 = x*x` after the `xmm0 = x*x + y*y`
         // statement was consumed by an earlier pass) and would
         // happily replace the good `[x*x + y*y]` with the partial
-        // `[x*x]`. Refuse the replacement when every recovered arg
-        // is no LARGER than the corresponding existing arg (by node
-        // count) AND the position count didn't grow. Equal-size is
-        // INCLUDED in the gate — codex review on PR #34 pass 1
-        // pointed out that two equal-size BinOps could still be a
-        // stale-replaces-good case, and a same-size replacement
-        // has no information advantage worth the risk of losing
-        // the existing recovery. This keeps the additive-chain
-        // `hypot2` recovery intact across basic-block consolidation
-        // passes.
+        // `[x*x]`. Refuse the replacement when EVERY existing arg
+        // has structure worth protecting (> 2 nodes — a minimal
+        // BinOp with two operands) AND every recovered arg is no
+        // LARGER than the corresponding existing arg.
+        //
+        // Two-part gate so legitimate pass-through cleanup still
+        // runs (codex review on PR #34 pass 2): replacing a
+        // synthesized `Var(rdi)` placeholder with a tracked
+        // concrete value like `0` is a 1→1 node swap that SHOULD
+        // happen, so allowing the replacement is correct. Only the
+        // "complex existing vs same-or-smaller recovered" case is
+        // refused. Equal-size complex BinOps stay protected since
+        // the codex P2 from pass 1 — two same-shape BinOps could be
+        // good vs stale — still applies.
         if existing_args.len() == recovered_args.len()
             && !existing_args.is_empty()
             && existing_args
                 .iter()
                 .zip(recovered_args.iter())
                 .all(|(existing, recovered)| {
-                    expr_node_count(existing) >= expr_node_count(recovered)
+                    let existing_nodes = expr_node_count(existing);
+                    existing_nodes > 2 && existing_nodes >= expr_node_count(recovered)
                 })
         {
             return false;
@@ -12099,6 +12104,42 @@ mod tests {
         assert!(
             !should_replace_existing_call_args(&[good], &[stale], &used_indices),
             "equal-size existing must NOT be replaced by an equal-size recovered arg",
+        );
+    }
+
+    /// Codex review on PR #34 pass 2: the equal-size gate must not
+    /// block legitimate pass-through replacements. When an earlier
+    /// pass synthesized `Var(rdi)` as a placeholder, the later
+    /// recovery that maps it to a tracked constant `0` (or a
+    /// register-typed local) is a beneficial 1→1 node swap that
+    /// must be allowed.
+    #[test]
+    fn should_replace_existing_call_args_replaces_passthrough_with_concrete() {
+        // existing = Var(rdi)  (1 node — passthrough placeholder)
+        let placeholder = Expr::unknown("rdi");
+        // recovered = IntLit(0)  (1 node — tracked concrete value)
+        let concrete = Expr::int(0);
+        let used_indices = vec![3usize];
+
+        assert!(
+            should_replace_existing_call_args(&[placeholder], &[concrete], &used_indices),
+            "pass-through Var(rdi) → IntLit(0) replacement must be allowed",
+        );
+    }
+
+    /// Companion: a 2-node UnaryOp(Var) wrapper is also passthrough-
+    /// ish and should be replaced when a recovery surfaces. The
+    /// gate only protects > 2-node existing args.
+    #[test]
+    fn should_replace_existing_call_args_replaces_thin_unary_with_constant() {
+        // -rdi (UnaryOp Neg over Var) is 2 nodes.
+        let placeholder = Expr::unary(UnaryOpKind::Neg, Expr::unknown("rdi"));
+        let concrete = Expr::int(42);
+        let used_indices = vec![3usize];
+
+        assert!(
+            should_replace_existing_call_args(&[placeholder], &[concrete], &used_indices),
+            "thin UnaryOp(Var) (2 nodes) should not block 1-node concrete replacement",
         );
     }
 
