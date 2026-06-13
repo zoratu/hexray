@@ -173,15 +173,81 @@ fn try_extract_and_chain(
         (inner_cond.clone(), inner_body.clone(), inner_else.clone())
     };
 
-    // Combine: outer_cond && final_cond.
-    // Simplify after combining so a duplicate-condition shape (`c && c`)
-    // folds to `c` instead of leaving `if (c && c) { ... }` in the
-    // recovered output. Codex review on the safe_div ucomisd +
-    // jne + jp recovery flagged this as the visible nested duplicate.
-    let combined =
-        Expr::binop(BinOpKind::LogicalAnd, outer_cond.clone(), final_cond).simplify();
+    // Combine: outer_cond && final_cond. If both sides are
+    // identical AND known-boolean / side-effect-free, collapse to
+    // a single copy so the recovered code reads `if (c) { ... }`
+    // instead of `if (c && c) { ... }`. We DO NOT call the full
+    // `Expr::simplify` here — codex review on PR #33 pass 3 noted
+    // it would apply other algebraic folds (e.g. `x - x = 0`) that
+    // are not side-effect safe in this expression-tree position
+    // and could drop calls from conditions like `f() - f()`. The
+    // targeted dedup is the only collapse we need.
+    let combined = combine_with_dedup(outer_cond.clone(), final_cond);
 
     Some((combined, final_body, final_else))
+}
+
+fn combine_with_dedup(left: Expr, right: Expr) -> Expr {
+    if expressions_dedup_safe(&left, &right) {
+        return left;
+    }
+    Expr::binop(BinOpKind::LogicalAnd, left, right)
+}
+
+/// Whether `left` and `right` are structurally identical AND it is
+/// semantics-preserving to drop one copy (boolean-typed, no
+/// side effects, no memory reads).
+fn expressions_dedup_safe(left: &Expr, right: &Expr) -> bool {
+    if !exprs_are_equal(left, right) {
+        return false;
+    }
+    is_boolean_dedup_safe(left)
+}
+
+/// Mirror of `expression::expr_is_safe_to_deduplicate` PLUS the
+/// boolean-result requirement, scoped to short-circuit chaining.
+fn is_boolean_dedup_safe(expr: &Expr) -> bool {
+    use super::expression::UnaryOpKind;
+
+    let bool_typed = matches!(
+        &expr.kind,
+        ExprKind::BinOp { op, .. } if op.is_comparison()
+            || matches!(op, BinOpKind::LogicalAnd | BinOpKind::LogicalOr)
+    ) || matches!(
+        &expr.kind,
+        ExprKind::UnaryOp {
+            op: UnaryOpKind::LogicalNot,
+            ..
+        }
+    );
+    if !bool_typed {
+        return false;
+    }
+
+    fn no_side_effects(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Call { .. }
+            | ExprKind::Assign { .. }
+            | ExprKind::CompoundAssign { .. }
+            | ExprKind::Deref { .. }
+            | ExprKind::ArrayAccess { .. }
+            | ExprKind::FieldAccess { .. } => false,
+            ExprKind::GotRef { is_deref, .. } => !*is_deref,
+            ExprKind::BinOp { left, right, .. } => no_side_effects(left) && no_side_effects(right),
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => no_side_effects(operand),
+            ExprKind::AddressOf(inner) => no_side_effects(inner),
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => no_side_effects(cond) && no_side_effects(then_expr) && no_side_effects(else_expr),
+            ExprKind::Phi(args) => args.iter().all(no_side_effects),
+            ExprKind::IntLit(_) | ExprKind::Var(_) | ExprKind::Unknown(_) => true,
+        }
+    }
+    no_side_effects(expr)
 }
 
 /// Try to extract a short-circuit OR chain from if-else with same body.
@@ -406,6 +472,57 @@ mod tests {
 
     fn make_condition(name: &str) -> Expr {
         Expr::binop(BinOpKind::Ne, make_var(name), Expr::int(0))
+    }
+
+    /// Codex review on PR #33 pass 3: the chain combine must not
+    /// run the general-purpose `Expr::simplify`, because algebraic
+    /// folds like `x - x = 0` would drop call sub-expressions.
+    /// Verify that an effectful condition `f() - f()` survives the
+    /// AND-chain combine intact.
+    #[test]
+    fn test_and_chain_does_not_drop_side_effects_in_conditions() {
+        let f_call = || Expr::call(CallTarget::Named("f".to_string()), vec![]);
+        let effectful_cond = || Expr::binop(BinOpKind::Sub, f_call(), f_call());
+
+        let inner_if = StructuredNode::If {
+            condition: effectful_cond(),
+            then_body: vec![StructuredNode::Return(Some(Expr::int(1)))],
+            else_body: None,
+        };
+        let outer_if = StructuredNode::If {
+            condition: effectful_cond(),
+            then_body: vec![inner_if],
+            else_body: None,
+        };
+
+        let result = detect_short_circuit(vec![outer_if]);
+        assert_eq!(result.len(), 1);
+
+        match &result[0] {
+            StructuredNode::If { condition, .. } => match &condition.kind {
+                ExprKind::BinOp {
+                    op: BinOpKind::LogicalAnd,
+                    left,
+                    right,
+                } => {
+                    // Each side must STILL be a `BinOp::Sub` of two
+                    // Calls. If `Expr::simplify` had run, the `x - x`
+                    // fold would have collapsed each to `IntLit(0)`,
+                    // silently dropping the calls.
+                    for side in [&**left, &**right] {
+                        match &side.kind {
+                            ExprKind::BinOp { op: BinOpKind::Sub, .. } => {}
+                            _ => panic!(
+                                "expected each AND operand to remain `f() - f()`, got {:?}",
+                                side.kind
+                            ),
+                        }
+                    }
+                }
+                other => panic!("expected LogicalAnd, got {:?}", other),
+            },
+            _ => panic!("expected If node"),
+        }
     }
 
     #[test]
