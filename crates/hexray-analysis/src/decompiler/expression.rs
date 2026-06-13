@@ -736,14 +736,20 @@ impl Expr {
                     // or, when the chain doesn't fire, a nested
                     // duplicate `if (c) { if (c) { ... } }`.
                     //
-                    // Only safe when the operand is free of side
-                    // effects AND single-evaluation: dropping one
-                    // copy of `f() && f()` or `*p && *p` (where the
-                    // memory may change between accesses) would
-                    // change observable behavior. Codex review on
-                    // PR #33 pass 1.
+                    // Three guards together make the fold safe:
+                    //   1. Operand must be side-effect free (no Call,
+                    //      Assign, memory read).
+                    //   2. Operand must ALREADY be boolean (a
+                    //      comparison or logical op). `x && x`
+                    //      evaluates to 0/1; the un-folded `x` could
+                    //      evaluate to any non-zero value, so a
+                    //      naked `x` substitute would change the
+                    //      value in non-condition contexts.
+                    //   3. Operands are structurally equal.
+                    // Codex review on PR #33 passes 1+2.
                     BinOpKind::LogicalAnd => {
                         if exprs_structurally_equal(&left, &right)
+                            && is_comparison_expr(&left)
                             && expr_is_safe_to_deduplicate(&left)
                         {
                             return left;
@@ -752,6 +758,7 @@ impl Expr {
                     // x || x = x — same rationale as LogicalAnd.
                     BinOpKind::LogicalOr => {
                         if exprs_structurally_equal(&left, &right)
+                            && is_comparison_expr(&left)
                             && expr_is_safe_to_deduplicate(&left)
                         {
                             return left;
@@ -4994,6 +5001,24 @@ mod tests {
             ),
             "*p && *p must stay as LogicalAnd (memory may change), got {:?}",
             combined_deref.kind
+        );
+
+        // Non-boolean operand: `x && x` evaluates to 0/1, but `x`
+        // could be any non-zero value. Codex review on PR #33 pass 2
+        // — must NOT fold when operand isn't already boolean.
+        let non_bool = || Expr::unknown("x");
+        let combined_nonbool =
+            Expr::binop(BinOpKind::LogicalAnd, non_bool(), non_bool()).simplify();
+        assert!(
+            matches!(
+                combined_nonbool.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::LogicalAnd,
+                    ..
+                }
+            ),
+            "x && x with non-boolean x must stay as LogicalAnd, got {:?}",
+            combined_nonbool.kind
         );
     }
 
