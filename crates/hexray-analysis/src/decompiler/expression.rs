@@ -1714,12 +1714,31 @@ impl Expr {
             "xorps" | "xorpd" | "pxor" | "vxorps" | "vxorpd" | "vpxor" => BinOpKind::Xor,
             _ => return None,
         };
-        // Require legacy SSE encoding `op xmm_dst, mem`: 2 operands,
-        // first is xmm dst, second is memory. The AVX VEX-encoded form
-        // `vop xmm_dst, xmm_src1, mem` (3 operands) is also accepted.
-        let (dst_reg, mem) = match inst.operands.as_slice() {
-            [Operand::Register(d), Operand::Memory(m)] => (d, m),
-            [Operand::Register(d), Operand::Register(_), Operand::Memory(m)] => (d, m),
+        // Two shapes:
+        //   * Legacy SSE 2-operand `op xmm_dst, src` where src is a
+        //     memory or register.
+        //   * AVX VEX-encoded 3-operand `vop xmm_dst, xmm_src1, src`
+        //     where src is memory or register.
+        // We accept ALL register-source forms because clang -O0 emits
+        // the fabs/neg idiom as `movaps xmm1, [.LCPI]; pand xmm0, xmm1`
+        // — the second instruction's source is a register, not memory.
+        // Lifting reg-reg pand as `xmm0 = xmm0 & xmm1` lets substitute
+        // propagate the mask constant from the preceding movaps.
+        // For the self-XOR zero case, the dedicated
+        // `lift_sse_self_xor_zero` runs first and skips us.
+        let (dst_reg, src_expr) = match inst.operands.as_slice() {
+            [Operand::Register(d), Operand::Memory(m)] => {
+                (d, Self::from_memory_with_context(m, inst, false))
+            }
+            [Operand::Register(d), Operand::Register(s)] => {
+                (d, Self::var(Variable::from_register(s)))
+            }
+            [Operand::Register(d), Operand::Register(_), Operand::Memory(m)] => {
+                (d, Self::from_memory_with_context(m, inst, false))
+            }
+            [Operand::Register(d), Operand::Register(_), Operand::Register(s)] => {
+                (d, Self::var(Variable::from_register(s)))
+            }
             _ => return None,
         };
         let dst_name = dst_reg.name().to_ascii_lowercase();
@@ -1737,10 +1756,9 @@ impl Expr {
             16
         };
         let dst_var = Self::var(Variable::reg(dst_name, dst_size));
-        let mem_deref = Self::from_memory_with_context(mem, inst, false);
         Some(Self::assign(
             dst_var.clone(),
-            Self::binop(op, dst_var, mem_deref),
+            Self::binop(op, dst_var, src_expr),
         ))
     }
 
