@@ -8208,15 +8208,22 @@ fn should_replace_existing_call_args(
         // concrete value like `0` is a 1→1 node swap that SHOULD
         // happen, so allowing the replacement is correct. Only the
         // "complex existing vs same-or-smaller recovered" case is
-        // refused. Equal-size complex BinOps stay protected since
-        // the codex P2 from pass 1 — two same-shape BinOps could be
-        // good vs stale — still applies.
+        // refused.
+        //
+        // Use `any` (not `all`) so a thin pass-through arg coexisting
+        // with a complex arg doesn't disable protection for the
+        // complex one (codex review on PR #34 pass 3). The result
+        // is: if ANY position has a complex existing arg at risk of
+        // being truncated, refuse the whole replacement — we don't
+        // want to truncate one arg just to clean up another. The
+        // pass-through arg's cleanup is deferred to a later pass
+        // where it can stand on its own.
         if existing_args.len() == recovered_args.len()
             && !existing_args.is_empty()
             && existing_args
                 .iter()
                 .zip(recovered_args.iter())
-                .all(|(existing, recovered)| {
+                .any(|(existing, recovered)| {
                     let existing_nodes = expr_node_count(existing);
                     existing_nodes > 2 && existing_nodes >= expr_node_count(recovered)
                 })
@@ -12140,6 +12147,46 @@ mod tests {
         assert!(
             should_replace_existing_call_args(&[placeholder], &[concrete], &used_indices),
             "thin UnaryOp(Var) (2 nodes) should not block 1-node concrete replacement",
+        );
+    }
+
+    /// Codex review on PR #34 pass 3: a thin/passthrough arg in a
+    /// multi-arg call must NOT disable protection for a coexisting
+    /// complex arg. If ANY position is a complex existing vs
+    /// smaller-or-equal recovered, the whole replacement is refused.
+    #[test]
+    fn should_replace_existing_call_args_keeps_complex_when_thin_sibling_exists() {
+        // existing = [farg0*farg0 + farg1*farg1, rsi]
+        let complex = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg0"),
+                Expr::unknown("farg0"),
+            ),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg1"),
+                Expr::unknown("farg1"),
+            ),
+        );
+        let thin_existing = Expr::unknown("rsi");
+        // recovered = [farg0*farg0, 0]
+        let truncated = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg0"),
+        );
+        let thin_recovered = Expr::int(0);
+        let used_indices = vec![5usize, 3usize];
+
+        assert!(
+            !should_replace_existing_call_args(
+                &[complex, thin_existing],
+                &[truncated, thin_recovered],
+                &used_indices,
+            ),
+            "thin sibling must NOT enable complex-arg truncation"
         );
     }
 
