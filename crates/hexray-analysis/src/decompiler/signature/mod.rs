@@ -2092,9 +2092,22 @@ impl SignatureRecovery {
                             // scan still tells us which arg lived at
                             // that offset. See
                             // `[[project_structurer_ordering_refactor]]`.
-                            self.record_usage_hint(&reg, |h| {
-                                h.is_pointer_arithmetic = true
-                            });
+                            //
+                            // Gate on the spill load's natural width
+                            // matching pointer size (8 bytes) — same
+                            // shape as the direct-`Var` path above.
+                            // Without this, a 32-bit integer arg
+                            // reloaded for `return n + 1` would get
+                            // mis-typed as a pointer because
+                            // `right_is_offset` accepts any small
+                            // constant. Codex review on PR #32
+                            // pass 2.
+                            let base_width = self.infer_expr_size(left).unwrap_or(0);
+                            if base_width >= 8 {
+                                self.record_usage_hint(&reg, |h| {
+                                    h.is_pointer_arithmetic = true
+                                });
+                            }
                         }
                     }
                 }
@@ -2135,15 +2148,28 @@ impl SignatureRecovery {
                             h.deref_element_type = Some(elem_type.clone());
                         }
                     });
-                    if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
-                        let elem_type_inner = Self::infer_type_from_size(*size as usize);
-                        self.record_usage_hint(&reg, |h| {
-                            h.is_dereferenced = true;
-                            h.deref_count += 1;
-                            if h.deref_element_type.is_none() {
-                                h.deref_element_type = Some(elem_type_inner);
-                            }
-                        });
+                    // Propagate to a spilled parameter only when the
+                    // load is wide enough to be a pointer (>= 8 bytes).
+                    // Without this, a 4-byte scalar int reload would
+                    // mis-set `is_dereferenced` on the spilled arg —
+                    // codex review on PR #32 pass 2 flagged the
+                    // unguarded form (the scalar case bypasses this
+                    // block today because `extract_var_name` on a
+                    // `BinOp(rbp, IntLit)` addr returns None, but a
+                    // future change that lifts stack slots to
+                    // synthetic names could surface the same shape;
+                    // the size gate keeps the bridge robust to that).
+                    if (*size as usize) >= 8 {
+                        if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
+                            let elem_type_inner = Self::infer_type_from_size(*size as usize);
+                            self.record_usage_hint(&reg, |h| {
+                                h.is_dereferenced = true;
+                                h.deref_count += 1;
+                                if h.deref_element_type.is_none() {
+                                    h.deref_element_type = Some(elem_type_inner);
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -7767,6 +7793,63 @@ mod tests {
             rsi_param.param_type,
             sig.parameters
         );
+    }
+
+    /// Codex review on PR #32 pass 2: the initial spill-slot bridge
+    /// mis-typed scalar args as pointers when they were just being
+    /// reloaded for plain integer use. Two scenarios:
+    ///   tmp = *(rbp-4)      ← `int n` reload, value used as int
+    ///   tmp = *(rbp-4) + 1  ← `n + 1`, value used as int
+    /// Both must keep the spilled `edi` as int, not pointer.
+    #[test]
+    fn test_scalar_spill_reload_does_not_force_pointer_typing() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let n_reload = || {
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(4)), 4)
+        };
+
+        // Body shape:
+        //   tmp_a = *(rbp-4)            ; scalar reload
+        //   tmp_b = *(rbp-4) + 1        ; n + 1
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("tmp_a"), n_reload()),
+                Expr::assign(
+                    Expr::unknown("tmp_b"),
+                    Expr::binop(BinOpKind::Add, n_reload(), Expr::int(1)),
+                ),
+            ],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "edi".to_string(),
+                offset: -4,
+            }]);
+        let sig = recovery.analyze(&cfg);
+
+        // No recovered parameter may be a pointer just because its
+        // spill slot was reloaded for plain scalar use. (The arg
+        // may or may not surface at all — what matters is the
+        // false-positive pointer hint stays off.)
+        for p in &sig.parameters {
+            assert!(
+                !matches!(
+                    p.param_type,
+                    ParamType::Pointer | ParamType::TypedPointer(_)
+                ),
+                "scalar int spill reload mis-typed param {:?} as pointer (full sig: {:?})",
+                p,
+                sig.parameters
+            );
+        }
     }
 
     #[test]
