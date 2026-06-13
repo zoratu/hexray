@@ -2070,6 +2070,37 @@ impl SignatureRecovery {
                         _ => false,
                     };
 
+                    // `Add` is commutative — the structurer can emit
+                    // either `spill + idx*S` or `idx*S + spill`.
+                    // Detect the spill+scaled-index pattern in the
+                    // operand we didn't already pick up, then fall
+                    // through to the existing right-is-offset path
+                    // with that same propagation.
+                    // Codex review on PR #32 pass 7.
+                    if matches!(op, BinOpKind::Add) && !right_is_offset {
+                        let left_is_scaled_index = matches!(
+                            &left.kind,
+                            ExprKind::BinOp {
+                                op: BinOpKind::Mul | BinOpKind::Shl,
+                                ..
+                            }
+                        );
+                        if left_is_scaled_index {
+                            if let Some(reg) = self
+                                .extract_var_name(right)
+                                .as_deref()
+                                .and_then(|n| self.spilled_arg_register_from_var_name(n))
+                            {
+                                let base_width = self.infer_expr_size(right).unwrap_or(0);
+                                let ptr_width = self.convention.pointer_width();
+                                if base_width >= ptr_width {
+                                    self.record_usage_hint(&reg, |h| {
+                                        h.is_pointer_arithmetic = true
+                                    });
+                                }
+                            }
+                        }
+                    }
                     if right_is_offset {
                         if let ExprKind::Var(var) = &left.kind {
                             let base_width =
@@ -7809,6 +7840,64 @@ mod tests {
             "rsi (ys) should be pointer, got {:?} (full sig: {:?})",
             rsi_param.param_type,
             sig.parameters
+        );
+    }
+
+    /// Codex review on PR #32 pass 7: the structurer can fold the
+    /// addend pair in either order, so `idx*8 + *(rbp-16)` is the
+    /// commuted form of the saxpy pattern and must also propagate.
+    #[test]
+    fn test_commuted_spill_pointer_arithmetic_recovers_pointer() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let xs_reload = Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(16)), 8);
+        let scaled = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("var_2c"),
+            Expr::int(8),
+        );
+        // Commuted: scaled-index on the LEFT, spill load on the RIGHT.
+        let elem = Expr::deref(Expr::binop(BinOpKind::Add, scaled, xs_reload), 8);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::assign(Expr::unknown("tmp"), elem)],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "commuted Add (idx*8 + spill) should still recover rdi as pointer, got {:?}",
+            rdi_param.param_type
         );
     }
 
