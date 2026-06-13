@@ -144,6 +144,13 @@ pub struct SignatureRecovery {
     /// reloads of the actual home slot, not on later reuse of the register as
     /// a scratch temp for an unrelated stack local (e.g. a loop counter).
     arg_spill_offsets: HashMap<usize, HashSet<i128>>,
+    /// Stack offsets where the prologue arg-spill slot has been
+    /// overwritten by a non-spill store later in the body. Once a
+    /// slot is invalidated, the spill-slot → param bridge in
+    /// [`Self::spilled_arg_register_from_var_name`] must stop using
+    /// it: subsequent loads from that offset are NOT the original
+    /// argument value. Codex review on PR #32 pass 9.
+    invalidated_spill_offsets: HashSet<i128>,
     /// Prologue spill observations from the raw CFG, used to recover
     /// the mixed int/float source declaration order — at `-O0` the
     /// compiler spills every parameter register in source order, so
@@ -951,6 +958,7 @@ impl SignatureRecovery {
             return_confidence: 0,
             param_names: HashMap::new(),
             arg_spill_offsets: HashMap::new(),
+            invalidated_spill_offsets: HashSet::new(),
             param_spill_order: Vec::new(),
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
@@ -1071,6 +1079,7 @@ impl SignatureRecovery {
         self.return_confidence = 0;
         self.param_names.clear();
         self.arg_spill_offsets.clear();
+        self.invalidated_spill_offsets.clear();
         self.param_type_overrides.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
@@ -1660,6 +1669,7 @@ impl SignatureRecovery {
 
                 // For parameter detection: check if an arg register is read and stored to stack
                 // Pattern: *(rbp + offset) = rdi  means rdi is a parameter
+                let mut rhs_is_matching_arg_spill = false;
                 if let ExprKind::Var(rhs_var) = &rhs.kind {
                     let rhs_name = rhs_var.name.to_lowercase();
                     if self.is_arg_register(&rhs_name) && !self.written_regs.contains(&rhs_name) {
@@ -1688,6 +1698,38 @@ impl SignatureRecovery {
                                     .or_default()
                                     .insert(offset);
                             }
+                            // Mark a "matching" spill so the
+                            // invalidation tracker below doesn't
+                            // treat the prologue spill itself as a
+                            // body-write of the slot.
+                            if self
+                                .param_spill_order
+                                .iter()
+                                .any(|obs| obs.offset as i128 == offset
+                                    && obs.register == rhs_name)
+                            {
+                                rhs_is_matching_arg_spill = true;
+                            }
+                        }
+                    }
+                }
+
+                // Slot-invalidation: if THIS write targets a stack
+                // slot that the prologue scan recorded as an arg
+                // spill home, AND the rhs is NOT that arg's register
+                // (i.e. the slot is being reused for something
+                // else), the original-parameter evidence is stale.
+                // Subsequent loads from this offset should NOT
+                // propagate to the original arg. Codex review on PR
+                // #32 pass 9.
+                if !rhs_is_matching_arg_spill {
+                    if let Some(offset) = self.extract_stack_offset(lhs) {
+                        if self
+                            .param_spill_order
+                            .iter()
+                            .any(|obs| obs.offset as i128 == offset)
+                        {
+                            self.invalidated_spill_offsets.insert(offset);
                         }
                     }
                 }
@@ -3571,6 +3613,12 @@ impl SignatureRecovery {
     fn spilled_arg_register_from_var_name(&self, name: &str) -> Option<String> {
         let offset_str = name.strip_prefix("stack_")?;
         let offset: i128 = offset_str.parse().ok()?;
+        if self.invalidated_spill_offsets.contains(&offset) {
+            // The slot was overwritten by a non-spill store after
+            // the prologue, so loads from it no longer represent
+            // the original argument. Codex review on PR #32 pass 9.
+            return None;
+        }
         self.param_spill_order
             .iter()
             .find(|obs| obs.offset as i128 == offset)
@@ -7867,6 +7915,73 @@ mod tests {
             rsi_param.param_type,
             sig.parameters
         );
+    }
+
+    /// Codex review on PR #32 pass 9: if the spill slot gets
+    /// overwritten by a non-spill store later in the body, the
+    /// prologue evidence is stale — subsequent loads from that
+    /// offset are NOT the original arg, so the bridge must not
+    /// propagate. Codex example:
+    ///   spill prologue: *(rbp-8) = rdi
+    ///   body write:     *(rbp-8) = some_other_pointer
+    ///   later use:      tmp = *(*(rbp-8))
+    /// `rdi` should NOT become a pointer just because the slot was
+    /// later loaded; the slot no longer holds rdi.
+    #[test]
+    fn test_overwritten_spill_slot_does_not_propagate_to_original_arg() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        // 1. Prologue spill: *(rbp-8) = rdi
+        let prologue_spill = Expr::assign(
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8),
+            Expr::var(Variable::reg("rdi", 8)),
+        );
+        // 2. Body write to same slot from a NON-arg source:
+        //    *(rbp-8) = arbitrary value (here, an Unknown).
+        let body_write = Expr::assign(
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8),
+            Expr::unknown("other_value"),
+        );
+        // 3. Later: tmp = *(*(rbp-8))
+        let later_load = Expr::assign(
+            Expr::unknown("tmp"),
+            Expr::deref(
+                Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8),
+                8,
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![prologue_spill, body_write, later_load],
+            address_range: (0x1000, 0x1030),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        if let Some(rdi_param) = sig.parameters.iter().find(|p| {
+            matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            )
+        }) {
+            assert!(
+                !matches!(
+                    rdi_param.param_type,
+                    ParamType::Pointer | ParamType::TypedPointer(_)
+                ),
+                "rdi MUST NOT be typed as pointer after its spill slot was overwritten, got {:?}",
+                rdi_param.param_type
+            );
+        }
     }
 
     /// Codex review on PR #32 pass 8: if the spilled arg register
