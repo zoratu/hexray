@@ -8187,9 +8187,35 @@ fn should_replace_existing_call_args(
     recovered_args: &[Expr],
     used_indices: &[usize],
 ) -> bool {
-    !used_indices.is_empty()
+    if !used_indices.is_empty()
         || (existing_args.is_empty() && !recovered_args.is_empty())
         || recovered_args.len() > existing_args.len()
+    {
+        // Guard against truncating a previously-recovered complex
+        // argument back to a partial one. A later pass that walks
+        // `result` may see only the most recent xmm-register
+        // assignment (e.g. `xmm0 = x*x` after the `xmm0 = x*x + y*y`
+        // statement was consumed by an earlier pass) and would
+        // happily replace the good `[x*x + y*y]` with the partial
+        // `[x*x]`. Refuse the replacement when every recovered arg
+        // is strictly smaller (or equal-size) than the corresponding
+        // existing arg AND the position count didn't grow. This
+        // keeps the additive-chain `hypot2` recovery intact across
+        // basic-block consolidation passes.
+        if existing_args.len() == recovered_args.len()
+            && !existing_args.is_empty()
+            && existing_args
+                .iter()
+                .zip(recovered_args.iter())
+                .all(|(existing, recovered)| {
+                    expr_node_count(existing) > expr_node_count(recovered)
+                })
+        {
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 fn tracked_arg_register_priority(reg_name: &str) -> usize {
@@ -11995,6 +12021,70 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rdi", "rsi"]
+        );
+    }
+
+    /// `hypot2(x, y) = sqrt(x*x + y*y)` — the addsd-chain recovery
+    /// puts `farg0 * farg0 + farg1 * farg1` as sqrt's existing arg
+    /// after the first simplifier pass. A subsequent basic-block
+    /// consolidation pass walks the rewritten statement list (which
+    /// no longer contains the addsd, because pass 1 consumed it),
+    /// recovers a TRUNCATED `farg0 * farg0` from the surviving
+    /// mulsd, and previously would replace the good arg with the
+    /// bad one because `should_replace_existing_call_args` only
+    /// gated on `!used_indices.is_empty()`. The guard added in this
+    /// PR rejects the replacement when every recovered arg is
+    /// strictly smaller than its corresponding existing arg.
+    #[test]
+    fn should_replace_existing_call_args_keeps_richer_existing_when_recovered_is_subset() {
+        // existing = [farg0 * farg0 + farg1 * farg1]  (the good
+        // result from the prior pass).
+        let big_arg = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg0"),
+                Expr::unknown("farg0"),
+            ),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg1"),
+                Expr::unknown("farg1"),
+            ),
+        );
+        // recovered = [farg0 * farg0]  (the truncation a later pass
+        // produces when the addsd statement has already been
+        // consumed). used_indices is non-empty (the surviving
+        // mulsd statement was reachable).
+        let small_arg = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg0"),
+        );
+        let used_indices = vec![9usize];
+
+        assert!(
+            !should_replace_existing_call_args(&[big_arg], &[small_arg], &used_indices),
+            "must NOT replace a richer existing arg with a smaller recovered arg",
+        );
+    }
+
+    #[test]
+    fn should_replace_existing_call_args_replaces_when_recovered_is_richer() {
+        // The opposite direction: when the recovery has more
+        // information than what's already there, we DO want to
+        // replace. (Common case for the first arg-recovery pass.)
+        let existing = Expr::unknown("xmm0");
+        let recovered = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg0"),
+        );
+        let used_indices = vec![5usize];
+
+        assert!(
+            should_replace_existing_call_args(&[existing], &[recovered], &used_indices),
+            "must replace a thin passthrough arg with a recovered expression",
         );
     }
 
