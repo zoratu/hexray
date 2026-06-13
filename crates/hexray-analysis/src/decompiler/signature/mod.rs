@@ -2079,6 +2079,22 @@ impl SignatureRecovery {
                                     h.is_pointer_arithmetic = true
                                 });
                             }
+                        } else if let Some(reg) = self
+                            .extract_var_name(left)
+                            .as_deref()
+                            .and_then(|n| self.spilled_arg_register_from_var_name(n))
+                        {
+                            // `left` is the spill-slot reload of a
+                            // parameter register — the structurer
+                            // folded `rax = *(rbp+offset)` into the
+                            // pointer-arith expression so the
+                            // register name is gone, but the prologue
+                            // scan still tells us which arg lived at
+                            // that offset. See
+                            // `[[project_structurer_ordering_refactor]]`.
+                            self.record_usage_hint(&reg, |h| {
+                                h.is_pointer_arithmetic = true
+                            });
                         }
                     }
                 }
@@ -2119,6 +2135,16 @@ impl SignatureRecovery {
                             h.deref_element_type = Some(elem_type.clone());
                         }
                     });
+                    if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
+                        let elem_type_inner = Self::infer_type_from_size(*size as usize);
+                        self.record_usage_hint(&reg, |h| {
+                            h.is_dereferenced = true;
+                            h.deref_count += 1;
+                            if h.deref_element_type.is_none() {
+                                h.deref_element_type = Some(elem_type_inner);
+                            }
+                        });
+                    }
                 }
             }
             ExprKind::ArrayAccess {
@@ -2139,6 +2165,17 @@ impl SignatureRecovery {
                             h.deref_element_type = Some(elem_type.clone());
                         }
                     });
+                    if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
+                        let elem_type_inner = Self::infer_type_from_size(*element_size);
+                        self.record_usage_hint(&reg, |h| {
+                            h.is_array_access = true;
+                            h.is_pointer_arithmetic = true;
+                            h.deref_count += 1;
+                            if h.deref_element_type.is_none() {
+                                h.deref_element_type = Some(elem_type_inner);
+                            }
+                        });
+                    }
                 }
 
                 // Index might be an array index parameter
@@ -3416,6 +3453,28 @@ impl SignatureRecovery {
             ExprKind::Unknown(name) if self.reg_size_from_name(name) > 0 => Some(name.clone()),
             _ => None,
         }
+    }
+
+    /// If `name` is a `stack_{offset}` slot synthesized by
+    /// [`Self::extract_var_name`] for a deref expression, and the
+    /// prologue scan recorded an argument register spilled to that
+    /// exact offset, return that register's canonical name.
+    ///
+    /// This is the bridge that lets pointer-usage hints flow to a
+    /// parameter even after the structurer's simplification folds
+    /// the intermediate `Var(rax) = *(rbp+offset)` reload into a
+    /// containing expression (so the load surfaces as
+    /// `Deref(stack_slot)` and the original register name is gone
+    /// from the IR). The `[[project_structurer_ordering_refactor]]`
+    /// memo's Option C — recognize collapsed patterns post-simplify
+    /// — depends on this lookup.
+    fn spilled_arg_register_from_var_name(&self, name: &str) -> Option<String> {
+        let offset_str = name.strip_prefix("stack_")?;
+        let offset: i128 = offset_str.parse().ok()?;
+        self.param_spill_order
+            .iter()
+            .find(|obs| obs.offset as i128 == offset)
+            .map(|obs| obs.register.clone())
     }
 
     /// Extracts a stack offset from a deref expression.
@@ -7579,6 +7638,134 @@ mod tests {
             ),
             "expected arg0 to be inferred as pointer or typed pointer, got {:?}",
             sig.parameters[0].param_type
+        );
+    }
+
+    /// SSE gap 1 from `[[project_structurer_ordering_refactor]]`:
+    /// at `-O0` saxpy_dot spills `rdi` (xs) and `rsi` (ys) and then
+    /// reloads them per iteration to compute `xs[i]` / `ys[i]`. The
+    /// structurer's simplifier folds the `rax = *(rbp-16)` reload
+    /// into the index expression, leaving
+    /// `Deref(Add(Deref(stack_-16), Mul(idx, 8)))` — with the
+    /// original `rdi` name gone. Without the spill-slot → arg
+    /// bridge, the analysis would see only `rbp` at the base and
+    /// recover `xs`/`ys` as `int32_t`, not pointers. The prologue
+    /// spill scan tells us which arg lived at -16/-24, so we
+    /// propagate the deref/array-access hints to those args.
+    #[test]
+    fn test_saxpy_indexed_spill_reload_recovers_pointer_args() {
+        use hexray_core::BasicBlockId;
+        // Mimic post-simplification IR for the inner loop of:
+        //   double saxpy_dot(double a, double *xs, double *ys, int n)
+        //       { for (int i=0; i<n; i++) total += a*xs[i] + ys[i]; }
+        //
+        // At -O0 clang spills xmm0/rdi/rsi/edx to home slots in
+        // source order, then reloads xs/ys per iteration to compute
+        // xs[i] / ys[i]. The structurer's copy-prop folds the
+        // intermediate `rax = *(rbp-16)` into the indexed deref, so
+        // the body shape is:
+        //   tmp_xs = *(*(rbp-16) + i*8)
+        //   tmp_ys = *(*(rbp-24) + i*8)
+        // with i materialized as the stack local `var_2c` (the loop
+        // counter slot), not as a register. Without the spill-slot
+        // → arg bridge in `analyze_expr_reads_with_context`, xs and
+        // ys recover as `int32_t`; with it they recover as pointers.
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let spill_load = |off: i128| {
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(off)), 8)
+        };
+        let scaled_index = || {
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("var_2c"),
+                Expr::int(8),
+            )
+        };
+        let xs_i = Expr::deref(
+            Expr::binop(BinOpKind::Add, spill_load(16), scaled_index()),
+            8,
+        );
+        let ys_i = Expr::deref(
+            Expr::binop(BinOpKind::Add, spill_load(24), scaled_index()),
+            8,
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("tmp_xs"), xs_i),
+                Expr::assign(Expr::unknown("tmp_ys"), ys_i),
+            ],
+            address_range: (0x1000, 0x1030),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+                ParamSpillObservation {
+                    register: "rsi".to_string(),
+                    offset: -24,
+                },
+                ParamSpillObservation {
+                    register: "edx".to_string(),
+                    offset: -28,
+                },
+            ]);
+        let sig = recovery.analyze(&cfg);
+
+        // The two int args that get array-indexed must come back as
+        // pointers; this is the fix for the saxpy gap. We don't
+        // assert anything about additional recovered params (n
+        // wasn't read in this body slice and may or may not show
+        // up depending on whether the spill scan alone is enough).
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        let rsi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rsi"
+                )
+            })
+            .expect("rsi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "rdi (xs) should be pointer, got {:?} (full sig: {:?})",
+            rdi_param.param_type,
+            sig.parameters
+        );
+        assert!(
+            matches!(
+                rsi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "rsi (ys) should be pointer, got {:?} (full sig: {:?})",
+            rsi_param.param_type,
+            sig.parameters
         );
     }
 
