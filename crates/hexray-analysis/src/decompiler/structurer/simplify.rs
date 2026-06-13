@@ -8202,22 +8202,28 @@ fn should_replace_existing_call_args(
         // BinOp with two operands) AND every recovered arg is no
         // LARGER than the corresponding existing arg.
         //
+        // Refuse only when SOMETHING is actually at risk:
+        //   - Truncation: complex existing has strictly more nodes
+        //     than recovered (hypot2 case).
+        //   - Equal-size stale: complex existing has the same node
+        //     count as recovered BUT structurally different (pass 1
+        //     concern — a same-size stale could overwrite a good
+        //     recovery).
+        //
         // Two-part gate so legitimate pass-through cleanup still
-        // runs (codex review on PR #34 pass 2): replacing a
-        // synthesized `Var(rdi)` placeholder with a tracked
-        // concrete value like `0` is a 1→1 node swap that SHOULD
-        // happen, so allowing the replacement is correct. Only the
-        // "complex existing vs same-or-smaller recovered" case is
-        // refused.
+        // runs (pass 2): replacing a synthesized `Var(rdi)` with a
+        // tracked concrete value like `0` is a 1→1 node swap that
+        // SHOULD happen.
         //
         // Use `any` (not `all`) so a thin pass-through arg coexisting
         // with a complex arg doesn't disable protection for the
-        // complex one (codex review on PR #34 pass 3). The result
-        // is: if ANY position has a complex existing arg at risk of
-        // being truncated, refuse the whole replacement — we don't
-        // want to truncate one arg just to clean up another. The
-        // pass-through arg's cleanup is deferred to a later pass
-        // where it can stand on its own.
+        // complex one (pass 3).
+        //
+        // Equal-size structurally-IDENTICAL existing args don't
+        // block the replacement (pass 4) — when typed recovery
+        // re-presents the same arg unchanged alongside a pass-
+        // through sibling that needs concretization, there's
+        // nothing to protect at that position.
         if existing_args.len() == recovered_args.len()
             && !existing_args.is_empty()
             && existing_args
@@ -8225,7 +8231,17 @@ fn should_replace_existing_call_args(
                 .zip(recovered_args.iter())
                 .any(|(existing, recovered)| {
                     let existing_nodes = expr_node_count(existing);
-                    existing_nodes > 2 && existing_nodes >= expr_node_count(recovered)
+                    if existing_nodes <= 2 {
+                        return false;
+                    }
+                    let recovered_nodes = expr_node_count(recovered);
+                    if existing_nodes > recovered_nodes {
+                        return true;
+                    }
+                    // Same node count: only veto when structurally
+                    // different (potential stale-replaces-good).
+                    existing_nodes == recovered_nodes
+                        && format!("{existing}") != format!("{recovered}")
                 })
         {
             return false;
@@ -12187,6 +12203,40 @@ mod tests {
                 &used_indices,
             ),
             "thin sibling must NOT enable complex-arg truncation"
+        );
+    }
+
+    /// Codex review on PR #34 pass 4: when typed recovery
+    /// re-presents an UNCHANGED complex arg alongside a thin
+    /// pass-through sibling that needs cleanup, the unchanged arg
+    /// must NOT veto the sibling cleanup. Structural equality at a
+    /// position means there's nothing to protect there.
+    #[test]
+    fn should_replace_existing_call_args_allows_sibling_cleanup_when_complex_unchanged() {
+        let complex = || {
+            Expr::binop(
+                BinOpKind::Add,
+                Expr::binop(
+                    BinOpKind::Mul,
+                    Expr::unknown("farg0"),
+                    Expr::unknown("farg0"),
+                ),
+                Expr::binop(
+                    BinOpKind::Mul,
+                    Expr::unknown("farg1"),
+                    Expr::unknown("farg1"),
+                ),
+            )
+        };
+        // existing = [complex, rsi]  recovered = [SAME complex, 0]
+        let used_indices = vec![3usize];
+        assert!(
+            should_replace_existing_call_args(
+                &[complex(), Expr::unknown("rsi")],
+                &[complex(), Expr::int(0)],
+                &used_indices,
+            ),
+            "unchanged complex arg must NOT block sibling pass-through cleanup",
         );
     }
 
