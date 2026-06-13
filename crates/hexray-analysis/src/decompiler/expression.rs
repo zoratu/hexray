@@ -6623,6 +6623,57 @@ mod tests {
         assert_ne!(rendered, "xmm0 = 0");
     }
 
+    /// SSE bitwise op against a memory operand is the canonical
+    /// fabs/neg idiom (`andps xmm0, [rip + .LCPI_pos_mask]` clears
+    /// the sign bit, `xorps xmm0, [rip + .LCPI_neg_mask]` flips
+    /// it). Lift this as a proper `BinOp` so the destination
+    /// register's data flow is preserved — without this it falls
+    /// to the opaque `/* SSE: andps */` comment and any record of
+    /// writing to xmm0 is lost (the recovered body then defaults
+    /// to `return 0.0;`).
+    #[test]
+    fn test_andps_with_memory_lifts_as_bitand() {
+        use hexray_core::{
+            register::x86, Architecture, MemoryRef, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        // andps xmm0, [rip + 0x100]
+        let mem = MemoryRef::base_disp(rip, 0x100, 16);
+        let inst = Instruction::new(0x401040, 7, vec![0x0f, 0x54, 0x05, 0, 0, 0, 0], "andps")
+            .with_operation(Operation::And)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Memory(mem)]);
+        let rendered = Expr::from_instruction(&inst).to_string();
+        // Expect `xmm0 = xmm0 & ...` (the deref of the rip-relative
+        // address). The exact format of the rhs depends on rodata
+        // materialization context, but at minimum the lhs is xmm0
+        // and the operator is bitwise AND.
+        assert!(
+            rendered.starts_with("xmm0 = xmm0 & "),
+            "expected `xmm0 = xmm0 & ...`, got `{rendered}`"
+        );
+    }
+
+    /// XOR-with-memory should also lift (the unary-negate idiom is
+    /// `xorps xmm0, [rip + .LCPI_neg_mask]`).
+    #[test]
+    fn test_xorps_with_memory_lifts_as_bitxor() {
+        use hexray_core::{
+            register::x86, Architecture, MemoryRef, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        let mem = MemoryRef::base_disp(rip, 0x200, 16);
+        let inst = Instruction::new(0x401050, 7, vec![0x0f, 0x57, 0x05, 0, 0, 0, 0], "xorps")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![Operand::Register(xmm0), Operand::Memory(mem)]);
+        let rendered = Expr::from_instruction(&inst).to_string();
+        assert!(
+            rendered.starts_with("xmm0 = xmm0 ^ "),
+            "expected `xmm0 = xmm0 ^ ...`, got `{rendered}`"
+        );
+    }
+
     #[test]
     fn test_pxor_distinct_xmm_registers_stays_opaque() {
         // Only the self-xor (same source and destination) is a zero-init
