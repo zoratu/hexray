@@ -119,6 +119,25 @@ impl CallingConvention {
     pub fn max_float_args(&self) -> usize {
         self.float_arg_registers().len()
     }
+
+    /// Returns the ABI's pointer width in bytes for this convention.
+    ///
+    /// Used by signature recovery to decide whether a spilled
+    /// register reload of a given width could plausibly hold a
+    /// pointer. All currently supported conventions are 64-bit
+    /// (SystemV / Win64 / Aarch64 / RV64) so this returns 8. If
+    /// 32-bit support is added (e.g. RV32 ILP32), the new variant
+    /// should return 4 here so the spill-slot pointer bridge in
+    /// `SignatureRecovery::analyze_expr_reads_with_context` accepts
+    /// 4-byte reloads as candidate pointer loads.
+    pub fn pointer_width(&self) -> u8 {
+        match self {
+            CallingConvention::SystemV
+            | CallingConvention::Win64
+            | CallingConvention::Aarch64
+            | CallingConvention::RiscV => 8,
+        }
+    }
 }
 
 /// Parameter usage pattern hints for better type inference.

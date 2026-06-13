@@ -2102,8 +2102,13 @@ impl SignatureRecovery {
                             // between pointer-arith and 64-bit
                             // integer arithmetic, so we don't make
                             // the call without the stronger signal.
-                            // Codex review on PR #32 passes 2+4.
+                            // The width threshold comes from the
+                            // active ABI's `pointer_width()` so a
+                            // future 32-bit convention (ILP32 RV32)
+                            // can accept 4-byte reloads. Codex
+                            // review on PR #32 passes 2+4+6.
                             let base_width = self.infer_expr_size(left).unwrap_or(0);
+                            let ptr_width = self.convention.pointer_width();
                             let right_has_scaled_index = matches!(
                                 &right.kind,
                                 ExprKind::BinOp {
@@ -2111,7 +2116,7 @@ impl SignatureRecovery {
                                     ..
                                 }
                             );
-                            if base_width >= 8 && right_has_scaled_index {
+                            if base_width >= ptr_width && right_has_scaled_index {
                                 self.record_usage_hint(&reg, |h| {
                                     h.is_pointer_arithmetic = true
                                 });
@@ -2158,18 +2163,20 @@ impl SignatureRecovery {
                     });
                     // Propagate to a spilled parameter only when the
                     // ADDRESS load (the spill reload itself) is wide
-                    // enough to be a pointer (>= 8 bytes). Use
+                    // enough to be a pointer. Use
                     // `infer_expr_size(addr)` rather than the outer
                     // `*size` — the outer size is the POINTEE width
                     // (the element being read through the pointer),
                     // while we want the WIDTH OF THE POINTER VALUE.
                     // For `int *p; return *p;` the IR is
                     // `Deref(Deref(rbp-8, 8), 4)`: outer size=4 (int)
-                    // but the addr load is 8 (pointer). Without this,
-                    // common `char*` / `int*` params get missed.
-                    // Codex review on PR #32 pass 3.
+                    // but the addr load is 8 (pointer). The width
+                    // threshold comes from the ABI's `pointer_width()`
+                    // — 8 today, 4 if a future ILP32 convention lands.
+                    // Codex review on PR #32 passes 3+6.
                     let addr_width = self.infer_expr_size(addr).unwrap_or(0);
-                    if addr_width >= 8 {
+                    let ptr_width = self.convention.pointer_width();
+                    if addr_width >= ptr_width {
                         if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
                             let elem_type_inner = Self::infer_type_from_size(*size as usize);
                             self.record_usage_hint(&reg, |h| {
