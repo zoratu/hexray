@@ -735,14 +735,25 @@ impl Expr {
                     // the recovered code reads `if (c && c) { ... }`
                     // or, when the chain doesn't fire, a nested
                     // duplicate `if (c) { if (c) { ... } }`.
+                    //
+                    // Only safe when the operand is free of side
+                    // effects AND single-evaluation: dropping one
+                    // copy of `f() && f()` or `*p && *p` (where the
+                    // memory may change between accesses) would
+                    // change observable behavior. Codex review on
+                    // PR #33 pass 1.
                     BinOpKind::LogicalAnd => {
-                        if exprs_structurally_equal(&left, &right) {
+                        if exprs_structurally_equal(&left, &right)
+                            && expr_is_safe_to_deduplicate(&left)
+                        {
                             return left;
                         }
                     }
                     // x || x = x — same rationale as LogicalAnd.
                     BinOpKind::LogicalOr => {
-                        if exprs_structurally_equal(&left, &right) {
+                        if exprs_structurally_equal(&left, &right)
+                            && expr_is_safe_to_deduplicate(&left)
+                        {
                             return left;
                         }
                     }
@@ -3485,6 +3496,51 @@ fn match_low_bits_reassembly(left: &Expr, right: &Expr) -> Option<Expr> {
     None
 }
 
+/// Whether `expr` is safe to drop one copy of when both operands of a
+/// boolean simplification (e.g. `x && x → x`) are structurally
+/// identical.
+///
+/// Calls, assignments, and memory loads all have observable behavior
+/// that differs across evaluations (side effects, the memory may
+/// change between accesses), so two textually-identical copies of
+/// such an expression are NOT semantically equivalent to one copy.
+/// Pure value expressions — vars, literals, casts/unary ops over
+/// pure operands, address-of — are safe to dedupe. Codex review on
+/// PR #33 pass 1.
+fn expr_is_safe_to_deduplicate(expr: &Expr) -> bool {
+    match &expr.kind {
+        // Unconditionally unsafe forms.
+        ExprKind::Call { .. }
+        | ExprKind::Assign { .. }
+        | ExprKind::CompoundAssign { .. }
+        | ExprKind::Deref { .. }
+        | ExprKind::ArrayAccess { .. }
+        | ExprKind::FieldAccess { .. } => false,
+        // A GotRef that resolves to a memory load is also a deref.
+        ExprKind::GotRef { is_deref, .. } => !*is_deref,
+        // Pure value expressions.
+        ExprKind::IntLit(_) | ExprKind::Var(_) | ExprKind::Unknown(_) => true,
+        // Containers: only safe if every contained expression is safe.
+        ExprKind::BinOp { left, right, .. } => {
+            expr_is_safe_to_deduplicate(left) && expr_is_safe_to_deduplicate(right)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_is_safe_to_deduplicate(operand),
+        ExprKind::AddressOf(inner) => expr_is_safe_to_deduplicate(inner),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_is_safe_to_deduplicate(cond)
+                && expr_is_safe_to_deduplicate(then_expr)
+                && expr_is_safe_to_deduplicate(else_expr)
+        }
+        ExprKind::Phi(args) => args.iter().all(expr_is_safe_to_deduplicate),
+    }
+}
+
 /// Checks if two expressions are structurally equal.
 /// Used for simplifications like `x - x = 0` and `x ^ x = 0`.
 fn exprs_structurally_equal(left: &Expr, right: &Expr) -> bool {
@@ -4870,6 +4926,74 @@ mod tests {
             ),
             "Expected LogicalAnd, got {:?}",
             simplified.kind
+        );
+    }
+
+    /// `c && c → c` collapses a pure duplicate condition, but MUST
+    /// preserve `f() && f()` because the call has side effects and
+    /// must run twice in the original semantics. Codex review on
+    /// PR #33 pass 1.
+    #[test]
+    fn test_logical_and_or_dedup_preserves_side_effects() {
+        use super::CallTarget;
+        // c && c → c when c is a pure comparison.
+        let pure_cmp = || Expr::binop(BinOpKind::Eq, Expr::unknown("x"), Expr::int(0));
+        let simplified = Expr::binop(BinOpKind::LogicalAnd, pure_cmp(), pure_cmp()).simplify();
+        assert!(
+            matches!(
+                simplified.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::Eq,
+                    ..
+                }
+            ),
+            "pure `x==0 && x==0` should fold to `x==0`, got {:?}",
+            simplified.kind
+        );
+
+        // f() && f() must NOT fold — the call has side effects.
+        let call_expr = || Expr::call(CallTarget::Named("f".to_string()), vec![]);
+        let combined = Expr::binop(BinOpKind::LogicalAnd, call_expr(), call_expr()).simplify();
+        assert!(
+            matches!(
+                combined.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::LogicalAnd,
+                    ..
+                }
+            ),
+            "f() && f() must stay as LogicalAnd, got {:?}",
+            combined.kind
+        );
+
+        // Same guard for LogicalOr.
+        let combined_or = Expr::binop(BinOpKind::LogicalOr, call_expr(), call_expr()).simplify();
+        assert!(
+            matches!(
+                combined_or.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::LogicalOr,
+                    ..
+                }
+            ),
+            "f() || f() must stay as LogicalOr, got {:?}",
+            combined_or.kind
+        );
+
+        // `*p && *p` — memory load may differ between accesses.
+        let deref = || Expr::deref(Expr::unknown("p"), 4);
+        let combined_deref =
+            Expr::binop(BinOpKind::LogicalAnd, deref(), deref()).simplify();
+        assert!(
+            matches!(
+                combined_deref.kind,
+                ExprKind::BinOp {
+                    op: BinOpKind::LogicalAnd,
+                    ..
+                }
+            ),
+            "*p && *p must stay as LogicalAnd (memory may change), got {:?}",
+            combined_deref.kind
         );
     }
 
