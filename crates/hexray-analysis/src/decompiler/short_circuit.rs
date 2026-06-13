@@ -173,8 +173,13 @@ fn try_extract_and_chain(
         (inner_cond.clone(), inner_body.clone(), inner_else.clone())
     };
 
-    // Combine: outer_cond && final_cond
-    let combined = Expr::binop(BinOpKind::LogicalAnd, outer_cond.clone(), final_cond);
+    // Combine: outer_cond && final_cond.
+    // Simplify after combining so a duplicate-condition shape (`c && c`)
+    // folds to `c` instead of leaving `if (c && c) { ... }` in the
+    // recovered output. Codex review on the safe_div ucomisd +
+    // jne + jp recovery flagged this as the visible nested duplicate.
+    let combined =
+        Expr::binop(BinOpKind::LogicalAnd, outer_cond.clone(), final_cond).simplify();
 
     Some((combined, final_body, final_else))
 }
@@ -406,13 +411,17 @@ mod tests {
     #[test]
     fn test_and_chain_detection() {
         // Create: if (a) { if (b) { return 1; } }
+        // Use distinct comparison-shaped conditions so that the
+        // simplify() pass on the combined LogicalAnd does not
+        // constant-fold them (which would happen with IntLit
+        // operands via fold_binary_constants).
         let inner_if = StructuredNode::If {
-            condition: Expr::int(1), // represents condition b
+            condition: make_condition("b"),
             then_body: vec![StructuredNode::Return(Some(Expr::int(1)))],
             else_body: None,
         };
         let outer_if = StructuredNode::If {
-            condition: Expr::int(2), // represents condition a
+            condition: make_condition("a"),
             then_body: vec![inner_if],
             else_body: None,
         };

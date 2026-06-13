@@ -727,6 +727,25 @@ impl Expr {
                             return Self::binop(BinOpKind::LogicalAnd, left, right);
                         }
                     }
+                    // x && x = x — collapses the duplicate-condition
+                    // shape that the short-circuit AND-chain pass can
+                    // produce when two nested ifs share an identical
+                    // condition (the safe_div ucomisd + jne + jp
+                    // recovery is the canonical case). Without this,
+                    // the recovered code reads `if (c && c) { ... }`
+                    // or, when the chain doesn't fire, a nested
+                    // duplicate `if (c) { if (c) { ... } }`.
+                    BinOpKind::LogicalAnd => {
+                        if exprs_structurally_equal(&left, &right) {
+                            return left;
+                        }
+                    }
+                    // x || x = x — same rationale as LogicalAnd.
+                    BinOpKind::LogicalOr => {
+                        if exprs_structurally_equal(&left, &right) {
+                            return left;
+                        }
+                    }
                     // x ^ 0 = x, 0 ^ x = x
                     BinOpKind::Xor => {
                         if matches!(right.kind, ExprKind::IntLit(0)) {
