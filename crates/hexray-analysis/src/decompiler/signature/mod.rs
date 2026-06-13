@@ -1182,6 +1182,32 @@ impl SignatureRecovery {
         }
     }
 
+    /// Variant of [`Self::record_usage_hint`] that bypasses the
+    /// "written-before-read" clobber filter in
+    /// [`Self::resolve_param_index_from_name_shallow`].
+    ///
+    /// Use this only when we already have HARD evidence that the
+    /// register name maps to a specific parameter — e.g. the spill
+    /// offset matched the prologue scan's record of where this
+    /// arg's home slot lives. In that case, even if the register
+    /// has been reused as a scratch (so `written_regs` contains it
+    /// and `read_regs` doesn't), the slot's identity as the
+    /// parameter's home is preserved by the offset evidence. The
+    /// regular clobber filter is meant for ambiguous register
+    /// references in the body, which is the wrong filter here.
+    /// Codex review on PR #32 pass 8.
+    fn record_hint_for_arg_register(
+        &mut self,
+        reg_name: &str,
+        hint_fn: impl FnOnce(&mut ParameterUsageHints),
+    ) {
+        let name = reg_name.to_lowercase();
+        if let Some(idx) = self.arg_register_index(&name) {
+            let hints = self.param_hints.entry(idx).or_default();
+            hint_fn(hints);
+        }
+    }
+
     fn copied_arg_root(&self, idx: usize) -> usize {
         let mut current = idx;
         let mut seen = HashSet::new();
@@ -2094,7 +2120,7 @@ impl SignatureRecovery {
                                 let base_width = self.infer_expr_size(right).unwrap_or(0);
                                 let ptr_width = self.convention.pointer_width();
                                 if base_width >= ptr_width {
-                                    self.record_usage_hint(&reg, |h| {
+                                    self.record_hint_for_arg_register(&reg, |h| {
                                         h.is_pointer_arithmetic = true
                                     });
                                 }
@@ -2148,7 +2174,7 @@ impl SignatureRecovery {
                                 }
                             );
                             if base_width >= ptr_width && right_has_scaled_index {
-                                self.record_usage_hint(&reg, |h| {
+                                self.record_hint_for_arg_register(&reg, |h| {
                                     h.is_pointer_arithmetic = true
                                 });
                             }
@@ -2210,7 +2236,7 @@ impl SignatureRecovery {
                     if addr_width >= ptr_width {
                         if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
                             let elem_type_inner = Self::infer_type_from_size(*size as usize);
-                            self.record_usage_hint(&reg, |h| {
+                            self.record_hint_for_arg_register(&reg, |h| {
                                 h.is_dereferenced = true;
                                 h.deref_count += 1;
                                 if h.deref_element_type.is_none() {
@@ -2241,7 +2267,7 @@ impl SignatureRecovery {
                     });
                     if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
                         let elem_type_inner = Self::infer_type_from_size(*element_size);
-                        self.record_usage_hint(&reg, |h| {
+                        self.record_hint_for_arg_register(&reg, |h| {
                             h.is_array_access = true;
                             h.is_pointer_arithmetic = true;
                             h.deref_count += 1;
@@ -7840,6 +7866,64 @@ mod tests {
             "rsi (ys) should be pointer, got {:?} (full sig: {:?})",
             rsi_param.param_type,
             sig.parameters
+        );
+    }
+
+    /// Codex review on PR #32 pass 8: if the spilled arg register
+    /// is clobbered (written) before its folded spill-reload is
+    /// analyzed, the regular `record_usage_hint` resolver discards
+    /// the hint because the register isn't "read before written".
+    /// But the spill-offset evidence is HARD evidence — the prologue
+    /// scan recorded that this slot is the param's home regardless
+    /// of subsequent register reuse. The dedicated
+    /// `record_hint_for_arg_register` bypass keeps the hint.
+    #[test]
+    fn test_spilled_pointer_recovers_even_when_register_clobbered_first() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        // Body:
+        //   rdi = 0;                ; clobber rdi as a scratch
+        //   tmp = *(*(rbp-16) + idx*8)  ; indexed access via spill
+        let clobber = Expr::assign(Expr::var(Variable::reg("rdi", 8)), Expr::int(0));
+        let xs_reload = Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(16)), 8);
+        let scaled = Expr::binop(BinOpKind::Mul, Expr::unknown("var_2c"), Expr::int(8));
+        let elem = Expr::deref(
+            Expr::binop(BinOpKind::Add, xs_reload, scaled),
+            8,
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![clobber, Expr::assign(Expr::unknown("tmp"), elem)],
+            address_range: (0x1000, 0x1030),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -16,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "spilled pointer should be recovered even after rdi was clobbered, got {:?}",
+            rdi_param.param_type
         );
     }
 
