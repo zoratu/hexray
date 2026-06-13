@@ -2149,17 +2149,19 @@ impl SignatureRecovery {
                         }
                     });
                     // Propagate to a spilled parameter only when the
-                    // load is wide enough to be a pointer (>= 8 bytes).
-                    // Without this, a 4-byte scalar int reload would
-                    // mis-set `is_dereferenced` on the spilled arg —
-                    // codex review on PR #32 pass 2 flagged the
-                    // unguarded form (the scalar case bypasses this
-                    // block today because `extract_var_name` on a
-                    // `BinOp(rbp, IntLit)` addr returns None, but a
-                    // future change that lifts stack slots to
-                    // synthetic names could surface the same shape;
-                    // the size gate keeps the bridge robust to that).
-                    if (*size as usize) >= 8 {
+                    // ADDRESS load (the spill reload itself) is wide
+                    // enough to be a pointer (>= 8 bytes). Use
+                    // `infer_expr_size(addr)` rather than the outer
+                    // `*size` — the outer size is the POINTEE width
+                    // (the element being read through the pointer),
+                    // while we want the WIDTH OF THE POINTER VALUE.
+                    // For `int *p; return *p;` the IR is
+                    // `Deref(Deref(rbp-8, 8), 4)`: outer size=4 (int)
+                    // but the addr load is 8 (pointer). Without this,
+                    // common `char*` / `int*` params get missed.
+                    // Codex review on PR #32 pass 3.
+                    let addr_width = self.infer_expr_size(addr).unwrap_or(0);
+                    if addr_width >= 8 {
                         if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
                             let elem_type_inner = Self::infer_type_from_size(*size as usize);
                             self.record_usage_hint(&reg, |h| {
@@ -7792,6 +7794,55 @@ mod tests {
             "rsi (ys) should be pointer, got {:?} (full sig: {:?})",
             rsi_param.param_type,
             sig.parameters
+        );
+    }
+
+    /// Codex review on PR #32 pass 3: a spilled `int *p` reloaded
+    /// and dereferenced as `Deref(Deref(rbp-8, 8), 4)` must still
+    /// recover as pointer even though the OUTER pointee width is 4.
+    /// The gate keys on the ADDRESS load width (8 bytes here),
+    /// not the pointee width.
+    #[test]
+    fn test_spilled_pointer_with_narrow_pointee_recovers_as_pointer() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        // *p where p = rdi was spilled at -8 and p points to int (4 bytes).
+        let p_reload = Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8);
+        let star_p = Expr::deref(p_reload, 4);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::assign(Expr::unknown("tmp"), star_p)],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "rdi should recover as pointer despite narrow pointee, got {:?}",
+            rdi_param.param_type
         );
     }
 
