@@ -2093,17 +2093,25 @@ impl SignatureRecovery {
                             // that offset. See
                             // `[[project_structurer_ordering_refactor]]`.
                             //
-                            // Gate on the spill load's natural width
-                            // matching pointer size (8 bytes) — same
-                            // shape as the direct-`Var` path above.
-                            // Without this, a 32-bit integer arg
-                            // reloaded for `return n + 1` would get
-                            // mis-typed as a pointer because
-                            // `right_is_offset` accepts any small
-                            // constant. Codex review on PR #32
-                            // pass 2.
+                            // Require BOTH: pointer-width address
+                            // load AND a SCALED-INDEX right-hand side
+                            // (`Mul` / `Shl`). A small IntLit offset
+                            // alone — codex example
+                            // `long n + 1` lifts to
+                            // `Deref(rbp-8, 8) + 1` — is ambiguous
+                            // between pointer-arith and 64-bit
+                            // integer arithmetic, so we don't make
+                            // the call without the stronger signal.
+                            // Codex review on PR #32 passes 2+4.
                             let base_width = self.infer_expr_size(left).unwrap_or(0);
-                            if base_width >= 8 {
+                            let right_has_scaled_index = matches!(
+                                &right.kind,
+                                ExprKind::BinOp {
+                                    op: BinOpKind::Mul | BinOpKind::Shl,
+                                    ..
+                                }
+                            );
+                            if base_width >= 8 && right_has_scaled_index {
                                 self.record_usage_hint(&reg, |h| {
                                     h.is_pointer_arithmetic = true
                                 });
@@ -7795,6 +7803,47 @@ mod tests {
             rsi_param.param_type,
             sig.parameters
         );
+    }
+
+    /// Codex review on PR #32 pass 4: `long f(long n) { return n+1; }`
+    /// lifts to `Deref(rbp-8, 8) + 1` — same shape as a pointer
+    /// reload with an IntLit offset. Width gate alone (`>= 8`) lets
+    /// it through; we additionally require a scaled-index rhs
+    /// (`Mul` / `Shl`) before claiming pointer arithmetic.
+    #[test]
+    fn test_long_scalar_plus_one_does_not_force_pointer_typing() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let n_reload = || Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8);
+        let n_plus_one = Expr::binop(BinOpKind::Add, n_reload(), Expr::int(1));
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::assign(Expr::unknown("tmp"), n_plus_one)],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        for p in &sig.parameters {
+            assert!(
+                !matches!(
+                    p.param_type,
+                    ParamType::Pointer | ParamType::TypedPointer(_)
+                ),
+                "scalar 64-bit add must not force pointer typing on {:?} (full sig: {:?})",
+                p,
+                sig.parameters
+            );
+        }
     }
 
     /// Codex review on PR #32 pass 3: a spilled `int *p` reloaded
