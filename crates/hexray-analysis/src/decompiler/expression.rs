@@ -1723,15 +1723,26 @@ impl Expr {
         // unambiguous compiler-emitted constant-pool pattern.
         //
         // Two shapes:
-        //   * Legacy SSE 2-operand `op xmm_dst, mem`.
-        //   * AVX VEX-encoded 3-operand `vop xmm_dst, xmm_src1, mem`.
-        let (dst_reg, mem) = match inst.operands.as_slice() {
-            [Operand::Register(d), Operand::Memory(m)] => (d, m),
-            [Operand::Register(d), Operand::Register(_), Operand::Memory(m)] => (d, m),
+        //   * Legacy SSE 2-operand `op xmm_dst, mem` — semantics is
+        //     `dst = dst op mem`.
+        //   * AVX VEX-encoded 3-operand `vop xmm_dst, xmm_src1, mem`
+        //     — semantics is `dst = src1 op mem` (non-destructive,
+        //     src1 may differ from dst). Codex review on PR #31
+        //     pass 1 caught the previous always-use-dst form.
+        let (dst_reg, lhs_expr, mem) = match inst.operands.as_slice() {
+            [Operand::Register(d), Operand::Memory(m)] => {
+                let dst_size = Self::xmm_family_size(&d.name().to_ascii_lowercase());
+                let lhs = Self::var(Variable::reg(d.name().to_ascii_lowercase(), dst_size));
+                (d, lhs, m)
+            }
+            [Operand::Register(d), Operand::Register(s1), Operand::Memory(m)] => {
+                let s1_size = Self::xmm_family_size(&s1.name().to_ascii_lowercase());
+                let lhs = Self::var(Variable::reg(s1.name().to_ascii_lowercase(), s1_size));
+                (d, lhs, m)
+            }
             _ => return None,
         };
         let src_expr = Self::from_memory_with_context(mem, inst, false);
-        let dst_reg = dst_reg;
         let dst_name = dst_reg.name().to_ascii_lowercase();
         if !(dst_name.starts_with("xmm")
             || dst_name.starts_with("ymm")
@@ -1739,18 +1750,22 @@ impl Expr {
         {
             return None;
         }
-        let dst_size = if dst_name.starts_with("zmm") {
+        let dst_size = Self::xmm_family_size(&dst_name);
+        let dst_var = Self::var(Variable::reg(dst_name, dst_size));
+        Some(Self::assign(dst_var, Self::binop(op, lhs_expr, src_expr)))
+    }
+
+    /// Returns the byte size of an `xmm*`/`ymm*`/`zmm*` register
+    /// family. Falls back to 16 (xmm) for any other name — callers
+    /// guard the family check before invoking this.
+    fn xmm_family_size(name: &str) -> u8 {
+        if name.starts_with("zmm") {
             64
-        } else if dst_name.starts_with("ymm") {
+        } else if name.starts_with("ymm") {
             32
         } else {
             16
-        };
-        let dst_var = Self::var(Variable::reg(dst_name, dst_size));
-        Some(Self::assign(
-            dst_var.clone(),
-            Self::binop(op, dst_var, src_expr),
-        ))
+        }
     }
 
     fn lift_sse_self_xor_zero(inst: &Instruction) -> Option<Self> {
@@ -6651,6 +6666,37 @@ mod tests {
         assert!(
             rendered.starts_with("xmm0 = xmm0 & "),
             "expected `xmm0 = xmm0 & ...`, got `{rendered}`"
+        );
+    }
+
+    /// Codex review on PR #31 pass 1: AVX VEX-encoded 3-operand
+    /// `vandps xmm0, xmm1, [mem]` is `dst = src1 op mem`, so when
+    /// `dst` and `src1` differ the lift must use `src1` as the LHS
+    /// of the BinOp, not `dst`. Building from `dst` (the previous
+    /// behavior) would emit `xmm0 = xmm0 & ...` instead of the
+    /// correct `xmm0 = xmm1 & ...`.
+    #[test]
+    fn test_vandps_three_operand_uses_src1_as_lhs() {
+        use hexray_core::{
+            register::x86, Architecture, MemoryRef, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM0, 128);
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::Vector, x86::XMM1, 128);
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, x86::RIP, 64);
+        let mem = MemoryRef::base_disp(rip, 0x100, 16);
+        // vandps xmm0, xmm1, [rip + 0x100]
+        let inst = Instruction::new(0x401040, 8, vec![0xc5, 0xf0, 0x54, 0x05, 0, 0, 0, 0], "vandps")
+            .with_operation(Operation::And)
+            .with_operands(vec![
+                Operand::Register(xmm0),
+                Operand::Register(xmm1),
+                Operand::Memory(mem),
+            ]);
+        let rendered = Expr::from_instruction(&inst).to_string();
+        // LHS of the BinOp must be xmm1 (the AVX src1), NOT xmm0.
+        assert!(
+            rendered.starts_with("xmm0 = xmm1 & "),
+            "expected `xmm0 = xmm1 & ...` for non-destructive AVX form, got `{rendered}`"
         );
     }
 
