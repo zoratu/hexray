@@ -1691,6 +1691,59 @@ impl Expr {
     ///     flagged the original 2-operand-only matcher for missing this
     ///     case — without it AVX float code keeps surfacing
     ///     `/* SSE: vpxor */` for what is in fact a `double s = 0.0`.
+    /// Lift `andps`/`andpd`/`pand`/`orps`/`orpd`/`por`/`xorps`/`xorpd`
+    /// /`pxor` instructions whose source is a memory operand
+    /// (typically the rip-relative load of a `.rodata.cst*` constant
+    /// pool entry) as a proper `BinOp` against the deref.
+    ///
+    /// Compilers reach for these as the canonical implementation of
+    /// `fabs(x)` (AND with `0x7FFF...FF`, clearing the sign bit) and
+    /// unary negation (XOR with `0x8000...00`, flipping it). Without
+    /// this lift the instruction collapses to the opaque
+    /// `/* SSE: pand */` comment and any record of writing to the
+    /// destination xmm register is lost. The proper BinOp lift lets
+    /// the existing rodata-constant materialization render the mask
+    /// as a concrete value, and a downstream simplifier pass can
+    /// recognize the AND-mask-clears-sign / XOR-mask-flips-sign
+    /// idioms and rewrite to `fabs(x)` / `-x`.
+    fn lift_sse_mem_bitwise(inst: &Instruction) -> Option<Self> {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        let op = match mnemonic.as_str() {
+            "andps" | "andpd" | "pand" | "vandps" | "vandpd" | "vpand" => BinOpKind::And,
+            "orps" | "orpd" | "por" | "vorps" | "vorpd" | "vpor" => BinOpKind::Or,
+            "xorps" | "xorpd" | "pxor" | "vxorps" | "vxorpd" | "vpxor" => BinOpKind::Xor,
+            _ => return None,
+        };
+        // Require legacy SSE encoding `op xmm_dst, mem`: 2 operands,
+        // first is xmm dst, second is memory. The AVX VEX-encoded form
+        // `vop xmm_dst, xmm_src1, mem` (3 operands) is also accepted.
+        let (dst_reg, mem) = match inst.operands.as_slice() {
+            [Operand::Register(d), Operand::Memory(m)] => (d, m),
+            [Operand::Register(d), Operand::Register(_), Operand::Memory(m)] => (d, m),
+            _ => return None,
+        };
+        let dst_name = dst_reg.name().to_ascii_lowercase();
+        if !(dst_name.starts_with("xmm")
+            || dst_name.starts_with("ymm")
+            || dst_name.starts_with("zmm"))
+        {
+            return None;
+        }
+        let dst_size = if dst_name.starts_with("zmm") {
+            64
+        } else if dst_name.starts_with("ymm") {
+            32
+        } else {
+            16
+        };
+        let dst_var = Self::var(Variable::reg(dst_name, dst_size));
+        let mem_deref = Self::from_memory_with_context(mem, inst, false);
+        Some(Self::assign(
+            dst_var.clone(),
+            Self::binop(op, dst_var, mem_deref),
+        ))
+    }
+
     fn lift_sse_self_xor_zero(inst: &Instruction) -> Option<Self> {
         let mnemonic = inst.mnemonic.to_ascii_lowercase();
         if !matches!(
@@ -1774,6 +1827,19 @@ impl Expr {
         // `/* SSE: pxor */` and the surrounding type recovery loses the
         // initial-value evidence.
         if let Some(expr) = Self::lift_sse_self_xor_zero(inst) {
+            return expr;
+        }
+        // `andps`/`andpd`/`pand`/`orps`/`orpd`/`por`/`xorps`/`xorpd`
+        // /`pxor` against memory are commonly used by compilers to
+        // implement `fabs` (AND with `0x7FFF...FF` clearing the sign
+        // bit) and unary negation (XOR with `0x8000...00` flipping
+        // it). Lifting them as a proper `BinOp` against the memory
+        // deref lets the rodata-constant materialization surface the
+        // mask, and a downstream simplifier pass can recognize and
+        // rewrite to `fabs(x)` / `-x`. Without this they fall to the
+        // opaque `/* SSE: pand */` comment and the SSE-protected
+        // body loses any record of writing to xmm0.
+        if let Some(expr) = Self::lift_sse_mem_bitwise(inst) {
             return expr;
         }
         if Self::should_lift_as_opaque_x86_integer_simd(inst) {
