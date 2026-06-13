@@ -1722,6 +1722,16 @@ impl SignatureRecovery {
                 // Subsequent loads from this offset should NOT
                 // propagate to the original arg. Codex review on PR
                 // #32 pass 9.
+                //
+                // Note: this is path-insensitive (same as
+                // `written_regs` and other walker state in this
+                // module) — a write in one branch invalidates the
+                // slot for sibling branches analyzed afterward. The
+                // failure mode is a false NEGATIVE (a pointer arg
+                // misses recovery) rather than a false positive
+                // (something becomes a pointer when it shouldn't),
+                // matching the surrounding analysis's bias toward
+                // conservative typing. Codex pass 10.
                 if !rhs_is_matching_arg_spill {
                     if let Some(offset) = self.extract_stack_offset(lhs) {
                         if self
