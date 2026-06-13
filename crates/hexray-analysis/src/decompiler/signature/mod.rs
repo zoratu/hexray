@@ -144,6 +144,13 @@ pub struct SignatureRecovery {
     /// reloads of the actual home slot, not on later reuse of the register as
     /// a scratch temp for an unrelated stack local (e.g. a loop counter).
     arg_spill_offsets: HashMap<usize, HashSet<i128>>,
+    /// Stack offsets where the prologue arg-spill slot has been
+    /// overwritten by a non-spill store later in the body. Once a
+    /// slot is invalidated, the spill-slot → param bridge in
+    /// [`Self::spilled_arg_register_from_var_name`] must stop using
+    /// it: subsequent loads from that offset are NOT the original
+    /// argument value. Codex review on PR #32 pass 9.
+    invalidated_spill_offsets: HashSet<i128>,
     /// Prologue spill observations from the raw CFG, used to recover
     /// the mixed int/float source declaration order — at `-O0` the
     /// compiler spills every parameter register in source order, so
@@ -951,6 +958,7 @@ impl SignatureRecovery {
             return_confidence: 0,
             param_names: HashMap::new(),
             arg_spill_offsets: HashMap::new(),
+            invalidated_spill_offsets: HashSet::new(),
             param_spill_order: Vec::new(),
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
@@ -1071,6 +1079,7 @@ impl SignatureRecovery {
         self.return_confidence = 0;
         self.param_names.clear();
         self.arg_spill_offsets.clear();
+        self.invalidated_spill_offsets.clear();
         self.param_type_overrides.clear();
         self.param_hints.clear();
         self.function_pointer_aliases.clear();
@@ -1177,6 +1186,32 @@ impl SignatureRecovery {
     ) {
         let name = reg_name.to_lowercase();
         if let Some(idx) = self.resolve_param_index_from_name_internal(&name, false) {
+            let hints = self.param_hints.entry(idx).or_default();
+            hint_fn(hints);
+        }
+    }
+
+    /// Variant of [`Self::record_usage_hint`] that bypasses the
+    /// "written-before-read" clobber filter in
+    /// [`Self::resolve_param_index_from_name_shallow`].
+    ///
+    /// Use this only when we already have HARD evidence that the
+    /// register name maps to a specific parameter — e.g. the spill
+    /// offset matched the prologue scan's record of where this
+    /// arg's home slot lives. In that case, even if the register
+    /// has been reused as a scratch (so `written_regs` contains it
+    /// and `read_regs` doesn't), the slot's identity as the
+    /// parameter's home is preserved by the offset evidence. The
+    /// regular clobber filter is meant for ambiguous register
+    /// references in the body, which is the wrong filter here.
+    /// Codex review on PR #32 pass 8.
+    fn record_hint_for_arg_register(
+        &mut self,
+        reg_name: &str,
+        hint_fn: impl FnOnce(&mut ParameterUsageHints),
+    ) {
+        let name = reg_name.to_lowercase();
+        if let Some(idx) = self.arg_register_index(&name) {
             let hints = self.param_hints.entry(idx).or_default();
             hint_fn(hints);
         }
@@ -1634,6 +1669,7 @@ impl SignatureRecovery {
 
                 // For parameter detection: check if an arg register is read and stored to stack
                 // Pattern: *(rbp + offset) = rdi  means rdi is a parameter
+                let mut rhs_is_matching_arg_spill = false;
                 if let ExprKind::Var(rhs_var) = &rhs.kind {
                     let rhs_name = rhs_var.name.to_lowercase();
                     if self.is_arg_register(&rhs_name) && !self.written_regs.contains(&rhs_name) {
@@ -1662,6 +1698,48 @@ impl SignatureRecovery {
                                     .or_default()
                                     .insert(offset);
                             }
+                            // Mark a "matching" spill so the
+                            // invalidation tracker below doesn't
+                            // treat the prologue spill itself as a
+                            // body-write of the slot.
+                            if self
+                                .param_spill_order
+                                .iter()
+                                .any(|obs| obs.offset as i128 == offset
+                                    && obs.register == rhs_name)
+                            {
+                                rhs_is_matching_arg_spill = true;
+                            }
+                        }
+                    }
+                }
+
+                // Slot-invalidation: if THIS write targets a stack
+                // slot that the prologue scan recorded as an arg
+                // spill home, AND the rhs is NOT that arg's register
+                // (i.e. the slot is being reused for something
+                // else), the original-parameter evidence is stale.
+                // Subsequent loads from this offset should NOT
+                // propagate to the original arg. Codex review on PR
+                // #32 pass 9.
+                //
+                // Note: this is path-insensitive (same as
+                // `written_regs` and other walker state in this
+                // module) — a write in one branch invalidates the
+                // slot for sibling branches analyzed afterward. The
+                // failure mode is a false NEGATIVE (a pointer arg
+                // misses recovery) rather than a false positive
+                // (something becomes a pointer when it shouldn't),
+                // matching the surrounding analysis's bias toward
+                // conservative typing. Codex pass 10.
+                if !rhs_is_matching_arg_spill {
+                    if let Some(offset) = self.extract_stack_offset(lhs) {
+                        if self
+                            .param_spill_order
+                            .iter()
+                            .any(|obs| obs.offset as i128 == offset)
+                        {
+                            self.invalidated_spill_offsets.insert(offset);
                         }
                     }
                 }
@@ -2070,12 +2148,85 @@ impl SignatureRecovery {
                         _ => false,
                     };
 
+                    // `Add` is commutative — the structurer can emit
+                    // either `spill + idx*S` or `idx*S + spill`.
+                    // Detect the spill+scaled-index pattern in the
+                    // operand we didn't already pick up, then fall
+                    // through to the existing right-is-offset path
+                    // with that same propagation.
+                    // Codex review on PR #32 pass 7.
+                    if matches!(op, BinOpKind::Add) && !right_is_offset {
+                        let left_is_scaled_index = matches!(
+                            &left.kind,
+                            ExprKind::BinOp {
+                                op: BinOpKind::Mul | BinOpKind::Shl,
+                                ..
+                            }
+                        );
+                        if left_is_scaled_index {
+                            if let Some(reg) = self
+                                .extract_var_name(right)
+                                .as_deref()
+                                .and_then(|n| self.spilled_arg_register_from_var_name(n))
+                            {
+                                let base_width = self.infer_expr_size(right).unwrap_or(0);
+                                let ptr_width = self.convention.pointer_width();
+                                if base_width >= ptr_width {
+                                    self.record_hint_for_arg_register(&reg, |h| {
+                                        h.is_pointer_arithmetic = true
+                                    });
+                                }
+                            }
+                        }
+                    }
                     if right_is_offset {
                         if let ExprKind::Var(var) = &left.kind {
                             let base_width =
                                 self.infer_expr_size(left).unwrap_or(var.size).max(var.size);
                             if base_width >= 8 {
                                 self.record_usage_hint(&var.name.to_lowercase(), |h| {
+                                    h.is_pointer_arithmetic = true
+                                });
+                            }
+                        } else if let Some(reg) = self
+                            .extract_var_name(left)
+                            .as_deref()
+                            .and_then(|n| self.spilled_arg_register_from_var_name(n))
+                        {
+                            // `left` is the spill-slot reload of a
+                            // parameter register — the structurer
+                            // folded `rax = *(rbp+offset)` into the
+                            // pointer-arith expression so the
+                            // register name is gone, but the prologue
+                            // scan still tells us which arg lived at
+                            // that offset. See
+                            // `[[project_structurer_ordering_refactor]]`.
+                            //
+                            // Require BOTH: pointer-width address
+                            // load AND a SCALED-INDEX right-hand side
+                            // (`Mul` / `Shl`). A small IntLit offset
+                            // alone — codex example
+                            // `long n + 1` lifts to
+                            // `Deref(rbp-8, 8) + 1` — is ambiguous
+                            // between pointer-arith and 64-bit
+                            // integer arithmetic, so we don't make
+                            // the call without the stronger signal.
+                            // The width threshold comes from the
+                            // active ABI's `pointer_width()` so a
+                            // future 32-bit convention (ILP32 RV32)
+                            // can accept 4-byte reloads. Codex
+                            // review on PR #32 passes 2+4+6.
+                            let base_width = self.infer_expr_size(left).unwrap_or(0);
+                            let ptr_width = self.convention.pointer_width();
+                            let right_has_scaled_index = matches!(
+                                &right.kind,
+                                ExprKind::BinOp {
+                                    op: BinOpKind::Mul | BinOpKind::Shl,
+                                    ..
+                                }
+                            );
+                            if base_width >= ptr_width && right_has_scaled_index {
+                                self.record_hint_for_arg_register(&reg, |h| {
                                     h.is_pointer_arithmetic = true
                                 });
                             }
@@ -2119,6 +2270,33 @@ impl SignatureRecovery {
                             h.deref_element_type = Some(elem_type.clone());
                         }
                     });
+                    // Propagate to a spilled parameter only when the
+                    // ADDRESS load (the spill reload itself) is wide
+                    // enough to be a pointer. Use
+                    // `infer_expr_size(addr)` rather than the outer
+                    // `*size` — the outer size is the POINTEE width
+                    // (the element being read through the pointer),
+                    // while we want the WIDTH OF THE POINTER VALUE.
+                    // For `int *p; return *p;` the IR is
+                    // `Deref(Deref(rbp-8, 8), 4)`: outer size=4 (int)
+                    // but the addr load is 8 (pointer). The width
+                    // threshold comes from the ABI's `pointer_width()`
+                    // — 8 today, 4 if a future ILP32 convention lands.
+                    // Codex review on PR #32 passes 3+6.
+                    let addr_width = self.infer_expr_size(addr).unwrap_or(0);
+                    let ptr_width = self.convention.pointer_width();
+                    if addr_width >= ptr_width {
+                        if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
+                            let elem_type_inner = Self::infer_type_from_size(*size as usize);
+                            self.record_hint_for_arg_register(&reg, |h| {
+                                h.is_dereferenced = true;
+                                h.deref_count += 1;
+                                if h.deref_element_type.is_none() {
+                                    h.deref_element_type = Some(elem_type_inner);
+                                }
+                            });
+                        }
+                    }
                 }
             }
             ExprKind::ArrayAccess {
@@ -2139,6 +2317,17 @@ impl SignatureRecovery {
                             h.deref_element_type = Some(elem_type.clone());
                         }
                     });
+                    if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
+                        let elem_type_inner = Self::infer_type_from_size(*element_size);
+                        self.record_hint_for_arg_register(&reg, |h| {
+                            h.is_array_access = true;
+                            h.is_pointer_arithmetic = true;
+                            h.deref_count += 1;
+                            if h.deref_element_type.is_none() {
+                                h.deref_element_type = Some(elem_type_inner);
+                            }
+                        });
+                    }
                 }
 
                 // Index might be an array index parameter
@@ -3416,6 +3605,34 @@ impl SignatureRecovery {
             ExprKind::Unknown(name) if self.reg_size_from_name(name) > 0 => Some(name.clone()),
             _ => None,
         }
+    }
+
+    /// If `name` is a `stack_{offset}` slot synthesized by
+    /// [`Self::extract_var_name`] for a deref expression, and the
+    /// prologue scan recorded an argument register spilled to that
+    /// exact offset, return that register's canonical name.
+    ///
+    /// This is the bridge that lets pointer-usage hints flow to a
+    /// parameter even after the structurer's simplification folds
+    /// the intermediate `Var(rax) = *(rbp+offset)` reload into a
+    /// containing expression (so the load surfaces as
+    /// `Deref(stack_slot)` and the original register name is gone
+    /// from the IR). The `[[project_structurer_ordering_refactor]]`
+    /// memo's Option C — recognize collapsed patterns post-simplify
+    /// — depends on this lookup.
+    fn spilled_arg_register_from_var_name(&self, name: &str) -> Option<String> {
+        let offset_str = name.strip_prefix("stack_")?;
+        let offset: i128 = offset_str.parse().ok()?;
+        if self.invalidated_spill_offsets.contains(&offset) {
+            // The slot was overwritten by a non-spill store after
+            // the prologue, so loads from it no longer represent
+            // the original argument. Codex review on PR #32 pass 9.
+            return None;
+        }
+        self.param_spill_order
+            .iter()
+            .find(|obs| obs.offset as i128 == offset)
+            .map(|obs| obs.register.clone())
     }
 
     /// Extracts a stack offset from a deref expression.
@@ -7580,6 +7797,464 @@ mod tests {
             "expected arg0 to be inferred as pointer or typed pointer, got {:?}",
             sig.parameters[0].param_type
         );
+    }
+
+    /// SSE gap 1 from `[[project_structurer_ordering_refactor]]`:
+    /// at `-O0` saxpy_dot spills `rdi` (xs) and `rsi` (ys) and then
+    /// reloads them per iteration to compute `xs[i]` / `ys[i]`. The
+    /// structurer's simplifier folds the `rax = *(rbp-16)` reload
+    /// into the index expression, leaving
+    /// `Deref(Add(Deref(stack_-16), Mul(idx, 8)))` — with the
+    /// original `rdi` name gone. Without the spill-slot → arg
+    /// bridge, the analysis would see only `rbp` at the base and
+    /// recover `xs`/`ys` as `int32_t`, not pointers. The prologue
+    /// spill scan tells us which arg lived at -16/-24, so we
+    /// propagate the deref/array-access hints to those args.
+    #[test]
+    fn test_saxpy_indexed_spill_reload_recovers_pointer_args() {
+        use hexray_core::BasicBlockId;
+        // Mimic post-simplification IR for the inner loop of:
+        //   double saxpy_dot(double a, double *xs, double *ys, int n)
+        //       { for (int i=0; i<n; i++) total += a*xs[i] + ys[i]; }
+        //
+        // At -O0 clang spills xmm0/rdi/rsi/edx to home slots in
+        // source order, then reloads xs/ys per iteration to compute
+        // xs[i] / ys[i]. The structurer's copy-prop folds the
+        // intermediate `rax = *(rbp-16)` into the indexed deref, so
+        // the body shape is:
+        //   tmp_xs = *(*(rbp-16) + i*8)
+        //   tmp_ys = *(*(rbp-24) + i*8)
+        // with i materialized as the stack local `var_2c` (the loop
+        // counter slot), not as a register. Without the spill-slot
+        // → arg bridge in `analyze_expr_reads_with_context`, xs and
+        // ys recover as `int32_t`; with it they recover as pointers.
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let spill_load = |off: i128| {
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(off)), 8)
+        };
+        let scaled_index = || {
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("var_2c"),
+                Expr::int(8),
+            )
+        };
+        let xs_i = Expr::deref(
+            Expr::binop(BinOpKind::Add, spill_load(16), scaled_index()),
+            8,
+        );
+        let ys_i = Expr::deref(
+            Expr::binop(BinOpKind::Add, spill_load(24), scaled_index()),
+            8,
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("tmp_xs"), xs_i),
+                Expr::assign(Expr::unknown("tmp_ys"), ys_i),
+            ],
+            address_range: (0x1000, 0x1030),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+                ParamSpillObservation {
+                    register: "rsi".to_string(),
+                    offset: -24,
+                },
+                ParamSpillObservation {
+                    register: "edx".to_string(),
+                    offset: -28,
+                },
+            ]);
+        let sig = recovery.analyze(&cfg);
+
+        // The two int args that get array-indexed must come back as
+        // pointers; this is the fix for the saxpy gap. We don't
+        // assert anything about additional recovered params (n
+        // wasn't read in this body slice and may or may not show
+        // up depending on whether the spill scan alone is enough).
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        let rsi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rsi"
+                )
+            })
+            .expect("rsi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "rdi (xs) should be pointer, got {:?} (full sig: {:?})",
+            rdi_param.param_type,
+            sig.parameters
+        );
+        assert!(
+            matches!(
+                rsi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "rsi (ys) should be pointer, got {:?} (full sig: {:?})",
+            rsi_param.param_type,
+            sig.parameters
+        );
+    }
+
+    /// Codex review on PR #32 pass 9: if the spill slot gets
+    /// overwritten by a non-spill store later in the body, the
+    /// prologue evidence is stale — subsequent loads from that
+    /// offset are NOT the original arg, so the bridge must not
+    /// propagate. Codex example:
+    ///   spill prologue: *(rbp-8) = rdi
+    ///   body write:     *(rbp-8) = some_other_pointer
+    ///   later use:      tmp = *(*(rbp-8))
+    /// `rdi` should NOT become a pointer just because the slot was
+    /// later loaded; the slot no longer holds rdi.
+    #[test]
+    fn test_overwritten_spill_slot_does_not_propagate_to_original_arg() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        // 1. Prologue spill: *(rbp-8) = rdi
+        let prologue_spill = Expr::assign(
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8),
+            Expr::var(Variable::reg("rdi", 8)),
+        );
+        // 2. Body write to same slot from a NON-arg source:
+        //    *(rbp-8) = arbitrary value (here, an Unknown).
+        let body_write = Expr::assign(
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8),
+            Expr::unknown("other_value"),
+        );
+        // 3. Later: tmp = *(*(rbp-8))
+        let later_load = Expr::assign(
+            Expr::unknown("tmp"),
+            Expr::deref(
+                Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8),
+                8,
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![prologue_spill, body_write, later_load],
+            address_range: (0x1000, 0x1030),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        if let Some(rdi_param) = sig.parameters.iter().find(|p| {
+            matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            )
+        }) {
+            assert!(
+                !matches!(
+                    rdi_param.param_type,
+                    ParamType::Pointer | ParamType::TypedPointer(_)
+                ),
+                "rdi MUST NOT be typed as pointer after its spill slot was overwritten, got {:?}",
+                rdi_param.param_type
+            );
+        }
+    }
+
+    /// Codex review on PR #32 pass 8: if the spilled arg register
+    /// is clobbered (written) before its folded spill-reload is
+    /// analyzed, the regular `record_usage_hint` resolver discards
+    /// the hint because the register isn't "read before written".
+    /// But the spill-offset evidence is HARD evidence — the prologue
+    /// scan recorded that this slot is the param's home regardless
+    /// of subsequent register reuse. The dedicated
+    /// `record_hint_for_arg_register` bypass keeps the hint.
+    #[test]
+    fn test_spilled_pointer_recovers_even_when_register_clobbered_first() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        // Body:
+        //   rdi = 0;                ; clobber rdi as a scratch
+        //   tmp = *(*(rbp-16) + idx*8)  ; indexed access via spill
+        let clobber = Expr::assign(Expr::var(Variable::reg("rdi", 8)), Expr::int(0));
+        let xs_reload = Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(16)), 8);
+        let scaled = Expr::binop(BinOpKind::Mul, Expr::unknown("var_2c"), Expr::int(8));
+        let elem = Expr::deref(
+            Expr::binop(BinOpKind::Add, xs_reload, scaled),
+            8,
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![clobber, Expr::assign(Expr::unknown("tmp"), elem)],
+            address_range: (0x1000, 0x1030),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -16,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "spilled pointer should be recovered even after rdi was clobbered, got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #32 pass 7: the structurer can fold the
+    /// addend pair in either order, so `idx*8 + *(rbp-16)` is the
+    /// commuted form of the saxpy pattern and must also propagate.
+    #[test]
+    fn test_commuted_spill_pointer_arithmetic_recovers_pointer() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let xs_reload = Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(16)), 8);
+        let scaled = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("var_2c"),
+            Expr::int(8),
+        );
+        // Commuted: scaled-index on the LEFT, spill load on the RIGHT.
+        let elem = Expr::deref(Expr::binop(BinOpKind::Add, scaled, xs_reload), 8);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::assign(Expr::unknown("tmp"), elem)],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![
+                ParamSpillObservation {
+                    register: "xmm0".to_string(),
+                    offset: -8,
+                },
+                ParamSpillObservation {
+                    register: "rdi".to_string(),
+                    offset: -16,
+                },
+            ]);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "commuted Add (idx*8 + spill) should still recover rdi as pointer, got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #32 pass 4: `long f(long n) { return n+1; }`
+    /// lifts to `Deref(rbp-8, 8) + 1` — same shape as a pointer
+    /// reload with an IntLit offset. Width gate alone (`>= 8`) lets
+    /// it through; we additionally require a scaled-index rhs
+    /// (`Mul` / `Shl`) before claiming pointer arithmetic.
+    #[test]
+    fn test_long_scalar_plus_one_does_not_force_pointer_typing() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let n_reload = || Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8);
+        let n_plus_one = Expr::binop(BinOpKind::Add, n_reload(), Expr::int(1));
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::assign(Expr::unknown("tmp"), n_plus_one)],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        for p in &sig.parameters {
+            assert!(
+                !matches!(
+                    p.param_type,
+                    ParamType::Pointer | ParamType::TypedPointer(_)
+                ),
+                "scalar 64-bit add must not force pointer typing on {:?} (full sig: {:?})",
+                p,
+                sig.parameters
+            );
+        }
+    }
+
+    /// Codex review on PR #32 pass 3: a spilled `int *p` reloaded
+    /// and dereferenced as `Deref(Deref(rbp-8, 8), 4)` must still
+    /// recover as pointer even though the OUTER pointee width is 4.
+    /// The gate keys on the ADDRESS load width (8 bytes here),
+    /// not the pointee width.
+    #[test]
+    fn test_spilled_pointer_with_narrow_pointee_recovers_as_pointer() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        // *p where p = rdi was spilled at -8 and p points to int (4 bytes).
+        let p_reload = Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(8)), 8);
+        let star_p = Expr::deref(p_reload, 4);
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![Expr::assign(Expr::unknown("tmp"), star_p)],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "rdi".to_string(),
+                offset: -8,
+            }]);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| {
+                matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+                )
+            })
+            .expect("rdi parameter present");
+        assert!(
+            matches!(
+                rdi_param.param_type,
+                ParamType::Pointer | ParamType::TypedPointer(_)
+            ),
+            "rdi should recover as pointer despite narrow pointee, got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #32 pass 2: the initial spill-slot bridge
+    /// mis-typed scalar args as pointers when they were just being
+    /// reloaded for plain integer use. Two scenarios:
+    ///   tmp = *(rbp-4)      ← `int n` reload, value used as int
+    ///   tmp = *(rbp-4) + 1  ← `n + 1`, value used as int
+    /// Both must keep the spilled `edi` as int, not pointer.
+    #[test]
+    fn test_scalar_spill_reload_does_not_force_pointer_typing() {
+        use hexray_core::BasicBlockId;
+        let rbp = || Expr::var(Variable::reg("rbp", 8));
+        let n_reload = || {
+            Expr::deref(Expr::binop(BinOpKind::Sub, rbp(), Expr::int(4)), 4)
+        };
+
+        // Body shape:
+        //   tmp_a = *(rbp-4)            ; scalar reload
+        //   tmp_b = *(rbp-4) + 1        ; n + 1
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(Expr::unknown("tmp_a"), n_reload()),
+                Expr::assign(
+                    Expr::unknown("tmp_b"),
+                    Expr::binop(BinOpKind::Add, n_reload(), Expr::int(1)),
+                ),
+            ],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_param_spill_order(vec![ParamSpillObservation {
+                register: "edi".to_string(),
+                offset: -4,
+            }]);
+        let sig = recovery.analyze(&cfg);
+
+        // No recovered parameter may be a pointer just because its
+        // spill slot was reloaded for plain scalar use. (The arg
+        // may or may not surface at all — what matters is the
+        // false-positive pointer hint stays off.)
+        for p in &sig.parameters {
+            assert!(
+                !matches!(
+                    p.param_type,
+                    ParamType::Pointer | ParamType::TypedPointer(_)
+                ),
+                "scalar int spill reload mis-typed param {:?} as pointer (full sig: {:?})",
+                p,
+                sig.parameters
+            );
+        }
     }
 
     #[test]
