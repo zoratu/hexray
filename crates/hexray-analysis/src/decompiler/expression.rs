@@ -1714,33 +1714,24 @@ impl Expr {
             "xorps" | "xorpd" | "pxor" | "vxorps" | "vxorpd" | "vpxor" => BinOpKind::Xor,
             _ => return None,
         };
+        // Restrict to the memory-source shape. Reg-reg `pxor`/`pand`
+        // is genuine integer-SIMD bitwise work in many cases (e.g.
+        // mask computation in vectorized code), and the existing
+        // `test_pxor_distinct_xmm_registers_stays_opaque` test
+        // protects that the opaque comment is preserved. The
+        // memory-source form `pand xmm0, [rip + .LCPI]` is the
+        // unambiguous compiler-emitted constant-pool pattern.
+        //
         // Two shapes:
-        //   * Legacy SSE 2-operand `op xmm_dst, src` where src is a
-        //     memory or register.
-        //   * AVX VEX-encoded 3-operand `vop xmm_dst, xmm_src1, src`
-        //     where src is memory or register.
-        // We accept ALL register-source forms because clang -O0 emits
-        // the fabs/neg idiom as `movaps xmm1, [.LCPI]; pand xmm0, xmm1`
-        // — the second instruction's source is a register, not memory.
-        // Lifting reg-reg pand as `xmm0 = xmm0 & xmm1` lets substitute
-        // propagate the mask constant from the preceding movaps.
-        // For the self-XOR zero case, the dedicated
-        // `lift_sse_self_xor_zero` runs first and skips us.
-        let (dst_reg, src_expr) = match inst.operands.as_slice() {
-            [Operand::Register(d), Operand::Memory(m)] => {
-                (d, Self::from_memory_with_context(m, inst, false))
-            }
-            [Operand::Register(d), Operand::Register(s)] => {
-                (d, Self::var(Variable::from_register(s)))
-            }
-            [Operand::Register(d), Operand::Register(_), Operand::Memory(m)] => {
-                (d, Self::from_memory_with_context(m, inst, false))
-            }
-            [Operand::Register(d), Operand::Register(_), Operand::Register(s)] => {
-                (d, Self::var(Variable::from_register(s)))
-            }
+        //   * Legacy SSE 2-operand `op xmm_dst, mem`.
+        //   * AVX VEX-encoded 3-operand `vop xmm_dst, xmm_src1, mem`.
+        let (dst_reg, mem) = match inst.operands.as_slice() {
+            [Operand::Register(d), Operand::Memory(m)] => (d, m),
+            [Operand::Register(d), Operand::Register(_), Operand::Memory(m)] => (d, m),
             _ => return None,
         };
+        let src_expr = Self::from_memory_with_context(mem, inst, false);
+        let dst_reg = dst_reg;
         let dst_name = dst_reg.name().to_ascii_lowercase();
         if !(dst_name.starts_with("xmm")
             || dst_name.starts_with("ymm")
