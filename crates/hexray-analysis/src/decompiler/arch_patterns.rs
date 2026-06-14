@@ -1077,6 +1077,18 @@ fn simplify_arm64_csinc_pattern(expr: &Expr) -> Option<Expr> {
 /// - `a + b * c` => madd(a, b, c) (if not already simplified)
 /// - `a - b * c` => msub(a, b, c)
 /// - `-(b * c)` => mneg(b, c)
+///
+/// **Float-context guard**: only fires when no operand looks
+/// floating-point. The ARM64 integer MADD has no float analog at
+/// this representation level — float FMA on ARM64 is emitted by
+/// the lifter as a dedicated FMADD/FNMADD/etc. Call, never as a
+/// `mul + add` pair to recover. On x86, a `mulsd + addsd`
+/// sequence is NOT semantically a fused multiply-add (two
+/// roundings vs one), so the pattern would produce a misleading
+/// `madd` Call that has no x86 instruction backing. The saxpy
+/// recovery (`a*xs[i] + ys[i]`) was the canonical failure: the
+/// pattern collapsed the addsd chain into `madd(farg0, farg2,
+/// farg1)`, dropping the xs[i] / ys[i] load context.
 fn simplify_arm64_madd_pattern(expr: &Expr) -> Option<Expr> {
     // Pattern: a + b * c => fma(b, c, a) for floating-point or madd(b, c, a) for integer
     if let ExprKind::BinOp {
@@ -1091,6 +1103,12 @@ fn simplify_arm64_madd_pattern(expr: &Expr) -> Option<Expr> {
             right: mul_right,
         } = &product.kind
         {
+            if expr_in_float_context(mul_left)
+                || expr_in_float_context(mul_right)
+                || expr_in_float_context(addend)
+            {
+                return None;
+            }
             // a + b * c => madd(b, c, a)
             return Some(Expr::call(
                 CallTarget::Named("madd".to_string()),
@@ -1109,6 +1127,12 @@ fn simplify_arm64_madd_pattern(expr: &Expr) -> Option<Expr> {
             right: mul_right,
         } = &addend.kind
         {
+            if expr_in_float_context(mul_left)
+                || expr_in_float_context(mul_right)
+                || expr_in_float_context(product)
+            {
+                return None;
+            }
             return Some(Expr::call(
                 CallTarget::Named("madd".to_string()),
                 vec![
@@ -1133,6 +1157,12 @@ fn simplify_arm64_madd_pattern(expr: &Expr) -> Option<Expr> {
             right: mul_right,
         } = &product.kind
         {
+            if expr_in_float_context(mul_left)
+                || expr_in_float_context(mul_right)
+                || expr_in_float_context(minuend)
+            {
+                return None;
+            }
             return Some(Expr::call(
                 CallTarget::Named("msub".to_string()),
                 vec![
@@ -1156,6 +1186,9 @@ fn simplify_arm64_madd_pattern(expr: &Expr) -> Option<Expr> {
             right: mul_right,
         } = &operand.kind
         {
+            if expr_in_float_context(mul_left) || expr_in_float_context(mul_right) {
+                return None;
+            }
             return Some(Expr::call(
                 CallTarget::Named("mneg".to_string()),
                 vec![mul_left.as_ref().clone(), mul_right.as_ref().clone()],
@@ -1164,6 +1197,79 @@ fn simplify_arm64_madd_pattern(expr: &Expr) -> Option<Expr> {
     }
 
     None
+}
+
+/// Detect whether `expr` is operating in a floating-point context
+/// for the ARM64 MADD/MSUB/MNEG pattern guard.
+///
+/// Any sub-expression naming a float-class register (`xmm*`, `ymm*`,
+/// `zmm*`, `d0`-`d7`, `s0`-`s7`, `q0`-`q7`, `v0`-`v7`), a float-arg
+/// alias (`farg*`), or a Float-typed Cast taints the entire
+/// expression. The check is conservative: false positives just
+/// disable an integer MADD recognition (no semantic loss), while
+/// false negatives would (re-)introduce the saxpy collapse bug.
+fn expr_in_float_context(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Var(var) => is_float_register_name(&var.name),
+        ExprKind::Unknown(name) => is_float_register_name(name),
+        ExprKind::Cast { expr: inner, .. } => expr_in_float_context(inner),
+        ExprKind::BinOp { left, right, .. } => {
+            expr_in_float_context(left) || expr_in_float_context(right)
+        }
+        ExprKind::UnaryOp { operand, .. } | ExprKind::BitField { expr: operand, .. } => {
+            expr_in_float_context(operand)
+        }
+        ExprKind::Deref { addr, .. } => expr_in_float_context(addr),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_in_float_context(base) || expr_in_float_context(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_in_float_context(base),
+        ExprKind::AddressOf(inner) => expr_in_float_context(inner),
+        ExprKind::Call { target, args } => {
+            (match target {
+                CallTarget::Named(name) => is_float_register_name(name),
+                _ => false,
+            }) || args.iter().any(expr_in_float_context)
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_in_float_context(cond)
+                || expr_in_float_context(then_expr)
+                || expr_in_float_context(else_expr)
+        }
+        ExprKind::Phi(args) => args.iter().any(expr_in_float_context),
+        ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            expr_in_float_context(lhs) || expr_in_float_context(rhs)
+        }
+        _ => false,
+    }
+}
+
+fn is_float_register_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("xmm")
+        || lower.starts_with("ymm")
+        || lower.starts_with("zmm")
+        || lower.starts_with("farg")
+    {
+        return true;
+    }
+    // ARM64 / AArch64 SIMD-FP register aliases — but only when the
+    // suffix is a one- or two-digit number (avoid matching unrelated
+    // identifiers like `dest`, `sum`, `vector`, `qword`).
+    if let Some(suffix) = lower
+        .strip_prefix('d')
+        .or_else(|| lower.strip_prefix('s'))
+        .or_else(|| lower.strip_prefix('q'))
+        .or_else(|| lower.strip_prefix('v'))
+        .or_else(|| lower.strip_prefix('h'))
+    {
+        return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+    }
+    false
 }
 
 // === RISC-V pseudo-instruction patterns ===
@@ -1842,6 +1948,115 @@ mod tests {
                 assert_eq!(name, "msub");
                 assert_eq!(args.len(), 3);
             }
+        }
+    }
+
+    /// Float-context guard: `farg0 * farg2 + farg1` looks like an
+    /// FMA pattern but the operands are floating-point on x86 (where
+    /// `mulsd; addsd` is two roundings, NOT a fused multiply-add) and
+    /// on ARM64 (where float FMA is a dedicated FMADD opcode that the
+    /// lifter emits directly). Must NOT collapse to `madd(...)`.
+    /// This was the saxpy_dot bug: `a * xs[i] + ys[i]` got mangled
+    /// into `madd(farg0, farg2, farg1)`, dropping the xs[i]/ys[i]
+    /// load context.
+    #[test]
+    fn test_madd_pattern_skips_float_operands() {
+        // farg0 * farg2 + farg1
+        let expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg0"),
+                Expr::unknown("farg2"),
+            ),
+            Expr::unknown("farg1"),
+        );
+        let simplified = simplify_arm64_madd_pattern(&expr);
+        assert!(
+            simplified.is_none(),
+            "float operands must NOT be collapsed into madd, got {simplified:?}",
+        );
+
+        // xmm0 * xmm2 + xmm1 — same case via raw register vars.
+        let xmm_expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                make_var("xmm0"),
+                make_var("xmm2"),
+            ),
+            make_var("xmm1"),
+        );
+        assert!(
+            simplify_arm64_madd_pattern(&xmm_expr).is_none(),
+            "xmm vars must NOT be collapsed into madd",
+        );
+
+        // d0/d1/d2 (ARM64 FP regs) — also skip.
+        let d_expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(BinOpKind::Mul, make_var("d0"), make_var("d2")),
+            make_var("d1"),
+        );
+        assert!(
+            simplify_arm64_madd_pattern(&d_expr).is_none(),
+            "ARM64 d* fp regs must NOT be collapsed into madd",
+        );
+    }
+
+    /// Companion: msub must also be float-gated.
+    #[test]
+    fn test_msub_pattern_skips_float_operands() {
+        let expr = Expr::binop(
+            BinOpKind::Sub,
+            Expr::unknown("farg0"),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg1"),
+                Expr::unknown("farg2"),
+            ),
+        );
+        assert!(simplify_arm64_madd_pattern(&expr).is_none());
+    }
+
+    /// And mneg.
+    #[test]
+    fn test_mneg_pattern_skips_float_operands() {
+        let expr = Expr::unary(
+            UnaryOpKind::Neg,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg0"),
+                Expr::unknown("farg1"),
+            ),
+        );
+        assert!(simplify_arm64_madd_pattern(&expr).is_none());
+    }
+
+    /// Integer operands still collapse — the gate is float-specific.
+    #[test]
+    fn test_madd_pattern_still_fires_for_integer_operands() {
+        // (rdi * rsi) + rdx → madd(rdi, rsi, rdx)
+        let expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                make_var("rdi"),
+                make_var("rsi"),
+            ),
+            make_var("rdx"),
+        );
+        let simplified = simplify_arm64_madd_pattern(&expr);
+        assert!(simplified.is_some(), "integer madd must still fire");
+        if let Some(Expr {
+            kind: ExprKind::Call {
+                target: CallTarget::Named(name),
+                ..
+            },
+            ..
+        }) = simplified
+        {
+            assert_eq!(name, "madd");
         }
     }
 
