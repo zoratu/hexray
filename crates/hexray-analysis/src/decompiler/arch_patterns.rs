@@ -1213,6 +1213,12 @@ fn expr_in_float_context(expr: &Expr) -> bool {
         ExprKind::Var(var) => is_float_register_name(&var.name),
         ExprKind::Unknown(name) => is_float_register_name(name),
         ExprKind::Cast { expr: inner, .. } => expr_in_float_context(inner),
+        // The lifter sets `is_float_context` on rip-relative loads
+        // whose destination is a SIMD-FP register, so a `mulsd xmm0,
+        // [rip + .L]` that's been propagated to a GotRef still needs
+        // to taint the surrounding expression. Codex review on PR #35
+        // pass 1.
+        ExprKind::GotRef { is_float_context, .. } => *is_float_context,
         ExprKind::BinOp { left, right, .. } => {
             expr_in_float_context(left) || expr_in_float_context(right)
         }
@@ -1260,9 +1266,16 @@ fn is_float_register_name(name: &str) -> bool {
     // ARM64 / AArch64 SIMD-FP register aliases — but only when the
     // suffix is a one- or two-digit number (avoid matching unrelated
     // identifiers like `dest`, `sum`, `vector`, `qword`).
+    //
+    // We do NOT include `s*` here. ARM64 single-precision registers
+    // are `s0`-`s31`, but RISC-V saved INTEGER registers are also
+    // `s0`-`s11`, and this pattern recognition runs arch-agnostically
+    // — accepting `s<num>` as float would suppress legitimate integer
+    // MADD recoveries on RISC-V. The d/q/v/h prefixes are
+    // ARM64-specific and don't collide with other architectures'
+    // common naming. Codex review on PR #35 pass 1.
     if let Some(suffix) = lower
         .strip_prefix('d')
-        .or_else(|| lower.strip_prefix('s'))
         .or_else(|| lower.strip_prefix('q'))
         .or_else(|| lower.strip_prefix('v'))
         .or_else(|| lower.strip_prefix('h'))
@@ -2031,6 +2044,91 @@ mod tests {
             ),
         );
         assert!(simplify_arm64_madd_pattern(&expr).is_none());
+    }
+
+    /// Codex review on PR #35 pass 1: RISC-V uses `s0`-`s11` as saved
+    /// INTEGER registers. The float gate must not suppress integer
+    /// MADD recoveries on RISC-V just because the spelling looks
+    /// like ARM64's single-precision SIMD-FP regs.
+    #[test]
+    fn test_madd_pattern_still_fires_for_riscv_s_integer_regs() {
+        // s0 * a0 + a1 — RISC-V integer madd, must collapse.
+        let expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(BinOpKind::Mul, make_var("s0"), make_var("a0")),
+            make_var("a1"),
+        );
+        let simplified = simplify_arm64_madd_pattern(&expr);
+        assert!(
+            simplified.is_some(),
+            "RISC-V integer `s0 * a0 + a1` must still collapse to madd",
+        );
+        if let Some(Expr {
+            kind: ExprKind::Call {
+                target: CallTarget::Named(name),
+                ..
+            },
+            ..
+        }) = simplified
+        {
+            assert_eq!(name, "madd");
+        }
+    }
+
+    /// Codex review on PR #35 pass 1: the lifter sets
+    /// `is_float_context: true` on rip-relative loads whose
+    /// destination is a SIMD-FP register. If the float operand was
+    /// substituted to a GotRef rather than an xmm name, the guard
+    /// must still recognize it as float.
+    #[test]
+    fn test_madd_pattern_skips_float_context_gotref() {
+        use crate::decompiler::expression::Expr as RawExpr;
+        let float_gotref = RawExpr {
+            kind: ExprKind::GotRef {
+                address: 0x1000,
+                instruction_address: 0x40,
+                size: 8,
+                display_expr: Box::new(Expr::int(0)),
+                is_deref: true,
+                is_float_context: true,
+            },
+        };
+        // farg0 * <float-gotref> + farg1  — full float chain via
+        // GotRef must not collapse.
+        let expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg0"),
+                float_gotref.clone(),
+            ),
+            Expr::unknown("farg1"),
+        );
+        assert!(
+            simplify_arm64_madd_pattern(&expr).is_none(),
+            "float-context GotRef must taint surrounding expression",
+        );
+
+        // Non-float GotRef still allows the integer madd to collapse.
+        let int_gotref = RawExpr {
+            kind: ExprKind::GotRef {
+                address: 0x2000,
+                instruction_address: 0x60,
+                size: 8,
+                display_expr: Box::new(Expr::int(0)),
+                is_deref: true,
+                is_float_context: false,
+            },
+        };
+        let int_expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(BinOpKind::Mul, make_var("rdi"), int_gotref),
+            make_var("rsi"),
+        );
+        assert!(
+            simplify_arm64_madd_pattern(&int_expr).is_some(),
+            "non-float-context GotRef must NOT taint the recovery",
+        );
     }
 
     /// Integer operands still collapse — the gate is float-specific.
