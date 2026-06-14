@@ -1263,19 +1263,25 @@ fn is_float_register_name(name: &str) -> bool {
     {
         return true;
     }
-    // ARM64 / AArch64 SIMD-FP register aliases — but only when the
-    // suffix is a one- or two-digit number (avoid matching unrelated
-    // identifiers like `dest`, `sum`, `vector`, `qword`).
+    // ARM64 / AArch64 SIMD-FP register aliases — `s*` (single-precision),
+    // `d*` (double), `q*` (quad), `v*` (vector), `h*` (half). Each
+    // accepted only when the suffix is all digits, to avoid matching
+    // unrelated identifiers like `dest`, `sum`, `qword`, `hi`.
     //
-    // We do NOT include `s*` here. ARM64 single-precision registers
-    // are `s0`-`s31`, but RISC-V saved INTEGER registers are also
-    // `s0`-`s11`, and this pattern recognition runs arch-agnostically
-    // — accepting `s<num>` as float would suppress legitimate integer
-    // MADD recoveries on RISC-V. The d/q/v/h prefixes are
-    // ARM64-specific and don't collide with other architectures'
-    // common naming. Codex review on PR #35 pass 1.
+    // Codex passes 1 and 2 raised opposing concerns about `s*`:
+    //   - RISC-V uses `s0`-`s11` as saved INTEGER registers, so
+    //     including `s*` suppresses integer MADD recoveries on those.
+    //   - ARM64 uses `s0`-`s31` as single-precision FP registers, so
+    //     EXcluding `s*` mis-labels float `s0 * s1 + s2` chains as
+    //     integer `madd`.
+    // We include `s*` here because false positives on ARM64 float FMA
+    // are semantically incorrect (relabeling a float computation as an
+    // integer multiply-add), whereas false positives on RISC-V integer
+    // expressions only lose a cosmetic madd collapse (the recovery
+    // stays as `s0 * a0 + a1`, which is readable and correct).
     if let Some(suffix) = lower
         .strip_prefix('d')
+        .or_else(|| lower.strip_prefix('s'))
         .or_else(|| lower.strip_prefix('q'))
         .or_else(|| lower.strip_prefix('v'))
         .or_else(|| lower.strip_prefix('h'))
@@ -2046,22 +2052,28 @@ mod tests {
         assert!(simplify_arm64_madd_pattern(&expr).is_none());
     }
 
-    /// Codex review on PR #35 pass 1: RISC-V uses `s0`-`s11` as saved
-    /// INTEGER registers. The float gate must not suppress integer
-    /// MADD recoveries on RISC-V just because the spelling looks
-    /// like ARM64's single-precision SIMD-FP regs.
+    /// RISC-V integer MADD recovery using non-overlapping register
+    /// names (`t0`/`a0`/`a1`). These don't collide with ARM64 FP
+    /// naming, so the recovery must still fire. Note the explicit
+    /// trade-off: `s0`-`s11` (RISC-V saved integer regs) DO overlap
+    /// with ARM64 single-precision `s0`-`s31`, and the float gate
+    /// favors correctness on ARM64 (suppressing `madd` for those),
+    /// at the cost of also suppressing RISC-V integer madd
+    /// recognition for those exact registers. See the comment on
+    /// `is_float_register_name` for the codex pass 1+2 trade-off.
     #[test]
-    fn test_madd_pattern_still_fires_for_riscv_s_integer_regs() {
-        // s0 * a0 + a1 — RISC-V integer madd, must collapse.
+    fn test_madd_pattern_still_fires_for_riscv_non_overlapping_integer_regs() {
+        // t0 * a0 + a1 — RISC-V integer madd using temporary/arg
+        // registers (no overlap with ARM64 FP naming).
         let expr = Expr::binop(
             BinOpKind::Add,
-            Expr::binop(BinOpKind::Mul, make_var("s0"), make_var("a0")),
+            Expr::binop(BinOpKind::Mul, make_var("t0"), make_var("a0")),
             make_var("a1"),
         );
         let simplified = simplify_arm64_madd_pattern(&expr);
         assert!(
             simplified.is_some(),
-            "RISC-V integer `s0 * a0 + a1` must still collapse to madd",
+            "RISC-V integer `t0 * a0 + a1` must still collapse to madd",
         );
         if let Some(Expr {
             kind: ExprKind::Call {
@@ -2073,6 +2085,23 @@ mod tests {
         {
             assert_eq!(name, "madd");
         }
+    }
+
+    /// Companion: ARM64 single-precision FP `s0 * s1 + s2` MUST NOT
+    /// collapse to integer `madd(...)`. Codex review on PR #35
+    /// pass 2 flagged the false negative if `s*` was excluded from
+    /// the float guard.
+    #[test]
+    fn test_madd_pattern_skips_arm64_single_precision_s_regs() {
+        let expr = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(BinOpKind::Mul, make_var("s0"), make_var("s1")),
+            make_var("s2"),
+        );
+        assert!(
+            simplify_arm64_madd_pattern(&expr).is_none(),
+            "ARM64 single-precision `s0 * s1 + s2` MUST NOT collapse",
+        );
     }
 
     /// Codex review on PR #35 pass 1: the lifter sets
