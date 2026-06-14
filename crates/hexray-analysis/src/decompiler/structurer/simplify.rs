@@ -5306,6 +5306,192 @@ fn expr_node_count(expr: &Expr) -> usize {
     expr_node_count_bounded(expr, SUBSTITUTION_VALUE_NODE_CAP)
 }
 
+/// Recursive structural equality on Exprs, sufficient for the
+/// call-argument replacement guard in
+/// [`should_replace_existing_call_args`].
+///
+/// `Display` cannot serve as a proxy because `Expr`'s formatter
+/// omits parentheses around nested BinOps with the same operator —
+/// `(a - b) - c` and `a - (b - c)` would print identically. Codex
+/// review on PR #34 pass 5 flagged this as defeating the equal-size
+/// stale-protection in exactly the case it was meant to protect.
+fn exprs_call_arg_structurally_equal(left: &Expr, right: &Expr) -> bool {
+    use super::super::expression::ExprKind;
+    match (&left.kind, &right.kind) {
+        (ExprKind::Var(a), ExprKind::Var(b)) => a == b,
+        (ExprKind::IntLit(a), ExprKind::IntLit(b)) => a == b,
+        (ExprKind::Unknown(a), ExprKind::Unknown(b)) => a == b,
+        (
+            ExprKind::BinOp {
+                op: op_a,
+                left: la,
+                right: ra,
+            },
+            ExprKind::BinOp {
+                op: op_b,
+                left: lb,
+                right: rb,
+            },
+        ) => {
+            op_a == op_b
+                && exprs_call_arg_structurally_equal(la, lb)
+                && exprs_call_arg_structurally_equal(ra, rb)
+        }
+        (
+            ExprKind::UnaryOp {
+                op: op_a,
+                operand: a,
+            },
+            ExprKind::UnaryOp {
+                op: op_b,
+                operand: b,
+            },
+        ) => op_a == op_b && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::Deref {
+                addr: a,
+                size: size_a,
+            },
+            ExprKind::Deref {
+                addr: b,
+                size: size_b,
+            },
+        ) => size_a == size_b && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::ArrayAccess {
+                base: ba,
+                index: ia,
+                element_size: ea,
+            },
+            ExprKind::ArrayAccess {
+                base: bb,
+                index: ib,
+                element_size: eb,
+            },
+        ) => {
+            ea == eb
+                && exprs_call_arg_structurally_equal(ba, bb)
+                && exprs_call_arg_structurally_equal(ia, ib)
+        }
+        (
+            ExprKind::FieldAccess {
+                base: ba,
+                offset: oa,
+                field_name: fa,
+            },
+            ExprKind::FieldAccess {
+                base: bb,
+                offset: ob,
+                field_name: fb,
+            },
+        ) => oa == ob && fa == fb && exprs_call_arg_structurally_equal(ba, bb),
+        (ExprKind::AddressOf(a), ExprKind::AddressOf(b)) => {
+            exprs_call_arg_structurally_equal(a, b)
+        }
+        (
+            ExprKind::Cast {
+                expr: a,
+                to_size: sa,
+                signed: za,
+            },
+            ExprKind::Cast {
+                expr: b,
+                to_size: sb,
+                signed: zb,
+            },
+        ) => sa == sb && za == zb && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::BitField {
+                expr: a,
+                start: sa,
+                width: wa,
+            },
+            ExprKind::BitField {
+                expr: b,
+                start: sb,
+                width: wb,
+            },
+        ) => sa == sb && wa == wb && exprs_call_arg_structurally_equal(a, b),
+        (
+            ExprKind::Assign { lhs: la, rhs: ra },
+            ExprKind::Assign { lhs: lb, rhs: rb },
+        ) => {
+            exprs_call_arg_structurally_equal(la, lb)
+                && exprs_call_arg_structurally_equal(ra, rb)
+        }
+        (
+            ExprKind::CompoundAssign {
+                op: op_a,
+                lhs: la,
+                rhs: ra,
+            },
+            ExprKind::CompoundAssign {
+                op: op_b,
+                lhs: lb,
+                rhs: rb,
+            },
+        ) => {
+            op_a == op_b
+                && exprs_call_arg_structurally_equal(la, lb)
+                && exprs_call_arg_structurally_equal(ra, rb)
+        }
+        (
+            ExprKind::Call {
+                target: ta,
+                args: aa,
+            },
+            ExprKind::Call {
+                target: tb,
+                args: ab,
+            },
+        ) => {
+            format!("{ta:?}") == format!("{tb:?}")
+                && aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab.iter())
+                    .all(|(a, b)| exprs_call_arg_structurally_equal(a, b))
+        }
+        (
+            ExprKind::Conditional {
+                cond: ca,
+                then_expr: ta,
+                else_expr: ea,
+            },
+            ExprKind::Conditional {
+                cond: cb,
+                then_expr: tb,
+                else_expr: eb,
+            },
+        ) => {
+            exprs_call_arg_structurally_equal(ca, cb)
+                && exprs_call_arg_structurally_equal(ta, tb)
+                && exprs_call_arg_structurally_equal(ea, eb)
+        }
+        (
+            ExprKind::GotRef {
+                address: aa,
+                size: sa,
+                is_deref: da,
+                ..
+            },
+            ExprKind::GotRef {
+                address: ab,
+                size: sb,
+                is_deref: db,
+                ..
+            },
+        ) => aa == ab && sa == sb && da == db,
+        (ExprKind::Phi(a), ExprKind::Phi(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| exprs_call_arg_structurally_equal(x, y))
+        }
+        _ => false,
+    }
+}
+
 /// Substitute variable references with their known values and simplify.
 ///
 /// Two phases: a simplify-free recursive substitution ([`substitute_vars_rec`])
@@ -8187,9 +8373,72 @@ fn should_replace_existing_call_args(
     recovered_args: &[Expr],
     used_indices: &[usize],
 ) -> bool {
-    !used_indices.is_empty()
+    if !used_indices.is_empty()
         || (existing_args.is_empty() && !recovered_args.is_empty())
         || recovered_args.len() > existing_args.len()
+    {
+        // Guard against truncating a previously-recovered complex
+        // argument back to a partial one. A later pass that walks
+        // `result` may see only the most recent xmm-register
+        // assignment (e.g. `xmm0 = x*x` after the `xmm0 = x*x + y*y`
+        // statement was consumed by an earlier pass) and would
+        // happily replace the good `[x*x + y*y]` with the partial
+        // `[x*x]`. Refuse the replacement when EVERY existing arg
+        // has structure worth protecting (> 2 nodes — a minimal
+        // BinOp with two operands) AND every recovered arg is no
+        // LARGER than the corresponding existing arg.
+        //
+        // Refuse only when SOMETHING is actually at risk:
+        //   - Truncation: complex existing has strictly more nodes
+        //     than recovered (hypot2 case).
+        //   - Equal-size stale: complex existing has the same node
+        //     count as recovered BUT structurally different (pass 1
+        //     concern — a same-size stale could overwrite a good
+        //     recovery).
+        //
+        // Two-part gate so legitimate pass-through cleanup still
+        // runs (pass 2): replacing a synthesized `Var(rdi)` with a
+        // tracked concrete value like `0` is a 1→1 node swap that
+        // SHOULD happen.
+        //
+        // Use `any` (not `all`) so a thin pass-through arg coexisting
+        // with a complex arg doesn't disable protection for the
+        // complex one (pass 3).
+        //
+        // Equal-size structurally-IDENTICAL existing args don't
+        // block the replacement (pass 4) — when typed recovery
+        // re-presents the same arg unchanged alongside a pass-
+        // through sibling that needs concretization, there's
+        // nothing to protect at that position.
+        if existing_args.len() == recovered_args.len()
+            && !existing_args.is_empty()
+            && existing_args
+                .iter()
+                .zip(recovered_args.iter())
+                .any(|(existing, recovered)| {
+                    let existing_nodes = expr_node_count(existing);
+                    if existing_nodes <= 2 {
+                        return false;
+                    }
+                    let recovered_nodes = expr_node_count(recovered);
+                    if existing_nodes > recovered_nodes {
+                        return true;
+                    }
+                    // Same node count: only veto when structurally
+                    // different (potential stale-replaces-good).
+                    // Use a proper recursive comparison — `Display`
+                    // omits parentheses for nested BinOps so
+                    // `(a-b)-c` and `a-(b-c)` would compare equal
+                    // (codex review on PR #34 pass 5).
+                    existing_nodes == recovered_nodes
+                        && !exprs_call_arg_structurally_equal(existing, recovered)
+                })
+        {
+            return false;
+        }
+        return true;
+    }
+    false
 }
 
 fn tracked_arg_register_priority(reg_name: &str) -> usize {
@@ -11995,6 +12244,245 @@ mod tests {
         assert_eq!(
             args.iter().map(|arg| format!("{arg}")).collect::<Vec<_>>(),
             ["rdi", "rsi"]
+        );
+    }
+
+    /// `hypot2(x, y) = sqrt(x*x + y*y)` — the addsd-chain recovery
+    /// puts `farg0 * farg0 + farg1 * farg1` as sqrt's existing arg
+    /// after the first simplifier pass. A subsequent basic-block
+    /// consolidation pass walks the rewritten statement list (which
+    /// no longer contains the addsd, because pass 1 consumed it),
+    /// recovers a TRUNCATED `farg0 * farg0` from the surviving
+    /// mulsd, and previously would replace the good arg with the
+    /// bad one because `should_replace_existing_call_args` only
+    /// gated on `!used_indices.is_empty()`. The guard added in this
+    /// PR rejects the replacement when every recovered arg is
+    /// strictly smaller than its corresponding existing arg.
+    #[test]
+    fn should_replace_existing_call_args_keeps_richer_existing_when_recovered_is_subset() {
+        // existing = [farg0 * farg0 + farg1 * farg1]  (the good
+        // result from the prior pass).
+        let big_arg = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg0"),
+                Expr::unknown("farg0"),
+            ),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg1"),
+                Expr::unknown("farg1"),
+            ),
+        );
+        // recovered = [farg0 * farg0]  (the truncation a later pass
+        // produces when the addsd statement has already been
+        // consumed). used_indices is non-empty (the surviving
+        // mulsd statement was reachable).
+        let small_arg = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg0"),
+        );
+        let used_indices = vec![9usize];
+
+        assert!(
+            !should_replace_existing_call_args(&[big_arg], &[small_arg], &used_indices),
+            "must NOT replace a richer existing arg with a smaller recovered arg",
+        );
+    }
+
+    /// Codex review on PR #34 pass 1: an equal-size stale recovered
+    /// arg must NOT replace an existing rich arg of the same size.
+    /// Both binary expressions of identical node count could be one
+    /// good (existing) and one stale (recovered) — without a deeper
+    /// equivalence check we can't distinguish, so we default to
+    /// keeping existing.
+    #[test]
+    fn should_replace_existing_call_args_keeps_equal_size_existing() {
+        // existing = farg0 + farg1  (3 nodes — the prior good pass)
+        let good = Expr::binop(
+            BinOpKind::Add,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg1"),
+        );
+        // recovered = farg0 - farg1  (3 nodes — a same-size stale)
+        let stale = Expr::binop(
+            BinOpKind::Sub,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg1"),
+        );
+        let used_indices = vec![7usize];
+
+        assert!(
+            !should_replace_existing_call_args(&[good], &[stale], &used_indices),
+            "equal-size existing must NOT be replaced by an equal-size recovered arg",
+        );
+    }
+
+    /// Codex review on PR #34 pass 2: the equal-size gate must not
+    /// block legitimate pass-through replacements. When an earlier
+    /// pass synthesized `Var(rdi)` as a placeholder, the later
+    /// recovery that maps it to a tracked constant `0` (or a
+    /// register-typed local) is a beneficial 1→1 node swap that
+    /// must be allowed.
+    #[test]
+    fn should_replace_existing_call_args_replaces_passthrough_with_concrete() {
+        // existing = Var(rdi)  (1 node — passthrough placeholder)
+        let placeholder = Expr::unknown("rdi");
+        // recovered = IntLit(0)  (1 node — tracked concrete value)
+        let concrete = Expr::int(0);
+        let used_indices = vec![3usize];
+
+        assert!(
+            should_replace_existing_call_args(&[placeholder], &[concrete], &used_indices),
+            "pass-through Var(rdi) → IntLit(0) replacement must be allowed",
+        );
+    }
+
+    /// Companion: a 2-node UnaryOp(Var) wrapper is also passthrough-
+    /// ish and should be replaced when a recovery surfaces. The
+    /// gate only protects > 2-node existing args.
+    #[test]
+    fn should_replace_existing_call_args_replaces_thin_unary_with_constant() {
+        // -rdi (UnaryOp Neg over Var) is 2 nodes.
+        let placeholder = Expr::unary(UnaryOpKind::Neg, Expr::unknown("rdi"));
+        let concrete = Expr::int(42);
+        let used_indices = vec![3usize];
+
+        assert!(
+            should_replace_existing_call_args(&[placeholder], &[concrete], &used_indices),
+            "thin UnaryOp(Var) (2 nodes) should not block 1-node concrete replacement",
+        );
+    }
+
+    /// Codex review on PR #34 pass 3: a thin/passthrough arg in a
+    /// multi-arg call must NOT disable protection for a coexisting
+    /// complex arg. If ANY position is a complex existing vs
+    /// smaller-or-equal recovered, the whole replacement is refused.
+    #[test]
+    fn should_replace_existing_call_args_keeps_complex_when_thin_sibling_exists() {
+        // existing = [farg0*farg0 + farg1*farg1, rsi]
+        let complex = Expr::binop(
+            BinOpKind::Add,
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg0"),
+                Expr::unknown("farg0"),
+            ),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::unknown("farg1"),
+                Expr::unknown("farg1"),
+            ),
+        );
+        let thin_existing = Expr::unknown("rsi");
+        // recovered = [farg0*farg0, 0]
+        let truncated = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg0"),
+        );
+        let thin_recovered = Expr::int(0);
+        let used_indices = vec![5usize, 3usize];
+
+        assert!(
+            !should_replace_existing_call_args(
+                &[complex, thin_existing],
+                &[truncated, thin_recovered],
+                &used_indices,
+            ),
+            "thin sibling must NOT enable complex-arg truncation"
+        );
+    }
+
+    /// Codex review on PR #34 pass 4: when typed recovery
+    /// re-presents an UNCHANGED complex arg alongside a thin
+    /// pass-through sibling that needs cleanup, the unchanged arg
+    /// must NOT veto the sibling cleanup. Structural equality at a
+    /// position means there's nothing to protect there.
+    #[test]
+    fn should_replace_existing_call_args_allows_sibling_cleanup_when_complex_unchanged() {
+        let complex = || {
+            Expr::binop(
+                BinOpKind::Add,
+                Expr::binop(
+                    BinOpKind::Mul,
+                    Expr::unknown("farg0"),
+                    Expr::unknown("farg0"),
+                ),
+                Expr::binop(
+                    BinOpKind::Mul,
+                    Expr::unknown("farg1"),
+                    Expr::unknown("farg1"),
+                ),
+            )
+        };
+        // existing = [complex, rsi]  recovered = [SAME complex, 0]
+        let used_indices = vec![3usize];
+        assert!(
+            should_replace_existing_call_args(
+                &[complex(), Expr::unknown("rsi")],
+                &[complex(), Expr::int(0)],
+                &used_indices,
+            ),
+            "unchanged complex arg must NOT block sibling pass-through cleanup",
+        );
+    }
+
+    /// Codex review on PR #34 pass 5: `Display` is lossy because
+    /// the formatter omits parens for same-operator nested BinOps.
+    /// `(a - b) - c` and `a - (b - c)` print identically but are
+    /// structurally different and produce different results. The
+    /// guard now uses recursive structural equality so this case
+    /// is correctly recognized as "different" and the replacement
+    /// is refused.
+    #[test]
+    fn should_replace_existing_call_args_uses_structural_equality_not_display() {
+        // (a - b) - c
+        let left_assoc = Expr::binop(
+            BinOpKind::Sub,
+            Expr::binop(BinOpKind::Sub, Expr::unknown("a"), Expr::unknown("b")),
+            Expr::unknown("c"),
+        );
+        // a - (b - c) — same nodes, different structure.
+        let right_assoc = Expr::binop(
+            BinOpKind::Sub,
+            Expr::unknown("a"),
+            Expr::binop(BinOpKind::Sub, Expr::unknown("b"), Expr::unknown("c")),
+        );
+        assert_eq!(
+            format!("{left_assoc}"),
+            format!("{right_assoc}"),
+            "Display is lossy (this is the bug codex flagged)",
+        );
+        let used_indices = vec![5usize];
+        assert!(
+            !should_replace_existing_call_args(
+                &[left_assoc],
+                &[right_assoc],
+                &used_indices,
+            ),
+            "structurally different same-size args must NOT trigger replacement",
+        );
+    }
+
+    #[test]
+    fn should_replace_existing_call_args_replaces_when_recovered_is_richer() {
+        // The opposite direction: when the recovery has more
+        // information than what's already there, we DO want to
+        // replace. (Common case for the first arg-recovery pass.)
+        let existing = Expr::unknown("xmm0");
+        let recovered = Expr::binop(
+            BinOpKind::Mul,
+            Expr::unknown("farg0"),
+            Expr::unknown("farg0"),
+        );
+        let used_indices = vec![5usize];
+
+        assert!(
+            should_replace_existing_call_args(&[existing], &[recovered], &used_indices),
+            "must replace a thin passthrough arg with a recovered expression",
         );
     }
 
