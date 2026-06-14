@@ -6323,6 +6323,14 @@ fn propagate_args_in_block_with_state(
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
+                // Snapshot the clobbered set BEFORE we mark the
+                // current LHS as written. A read of the LHS in this
+                // same statement's RHS (the canonical self-modify
+                // `rdi = rdi + 1`) refers to the INCOMING value, so
+                // stabilization needs to canonicalize it back to
+                // `arg0`. Using the post-insert set would block that
+                // canonicalization. Codex review on PR #36 pass 1.
+                let prior_clobbered_regs = clobbered_regs.clone();
                 // Once written, this register is a local temporary for the rest
                 // of the block, not the incoming argument.
                 for alias in &written_aliases {
@@ -6356,7 +6364,7 @@ fn propagate_args_in_block_with_state(
                 if is_temp_register(&v.name) {
                     let stabilized_temp_rhs = stabilize_saved_arg_registers_excluding(
                         tracked_rhs.clone(),
-                        &clobbered_regs,
+                        &prior_clobbered_regs,
                     );
                     // Sub-register writes (al, ah, ax, ...) must not propagate
                     // the substituted RHS at all under the canonical-name slot
@@ -6397,7 +6405,7 @@ fn propagate_args_in_block_with_state(
                         &tracked_rhs,
                         &state.arg_values,
                         Some(&state.saved_temp_values),
-                        &clobbered_regs,
+                        &prior_clobbered_regs,
                     );
                     if tracks_register_aliases && !expr_requires_single_evaluation(&tracked_rhs) {
                         let tracked_reg_value = preserved_tracked_arg_value.clone();
@@ -11947,6 +11955,41 @@ mod tests {
         assert!(
             rendered.contains("xmm2"),
             "scratch xmm2 def must survive (renders:\n{rendered})",
+        );
+    }
+
+    /// Codex review on PR #36 pass 1: a self-referential first
+    /// assignment `rdi = rdi + 1` reads the INCOMING `rdi` value
+    /// (which is the function's arg0). The clobber set must be
+    /// snapshotted BEFORE the LHS is added, otherwise the
+    /// self-read fails to canonicalize back to `arg0` and a later
+    /// call uses the raw register name.
+    #[test]
+    fn test_propagate_args_canonicalizes_self_read_to_incoming_arg() {
+        // rdi = rdi + 1
+        // call recurse
+        // The call's arg0 should be canonicalized to `arg0 + 1`,
+        // NOT left as `rdi + 1`.
+        let statements = vec![
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(BinOpKind::Add, reg("rdi", 8), Expr::int(1)),
+            ),
+            Expr::call(CallTarget::Named("recurse".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+        assert_eq!(args.len(), 1);
+        let arg_str = format!("{}", args[0]);
+        assert!(
+            arg_str.contains("arg0"),
+            "self-read of rdi must canonicalize to arg0, got `{arg_str}`",
         );
     }
 
