@@ -6397,6 +6397,7 @@ fn propagate_args_in_block_with_state(
                         &tracked_rhs,
                         &state.arg_values,
                         Some(&state.saved_temp_values),
+                        &clobbered_regs,
                     );
                     if tracks_register_aliases && !expr_requires_single_evaluation(&tracked_rhs) {
                         let tracked_reg_value = preserved_tracked_arg_value.clone();
@@ -9262,6 +9263,7 @@ fn resolve_tracked_arg_snapshot_value(
     tracked_rhs: &Expr,
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
     saved_temp_values: Option<&HashMap<String, Expr>>,
+    clobbered_regs: &HashSet<String>,
 ) -> Expr {
     use super::super::expression::ExprKind;
 
@@ -9275,7 +9277,14 @@ fn resolve_tracked_arg_snapshot_value(
         }
     }
 
-    stabilize_saved_arg_registers(tracked_rhs.clone())
+    // Pass `clobbered_regs` so a scratch xmm read (e.g. saxpy_dot's
+    // `xmm0 = xmm0 * xmm2` where xmm2 was just loaded from memory)
+    // does NOT get renamed to `farg2`. Without this, the
+    // stabilized form propagates through state.reg_values into every
+    // later use, and the original `xmm2 = ys[i]` def becomes an
+    // orphan because nobody references the original register name
+    // anymore.
+    stabilize_saved_arg_registers_excluding(tracked_rhs.clone(), clobbered_regs)
 }
 
 fn resolve_string_literal(expr: &Expr, binary_data: Option<&BinaryDataContext>) -> Option<String> {
@@ -11894,6 +11903,50 @@ mod tests {
             rhs.to_string().contains("rbp"),
             "loop-carried slot folded into the loop body: {}",
             rhs
+        );
+    }
+
+    /// Saxpy-style scratch-register usage: `xmm2 = ys[i];
+    /// xmm0 = xmm0 * xmm2`. The xmm2 use is a SCRATCH read of the
+    /// value just loaded, not the third float argument. Without
+    /// passing `clobbered_regs` through `resolve_tracked_arg_snapshot_value`,
+    /// the tracked value for xmm0 had xmm2 renamed to `farg2`, the
+    /// rename propagated through `state.reg_values` into every later
+    /// use, and the `xmm2 = ys[i]` def became orphaned.
+    ///
+    /// After the fix, propagate_args_in_block preserves the xmm2
+    /// references so the original load survives as a real
+    /// statement.
+    #[test]
+    fn test_propagate_args_preserves_scratch_xmm_assignment() {
+        // Mimic the saxpy_dot loop body:
+        //   xmm2 = ys[i]
+        //   xmm0 = xmm0 * xmm2
+        let scratch_load = Expr::assign(
+            reg("xmm2", 8),
+            Expr::array_access(reg("rsi", 8), reg("rcx", 8), 8),
+        );
+        let scratch_use = Expr::assign(
+            reg("xmm0", 8),
+            Expr::binop(BinOpKind::Mul, reg("xmm0", 8), reg("xmm2", 8)),
+        );
+
+        let propagated = propagate_args_in_block(vec![scratch_load, scratch_use]);
+        let rendered: String = propagated
+            .iter()
+            .map(|s| format!("{s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !rendered.contains("farg2"),
+            "scratch xmm2 must NOT be renamed to farg2 (renders:\n{rendered})",
+        );
+        // The scratch load must survive — it's referenced by the
+        // multiplication on the next line.
+        assert!(
+            rendered.contains("xmm2"),
+            "scratch xmm2 def must survive (renders:\n{rendered})",
         );
     }
 
