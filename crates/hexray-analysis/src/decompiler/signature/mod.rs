@@ -1622,6 +1622,24 @@ impl SignatureRecovery {
                     }
                 }
 
+                // When the structurer's stabilization renames a
+                // scratch xmm to a `farg*` Unknown, the LHS Unknown
+                // doesn't pass `extract_register_name`'s
+                // `reg_size_from_name` check, so `record_register_write`
+                // never runs and `written_regs` doesn't contain the
+                // farg name. A later body read of that same farg
+                // (e.g. `farg0 * farg2`) then unconditionally counts
+                // as an arg observation and the recovered signature
+                // grows a phantom param. Track the write explicitly
+                // here so the use-before-write filter on the read
+                // path can suppress the false observation.
+                if let ExprKind::Unknown(name) = &lhs.kind {
+                    let lower = name.to_lowercase();
+                    if self.is_float_arg_register(&lower) || self.is_arg_register(&lower) {
+                        self.written_regs.insert(lower);
+                    }
+                }
+
                 // Check if LHS is a register being written
                 if let Some(reg_name) = self.extract_register_name(lhs) {
                     let reg_lower = reg_name.to_lowercase();
@@ -2072,7 +2090,17 @@ impl SignatureRecovery {
                     let observed_name = self
                         .canonical_float_arg_register_name(&name)
                         .unwrap_or_else(|| name.clone());
-                    self.observed_float_arg_regs.insert(observed_name.clone());
+                    // Only count this read as a float-arg observation
+                    // if the register hasn't been written first
+                    // (mirrors the integer-arg use-before-write rule
+                    // a few lines below). Without this gate, a scratch
+                    // xmm renamed to `farg2` and assigned from `ys[i]`
+                    // would still appear as the third float arg.
+                    if !self.written_regs.contains(&name)
+                        && !self.written_regs.contains(&observed_name)
+                    {
+                        self.observed_float_arg_regs.insert(observed_name.clone());
+                    }
                     let size = self.observed_float_expr_size(var);
                     if size > 0 {
                         self.record_value_size_hint(&name, size);
@@ -2102,7 +2130,15 @@ impl SignatureRecovery {
                     let observed_name = self
                         .canonical_float_arg_register_name(&lowered)
                         .unwrap_or_else(|| lowered.clone());
-                    self.observed_float_arg_regs.insert(observed_name);
+                    // Same use-before-write guard as the Var path:
+                    // a scratch-written `farg2` should NOT count as
+                    // the third float arg just because the body
+                    // reads it after the assignment.
+                    if !self.written_regs.contains(&lowered)
+                        && !self.written_regs.contains(&observed_name)
+                    {
+                        self.observed_float_arg_regs.insert(observed_name);
+                    }
                 }
                 // Lifted IR often represents argument aliases as unknown identifiers
                 // (e.g., arg0/arg_8); treat them as reads for use-before-def.
@@ -7803,6 +7839,118 @@ mod tests {
     /// at `-O0` saxpy_dot spills `rdi` (xs) and `rsi` (ys) and then
     /// reloads them per iteration to compute `xs[i]` / `ys[i]`. The
     /// structurer's simplifier folds the `rax = *(rbp-16)` reload
+    /// After PR #36 the saxpy_dot recovery preserves scratch xmm
+    /// reads but the signature still showed phantom `farg1`/`farg2`
+    /// params. Root cause: the body has `Var(xmm2) = arr[i]; ... *
+    /// Var(xmm2)` AND a stabilized rename to `Unknown("farg2")` in
+    /// some positions. The `analyze_expr_reads_with_context` paths
+    /// that observe float-arg-named operands must NOT count a read
+    /// as a parameter observation when the body has already written
+    /// to that name. This test models the post-PR-#36 shape: the
+    /// float-arg seed contains only xmm0 (the real `a` parameter),
+    /// and the body writes xmm2 then reads xmm0 and xmm2.
+    #[test]
+    fn test_float_arg_observation_skips_xmm_written_before_read() {
+        use hexray_core::BasicBlockId;
+        let write_xmm2 = Expr::assign(
+            Expr::var(Variable::reg("xmm2", 8)),
+            Expr::array_access(Expr::unknown("arr"), Expr::unknown("i"), 8),
+        );
+        let use_xmm = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::var(Variable::reg("xmm0", 8)),
+                Expr::var(Variable::reg("xmm2", 8)),
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![write_xmm2, use_xmm],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        // The prologue scan would have seen `xmm0 = a` (the real
+        // float arg) so seed xmm0 only — not xmm2.
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_float_arg_seeds(vec![(0, "xmm0".to_string(), 8)]);
+        let sig = recovery.analyze(&cfg);
+
+        let float_param_indices: Vec<usize> = sig
+            .parameters
+            .iter()
+            .filter_map(|p| match &p.location {
+                ParameterLocation::FloatRegister { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            float_param_indices.contains(&0),
+            "farg0 should be recovered (it was seeded and read first): {:?}",
+            sig.parameters
+        );
+        assert!(
+            !float_param_indices.contains(&2),
+            "xmm2 was written before read — must NOT be a float param: {:?}",
+            sig.parameters
+        );
+    }
+
+    /// Same shape but with the structurer's `Unknown("farg2")`
+    /// rename — the explicit write-tracking for farg-named Unknown
+    /// LHS values must catch this too.
+    #[test]
+    fn test_float_arg_observation_skips_farg_unknown_written_before_read() {
+        use hexray_core::BasicBlockId;
+        let write_farg2 = Expr::assign(
+            Expr::unknown("farg2"),
+            Expr::array_access(Expr::unknown("arr"), Expr::unknown("i"), 8),
+        );
+        let use_xmm = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::var(Variable::reg("xmm0", 8)),
+                Expr::unknown("farg2"),
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![write_farg2, use_xmm],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_float_arg_seeds(vec![(0, "xmm0".to_string(), 8)]);
+        let sig = recovery.analyze(&cfg);
+
+        let float_param_indices: Vec<usize> = sig
+            .parameters
+            .iter()
+            .filter_map(|p| match &p.location {
+                ParameterLocation::FloatRegister { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !float_param_indices.contains(&2),
+            "Unknown(farg2) was written before read — must NOT be a float param: {:?}",
+            sig.parameters
+        );
+    }
+
     /// into the index expression, leaving
     /// `Deref(Add(Deref(stack_-16), Mul(idx, 8)))` — with the
     /// original `rdi` name gone. Without the spill-slot → arg
