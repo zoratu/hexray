@@ -2381,9 +2381,15 @@ impl SignatureRecovery {
                 // The address expression is being dereferenced
                 self.analyze_expr_reads_with_context(addr, true, false);
 
-                // Track element type and dereference count for base variables
+                // Track element type and dereference count for base variables.
+                // Use the int default (not the float-context override) for
+                // plain `Deref(base)` — `movq xmm0, [rdi]` lifts this way and
+                // is an integer-SIMD load despite landing in an xmm register.
+                // The float context only fires for ArrayAccess (indexed
+                // load `arr[i]` — the canonical scalar SSE pattern).
+                // Codex review on PR #38 pass 2.
                 if let Some(base_name) = self.extract_var_name(addr) {
-                    let elem_type = self.infer_deref_element_type(*size as usize);
+                    let elem_type = Self::infer_type_from_size(*size as usize);
                     self.record_usage_hint(&base_name, |h| {
                         h.deref_count += 1;
                         Self::merge_deref_element_type(h, &elem_type);
@@ -2405,7 +2411,12 @@ impl SignatureRecovery {
                     let ptr_width = self.convention.pointer_width();
                     if addr_width >= ptr_width {
                         if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
-                            let elem_type_inner = self.infer_deref_element_type(*size as usize);
+                            // Same as the parent Deref branch: do NOT use
+                            // the float-context override here. The spill-
+                            // slot bridge fires for plain pointer reloads
+                            // (`mov rax, [rbp-16]`) too, where the float
+                            // context isn't valid evidence.
+                            let elem_type_inner = Self::infer_type_from_size(*size as usize);
                             self.record_hint_for_arg_register(&reg, |h| {
                                 h.is_dereferenced = true;
                                 h.deref_count += 1;
@@ -8236,6 +8247,51 @@ mod tests {
                 ParamType::TypedPointer(inner) if matches!(inner.as_ref(), ParamType::Float(64))
             ),
             "rdi should be `double*` (TypedPointer(Float(64))) — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 2: `movq xmm0, [rdi]` is a
+    /// plain `Deref(rdi)` load (not ArrayAccess) and is an
+    /// integer-SIMD operation despite landing in an xmm
+    /// destination. The float-context override is scoped to
+    /// ArrayAccess patterns (`arr[i]` — the canonical scalar SSE
+    /// indexed load); plain Deref keeps the int default.
+    #[test]
+    fn test_xmm_plain_deref_is_not_float_typed() {
+        use hexray_core::BasicBlockId;
+        // Var(xmm0, size=8) = Deref(rdi, 8) — the `movq xmm0,
+        // [rdi]` shape codex flagged.
+        let load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::deref(Expr::unknown("rdi"), 8),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "plain Deref(rdi) into xmm must NOT recover as `double*` / `float*` — got {:?}",
             rdi_param.param_type
         );
     }
