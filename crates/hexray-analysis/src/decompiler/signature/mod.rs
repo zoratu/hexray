@@ -3901,18 +3901,25 @@ impl SignatureRecovery {
             || Self::x86_simd_register_index(&name_lower) == Some(0)
     }
 
-    /// If `lhs` is a float-bank register destination (`xmm*` /
-    /// `ymm*` / `zmm*` / `farg*` / ARM64 `s*`/`d*`/`q*`/`v*`),
-    /// return the destination's load width in bytes (the Variable's
-    /// `size`, clamped to 8 for SIMD-wide regs since scalar SSE
-    /// loads land in 64-bit lanes). Otherwise 0. Used by the Assign
-    /// handler to flag the RHS walk as "float context" so
-    /// Deref/ArrayAccess hint propagation can pick `Float(n)`
-    /// element types instead of the default `SignedInt`.
+    /// If `lhs` is a float-bank register destination AND the load
+    /// is SCALAR-WIDTH (4 = single, 8 = double), return the width.
+    /// Otherwise 0. Used by the Assign handler to flag the RHS walk
+    /// as "float context" so Deref/ArrayAccess hint propagation
+    /// picks `Float(n)` element types.
+    ///
+    /// Codex review on PR #38 pass 1 narrowed this — the register
+    /// bank alone is not enough to distinguish scalar FP loads
+    /// (`movsd`/`movss`) from integer SIMD loads (`movq`/`movdqa`/
+    /// `vmovdqu`/NEON `LDR Q*`). Scalar SSE lifts to a Variable
+    /// with size 4 or 8; full-width SIMD (xmm 16B, ymm 32B, zmm
+    /// 64B) lifts to a Variable with size > 8 and must NOT be
+    /// treated as float context. The `Unknown("farg*")` rename
+    /// only happens in scalar contexts via PR #36's lift logic,
+    /// so it's safe to default to 8 there.
     fn float_dest_load_size(&self, lhs: &Expr) -> u8 {
-        let name = match &lhs.kind {
-            ExprKind::Var(var) => var.name.clone(),
-            ExprKind::Unknown(name) => name.clone(),
+        let (name, var_size) = match &lhs.kind {
+            ExprKind::Var(var) => (var.name.clone(), Some(var.size)),
+            ExprKind::Unknown(name) => (name.clone(), None),
             _ => return 0,
         };
         let lower = name.to_ascii_lowercase();
@@ -3931,21 +3938,19 @@ impl SignatureRecovery {
         if !is_float_bank {
             return 0;
         }
-        // For `Var(xmm*)` use the Variable's declared size when
-        // it's a scalar (1..=8). SIMD-width xmm/ymm/zmm scalar
-        // loads (movsd/movss) typically declare 8 / 4 here.
-        let raw_size = match &lhs.kind {
-            ExprKind::Var(var) if var.size > 0 && var.size <= 16 => var.size,
-            _ => 0,
-        };
-        if raw_size > 0 && raw_size <= 8 {
-            raw_size
-        } else {
-            // Unknown(farg*) or a 16-byte xmm load — assume
-            // double-precision scalar by default (the common SSE
-            // movsd shape). 4-byte movss cases would set size=4
-            // explicitly via the Var path.
-            8
+        match var_size {
+            // Scalar SSE: movsd (8) / movss (4). Accept.
+            Some(8) => 8,
+            Some(4) => 4,
+            // Wider (full xmm 16 / ymm 32 / zmm 64) or narrower
+            // half-precision — not a scalar float context, the
+            // lifted instruction was likely an integer SIMD load
+            // or an FP16 load we don't handle yet. Reject.
+            Some(_) => 0,
+            // Unknown spelling (e.g. `farg2` after structurer
+            // stabilization) — the rename only fires in scalar
+            // contexts so default to double.
+            None => 8,
         }
     }
 
@@ -8231,6 +8236,52 @@ mod tests {
                 ParamType::TypedPointer(inner) if matches!(inner.as_ref(), ParamType::Float(64))
             ),
             "rdi should be `double*` (TypedPointer(Float(64))) — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 1: a 16-byte SIMD load
+    /// (`movdqa xmm0, [rdi]` or similar integer-SIMD) lifts to a
+    /// `Var(xmm0, size=16)` LHS. Must NOT be treated as a scalar
+    /// float context — otherwise an `int128_t* p` would be
+    /// mis-recovered as `double* p`.
+    #[test]
+    fn test_simd_wide_load_is_not_float_context() {
+        use hexray_core::BasicBlockId;
+        // `Var(xmm0)` with size=16 simulates movdqa/vmovdqu.
+        let load_simd = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 16)),
+            Expr::array_access(Expr::unknown("rdi"), Expr::unknown("i"), 8),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load_simd],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        // The element type must NOT be Float — should stay as the
+        // int default since the SIMD register width signals an
+        // integer-SIMD load, not a scalar SSE one.
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "wide-SIMD load must NOT recover rdi as `double*` / `float*` — got {:?}",
             rdi_param.param_type
         );
     }
