@@ -2378,8 +2378,18 @@ impl SignatureRecovery {
                 self.analyze_expr_reads_with_context(operand, false, is_comparison);
             }
             ExprKind::Deref { addr, size } => {
-                // The address expression is being dereferenced
+                // The address expression is being dereferenced.
+                // Clear the float-context override while walking the
+                // ADDRESS — a nested ArrayAccess inside the addr is
+                // an outer-pointer-to-pointer access; its element
+                // type is the address being dereferenced, not the
+                // float value the outer load eventually yields.
+                // Same rationale as the ArrayAccess index scope —
+                // codex review on PR #38 pass 3.
+                let saved_float_dest = self.current_rhs_float_dest_size;
+                self.current_rhs_float_dest_size = 0;
                 self.analyze_expr_reads_with_context(addr, true, false);
+                self.current_rhs_float_dest_size = saved_float_dest;
 
                 // Track element type and dereference count for base variables.
                 // Use the int default (not the float-context override) for
@@ -2457,7 +2467,15 @@ impl SignatureRecovery {
                 if let ExprKind::Var(var) = &index.kind {
                     self.record_usage_hint(&var.name.to_lowercase(), |h| h.is_array_index = true);
                 }
+                // Scope the float-context override to the BASE only.
+                // A nested ArrayAccess in the index subexpression
+                // (`xs[idx[i]]`) is a separate integer load — its
+                // base should NOT inherit the outer SSE float
+                // context. Codex review on PR #38 pass 3.
+                let saved_float_dest = self.current_rhs_float_dest_size;
+                self.current_rhs_float_dest_size = 0;
                 self.analyze_expr_reads_with_context(index, false, false);
+                self.current_rhs_float_dest_size = saved_float_dest;
             }
             ExprKind::BitField { expr, .. } => {
                 self.analyze_expr_reads_with_context(expr, false, false);
@@ -8248,6 +8266,72 @@ mod tests {
             ),
             "rdi should be `double*` (TypedPointer(Float(64))) — got {:?}",
             rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 3: a nested ArrayAccess in the
+    /// INDEX subexpression of an outer SSE-load is its own
+    /// separate integer load — its base must NOT inherit the
+    /// outer float context. For `xmm0 = ArrayAccess(xs,
+    /// ArrayAccess(idx, i, 4), 8)`, xs gets `double*` but idx
+    /// must stay `int32_t*`.
+    #[test]
+    fn test_nested_array_index_does_not_inherit_float_context() {
+        use hexray_core::BasicBlockId;
+        let outer_load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::array_access(
+                Expr::unknown("rdi"),
+                Expr::array_access(Expr::unknown("rsi"), Expr::unknown("i"), 4),
+                8,
+            ),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![outer_load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        assert!(
+            matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(64))
+            ),
+            "outer base (rdi) should still recover as `double*`, got {:?}",
+            rdi_param.param_type
+        );
+
+        let rsi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rsi"
+            ))
+            .expect("rsi parameter recovered");
+        assert!(
+            !matches!(
+                &rsi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "nested-index base (rsi) must NOT inherit float context, got {:?}",
+            rsi_param.param_type
         );
     }
 
