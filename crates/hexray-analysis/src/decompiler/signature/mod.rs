@@ -1909,6 +1909,17 @@ impl SignatureRecovery {
     fn record_register_write(&mut self, reg_name: &str, rhs: &Expr, near_return: bool) {
         let reg_lower = reg_name.to_lowercase();
         self.written_regs.insert(reg_lower.clone());
+        // Also record the canonical ABI float-arg form so a write
+        // under one vector-width alias (`ymm2` / `zmm2` / `farg2`)
+        // gates a subsequent read under `xmm2` (and vice versa).
+        // Without this, `vmovsd ymm2, ...` followed by `mulsd xmm0,
+        // xmm2` would still record xmm2 as a float param. Codex
+        // review on PR #37 pass 2.
+        if let Some(canonical) = self.canonical_float_arg_register_name(&reg_lower) {
+            if canonical != reg_lower {
+                self.written_regs.insert(canonical);
+            }
+        }
 
         // If this is an argument register being reloaded from its prologue
         // spill slot, the slot is its home and naming the parameter after it
@@ -8065,6 +8076,56 @@ mod tests {
         assert!(
             !float_param_indices.contains(&2),
             "Unknown(farg2) write + Var(xmm2) read must NOT count as a param: {:?}",
+            sig.parameters
+        );
+    }
+
+    /// Codex review on PR #37 pass 2: vector-width aliases. A
+    /// `ymm2` / `zmm2` write followed by an `xmm2` read must also
+    /// be paired by the use-before-write filter.
+    /// `record_register_write` now records the canonical `xmm2`
+    /// alongside the literal `ymm2`/`zmm2`.
+    #[test]
+    fn test_float_arg_observation_skips_ymm_written_then_xmm_read() {
+        use hexray_core::BasicBlockId;
+        // Body: `ymm2 = ...`  then `xmm0 = xmm0 * xmm2`.
+        // The xmm2 read must be filtered because ymm2 was written.
+        let write_ymm2 = Expr::assign(
+            Expr::var(Variable::reg("ymm2", 16)),
+            Expr::array_access(Expr::unknown("arr"), Expr::unknown("i"), 8),
+        );
+        let use_xmm2 = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::var(Variable::reg("xmm0", 8)),
+                Expr::var(Variable::reg("xmm2", 8)),
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![write_ymm2, use_xmm2],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_float_arg_seeds(vec![(0, "xmm0".to_string(), 8)]);
+        let sig = recovery.analyze(&cfg);
+        let float_param_indices: Vec<usize> = sig
+            .parameters
+            .iter()
+            .filter_map(|p| match &p.location {
+                ParameterLocation::FloatRegister { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !float_param_indices.contains(&2),
+            "ymm2 write + xmm2 read must NOT count as a param: {:?}",
             sig.parameters
         );
     }
