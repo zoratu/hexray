@@ -1633,9 +1633,20 @@ impl SignatureRecovery {
                 // grows a phantom param. Track the write explicitly
                 // here so the use-before-write filter on the read
                 // path can suppress the false observation.
+                //
+                // Record BOTH spellings (`farg2` AND the canonical
+                // `xmm2`) so a write under one name and a read under
+                // the other are correctly paired — codex review on
+                // PR #37 pass 1 flagged the mixed-representation
+                // failure mode.
                 if let ExprKind::Unknown(name) = &lhs.kind {
                     let lower = name.to_lowercase();
                     if self.is_float_arg_register(&lower) || self.is_arg_register(&lower) {
+                        if let Some(canonical) =
+                            self.canonical_float_arg_register_name(&lower)
+                        {
+                            self.written_regs.insert(canonical);
+                        }
                         self.written_regs.insert(lower);
                     }
                 }
@@ -3865,6 +3876,18 @@ impl SignatureRecovery {
                 .float_arg_registers()
                 .get(idx)
                 .map(|reg| reg.to_lowercase());
+        }
+        // `farg{n}` aliases (the structurer's stabilization rename)
+        // also map to the convention's nth float arg register so the
+        // write-before-read filter recognizes `farg2` write paired
+        // with an `xmm2` read (and vice versa). Codex review on
+        // PR #37 pass 1.
+        if let Some(suffix) = name_lower.strip_prefix("farg") {
+            if let Ok(idx) = suffix.parse::<usize>() {
+                if let Some(reg) = self.convention.float_arg_registers().get(idx) {
+                    return Some(reg.to_lowercase());
+                }
+            }
         }
         self.convention
             .float_arg_registers()
@@ -7947,6 +7970,101 @@ mod tests {
         assert!(
             !float_param_indices.contains(&2),
             "Unknown(farg2) was written before read — must NOT be a float param: {:?}",
+            sig.parameters
+        );
+    }
+
+    /// Codex review on PR #37 pass 1: a write under one spelling
+    /// (`Var(xmm2)`) and a read under the other (`Unknown(farg2)`)
+    /// must also be paired by the use-before-write filter. The
+    /// `canonical_float_arg_register_name` now maps `farg{n}` ↔
+    /// `xmm{n}`, AND the explicit Unknown-LHS write records both
+    /// spellings, so either direction works.
+    #[test]
+    fn test_float_arg_observation_mixed_xmm_write_farg_read() {
+        use hexray_core::BasicBlockId;
+        let write_xmm2 = Expr::assign(
+            Expr::var(Variable::reg("xmm2", 8)),
+            Expr::array_access(Expr::unknown("arr"), Expr::unknown("i"), 8),
+        );
+        // Read uses the Unknown(farg2) spelling.
+        let use_farg2 = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::var(Variable::reg("xmm0", 8)),
+                Expr::unknown("farg2"),
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![write_xmm2, use_farg2],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_float_arg_seeds(vec![(0, "xmm0".to_string(), 8)]);
+        let sig = recovery.analyze(&cfg);
+        let float_param_indices: Vec<usize> = sig
+            .parameters
+            .iter()
+            .filter_map(|p| match &p.location {
+                ParameterLocation::FloatRegister { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !float_param_indices.contains(&2),
+            "Var(xmm2) write + Unknown(farg2) read must NOT count as a param: {:?}",
+            sig.parameters
+        );
+    }
+
+    /// Companion: write under `Unknown(farg2)` then read under
+    /// `Var(xmm2)`.
+    #[test]
+    fn test_float_arg_observation_mixed_farg_write_xmm_read() {
+        use hexray_core::BasicBlockId;
+        let write_farg2 = Expr::assign(
+            Expr::unknown("farg2"),
+            Expr::array_access(Expr::unknown("arr"), Expr::unknown("i"), 8),
+        );
+        let use_xmm2 = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::binop(
+                BinOpKind::Mul,
+                Expr::var(Variable::reg("xmm0", 8)),
+                Expr::var(Variable::reg("xmm2", 8)),
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![write_farg2, use_xmm2],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV)
+            .with_float_arg_seeds(vec![(0, "xmm0".to_string(), 8)]);
+        let sig = recovery.analyze(&cfg);
+        let float_param_indices: Vec<usize> = sig
+            .parameters
+            .iter()
+            .filter_map(|p| match &p.location {
+                ParameterLocation::FloatRegister { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !float_param_indices.contains(&2),
+            "Unknown(farg2) write + Var(xmm2) read must NOT count as a param: {:?}",
             sig.parameters
         );
     }
