@@ -486,13 +486,19 @@ impl PseudoCodeEmitter {
         Self::is_pointer_like_type_hint(type_hint)
     }
 
-    /// Whether `type_hint` is a generic `<scalar>*` form (no qualifiers,
-    /// no array suffix, no extra indirection) — the kind the
-    /// expression-type-propagation pass emits when it sees a deref of
-    /// pointer-sized scalar and can't tell the element type apart
-    /// from a register width. Used as the override gate for
+    /// Whether `type_hint` is a generic `<scalar>*` form (no
+    /// qualifiers, no array suffix, no extra indirection) — the kind
+    /// the expression-type-propagation pass emits when it sees a
+    /// deref of pointer-sized scalar and can't tell the element type
+    /// apart from a register width. Used as the override gate for
     /// signature-recovered TypedPointer types with non-scalar
     /// element types.
+    ///
+    /// Codex review on PR #38 pass 5 added the multi-word C variants
+    /// (`unsigned int`, `unsigned long`, etc.) — type-prop emits
+    /// `unsigned int` for 32-bit unsigned values, and rejecting
+    /// names with spaces left those falling through and demoting
+    /// `float*` parameters back to `unsigned int*`.
     fn type_hint_is_generic_scalar_pointer(type_hint: &str) -> bool {
         let trimmed = type_hint.trim();
         let Some(elem) = trimmed.strip_suffix('*') else {
@@ -500,14 +506,27 @@ impl PseudoCodeEmitter {
         };
         let elem = elem.trim();
         // Reject if the element itself looks layered (`int**`,
-        // `int[5]`, struct names, etc.).
-        if elem.contains('*') || elem.contains('[') || elem.contains(' ') {
+        // `int[5]`, struct names, qualifiers).
+        if elem.contains('*') || elem.contains('[') {
             return false;
         }
+        // Collapse internal whitespace to a single space so
+        // `unsigned   int` matches `unsigned int`.
+        let normalized = elem.split_whitespace().collect::<Vec<_>>().join(" ");
         matches!(
-            elem,
+            normalized.as_str(),
             "int"
                 | "unsigned"
+                | "unsigned int"
+                | "unsigned char"
+                | "unsigned short"
+                | "unsigned long"
+                | "unsigned long long"
+                | "short"
+                | "long"
+                | "long long"
+                | "char"
+                | "signed char"
                 | "int8_t"
                 | "uint8_t"
                 | "int16_t"
@@ -518,6 +537,7 @@ impl PseudoCodeEmitter {
                 | "uint64_t"
                 | "size_t"
                 | "ssize_t"
+                | "ptrdiff_t"
                 | "void"
         )
     }
@@ -10141,25 +10161,38 @@ mod tests {
     /// The emitter's `type_info` map can carry a generic scalar
     /// pointer hint like `int64_t*` from the expression-type
     /// propagation pass. When the signature has a more specific
-    /// `TypedPointer(Float(64))`, the hint must NOT override it —
-    /// saxpy's `double *xs` would otherwise demote back to
-    /// `int64_t *xs`.
+    /// `TypedPointer(Float(64))` (or `Float(32)`), the hint must
+    /// NOT override it — saxpy's `double *xs` would otherwise
+    /// demote back to `int64_t *xs`.
     #[test]
     fn test_should_apply_signature_type_hint_keeps_typed_float_pointer() {
         use super::super::signature::ParamType;
         let typed_double_ptr = ParamType::TypedPointer(Box::new(ParamType::Float(64)));
-        assert!(
-            !PseudoCodeEmitter::should_apply_signature_type_hint(&typed_double_ptr, "int64_t*"),
-            "scalar `int64_t*` hint must NOT override a TypedPointer(Float(64))",
-        );
-        assert!(
-            !PseudoCodeEmitter::should_apply_signature_type_hint(&typed_double_ptr, "uint64_t*"),
-            "scalar `uint64_t*` hint must NOT override a TypedPointer(Float(64))",
-        );
-        assert!(
-            !PseudoCodeEmitter::should_apply_signature_type_hint(&typed_double_ptr, "void*"),
-            "scalar `void*` hint must NOT override a TypedPointer(Float(64))",
-        );
+        for hint in [
+            "int64_t*",
+            "uint64_t*",
+            "int32_t*",
+            "uint32_t*",
+            "void*",
+            "unsigned int*",
+            "unsigned long*",
+            "long long*",
+            "size_t*",
+        ] {
+            assert!(
+                !PseudoCodeEmitter::should_apply_signature_type_hint(&typed_double_ptr, hint),
+                "scalar `{hint}` hint must NOT override a TypedPointer(Float(64))",
+            );
+        }
+
+        // Float(32) too (movss).
+        let typed_float_ptr = ParamType::TypedPointer(Box::new(ParamType::Float(32)));
+        for hint in ["uint32_t*", "int32_t*", "unsigned int*"] {
+            assert!(
+                !PseudoCodeEmitter::should_apply_signature_type_hint(&typed_float_ptr, hint),
+                "scalar `{hint}` hint must NOT override a TypedPointer(Float(32))",
+            );
+        }
     }
 
     /// Companion: a NON-scalar pointer hint (struct, char**, etc.)
