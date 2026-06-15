@@ -1660,8 +1660,20 @@ impl SignatureRecovery {
                 // an `xmm*` / `farg*` / aarch64 d-bank register. The
                 // scalar SSE loads `movsd`/`movss` flow through here
                 // as `Var(xmm*) = ArrayAccess(..., size)`.
+                //
+                // Only set the flag when the rhs is a DIRECT
+                // ArrayAccess — an intervening `Cast` or `BinOp` is
+                // evidence that the load isn't a raw scalar FP read:
+                // `xmm0 = Cast(ArrayAccess(rdi, i, 4), Float)` is the
+                // `cvtsi2sd` int→float conversion shape, where the
+                // memory source is still INTEGER data. Codex review
+                // on PR #38 pass 6.
                 let prev_float_dest = self.current_rhs_float_dest_size;
-                self.current_rhs_float_dest_size = self.float_dest_load_size(lhs);
+                self.current_rhs_float_dest_size = if matches!(rhs.kind, ExprKind::ArrayAccess { .. }) {
+                    self.float_dest_load_size(lhs)
+                } else {
+                    0
+                };
                 // First, analyze the RHS for reads
                 self.analyze_expr_reads(rhs);
                 self.current_rhs_float_dest_size = prev_float_dest;
@@ -3965,18 +3977,26 @@ impl SignatureRecovery {
             _ => return 0,
         };
         let lower = name.to_ascii_lowercase();
-        let is_float_bank = lower.starts_with("xmm")
+        let is_x86_float_bank = matches!(
+            self.convention,
+            CallingConvention::SystemV | CallingConvention::Win64
+        ) && (lower.starts_with("xmm")
             || lower.starts_with("ymm")
-            || lower.starts_with("zmm")
-            || lower
-                .strip_prefix("farg")
-                .is_some_and(|s| s.parse::<usize>().is_ok())
-            || ((lower.starts_with('d')
+            || lower.starts_with("zmm"));
+        // ARM64 SIMD-FP register aliases — `s*` collides with RISC-V
+        // saved INTEGER registers `s0`-`s11`, so gate by convention.
+        // Codex review on PR #38 pass 6.
+        let is_arm_float_bank = matches!(self.convention, CallingConvention::Aarch64)
+            && (lower.starts_with('d')
                 || lower.starts_with('s')
                 || lower.starts_with('q')
                 || lower.starts_with('v'))
-                && lower[1..].chars().all(|c| c.is_ascii_digit())
-                && lower.len() > 1);
+            && lower.len() > 1
+            && lower[1..].chars().all(|c| c.is_ascii_digit());
+        let is_farg_alias = lower
+            .strip_prefix("farg")
+            .is_some_and(|s| s.parse::<usize>().is_ok());
+        let is_float_bank = is_x86_float_bank || is_arm_float_bank || is_farg_alias;
         if !is_float_bank {
             return 0;
         }
@@ -8280,6 +8300,105 @@ mod tests {
             "rdi should be `double*` (TypedPointer(Float(64))) — got {:?}",
             rdi_param.param_type
         );
+    }
+
+    /// Codex review on PR #38 pass 6: integer-to-float conversion
+    /// (`cvtsi2sd xmm0, [rdi+i*4]`) lifts as
+    /// `Var(xmm0) = Cast(ArrayAccess(rdi, i, 4), Float(64))`. The
+    /// memory source is INTEGER data; the destination being a
+    /// float-bank register is irrelevant. Setting the float-context
+    /// flag only when the rhs is a DIRECT ArrayAccess (no Cast
+    /// wrap) handles this — rdi stays as `int32_t*` /
+    /// `uint32_t*`, not promoted to `float*`.
+    #[test]
+    fn test_cvtsi2sd_int_to_float_does_not_float_type_source() {
+        use hexray_core::BasicBlockId;
+        let cvt_load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(Expr::array_access(
+                        Expr::unknown("rdi"),
+                        Expr::unknown("i"),
+                        4,
+                    )),
+                    to_size: 8,
+                    signed: true,
+                },
+            },
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![cvt_load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "cvtsi2sd source must NOT recover as `float*`/`double*` — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 6: RISC-V `s0`-`s11` are saved
+    /// INTEGER registers, but the spelling collides with AArch64
+    /// SIMD-FP `s0`-`s31`. Gating the FP-alias detection by
+    /// convention prevents a RISC-V `s0 = ArrayAccess(a0, i, 8)`
+    /// from promoting `a0` to `double*`.
+    #[test]
+    fn test_riscv_s_register_not_treated_as_float_bank() {
+        use hexray_core::BasicBlockId;
+        let load = Expr::assign(
+            Expr::var(Variable::reg("s0", 8)),
+            Expr::array_access(Expr::unknown("a0"), Expr::unknown("i"), 8),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::RiscV);
+        let sig = recovery.analyze(&cfg);
+        // Whatever `a0` recovers as, it MUST NOT be float-typed
+        // (the s0 LHS is an integer-saved register in RISC-V,
+        // not an FP scalar destination).
+        if let Some(a0_param) = sig.parameters.iter().find(|p| {
+            matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "a0"
+            )
+        }) {
+            assert!(
+                !matches!(
+                    &a0_param.param_type,
+                    ParamType::TypedPointer(inner)
+                        if matches!(inner.as_ref(), ParamType::Float(_))
+                ),
+                "RISC-V `s0 = a0[i]` must NOT recover a0 as float pointer (s0 is integer-saved), got {:?}",
+                a0_param.param_type,
+            );
+        }
     }
 
     /// Codex review on PR #38 pass 4: a nested ArrayAccess as the
