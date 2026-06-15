@@ -1668,6 +1668,18 @@ impl SignatureRecovery {
                 // `cvtsi2sd` int→float conversion shape, where the
                 // memory source is still INTEGER data. Codex review
                 // on PR #38 pass 6.
+                //
+                // Known limitation (codex pass 7): an indexed
+                // integer-SIMD load like `movq xmm0, [rdi+rcx*8]`
+                // lifts to the SAME shape as scalar `movsd xmm2,
+                // [arr+i*8]` and gets the same float-context
+                // treatment. Without lift-time mnemonic annotation
+                // (analogous to `GotRef.is_float_context`) we can't
+                // distinguish them at this layer. The trade-off
+                // favors the dramatically more common scalar-float
+                // array case; the indexed-integer-SIMD pattern is
+                // rare in compiled C code (compilers prefer general-
+                // purpose registers for integer indexed loads).
                 let prev_float_dest = self.current_rhs_float_dest_size;
                 self.current_rhs_float_dest_size = if matches!(rhs.kind, ExprKind::ArrayAccess { .. }) {
                     self.float_dest_load_size(lhs)
