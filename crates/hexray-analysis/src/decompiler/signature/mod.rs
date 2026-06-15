@@ -2441,8 +2441,21 @@ impl SignatureRecovery {
                 index,
                 element_size,
             } => {
-                // Base is being used as a pointer/array
+                // Base is being used as a pointer/array.
+                //
+                // Clear the float-context override while walking the
+                // BASE recursively — a nested `ArrayAccess(inner, j,
+                // 8)` for a pointer table `ptrs[i][j]` should record
+                // `inner` as a pointer-typed element, not the float
+                // value the OUTER access eventually yields. The
+                // IMMEDIATE element-type assignment below (the
+                // extract_var_name + merge_deref_element_type lines)
+                // still uses the float context for the outer base.
+                // Codex review on PR #38 pass 4.
+                let saved_float_dest = self.current_rhs_float_dest_size;
+                self.current_rhs_float_dest_size = 0;
                 self.analyze_expr_reads_with_context(base, true, false);
+                self.current_rhs_float_dest_size = saved_float_dest;
 
                 // Mark base as array access and track element type
                 if let Some(base_name) = self.extract_var_name(base) {
@@ -8265,6 +8278,57 @@ mod tests {
                 ParamType::TypedPointer(inner) if matches!(inner.as_ref(), ParamType::Float(64))
             ),
             "rdi should be `double*` (TypedPointer(Float(64))) — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 4: a nested ArrayAccess as the
+    /// BASE of an outer SSE-load (`xmm0 = ptrs[i][j]` for a
+    /// pointer table) — the inner access loads a pointer, the
+    /// outer loads the float through it. The inner base must NOT
+    /// be float-typed.
+    #[test]
+    fn test_nested_array_base_does_not_inherit_float_context() {
+        use hexray_core::BasicBlockId;
+        // xmm0 = ArrayAccess(ArrayAccess(rdi, i, 8), j, 8)
+        let outer_load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::array_access(
+                Expr::array_access(Expr::unknown("rdi"), Expr::unknown("i"), 8),
+                Expr::unknown("j"),
+                8,
+            ),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![outer_load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        // rdi is the OUTER table base — it holds pointers (or
+        // pointer-sized values), NOT raw doubles. Must not be
+        // `double*`.
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "nested-base rdi must NOT recover as `double*`/`float*` — got {:?}",
             rdi_param.param_type
         );
     }
