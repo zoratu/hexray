@@ -6323,6 +6323,14 @@ fn propagate_args_in_block_with_state(
             if let ExprKind::Var(v) = &lhs.kind {
                 let written_aliases: HashSet<String> =
                     get_register_aliases(&v.name).into_iter().collect();
+                // Snapshot the clobbered set BEFORE we mark the
+                // current LHS as written. A read of the LHS in this
+                // same statement's RHS (the canonical self-modify
+                // `rdi = rdi + 1`) refers to the INCOMING value, so
+                // stabilization needs to canonicalize it back to
+                // `arg0`. Using the post-insert set would block that
+                // canonicalization. Codex review on PR #36 pass 1.
+                let prior_clobbered_regs = clobbered_regs.clone();
                 // Once written, this register is a local temporary for the rest
                 // of the block, not the incoming argument.
                 for alias in &written_aliases {
@@ -6356,7 +6364,7 @@ fn propagate_args_in_block_with_state(
                 if is_temp_register(&v.name) {
                     let stabilized_temp_rhs = stabilize_saved_arg_registers_excluding(
                         tracked_rhs.clone(),
-                        &clobbered_regs,
+                        &prior_clobbered_regs,
                     );
                     // Sub-register writes (al, ah, ax, ...) must not propagate
                     // the substituted RHS at all under the canonical-name slot
@@ -6397,6 +6405,7 @@ fn propagate_args_in_block_with_state(
                         &tracked_rhs,
                         &state.arg_values,
                         Some(&state.saved_temp_values),
+                        &prior_clobbered_regs,
                     );
                     if tracks_register_aliases && !expr_requires_single_evaluation(&tracked_rhs) {
                         let tracked_reg_value = preserved_tracked_arg_value.clone();
@@ -9262,6 +9271,7 @@ fn resolve_tracked_arg_snapshot_value(
     tracked_rhs: &Expr,
     arg_values: &HashMap<String, (Option<usize>, Expr)>,
     saved_temp_values: Option<&HashMap<String, Expr>>,
+    clobbered_regs: &HashSet<String>,
 ) -> Expr {
     use super::super::expression::ExprKind;
 
@@ -9275,7 +9285,14 @@ fn resolve_tracked_arg_snapshot_value(
         }
     }
 
-    stabilize_saved_arg_registers(tracked_rhs.clone())
+    // Pass `clobbered_regs` so a scratch xmm read (e.g. saxpy_dot's
+    // `xmm0 = xmm0 * xmm2` where xmm2 was just loaded from memory)
+    // does NOT get renamed to `farg2`. Without this, the
+    // stabilized form propagates through state.reg_values into every
+    // later use, and the original `xmm2 = ys[i]` def becomes an
+    // orphan because nobody references the original register name
+    // anymore.
+    stabilize_saved_arg_registers_excluding(tracked_rhs.clone(), clobbered_regs)
 }
 
 fn resolve_string_literal(expr: &Expr, binary_data: Option<&BinaryDataContext>) -> Option<String> {
@@ -11894,6 +11911,85 @@ mod tests {
             rhs.to_string().contains("rbp"),
             "loop-carried slot folded into the loop body: {}",
             rhs
+        );
+    }
+
+    /// Saxpy-style scratch-register usage: `xmm2 = ys[i];
+    /// xmm0 = xmm0 * xmm2`. The xmm2 use is a SCRATCH read of the
+    /// value just loaded, not the third float argument. Without
+    /// passing `clobbered_regs` through `resolve_tracked_arg_snapshot_value`,
+    /// the tracked value for xmm0 had xmm2 renamed to `farg2`, the
+    /// rename propagated through `state.reg_values` into every later
+    /// use, and the `xmm2 = ys[i]` def became orphaned.
+    ///
+    /// After the fix, propagate_args_in_block preserves the xmm2
+    /// references so the original load survives as a real
+    /// statement.
+    #[test]
+    fn test_propagate_args_preserves_scratch_xmm_assignment() {
+        // Mimic the saxpy_dot loop body:
+        //   xmm2 = ys[i]
+        //   xmm0 = xmm0 * xmm2
+        let scratch_load = Expr::assign(
+            reg("xmm2", 8),
+            Expr::array_access(reg("rsi", 8), reg("rcx", 8), 8),
+        );
+        let scratch_use = Expr::assign(
+            reg("xmm0", 8),
+            Expr::binop(BinOpKind::Mul, reg("xmm0", 8), reg("xmm2", 8)),
+        );
+
+        let propagated = propagate_args_in_block(vec![scratch_load, scratch_use]);
+        let rendered: String = propagated
+            .iter()
+            .map(|s| format!("{s}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !rendered.contains("farg2"),
+            "scratch xmm2 must NOT be renamed to farg2 (renders:\n{rendered})",
+        );
+        // The scratch load must survive — it's referenced by the
+        // multiplication on the next line.
+        assert!(
+            rendered.contains("xmm2"),
+            "scratch xmm2 def must survive (renders:\n{rendered})",
+        );
+    }
+
+    /// Codex review on PR #36 pass 1: a self-referential first
+    /// assignment `rdi = rdi + 1` reads the INCOMING `rdi` value
+    /// (which is the function's arg0). The clobber set must be
+    /// snapshotted BEFORE the LHS is added, otherwise the
+    /// self-read fails to canonicalize back to `arg0` and a later
+    /// call uses the raw register name.
+    #[test]
+    fn test_propagate_args_canonicalizes_self_read_to_incoming_arg() {
+        // rdi = rdi + 1
+        // call recurse
+        // The call's arg0 should be canonicalized to `arg0 + 1`,
+        // NOT left as `rdi + 1`.
+        let statements = vec![
+            Expr::assign(
+                reg("rdi", 8),
+                Expr::binop(BinOpKind::Add, reg("rdi", 8), Expr::int(1)),
+            ),
+            Expr::call(CallTarget::Named("recurse".to_string()), vec![]),
+        ];
+
+        let propagated = propagate_args_in_block(statements);
+        let Some(Expr {
+            kind: ExprKind::Call { args, .. },
+        }) = propagated.last()
+        else {
+            panic!("expected trailing call after propagation");
+        };
+        assert_eq!(args.len(), 1);
+        let arg_str = format!("{}", args[0]);
+        assert!(
+            arg_str.contains("arg0"),
+            "self-read of rdi must canonicalize to arg0, got `{arg_str}`",
         );
     }
 
