@@ -122,6 +122,14 @@ pub struct SignatureRecovery {
     x87_ops_observed: bool,
     /// Entry-like x87 input was observed via ST(0).
     x87_st0_input_observed: bool,
+    /// Width of the float-bank destination during the current RHS
+    /// walk (4 = single, 8 = double, 16 = SIMD width), or 0 when the
+    /// current assignment's destination isn't a float-bank register.
+    /// Used by the Deref / ArrayAccess hint propagation to pick
+    /// `Float(n)` element types for SSE-loaded pointer args instead
+    /// of the default `SignedInt(64)` — so `movsd xmm2, [arr+i*8]`
+    /// recovers as `double *arr`, not `int64_t *arr`.
+    current_rhs_float_dest_size: u8,
     /// Stack argument offsets consumed by x87 operations.
     x87_stack_arg_offsets: BTreeSet<i64>,
     /// Recovered function-pointer return type when applicable.
@@ -949,6 +957,7 @@ impl SignatureRecovery {
             arg_register_copy_sources: HashMap::new(),
             x87_ops_observed: false,
             x87_st0_input_observed: false,
+            current_rhs_float_dest_size: 0,
             x87_stack_arg_offsets: BTreeSet::new(),
             return_function_pointer: None,
             tail_call_return_type: None,
@@ -1303,6 +1312,50 @@ impl SignatureRecovery {
         }
     }
 
+    /// Variant of [`Self::infer_type_from_size`] that consults the
+    /// `current_rhs_float_dest_size` flag set by the Assign handler.
+    /// When the RHS of the current assignment lands in a float-bank
+    /// register (`movsd xmm2, [arr+i*8]` lifts to
+    /// `Var(xmm2) = ArrayAccess(arr, i, 8)`), pick `Float(64)` for an
+    /// 8-byte element and `Float(32)` for a 4-byte element instead
+    /// of the default signed-int. That makes the recovered base
+    /// pointer come back as `double *arr` / `float *arr` rather
+    /// than `int64_t *` / `int32_t *`.
+    fn infer_deref_element_type(&self, size: usize) -> ParamType {
+        if self.current_rhs_float_dest_size > 0 {
+            match size {
+                4 => return ParamType::Float(32),
+                8 => return ParamType::Float(64),
+                _ => {}
+            }
+        }
+        Self::infer_type_from_size(size)
+    }
+
+    /// Merge a newly-inferred deref element type into an existing
+    /// hint. Earlier-wins for matching kinds, but a Float observation
+    /// PROMOTES a previously-stored int of the same width — the int
+    /// default was the conservative fallback when no float context
+    /// was available, and a later float-bank deref is strictly more
+    /// informative.
+    fn merge_deref_element_type(h: &mut ParameterUsageHints, new_ty: &ParamType) {
+        match (&h.deref_element_type, new_ty) {
+            (None, _) => {
+                h.deref_element_type = Some(new_ty.clone());
+            }
+            (Some(ParamType::SignedInt(prev_bits)), ParamType::Float(new_bits))
+                if prev_bits == new_bits =>
+            {
+                // Promote int → float when the widths match and the
+                // new observation is float-context. The earlier int
+                // was a default-from-size fallback; the float
+                // context is harder evidence.
+                h.deref_element_type = Some(new_ty.clone());
+            }
+            _ => {}
+        }
+    }
+
     /// Extracts a function name from a call target.
     fn extract_call_name(&self, target: &super::expression::CallTarget) -> Option<String> {
         match target {
@@ -1601,8 +1654,41 @@ impl SignatureRecovery {
         match &expr.kind {
             ExprKind::Assign { lhs, rhs } => {
                 self.observe_sysv_va_list_assignment(lhs, rhs);
+                // Stash the float-bank-destination size during the
+                // RHS walk so the Deref/ArrayAccess handlers can pick
+                // `Float(n)` element types when the load lands in
+                // an `xmm*` / `farg*` / aarch64 d-bank register. The
+                // scalar SSE loads `movsd`/`movss` flow through here
+                // as `Var(xmm*) = ArrayAccess(..., size)`.
+                //
+                // Only set the flag when the rhs is a DIRECT
+                // ArrayAccess — an intervening `Cast` or `BinOp` is
+                // evidence that the load isn't a raw scalar FP read:
+                // `xmm0 = Cast(ArrayAccess(rdi, i, 4), Float)` is the
+                // `cvtsi2sd` int→float conversion shape, where the
+                // memory source is still INTEGER data. Codex review
+                // on PR #38 pass 6.
+                //
+                // Known limitation (codex pass 7): an indexed
+                // integer-SIMD load like `movq xmm0, [rdi+rcx*8]`
+                // lifts to the SAME shape as scalar `movsd xmm2,
+                // [arr+i*8]` and gets the same float-context
+                // treatment. Without lift-time mnemonic annotation
+                // (analogous to `GotRef.is_float_context`) we can't
+                // distinguish them at this layer. The trade-off
+                // favors the dramatically more common scalar-float
+                // array case; the indexed-integer-SIMD pattern is
+                // rare in compiled C code (compilers prefer general-
+                // purpose registers for integer indexed loads).
+                let prev_float_dest = self.current_rhs_float_dest_size;
+                self.current_rhs_float_dest_size = if matches!(rhs.kind, ExprKind::ArrayAccess { .. }) {
+                    self.float_dest_load_size(lhs)
+                } else {
+                    0
+                };
                 // First, analyze the RHS for reads
                 self.analyze_expr_reads(rhs);
+                self.current_rhs_float_dest_size = prev_float_dest;
                 // Lvalue bases still contribute reads for parameter recovery, e.g.
                 // *(arg1) = ret_0 should keep arg1 as a used pointer parameter.
                 if !matches!(lhs.kind, ExprKind::Var(_) | ExprKind::Unknown(_)) {
@@ -2316,17 +2402,31 @@ impl SignatureRecovery {
                 self.analyze_expr_reads_with_context(operand, false, is_comparison);
             }
             ExprKind::Deref { addr, size } => {
-                // The address expression is being dereferenced
+                // The address expression is being dereferenced.
+                // Clear the float-context override while walking the
+                // ADDRESS — a nested ArrayAccess inside the addr is
+                // an outer-pointer-to-pointer access; its element
+                // type is the address being dereferenced, not the
+                // float value the outer load eventually yields.
+                // Same rationale as the ArrayAccess index scope —
+                // codex review on PR #38 pass 3.
+                let saved_float_dest = self.current_rhs_float_dest_size;
+                self.current_rhs_float_dest_size = 0;
                 self.analyze_expr_reads_with_context(addr, true, false);
+                self.current_rhs_float_dest_size = saved_float_dest;
 
-                // Track element type and dereference count for base variables
+                // Track element type and dereference count for base variables.
+                // Use the int default (not the float-context override) for
+                // plain `Deref(base)` — `movq xmm0, [rdi]` lifts this way and
+                // is an integer-SIMD load despite landing in an xmm register.
+                // The float context only fires for ArrayAccess (indexed
+                // load `arr[i]` — the canonical scalar SSE pattern).
+                // Codex review on PR #38 pass 2.
                 if let Some(base_name) = self.extract_var_name(addr) {
                     let elem_type = Self::infer_type_from_size(*size as usize);
                     self.record_usage_hint(&base_name, |h| {
                         h.deref_count += 1;
-                        if h.deref_element_type.is_none() {
-                            h.deref_element_type = Some(elem_type.clone());
-                        }
+                        Self::merge_deref_element_type(h, &elem_type);
                     });
                     // Propagate to a spilled parameter only when the
                     // ADDRESS load (the spill reload itself) is wide
@@ -2345,13 +2445,16 @@ impl SignatureRecovery {
                     let ptr_width = self.convention.pointer_width();
                     if addr_width >= ptr_width {
                         if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
+                            // Same as the parent Deref branch: do NOT use
+                            // the float-context override here. The spill-
+                            // slot bridge fires for plain pointer reloads
+                            // (`mov rax, [rbp-16]`) too, where the float
+                            // context isn't valid evidence.
                             let elem_type_inner = Self::infer_type_from_size(*size as usize);
                             self.record_hint_for_arg_register(&reg, |h| {
                                 h.is_dereferenced = true;
                                 h.deref_count += 1;
-                                if h.deref_element_type.is_none() {
-                                    h.deref_element_type = Some(elem_type_inner);
-                                }
+                                Self::merge_deref_element_type(h, &elem_type_inner);
                             });
                         }
                     }
@@ -2362,28 +2465,37 @@ impl SignatureRecovery {
                 index,
                 element_size,
             } => {
-                // Base is being used as a pointer/array
+                // Base is being used as a pointer/array.
+                //
+                // Clear the float-context override while walking the
+                // BASE recursively — a nested `ArrayAccess(inner, j,
+                // 8)` for a pointer table `ptrs[i][j]` should record
+                // `inner` as a pointer-typed element, not the float
+                // value the OUTER access eventually yields. The
+                // IMMEDIATE element-type assignment below (the
+                // extract_var_name + merge_deref_element_type lines)
+                // still uses the float context for the outer base.
+                // Codex review on PR #38 pass 4.
+                let saved_float_dest = self.current_rhs_float_dest_size;
+                self.current_rhs_float_dest_size = 0;
                 self.analyze_expr_reads_with_context(base, true, false);
+                self.current_rhs_float_dest_size = saved_float_dest;
 
                 // Mark base as array access and track element type
                 if let Some(base_name) = self.extract_var_name(base) {
-                    let elem_type = Self::infer_type_from_size(*element_size);
+                    let elem_type = self.infer_deref_element_type(*element_size);
                     self.record_usage_hint(&base_name, |h| {
                         h.is_array_access = true;
                         h.deref_count += 1;
-                        if h.deref_element_type.is_none() {
-                            h.deref_element_type = Some(elem_type.clone());
-                        }
+                        Self::merge_deref_element_type(h, &elem_type);
                     });
                     if let Some(reg) = self.spilled_arg_register_from_var_name(&base_name) {
-                        let elem_type_inner = Self::infer_type_from_size(*element_size);
+                        let elem_type_inner = self.infer_deref_element_type(*element_size);
                         self.record_hint_for_arg_register(&reg, |h| {
                             h.is_array_access = true;
                             h.is_pointer_arithmetic = true;
                             h.deref_count += 1;
-                            if h.deref_element_type.is_none() {
-                                h.deref_element_type = Some(elem_type_inner);
-                            }
+                            Self::merge_deref_element_type(h, &elem_type_inner);
                         });
                     }
                 }
@@ -2392,7 +2504,15 @@ impl SignatureRecovery {
                 if let ExprKind::Var(var) = &index.kind {
                     self.record_usage_hint(&var.name.to_lowercase(), |h| h.is_array_index = true);
                 }
+                // Scope the float-context override to the BASE only.
+                // A nested ArrayAccess in the index subexpression
+                // (`xs[idx[i]]`) is a separate integer load — its
+                // base should NOT inherit the outer SSE float
+                // context. Codex review on PR #38 pass 3.
+                let saved_float_dest = self.current_rhs_float_dest_size;
+                self.current_rhs_float_dest_size = 0;
                 self.analyze_expr_reads_with_context(index, false, false);
+                self.current_rhs_float_dest_size = saved_float_dest;
             }
             ExprKind::BitField { expr, .. } => {
                 self.analyze_expr_reads_with_context(expr, false, false);
@@ -3845,6 +3965,67 @@ impl SignatureRecovery {
             || name_lower == self.convention.integer_return_register_32()
             || name_lower == self.convention.float_return_register()
             || Self::x86_simd_register_index(&name_lower) == Some(0)
+    }
+
+    /// If `lhs` is a float-bank register destination AND the load
+    /// is SCALAR-WIDTH (4 = single, 8 = double), return the width.
+    /// Otherwise 0. Used by the Assign handler to flag the RHS walk
+    /// as "float context" so Deref/ArrayAccess hint propagation
+    /// picks `Float(n)` element types.
+    ///
+    /// Codex review on PR #38 pass 1 narrowed this — the register
+    /// bank alone is not enough to distinguish scalar FP loads
+    /// (`movsd`/`movss`) from integer SIMD loads (`movq`/`movdqa`/
+    /// `vmovdqu`/NEON `LDR Q*`). Scalar SSE lifts to a Variable
+    /// with size 4 or 8; full-width SIMD (xmm 16B, ymm 32B, zmm
+    /// 64B) lifts to a Variable with size > 8 and must NOT be
+    /// treated as float context. The `Unknown("farg*")` rename
+    /// only happens in scalar contexts via PR #36's lift logic,
+    /// so it's safe to default to 8 there.
+    fn float_dest_load_size(&self, lhs: &Expr) -> u8 {
+        let (name, var_size) = match &lhs.kind {
+            ExprKind::Var(var) => (var.name.clone(), Some(var.size)),
+            ExprKind::Unknown(name) => (name.clone(), None),
+            _ => return 0,
+        };
+        let lower = name.to_ascii_lowercase();
+        let is_x86_float_bank = matches!(
+            self.convention,
+            CallingConvention::SystemV | CallingConvention::Win64
+        ) && (lower.starts_with("xmm")
+            || lower.starts_with("ymm")
+            || lower.starts_with("zmm"));
+        // ARM64 SIMD-FP register aliases — `s*` collides with RISC-V
+        // saved INTEGER registers `s0`-`s11`, so gate by convention.
+        // Codex review on PR #38 pass 6.
+        let is_arm_float_bank = matches!(self.convention, CallingConvention::Aarch64)
+            && (lower.starts_with('d')
+                || lower.starts_with('s')
+                || lower.starts_with('q')
+                || lower.starts_with('v'))
+            && lower.len() > 1
+            && lower[1..].chars().all(|c| c.is_ascii_digit());
+        let is_farg_alias = lower
+            .strip_prefix("farg")
+            .is_some_and(|s| s.parse::<usize>().is_ok());
+        let is_float_bank = is_x86_float_bank || is_arm_float_bank || is_farg_alias;
+        if !is_float_bank {
+            return 0;
+        }
+        match var_size {
+            // Scalar SSE: movsd (8) / movss (4). Accept.
+            Some(8) => 8,
+            Some(4) => 4,
+            // Wider (full xmm 16 / ymm 32 / zmm 64) or narrower
+            // half-precision — not a scalar float context, the
+            // lifted instruction was likely an integer SIMD load
+            // or an FP16 load we don't handle yet. Reject.
+            Some(_) => 0,
+            // Unknown spelling (e.g. `farg2` after structurer
+            // stabilization) — the rename only fires in scalar
+            // contexts so default to double.
+            None => 8,
+        }
     }
 
     fn is_float_arg_register(&self, name: &str) -> bool {
@@ -8078,6 +8259,424 @@ mod tests {
             "Unknown(farg2) write + Var(xmm2) read must NOT count as a param: {:?}",
             sig.parameters
         );
+    }
+
+    /// SSE-double loads land in the float bank — `movsd xmm2,
+    /// [arr+i*8]` lifts to `Var(xmm2) = ArrayAccess(arr, i, 8)`.
+    /// The Assign handler stashes the float-dest size while
+    /// walking the rhs so the ArrayAccess handler picks
+    /// `Float(64)` for the base pointer's element type, not the
+    /// default `SignedInt(64)`. Without this, `double *xs`
+    /// recovers as `int64_t *xs`.
+    #[test]
+    fn test_sse_double_load_yields_double_pointer_element_type() {
+        use hexray_core::BasicBlockId;
+        let load_xmm = Expr::assign(
+            Expr::var(Variable::reg("xmm2", 8)),
+            Expr::array_access(Expr::unknown("rdi"), Expr::unknown("i"), 8),
+        );
+        // Touch xmm0 once so the integer arg appears in the
+        // recovered signature.
+        let use_xmm = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::var(Variable::reg("xmm2", 8)),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load_xmm, use_xmm],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        // rdi → arg 0 should be TypedPointer(Float(64)).
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        assert!(
+            matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner) if matches!(inner.as_ref(), ParamType::Float(64))
+            ),
+            "rdi should be `double*` (TypedPointer(Float(64))) — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 6: integer-to-float conversion
+    /// (`cvtsi2sd xmm0, [rdi+i*4]`) lifts as
+    /// `Var(xmm0) = Cast(ArrayAccess(rdi, i, 4), Float(64))`. The
+    /// memory source is INTEGER data; the destination being a
+    /// float-bank register is irrelevant. Setting the float-context
+    /// flag only when the rhs is a DIRECT ArrayAccess (no Cast
+    /// wrap) handles this — rdi stays as `int32_t*` /
+    /// `uint32_t*`, not promoted to `float*`.
+    #[test]
+    fn test_cvtsi2sd_int_to_float_does_not_float_type_source() {
+        use hexray_core::BasicBlockId;
+        let cvt_load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(Expr::array_access(
+                        Expr::unknown("rdi"),
+                        Expr::unknown("i"),
+                        4,
+                    )),
+                    to_size: 8,
+                    signed: true,
+                },
+            },
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![cvt_load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "cvtsi2sd source must NOT recover as `float*`/`double*` — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 6: RISC-V `s0`-`s11` are saved
+    /// INTEGER registers, but the spelling collides with AArch64
+    /// SIMD-FP `s0`-`s31`. Gating the FP-alias detection by
+    /// convention prevents a RISC-V `s0 = ArrayAccess(a0, i, 8)`
+    /// from promoting `a0` to `double*`.
+    #[test]
+    fn test_riscv_s_register_not_treated_as_float_bank() {
+        use hexray_core::BasicBlockId;
+        let load = Expr::assign(
+            Expr::var(Variable::reg("s0", 8)),
+            Expr::array_access(Expr::unknown("a0"), Expr::unknown("i"), 8),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::RiscV);
+        let sig = recovery.analyze(&cfg);
+        // Whatever `a0` recovers as, it MUST NOT be float-typed
+        // (the s0 LHS is an integer-saved register in RISC-V,
+        // not an FP scalar destination).
+        if let Some(a0_param) = sig.parameters.iter().find(|p| {
+            matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "a0"
+            )
+        }) {
+            assert!(
+                !matches!(
+                    &a0_param.param_type,
+                    ParamType::TypedPointer(inner)
+                        if matches!(inner.as_ref(), ParamType::Float(_))
+                ),
+                "RISC-V `s0 = a0[i]` must NOT recover a0 as float pointer (s0 is integer-saved), got {:?}",
+                a0_param.param_type,
+            );
+        }
+    }
+
+    /// Codex review on PR #38 pass 4: a nested ArrayAccess as the
+    /// BASE of an outer SSE-load (`xmm0 = ptrs[i][j]` for a
+    /// pointer table) — the inner access loads a pointer, the
+    /// outer loads the float through it. The inner base must NOT
+    /// be float-typed.
+    #[test]
+    fn test_nested_array_base_does_not_inherit_float_context() {
+        use hexray_core::BasicBlockId;
+        // xmm0 = ArrayAccess(ArrayAccess(rdi, i, 8), j, 8)
+        let outer_load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::array_access(
+                Expr::array_access(Expr::unknown("rdi"), Expr::unknown("i"), 8),
+                Expr::unknown("j"),
+                8,
+            ),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![outer_load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        // rdi is the OUTER table base — it holds pointers (or
+        // pointer-sized values), NOT raw doubles. Must not be
+        // `double*`.
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "nested-base rdi must NOT recover as `double*`/`float*` — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 3: a nested ArrayAccess in the
+    /// INDEX subexpression of an outer SSE-load is its own
+    /// separate integer load — its base must NOT inherit the
+    /// outer float context. For `xmm0 = ArrayAccess(xs,
+    /// ArrayAccess(idx, i, 4), 8)`, xs gets `double*` but idx
+    /// must stay `int32_t*`.
+    #[test]
+    fn test_nested_array_index_does_not_inherit_float_context() {
+        use hexray_core::BasicBlockId;
+        let outer_load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::array_access(
+                Expr::unknown("rdi"),
+                Expr::array_access(Expr::unknown("rsi"), Expr::unknown("i"), 4),
+                8,
+            ),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![outer_load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        assert!(
+            matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(64))
+            ),
+            "outer base (rdi) should still recover as `double*`, got {:?}",
+            rdi_param.param_type
+        );
+
+        let rsi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rsi"
+            ))
+            .expect("rsi parameter recovered");
+        assert!(
+            !matches!(
+                &rsi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "nested-index base (rsi) must NOT inherit float context, got {:?}",
+            rsi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 2: `movq xmm0, [rdi]` is a
+    /// plain `Deref(rdi)` load (not ArrayAccess) and is an
+    /// integer-SIMD operation despite landing in an xmm
+    /// destination. The float-context override is scoped to
+    /// ArrayAccess patterns (`arr[i]` — the canonical scalar SSE
+    /// indexed load); plain Deref keeps the int default.
+    #[test]
+    fn test_xmm_plain_deref_is_not_float_typed() {
+        use hexray_core::BasicBlockId;
+        // Var(xmm0, size=8) = Deref(rdi, 8) — the `movq xmm0,
+        // [rdi]` shape codex flagged.
+        let load = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::deref(Expr::unknown("rdi"), 8),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "plain Deref(rdi) into xmm must NOT recover as `double*` / `float*` — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Codex review on PR #38 pass 1: a 16-byte SIMD load
+    /// (`movdqa xmm0, [rdi]` or similar integer-SIMD) lifts to a
+    /// `Var(xmm0, size=16)` LHS. Must NOT be treated as a scalar
+    /// float context — otherwise an `int128_t* p` would be
+    /// mis-recovered as `double* p`.
+    #[test]
+    fn test_simd_wide_load_is_not_float_context() {
+        use hexray_core::BasicBlockId;
+        // `Var(xmm0)` with size=16 simulates movdqa/vmovdqu.
+        let load_simd = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 16)),
+            Expr::array_access(Expr::unknown("rdi"), Expr::unknown("i"), 8),
+        );
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load_simd],
+            address_range: (0x1000, 0x1010),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        let rdi_param = sig
+            .parameters
+            .iter()
+            .find(|p| matches!(
+                &p.location,
+                ParameterLocation::IntegerRegister { name, .. } if name == "rdi"
+            ))
+            .expect("rdi parameter recovered");
+        // The element type must NOT be Float — should stay as the
+        // int default since the SIMD register width signals an
+        // integer-SIMD load, not a scalar SSE one.
+        assert!(
+            !matches!(
+                &rdi_param.param_type,
+                ParamType::TypedPointer(inner)
+                    if matches!(inner.as_ref(), ParamType::Float(_))
+            ),
+            "wide-SIMD load must NOT recover rdi as `double*` / `float*` — got {:?}",
+            rdi_param.param_type
+        );
+    }
+
+    /// Float observation across multiple array accesses on different
+    /// pointer args — saxpy's body has both `xmm2 = xs[i]` and
+    /// `xmm1 = ys[i]`. Both base pointers must recover their float
+    /// element type independently.
+    #[test]
+    fn test_sse_double_loads_on_distinct_pointers_both_get_double_typed() {
+        use hexray_core::BasicBlockId;
+        let load_xs = Expr::assign(
+            Expr::var(Variable::reg("xmm2", 8)),
+            Expr::array_access(Expr::unknown("rdi"), Expr::unknown("i"), 8),
+        );
+        let load_ys = Expr::assign(
+            Expr::var(Variable::reg("xmm1", 8)),
+            Expr::array_access(Expr::unknown("rsi"), Expr::unknown("i"), 8),
+        );
+        let use_xmm = Expr::assign(
+            Expr::var(Variable::reg("xmm0", 8)),
+            Expr::binop(
+                BinOpKind::Add,
+                Expr::var(Variable::reg("xmm2", 8)),
+                Expr::var(Variable::reg("xmm1", 8)),
+            ),
+        );
+
+        let block = StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements: vec![load_xs, load_ys, use_xmm],
+            address_range: (0x1000, 0x1020),
+        };
+        let cfg = StructuredCfg {
+            body: vec![block],
+            cfg_entry: BasicBlockId::new(0),
+        };
+
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+
+        for reg in &["rdi", "rsi"] {
+            let p = sig
+                .parameters
+                .iter()
+                .find(|p| matches!(
+                    &p.location,
+                    ParameterLocation::IntegerRegister { name, .. } if name == reg
+                ))
+                .unwrap_or_else(|| panic!("expected {reg} parameter"));
+            assert!(
+                matches!(
+                    &p.param_type,
+                    ParamType::TypedPointer(inner)
+                        if matches!(inner.as_ref(), ParamType::Float(64))
+                ),
+                "{reg} should be `double*`, got {:?}",
+                p.param_type
+            );
+        }
     }
 
     /// Codex review on PR #37 pass 2: vector-width aliases. A
