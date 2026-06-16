@@ -418,18 +418,17 @@ fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
         ExprKind::UnaryOp { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::BitField { expr: operand, .. } => expr_safe_to_reevaluate(operand),
-        // Memory reads: only safe when rooted at the stack frame.
-        ExprKind::Deref { addr, .. } => {
-            expr_is_stack_frame_address(addr) && expr_safe_to_reevaluate(addr)
-        }
+        // Memory reads: only safe when the access is a PROVEN fixed
+        // stack-frame slot (`[rbp-16]`, `rsp[-3]`). A variable offset
+        // (`rbp + rax`) or variable index could escape the frame or hit
+        // externally-mutable memory — reject. Codex review on PR #39
+        // pass 3.
+        ExprKind::Deref { addr, .. } => expr_is_fixed_stack_frame_address(addr),
         ExprKind::ArrayAccess { base, index, .. } => {
-            expr_is_stack_frame_address(base)
-                && expr_safe_to_reevaluate(base)
-                && expr_safe_to_reevaluate(index)
+            expr_is_fixed_stack_frame_address(base)
+                && matches!(index.kind, ExprKind::IntLit(_))
         }
-        ExprKind::FieldAccess { base, .. } => {
-            expr_is_stack_frame_address(base) && expr_safe_to_reevaluate(base)
-        }
+        ExprKind::FieldAccess { base, .. } => expr_is_fixed_stack_frame_address(base),
         ExprKind::AddressOf(inner) => expr_safe_to_reevaluate(inner),
         ExprKind::Conditional {
             cond,
@@ -448,34 +447,45 @@ fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `addr` is rooted at a stack-frame base register (rsp/rbp/x29/sp/
-/// ebp/fp) — i.e. dereferencing it reads the current function's own frame,
-/// which is not externally mutable between two adjacent instructions.
-/// Recognizes the bare register, `base ± offset`, and nested stack-frame
-/// access chains.
-fn expr_is_stack_frame_address(addr: &Expr) -> bool {
-    fn is_stack_base_name(name: &str) -> bool {
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp" | "x29" | "fp" | "x31"
-        )
-    }
+/// Whether `addr` is a PROVEN fixed stack-frame slot address — the bare frame
+/// register, or `base ± <constant>`. A constant offset keeps the access
+/// pinned to the function's own frame (not externally mutable across two
+/// adjacent branch tests); a variable offset (`rbp + rax`) could escape the
+/// frame or hit volatile/shared memory, so it is rejected. Codex review on
+/// PR #39 pass 3.
+fn expr_is_fixed_stack_frame_address(addr: &Expr) -> bool {
     match &addr.kind {
-        ExprKind::Var(v) => is_stack_base_name(&v.name),
-        ExprKind::Unknown(name) => is_stack_base_name(name),
+        ExprKind::Var(v) => is_stack_base_register_name(&v.name),
+        ExprKind::Unknown(name) => is_stack_base_register_name(name),
+        ExprKind::Cast { expr: inner, .. } => expr_is_fixed_stack_frame_address(inner),
+        // `base ± constant` — exactly one operand is the frame base and the
+        // other is an integer literal. For `Sub` the base must be the left
+        // operand (`base - k`, never `k - base`).
         ExprKind::BinOp {
-            op: BinOpKind::Add | BinOpKind::Sub,
+            op: BinOpKind::Add,
             left,
             right,
-        } => expr_is_stack_frame_address(left) || expr_is_stack_frame_address(right),
-        ExprKind::Cast { expr: inner, .. } => expr_is_stack_frame_address(inner),
-        // A stack slot reached via an indexed/field access whose own base is
-        // the frame (`rbp[-3]`, `(rsp+k).field`).
-        ExprKind::ArrayAccess { base, .. } | ExprKind::FieldAccess { base, .. } => {
-            expr_is_stack_frame_address(base)
+        } => {
+            (expr_is_fixed_stack_frame_address(left) && matches!(right.kind, ExprKind::IntLit(_)))
+                || (expr_is_fixed_stack_frame_address(right)
+                    && matches!(left.kind, ExprKind::IntLit(_)))
+        }
+        ExprKind::BinOp {
+            op: BinOpKind::Sub,
+            left,
+            right,
+        } => {
+            expr_is_fixed_stack_frame_address(left) && matches!(right.kind, ExprKind::IntLit(_))
         }
         _ => false,
     }
+}
+
+fn is_stack_base_register_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp" | "x29" | "fp" | "x31"
+    )
 }
 
 /// Extract a single If node from a body, returning (if_node, prefix_nodes, suffix_nodes).
@@ -853,6 +863,77 @@ mod tests {
                 assert!(
                     else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
                     "inner If must be preserved when outer then is non-empty",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// Codex review on PR #39 pass 3: a stack-frame read with a
+    /// VARIABLE offset (`rbp[rax]`, `*(rsp + rcx)`) is not a proven
+    /// fixed slot — it could escape the frame — so the collapse must
+    /// NOT fire. Only fixed-offset slots (`*(rbp-16)`, `rsp[-3]`)
+    /// qualify.
+    #[test]
+    fn test_collapse_skips_variable_offset_stack_read() {
+        // *(rbp + rax) != 0 — variable offset.
+        let var_off_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::deref(
+                    Expr::binop(BinOpKind::Add, make_var("rbp"), make_var("rax")),
+                    8,
+                ),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: var_off_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: var_off_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "variable-offset stack read must NOT collapse (not a proven fixed slot)",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+
+        // rbp[rax] (variable index ArrayAccess) — also rejected.
+        let var_idx_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::array_access(make_var("rbp"), make_var("rax"), 8),
+                Expr::int(0),
+            )
+        };
+        let inner2 = StructuredNode::If {
+            condition: var_idx_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer2 = StructuredNode::If {
+            condition: var_idx_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner2]),
+        };
+        let result2 = detect_short_circuit(vec![outer2]);
+        match &result2[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "variable-index stack ArrayAccess must NOT collapse",
                 );
             }
             other => panic!("expected If, got {other:?}"),
