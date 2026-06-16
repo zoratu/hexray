@@ -7,7 +7,7 @@
 //! 2. `if (a) { body } else { if (b) { same_body }}` → `if (a || b) { body }`
 //! 3. Chains: `if (a) { if (b) { if (c) { body }}}` → `if (a && b && c) { body }`
 
-use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
+use super::expression::{BinOpKind, CallTarget, Expr, ExprKind, UnaryOpKind};
 use super::structurer::StructuredNode;
 
 /// Entry point: detect short-circuit patterns in a list of nodes.
@@ -408,6 +408,13 @@ fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
         ExprKind::BinOp { left, right, .. } => {
             expr_safe_to_reevaluate(left) && expr_safe_to_reevaluate(right)
         }
+        // `++x` / `--x` mutate their operand, so re-evaluation is not
+        // idempotent — reject like assignments. Codex review on PR #39
+        // pass 2.
+        ExprKind::UnaryOp {
+            op: UnaryOpKind::Inc | UnaryOpKind::Dec,
+            ..
+        } => false,
         ExprKind::UnaryOp { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::BitField { expr: operand, .. } => expr_safe_to_reevaluate(operand),
@@ -846,6 +853,42 @@ mod tests {
                 assert!(
                     else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
                     "inner If must be preserved when outer then is non-empty",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// Codex review on PR #39 pass 2: the collapse must NOT fire when
+    /// the condition contains a side-effecting `++`/`--` — the first
+    /// (false) evaluation mutates the operand, so the inner guard is
+    /// NOT redundant.
+    #[test]
+    fn test_collapse_skips_increment_condition() {
+        let inc_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::unary(UnaryOpKind::Inc, make_var("i")),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: inc_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: inc_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "++i condition must NOT collapse (mutates operand)",
                 );
             }
             other => panic!("expected If, got {other:?}"),
