@@ -1301,10 +1301,17 @@ impl Expr {
         let Operand::Immediate(imm) = ops.get(imm_idx)? else {
             return None;
         };
-        let dst_name = match ops.first()? {
-            Operand::Register(r) => r.name(),
-            _ => return None,
+        let Operand::Register(dst_reg) = ops.first()? else {
+            return None;
         };
+        // 128-bit (XMM) only. On YMM/ZMM, `vshufps`'s immediate broadcasts
+        // WITHIN each 128-bit lane, not across the whole register, so a
+        // single `src[lane]` splat would misrepresent the upper lanes.
+        // Codex review on PR #40 pass 4.
+        if dst_reg.size != 128 {
+            return None;
+        }
+        let dst_name = dst_reg.name();
         let all_same_register = ops[..imm_idx].iter().all(|op| {
             matches!(op, Operand::Register(r) if r.name().eq_ignore_ascii_case(dst_name))
         });
@@ -7057,6 +7064,34 @@ mod tests {
             panic!("expected lane extract for 4-operand vshufps, got {rhs:?}");
         };
         assert!(matches!(index.kind, ExprKind::IntLit(1)), "0x55 → lane 1");
+    }
+
+    /// Codex review on PR #40 pass 4: `vshufps` on a 256-bit YMM only
+    /// broadcasts within each 128-bit lane, so a single `src[lane]` splat
+    /// would misrepresent the upper lanes. Restrict to 128-bit XMM — a YMM
+    /// self-broadcast must stay opaque.
+    #[test]
+    fn test_wide_ymm_vshufps_is_not_lane_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Immediate, Operand, Operation, Register, RegisterClass,
+        };
+        // 256-bit YMM0.
+        let ymm0 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM0, 256);
+        let inst = Instruction::new(0x401070, 5, vec![0xc5, 0xfc, 0xc6, 0xc0, 0x55], "vshufps")
+            .with_operation(Operation::Other(0xC6))
+            .with_operands(vec![
+                Operand::Register(ymm0.clone()),
+                Operand::Register(ymm0.clone()),
+                Operand::Register(ymm0),
+                Operand::Immediate(Immediate { value: 0x55, size: 8, signed: false }),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        if let ExprKind::Assign { rhs, .. } = &expr.kind {
+            assert!(
+                !matches!(rhs.kind, ExprKind::ArrayAccess { .. }),
+                "256-bit vshufps must NOT become a whole-register lane extract, got {rhs:?}",
+            );
+        }
     }
 
     /// `shufps xmm1, xmm1, 0xff` → lane 3 (0xff & 0b11 = 3).
