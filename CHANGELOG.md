@@ -5,6 +5,61 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.10] - 2026-06-16
+
+### Decompiler — SSE float recovery (structurer-ordering refactor)
+
+Closes all four gaps where the structurer simplified register-level data flow
+before signature/argument recovery could see it, collapsing it into opaque
+memory addresses. Recovery is now faithful for the canonical SSE shapes:
+
+- **saxpy_dot** (`double saxpy_dot(double a, double *xs, double *ys, int n)`)
+  recovers its 4-arg signature with `double*` pointer parameters, and the loop
+  body reads `total += a*xs[i] + ys[i]`. Required a spill-slot→argument bridge,
+  scratch-`xmm` preservation, a float-arg use-before-write gate, and
+  `double*`/`float*` element-type recovery from scalar SSE loads.
+- **safe_div** (`if (b == 0.0) return 0.0;`) recovers a single `if (b == 0.0)`
+  guard. The `ucomisd; jne X; jp X` float-equality idiom (two branches so NaN
+  follows C `==` semantics) was structured as a nested duplicate `if`; a
+  duplicate-empty-then-guard coalescer collapses it.
+- **hypot2** (`sqrt(x*x + y*y)`) round-trips, instead of dropping the `+ y*y`
+  term — call-arg recovery no longer truncates a complex argument back to a
+  partial one across a later consolidation pass.
+- **dot4** (vector horizontal sum) recovers `c[0]+c[1]+c[2]+c[3]`: self-`shufps`
+  broadcast immediates (`0x55`/`0xff`) lift to vector lane extracts (`c[1]`,
+  `c[3]`) instead of the prior nonsensical `c + c*3`.
+
+Supporting recognizers: `madd`/`msub`/`mneg` arch-pattern matching is gated off
+float operands (a `mulsd; addsd` chain is not a fused multiply-add); rip-relative
+`.rodata` float constants materialize as literals; `c && c → c` / `c || c → c`
+idempotence (side-effect-free, boolean operands only).
+
+### Decompiler — aarch64 & types
+
+- Extend the SSE float-ABI scan to **aarch64 AAPCS** (`d0`–`d7` args, `d0`
+  return).
+- Map aarch64 `R_AARCH64_CALL26` / `JUMP26` relocations for call resolution.
+- Bind stack locals as `std::shared_ptr` / `unique_ptr` / `weak_ptr<T>`.
+- Register ~90 `math.h` scalar prototypes for call-site argument recovery
+  (correct mixed int/float classes for `ldexp`/`frexp`/`modf`).
+- Reconstruct **stack-local structs** from known call prototypes.
+- Reorder mixed int/float parameters by source-declaration (spill) order.
+
+### Decompiler — C++ exceptions / coroutines
+
+- Apply `.rela.eh_frame` / `.gcc_except_table` relocations for `.o` files so
+  LSDA tables resolve.
+- Collapse multi-store POD throws into a `throw { ... }` literal; recognize the
+  `__cxa_throw` triple as `throw VALUE` / `throw Class(args)`.
+- Annotate C++20 coroutine `.actor` / `.destroy` / `.cleanup` clones.
+- Demangle relocation-resolved call targets at emit time.
+
+### Robustness / hardening (fuzz- and soak-found)
+
+- Reject corrupted ELF `sh_entsize` smaller than the natural struct size.
+- `CType::size` returns `None` on array-length overflow.
+- Pre-release sweep: MSRV truth-up, `cargo-deny` policy, doc-warning trim.
+
 ## [1.3.9] - 2026-05-29
 
 ### Decompiler — x86-64 SysV float ABI
