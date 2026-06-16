@@ -58,6 +58,25 @@ fn detect_short_circuit_in_node(node: StructuredNode) -> StructuredNode {
                 }
             }
 
+            // Collapse a redundant duplicate-condition guard:
+            //   if (c) {} else { if (c) {} else { body } }
+            //     → if (c) {} else { body }
+            // This is the structured manifestation of the x86 float-equality
+            // idiom `ucomisd; jne X; jp X` — the compiler emits TWO conditional
+            // branches to the same target so NaN is handled per C's `==`
+            // semantics, and the structurer turns each into its own empty-then
+            // `if` on the same lifted comparison. See
+            // `try_collapse_duplicate_empty_then_guard`.
+            if let Some(collapsed_else) =
+                try_collapse_duplicate_empty_then_guard(&condition, &then_body, &else_body)
+            {
+                return StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body: collapsed_else,
+                };
+            }
+
             StructuredNode::If {
                 condition,
                 then_body,
@@ -297,6 +316,120 @@ fn try_extract_or_chain(
     Some((combined, then_body.to_vec()))
 }
 
+/// Collapse a redundant duplicate-condition guard:
+///   `if (c) {} else { if (c) {} else { body } }` → `if (c) {} else { body }`
+///
+/// Returns the new `else_body` (the inner if's else) when the pattern matches,
+/// or `None` otherwise. The caller keeps the outer condition and (empty) then.
+///
+/// ## Why this is sound
+///
+/// The two conditions are structurally equal, the outer then is empty, and the
+/// inner `if` is the SOLE content of the outer else (no statements before it).
+/// So there is literally no code between the two evaluations of `c` — control
+/// reaches the inner `if (c)` only along the outer's `else` edge (c false), and
+/// nothing has run that could change `c`. The inner test is therefore always
+/// false and its else body always executes; the inner guard is dead.
+///
+/// ## Why this fires on the ucomisd parity idiom
+///
+/// For `if (b == 0.0)` clang at `-O0` emits `ucomisd; jne X; jp X` — two
+/// conditional branches to the same target X so NaN follows C's `==` semantics
+/// (NaN compares unequal). The structurer lifts each branch into its own
+/// empty-then `if` on the same recovered comparison (`b != 0.0`), nesting the
+/// second in the first's else. Collapsing yields a single guard, so the emitter
+/// renders the clean `if (b == 0.0) { ... } else { ... }`.
+///
+/// ## Re-evaluation safety
+///
+/// We require `c` to be free of calls and assignments (`expr_safe_to_reevaluate`).
+/// A plain comparison of a (possibly memory-loaded) value against a constant is
+/// idempotent given the no-intervening-code guarantee above; a call or
+/// assignment in the condition would not be, so those are rejected.
+fn try_collapse_duplicate_empty_then_guard(
+    condition: &Expr,
+    then_body: &[StructuredNode],
+    else_body: &Option<Vec<StructuredNode>>,
+) -> Option<Option<Vec<StructuredNode>>> {
+    // Outer then must carry no statements (only empty blocks allowed).
+    if !then_body.iter().all(is_empty_block_node) {
+        return None;
+    }
+    if !expr_safe_to_reevaluate(condition) {
+        return None;
+    }
+
+    let else_nodes = else_body.as_ref()?;
+    let (inner_if, prefix, suffix) = extract_single_if(else_nodes)?;
+    // The inner if must be the SOLE content of the outer else — no statements
+    // before or after it, or there would be intervening code between the two
+    // condition evaluations.
+    if !prefix.is_empty() || !suffix.is_empty() {
+        return None;
+    }
+
+    let StructuredNode::If {
+        condition: inner_cond,
+        then_body: inner_then,
+        else_body: inner_else,
+    } = inner_if
+    else {
+        return None;
+    };
+    if !inner_then.iter().all(is_empty_block_node) {
+        return None;
+    }
+    if !exprs_are_equal(condition, &inner_cond) {
+        return None;
+    }
+
+    // Drop the redundant inner guard: keep the outer (empty) then and splice
+    // the inner else up to be the outer else.
+    Some(inner_else)
+}
+
+/// Whether a structured node carries no statements (an empty `Block`).
+fn is_empty_block_node(node: &StructuredNode) -> bool {
+    matches!(node, StructuredNode::Block { statements, .. } if statements.is_empty())
+}
+
+/// Whether `expr` can be evaluated twice with the same result GIVEN no
+/// intervening code mutates state — i.e. it contains no function call and no
+/// assignment. Memory reads are allowed (the caller guarantees nothing writes
+/// between the two evaluations). Used by
+/// [`try_collapse_duplicate_empty_then_guard`].
+fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Call { .. } | ExprKind::Assign { .. } | ExprKind::CompoundAssign { .. } => false,
+        ExprKind::BinOp { left, right, .. } => {
+            expr_safe_to_reevaluate(left) && expr_safe_to_reevaluate(right)
+        }
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_safe_to_reevaluate(operand),
+        ExprKind::Deref { addr, .. } => expr_safe_to_reevaluate(addr),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_safe_to_reevaluate(base) && expr_safe_to_reevaluate(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_safe_to_reevaluate(base),
+        ExprKind::AddressOf(inner) => expr_safe_to_reevaluate(inner),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_safe_to_reevaluate(cond)
+                && expr_safe_to_reevaluate(then_expr)
+                && expr_safe_to_reevaluate(else_expr)
+        }
+        ExprKind::Phi(args) => args.iter().all(expr_safe_to_reevaluate),
+        ExprKind::IntLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Unknown(_)
+        | ExprKind::GotRef { .. } => true,
+    }
+}
+
 /// Extract a single If node from a body, returning (if_node, prefix_nodes, suffix_nodes).
 /// Returns None if there's no If or multiple Ifs.
 fn extract_single_if(
@@ -439,6 +572,58 @@ fn exprs_are_equal(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Assign { lhs: l1, rhs: r1 }, ExprKind::Assign { lhs: l2, rhs: r2 }) => {
             exprs_are_equal(l1, l2) && exprs_are_equal(r1, r2)
         }
+        (ExprKind::Unknown(s1), ExprKind::Unknown(s2)) => s1 == s2,
+        (
+            ExprKind::ArrayAccess {
+                base: b1,
+                index: i1,
+                element_size: e1,
+            },
+            ExprKind::ArrayAccess {
+                base: b2,
+                index: i2,
+                element_size: e2,
+            },
+        ) => e1 == e2 && exprs_are_equal(b1, b2) && exprs_are_equal(i1, i2),
+        (
+            ExprKind::FieldAccess {
+                base: b1,
+                offset: o1,
+                ..
+            },
+            ExprKind::FieldAccess {
+                base: b2,
+                offset: o2,
+                ..
+            },
+        ) => o1 == o2 && exprs_are_equal(b1, b2),
+        (
+            ExprKind::Cast {
+                expr: e1,
+                to_size: s1,
+                signed: sg1,
+            },
+            ExprKind::Cast {
+                expr: e2,
+                to_size: s2,
+                signed: sg2,
+            },
+        ) => s1 == s2 && sg1 == sg2 && exprs_are_equal(e1, e2),
+        (ExprKind::AddressOf(e1), ExprKind::AddressOf(e2)) => exprs_are_equal(e1, e2),
+        (
+            ExprKind::GotRef {
+                address: a1,
+                size: s1,
+                is_deref: d1,
+                ..
+            },
+            ExprKind::GotRef {
+                address: a2,
+                size: s2,
+                is_deref: d2,
+                ..
+            },
+        ) => a1 == a2 && s1 == s2 && d1 == d2,
         _ => false,
     }
 }
@@ -472,6 +657,192 @@ mod tests {
 
     fn make_condition(name: &str) -> Expr {
         Expr::binop(BinOpKind::Ne, make_var(name), Expr::int(0))
+    }
+
+    /// Helper: `mem[off] != 0` — the lifted shape of the ucomisd
+    /// parity-idiom condition (a stack-slot float compared to zero).
+    fn mem_ne_zero() -> Expr {
+        Expr::binop(
+            BinOpKind::Ne,
+            Expr::array_access(make_var("rsp"), Expr::int(-3), 8),
+            Expr::int(0),
+        )
+    }
+
+    /// gap-2 ucomisd parity coalescer: the structured form of
+    /// `ucomisd; jne X; jp X` is
+    ///   `if (c) {} else { if (c) {} else { body } }`
+    /// with both `c` structurally identical and no intervening code.
+    /// Collapses to `if (c) {} else { body }`.
+    #[test]
+    fn test_collapse_duplicate_empty_then_guard() {
+        let body = vec![StructuredNode::Return(Some(Expr::int(0)))];
+        let inner = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(body.clone()),
+        };
+        let outer = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+
+        let result = detect_short_circuit(vec![outer]);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                assert!(then_body.is_empty(), "outer then stays empty");
+                let else_nodes = else_body.as_ref().expect("else preserved");
+                // The inner duplicate guard is gone — the else is the body
+                // directly, no nested If.
+                assert!(
+                    !else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "inner duplicate If must be collapsed, got {else_nodes:?}",
+                );
+                assert!(
+                    else_nodes
+                        .iter()
+                        .any(|n| matches!(n, StructuredNode::Return(_))),
+                    "body must survive in the else",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// A 3-deep duplicate-guard nest collapses fully (bottom-up).
+    #[test]
+    fn test_collapse_triple_duplicate_empty_then_guard() {
+        let body = vec![StructuredNode::Return(Some(Expr::int(0)))];
+        let mut node = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(body),
+        };
+        for _ in 0..2 {
+            node = StructuredNode::If {
+                condition: mem_ne_zero(),
+                then_body: vec![],
+                else_body: Some(vec![node]),
+            };
+        }
+        let result = detect_short_circuit(vec![node]);
+        // Count nested Ifs remaining — should be exactly 1.
+        fn count_ifs(nodes: &[StructuredNode]) -> usize {
+            nodes
+                .iter()
+                .map(|n| match n {
+                    StructuredNode::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        1 + count_ifs(then_body)
+                            + else_body.as_ref().map_or(0, |e| count_ifs(e))
+                    }
+                    _ => 0,
+                })
+                .sum()
+        }
+        assert_eq!(count_ifs(&result), 1, "all duplicate guards collapse to one");
+    }
+
+    /// The collapse must NOT fire when the conditions differ.
+    #[test]
+    fn test_collapse_skips_distinct_conditions() {
+        let inner = StructuredNode::If {
+            condition: make_condition("a"),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: make_condition("b"),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        // Both Ifs remain (different conditions).
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "distinct-condition inner If must be preserved",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// The collapse must NOT fire when the outer then is non-empty
+    /// (there's a real branch body, not the empty parity guard).
+    #[test]
+    fn test_collapse_skips_nonempty_then() {
+        let inner = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![StructuredNode::Expr(Expr::unknown("side_effect"))],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                assert!(!then_body.is_empty(), "non-empty then preserved");
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "inner If must be preserved when outer then is non-empty",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// The collapse must NOT fire when the condition contains a call
+    /// (re-evaluation could differ).
+    #[test]
+    fn test_collapse_skips_call_condition() {
+        let call_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::call(CallTarget::Named("f".to_string()), vec![]),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: call_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: call_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "call-condition inner If must be preserved (re-eval unsafe)",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
     }
 
     /// Codex review on PR #33 pass 3: the chain combine must not
