@@ -7,7 +7,7 @@
 //! 2. `if (a) { body } else { if (b) { same_body }}` → `if (a || b) { body }`
 //! 3. Chains: `if (a) { if (b) { if (c) { body }}}` → `if (a && b && c) { body }`
 
-use super::expression::{BinOpKind, CallTarget, Expr, ExprKind};
+use super::expression::{BinOpKind, CallTarget, Expr, ExprKind, UnaryOpKind};
 use super::structurer::StructuredNode;
 
 /// Entry point: detect short-circuit patterns in a list of nodes.
@@ -56,6 +56,25 @@ fn detect_short_circuit_in_node(node: StructuredNode) -> StructuredNode {
                         else_body: None,
                     };
                 }
+            }
+
+            // Collapse a redundant duplicate-condition guard:
+            //   if (c) {} else { if (c) {} else { body } }
+            //     → if (c) {} else { body }
+            // This is the structured manifestation of the x86 float-equality
+            // idiom `ucomisd; jne X; jp X` — the compiler emits TWO conditional
+            // branches to the same target so NaN is handled per C's `==`
+            // semantics, and the structurer turns each into its own empty-then
+            // `if` on the same lifted comparison. See
+            // `try_collapse_duplicate_empty_then_guard`.
+            if let Some(collapsed_else) =
+                try_collapse_duplicate_empty_then_guard(&condition, &then_body, &else_body)
+            {
+                return StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body: collapsed_else,
+                };
             }
 
             StructuredNode::If {
@@ -297,6 +316,178 @@ fn try_extract_or_chain(
     Some((combined, then_body.to_vec()))
 }
 
+/// Collapse a redundant duplicate-condition guard:
+///   `if (c) {} else { if (c) {} else { body } }` → `if (c) {} else { body }`
+///
+/// Returns the new `else_body` (the inner if's else) when the pattern matches,
+/// or `None` otherwise. The caller keeps the outer condition and (empty) then.
+///
+/// ## Why this is sound
+///
+/// The two conditions are structurally equal, the outer then is empty, and the
+/// inner `if` is the SOLE content of the outer else (no statements before it).
+/// So there is literally no code between the two evaluations of `c` — control
+/// reaches the inner `if (c)` only along the outer's `else` edge (c false), and
+/// nothing has run that could change `c`. The inner test is therefore always
+/// false and its else body always executes; the inner guard is dead.
+///
+/// ## Why this fires on the ucomisd parity idiom
+///
+/// For `if (b == 0.0)` clang at `-O0` emits `ucomisd; jne X; jp X` — two
+/// conditional branches to the same target X so NaN follows C's `==` semantics
+/// (NaN compares unequal). The structurer lifts each branch into its own
+/// empty-then `if` on the same recovered comparison (`b != 0.0`), nesting the
+/// second in the first's else. Collapsing yields a single guard, so the emitter
+/// renders the clean `if (b == 0.0) { ... } else { ... }`.
+///
+/// ## Re-evaluation safety
+///
+/// We require `c` to be free of calls and assignments (`expr_safe_to_reevaluate`).
+/// A plain comparison of a (possibly memory-loaded) value against a constant is
+/// idempotent given the no-intervening-code guarantee above; a call or
+/// assignment in the condition would not be, so those are rejected.
+fn try_collapse_duplicate_empty_then_guard(
+    condition: &Expr,
+    then_body: &[StructuredNode],
+    else_body: &Option<Vec<StructuredNode>>,
+) -> Option<Option<Vec<StructuredNode>>> {
+    // Outer then must carry no statements (only empty blocks allowed).
+    if !then_body.iter().all(is_empty_block_node) {
+        return None;
+    }
+    if !expr_safe_to_reevaluate(condition) {
+        return None;
+    }
+
+    let else_nodes = else_body.as_ref()?;
+    let (inner_if, prefix, suffix) = extract_single_if(else_nodes)?;
+    // The inner if must be the SOLE content of the outer else — no statements
+    // before or after it, or there would be intervening code between the two
+    // condition evaluations.
+    if !prefix.is_empty() || !suffix.is_empty() {
+        return None;
+    }
+
+    let StructuredNode::If {
+        condition: inner_cond,
+        then_body: inner_then,
+        else_body: inner_else,
+    } = inner_if
+    else {
+        return None;
+    };
+    if !inner_then.iter().all(is_empty_block_node) {
+        return None;
+    }
+    if !exprs_are_equal(condition, &inner_cond) {
+        return None;
+    }
+
+    // Drop the redundant inner guard: keep the outer (empty) then and splice
+    // the inner else up to be the outer else.
+    Some(inner_else)
+}
+
+/// Whether a structured node carries no statements (an empty `Block`).
+fn is_empty_block_node(node: &StructuredNode) -> bool {
+    matches!(node, StructuredNode::Block { statements, .. } if statements.is_empty())
+}
+
+/// Whether `expr` can be evaluated twice with the same result GIVEN no
+/// intervening code mutates state. It must contain no function call and no
+/// assignment, AND any memory read must be a STACK-FRAME access (rsp/rbp/x29
+/// -relative). Heap/global/volatile/MMIO reads are rejected — even with no
+/// intervening structured statements, externally-mutable memory could change
+/// between the two evaluations, so the rest of this module treats those as
+/// unsafe to deduplicate (codex review on PR #39 pass 1). Stack-frame slots
+/// (the parity idiom's spilled compare operand) are the function's own frame
+/// and provably stable across the two adjacent branch tests.
+fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Call { .. } | ExprKind::Assign { .. } | ExprKind::CompoundAssign { .. } => false,
+        ExprKind::BinOp { left, right, .. } => {
+            expr_safe_to_reevaluate(left) && expr_safe_to_reevaluate(right)
+        }
+        // `++x` / `--x` mutate their operand, so re-evaluation is not
+        // idempotent — reject like assignments. Codex review on PR #39
+        // pass 2.
+        ExprKind::UnaryOp {
+            op: UnaryOpKind::Inc | UnaryOpKind::Dec,
+            ..
+        } => false,
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_safe_to_reevaluate(operand),
+        // Memory reads: only safe when the access is a PROVEN fixed
+        // stack-frame slot (`[rbp-16]`, `rsp[-3]`). A variable offset
+        // (`rbp + rax`) or variable index could escape the frame or hit
+        // externally-mutable memory — reject. Codex review on PR #39
+        // pass 3.
+        ExprKind::Deref { addr, .. } => expr_is_fixed_stack_frame_address(addr),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_is_fixed_stack_frame_address(base)
+                && matches!(index.kind, ExprKind::IntLit(_))
+        }
+        ExprKind::FieldAccess { base, .. } => expr_is_fixed_stack_frame_address(base),
+        ExprKind::AddressOf(inner) => expr_safe_to_reevaluate(inner),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_safe_to_reevaluate(cond)
+                && expr_safe_to_reevaluate(then_expr)
+                && expr_safe_to_reevaluate(else_expr)
+        }
+        ExprKind::Phi(args) => args.iter().all(expr_safe_to_reevaluate),
+        // A non-dereferencing GotRef is an address constant (safe); a
+        // dereferencing one is a global memory load (reject).
+        ExprKind::GotRef { is_deref, .. } => !*is_deref,
+        ExprKind::IntLit(_) | ExprKind::Var(_) | ExprKind::Unknown(_) => true,
+    }
+}
+
+/// Whether `addr` is a PROVEN fixed stack-frame slot address — the bare frame
+/// register, or `base ± <constant>`. A constant offset keeps the access
+/// pinned to the function's own frame (not externally mutable across two
+/// adjacent branch tests); a variable offset (`rbp + rax`) could escape the
+/// frame or hit volatile/shared memory, so it is rejected. Codex review on
+/// PR #39 pass 3.
+fn expr_is_fixed_stack_frame_address(addr: &Expr) -> bool {
+    match &addr.kind {
+        ExprKind::Var(v) => is_stack_base_register_name(&v.name),
+        ExprKind::Unknown(name) => is_stack_base_register_name(name),
+        ExprKind::Cast { expr: inner, .. } => expr_is_fixed_stack_frame_address(inner),
+        // `base ± constant` — exactly one operand is the frame base and the
+        // other is an integer literal. For `Sub` the base must be the left
+        // operand (`base - k`, never `k - base`).
+        ExprKind::BinOp {
+            op: BinOpKind::Add,
+            left,
+            right,
+        } => {
+            (expr_is_fixed_stack_frame_address(left) && matches!(right.kind, ExprKind::IntLit(_)))
+                || (expr_is_fixed_stack_frame_address(right)
+                    && matches!(left.kind, ExprKind::IntLit(_)))
+        }
+        ExprKind::BinOp {
+            op: BinOpKind::Sub,
+            left,
+            right,
+        } => {
+            expr_is_fixed_stack_frame_address(left) && matches!(right.kind, ExprKind::IntLit(_))
+        }
+        _ => false,
+    }
+}
+
+fn is_stack_base_register_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp" | "x29" | "fp" | "x31"
+    )
+}
+
 /// Extract a single If node from a body, returning (if_node, prefix_nodes, suffix_nodes).
 /// Returns None if there's no If or multiple Ifs.
 fn extract_single_if(
@@ -439,6 +630,58 @@ fn exprs_are_equal(a: &Expr, b: &Expr) -> bool {
         (ExprKind::Assign { lhs: l1, rhs: r1 }, ExprKind::Assign { lhs: l2, rhs: r2 }) => {
             exprs_are_equal(l1, l2) && exprs_are_equal(r1, r2)
         }
+        (ExprKind::Unknown(s1), ExprKind::Unknown(s2)) => s1 == s2,
+        (
+            ExprKind::ArrayAccess {
+                base: b1,
+                index: i1,
+                element_size: e1,
+            },
+            ExprKind::ArrayAccess {
+                base: b2,
+                index: i2,
+                element_size: e2,
+            },
+        ) => e1 == e2 && exprs_are_equal(b1, b2) && exprs_are_equal(i1, i2),
+        (
+            ExprKind::FieldAccess {
+                base: b1,
+                offset: o1,
+                ..
+            },
+            ExprKind::FieldAccess {
+                base: b2,
+                offset: o2,
+                ..
+            },
+        ) => o1 == o2 && exprs_are_equal(b1, b2),
+        (
+            ExprKind::Cast {
+                expr: e1,
+                to_size: s1,
+                signed: sg1,
+            },
+            ExprKind::Cast {
+                expr: e2,
+                to_size: s2,
+                signed: sg2,
+            },
+        ) => s1 == s2 && sg1 == sg2 && exprs_are_equal(e1, e2),
+        (ExprKind::AddressOf(e1), ExprKind::AddressOf(e2)) => exprs_are_equal(e1, e2),
+        (
+            ExprKind::GotRef {
+                address: a1,
+                size: s1,
+                is_deref: d1,
+                ..
+            },
+            ExprKind::GotRef {
+                address: a2,
+                size: s2,
+                is_deref: d2,
+                ..
+            },
+        ) => a1 == a2 && s1 == s2 && d1 == d2,
         _ => false,
     }
 }
@@ -472,6 +715,374 @@ mod tests {
 
     fn make_condition(name: &str) -> Expr {
         Expr::binop(BinOpKind::Ne, make_var(name), Expr::int(0))
+    }
+
+    /// Helper: `mem[off] != 0` — the lifted shape of the ucomisd
+    /// parity-idiom condition (a stack-slot float compared to zero).
+    fn mem_ne_zero() -> Expr {
+        Expr::binop(
+            BinOpKind::Ne,
+            Expr::array_access(make_var("rsp"), Expr::int(-3), 8),
+            Expr::int(0),
+        )
+    }
+
+    /// gap-2 ucomisd parity coalescer: the structured form of
+    /// `ucomisd; jne X; jp X` is
+    ///   `if (c) {} else { if (c) {} else { body } }`
+    /// with both `c` structurally identical and no intervening code.
+    /// Collapses to `if (c) {} else { body }`.
+    #[test]
+    fn test_collapse_duplicate_empty_then_guard() {
+        let body = vec![StructuredNode::Return(Some(Expr::int(0)))];
+        let inner = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(body.clone()),
+        };
+        let outer = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+
+        let result = detect_short_circuit(vec![outer]);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                assert!(then_body.is_empty(), "outer then stays empty");
+                let else_nodes = else_body.as_ref().expect("else preserved");
+                // The inner duplicate guard is gone — the else is the body
+                // directly, no nested If.
+                assert!(
+                    !else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "inner duplicate If must be collapsed, got {else_nodes:?}",
+                );
+                assert!(
+                    else_nodes
+                        .iter()
+                        .any(|n| matches!(n, StructuredNode::Return(_))),
+                    "body must survive in the else",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// A 3-deep duplicate-guard nest collapses fully (bottom-up).
+    #[test]
+    fn test_collapse_triple_duplicate_empty_then_guard() {
+        let body = vec![StructuredNode::Return(Some(Expr::int(0)))];
+        let mut node = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(body),
+        };
+        for _ in 0..2 {
+            node = StructuredNode::If {
+                condition: mem_ne_zero(),
+                then_body: vec![],
+                else_body: Some(vec![node]),
+            };
+        }
+        let result = detect_short_circuit(vec![node]);
+        // Count nested Ifs remaining — should be exactly 1.
+        fn count_ifs(nodes: &[StructuredNode]) -> usize {
+            nodes
+                .iter()
+                .map(|n| match n {
+                    StructuredNode::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        1 + count_ifs(then_body)
+                            + else_body.as_ref().map_or(0, |e| count_ifs(e))
+                    }
+                    _ => 0,
+                })
+                .sum()
+        }
+        assert_eq!(count_ifs(&result), 1, "all duplicate guards collapse to one");
+    }
+
+    /// The collapse must NOT fire when the conditions differ.
+    #[test]
+    fn test_collapse_skips_distinct_conditions() {
+        let inner = StructuredNode::If {
+            condition: make_condition("a"),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: make_condition("b"),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        // Both Ifs remain (different conditions).
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "distinct-condition inner If must be preserved",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// The collapse must NOT fire when the outer then is non-empty
+    /// (there's a real branch body, not the empty parity guard).
+    #[test]
+    fn test_collapse_skips_nonempty_then() {
+        let inner = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: mem_ne_zero(),
+            then_body: vec![StructuredNode::Expr(Expr::unknown("side_effect"))],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                assert!(!then_body.is_empty(), "non-empty then preserved");
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "inner If must be preserved when outer then is non-empty",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// Codex review on PR #39 pass 3: a stack-frame read with a
+    /// VARIABLE offset (`rbp[rax]`, `*(rsp + rcx)`) is not a proven
+    /// fixed slot — it could escape the frame — so the collapse must
+    /// NOT fire. Only fixed-offset slots (`*(rbp-16)`, `rsp[-3]`)
+    /// qualify.
+    #[test]
+    fn test_collapse_skips_variable_offset_stack_read() {
+        // *(rbp + rax) != 0 — variable offset.
+        let var_off_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::deref(
+                    Expr::binop(BinOpKind::Add, make_var("rbp"), make_var("rax")),
+                    8,
+                ),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: var_off_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: var_off_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "variable-offset stack read must NOT collapse (not a proven fixed slot)",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+
+        // rbp[rax] (variable index ArrayAccess) — also rejected.
+        let var_idx_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::array_access(make_var("rbp"), make_var("rax"), 8),
+                Expr::int(0),
+            )
+        };
+        let inner2 = StructuredNode::If {
+            condition: var_idx_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer2 = StructuredNode::If {
+            condition: var_idx_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner2]),
+        };
+        let result2 = detect_short_circuit(vec![outer2]);
+        match &result2[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "variable-index stack ArrayAccess must NOT collapse",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// Codex review on PR #39 pass 2: the collapse must NOT fire when
+    /// the condition contains a side-effecting `++`/`--` — the first
+    /// (false) evaluation mutates the operand, so the inner guard is
+    /// NOT redundant.
+    #[test]
+    fn test_collapse_skips_increment_condition() {
+        let inc_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::unary(UnaryOpKind::Inc, make_var("i")),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: inc_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: inc_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "++i condition must NOT collapse (mutates operand)",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// Codex review on PR #39 pass 1: the collapse must NOT fire when
+    /// the condition reads NON-stack memory (heap/global/volatile/MMIO)
+    /// — that memory could change between the two evaluations even with
+    /// no intervening structured code. Here `*rdi != 0` (a deref of an
+    /// arbitrary pointer arg) must be preserved.
+    #[test]
+    fn test_collapse_skips_non_stack_memory_condition() {
+        let heap_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::deref(make_var("rdi"), 8),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: heap_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: heap_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "non-stack memory deref condition must NOT collapse (could be volatile)",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// The collapse STILL fires for a stack-frame memory read (the
+    /// parity idiom's spilled compare operand `[rbp-N]`), since the
+    /// frame is not externally mutable.
+    #[test]
+    fn test_collapse_fires_for_stack_frame_deref_condition() {
+        let stack_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::deref(
+                    Expr::binop(BinOpKind::Sub, make_var("rbp"), Expr::int(16)),
+                    8,
+                ),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: stack_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: stack_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    !else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "stack-frame deref condition SHOULD collapse, got {else_nodes:?}",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// The collapse must NOT fire when the condition contains a call
+    /// (re-evaluation could differ).
+    #[test]
+    fn test_collapse_skips_call_condition() {
+        let call_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::call(CallTarget::Named("f".to_string()), vec![]),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: call_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: call_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "call-condition inner If must be preserved (re-eval unsafe)",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
     }
 
     /// Codex review on PR #33 pass 3: the chain combine must not
