@@ -1263,20 +1263,25 @@ impl Expr {
     /// one lane into lane 0: `shufps xmm, xmm, imm8` (dst == src) puts lane
     /// `imm8 & 0b11` into lane 0 (the low element the scalar `addss` reads).
     ///
-    /// We recognize ONLY the self-operand form (`dst == src`): that's the
-    /// lane-broadcast/extract idiom, not a general two-source data shuffle
-    /// (those stay opaque). `shufps` is unambiguously a 4-byte single-
-    /// precision op, so the recovered value is `src[lane]` with a 4-byte
-    /// element, rendering e.g. `c[1]` / `c[3]` so the surrounding `addss`
-    /// chain reads as a horizontal sum.
+    /// We recognize ONLY the self-operand form (`dst == src`) with a
+    /// BROADCAST immediate — one whose four 2-bit lane-select fields are all
+    /// equal (`0x00`, `0x55`, `0xAA`, `0xFF`). For those every output lane
+    /// becomes `src[imm8 & 0b11]`, so the whole destination is a splat of a
+    /// single source lane and representing it as `src[lane]` captures the
+    /// value faithfully regardless of which lane a later op reads. `shufps`
+    /// is unambiguously a 4-byte single-precision op, so the element size is
+    /// 4 and it renders e.g. `c[1]` / `c[3]` — the horizontal-sum lane grabs.
     ///
-    /// NOTE: `unpckhpd` (the lane-2 grab in the same idiom) is deliberately
-    /// NOT handled here. It is natively a DOUBLE-precision op (its high-
-    /// quadword-to-low move means lane 1 of an 8-byte-element vector), and
-    /// without knowing whether the consumer is `addss` (float, lane 2) or
-    /// `addsd` (double, lane 1) we cannot pick the correct element size /
-    /// index — codex review on PR #40 pass 1. It stays an opaque call until
-    /// the lift carries consumer-precision context.
+    /// A genuine permute (`0x1b` reverse, `0xe4` identity, etc. — fields
+    /// differ) is NOT a single-lane value and stays an opaque call. Codex
+    /// review on PR #40 pass 2: without consumer context we can't claim the
+    /// whole register equals one lane unless the shuffle is a broadcast.
+    ///
+    /// `unpckhpd` (the lane-2 grab in the float-hsum idiom) is also NOT
+    /// handled — it is natively a DOUBLE-precision op (high quadword → low =
+    /// lane 1 of an 8-byte-element vector), and the lift can't tell an
+    /// `addss` (float, lane 2) consumer from an `addsd` (double, lane 1) one
+    /// to pick the element size/index. Codex review on PR #40 pass 1.
     fn x86_vector_lane_extract_expr(inst: &Instruction) -> Option<Self> {
         let mnemonic = inst.mnemonic.to_ascii_lowercase();
         if !matches!(mnemonic.as_str(), "shufps" | "vshufps") {
@@ -1292,11 +1297,16 @@ impl Expr {
             return None;
         }
 
-        // `shufps r, r, imm8`: low lane ← src[imm8 & 0b11].
         let Operand::Immediate(imm) = ops.get(2)? else {
             return None;
         };
-        let lane = (imm.value as u64 & 0b11) as i128;
+        let imm8 = imm.value as u64 & 0xff;
+        // Broadcast only: all four 2-bit lane-select fields identical.
+        let lane = (imm8 & 0b11) as i128;
+        let is_broadcast = (0..4).all(|f| ((imm8 >> (f * 2)) & 0b11) as i128 == lane);
+        if !is_broadcast {
+            return None;
+        }
 
         let dst_expr = Self::from_operand_with_inst(ops.first()?, inst);
         let src_expr = Self::from_operand_with_inst(ops.get(1)?, inst);
@@ -7057,6 +7067,58 @@ mod tests {
                 "self-unpckhpd must not be lifted as a lane extract, got {rhs:?}",
             );
         }
+    }
+
+    /// Codex review on PR #40 pass 2: a self-`shufps` with a NON-broadcast
+    /// immediate (`0x1b` = reverse — the four lane-select fields differ) is
+    /// a genuine 4-lane permute, not a single-lane splat. It must stay an
+    /// opaque call, not collapse to `src[3]`.
+    #[test]
+    fn test_self_shufps_permute_is_not_lane_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Immediate, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM0, 128);
+        // 0x1b = 00_01_10_11 — fields differ → reverse permute.
+        let inst = Instruction::new(0x401050, 4, vec![0x0f, 0xc6, 0xc0, 0x1b], "shufps")
+            .with_operation(Operation::Other(0xC6))
+            .with_operands(vec![
+                Operand::Register(xmm0.clone()),
+                Operand::Register(xmm0),
+                Operand::Immediate(Immediate { value: 0x1b, size: 8, signed: false }),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        if let ExprKind::Assign { rhs, .. } = &expr.kind {
+            assert!(
+                !matches!(rhs.kind, ExprKind::ArrayAccess { .. }),
+                "non-broadcast permute must NOT become a lane extract, got {rhs:?}",
+            );
+        }
+    }
+
+    /// `shufps xmm, xmm, 0x00` is a lane-0 broadcast (all fields 0) — it IS
+    /// a single-lane splat and recovers as `src[0]`.
+    #[test]
+    fn test_self_shufps_lane0_broadcast_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Immediate, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM0, 128);
+        let inst = Instruction::new(0x401050, 4, vec![0x0f, 0xc6, 0xc0, 0x00], "shufps")
+            .with_operation(Operation::Other(0xC6))
+            .with_operands(vec![
+                Operand::Register(xmm0.clone()),
+                Operand::Register(xmm0),
+                Operand::Immediate(Immediate { value: 0x00, size: 8, signed: false }),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { rhs, .. } = expr.kind else {
+            panic!("expected assignment");
+        };
+        let ExprKind::ArrayAccess { index, .. } = rhs.kind else {
+            panic!("expected lane extract for broadcast 0x00");
+        };
+        assert!(matches!(index.kind, ExprKind::IntLit(0)), "0x00 → lane 0 splat");
     }
 
     /// A shuffle between DIFFERENT registers is a genuine data shuffle, not
