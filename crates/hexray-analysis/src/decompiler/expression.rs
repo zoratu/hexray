@@ -1289,17 +1289,29 @@ impl Expr {
         }
         let ops = &inst.operands;
 
-        // Destination and source must be the same register (self-shuffle).
-        let (Operand::Register(dst), Operand::Register(src)) = (ops.first()?, ops.get(1)?) else {
+        // Two operand layouts (codex review on PR #40 pass 3):
+        //   legacy SSE:  `shufps  dst, src, imm8`         (imm at ops[2])
+        //   AVX VEX:     `vshufps dst, src1, src2, imm8`   (imm at ops[3])
+        // The immediate is always the LAST operand; every register operand
+        // before it must be the SAME register for the self-broadcast idiom.
+        let imm_idx = ops.len().checked_sub(1)?;
+        if imm_idx < 2 {
+            return None;
+        }
+        let Operand::Immediate(imm) = ops.get(imm_idx)? else {
             return None;
         };
-        if !dst.name().eq_ignore_ascii_case(src.name()) {
+        let dst_name = match ops.first()? {
+            Operand::Register(r) => r.name(),
+            _ => return None,
+        };
+        let all_same_register = ops[..imm_idx].iter().all(|op| {
+            matches!(op, Operand::Register(r) if r.name().eq_ignore_ascii_case(dst_name))
+        });
+        if !all_same_register {
             return None;
         }
 
-        let Operand::Immediate(imm) = ops.get(2)? else {
-            return None;
-        };
         let imm8 = imm.value as u64 & 0xff;
         // Broadcast only: all four 2-bit lane-select fields identical.
         let lane = (imm8 & 0b11) as i128;
@@ -1309,7 +1321,7 @@ impl Expr {
         }
 
         let dst_expr = Self::from_operand_with_inst(ops.first()?, inst);
-        let src_expr = Self::from_operand_with_inst(ops.get(1)?, inst);
+        let src_expr = Self::from_operand_with_inst(ops.first()?, inst);
         Some(Self::assign(
             dst_expr,
             // 4-byte element: shufps is single-precision.
@@ -7018,6 +7030,33 @@ mod tests {
         };
         assert_eq!(element_size, 4, "ps lanes are 4 bytes");
         assert!(matches!(index.kind, ExprKind::IntLit(1)), "0x55 & 0b11 = lane 1");
+    }
+
+    /// Codex review on PR #40 pass 3: AVX `vshufps dst, src1, src2, imm8`
+    /// puts the immediate at operand 3. A self-broadcast (all three regs
+    /// equal) must still recover as `src[lane]`.
+    #[test]
+    fn test_self_vshufps_four_operand_lane_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Immediate, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM0, 128);
+        let inst = Instruction::new(0x401060, 5, vec![0xc5, 0xf8, 0xc6, 0xc0, 0x55], "vshufps")
+            .with_operation(Operation::Other(0xC6))
+            .with_operands(vec![
+                Operand::Register(xmm0.clone()),
+                Operand::Register(xmm0.clone()),
+                Operand::Register(xmm0),
+                Operand::Immediate(Immediate { value: 0x55, size: 8, signed: false }),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { rhs, .. } = expr.kind else {
+            panic!("expected assignment, got {expr:?}");
+        };
+        let ExprKind::ArrayAccess { index, .. } = rhs.kind else {
+            panic!("expected lane extract for 4-operand vshufps, got {rhs:?}");
+        };
+        assert!(matches!(index.kind, ExprKind::IntLit(1)), "0x55 → lane 1");
     }
 
     /// `shufps xmm1, xmm1, 0xff` → lane 3 (0xff & 0b11 = 3).
