@@ -394,10 +394,14 @@ fn is_empty_block_node(node: &StructuredNode) -> bool {
 }
 
 /// Whether `expr` can be evaluated twice with the same result GIVEN no
-/// intervening code mutates state — i.e. it contains no function call and no
-/// assignment. Memory reads are allowed (the caller guarantees nothing writes
-/// between the two evaluations). Used by
-/// [`try_collapse_duplicate_empty_then_guard`].
+/// intervening code mutates state. It must contain no function call and no
+/// assignment, AND any memory read must be a STACK-FRAME access (rsp/rbp/x29
+/// -relative). Heap/global/volatile/MMIO reads are rejected — even with no
+/// intervening structured statements, externally-mutable memory could change
+/// between the two evaluations, so the rest of this module treats those as
+/// unsafe to deduplicate (codex review on PR #39 pass 1). Stack-frame slots
+/// (the parity idiom's spilled compare operand) are the function's own frame
+/// and provably stable across the two adjacent branch tests.
 fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Call { .. } | ExprKind::Assign { .. } | ExprKind::CompoundAssign { .. } => false,
@@ -407,11 +411,18 @@ fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
         ExprKind::UnaryOp { operand, .. }
         | ExprKind::Cast { expr: operand, .. }
         | ExprKind::BitField { expr: operand, .. } => expr_safe_to_reevaluate(operand),
-        ExprKind::Deref { addr, .. } => expr_safe_to_reevaluate(addr),
-        ExprKind::ArrayAccess { base, index, .. } => {
-            expr_safe_to_reevaluate(base) && expr_safe_to_reevaluate(index)
+        // Memory reads: only safe when rooted at the stack frame.
+        ExprKind::Deref { addr, .. } => {
+            expr_is_stack_frame_address(addr) && expr_safe_to_reevaluate(addr)
         }
-        ExprKind::FieldAccess { base, .. } => expr_safe_to_reevaluate(base),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_is_stack_frame_address(base)
+                && expr_safe_to_reevaluate(base)
+                && expr_safe_to_reevaluate(index)
+        }
+        ExprKind::FieldAccess { base, .. } => {
+            expr_is_stack_frame_address(base) && expr_safe_to_reevaluate(base)
+        }
         ExprKind::AddressOf(inner) => expr_safe_to_reevaluate(inner),
         ExprKind::Conditional {
             cond,
@@ -423,10 +434,40 @@ fn expr_safe_to_reevaluate(expr: &Expr) -> bool {
                 && expr_safe_to_reevaluate(else_expr)
         }
         ExprKind::Phi(args) => args.iter().all(expr_safe_to_reevaluate),
-        ExprKind::IntLit(_)
-        | ExprKind::Var(_)
-        | ExprKind::Unknown(_)
-        | ExprKind::GotRef { .. } => true,
+        // A non-dereferencing GotRef is an address constant (safe); a
+        // dereferencing one is a global memory load (reject).
+        ExprKind::GotRef { is_deref, .. } => !*is_deref,
+        ExprKind::IntLit(_) | ExprKind::Var(_) | ExprKind::Unknown(_) => true,
+    }
+}
+
+/// Whether `addr` is rooted at a stack-frame base register (rsp/rbp/x29/sp/
+/// ebp/fp) — i.e. dereferencing it reads the current function's own frame,
+/// which is not externally mutable between two adjacent instructions.
+/// Recognizes the bare register, `base ± offset`, and nested stack-frame
+/// access chains.
+fn expr_is_stack_frame_address(addr: &Expr) -> bool {
+    fn is_stack_base_name(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "rsp" | "esp" | "sp" | "rbp" | "ebp" | "bp" | "x29" | "fp" | "x31"
+        )
+    }
+    match &addr.kind {
+        ExprKind::Var(v) => is_stack_base_name(&v.name),
+        ExprKind::Unknown(name) => is_stack_base_name(name),
+        ExprKind::BinOp {
+            op: BinOpKind::Add | BinOpKind::Sub,
+            left,
+            right,
+        } => expr_is_stack_frame_address(left) || expr_is_stack_frame_address(right),
+        ExprKind::Cast { expr: inner, .. } => expr_is_stack_frame_address(inner),
+        // A stack slot reached via an indexed/field access whose own base is
+        // the frame (`rbp[-3]`, `(rsp+k).field`).
+        ExprKind::ArrayAccess { base, .. } | ExprKind::FieldAccess { base, .. } => {
+            expr_is_stack_frame_address(base)
+        }
+        _ => false,
     }
 }
 
@@ -805,6 +846,81 @@ mod tests {
                 assert!(
                     else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
                     "inner If must be preserved when outer then is non-empty",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// Codex review on PR #39 pass 1: the collapse must NOT fire when
+    /// the condition reads NON-stack memory (heap/global/volatile/MMIO)
+    /// — that memory could change between the two evaluations even with
+    /// no intervening structured code. Here `*rdi != 0` (a deref of an
+    /// arbitrary pointer arg) must be preserved.
+    #[test]
+    fn test_collapse_skips_non_stack_memory_condition() {
+        let heap_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::deref(make_var("rdi"), 8),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: heap_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: heap_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "non-stack memory deref condition must NOT collapse (could be volatile)",
+                );
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    /// The collapse STILL fires for a stack-frame memory read (the
+    /// parity idiom's spilled compare operand `[rbp-N]`), since the
+    /// frame is not externally mutable.
+    #[test]
+    fn test_collapse_fires_for_stack_frame_deref_condition() {
+        let stack_cond = || {
+            Expr::binop(
+                BinOpKind::Ne,
+                Expr::deref(
+                    Expr::binop(BinOpKind::Sub, make_var("rbp"), Expr::int(16)),
+                    8,
+                ),
+                Expr::int(0),
+            )
+        };
+        let inner = StructuredNode::If {
+            condition: stack_cond(),
+            then_body: vec![],
+            else_body: Some(vec![StructuredNode::Return(None)]),
+        };
+        let outer = StructuredNode::If {
+            condition: stack_cond(),
+            then_body: vec![],
+            else_body: Some(vec![inner]),
+        };
+        let result = detect_short_circuit(vec![outer]);
+        match &result[0] {
+            StructuredNode::If { else_body, .. } => {
+                let else_nodes = else_body.as_ref().unwrap();
+                assert!(
+                    !else_nodes.iter().any(|n| matches!(n, StructuredNode::If { .. })),
+                    "stack-frame deref condition SHOULD collapse, got {else_nodes:?}",
                 );
             }
             other => panic!("expected If, got {other:?}"),
