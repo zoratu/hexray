@@ -1256,6 +1256,55 @@ impl Expr {
         Self::x86_vector_float_binop(inst, &inst.operands, base)
     }
 
+    /// Recover a SELF-shuffle / self-unpack as a vector lane extract.
+    ///
+    /// The float horizontal-sum idiom (`c[0]+c[1]+c[2]+c[3]`) lowers to a
+    /// chain of single-source permutes feeding `addss`, each moving one lane
+    /// into lane 0:
+    ///   - `shufps xmm, xmm, imm8` (dst == src) → lane `imm8 & 0b11` lands in
+    ///     lane 0 (the low element the scalar `addss` then reads).
+    ///   - `unpckhpd xmm, xmm` (dst == src) → the high quadword moves to the
+    ///     low quadword, so lane 0 becomes the original lane 2.
+    ///
+    /// We recognize ONLY the self-operand form (`dst == src`): that's the
+    /// lane-broadcast/extract idiom, not a general two-source data shuffle.
+    /// The recovered value is `src[lane]` (an `ArrayAccess` with a 4-byte
+    /// element), which renders as e.g. `c[1]` / `c[2]` / `c[3]` so the
+    /// surrounding `addss` chain reads as `c[0] + c[1] + c[2] + c[3]`.
+    fn x86_vector_lane_extract_expr(inst: &Instruction) -> Option<Self> {
+        let mnemonic = inst.mnemonic.to_ascii_lowercase();
+        let ops = &inst.operands;
+
+        // Destination and source must be the same register.
+        let (Operand::Register(dst), Operand::Register(src)) = (ops.first()?, ops.get(1)?) else {
+            return None;
+        };
+        if !dst.name().eq_ignore_ascii_case(src.name()) {
+            return None;
+        }
+
+        let lane = match mnemonic.as_str() {
+            // `shufps`/`vshufps r, r, imm8`: low lane ← src[imm8 & 0b11].
+            "shufps" | "vshufps" => {
+                let Operand::Immediate(imm) = ops.get(2)? else {
+                    return None;
+                };
+                (imm.value as u64 & 0b11) as i128
+            }
+            // `unpckhpd r, r`: high quadword → low; lane 0 becomes lane 2.
+            "unpckhpd" | "vunpckhpd" => 2,
+            _ => return None,
+        };
+
+        let dst_expr = Self::from_operand_with_inst(ops.first()?, inst);
+        let src_expr = Self::from_operand_with_inst(ops.get(1)?, inst);
+        Some(Self::assign(
+            dst_expr,
+            // 4-byte element: these idioms feed scalar single-precision adds.
+            Self::array_access(src_expr, Self::int(lane), 4),
+        ))
+    }
+
     fn x86_fma_expr(inst: &Instruction) -> Option<Self> {
         let mnemonic = inst.mnemonic.to_ascii_lowercase();
         if !mnemonic.starts_with("vfmadd") || inst.operands.len() < 3 {
@@ -2262,6 +2311,7 @@ impl Expr {
                 if let Some(expr) = Self::x86_fma_expr(inst)
                     .or_else(|| Self::x86_scalar_minmax_expr(inst))
                     .or_else(|| Self::x86_vector_minmax_expr(inst))
+                    .or_else(|| Self::x86_vector_lane_extract_expr(inst))
                 {
                     return expr;
                 }
@@ -6924,6 +6974,111 @@ mod tests {
         let rendered = Expr::from_instruction(&inst).to_string();
 
         assert_eq!(rendered, "/* SSE: paddq */");
+    }
+
+    /// gap 4: `shufps xmm2, xmm2, 0x55` (self-shuffle) recovers as the
+    /// lane extract `xmm2[1]` (imm8 & 0b11 = 1). This is the float
+    /// horizontal-sum idiom's lane-1 grab.
+    #[test]
+    fn test_self_shufps_lifts_to_lane_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Immediate, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm2 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM2, 128);
+        let inst = Instruction::new(0x401025, 4, vec![0x0f, 0xc6, 0xd2, 0x55], "shufps")
+            .with_operation(Operation::Other(0xC6))
+            .with_operands(vec![
+                Operand::Register(xmm2.clone()),
+                Operand::Register(xmm2),
+                Operand::Immediate(Immediate { value: 0x55, size: 8, signed: false }),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { rhs, .. } = expr.kind else {
+            panic!("expected assignment, got {expr:?}");
+        };
+        let ExprKind::ArrayAccess {
+            index,
+            element_size,
+            ..
+        } = rhs.kind
+        else {
+            panic!("expected lane extract ArrayAccess, got {rhs:?}");
+        };
+        assert_eq!(element_size, 4, "ps lanes are 4 bytes");
+        assert!(matches!(index.kind, ExprKind::IntLit(1)), "0x55 & 0b11 = lane 1");
+    }
+
+    /// `shufps xmm1, xmm1, 0xff` → lane 3 (0xff & 0b11 = 3).
+    #[test]
+    fn test_self_shufps_high_lane_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Immediate, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM1, 128);
+        let inst = Instruction::new(0x401038, 4, vec![0x0f, 0xc6, 0xc9, 0xff], "shufps")
+            .with_operation(Operation::Other(0xC6))
+            .with_operands(vec![
+                Operand::Register(xmm1.clone()),
+                Operand::Register(xmm1),
+                Operand::Immediate(Immediate { value: 0xff, size: 8, signed: false }),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { rhs, .. } = expr.kind else {
+            panic!("expected assignment");
+        };
+        let ExprKind::ArrayAccess { index, .. } = rhs.kind else {
+            panic!("expected lane extract");
+        };
+        assert!(matches!(index.kind, ExprKind::IntLit(3)), "0xff & 0b11 = lane 3");
+    }
+
+    /// `unpckhpd xmm2, xmm2` (self) → lane 2 extract.
+    #[test]
+    fn test_self_unpckhpd_lifts_to_lane2_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm2 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM2, 128);
+        let inst = Instruction::new(0x401030, 4, vec![0x66, 0x0f, 0x15, 0xd2], "unpckhpd")
+            .with_operation(Operation::Other(0x15))
+            .with_operands(vec![
+                Operand::Register(xmm2.clone()),
+                Operand::Register(xmm2),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        let ExprKind::Assign { rhs, .. } = expr.kind else {
+            panic!("expected assignment");
+        };
+        let ExprKind::ArrayAccess { index, .. } = rhs.kind else {
+            panic!("expected lane extract");
+        };
+        assert!(matches!(index.kind, ExprKind::IntLit(2)), "unpckhpd self → lane 2");
+    }
+
+    /// A shuffle between DIFFERENT registers is a genuine data shuffle, not
+    /// a lane extract — it must stay an opaque call, not be mis-lifted.
+    #[test]
+    fn test_cross_register_shufps_is_not_lane_extract() {
+        use hexray_core::{
+            register::x86, Architecture, Immediate, Operand, Operation, Register, RegisterClass,
+        };
+        let xmm0 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM0, 128);
+        let xmm1 = Register::new(Architecture::X86_64, RegisterClass::FloatingPoint, x86::XMM1, 128);
+        let inst = Instruction::new(0x401040, 4, vec![0x0f, 0xc6, 0xc1, 0x55], "shufps")
+            .with_operation(Operation::Other(0xC6))
+            .with_operands(vec![
+                Operand::Register(xmm0),
+                Operand::Register(xmm1),
+                Operand::Immediate(Immediate { value: 0x55, size: 8, signed: false }),
+            ]);
+        let expr = Expr::from_instruction(&inst);
+        // Must NOT be a lane-extract assign; falls through to the opaque call.
+        if let ExprKind::Assign { rhs, .. } = &expr.kind {
+            assert!(
+                !matches!(rhs.kind, ExprKind::ArrayAccess { .. }),
+                "cross-register shufps must not become a lane extract",
+            );
+        }
     }
 
     #[test]
