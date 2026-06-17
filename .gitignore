@@ -22,6 +22,13 @@ Thumbs.db
 *.so
 *.dylib
 
+# ...but the committed PE test fixtures are checked-in source artifacts
+# (tiny, deterministic, `include_bytes!`'d by hexray-formats / cli_tests).
+# Without these a clean checkout / `git archive` can't compile the tests.
+# Regenerate via tests/fixtures/pe/create_pe*.py if ever needed.
+!tests/fixtures/pe/simple_x64.exe
+!tests/fixtures/pe/complex_x64.exe
+
 # Build artifacts
 *.pdb
 *.proptest-regressions
