@@ -737,11 +737,19 @@ fn try_bind_optional_variant_method_call(
 /// `::S` mistaken for the method (codex P2 on PR #43).
 fn method_returns_object_by_value(kind: OptVarKind, type_args: &[String], method: &str) -> bool {
     match (kind, method) {
+        // `value_or(U&&)` returns the value type `T` — register-safe when `T`
+        // is a scalar, sret otherwise.
         (OptVarKind::Optional, "value_or") => type_args
             .first()
             .map(|t| !is_register_returned_scalar(t))
             // No parsed value type → can't prove it's register-safe; assume sret.
             .unwrap_or(true),
+        // C++23 monadic ops return a `std::optional<U>` by value whose `U`
+        // (and thus triviality / size, hence sret-or-not) isn't recoverable
+        // from the member name. Conservatively assume sret and decline — a
+        // miss is safe, mis-binding the return buffer is not. Other calls on
+        // the same optional (`has_value`, `value`, `operator*`) still bind it.
+        (OptVarKind::Optional, "transform" | "and_then" | "or_else") => true,
         _ => false,
     }
 }
@@ -3011,6 +3019,26 @@ mod tests {
         let b = bindings.get(-24).expect("scalar value_or must bind");
         assert_eq!(b.type_name, "std::optional<int>");
         assert_eq!(b.size, 8);
+    }
+
+    /// Codex P2 on PR #43: C++23 `optional<T>::transform/and_then/or_else`
+    /// return a `std::optional<U>` by value (sret in `args[0]` for non-trivial
+    /// `U`), and `U` isn't recoverable from the member name. The binder must
+    /// decline these — even though `T` itself is a sizeable scalar — rather
+    /// than type the sret return buffer as the optional.
+    #[test]
+    fn declines_optional_monadic_by_value_returns() {
+        for method in ["transform", "and_then", "or_else"] {
+            let name = format!("std::optional<int>::{method}<F>(F&&) const");
+            let call = Expr::call(
+                CallTarget::Named(name.clone()),
+                // args[0] = hidden sret return buffer, args[1] = receiver.
+                vec![rbp_plus(-16), rbp_plus(-32)],
+            );
+            let mut bindings = StackStructBindings::new();
+            bindings.analyze(&[block(vec![call])], &full_db(), None);
+            assert_eq!(bindings.len(), 0, "monadic {method} must decline");
+        }
     }
 
     #[test]
