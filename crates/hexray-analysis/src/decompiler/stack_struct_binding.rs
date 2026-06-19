@@ -764,7 +764,10 @@ fn method_returns_object_by_value(kind: OptVarKind, type_args: &[String], method
 /// though the sizing table declines it (its 16-byte SysV alignment isn't
 /// modelled). Both share [`primitive_scalar_size_align`] for the common cases.
 fn is_register_returned_scalar(name: &str) -> bool {
-    let n = name.trim();
+    // Strip top-level cv like the sizing path does, so a `value_or` on
+    // `int const` / `int* const` is still recognized as register-returned and
+    // binds (codex P3 on PR #43).
+    let n = strip_top_level_cv(name.trim());
     n.ends_with('*')
         || n.ends_with('&')
         || n == "long double"
@@ -3201,6 +3204,24 @@ mod tests {
         bindings.analyze(&[block(vec![call])], &full_db(), None);
         let b = bindings.get(-24).expect("scalar value_or must bind");
         assert_eq!(b.type_name, "std::optional<int>");
+        assert_eq!(b.size, 8);
+    }
+
+    /// Codex P3 on PR #43: a cv-qualified scalar/pointer payload is still
+    /// register-returned, so `value_or` on `int const` keeps `this` in
+    /// `args[0]` and must bind (the sret guard strips cv like the sizing path).
+    #[test]
+    fn binds_cv_qualified_scalar_value_or() {
+        assert!(is_register_returned_scalar("int const"));
+        assert!(is_register_returned_scalar("int* const"));
+        let call = Expr::call(
+            CallTarget::Named("std::optional<int const>::value_or(int const&&) const".to_string()),
+            vec![rbp_plus(-24)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        let b = bindings.get(-24).expect("cv scalar value_or must bind");
+        assert_eq!(b.type_name, "std::optional<int const>");
         assert_eq!(b.size, 8);
     }
 
