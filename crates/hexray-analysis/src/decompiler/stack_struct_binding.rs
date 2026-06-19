@@ -989,12 +989,12 @@ fn variant_layout_size(db: &TypeDatabase, alternatives: &[String]) -> Option<usi
 }
 
 /// Size and alignment (in bytes) of a demangled type spelling. Handles the
-/// common scalar spellings the Itanium demangler emits, pointer types (any
-/// trailing `*`), and named struct/union/enum/typedef types resolved through
-/// `db`. `long` follows the DB's `long_size` (LP64 vs ILP32). Returns `None`
-/// for anything it can't size confidently — notably `long double` (16-byte
-/// alignment on x86-64 SysV, which this conservative table doesn't model) —
-/// so the caller declines rather than emit a wrong-sized binding.
+/// data-model-fixed scalar spellings (see [`primitive_scalar_size_align`]),
+/// pointer/reference types (any trailing `*`/`&`, one machine word), and named
+/// struct/union/enum/typedef types resolved through `db`. Returns `None` for
+/// anything it can't size confidently — including the data-model-dependent
+/// scalars (`long`, `wchar_t`, `long double`) — so the caller declines rather
+/// than emit a wrong-sized binding.
 fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)> {
     let n = name.trim();
     // Pointer / reference to anything is one machine word.
@@ -1007,15 +1007,26 @@ fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)
 }
 
 /// Size and alignment of a primitive scalar type spelling (no pointers, no DB
-/// lookup). `long_size` carries the target word width (8 on LP64, 4 on ILP32)
-/// and doubles as the alignment of the 8-byte scalars: under i386 System V
-/// `double` / `long long` are 8 bytes but only **4-byte aligned**, so
-/// `optional<double>` is 12 bytes there, not 16 — using a hardcoded 8 would
-/// over-size the region and absorb adjacent locals (codex P2 on this PR).
-/// Returns `None` for non-primitive spellings and for `long double` (its SysV
-/// alignment — 16 on x86-64, 4 on i386 — isn't modelled; see
-/// [`is_register_returned_scalar`]). Shared by the sizing and ABI-return-class
-/// paths so the spelling list lives in one place.
+/// lookup). `long_size` carries the target word width and doubles as the
+/// alignment of the 8-byte scalars: under i386 System V `double` / `long long`
+/// are 8 bytes but only **4-byte aligned**, so `optional<double>` is 12 bytes
+/// there, not 16 — using a hardcoded 8 would over-size the region and absorb
+/// adjacent locals (codex P2 on this PR).
+///
+/// Only spellings whose size is fixed across the data models hexray sees are
+/// listed. **Declined** (→ `None`, caller declines the bind rather than
+/// mis-size):
+///   - `long` / `unsigned long`: 8 on LP64 but 4 on LLP64 (Win64), and the
+///     binder's `ArchInfo` can't currently distinguish the two (the pipeline
+///     forces `long_size == pointer_size`), so binding it risks an oversized
+///     region on Win64 (codex P2, confirmatory pass on this PR).
+///   - `wchar_t`: 4 on SysV, 2 on Windows — likewise data-model-dependent.
+///   - `long double`: alignment (16 on x86-64, 4 on i386) isn't modelled; see
+///     [`is_register_returned_scalar`].
+/// `char8_t`/`char16_t`/`char32_t` are standard-fixed (1/2/4) and kept. Shared
+/// by the sizing and ABI-return-class paths so the spelling list lives in one
+/// place. Threading the real data model to recover `long`/`wchar_t` precisely
+/// is a documented follow-up.
 fn primitive_scalar_size_align(name: &str, long_size: usize) -> Option<(usize, usize)> {
     let wide_align = long_size.min(8);
     Some(match name {
@@ -1023,8 +1034,7 @@ fn primitive_scalar_size_align(name: &str, long_size: usize) -> Option<(usize, u
         "char" | "signed char" | "unsigned char" | "char8_t" => (1, 1),
         "short" | "short int" | "unsigned short" | "unsigned short int" | "char16_t" => (2, 2),
         "int" | "unsigned int" | "unsigned" => (4, 4),
-        "char32_t" | "wchar_t" | "float" => (4, 4),
-        "long" | "long int" | "unsigned long" | "unsigned long int" => (long_size, long_size),
+        "char32_t" | "float" => (4, 4),
         "long long" | "long long int" | "unsigned long long" | "unsigned long long int" => {
             (8, wide_align)
         }
@@ -2983,6 +2993,29 @@ mod tests {
         );
         // LP64 stays 16 for the same types.
         assert_eq!(optional_layout_size(&full_db(), "double"), Some(16));
+    }
+
+    /// Codex P2 (confirmatory pass) on PR #43: `long` is 8 on LP64 but 4 on
+    /// LLP64 (Win64), and `wchar_t` is 4 on SysV but 2 on Windows. The binder's
+    /// arch info can't distinguish the data models (the pipeline forces
+    /// `long_size == pointer_size`), so these must decline rather than risk an
+    /// oversized region. Standard-fixed widths (`int`, `long long`, `char32_t`)
+    /// still size.
+    #[test]
+    fn declines_data_model_dependent_scalars() {
+        let db = full_db();
+        assert_eq!(optional_layout_size(&db, "long"), None);
+        assert_eq!(optional_layout_size(&db, "unsigned long"), None);
+        assert_eq!(optional_layout_size(&db, "wchar_t"), None);
+        // Fixed-width scalars are unaffected.
+        assert_eq!(optional_layout_size(&db, "int"), Some(8));
+        assert_eq!(optional_layout_size(&db, "long long"), Some(16));
+        assert_eq!(optional_layout_size(&db, "char32_t"), Some(8));
+        // A variant whose alternative is data-model-dependent also declines.
+        assert_eq!(
+            variant_layout_size(&db, &["int".into(), "long".into()]),
+            None
+        );
     }
 
     #[test]
