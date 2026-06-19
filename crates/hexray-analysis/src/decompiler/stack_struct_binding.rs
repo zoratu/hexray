@@ -273,6 +273,10 @@ fn visit_expr(
         // class template, not a libc/POSIX prototype), so they need a
         // separate name-pattern detection path.
         try_bind_smart_pointer_method_call(target, args, db, binary_data, out);
+        // `std::optional<T>` / `std::variant<...>` are class templates
+        // too, recognised the same way (qualified-method name pattern +
+        // stack `this`), but with template-arg-derived layout sizes.
+        try_bind_optional_variant_method_call(target, args, db, binary_data, out);
     }
     walk_children(expr, db, binary_data, out);
 }
@@ -625,6 +629,272 @@ fn synthesize_smart_pointer_local_name(short: &str, inner: &str, offset: i64) ->
     } else {
         format!("{trimmed}_{short}_{:x}", offset.unsigned_abs())
     }
+}
+
+// ----- std::optional / std::variant binding ----------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptVarKind {
+    Optional,
+    Variant,
+}
+
+/// Recognise a `std::optional<T>::<method>(...)` or
+/// `std::variant<T...>::<method>(...)` member call whose `this` argument is a
+/// stack address, and bind that region as `std::optional<T>` /
+/// `std::variant<T...>`.
+///
+/// Like [`try_bind_smart_pointer_method_call`], these are class templates that
+/// resolve per-instantiation, so detection is by demangled-name pattern rather
+/// than the `TypeDatabase`. The key difference is sizing: optional/variant
+/// layout is derived from the template arguments' own sizes/alignments (see
+/// [`optional_layout_size`] / [`variant_layout_size`]), and the bind is
+/// *declined* whenever a template argument can't be sized confidently — an
+/// over- or under-sized region would absorb adjacent stack locals or split the
+/// object, the same hazard the smart-pointer stateful-deleter guard avoids.
+///
+/// First slice: type binding + named local only. The `has_value()` / `index()`
+/// → engaged-flag / discriminator semantic sugar is a documented follow-up; the
+/// free-function `std::get<...>` / `std::holds_alternative<...>` forms are
+/// deliberately not matched here because their template shape is ambiguous with
+/// `std::tuple` / `std::pair` access.
+fn try_bind_optional_variant_method_call(
+    target: &CallTarget,
+    args: &[Expr],
+    db: &TypeDatabase,
+    binary_data: Option<&BinaryDataContext>,
+    out: &mut StackStructBindings,
+) {
+    let Some(raw_name) = resolve_call_name(target, binary_data) else {
+        return;
+    };
+    // Demangle on entry (relocation-map names arrive raw) and fall back to the
+    // raw form — same rationale as the smart-pointer path.
+    let demangled = hexray_demangle::demangle(&raw_name);
+    let name: &str = demangled.as_deref().unwrap_or(&raw_name);
+    // Members returning a non-trivial object by value take a hidden sret
+    // pointer as `args[0]` and the receiver as `args[1]`; binding `args[0]`
+    // would type the return buffer's slot, not the optional. Canonical case:
+    // `optional<T>::value_or(U&&)` returns `T` by value.
+    if optional_variant_method_returns_by_value(name) {
+        return;
+    }
+    let Some((kind, type_args)) = parse_optional_variant_kind_and_args(name) else {
+        return;
+    };
+    // Instance methods receive `this` as the first argument in the lifted call.
+    let Some(this_arg) = args.first() else {
+        return;
+    };
+    let Some(stack_offset) = stack_offset_of_address(this_arg) else {
+        return;
+    };
+    let (short, type_name, size) = match kind {
+        OptVarKind::Optional => {
+            let inner = &type_args[0];
+            let Some(size) = optional_layout_size(db, inner) else {
+                return;
+            };
+            ("optional", format!("std::optional<{inner}>"), size)
+        }
+        OptVarKind::Variant => {
+            let Some(size) = variant_layout_size(db, &type_args) else {
+                return;
+            };
+            let joined = type_args.join(", ");
+            ("variant", format!("std::variant<{joined}>"), size)
+        }
+    };
+    let slug_inner = type_args.join("_");
+    let local_name = synthesize_smart_pointer_local_name(short, &slug_inner, stack_offset);
+    out.by_offset
+        .entry(stack_offset)
+        .or_insert(StackStructBinding {
+            stack_offset,
+            size,
+            type_name,
+            local_name,
+            // Like smart pointers, a zero-store into one of these slots is the
+            // default constructor (disengaged optional / valueless variant),
+            // not aggregate zero-init padding.
+            class_object: true,
+        });
+}
+
+/// Recognise the optional/variant members that return a non-trivial object by
+/// value (sret in `args[0]`, receiver in `args[1]`). Kept tight.
+fn optional_variant_method_returns_by_value(name: &str) -> bool {
+    let method = match name.rsplit_once("::") {
+        Some((_, tail)) => tail
+            .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
+            .next()
+            .unwrap_or(""),
+        None => return false,
+    };
+    matches!(method, "value_or")
+}
+
+/// Parse a demangled name and, if it is `std::optional<T>::method(...)` or
+/// `std::variant<T...>::method(...)`, return the kind and the trimmed top-level
+/// template arguments (one element for optional, the full alternative list for
+/// variant). Returns `None` for anything else.
+fn parse_optional_variant_kind_and_args(name: &str) -> Option<(OptVarKind, Vec<String>)> {
+    if let Some(args) = template_args_of_qualified_method(name, "std::optional") {
+        let inner = split_top_level_comma(&args)
+            .into_iter()
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())?;
+        return Some((OptVarKind::Optional, vec![inner]));
+    }
+    if let Some(args) = template_args_of_qualified_method(name, "std::variant") {
+        let segments: Vec<String> = split_top_level_comma(&args)
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segments.is_empty() {
+            return None;
+        }
+        return Some((OptVarKind::Variant, segments));
+    }
+    None
+}
+
+/// If `name` is `<prefix><...>::method(...)` — with `prefix` anchored at an
+/// identifier boundary and occurring before the method's own argument list —
+/// return the `<...>` class-template argument string. Mirrors the anchoring /
+/// pre-argument-list / `::method` guards in [`parse_smart_pointer_kind_and_inner`]
+/// (two codex P2s on PR #24) so `mystd::optional<T>` and a `std::optional<T>`
+/// nested inside another function's signature are both rejected.
+fn template_args_of_qualified_method(name: &str, prefix: &str) -> Option<String> {
+    let is_identifier_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let arg_list_start = name.find('(').unwrap_or(name.len());
+    let i = name.find(prefix)?;
+    if i >= arg_list_start {
+        return None;
+    }
+    let prev_ok = i == 0
+        || name
+            .as_bytes()
+            .get(i.saturating_sub(1))
+            .is_none_or(|b| !is_identifier_byte(*b));
+    if !prev_ok {
+        return None;
+    }
+    // The byte right after the prefix must open the template argument list,
+    // not continue an identifier (so `std::optionalish<…>` doesn't match
+    // `std::optional`).
+    let after_prefix = &name[i + prefix.len()..];
+    let after_lt = after_prefix.strip_prefix('<')?;
+    // Walk to the matching `>` honouring nested template brackets.
+    let mut depth = 1usize;
+    let mut end = None;
+    for (j, c) in after_lt.char_indices() {
+        match c {
+            '<' => depth = depth.saturating_add(1),
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(j);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let after_args = after_lt.get(end + 1..)?;
+    // Must be a method call (`::method`), not a stray type mention. Trim the
+    // space the Itanium demangler emits before a nested-template closer.
+    if !after_args.trim_start().starts_with("::") {
+        return None;
+    }
+    Some(after_lt[..end].to_string())
+}
+
+/// Round `n` up to a multiple of `align` (treating `align == 0` as 1).
+fn align_up(n: usize, align: usize) -> usize {
+    let align = align.max(1);
+    n.div_ceil(align).saturating_mul(align)
+}
+
+/// libstdc++ `std::optional<T>` layout: the `T` payload, a one-byte engaged
+/// flag at offset `sizeof(T)`, padded to `alignof(T)`. Empirically verified
+/// against g++ 13 (`optional<char>`=2, `<int>`=8, `<double>`=16, `<int*>`=16).
+/// Returns `None` if `T` can't be sized (caller declines the bind).
+fn optional_layout_size(db: &TypeDatabase, inner: &str) -> Option<usize> {
+    let (size, align) = inner_type_size_align(db, inner)?;
+    Some(align_up(size.saturating_add(1), align))
+}
+
+/// libstdc++ `std::variant<T...>` layout: a union of the alternatives followed
+/// by a one-byte discriminator, padded to the max alternative alignment.
+/// Empirically verified against g++ 13 (`variant<char,char>`=2,
+/// `<int,char>`=8, `<int,double>`=16, `<int,int,double>`=16). Declines if any
+/// alternative can't be sized, or for the (unrealistic) >255-alternative case
+/// where libstdc++ widens the discriminator past one byte.
+fn variant_layout_size(db: &TypeDatabase, alternatives: &[String]) -> Option<usize> {
+    if alternatives.is_empty() || alternatives.len() > 255 {
+        return None;
+    }
+    let mut payload = 0usize;
+    let mut payload_align = 1usize;
+    for t in alternatives {
+        let (size, align) = inner_type_size_align(db, t)?;
+        payload = payload.max(size);
+        payload_align = payload_align.max(align);
+    }
+    Some(align_up(payload.saturating_add(1), payload_align))
+}
+
+/// Size and alignment (in bytes) of a demangled type spelling. Handles the
+/// common scalar spellings the Itanium demangler emits, pointer types (any
+/// trailing `*`), and named struct/union/enum/typedef types resolved through
+/// `db`. `long` follows the DB's `long_size` (LP64 vs ILP32). Returns `None`
+/// for anything it can't size confidently — notably `long double` (16-byte
+/// alignment on x86-64 SysV, which this conservative table doesn't model) —
+/// so the caller declines rather than emit a wrong-sized binding.
+fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)> {
+    let n = name.trim();
+    // Pointer / reference to anything is one machine word.
+    if n.ends_with('*') || n.ends_with('&') {
+        let p = db.arch().pointer_size;
+        return Some((p, p));
+    }
+    let long = db.arch().long_size;
+    let scalar = match n {
+        "bool" => (1, 1),
+        "char" | "signed char" | "unsigned char" | "char8_t" => (1, 1),
+        "short" | "short int" | "unsigned short" | "unsigned short int" | "char16_t" => (2, 2),
+        "int" | "unsigned int" | "unsigned" => (4, 4),
+        "char32_t" | "wchar_t" | "float" => (4, 4),
+        "long" | "long int" | "unsigned long" | "unsigned long int" => (long, long),
+        "long long" | "long long int" | "unsigned long long" | "unsigned long long int" => (8, 8),
+        "double" => (8, 8),
+        _ => return named_type_size_align(db, n),
+    };
+    Some(scalar)
+}
+
+/// Resolve a named (non-scalar) type's size and alignment through the type
+/// database, trying the bare name plus the `struct`/`union`/`enum` spellings
+/// the DB keys aggregates under.
+fn named_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)> {
+    for key in [
+        name.to_string(),
+        format!("struct {name}"),
+        format!("union {name}"),
+        format!("enum {name}"),
+    ] {
+        if let Some(ty) = db.get_type(&key) {
+            let peeled = peel_typedef(ty);
+            if let (Some(size), Some(align)) = (peeled.size(), peeled.alignment()) {
+                return Some((size, align));
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a `CallTarget` to a textual function name. `Named` is trivial;
@@ -2305,5 +2575,200 @@ mod tests {
             4,
             "unique_ptr on 32-bit = 1 * 4 bytes"
         );
+    }
+
+    // ----- std::optional / std::variant binding tests ------------------
+
+    #[test]
+    fn optional_variant_parser_recognises_member_calls() {
+        // optional: single template arg, various method shapes incl. the
+        // constructor's own method-template clause and a `const` suffix.
+        for (name, expect) in [
+            ("std::optional<int>::has_value() const", vec!["int"]),
+            ("std::optional<int>::optional<int, true>()", vec!["int"]),
+            ("std::optional<double>::operator*()", vec!["double"]),
+            (
+                "std::optional<std::vector<int> >::value()",
+                vec!["std::vector<int>"],
+            ),
+        ] {
+            let (kind, args) = parse_optional_variant_kind_and_args(name)
+                .unwrap_or_else(|| panic!("parser declined valid optional name: {name}"));
+            assert_eq!(kind, OptVarKind::Optional, "kind mismatch on {name}");
+            assert_eq!(args, expect, "args mismatch on {name}");
+        }
+        // variant: full alternative list preserved, nested commas honoured.
+        for (name, expect) in [
+            (
+                "std::variant<int, double>::index() const",
+                vec!["int", "double"],
+            ),
+            (
+                "std::variant<int, double>::operator=<int>()",
+                vec!["int", "double"],
+            ),
+            (
+                "std::variant<int, std::pair<int, double> >::index() const",
+                vec!["int", "std::pair<int, double>"],
+            ),
+        ] {
+            let (kind, args) = parse_optional_variant_kind_and_args(name)
+                .unwrap_or_else(|| panic!("parser declined valid variant name: {name}"));
+            assert_eq!(kind, OptVarKind::Variant, "kind mismatch on {name}");
+            assert_eq!(args, expect, "args mismatch on {name}");
+        }
+    }
+
+    #[test]
+    fn optional_variant_parser_declines_unrelated_names() {
+        for name in [
+            "memcpy",
+            "std::optional<int>",                        // type ref, not ::method
+            "std::variant<int, double>",                 // type ref, not ::method
+            "mystd::optional<int>::has_value()",         // not anchored at boundary
+            "foo(std::optional<int>::value_type*)",      // nested in an arg list
+            "std::vector<int>::push_back(int const&)",   // unrelated template
+        ] {
+            assert!(
+                parse_optional_variant_kind_and_args(name).is_none(),
+                "parser accepted unrelated name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_stack_this_arg_for_optional_method_call() {
+        // sizeof(optional<int>) == 8 (4 payload + engaged@4 + pad).
+        let call = Expr::call(
+            CallTarget::Named("std::optional<int>::has_value() const".to_string()),
+            vec![rbp_plus(-24)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+
+        let b = bindings.get(-24).expect("binding at -24");
+        assert_eq!(b.type_name, "std::optional<int>");
+        assert_eq!(b.size, 8, "optional<int> = align_up(4 + 1, 4)");
+        assert!(b.class_object, "optional is a class object");
+        assert_eq!(b.local_name, "int_optional_18");
+    }
+
+    #[test]
+    fn binds_stack_this_arg_for_optional_double_method_call() {
+        // sizeof(optional<double>) == 16 (8 payload + engaged@8 + pad).
+        let call = Expr::call(
+            CallTarget::Named("std::optional<double>::value()".to_string()),
+            vec![rbp_plus(-32)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        let b = bindings.get(-32).expect("binding at -32");
+        assert_eq!(b.type_name, "std::optional<double>");
+        assert_eq!(b.size, 16, "optional<double> = align_up(8 + 1, 8)");
+    }
+
+    #[test]
+    fn binds_stack_this_arg_for_variant_method_call() {
+        // sizeof(variant<int, double>) == 16 (8 union payload + index@8).
+        let call = Expr::call(
+            CallTarget::Named("std::variant<int, double>::index() const".to_string()),
+            vec![rbp_plus(-24)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+
+        let b = bindings.get(-24).expect("binding at -24");
+        assert_eq!(b.type_name, "std::variant<int, double>");
+        assert_eq!(b.size, 16, "variant<int, double> = align_up(8 + 1, 8)");
+        assert!(b.class_object, "variant is a class object");
+    }
+
+    #[test]
+    fn variant_layout_picks_largest_alternative() {
+        // variant<char, char> == 2; variant<int, char> == 8.
+        assert_eq!(
+            variant_layout_size(&full_db(), &["char".into(), "char".into()]),
+            Some(2)
+        );
+        assert_eq!(
+            variant_layout_size(&full_db(), &["int".into(), "char".into()]),
+            Some(8)
+        );
+        assert_eq!(
+            variant_layout_size(
+                &full_db(),
+                &["int".into(), "int".into(), "double".into()]
+            ),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn optional_layout_handles_pointer_and_char() {
+        // optional<char> == 2, optional<int*> == 16 (ptr payload + flag + pad).
+        assert_eq!(optional_layout_size(&full_db(), "char"), Some(2));
+        assert_eq!(optional_layout_size(&full_db(), "int*"), Some(16));
+    }
+
+    #[test]
+    fn declines_optional_when_inner_type_unsizable() {
+        // `long double` is intentionally not in the scalar table (16-byte
+        // alignment on x86-64 SysV is not modelled), and an unknown user
+        // type can't be sized — both must decline rather than mis-size.
+        assert_eq!(optional_layout_size(&full_db(), "long double"), None);
+        assert_eq!(optional_layout_size(&full_db(), "CompletelyUnknownType"), None);
+
+        let call = Expr::call(
+            CallTarget::Named("std::optional<long double>::has_value() const".to_string()),
+            vec![rbp_plus(-32)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(bindings.len(), 0, "must not bind an unsizable optional");
+    }
+
+    #[test]
+    fn does_not_bind_optional_when_this_arg_is_not_stack_address() {
+        let call = Expr::call(
+            CallTarget::Named("std::optional<int>::has_value() const".to_string()),
+            vec![Expr::var(Variable::reg("rdi", 8))],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(bindings.len(), 0, "must not bind a register this");
+    }
+
+    /// `optional<T>::value_or(U&&)` returns `T` by value, so the SysV /
+    /// Itanium ABI passes the destination's address as `args[0]` and the
+    /// receiver as `args[1]`. The binder must decline rather than type the
+    /// return buffer's stack region as the optional.
+    #[test]
+    fn does_not_bind_sret_returning_optional_value_or() {
+        let call = Expr::call(
+            CallTarget::Named("std::optional<int>::value_or(int&&) const".to_string()),
+            vec![rbp_plus(-16), rbp_plus(-32)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(
+            bindings.len(),
+            0,
+            "must not bind for sret-returning value_or: {:#?}",
+            bindings.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn binds_optional_from_raw_mangled_itanium_symbol() {
+        // _ZNSt8optionalIiE9has_valueEv ≡ std::optional<int>::has_value() const
+        let call = Expr::call(
+            CallTarget::Named("_ZNKSt8optionalIiE9has_valueEv".to_string()),
+            vec![rbp_plus(-24)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        let b = bindings.get(-24).expect("binding at -24");
+        assert_eq!(b.type_name, "std::optional<int>");
+        assert_eq!(b.size, 8);
     }
 }
