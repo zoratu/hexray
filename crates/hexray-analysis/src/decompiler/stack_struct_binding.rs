@@ -672,7 +672,7 @@ fn try_bind_optional_variant_method_call(
     // raw form — same rationale as the smart-pointer path.
     let demangled = hexray_demangle::demangle(&raw_name);
     let name: &str = demangled.as_deref().unwrap_or(&raw_name);
-    let Some((kind, type_args)) = parse_optional_variant_kind_and_args(name) else {
+    let Some((kind, type_args, method)) = parse_optional_variant_kind_and_args(name) else {
         return;
     };
     // A member returning a non-trivial *object* by value takes a hidden sret
@@ -683,7 +683,7 @@ fn try_bind_optional_variant_method_call(
     // `int`/`double`/a pointer/…) still passes `this` in `args[0]`, so binding
     // is safe and declining would miss the optional entirely (codex P2 on this
     // PR). Decide using the parsed type, not the name alone.
-    if method_returns_object_by_value(name, kind, &type_args) {
+    if method_returns_object_by_value(kind, &type_args, &method) {
         return;
     }
     // Instance methods receive `this` as the first argument in the lifted call.
@@ -730,14 +730,12 @@ fn try_bind_optional_variant_method_call(
 /// `args[1]`). The only such method among the ones we match is
 /// `optional<T>::value_or(U&&)` returning `T`; and only when `T` is an object
 /// type — a register-returned scalar still passes `this` in `args[0]`.
-fn method_returns_object_by_value(name: &str, kind: OptVarKind, type_args: &[String]) -> bool {
-    let method = match name.rsplit_once("::") {
-        Some((_, tail)) => tail
-            .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
-            .next()
-            .unwrap_or(""),
-        None => return false,
-    };
+///
+/// `method` is the receiver-qualifier's method name extracted by the parser
+/// (e.g. `"value_or"`), NOT a rsplit of the whole signature: a namespaced
+/// parameter type like `value_or(ns::S&&)` would otherwise have its trailing
+/// `::S` mistaken for the method (codex P2 on PR #43).
+fn method_returns_object_by_value(kind: OptVarKind, type_args: &[String], method: &str) -> bool {
     match (kind, method) {
         (OptVarKind::Optional, "value_or") => type_args
             .first()
@@ -769,16 +767,16 @@ fn is_register_returned_scalar(name: &str) -> bool {
 /// `std::variant<T...>::method(...)`, return the kind and the trimmed top-level
 /// template arguments (one element for optional, the full alternative list for
 /// variant). Returns `None` for anything else.
-fn parse_optional_variant_kind_and_args(name: &str) -> Option<(OptVarKind, Vec<String>)> {
-    if let Some(args) = template_args_of_qualified_method(name, "std::optional") {
+fn parse_optional_variant_kind_and_args(name: &str) -> Option<(OptVarKind, Vec<String>, String)> {
+    if let Some((args, method)) = template_args_of_qualified_method(name, "std::optional") {
         let inner = split_top_level_comma(&args)
             .into_iter()
             .next()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
-        return Some((OptVarKind::Optional, vec![inner]));
+        return Some((OptVarKind::Optional, vec![inner], method));
     }
-    if let Some(args) = template_args_of_qualified_method(name, "std::variant") {
+    if let Some((args, method)) = template_args_of_qualified_method(name, "std::variant") {
         let segments: Vec<String> = split_top_level_comma(&args)
             .into_iter()
             .map(|s| s.trim().to_string())
@@ -787,7 +785,7 @@ fn parse_optional_variant_kind_and_args(name: &str) -> Option<(OptVarKind, Vec<S
         if segments.is_empty() {
             return None;
         }
-        return Some((OptVarKind::Variant, segments));
+        return Some((OptVarKind::Variant, segments, method));
     }
     None
 }
@@ -811,7 +809,7 @@ fn parse_optional_variant_kind_and_args(name: &str) -> Option<(OptVarKind, Vec<S
 /// real receiver qualifier is found. (hexray's own demangler is configured
 /// `no_return_type`, so it emits the short form, but names can arrive
 /// pre-demangled from other sources; this hardens against codex P2 on PR #43.)
-fn template_args_of_qualified_method(name: &str, prefix: &str) -> Option<String> {
+fn template_args_of_qualified_method(name: &str, prefix: &str) -> Option<(String, String)> {
     let is_identifier_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let bytes = name.as_bytes();
     let mut search_from = 0;
@@ -859,22 +857,22 @@ fn template_args_of_qualified_method(name: &str, prefix: &str) -> Option<String>
         let Some(after_colons) = tail.strip_prefix("::") else {
             continue;
         };
-        if !method_head_is_direct_call(after_colons) {
+        let Some(method) = method_call_head(after_colons) else {
             continue;
-        }
-        return Some(after_lt[..end].to_string());
+        };
+        return Some((after_lt[..end].to_string(), method));
     }
     None
 }
 
-/// Whether the text right after a `Qualifier::` is a method name applied
-/// directly to its argument list — `name(`, `name<...>(`, `operator…(` — rather
-/// than `<return-type> <function-name>(`, the shape an unrelated function takes
-/// when its return type merely *spells* this template (e.g.
-/// `std::optional<int>::value_type make_value(int*)`). Without this, the binder
-/// would treat that free function's first stack argument as a bogus `this`
-/// (codex P2 on PR #43).
-fn method_head_is_direct_call(after_colons: &str) -> bool {
+/// If the text right after a `Qualifier::` is a method name applied directly to
+/// its argument list — `name(`, `name<...>(`, `operator…(` — return the bare
+/// method name. Returns `None` for `<return-type> <function-name>(`, the shape
+/// an unrelated function takes when its return type merely *spells* this
+/// template (e.g. `std::optional<int>::value_type make_value(int*)`); without
+/// this the binder would treat that free function's first stack argument as a
+/// bogus `this` (codex P2 on PR #43).
+fn method_call_head(after_colons: &str) -> Option<String> {
     // Locate the method's own `(` at angle-bracket depth 0 (so an explicit
     // template-args clause like `operator=<int>` isn't mistaken for the args).
     let mut angle_depth = 0i32;
@@ -890,15 +888,16 @@ fn method_head_is_direct_call(after_colons: &str) -> bool {
             _ => {}
         }
     }
-    let Some(paren) = paren else { return false };
-    let head = after_colons[..paren].trim();
+    let head = after_colons[..paren?].trim();
     if head.is_empty() {
-        return false;
+        return None;
     }
     // Operator functions (`operator=`, `operator bool`, `operator new[]`,
-    // `operator()`) legitimately carry spaces / symbols in the name.
+    // `operator()`) legitimately carry spaces / symbols in the name; none of
+    // them are sret-returning members we special-case, so the bare `"operator"`
+    // tag is enough for the caller.
     if head.starts_with("operator") {
-        return true;
+        return Some("operator".to_string());
     }
     // Otherwise the name is a single identifier (or `~dtor`), optionally
     // followed by an explicit template-args clause `<...>`. A space-separated
@@ -908,10 +907,14 @@ fn method_head_is_direct_call(after_colons: &str) -> bool {
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '~'))
         .unwrap_or(head.len());
     if ident_end == 0 {
-        return false;
+        return None;
     }
     let rest = head[ident_end..].trim_start();
-    rest.is_empty() || rest.starts_with('<')
+    if rest.is_empty() || rest.starts_with('<') {
+        Some(head[..ident_end].to_string())
+    } else {
+        None
+    }
 }
 
 /// Count of unbalanced `(` before byte index `i` (each `)` cancels a `(`,
@@ -2731,7 +2734,7 @@ mod tests {
                 vec!["std::vector<int>"],
             ),
         ] {
-            let (kind, args) = parse_optional_variant_kind_and_args(name)
+            let (kind, args, _method) = parse_optional_variant_kind_and_args(name)
                 .unwrap_or_else(|| panic!("parser declined valid optional name: {name}"));
             assert_eq!(kind, OptVarKind::Optional, "kind mismatch on {name}");
             assert_eq!(args, expect, "args mismatch on {name}");
@@ -2751,11 +2754,39 @@ mod tests {
                 vec!["int", "std::pair<int, double>"],
             ),
         ] {
-            let (kind, args) = parse_optional_variant_kind_and_args(name)
+            let (kind, args, _method) = parse_optional_variant_kind_and_args(name)
                 .unwrap_or_else(|| panic!("parser declined valid variant name: {name}"));
             assert_eq!(kind, OptVarKind::Variant, "kind mismatch on {name}");
             assert_eq!(args, expect, "args mismatch on {name}");
         }
+    }
+
+    /// Codex P2 on PR #43: `rsplit_once("::")` on the whole signature splits
+    /// inside a namespaced parameter type (`ns::S`), so `value_or` went
+    /// undetected and the sret return buffer (`args[0]`) was bound as the
+    /// optional. The method name must come from the receiver qualifier.
+    #[test]
+    fn parses_method_name_past_namespaced_param_type() {
+        let (kind, args, method) =
+            parse_optional_variant_kind_and_args("std::optional<ns::S>::value_or(ns::S&&) const")
+                .expect("must parse");
+        assert_eq!(kind, OptVarKind::Optional);
+        assert_eq!(args, vec!["ns::S"]);
+        assert_eq!(method, "value_or");
+    }
+
+    #[test]
+    fn declines_object_value_or_with_namespaced_param() {
+        // value_or returning a non-scalar object → assume sret → args[0] is the
+        // return buffer, not `this`. Must decline (even with the namespaced
+        // parameter type that previously masked the value_or detection).
+        let call = Expr::call(
+            CallTarget::Named("std::optional<ns::S>::value_or(ns::S&&) const".to_string()),
+            vec![rbp_plus(-16), rbp_plus(-32)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        assert_eq!(bindings.len(), 0, "object value_or must decline");
     }
 
     /// Codex P2 on PR #43: a demangled member name may lead with a return
@@ -2767,10 +2798,11 @@ mod tests {
     fn optional_variant_parser_finds_receiver_past_return_type() {
         let name = "std::enable_if<(true), std::variant<int, double>&>::type \
                     std::variant<int, double>::operator=<int>(int&&)";
-        let (kind, args) = parse_optional_variant_kind_and_args(name)
+        let (kind, args, method) = parse_optional_variant_kind_and_args(name)
             .expect("must find the receiver qualifier past the return type");
         assert_eq!(kind, OptVarKind::Variant);
         assert_eq!(args, vec!["int", "double"]);
+        assert_eq!(method, "operator");
     }
 
     #[test]

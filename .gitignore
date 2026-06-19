@@ -32,6 +32,7 @@ Thumbs.db
 # Build artifacts
 *.pdb
 *.proptest-regressions
+a.out
 
 # Test binaries
 ls
