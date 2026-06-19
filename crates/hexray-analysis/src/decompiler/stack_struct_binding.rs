@@ -881,8 +881,21 @@ fn template_args_of_qualified_method(name: &str, prefix: &str) -> Option<(String
 /// this the binder would treat that free function's first stack argument as a
 /// bogus `this` (codex P2 on PR #43).
 fn method_call_head(after_colons: &str) -> Option<String> {
+    let trimmed = after_colons.trim_start();
+    // Operator functions first: their names legitimately contain `<`, `>`,
+    // `-`, and spaces (`operator->`, `operator<<`, `operator<=`,
+    // `operator bool`, `operator new[]`, `operator()`), which would otherwise
+    // throw off the angle-bracket / identifier scan below — e.g. the `>` in
+    // `operator->` reads as a template close and the method `(` is never found
+    // (codex P2 on PR #43). A name starting with `operator` after the qualifier
+    // is always a member function; require its argument list to be present.
+    // None of these operators are sret-returning members we special-case, so
+    // the bare `"operator"` tag is enough for the caller.
+    if trimmed.starts_with("operator") {
+        return trimmed.contains('(').then(|| "operator".to_string());
+    }
     // Locate the method's own `(` at angle-bracket depth 0 (so an explicit
-    // template-args clause like `operator=<int>` isn't mistaken for the args).
+    // template-args clause like `value_or<int>` isn't mistaken for the args).
     let mut angle_depth = 0i32;
     let mut paren = None;
     for (k, c) in after_colons.char_indices() {
@@ -900,17 +913,10 @@ fn method_call_head(after_colons: &str) -> Option<String> {
     if head.is_empty() {
         return None;
     }
-    // Operator functions (`operator=`, `operator bool`, `operator new[]`,
-    // `operator()`) legitimately carry spaces / symbols in the name; none of
-    // them are sret-returning members we special-case, so the bare `"operator"`
-    // tag is enough for the caller.
-    if head.starts_with("operator") {
-        return Some("operator".to_string());
-    }
-    // Otherwise the name is a single identifier (or `~dtor`), optionally
-    // followed by an explicit template-args clause `<...>`. A space-separated
-    // second identifier means `<return-type> <function-name>` → not a direct
-    // method call on this qualifier.
+    // The name is a single identifier (or `~dtor`), optionally followed by an
+    // explicit template-args clause `<...>`. A space-separated second
+    // identifier means `<return-type> <function-name>` → not a direct method
+    // call on this qualifier.
     let ident_end = head
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '~'))
         .unwrap_or(head.len());
@@ -2850,6 +2856,29 @@ mod tests {
         assert_eq!(b.size, 8, "optional<int> = align_up(4 + 1, 4)");
         assert!(b.class_object, "optional is a class object");
         assert_eq!(b.local_name, "int_optional_18");
+    }
+
+    /// Codex P2 on PR #43: `operator->` (and `operator<`, `operator<<`, …)
+    /// contain `>`/`<`, which the angle-depth scan mistook for template
+    /// brackets, so the method `(` was never found and the binding was missed.
+    /// `optional<int>::operator->()` is a common `-O0` access path.
+    #[test]
+    fn binds_optional_accessed_via_arrow_and_angle_operators() {
+        for name in [
+            "std::optional<int>::operator->()",
+            "std::optional<int>::operator*() const",
+            "std::optional<int>::operator bool() const",
+        ] {
+            let call =
+                Expr::call(CallTarget::Named(name.to_string()), vec![rbp_plus(-24)]);
+            let mut bindings = StackStructBindings::new();
+            bindings.analyze(&[block(vec![call])], &full_db(), None);
+            let b = bindings
+                .get(-24)
+                .unwrap_or_else(|| panic!("must bind via operator: {name}"));
+            assert_eq!(b.type_name, "std::optional<int>");
+            assert_eq!(b.size, 8);
+        }
     }
 
     #[test]
