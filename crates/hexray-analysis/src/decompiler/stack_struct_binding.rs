@@ -898,11 +898,17 @@ fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)
 }
 
 /// Size and alignment of a primitive scalar type spelling (no pointers, no DB
-/// lookup). `long` follows `long_size` (LP64 vs ILP32). Returns `None` for
-/// non-primitive spellings and for `long double` (16-byte x86-64 SysV
-/// alignment not modelled — see [`is_register_returned_scalar`]). Shared by the
-/// sizing and ABI-return-class paths so the spelling list lives in one place.
+/// lookup). `long_size` carries the target word width (8 on LP64, 4 on ILP32)
+/// and doubles as the alignment of the 8-byte scalars: under i386 System V
+/// `double` / `long long` are 8 bytes but only **4-byte aligned**, so
+/// `optional<double>` is 12 bytes there, not 16 — using a hardcoded 8 would
+/// over-size the region and absorb adjacent locals (codex P2 on this PR).
+/// Returns `None` for non-primitive spellings and for `long double` (its SysV
+/// alignment — 16 on x86-64, 4 on i386 — isn't modelled; see
+/// [`is_register_returned_scalar`]). Shared by the sizing and ABI-return-class
+/// paths so the spelling list lives in one place.
 fn primitive_scalar_size_align(name: &str, long_size: usize) -> Option<(usize, usize)> {
+    let wide_align = long_size.min(8);
     Some(match name {
         "bool" => (1, 1),
         "char" | "signed char" | "unsigned char" | "char8_t" => (1, 1),
@@ -910,8 +916,10 @@ fn primitive_scalar_size_align(name: &str, long_size: usize) -> Option<(usize, u
         "int" | "unsigned int" | "unsigned" => (4, 4),
         "char32_t" | "wchar_t" | "float" => (4, 4),
         "long" | "long int" | "unsigned long" | "unsigned long int" => (long_size, long_size),
-        "long long" | "long long int" | "unsigned long long" | "unsigned long long int" => (8, 8),
-        "double" => (8, 8),
+        "long long" | "long long int" | "unsigned long long" | "unsigned long long int" => {
+            (8, wide_align)
+        }
+        "double" => (8, wide_align),
         _ => return None,
     })
 }
@@ -2747,6 +2755,28 @@ mod tests {
         // optional<char> == 2, optional<int*> == 16 (ptr payload + flag + pad).
         assert_eq!(optional_layout_size(&full_db(), "char"), Some(2));
         assert_eq!(optional_layout_size(&full_db(), "int*"), Some(16));
+    }
+
+    /// Codex P2 on this PR: under i386 System V, `double` / `long long` are
+    /// 8 bytes but only 4-byte aligned, so `optional<double>` is 12 (not 16)
+    /// and `optional<int*>` is 8 (4-byte pointer). The layout must track the
+    /// target arch's word width, not a hardcoded LP64 alignment.
+    #[test]
+    fn layout_respects_ilp32_scalar_alignment() {
+        use hexray_types::database::ArchInfo;
+        let db32 = TypeDatabase::with_arch(ArchInfo::ilp32());
+        // align_up(8 + 1, 4) == 12
+        assert_eq!(optional_layout_size(&db32, "double"), Some(12));
+        assert_eq!(optional_layout_size(&db32, "long long"), Some(12));
+        // 4-byte pointer payload: align_up(4 + 1, 4) == 8
+        assert_eq!(optional_layout_size(&db32, "int*"), Some(8));
+        // variant<int, double>: payload 8, align 4 → align_up(8 + 1, 4) == 12
+        assert_eq!(
+            variant_layout_size(&db32, &["int".into(), "double".into()]),
+            Some(12)
+        );
+        // LP64 stays 16 for the same types.
+        assert_eq!(optional_layout_size(&full_db(), "double"), Some(16));
     }
 
     #[test]
