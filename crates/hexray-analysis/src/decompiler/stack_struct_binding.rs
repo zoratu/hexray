@@ -672,16 +672,20 @@ fn try_bind_optional_variant_method_call(
     // raw form — same rationale as the smart-pointer path.
     let demangled = hexray_demangle::demangle(&raw_name);
     let name: &str = demangled.as_deref().unwrap_or(&raw_name);
-    // Members returning a non-trivial object by value take a hidden sret
-    // pointer as `args[0]` and the receiver as `args[1]`; binding `args[0]`
-    // would type the return buffer's slot, not the optional. Canonical case:
-    // `optional<T>::value_or(U&&)` returns `T` by value.
-    if optional_variant_method_returns_by_value(name) {
-        return;
-    }
     let Some((kind, type_args)) = parse_optional_variant_kind_and_args(name) else {
         return;
     };
+    // A member returning a non-trivial *object* by value takes a hidden sret
+    // pointer as `args[0]` (receiver in `args[1]`); binding `args[0]` would
+    // type the return buffer, not the optional. The only such method here is
+    // `optional<T>::value_or(U&&)`, which returns `T` by value — but only an
+    // object `T` uses sret. A register-returned scalar (`value_or` on
+    // `int`/`double`/a pointer/…) still passes `this` in `args[0]`, so binding
+    // is safe and declining would miss the optional entirely (codex P2 on this
+    // PR). Decide using the parsed type, not the name alone.
+    if method_returns_object_by_value(name, kind, &type_args) {
+        return;
+    }
     // Instance methods receive `this` as the first argument in the lifted call.
     let Some(this_arg) = args.first() else {
         return;
@@ -721,9 +725,12 @@ fn try_bind_optional_variant_method_call(
         });
 }
 
-/// Recognise the optional/variant members that return a non-trivial object by
-/// value (sret in `args[0]`, receiver in `args[1]`). Kept tight.
-fn optional_variant_method_returns_by_value(name: &str) -> bool {
+/// Whether the called member returns a non-trivial *object* by value, so the
+/// SysV / Itanium ABI passes a hidden sret pointer as `args[0]` (receiver in
+/// `args[1]`). The only such method among the ones we match is
+/// `optional<T>::value_or(U&&)` returning `T`; and only when `T` is an object
+/// type — a register-returned scalar still passes `this` in `args[0]`.
+fn method_returns_object_by_value(name: &str, kind: OptVarKind, type_args: &[String]) -> bool {
     let method = match name.rsplit_once("::") {
         Some((_, tail)) => tail
             .split(|c: char| c == '(' || c == '<' || c.is_whitespace())
@@ -731,7 +738,31 @@ fn optional_variant_method_returns_by_value(name: &str) -> bool {
             .unwrap_or(""),
         None => return false,
     };
-    matches!(method, "value_or")
+    match (kind, method) {
+        (OptVarKind::Optional, "value_or") => type_args
+            .first()
+            .map(|t| !is_register_returned_scalar(t))
+            // No parsed value type → can't prove it's register-safe; assume sret.
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+/// Whether a demangled type spelling is returned in registers under the SysV /
+/// Itanium ABI (scalars, pointers, references) rather than via a hidden sret
+/// pointer. Conservative: only primitive scalar spellings and pointer/reference
+/// types count; objects and unknown user types are assumed to use sret.
+///
+/// Note this is a deliberately *different* axis from [`inner_type_size_align`]:
+/// `long double` is register-returned (x87 `st0`) and so counts here, even
+/// though the sizing table declines it (its 16-byte SysV alignment isn't
+/// modelled). Both share [`primitive_scalar_size_align`] for the common cases.
+fn is_register_returned_scalar(name: &str) -> bool {
+    let n = name.trim();
+    n.ends_with('*')
+        || n.ends_with('&')
+        || n == "long double"
+        || primitive_scalar_size_align(n, 8).is_some()
 }
 
 /// Parse a demangled name and, if it is `std::optional<T>::method(...)` or
@@ -862,19 +893,27 @@ fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)
         let p = db.arch().pointer_size;
         return Some((p, p));
     }
-    let long = db.arch().long_size;
-    let scalar = match n {
+    primitive_scalar_size_align(n, db.arch().long_size)
+        .or_else(|| named_type_size_align(db, n))
+}
+
+/// Size and alignment of a primitive scalar type spelling (no pointers, no DB
+/// lookup). `long` follows `long_size` (LP64 vs ILP32). Returns `None` for
+/// non-primitive spellings and for `long double` (16-byte x86-64 SysV
+/// alignment not modelled — see [`is_register_returned_scalar`]). Shared by the
+/// sizing and ABI-return-class paths so the spelling list lives in one place.
+fn primitive_scalar_size_align(name: &str, long_size: usize) -> Option<(usize, usize)> {
+    Some(match name {
         "bool" => (1, 1),
         "char" | "signed char" | "unsigned char" | "char8_t" => (1, 1),
         "short" | "short int" | "unsigned short" | "unsigned short int" | "char16_t" => (2, 2),
         "int" | "unsigned int" | "unsigned" => (4, 4),
         "char32_t" | "wchar_t" | "float" => (4, 4),
-        "long" | "long int" | "unsigned long" | "unsigned long int" => (long, long),
+        "long" | "long int" | "unsigned long" | "unsigned long int" => (long_size, long_size),
         "long long" | "long long int" | "unsigned long long" | "unsigned long long int" => (8, 8),
         "double" => (8, 8),
-        _ => return named_type_size_align(db, n),
-    };
-    Some(scalar)
+        _ => return None,
+    })
 }
 
 /// Resolve a named (non-scalar) type's size and alignment through the type
@@ -2738,14 +2777,14 @@ mod tests {
         assert_eq!(bindings.len(), 0, "must not bind a register this");
     }
 
-    /// `optional<T>::value_or(U&&)` returns `T` by value, so the SysV /
-    /// Itanium ABI passes the destination's address as `args[0]` and the
-    /// receiver as `args[1]`. The binder must decline rather than type the
-    /// return buffer's stack region as the optional.
+    /// `optional<Obj>::value_or(U&&)` returning a non-trivial *object* by value
+    /// uses sret: `args[0]` is the return buffer, the receiver is `args[1]`.
+    /// The binder must decline rather than type the return buffer's stack
+    /// region as the optional. (`Obj` is unknown to the DB → object-by-value.)
     #[test]
-    fn does_not_bind_sret_returning_optional_value_or() {
+    fn does_not_bind_sret_returning_object_value_or() {
         let call = Expr::call(
-            CallTarget::Named("std::optional<int>::value_or(int&&) const".to_string()),
+            CallTarget::Named("std::optional<Obj>::value_or(Obj&&) const".to_string()),
             vec![rbp_plus(-16), rbp_plus(-32)],
         );
         let mut bindings = StackStructBindings::new();
@@ -2753,9 +2792,26 @@ mod tests {
         assert_eq!(
             bindings.len(),
             0,
-            "must not bind for sret-returning value_or: {:#?}",
+            "must not bind for sret-returning object value_or: {:#?}",
             bindings.iter().collect::<Vec<_>>()
         );
+    }
+
+    /// Codex P2 on this PR: `optional<int>::value_or(int)` returns a *scalar*
+    /// in registers — no hidden sret — so `args[0]` is still the stack `this`.
+    /// Binding it is safe and declining would miss the optional entirely. The
+    /// receiver region must bind as `std::optional<int>`.
+    #[test]
+    fn binds_scalar_value_or_optional() {
+        let call = Expr::call(
+            CallTarget::Named("std::optional<int>::value_or(int&&) const".to_string()),
+            vec![rbp_plus(-24)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        let b = bindings.get(-24).expect("scalar value_or must bind");
+        assert_eq!(b.type_name, "std::optional<int>");
+        assert_eq!(b.size, 8);
     }
 
     #[test]
