@@ -996,7 +996,12 @@ fn variant_layout_size(db: &TypeDatabase, alternatives: &[String]) -> Option<usi
 /// scalars (`long`, `wchar_t`, `long double`) — so the caller declines rather
 /// than emit a wrong-sized binding.
 fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)> {
-    let n = name.trim();
+    // Strip top-level cv-qualifiers first: a `const`/`volatile` payload has the
+    // same size/alignment as the unqualified type, but the demangler spells it
+    // `int const` / `int* const`, which would otherwise miss both the scalar
+    // table and the DB (codex P2 on PR #43). Done before the pointer check so
+    // `int* const` (const pointer) still sizes as a pointer.
+    let n = strip_top_level_cv(name.trim());
     // Pointer / reference to anything is one machine word.
     if n.ends_with('*') || n.ends_with('&') {
         let p = db.arch().pointer_size;
@@ -1004,6 +1009,33 @@ fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)
     }
     primitive_scalar_size_align(n, db.arch().pointer_size)
         .or_else(|| named_type_size_align(db, n))
+}
+
+/// Strip leading/trailing top-level `const` / `volatile` qualifiers (as
+/// whole tokens, so `constant` / `Volatile_t` aren't touched). Leaves
+/// qualifiers nested inside template arguments alone.
+fn strip_top_level_cv(s: &str) -> &str {
+    let mut s = s.trim();
+    loop {
+        let start = s;
+        for kw in ["const", "volatile"] {
+            // Leading `<kw> ...`
+            if let Some(rest) = s.strip_prefix(kw) {
+                if rest.starts_with(char::is_whitespace) {
+                    s = rest.trim_start();
+                }
+            }
+            // Trailing `... <kw>`
+            if let Some(rest) = s.strip_suffix(kw) {
+                if rest.ends_with(char::is_whitespace) {
+                    s = rest.trim_end();
+                }
+            }
+        }
+        if s == start {
+            return s;
+        }
+    }
 }
 
 /// Size and alignment of a primitive scalar type spelling (no pointers, no DB
@@ -3023,6 +3055,26 @@ mod tests {
             ),
             Some(16)
         );
+    }
+
+    /// Codex P2 on PR #43: the demangler spells a cv-qualified payload as
+    /// `int const` / `int* const`, which misses both the scalar table and the
+    /// DB. Top-level `const`/`volatile` must be stripped before sizing (a
+    /// qualified type has the same layout as its unqualified form).
+    #[test]
+    fn sizes_cv_qualified_payloads() {
+        let db = full_db();
+        assert_eq!(optional_layout_size(&db, "int const"), Some(8));
+        assert_eq!(optional_layout_size(&db, "const int"), Some(8));
+        assert_eq!(optional_layout_size(&db, "int volatile"), Some(8));
+        // const pointer → still a pointer (8 on LP64): align_up(8 + 1, 8) = 16.
+        assert_eq!(optional_layout_size(&db, "int* const"), Some(16));
+        // cv nested in a template arg is left alone (declines, unknown type).
+        assert_eq!(optional_layout_size(&db, "std::vector<const int>"), None);
+        // Token-boundary safety: `constant` is not a qualifier.
+        assert_eq!(strip_top_level_cv("constant"), "constant");
+        assert_eq!(strip_top_level_cv("int const"), "int");
+        assert_eq!(strip_top_level_cv("const volatile int"), "int");
     }
 
     #[test]
