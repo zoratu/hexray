@@ -792,56 +792,91 @@ fn parse_optional_variant_kind_and_args(name: &str) -> Option<(OptVarKind, Vec<S
     None
 }
 
-/// If `name` is `<prefix><...>::method(...)` — with `prefix` anchored at an
-/// identifier boundary and occurring before the method's own argument list —
-/// return the `<...>` class-template argument string. Mirrors the anchoring /
-/// pre-argument-list / `::method` guards in [`parse_smart_pointer_kind_and_inner`]
-/// (two codex P2s on PR #24) so `mystd::optional<T>` and a `std::optional<T>`
-/// nested inside another function's signature are both rejected.
+/// If `name` contains a receiver qualifier `<prefix><...>::method(...)`, return
+/// the `<...>` class-template argument string.
+///
+/// Each candidate occurrence of `prefix` must be:
+///   1. anchored at an identifier boundary (so `mystd::optional<T>` and
+///      `std::optionalish<…>` don't match),
+///   2. at paren-depth 0 — *not* nested inside another function's argument
+///      list (rejects `foo(std::optional<int>::value_type*)`),
+///   3. immediately followed by a balanced `<...>` then `::`, with a `(` later
+///      in the tail (so it's a called method, not a stray type mention).
+///
+/// Scanning *every* occurrence at paren-depth 0 (rather than the first match +
+/// a global first-`(` cutoff) is what makes this robust to a demangled name
+/// that leads with a return type containing the same template, e.g.
+/// `std::enable_if<…, std::variant<int,double>&>::type std::variant<int,double>::operator=<int>(…)`
+/// — the return-type occurrence is rejected (followed by `&`, not `::`) and the
+/// real receiver qualifier is found. (hexray's own demangler is configured
+/// `no_return_type`, so it emits the short form, but names can arrive
+/// pre-demangled from other sources; this hardens against codex P2 on PR #43.)
 fn template_args_of_qualified_method(name: &str, prefix: &str) -> Option<String> {
     let is_identifier_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let arg_list_start = name.find('(').unwrap_or(name.len());
-    let i = name.find(prefix)?;
-    if i >= arg_list_start {
-        return None;
-    }
-    let prev_ok = i == 0
-        || name
-            .as_bytes()
-            .get(i.saturating_sub(1))
-            .is_none_or(|b| !is_identifier_byte(*b));
-    if !prev_ok {
-        return None;
-    }
-    // The byte right after the prefix must open the template argument list,
-    // not continue an identifier (so `std::optionalish<…>` doesn't match
-    // `std::optional`).
-    let after_prefix = &name[i + prefix.len()..];
-    let after_lt = after_prefix.strip_prefix('<')?;
-    // Walk to the matching `>` honouring nested template brackets.
-    let mut depth = 1usize;
-    let mut end = None;
-    for (j, c) in after_lt.char_indices() {
-        match c {
-            '<' => depth = depth.saturating_add(1),
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(j);
-                    break;
+    let bytes = name.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = name.get(search_from..)?.find(prefix) {
+        let i = search_from + rel;
+        // Advance past this occurrence for the next iteration regardless of
+        // whether it matches.
+        search_from = i + prefix.len();
+
+        let prev_ok = i == 0 || bytes.get(i - 1).is_none_or(|b| !is_identifier_byte(*b));
+        if !prev_ok {
+            continue;
+        }
+        // Reject occurrences nested inside an earlier (...) argument list.
+        if paren_depth_before(name, i) != 0 {
+            continue;
+        }
+        let Some(after_lt) = name[i + prefix.len()..].strip_prefix('<') else {
+            continue;
+        };
+        // Walk to the matching `>` honouring nested template brackets.
+        let mut depth = 1usize;
+        let mut end = None;
+        for (j, c) in after_lt.char_indices() {
+            match c {
+                '<' => depth = depth.saturating_add(1),
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
                 }
+                _ => {}
             }
+        }
+        let Some(end) = end else { continue };
+        let Some(after_args) = after_lt.get(end + 1..) else {
+            continue;
+        };
+        // Must be a method call: `::method` (trim the space the Itanium
+        // demangler emits before a nested-template closer) with the method's
+        // own argument list `(` somewhere in the tail.
+        let tail = after_args.trim_start();
+        if !tail.starts_with("::") || !tail.contains('(') {
+            continue;
+        }
+        return Some(after_lt[..end].to_string());
+    }
+    None
+}
+
+/// Count of unbalanced `(` before byte index `i` (each `)` cancels a `(`,
+/// floored at 0). Used to tell a receiver qualifier at top level from a
+/// template mentioned inside another call's argument list.
+fn paren_depth_before(name: &str, i: usize) -> i32 {
+    let mut depth = 0i32;
+    for &b in &name.as_bytes()[..i] {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = (depth - 1).max(0),
             _ => {}
         }
     }
-    let end = end?;
-    let after_args = after_lt.get(end + 1..)?;
-    // Must be a method call (`::method`), not a stray type mention. Trim the
-    // space the Itanium demangler emits before a nested-template closer.
-    if !after_args.trim_start().starts_with("::") {
-        return None;
-    }
-    Some(after_lt[..end].to_string())
+    depth
 }
 
 /// Round `n` up to a multiple of `align` (treating `align == 0` as 1).
@@ -2664,6 +2699,21 @@ mod tests {
             assert_eq!(kind, OptVarKind::Variant, "kind mismatch on {name}");
             assert_eq!(args, expect, "args mismatch on {name}");
         }
+    }
+
+    /// Codex P2 on PR #43: a demangled member name may lead with a return
+    /// type that itself mentions the same template (the receiver qualifier
+    /// follows it). The parser must skip the return-type occurrence — which is
+    /// followed by `&`/`>`, not `::` — and the parens inside the return type,
+    /// and bind from the real receiver qualifier.
+    #[test]
+    fn optional_variant_parser_finds_receiver_past_return_type() {
+        let name = "std::enable_if<(true), std::variant<int, double>&>::type \
+                    std::variant<int, double>::operator=<int>(int&&)";
+        let (kind, args) = parse_optional_variant_kind_and_args(name)
+            .expect("must find the receiver qualifier past the return type");
+        assert_eq!(kind, OptVarKind::Variant);
+        assert_eq!(args, vec!["int", "double"]);
     }
 
     #[test]
