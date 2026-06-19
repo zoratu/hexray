@@ -944,12 +944,18 @@ fn optional_layout_size(db: &TypeDatabase, inner: &str) -> Option<usize> {
     Some(align_up(size.saturating_add(1), align))
 }
 
-/// libstdc++ `std::variant<T...>` layout: a union of the alternatives followed
-/// by a one-byte discriminator, padded to the max alternative alignment.
-/// Empirically verified against g++ 13 (`variant<char,char>`=2,
-/// `<int,char>`=8, `<int,double>`=16, `<int,int,double>`=16). Declines if any
-/// alternative can't be sized, or for the (unrealistic) >255-alternative case
-/// where libstdc++ widens the discriminator past one byte.
+/// libstdc++ `std::variant<T...>` layout: a union of the alternatives, itself
+/// padded to the max alternative alignment, followed by a one-byte
+/// discriminator, with the whole object padded to that same alignment.
+/// Crucially the union is padded to its alignment *before* the discriminator is
+/// placed — when the largest alternative isn't the most-aligned one (e.g.
+/// `variant<S, double>` with `S` 12 bytes/4-aligned and `double` 8/8-aligned)
+/// the union is `align_up(12, 8) = 16` and the variant is `align_up(16+1, 8) =
+/// 24`, not `align_up(12+1, 8) = 16` (codex P2 on PR #43). Empirically verified
+/// against g++ 13 (`variant<char,char>`=2, `<int,char>`=8, `<int,double>`=16,
+/// `<int,int,double>`=16). Declines if any alternative can't be sized, or for
+/// the (unrealistic) >255-alternative case where libstdc++ widens the
+/// discriminator past one byte.
 fn variant_layout_size(db: &TypeDatabase, alternatives: &[String]) -> Option<usize> {
     if alternatives.is_empty() || alternatives.len() > 255 {
         return None;
@@ -961,7 +967,8 @@ fn variant_layout_size(db: &TypeDatabase, alternatives: &[String]) -> Option<usi
         payload = payload.max(size);
         payload_align = payload_align.max(align);
     }
-    Some(align_up(payload.saturating_add(1), payload_align))
+    let union_size = align_up(payload, payload_align);
+    Some(align_up(union_size.saturating_add(1), payload_align))
 }
 
 /// Size and alignment (in bytes) of a demangled type spelling. Handles the
@@ -2833,6 +2840,31 @@ mod tests {
         assert_eq!(b.type_name, "std::variant<int, double>");
         assert_eq!(b.size, 16, "variant<int, double> = align_up(8 + 1, 8)");
         assert!(b.class_object, "variant is a class object");
+    }
+
+    /// Codex P2 on PR #43: when the largest-sized alternative is not the
+    /// most-aligned one, the union is padded to its alignment *before* the
+    /// discriminator. `variant<S, double>` with `S` = 12 bytes / 4-aligned and
+    /// `double` = 8 / 8-aligned: union = align_up(12, 8) = 16, variant =
+    /// align_up(16 + 1, 8) = 24 — not align_up(12 + 1, 8) = 16.
+    #[test]
+    fn variant_layout_pads_union_before_discriminator() {
+        use hexray_types::types::StructType;
+        let mut db = full_db();
+        let s = StructType {
+            name: Some("S".to_string()),
+            fields: vec![],
+            size: 12,
+            alignment: 4,
+            packed: false,
+        };
+        db.add_type("S", CType::Struct(s));
+        // sanity: the DB sizes S as 12/4.
+        assert_eq!(inner_type_size_align(&db, "S"), Some((12, 4)));
+        assert_eq!(
+            variant_layout_size(&db, &["S".into(), "double".into()]),
+            Some(24)
+        );
     }
 
     #[test]
