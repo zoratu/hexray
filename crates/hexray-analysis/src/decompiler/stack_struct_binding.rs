@@ -1049,17 +1049,31 @@ fn primitive_scalar_size_align(name: &str, long_size: usize) -> Option<(usize, u
 /// database, trying the bare name plus the `struct`/`union`/`enum` spellings
 /// the DB keys aggregates under.
 fn named_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)> {
-    for key in [
+    [
         name.to_string(),
         format!("struct {name}"),
         format!("union {name}"),
         format!("enum {name}"),
-    ] {
-        if let Some(ty) = db.get_type(&key) {
-            let peeled = peel_typedef(ty);
-            if let (Some(size), Some(align)) = (peeled.size(), peeled.alignment()) {
-                return Some((size, align));
-            }
+    ]
+    .into_iter()
+    .find_map(|key| resolve_named_size_align(db, &key))
+}
+
+/// Resolve a DB type key to its concrete size/alignment, following both
+/// `Typedef` wrappers (peeled in place) and `CType::Named` references (looked
+/// back up by name) — the same two hops `struct_size_in_db` walks. Without the
+/// `Named` hop, a typedef whose target is stored as `CType::Named` (e.g.
+/// `epoll_data_t -> Named("union epoll_data")`) leaves a `Named` node whose
+/// `size()`/`alignment()` are `None`, so the binder would decline a type the
+/// DB can actually size (codex P2 on PR #43). Bounded loop guards against
+/// self-referential aliases.
+fn resolve_named_size_align(db: &TypeDatabase, key: &str) -> Option<(usize, usize)> {
+    let mut current = key.to_string();
+    for _ in 0..16 {
+        let ty = db.get_type(&current)?;
+        match peel_typedef(ty) {
+            CType::Named(next) => current = next.clone(),
+            concrete => return concrete.size().zip(concrete.alignment()),
         }
     }
     None
@@ -2946,6 +2960,19 @@ mod tests {
             variant_layout_size(&db, &["S".into(), "double".into()]),
             Some(24)
         );
+    }
+
+    /// Codex P2 on PR #43: a template argument that is a typedef whose target
+    /// is stored as `CType::Named` (e.g. `epoll_data_t -> union epoll_data`)
+    /// must follow the `Named` reference back through the DB, like
+    /// `struct_size_in_db` does — otherwise the binder declines a type the DB
+    /// can size. `union epoll_data` is 8 bytes / 8-aligned, so
+    /// `optional<epoll_data_t>` = align_up(8 + 1, 8) = 16.
+    #[test]
+    fn sizes_optional_of_typedef_alias_to_named_type() {
+        let db = full_db();
+        assert_eq!(inner_type_size_align(&db, "epoll_data_t"), Some((8, 8)));
+        assert_eq!(optional_layout_size(&db, "epoll_data_t"), Some(16));
     }
 
     #[test]
