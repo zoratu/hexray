@@ -1014,15 +1014,17 @@ fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)
 /// adjacent locals (codex P2 on this PR).
 ///
 /// Only spellings whose size is fixed across the data models hexray sees are
-/// listed. **Declined** (→ `None`, caller declines the bind rather than
-/// mis-size):
-///   - `long` / `unsigned long`: 8 on LP64 but 4 on LLP64 (Win64), and the
-///     binder's `ArchInfo` can't currently distinguish the two (the pipeline
-///     forces `long_size == pointer_size`), so binding it risks an oversized
-///     region on Win64 (codex P2, confirmatory pass on this PR).
-///   - `wchar_t`: 4 on SysV, 2 on Windows — likewise data-model-dependent.
-///   - `long double`: alignment (16 on x86-64, 4 on i386) isn't modelled; see
-///     [`is_register_returned_scalar`].
+/// listed. The following are **declined** (→ `None`, so the caller declines
+/// the bind rather than mis-size):
+///
+/// - `long` / `unsigned long`: 8 on LP64 but 4 on LLP64 (Win64), and the
+///   binder's `ArchInfo` can't currently distinguish the two (the pipeline
+///   forces `long_size == pointer_size`), so binding it risks an oversized
+///   region on Win64 (codex P2, confirmatory pass on this PR).
+/// - `wchar_t`: 4 on SysV, 2 on Windows — likewise data-model-dependent.
+/// - `long double`: alignment (16 on x86-64, 4 on i386) isn't modelled; see
+///   [`is_register_returned_scalar`].
+///
 /// `char8_t`/`char16_t`/`char32_t` are standard-fixed (1/2/4) and kept. Shared
 /// by the sizing and ABI-return-class paths so the spelling list lives in one
 /// place. Threading the real data model to recover `long`/`wchar_t` precisely
