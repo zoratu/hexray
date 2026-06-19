@@ -1073,6 +1073,15 @@ fn resolve_named_size_align(db: &TypeDatabase, key: &str) -> Option<(usize, usiz
         let ty = db.get_type(&current)?;
         match peel_typedef(ty) {
             CType::Named(next) => current = next.clone(),
+            // `CType::Pointer::size()/alignment()` are hardcoded to 8, so a
+            // typedef/named alias to a pointer (e.g. `using P = int*`) would
+            // size as 8 even on ILP32 — the direct `int*` spelling avoids this
+            // via the `ends_with('*')` fast path, but a named alias reaches
+            // here (codex P2 on PR #43). Use the target pointer width.
+            CType::Pointer(_) => {
+                let p = db.arch().pointer_size;
+                return Some((p, p));
+            }
             concrete => return concrete.size().zip(concrete.alignment()),
         }
     }
@@ -2973,6 +2982,26 @@ mod tests {
         let db = full_db();
         assert_eq!(inner_type_size_align(&db, "epoll_data_t"), Some((8, 8)));
         assert_eq!(optional_layout_size(&db, "epoll_data_t"), Some(16));
+    }
+
+    /// Codex P2 on PR #43: `CType::Pointer::size()` is hardcoded to 8, so a
+    /// *named* alias to a pointer (`using P = int*`) resolved via the DB sized
+    /// as 8 even on ILP32 — unlike the direct `int*` spelling, which uses the
+    /// arch pointer width. `resolve_named_size_align` must use the target
+    /// pointer size for resolved pointer types.
+    #[test]
+    fn sizes_named_pointer_alias_by_target_pointer_width() {
+        use hexray_types::database::ArchInfo;
+        let mut db64 = full_db();
+        db64.add_type("IntPtrAlias", CType::ptr(CType::int()));
+        assert_eq!(inner_type_size_align(&db64, "IntPtrAlias"), Some((8, 8)));
+        assert_eq!(optional_layout_size(&db64, "IntPtrAlias"), Some(16));
+
+        let mut db32 = TypeDatabase::with_arch(ArchInfo::ilp32());
+        db32.add_type("IntPtrAlias", CType::ptr(CType::int()));
+        // 4-byte pointer: align_up(4 + 1, 4) == 8, not 16.
+        assert_eq!(inner_type_size_align(&db32, "IntPtrAlias"), Some((4, 4)));
+        assert_eq!(optional_layout_size(&db32, "IntPtrAlias"), Some(8));
     }
 
     #[test]
