@@ -853,15 +853,65 @@ fn template_args_of_qualified_method(name: &str, prefix: &str) -> Option<String>
             continue;
         };
         // Must be a method call: `::method` (trim the space the Itanium
-        // demangler emits before a nested-template closer) with the method's
-        // own argument list `(` somewhere in the tail.
+        // demangler emits before a nested-template closer), with the method's
+        // own argument list applied *directly* to the name after the qualifier.
         let tail = after_args.trim_start();
-        if !tail.starts_with("::") || !tail.contains('(') {
+        let Some(after_colons) = tail.strip_prefix("::") else {
+            continue;
+        };
+        if !method_head_is_direct_call(after_colons) {
             continue;
         }
         return Some(after_lt[..end].to_string());
     }
     None
+}
+
+/// Whether the text right after a `Qualifier::` is a method name applied
+/// directly to its argument list — `name(`, `name<...>(`, `operator…(` — rather
+/// than `<return-type> <function-name>(`, the shape an unrelated function takes
+/// when its return type merely *spells* this template (e.g.
+/// `std::optional<int>::value_type make_value(int*)`). Without this, the binder
+/// would treat that free function's first stack argument as a bogus `this`
+/// (codex P2 on PR #43).
+fn method_head_is_direct_call(after_colons: &str) -> bool {
+    // Locate the method's own `(` at angle-bracket depth 0 (so an explicit
+    // template-args clause like `operator=<int>` isn't mistaken for the args).
+    let mut angle_depth = 0i32;
+    let mut paren = None;
+    for (k, c) in after_colons.char_indices() {
+        match c {
+            '<' => angle_depth += 1,
+            '>' => angle_depth -= 1,
+            '(' if angle_depth == 0 => {
+                paren = Some(k);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(paren) = paren else { return false };
+    let head = after_colons[..paren].trim();
+    if head.is_empty() {
+        return false;
+    }
+    // Operator functions (`operator=`, `operator bool`, `operator new[]`,
+    // `operator()`) legitimately carry spaces / symbols in the name.
+    if head.starts_with("operator") {
+        return true;
+    }
+    // Otherwise the name is a single identifier (or `~dtor`), optionally
+    // followed by an explicit template-args clause `<...>`. A space-separated
+    // second identifier means `<return-type> <function-name>` → not a direct
+    // method call on this qualifier.
+    let ident_end = head
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '~'))
+        .unwrap_or(head.len());
+    if ident_end == 0 {
+        return false;
+    }
+    let rest = head[ident_end..].trim_start();
+    rest.is_empty() || rest.starts_with('<')
 }
 
 /// Count of unbalanced `(` before byte index `i` (each `)` cancels a `(`,
@@ -2725,6 +2775,11 @@ mod tests {
             "mystd::optional<int>::has_value()",         // not anchored at boundary
             "foo(std::optional<int>::value_type*)",      // nested in an arg list
             "std::vector<int>::push_back(int const&)",   // unrelated template
+            // Free function whose RETURN TYPE spells the template, with a
+            // space-separated function name — the `(` belongs to `make_value`,
+            // not to a method on the qualifier (codex P2 on PR #43).
+            "std::optional<int>::value_type make_value(int*)",
+            "std::variant<int, double>::type build(int*, double*)",
         ] {
             assert!(
                 parse_optional_variant_kind_and_args(name).is_none(),
