@@ -1002,47 +1002,48 @@ fn inner_type_size_align(db: &TypeDatabase, name: &str) -> Option<(usize, usize)
         let p = db.arch().pointer_size;
         return Some((p, p));
     }
-    primitive_scalar_size_align(n, db.arch().long_size)
+    primitive_scalar_size_align(n, db.arch().pointer_size)
         .or_else(|| named_type_size_align(db, n))
 }
 
 /// Size and alignment of a primitive scalar type spelling (no pointers, no DB
-/// lookup). `long_size` carries the target word width and doubles as the
-/// alignment of the 8-byte scalars: under i386 System V `double` / `long long`
-/// are 8 bytes but only **4-byte aligned**, so `optional<double>` is 12 bytes
-/// there, not 16 — using a hardcoded 8 would over-size the region and absorb
-/// adjacent locals (codex P2 on this PR).
+/// lookup), for a target with the given `pointer_size`.
 ///
-/// Only spellings whose size is fixed across the data models hexray sees are
-/// listed. The following are **declined** (→ `None`, so the caller declines
-/// the bind rather than mis-size):
+/// The 8-byte scalars (`double`, `long long`) are the tricky case: their
+/// alignment is ABI-specific and *not* derivable from data-model sizes alone.
+/// On every 64-bit ABI they are 8-aligned (LP64 *and* LLP64/Win64, so
+/// `optional<double>` is 16). On 32-bit it splits — i386 System V aligns them
+/// to 4 (`optional<double>` = 12) but ARM32 AAPCS aligns to 8 (= 16) — and
+/// `ArchInfo` can't tell those apart. So: 8-align on 64-bit (`pointer_size >=
+/// 8`), and **decline** the 8-byte scalars on 32-bit rather than guess and
+/// risk an over/under-sized region (codex P2s on this PR).
 ///
-/// - `long` / `unsigned long`: 8 on LP64 but 4 on LLP64 (Win64), and the
-///   binder's `ArchInfo` can't currently distinguish the two (the pipeline
-///   forces `long_size == pointer_size`), so binding it risks an oversized
-///   region on Win64 (codex P2, confirmatory pass on this PR).
-/// - `wchar_t`: 4 on SysV, 2 on Windows — likewise data-model-dependent.
-/// - `long double`: alignment (16 on x86-64, 4 on i386) isn't modelled; see
-///   [`is_register_returned_scalar`].
+/// Other spellings **declined** (→ `None`):
+///
+/// - `long` / `unsigned long`: 8 on LP64 but 4 on LLP64, and `ArchInfo` can't
+///   distinguish the two — data-model-dependent.
+/// - `wchar_t`: 4 on SysV, 2 on Windows — likewise.
+/// - `long double`: alignment (16 on x86-64, 4 on i386) isn't modelled.
 ///
 /// `char8_t`/`char16_t`/`char32_t` are standard-fixed (1/2/4) and kept. Shared
 /// by the sizing and ABI-return-class paths so the spelling list lives in one
-/// place. Threading the real data model to recover `long`/`wchar_t` precisely
-/// is a documented follow-up.
-fn primitive_scalar_size_align(name: &str, long_size: usize) -> Option<(usize, usize)> {
-    let wide_align = long_size.min(8);
-    Some(match name {
-        "bool" => (1, 1),
-        "char" | "signed char" | "unsigned char" | "char8_t" => (1, 1),
-        "short" | "short int" | "unsigned short" | "unsigned short int" | "char16_t" => (2, 2),
-        "int" | "unsigned int" | "unsigned" => (4, 4),
-        "char32_t" | "float" => (4, 4),
-        "long long" | "long long int" | "unsigned long long" | "unsigned long long int" => {
-            (8, wide_align)
+/// place. Threading the real ABI to recover `long`/`wchar_t`/32-bit-`double`
+/// precisely is a documented follow-up.
+fn primitive_scalar_size_align(name: &str, pointer_size: usize) -> Option<(usize, usize)> {
+    // 8-byte scalars: 8-aligned on all 64-bit ABIs; ambiguous on 32-bit.
+    let wide = (pointer_size >= 8).then_some((8usize, 8usize));
+    match name {
+        "bool" => Some((1, 1)),
+        "char" | "signed char" | "unsigned char" | "char8_t" => Some((1, 1)),
+        "short" | "short int" | "unsigned short" | "unsigned short int" | "char16_t" => {
+            Some((2, 2))
         }
-        "double" => (8, wide_align),
-        _ => return None,
-    })
+        "int" | "unsigned int" | "unsigned" => Some((4, 4)),
+        "char32_t" | "float" => Some((4, 4)),
+        "long long" | "long long int" | "unsigned long long" | "unsigned long long int"
+        | "double" => wide,
+        _ => None,
+    }
 }
 
 /// Resolve a named (non-scalar) type's size and alignment through the type
@@ -3031,26 +3032,36 @@ mod tests {
         assert_eq!(optional_layout_size(&full_db(), "int*"), Some(16));
     }
 
-    /// Codex P2 on this PR: under i386 System V, `double` / `long long` are
-    /// 8 bytes but only 4-byte aligned, so `optional<double>` is 12 (not 16)
-    /// and `optional<int*>` is 8 (4-byte pointer). The layout must track the
-    /// target arch's word width, not a hardcoded LP64 alignment.
+    /// Codex P2s on this PR: the 8-byte scalars' alignment is ABI-specific and
+    /// not derivable from data-model sizes. On 32-bit it's ambiguous (i386 = 4,
+    /// ARM32 = 8) so `double`/`long long` must DECLINE there rather than guess;
+    /// pointers still size by the target width. On 64-bit (LP64 *and* LLP64)
+    /// they are 8-aligned, so `optional<double>` = 16.
     #[test]
-    fn layout_respects_ilp32_scalar_alignment() {
+    fn scalar_layout_respects_target_abi() {
         use hexray_types::database::ArchInfo;
+
+        // 32-bit: 8-byte scalars decline (ambiguous alignment), pointers size.
         let db32 = TypeDatabase::with_arch(ArchInfo::ilp32());
-        // align_up(8 + 1, 4) == 12
-        assert_eq!(optional_layout_size(&db32, "double"), Some(12));
-        assert_eq!(optional_layout_size(&db32, "long long"), Some(12));
-        // 4-byte pointer payload: align_up(4 + 1, 4) == 8
-        assert_eq!(optional_layout_size(&db32, "int*"), Some(8));
-        // variant<int, double>: payload 8, align 4 → align_up(8 + 1, 4) == 12
+        assert_eq!(optional_layout_size(&db32, "double"), None);
+        assert_eq!(optional_layout_size(&db32, "long long"), None);
         assert_eq!(
             variant_layout_size(&db32, &["int".into(), "double".into()]),
-            Some(12)
+            None
         );
-        // LP64 stays 16 for the same types.
-        assert_eq!(optional_layout_size(&full_db(), "double"), Some(16));
+        // 4-byte pointer payload still binds: align_up(4 + 1, 4) == 8.
+        assert_eq!(optional_layout_size(&db32, "int*"), Some(8));
+
+        // LP64 and LLP64 both 8-align the 8-byte scalars → 16.
+        for arch in [ArchInfo::lp64(), ArchInfo::llp64()] {
+            let db = TypeDatabase::with_arch(arch);
+            assert_eq!(optional_layout_size(&db, "double"), Some(16));
+            assert_eq!(optional_layout_size(&db, "long long"), Some(16));
+            assert_eq!(
+                variant_layout_size(&db, &["int".into(), "double".into()]),
+                Some(16)
+            );
+        }
     }
 
     /// Codex P2 (confirmatory pass) on PR #43: `long` is 8 on LP64 but 4 on
