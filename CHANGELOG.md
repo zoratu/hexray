@@ -5,6 +5,38 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.11] - 2026-06-21
+
+### Decompiler — C++ `std::optional` / `std::variant` stack locals
+
+- Recover `std::optional<T>` and `std::variant<...>` stack locals (deferral #5).
+  A demangled `std::optional<...>::method(...)` / `std::variant<...>::method(...)`
+  call whose `this` argument is a stack address now names that region with the
+  class-template type, so the emitter declares a typed local
+  (`std::optional<int> x;`, `std::variant<int, double> v;`) and rewrites `this`
+  to `&x` — instead of leaving scattered raw `sp+offset` slots. Builds on the
+  existing stack-struct / smart-pointer binding path.
+- Region size is derived from the template arguments
+  (`optional<T>` = `align_up(sizeof(T) + 1, alignof(T))`; `variant<T...>` = the
+  alternative union padded to its alignment, plus a one-byte discriminator) and
+  declines whenever an argument can't be sized confidently, so a binding never
+  absorbs adjacent stack locals. Sizing is ABI-aware: 8-byte scalars are
+  8-aligned on 64-bit targets (LP64 and LLP64) and declined on 32-bit where the
+  alignment is ambiguous; `long` / `wchar_t` / `long double` are declined as
+  data-model-dependent. Methods that return an object by value (`value_or` of an
+  object, the C++23 monadic `transform` / `and_then` / `or_else`) are declined
+  so an sret return buffer is never mistaken for the receiver.
+
+This is the type-binding slice; surfacing `has_value()` / `index()` as
+`if (o)` / tagged-union access is a follow-up.
+
+### Testing / infrastructure
+
+- Make the demangle property test deterministic (it previously generated
+  `__Z…`-style Darwin mangled names its guard didn't account for) and commit the
+  PE test fixtures that `include_bytes!` requires, so a clean checkout /
+  `git archive` compiles the test suite.
+
 ## [1.3.10] - 2026-06-16
 
 ### Decompiler — SSE float recovery (structurer-ordering refactor)
