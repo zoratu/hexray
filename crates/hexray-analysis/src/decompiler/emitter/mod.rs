@@ -5388,6 +5388,95 @@ impl PseudoCodeEmitter {
         Some((Self::strip_expr_casts(object_expr), slot_offset))
     }
 
+    /// Render a C++ member call on a bound `std::optional` / `std::variant`
+    /// stack local using receiver syntax. After the stack-struct binding pass
+    /// rewrites the `this` pointer to `&o`, a lifted call
+    /// `std::optional<int>::has_value(&o)` reads far better as `o.has_value()`.
+    ///
+    /// Returns `None` — leaving the plain qualified-call form — unless the call
+    /// is unambiguously such a member call: the callee is a
+    /// `std::optional<...>::method` / `std::variant<...>::method` and `args[0]`
+    /// is `&recv` where `recv` is a local whose recovered type is *exactly*
+    /// that optional/variant. The type match is what keeps a free function like
+    /// `std::get<int, int, double>(&v)` (callee qualifier `std`, not the
+    /// receiver's type) from being mis-sugared into `v.get<…>()`.
+    ///
+    /// First slice: named methods (`o.has_value()`, `v.index()`, …),
+    /// `operator*` → `*o`, and `operator bool` → `(bool)o`. Other operators
+    /// (`operator=`, `operator->`, `operator[]`, …) are left in qualified form
+    /// for a follow-up.
+    fn try_format_optional_variant_method_sugar(
+        &self,
+        target_name: &str,
+        args: &[Expr],
+        table: &StringTable,
+    ) -> Option<String> {
+        let (qualifier, method) = split_qualified_method(target_name)?;
+        let qualifier = qualifier.trim();
+        // Feature gate: only `std::optional` / `std::variant` receivers.
+        if !(qualifier.starts_with("std::optional<") || qualifier.starts_with("std::variant<")) {
+            return None;
+        }
+        // `this` must be `&recv` with `recv` a local whose recovered type
+        // matches the call's class qualifier exactly (whitespace-insensitive).
+        let ExprKind::AddressOf(recv) = &args.first()?.kind else {
+            return None;
+        };
+        let ExprKind::Var(v) = &recv.kind else {
+            return None;
+        };
+        let recv_type = self
+            .type_info
+            .get(&v.name)
+            .or_else(|| self.type_info.get(&v.name.to_lowercase()))?;
+        if !whitespace_insensitive_eq(recv_type, qualifier) {
+            return None;
+        }
+        // Skip constructors / destructors (the method's base identifier matches
+        // the class template name): `o.optional<int, true>(…)` reads worse than
+        // the qualified ctor call, and assignment-style ctor sugar is a
+        // follow-up.
+        let class_base = class_base_name(qualifier);
+        let method_base = method
+            .trim_start_matches('~')
+            .split('<')
+            .next()
+            .unwrap_or(method)
+            .trim();
+        if !class_base.is_empty() && method_base == class_base {
+            return None;
+        }
+        // Optional members that return an object by value use a hidden sret
+        // buffer: under the SysV / Itanium ABI `args[0]` is that buffer and the
+        // real `this` is `args[1]` — not the shape this sugar assumes. The
+        // monadic ops return another `std::optional<U>`, whose buffer type can
+        // even match this qualifier (when U == T) and slip past the type gate,
+        // so sugaring would mislabel both receiver and args. Mirrors the
+        // binding pass's sret exclusion; leave these qualified (codex P2).
+        if matches!(method_base, "value_or" | "transform" | "and_then" | "or_else") {
+            return None;
+        }
+        let recv_str = self.format_expr_with_strings(recv, table);
+        // Unary operator forms.
+        if method == "operator*" {
+            return Some(format!("*{recv_str}"));
+        }
+        if method == "operator bool" {
+            return Some(format!("(bool){recv_str}"));
+        }
+        // operator= / -> / [] / == … left in qualified form for a follow-up.
+        if method.starts_with("operator") {
+            return None;
+        }
+        // Named member function: `recv.method(rest_args)`.
+        let rest: Vec<String> = args
+            .iter()
+            .skip(1)
+            .map(|a| self.format_expr_with_strings(a, table))
+            .collect();
+        Some(format!("{recv_str}.{method}({})", rest.join(", ")))
+    }
+
     fn try_format_virtual_dispatch(
         &self,
         target: &CallTarget,
@@ -5907,6 +5996,16 @@ impl PseudoCodeEmitter {
                         }
                     }
                 };
+                // C++ member-call sugar on a bound optional/variant local:
+                // `std::optional<int>::has_value(&o)` → `o.has_value()`. Uses
+                // the resolved `target_str` so it fires for relocation-resolved
+                // (`CallTarget::Direct`) calls in `.o` files too, not just
+                // already-`Named` ones.
+                if let Some(sugar) =
+                    self.try_format_optional_variant_method_sugar(&target_str, args, table)
+                {
+                    return sugar;
+                }
                 // Format arguments with context-aware constant recognition
                 let args_str: Vec<_> = args
                     .iter()
@@ -9978,6 +10077,65 @@ impl PseudoCodeEmitter {
             self.emit_statement(expr, output, depth);
         }
     }
+}
+
+/// Split a demangled `Namespace::Class<...>::method` into `(qualifier, method)`
+/// at the last `::` that sits at angle-bracket depth 0, so a `::` *inside*
+/// template arguments (e.g. `std::optional<std::pair<int, int>>::value`) is not
+/// chosen as the split point. Returns `None` when there is no top-level `::`.
+fn split_qualified_method(name: &str) -> Option<(&str, &str)> {
+    let bytes = name.as_bytes();
+    let mut depth = 0i32;
+    let mut last = None;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && bytes[i + 1] == b':' => {
+                last = Some(i);
+                i += 1; // skip the second ':'
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let idx = last?;
+    Some((&name[..idx], &name[idx + 2..]))
+}
+
+/// The class's base identifier from a qualifier like `std::optional<int>` →
+/// `optional`: the identifier after the last `::` at angle-bracket depth 0,
+/// truncated at its first `<`. Handles nested templates
+/// (`std::optional<std::pair<int, int>>` → `optional`).
+fn class_base_name(qualifier: &str) -> &str {
+    let bytes = qualifier.as_bytes();
+    let mut depth = 0i32;
+    let mut after_last_colons = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && bytes[i + 1] == b':' => {
+                after_last_colons = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let seg = &qualifier[after_last_colons..];
+    seg.split('<').next().unwrap_or(seg)
+}
+
+/// Compare two strings ignoring all whitespace, so `std::variant<int, double>`
+/// (from a demangled call name) matches `std::variant<int,double>` (a recovered
+/// local's type spelling) regardless of how the comma spacing was rendered.
+fn whitespace_insensitive_eq(a: &str, b: &str) -> bool {
+    a.chars()
+        .filter(|c| !c.is_whitespace())
+        .eq(b.chars().filter(|c| !c.is_whitespace()))
 }
 
 #[cfg(test)]
@@ -14284,5 +14442,171 @@ mod tests {
             emitter.format_call_target_name("__cxa_throw"),
             "__cxa_throw"
         );
+    }
+
+    // ----- optional/variant member-call sugar --------------------------
+
+    #[test]
+    fn split_qualified_method_splits_at_top_level_colons() {
+        assert_eq!(
+            split_qualified_method("std::optional<int>::has_value"),
+            Some(("std::optional<int>", "has_value"))
+        );
+        assert_eq!(
+            split_qualified_method("std::variant<int, double>::index"),
+            Some(("std::variant<int, double>", "index"))
+        );
+        // The `>` in `operator->` must not be mistaken for a template close.
+        assert_eq!(
+            split_qualified_method("std::optional<int>::operator->"),
+            Some(("std::optional<int>", "operator->"))
+        );
+        // A `::` nested inside template arguments is not the split point.
+        assert_eq!(
+            split_qualified_method("std::optional<std::pair<int, int>>::value"),
+            Some(("std::optional<std::pair<int, int>>", "value"))
+        );
+        assert_eq!(split_qualified_method("memcpy"), None);
+    }
+
+    #[test]
+    fn class_base_name_extracts_template_class() {
+        assert_eq!(class_base_name("std::optional<int>"), "optional");
+        assert_eq!(class_base_name("std::variant<int, double>"), "variant");
+        assert_eq!(
+            class_base_name("std::optional<std::pair<int, int>>"),
+            "optional"
+        );
+    }
+
+    #[test]
+    fn whitespace_insensitive_eq_ignores_spacing() {
+        assert!(whitespace_insensitive_eq(
+            "std::variant<int, double>",
+            "std::variant<int,double>"
+        ));
+        assert!(!whitespace_insensitive_eq(
+            "std::optional<int>",
+            "std::optional<long>"
+        ));
+    }
+
+    fn sugar_emitter(var: &str, ty: &str) -> PseudoCodeEmitter {
+        let mut ti = HashMap::new();
+        ti.insert(var.to_string(), ty.to_string());
+        PseudoCodeEmitter::new("    ", false).with_type_info(ti)
+    }
+
+    fn this_arg(var: &str) -> Vec<Expr> {
+        vec![Expr::address_of(Expr::var(
+            super::super::expression::Variable::reg(var, 8),
+        ))]
+    }
+
+    #[test]
+    fn sugars_optional_named_method_and_unary_operators() {
+        let e = sugar_emitter("o", "std::optional<int>");
+        let t = StringTable::new();
+        let a = this_arg("o");
+        assert_eq!(
+            e.try_format_optional_variant_method_sugar("std::optional<int>::has_value", &a, &t)
+                .as_deref(),
+            Some("o.has_value()")
+        );
+        assert_eq!(
+            e.try_format_optional_variant_method_sugar("std::optional<int>::operator*", &a, &t)
+                .as_deref(),
+            Some("*o")
+        );
+        assert_eq!(
+            e.try_format_optional_variant_method_sugar("std::optional<int>::operator bool", &a, &t)
+                .as_deref(),
+            Some("(bool)o")
+        );
+    }
+
+    #[test]
+    fn sugars_variant_index_method() {
+        let e = sugar_emitter("v", "std::variant<int, double>");
+        let t = StringTable::new();
+        assert_eq!(
+            e.try_format_optional_variant_method_sugar(
+                "std::variant<int, double>::index",
+                &this_arg("v"),
+                &t
+            )
+            .as_deref(),
+            Some("v.index()")
+        );
+    }
+
+    #[test]
+    fn sugar_declines_ctor_unhandled_operators_free_fn_and_type_mismatch() {
+        let t = StringTable::new();
+        // Constructor (method base identifier == class base) — left qualified.
+        let eo = sugar_emitter("o", "std::optional<int>");
+        assert_eq!(
+            eo.try_format_optional_variant_method_sugar(
+                "std::optional<int>::optional<int, true>",
+                &this_arg("o"),
+                &t
+            ),
+            None
+        );
+        let ev = sugar_emitter("v", "std::variant<int, double>");
+        // Unhandled operator (operator=) — left qualified in this slice.
+        assert_eq!(
+            ev.try_format_optional_variant_method_sugar(
+                "std::variant<int, double>::operator=<int>",
+                &this_arg("v"),
+                &t
+            ),
+            None
+        );
+        // Free function `std::get<…>` — qualifier is `std`, not the receiver
+        // type, so it is never mis-sugared into `v.get<…>()`.
+        assert_eq!(
+            ev.try_format_optional_variant_method_sugar(
+                "std::get<int, int, double>",
+                &this_arg("v"),
+                &t
+            ),
+            None
+        );
+        // Receiver's recovered type doesn't match the call's class qualifier.
+        let emis = sugar_emitter("o", "std::variant<int, double>");
+        assert_eq!(
+            emis.try_format_optional_variant_method_sugar(
+                "std::optional<int>::has_value",
+                &this_arg("o"),
+                &t
+            ),
+            None
+        );
+    }
+
+    /// Codex P2 on this PR: optional members returning an object by value
+    /// (`value_or`, and the C++23 monadic `transform`/`and_then`/`or_else`) use
+    /// a hidden sret buffer in `args[0]` with the receiver in `args[1]`. The
+    /// monadic ones return `std::optional<U>`, whose buffer can match this
+    /// qualifier and slip past the type gate, so they must not be sugared.
+    #[test]
+    fn sugar_declines_sret_returning_optional_methods() {
+        let e = sugar_emitter("o", "std::optional<int>");
+        let t = StringTable::new();
+        // `or_else` returns std::optional<int> by value — args[0] is the sret
+        // buffer (also an optional<int>), which would otherwise match.
+        let buf_then_this = vec![
+            Expr::address_of(Expr::var(super::super::expression::Variable::reg("o", 8))),
+            Expr::address_of(Expr::var(super::super::expression::Variable::reg("this_o", 8))),
+        ];
+        for method in ["or_else<F>", "transform<F>", "and_then<F>", "value_or"] {
+            let name = format!("std::optional<int>::{method}");
+            assert_eq!(
+                e.try_format_optional_variant_method_sugar(&name, &buf_then_this, &t),
+                None,
+                "must not sugar sret-returning {method}"
+            );
+        }
     }
 }
