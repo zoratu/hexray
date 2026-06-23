@@ -5769,13 +5769,25 @@ impl SignatureRecovery {
     /// Number of named float params, read from the SysV `__va_list_tag`'s
     /// `fp_offset` field — but only once a genuine tag is located by its full
     /// shape: `gp_offset` (8*k) at base `b`, `fp_offset` (48+16*f) at `b+4`,
-    /// and pointer fields (`overflow_arg_area` / `reg_save_area`) at `b+8` and
-    /// `b+16`. Requiring the pointer fields rejects an unrelated adjacent pair
-    /// of gp/fp-looking constants (codex P2 on PR #46). `None` when no such tag
-    /// is present (e.g. the structurer already collapsed the diamond), so
-    /// callers fall back to the integer prefix.
+    /// and `stack_base`-relative pointer fields (`overflow_arg_area` /
+    /// `reg_save_area`) at `b+8` and `b+16`. Requiring all four fields rejects
+    /// an unrelated adjacent pair of gp/fp-looking constants (codex P2 on PR
+    /// #46). `None` when no such tag is present (e.g. the structurer already
+    /// collapsed the diamond), so callers fall back to the integer prefix.
+    ///
+    /// Candidate bases are scanned in a deterministic (sorted) order so the
+    /// recovered signature is stable. (A local aggregate initialised to the
+    /// *exact* 24-byte va_list-tag shape — two small int constants followed by
+    /// two stack-relative pointers at +8/+16 — would also match; that is not a
+    /// shape compilers emit for ordinary locals, so it is an accepted
+    /// theoretical residual rather than a practical hazard.)
     fn resolve_sysv_named_float_count(&self) -> Option<usize> {
-        for (&base, &gp_value) in &self.sysv_stack_const_stores {
+        let mut bases: Vec<i64> = self.sysv_stack_const_stores.keys().copied().collect();
+        bases.sort_unstable();
+        for base in bases {
+            let Some(&gp_value) = self.sysv_stack_const_stores.get(&base) else {
+                continue;
+            };
             if Self::sysv_va_list_named_param_count_from_gp_offset(gp_value).is_none() {
                 continue;
             }
