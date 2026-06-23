@@ -216,23 +216,16 @@ pub struct SignatureRecovery {
     sysv_va_start_seen: bool,
     /// Fixed non-variadic prefix inferred for the current function.
     variadic_fixed_param_count: Option<usize>,
-    /// Number of named (non-variadic) FLOAT parameters, recovered from the
-    /// `va_start` `fp_offset` initialiser (`fp_offset = 48 + 16 * named_floats`
-    /// under SysV). `Some(0)` for the common integer-named variadic
-    /// (`printf`-style) case, where every float arg register is the variadic
-    /// FP register-save area rather than a parameter. `None` when no
-    /// `fp_offset` store was observed (e.g. the structurer already collapsed
-    /// the `va_arg` diamond), so callers fall back to the integer prefix.
-    variadic_fixed_float_count: Option<usize>,
-    /// Frame offsets of observed `gp_offset`-field stores. Used to confirm an
-    /// `fp_offset`-pattern store really is the va_list `fp_offset` field (which
-    /// sits 4 bytes after the `gp_offset` field in `__va_list_tag`) and not an
-    /// unrelated stack constant that merely matches the value range.
-    sysv_va_list_gp_field_offsets: HashSet<i64>,
-    /// Pending `fp_offset`-pattern stores keyed by frame offset → named-float
-    /// count, resolved against [`Self::sysv_va_list_gp_field_offsets`] (whose
-    /// store may arrive before or after) to set `variadic_fixed_float_count`.
-    sysv_va_list_fp_field_candidates: HashMap<i64, usize>,
+    /// Integer constants stored to frame slots, keyed by frame offset. Used to
+    /// locate the SysV `__va_list_tag` by its full shape — `gp_offset` (8*k)
+    /// at base `b`, `fp_offset` (48+16*f) at `b+4` — so the `fp_offset` value
+    /// is read only from a genuine va_list, not an unrelated adjacent pair of
+    /// constants that merely look like one (codex P2 on PR #46).
+    sysv_stack_const_stores: HashMap<i64, i128>,
+    /// Frame offsets of slots assigned a `stack_base + const` pointer (the
+    /// `overflow_arg_area` / `reg_save_area` fields at `b+8` / `b+16` of the
+    /// `__va_list_tag`), used to corroborate a candidate tag base.
+    sysv_stack_pointer_stores: HashSet<i64>,
 }
 
 /// One observation of an argument register being spilled to a
@@ -1007,9 +1000,8 @@ impl SignatureRecovery {
             sysv_va_list_pointer_slots: HashSet::new(),
             sysv_va_start_seen: false,
             variadic_fixed_param_count: None,
-            variadic_fixed_float_count: None,
-            sysv_va_list_gp_field_offsets: HashSet::new(),
-            sysv_va_list_fp_field_candidates: HashMap::new(),
+            sysv_stack_const_stores: HashMap::new(),
+            sysv_stack_pointer_stores: HashSet::new(),
         }
     }
 
@@ -1122,9 +1114,8 @@ impl SignatureRecovery {
         self.sysv_va_list_pointer_slots.clear();
         self.sysv_va_start_seen = false;
         self.variadic_fixed_param_count = None;
-        self.variadic_fixed_float_count = None;
-        self.sysv_va_list_gp_field_offsets.clear();
-        self.sysv_va_list_fp_field_candidates.clear();
+        self.sysv_stack_const_stores.clear();
+        self.sysv_stack_pointer_stores.clear();
 
         // Seed float argument registers detected from the raw instruction stream
         // (the `-O0` spill of an xmm arg is pruned before this structured form,
@@ -4969,7 +4960,7 @@ impl SignatureRecovery {
         // (e.g. the structurer already collapsed the diamond) to avoid
         // regressing the pre-existing behaviour there.
         let float_param_cutoff = variadic_fixed_param_count
-            .map(|int_fixed| self.variadic_fixed_float_count.unwrap_or(int_fixed));
+            .map(|int_fixed| self.resolve_sysv_named_float_count().unwrap_or(int_fixed));
         for (idx, reg) in float_regs.iter().enumerate() {
             if float_param_cutoff.is_some_and(|cutoff| idx >= cutoff) {
                 continue;
@@ -5278,9 +5269,20 @@ impl SignatureRecovery {
             || self.extract_stack_offset(lhs).is_some();
 
         if lhs_is_stack_slot {
+            // Record every frame-slot constant / pointer store by offset; the
+            // va_list `fp_offset` field is resolved later from the full
+            // `__va_list_tag` shape (see `resolve_sysv_named_float_count`),
+            // never from an isolated value match (codex P2 on PR #46).
+            if let Some(off) = self.sysv_stack_slot_offset(lhs) {
+                if let ExprKind::IntLit(value) = &rhs.kind {
+                    self.sysv_stack_const_stores.insert(off, *value);
+                }
+                if Self::expr_is_stack_base_with_const_offset(rhs) {
+                    self.sysv_stack_pointer_stores.insert(off);
+                }
+            }
             match &rhs.kind {
                 ExprKind::IntLit(value) => {
-                    let slot_off = self.sysv_stack_slot_offset(lhs);
                     if let Some(fixed_count) =
                         Self::sysv_va_list_named_param_count_from_gp_offset(*value)
                     {
@@ -5290,37 +5292,9 @@ impl SignatureRecovery {
                                 .unwrap_or(0)
                                 .max(fixed_count),
                         );
-                        // Record the gp_offset field's frame offset and resolve
-                        // any fp_offset candidate sitting 4 bytes later.
-                        if let Some(off) = slot_off {
-                            self.sysv_va_list_gp_field_offsets.insert(off);
-                            if let Some(&float_count) =
-                                self.sysv_va_list_fp_field_candidates.get(&(off + 4))
-                            {
-                                self.record_variadic_fixed_float_count(float_count);
-                            }
-                        }
                     }
                     if Self::is_sysv_va_list_fp_offset(*value) {
                         self.sysv_va_list_fp_offset_slots.insert(lhs_name.clone());
-                        if let Some(float_count) =
-                            Self::sysv_va_list_named_float_count_from_fp_offset(*value)
-                        {
-                            // Only trust this as the va_list `fp_offset` field
-                            // — and let it shape the float-param cutoff — when
-                            // the `gp_offset` field (4 bytes earlier) is also
-                            // present; otherwise an unrelated stack local in
-                            // 48..=176 would poison the count (codex P2 on PR
-                            // #46). The gp store may arrive after this one, so
-                            // also stash a pending candidate.
-                            if let Some(off) = slot_off {
-                                self.sysv_va_list_fp_field_candidates
-                                    .insert(off, float_count);
-                                if self.sysv_va_list_gp_field_offsets.contains(&(off - 4)) {
-                                    self.record_variadic_fixed_float_count(float_count);
-                                }
-                            }
-                        }
                     }
                 }
                 ExprKind::Var(var) => self.observe_sysv_va_list_alias(&lhs_name, &var.name),
@@ -5787,9 +5761,33 @@ impl SignatureRecovery {
             .and_then(|off| i64::try_from(off).ok())
     }
 
-    fn record_variadic_fixed_float_count(&mut self, count: usize) {
-        self.variadic_fixed_float_count =
-            Some(self.variadic_fixed_float_count.unwrap_or(0).max(count));
+    /// Number of named float params, read from the SysV `__va_list_tag`'s
+    /// `fp_offset` field — but only once a genuine tag is located by its full
+    /// shape: `gp_offset` (8*k) at base `b`, `fp_offset` (48+16*f) at `b+4`,
+    /// and pointer fields (`overflow_arg_area` / `reg_save_area`) at `b+8` and
+    /// `b+16`. Requiring the pointer fields rejects an unrelated adjacent pair
+    /// of gp/fp-looking constants (codex P2 on PR #46). `None` when no such tag
+    /// is present (e.g. the structurer already collapsed the diamond), so
+    /// callers fall back to the integer prefix.
+    fn resolve_sysv_named_float_count(&self) -> Option<usize> {
+        for (&base, &gp_value) in &self.sysv_stack_const_stores {
+            if Self::sysv_va_list_named_param_count_from_gp_offset(gp_value).is_none() {
+                continue;
+            }
+            let Some(&fp_value) = self.sysv_stack_const_stores.get(&(base + 4)) else {
+                continue;
+            };
+            let Some(float_count) = Self::sysv_va_list_named_float_count_from_fp_offset(fp_value)
+            else {
+                continue;
+            };
+            if self.sysv_stack_pointer_stores.contains(&(base + 8))
+                && self.sysv_stack_pointer_stores.contains(&(base + 16))
+            {
+                return Some(float_count);
+            }
+        }
+        None
     }
 
     fn expr_looks_like_sysv_va_list_arg(&self, expr: &Expr) -> bool {
@@ -7773,10 +7771,12 @@ mod tests {
             let rbp = Expr::var(Variable::reg("rbp", 8));
             let rdi = Expr::var(Variable::reg("rdi", 8));
             let xmm0 = Expr::var(Variable::reg("xmm0", 8));
-            let gp_offset = Expr::var(Variable::stack(-0x10, 4));
-            let fp_offset = Expr::var(Variable::stack(-0xc, 4));
-            let overflow = Expr::var(Variable::stack(-0x8, 8));
-            let reg_save = Expr::var(Variable::stack(-0x18, 8));
+            // __va_list_tag layout: gp_offset@b, fp_offset@b+4,
+            // overflow_arg_area@b+8, reg_save_area@b+16 (b = -0x18).
+            let gp_offset = Expr::var(Variable::stack(-0x18, 4));
+            let fp_offset = Expr::var(Variable::stack(-0x14, 4));
+            let overflow = Expr::var(Variable::stack(-0x10, 8));
+            let reg_save = Expr::var(Variable::stack(-0x8, 8));
             let sum = Expr::var(Variable::stack(-0x58, 8));
 
             let cfg = StructuredCfg {
@@ -7842,18 +7842,23 @@ mod tests {
         let rbp = Expr::var(Variable::reg("rbp", 8));
         let rdi = Expr::var(Variable::reg("rdi", 8));
         let xmm0 = Expr::var(Variable::reg("xmm0", 8));
-        let gp_offset = Expr::var(Variable::stack(-0x10, 4));
-        let fp_offset = Expr::var(Variable::stack(-0xc, 4)); // gp + 4 = the real field
-        let decoy = Expr::var(Variable::stack(-0x60, 4)); // unrelated local = 64
-        let overflow = Expr::var(Variable::stack(-0x8, 8));
-        let reg_save = Expr::var(Variable::stack(-0x18, 8));
+        // Real __va_list_tag at base -0x18: gp@-0x18, fp@-0x14, overflow@-0x10,
+        // reg_save@-0x8. A decoy adjacent gp/fp-looking pair (8 then 64) sits
+        // at -0x60/-0x5c with NO pointer fields — it must be rejected.
+        let gp_offset = Expr::var(Variable::stack(-0x18, 4));
+        let fp_offset = Expr::var(Variable::stack(-0x14, 4));
+        let decoy_gp = Expr::var(Variable::stack(-0x60, 4)); // looks like gp_offset = 8
+        let decoy_fp = Expr::var(Variable::stack(-0x5c, 4)); // looks like fp_offset = 64
+        let overflow = Expr::var(Variable::stack(-0x10, 8));
+        let reg_save = Expr::var(Variable::stack(-0x8, 8));
         let sum = Expr::var(Variable::stack(-0x58, 8));
 
         let cfg = StructuredCfg {
             body: vec![StructuredNode::Block {
                 id: BasicBlockId::new(0),
                 statements: vec![
-                    Expr::assign(decoy, Expr::int(64)), // poison attempt
+                    Expr::assign(decoy_gp, Expr::int(8)), // poison attempt: gp/fp pair
+                    Expr::assign(decoy_fp, Expr::int(64)), // ...but no pointer fields
                     Expr::assign(gp_offset, Expr::int(8)),
                     Expr::assign(fp_offset, Expr::int(48)), // real fp_offset: 0 named floats
                     Expr::assign(
